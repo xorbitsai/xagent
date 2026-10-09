@@ -299,6 +299,79 @@ def test_create_outcome_producible_words_minus_word_list_leaves_exactly_three() 
     }
 
 
+def test_every_producible_create_pair_is_produced_by_a_cell_test_and_nothing_else() -> (
+    None
+):
+    """AST-based, like the respond-side
+    ``test_every_vocabulary_pair_is_produced_by_at_least_one_cell_test``
+    further down, but an equality rather than a coverage check: scans this
+    module's own source for every ``svc.Create<Outcome>(reason="...")``
+    construction that sits inside the comparison of an ``assert ... == ...``
+    statement, and requires the resulting (outcome type, reason) set to
+    equal ``CREATE_OUTCOME_PRODUCIBLE_REASONS`` expanded into pairs. A
+    declared pair no cell test asserts, and a cell test asserting a pair
+    the table does not declare, both turn this red. A construction outside
+    such an assert (bound to a name, or listed in a ``pytest.param``) is not
+    counted, so constructing a pair without asserting it cannot keep this
+    green.
+
+    Its blind spot: it proves every producible pair is asserted by some
+    cell test and no cell test asserts an undeclared one. It does not prove
+    a cell's construction really reaches the ``create()`` branch that
+    returns that pair -- that is each cell's own job. This function's own
+    body must not contain such an assert, or it would count itself.
+    """
+
+    import ast
+    import inspect
+    import typing
+
+    module = inspect.getmodule(
+        test_every_producible_create_pair_is_produced_by_a_cell_test_and_nothing_else
+    )
+    tree = ast.parse(inspect.getsource(module))
+
+    # Restricted to the CreateOutcome members that carry a reason: the
+    # module also calls same-prefixed constructors such as
+    # svc.CreateInteractionEnvelope(...), which are not outcomes.
+    outcome_names = {cls.__name__ for cls in typing.get_args(svc.CreateOutcome)} - {
+        "CreateCreated"
+    }
+    equality_operands = [
+        node.test
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assert)
+        and isinstance(node.test, ast.Compare)
+        and any(isinstance(op, ast.Eq) for op in node.test.ops)
+    ]
+    produced: set[tuple[str, str]] = set()
+    for node in (n for operand in equality_operands for n in ast.walk(operand)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "svc"
+            and node.func.attr in outcome_names
+        ):
+            for kw in node.keywords:
+                if (
+                    kw.arg == "reason"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                ):
+                    produced.add((node.func.attr, kw.value.value))
+
+    expected = {
+        (cls.__name__, reason)
+        for cls, reasons in svc.CREATE_OUTCOME_PRODUCIBLE_REASONS.items()
+        for reason in reasons
+    }
+    assert produced == expected, (
+        f"declared but not asserted by any cell: {sorted(expected - produced)}; "
+        f"asserted but not declared: {sorted(produced - expected)}"
+    )
+
+
 def test_create_outcome_union_has_exactly_the_six_known_variants() -> None:
     import typing
 
@@ -5792,6 +5865,53 @@ def test_i_a_5_system_path_issues_no_task_query() -> None:
         "a .query(...) call is reachable from the system-principal branch: "
         f"{ast.dump(query_calls_in_system_branch[0]) if query_calls_in_system_branch else ''}"
     )
+
+
+def test_i_a_5b_system_path_reads_tasks_only_for_the_storage_version(
+    _db: Session, _system_call_ctx: dict[str, Any]
+) -> None:
+    """Behavioral half of the static check above: across one successful
+    system-principal create() call, the only SELECT that reads ``tasks`` is
+    the execution-event storage-version check issued after the row is
+    staged. The static check only finds ``.query(...)`` calls; a reload of
+    the caller's task object (``db.refresh``, an expired attribute, a
+    ``db.get``) issues the same kind of read without one, and only the
+    statement stream shows it."""
+
+    import re
+
+    task = _system_call_ctx["task"]
+    # Same reason as _capture_statement_sequence: load what create() reads
+    # before the hook is attached, so a reload left over from the fixture's
+    # own commits is not counted against create().
+    _ = (task.id, task.user_id, task.source, task.run_id, task.lease_attempt_id)
+
+    statements: list[str] = []
+
+    def _before_cursor_execute(
+        conn, cursor, statement, parameters, context, executemany
+    ):
+        statements.append(statement)
+
+    engine = _db.get_bind()
+    sa.event.listen(engine, "before_cursor_execute", _before_cursor_execute)
+    try:
+        outcome = _system_create(
+            _db, _system_call_ctx, request_idempotency_key="sys-key-tasks-select-count"
+        )
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", _before_cursor_execute)
+
+    assert isinstance(outcome, svc.CreateCreated)
+    task_selects = [
+        s
+        for s in statements
+        if re.match(r"\s*SELECT\b", s, re.IGNORECASE)
+        and re.search(r"\bFROM\s+tasks\b", s, re.IGNORECASE)
+    ]
+    assert len(task_selects) == 1, task_selects
+    assert "tasks.conversation_storage_version" in task_selects[0]
+    assert re.search(r"WHERE\s+tasks\.id\s*=", task_selects[0])
 
 
 def test_i_a_6_task_handed_to_handoff_is_the_caller_supplied_object(

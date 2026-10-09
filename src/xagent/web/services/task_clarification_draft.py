@@ -13,10 +13,12 @@ row? The answer is one of three outcomes, never folded into a boolean:
   (``request_payload``, ``request_idempotency_key``, ``expires_at``).
 * :class:`NotApplicable` -- nothing durable should be written this round,
   but nothing failed either: either this run never produced a clarification
-  in the first place, or a waiting run's draft could not be turned into a
-  publishable payload (no resume anchor, or the payload could not be shaped
-  within the size and character limits below). The caller's own settlement
-  proceeds exactly as it would have before this module existed.
+  in the first place, or the waiting turn is the host's MCP approval prompt
+  rather than a question the agent asked, or a waiting run's draft could not
+  be turned into a publishable payload (no resume anchor, or the payload
+  could not be shaped within the size and character limits below). The
+  caller's own settlement proceeds exactly as it would have before this
+  module existed.
 * :class:`FailClosed` -- carries one of seven reason strings that split into
   two different consequences, not one. Four of them do not discard the
   round at all: no structured row is written, but the finalizer's existing
@@ -98,6 +100,10 @@ from datetime import datetime, timedelta
 from typing import Any, Literal, Mapping
 
 from ...core.agent.clarification import ClarificationDraft
+from ...core.agent.pattern.react.react import _normalize_interaction_text
+from ...core.tools.adapters.vibe.mcp_approval_gate import (
+    is_gate_issued_interaction_id,
+)
 from ..models.task import Task
 from .ops_signals import (
     CLARIFICATION_DRAFT_MISSING,
@@ -204,7 +210,9 @@ def _truncate_to_byte_limit(text: str, max_bytes: int) -> str:
 # and :class:`FailClosed`'s own docstrings. Both are ``str`` at runtime --
 # ``Literal`` only narrows what a type checker accepts, so a caller reading
 # ``resolution.fail_closed_reason == "attempt_mismatch"`` needs no change.
-NotApplicableReason = Literal["no_anchor", "payload_too_large", "empty_question"]
+NotApplicableReason = Literal[
+    "host_approval_prompt", "no_anchor", "payload_too_large", "empty_question"
+]
 FailClosedReason = Literal[
     "missing_draft",
     "draft_status_mismatch",
@@ -235,10 +243,15 @@ class NotApplicable:
     ``reason`` is ``None`` for the ordinary case -- this finalization was
     never a waiting-for-user turn with a draft attached, so publication
     simply does not apply, and the caller's settlement proceeds exactly as
-    it would without this module. ``reason`` is one of ``"no_anchor"``,
-    ``"payload_too_large"``, or ``"empty_question"`` when a waiting turn's
-    draft existed but could not be shaped into a publishable payload; each
-    of those is a degrade, not a failure -- the run is not discarded.
+    it would without this module. ``reason`` is ``"host_approval_prompt"``
+    when the waiting turn is the host's MCP approval prompt -- a request to
+    confirm a tool call, not a question the agent asked -- which is never
+    published as a structured interaction; that is not a shaping failure,
+    and the run is not discarded either. ``reason`` is one of
+    ``"no_anchor"``, ``"payload_too_large"``, or ``"empty_question"`` when a
+    waiting turn's draft existed but could not be shaped into a publishable
+    payload; each of those is a degrade, not a failure -- the run is not
+    discarded.
     """
 
     reason: NotApplicableReason | None
@@ -298,6 +311,15 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     characters a truncated tail happened to contain -- the same input must
     always truncate to the same length.
 
+    Between those two steps, ``message`` and each interaction's ``field``
+    go through ``_normalize_interaction_text`` (``react.py``), the same
+    trim function the write-side rules (``validate_v1_write_payload``)
+    judge them with, so a control character removed next to an edge space
+    cannot leave that space behind for the write side to refuse. Option
+    ``label`` / ``value``, ``message_type`` and ``requests`` are not
+    normalized: trimming option text would change option values that are
+    valid today.
+
     Every step here degrades rather than raises: a control character is
     dropped silently (it was never visible to begin with), an over-length
     ``question`` is cut with a fixed suffix and flagged, and an over-length
@@ -352,6 +374,11 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             },
         )
 
+    # After the warning above, which counts control characters only: a
+    # message made only of trim characters such as U+FEFF is not "empty
+    # after removing control characters" and must not be logged as such.
+    cleaned_question = _normalize_interaction_text(cleaned_question)
+
     message_truncated = False
     question = cleaned_question
     if len(cleaned_question.encode("utf-8")) > _QUESTION_MAX_BYTES:
@@ -365,6 +392,13 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         message_truncated = True
 
     interactions_cleaned = [_clean_leaves(dict(item)) for item in draft.interactions]
+    # Only the ``field`` key: ``_clean_leaves`` cannot see key names, and
+    # option ``label`` / ``value`` keep their edge whitespace on purpose.
+    # A non-string ``field`` is left as is for the v1 parser to refuse.
+    for item in interactions_cleaned:
+        field_value = item.get("field")
+        if isinstance(field_value, str):
+            item["field"] = _normalize_interaction_text(field_value)
     interactions_dropped = False
     interactions_payload: list[Any] = interactions_cleaned
     if _serialized_byte_length(interactions_cleaned) > _INTERACTIONS_MAX_BYTES:
@@ -482,15 +516,30 @@ def resolve_publishable_clarification(
        interaction handoff's own re-check so the two cannot drift; the
        fail-closed classification each one produces here is this function's
        alone.
-    5. ``anchor is not None`` -- no resume anchor means this run's most
+    5. The draft is not the host's MCP approval prompt: a ``tool_waiting``
+       draft where *any* item in ``draft.requests`` carries an
+       ``interaction_id`` the MCP approval gate issued is
+       ``NotApplicable("host_approval_prompt")``. Any item, not all: a
+       multi-tool draft is published as a single row, so publishing it would
+       hand that approval to the structured-answer path. Only
+       ``tool_waiting`` drafts are checked -- ``ask_user_question`` and
+       ``send_message`` items carry a model-produced tool call id, which is
+       never excluded even if it happens to look like a gate id. This runs
+       after guards 2 through 4, because a fence failure must still discard
+       the round, and before the anchor check, so an approval wait is
+       neither reported as ``no_anchor`` nor shaped into a payload.
+       Recognising a gate-issued id belongs to the gate module
+       (``is_gate_issued_interaction_id``); this function does not parse
+       the id itself. No degradation signal is registered.
+    6. ``anchor is not None`` -- no resume anchor means this run's most
        recent checkpoint was never one a structured interaction can resume
        against; this degrades, it does not fail the round.
-    6. ``draft.event_id`` is a non-empty string in the downstream command-ID
+    7. ``draft.event_id`` is a non-empty string in the downstream command-ID
        domain -- a question without the identity allocated before publication,
        or with a restored identity that staging would normalize or reject,
        cannot safely become a native interaction row. This fails closed for
        native publication without discarding the round.
-    7. The payload built from the draft fits the character domain and size
+    8. The payload built from the draft fits the character domain and size
         limits in :func:`build_clarification_payload`; if it does not
         (empty after filtering, or reduced to only whitespace, or still
         oversized after truncation), that also degrades rather than fails.
@@ -576,6 +625,11 @@ def resolve_publishable_clarification(
 
     if not task_row_matches_lease_attempt(task, lease):
         return FailClosed("attempt_mismatch")
+
+    if draft.source == "tool_waiting" and any(
+        is_gate_issued_interaction_id(item.interaction_id) for item in draft.requests
+    ):
+        return NotApplicable("host_approval_prompt")
 
     if anchor is None:
         return NotApplicable("no_anchor")

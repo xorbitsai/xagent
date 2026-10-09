@@ -27,6 +27,7 @@ from tests.web.services.task_interaction_schema_shared import (
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
@@ -612,6 +613,74 @@ def test_read_surface_recovers_a_superseded_question(_db: Session) -> None:
     assert question is not None
     assert question.startswith("Which environment?")
     assert interactions == [{"type": "text_input", "label": "Environment"}]
+
+
+def test_read_back_is_unchanged_across_a_real_relabel_in_the_steady_state(
+    _db: Session,
+) -> None:
+    """Same steady state as the test above, except that the relabel is
+    produced by the real relabel function rather than by writing a
+    ``question_superseded`` row directly. This pins that the predicate the
+    relabel function writes and the predicate the read surface's
+    superseded pass reads are the same pair: the read-back before and
+    after the relabel is identical."""
+
+    task = _make_task(_db, marker=None)
+    task.status = TaskStatus.WAITING_FOR_USER
+    _db.commit()
+    # Kept so this cell is the same steady state as the test above, which
+    # includes the terminal row a publication leaves behind. Under a NULL
+    # marker the read surface does not query the interaction table, so this
+    # row changes neither read-back below.
+    _make_terminated_row(_db, task_id=int(task.id))
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "Which environment?",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Environment"}],
+    )
+
+    before = read_surface.get_pending_interaction_question(_db, task)
+    chat_history_service.supersede_legacy_question_rows(_db, task_id=int(task.id))
+    _db.commit()
+    after = read_surface.get_pending_interaction_question(_db, task)
+
+    message_types = [
+        row.message_type
+        for row in _db.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == int(task.id))
+        .all()
+    ]
+    assert message_types == ["question_superseded"]
+    assert before[0] is not None
+    assert after == before
+
+
+def test_adapter_still_returns_the_question_after_the_real_relabel(
+    _db: Session,
+) -> None:
+    task = _make_task(_db, marker=None)
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "A pending question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Pending"}],
+    )
+    relabelled = chat_history_service.supersede_legacy_question_rows(
+        _db, task_id=int(task.id)
+    )
+    _db.commit()
+    assert relabelled >= 1
+
+    question, interactions = read_surface.get_pending_interaction_question(_db, task)
+
+    assert question is not None
+    assert question.startswith("A pending question")
+    assert interactions == [{"type": "text_input", "label": "Pending"}]
 
 
 def test_recovery_still_applies_when_an_active_row_exists_under_a_null_marker(

@@ -1805,10 +1805,21 @@ def test_cm1_seven_cell_exit_matrix(
     # every environment-dependent built-in attribute (which varies across
     # Python versions and capture setups) appears on both sides and cancels
     # out of the diff; a hand-constructed bare LogRecord does not have that
-    # property.
-    degraded_records = [
-        r for r in caplog.records if r.message == "interaction handoff degraded"
-    ]
+    # property. The attempt-mismatch cell logs its own message (see
+    # test_cm6_attempt_mismatch_logs_its_own_message) with the same `extra`
+    # keys, so that one cell selects its record by that message's prefix.
+    if case == "attempt-mismatch":
+        degraded_records = [
+            r
+            for r in caplog.records
+            if r.message.startswith(
+                "interaction handoff degraded: InteractionAttemptMismatch for task "
+            )
+        ]
+    else:
+        degraded_records = [
+            r for r in caplog.records if r.message == "interaction handoff degraded"
+        ]
     assert len(degraded_records) == 1, degraded_records
     record = degraded_records[0]
     logging.getLogger("xagent.web.services.task_interaction_staging").error(
@@ -2142,6 +2153,58 @@ def test_cm5_in_block_write_is_discarded_with_the_degraded_row(
 
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
     assert not _caller_write_survived(db, task_id, "in-block-write")
+    db.close()
+
+
+def test_cm6_attempt_mismatch_logs_its_own_message(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A swallowed attempt mismatch is logged with its own message naming
+    the task, the lease's attempt and the task row's attempt, instead of
+    the message the other swallowed exceptions share. The expected message
+    is written out here as a literal on purpose, so a change to the
+    production format string is caught rather than mirrored."""
+
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    task_id, anchor_id = _seed(session_factory)
+    db = session_factory()
+    anchor = _anchor(anchor_id)
+    lease = _force_attempt_mismatch(db, task_id)
+    db.commit()
+    task = db.get(Task, task_id)
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_staging"
+    )
+
+    with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
+        h.stage(
+            kind="clarification",
+            protocol_version=1,
+            request_payload={"prompt": "p"},
+            request_idempotency_key=_next_key(),
+            expires_at=_now() + timedelta(minutes=15),
+        )
+    db.commit()
+
+    errors = [
+        r
+        for r in caplog.records
+        if r.name == "xagent.web.services.task_interaction_staging"
+        and r.levelno == logging.ERROR
+    ]
+    assert len(errors) == 1, errors
+    message = errors[0].getMessage()
+    assert message == (
+        "interaction handoff degraded: InteractionAttemptMismatch for task "
+        f"{task_id} (lease attempt 'attempt-stale', "
+        "task row attempt 'attempt-current')"
+    )
+    assert str(task_id) in message
+    assert "attempt-stale" in message
+    assert "attempt-current" in message
+    assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
+    assert db.query(TaskInteractionRequest).count() == 0
     db.close()
 
 
@@ -2725,6 +2788,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
         **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
     )
     db.commit()
+    before = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert before == 1
     _mark_caller_write(db, task_id, "sp1-write")
 
     with interaction_handoff(db, lease, task=task, anchor=anchor, now=_now()) as h:
@@ -2736,6 +2805,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(tmp_path: Path) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
+    after = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert after == before
     assert _caller_write_survived(db, task_id, "sp1-write")
     # Exact-set, not `in`, scoped to this module's own signal names -- same
     # idiom as T-CM-1 (test_cm1_seven_cell_exit_matrix): the module-global

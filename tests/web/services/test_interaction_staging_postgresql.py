@@ -364,6 +364,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
         **_stage_kwargs(anchor, request_idempotency_key=_next_key()),
     )
     db.commit()
+    before = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert before == 1
     task = db.get(Task, task_id)
     _mark_caller_write(db, task_id, "pg-sp1-write")
 
@@ -376,6 +382,12 @@ def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:
             expires_at=_now() + timedelta(minutes=15),
         )
     db.commit()
+    after = db.execute(
+        sa.select(sa.func.count())
+        .select_from(TaskInteractionRequest)
+        .where(TaskInteractionRequest.task_id == task_id)
+    ).scalar_one()
+    assert after == before
     assert _caller_write_survived(db, task_id, "pg-sp1-write")
     assert ops_signals.INTERACTION_HANDOFF_DEGRADED in ops_signals.active_degradations()
 

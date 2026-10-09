@@ -19,7 +19,10 @@ if TYPE_CHECKING:
         category = Column(String(20), nullable=False, default="llm")
         model_provider = Column(String(50), nullable=False)
         model_name = Column(String(100), nullable=False)
-        _api_key_encrypted = Column(Text, nullable=False)
+        # Type-checking facade for the decrypted property exposed by the
+        # runtime model factory. The persisted ciphertext column is declared
+        # as Text in create_model_table().
+        api_key = Column(Text, nullable=False)
         base_url = Column(String(500), nullable=True)
         bedrock_region = Column(String(64), nullable=True)
         bedrock_auth_mode = Column(String(32), nullable=True)

@@ -892,7 +892,10 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ..api.auth import _resolve_oauth_redirect_uri, _resolve_oauth_secret
+        from ..api.auth import (
+            _resolve_oauth_client_per_field,
+            _resolve_oauth_redirect_uri,
+        )
         from ..models.oauth_provider import OAuthProvider
         from ..oauth_provider_quirks import requires_json_accept_header
 
@@ -910,11 +913,8 @@ async def refresh_oauth_token_if_needed(
         # blank credentials (e.g. a migration that ran before the app's env
         # was fully populated) connects fine via the env fallback but then
         # fails every refresh, since this used to read only the DB row.
-        client_id = _resolve_oauth_secret(
-            provider_name, provider_config.client_id, "CLIENT_ID"
-        )
-        client_secret = _resolve_oauth_secret(
-            provider_name, provider_config.client_secret, "CLIENT_SECRET"
+        client_id, client_secret = _resolve_oauth_client_per_field(
+            provider_name, provider_config
         )
 
         if not client_id or not client_secret:

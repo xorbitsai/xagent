@@ -1188,6 +1188,42 @@ def test_guard_catches_a_rebound_parameter(source: str) -> None:
     assert _guard_offenders(source), "the rebound parameter must be flagged"
 
 
+_CONTROL_STATE_SPREAD = """
+async def publish(websocket, report):
+    {binding}
+    await manager.send_personal_message(
+        {{"type": "error", "message": "Task failed", **report.control_state}},
+        websocket,
+    )
+"""
+
+
+def test_guard_trusts_control_state_of_a_fresh_settlement_report() -> None:
+    source = _CONTROL_STATE_SPREAD.format(binding="report = SettlementReport()")
+    assert not _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        pytest.param("pass", id="parameter"),
+        pytest.param("report = load_report()", id="rebound-to-other-call"),
+        pytest.param(
+            "report = SettlementReport(control_state={'message': str(exc)})",
+            id="built-with-arguments",
+        ),
+        pytest.param(
+            "report = SettlementReport() if websocket else other",
+            id="rebound-conditionally",
+        ),
+    ],
+)
+def test_guard_rejects_control_state_of_an_untrusted_report(binding: str) -> None:
+    """Only a name bound to ``SettlementReport(...)`` may spread control_state:
+    a parameter or any other binding could carry a message or error field."""
+    assert _guard_offenders(_CONTROL_STATE_SPREAD.format(binding=binding))
+
+
 def test_guard_still_trusts_a_genuinely_forwarded_parameter() -> None:
     """The wrapper shape stays clean; only its callers are judged."""
     source = """

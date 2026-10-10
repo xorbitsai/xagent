@@ -53,6 +53,7 @@ from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 
 
 def _make_task_orm() -> Task:
@@ -126,7 +127,7 @@ def _bg_patches(db: Any) -> list[Any]:
                 chat_response=None,
                 waiting_for_control=False,
                 terminal_state_committed=True,
-                final_control_snapshot=None,
+                report=SettlementReport(),
                 final_task_status=TaskStatus.COMPLETED.value,
                 broadcast_meta={
                     "id": 42,
@@ -466,7 +467,7 @@ async def test_resumed_turn_re_resolves_scope() -> None:
                     "agent_logo_url": None,
                     "final_status": TaskStatus.COMPLETED.value,
                     "lease_released": True,
-                    "control_event_state": {},
+                    "report": SettlementReport(),
                     "normalized_outputs": [],
                     "output": "ok",
                     "late_result": False,
@@ -531,7 +532,7 @@ async def test_resume_background_adopts_preacquired_lease_without_reacquiring() 
                     "agent_logo_url": None,
                     "final_status": TaskStatus.COMPLETED.value,
                     "lease_released": True,
-                    "control_event_state": {},
+                    "report": SettlementReport(),
                     "normalized_outputs": [],
                     "output": "ok",
                     "late_result": False,
@@ -610,7 +611,7 @@ async def test_resumed_task_completed_frame_carries_the_finalized_error_fields()
                     "agent_logo_url": None,
                     "final_status": TaskStatus.FAILED.value,
                     "lease_released": True,
-                    "control_event_state": {},
+                    "report": SettlementReport(),
                     "normalized_outputs": [],
                     "output": "failed",
                     "late_result": False,
@@ -1049,7 +1050,7 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
             "agent_logo_url": None,
             "final_status": TaskStatus.COMPLETED.value,
             "lease_released": False,
-            "control_event_state": {},
+            "report": SettlementReport(),
             "normalized_outputs": [],
             "output": "ok",
             "late_result": False,
@@ -1060,13 +1061,12 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         *,
         error_message: str | None,
         injection_outcome_unknown: bool = False,
-        terminal_event_state: dict[str, Any] | None = None,
         interruption: Any = None,
-        paused_for: list[Any] | None = None,
+        report: SettlementReport | None = None,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
-        assert terminal_event_state == {}
+        assert report == SettlementReport()
         assert interruption is None
         worker_events.append(("release", threading.get_ident()))
 
@@ -1184,7 +1184,7 @@ async def test_resume_final_usage_and_heartbeat_finish_before_lease_release() ->
             "agent_logo_url": None,
             "final_status": TaskStatus.COMPLETED.value,
             "lease_released": True,
-            "control_event_state": {},
+            "report": SettlementReport(),
             "normalized_outputs": [],
             "output": "ok",
             "late_result": False,

@@ -137,6 +137,7 @@ from .task_lease_service import (
     validate_preacquired_task_lease_isolated,
 )
 from .task_runtime import mcp_runtime_authorization_policy_required
+from .task_settlement_report import SettlementReport
 from .task_setup_snapshot import load_task_setup_snapshot_sync
 
 logger = logging.getLogger(__name__)
@@ -1767,17 +1768,18 @@ TASK_INTERRUPTION_PAUSED_MESSAGE = (
 TASK_USER_PAUSED_MESSAGE = "Task paused"
 
 
-async def publish_interruption_pause(
-    task_id: int,
-    control_state: dict[str, Any],
-    reason: InterruptionReason,
-) -> None:
+async def publish_settlement_pause(task_id: int, report: SettlementReport) -> None:
     """Broadcast a committed interruption pause, as an input pause is.
 
-    The message and ``interruption_reason`` say whether the user's own pause
-    request or a system interruption stopped the run. Best effort: the PAUSED
-    row is already committed, so a failed broadcast is only logged.
+    Publishes only when ``report`` records a committed pause. The message and
+    ``interruption_reason`` say whether the user's own pause request or a
+    system interruption stopped the run. Best effort: the PAUSED row is
+    already committed, so a failed broadcast is only logged.
     """
+    reason = report.paused_for
+    if reason is None:
+        return
+
     from .task_events import publish_task_event
 
     try:
@@ -1793,7 +1795,7 @@ async def publish_interruption_pause(
                 # Lets a client say why the run stopped (an InterruptionReason).
                 "interruption_reason": reason.value,
                 "timestamp": datetime.now(timezone.utc).timestamp(),
-                **control_state,
+                **report.control_state,
             },
             task_id,
         )
@@ -1843,10 +1845,9 @@ def settle_task_lease_isolated(
     error_message: str | None = None,
     client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
     client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
-    terminal_event_state: dict[str, Any] | None = None,
     classify_unknown_tool_effect: bool = False,
     interruption: InterruptionReason | None = None,
-    paused_for: list[InterruptionReason] | None = None,
+    report: SettlementReport | None = None,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1862,8 +1863,8 @@ def settle_task_lease_isolated(
     terminal/control outcome may still be reconciled and released, but returns
     ``False`` so callers do not publish a contradictory failure event.
 
-    When supplied, ``terminal_event_state`` receives the committed V2 control
-    identity after commit; the caller can publish without re-reading latest state.
+    When supplied, ``report`` receives the committed V2 control identity after
+    commit; the caller can publish without re-reading latest state.
 
     ``classify_unknown_tool_effect`` is for a run that raised: if its V2
     facts show a started tool attempt with no committed outcome, the failure
@@ -1884,8 +1885,8 @@ def settle_task_lease_isolated(
     the run fails as without ``interruption``: with a settlement switch off
     by the very same statements; for an ineligible task with the same outcome but
     after an extra row lock and eligibility read. Every decided interruption
-    is recorded in ``task_auto_recovery``. ``paused_for``, when supplied,
-    receives the recorded reason of a committed pause.
+    is recorded in ``task_auto_recovery``. ``report``, when supplied,
+    also receives the recorded reason of a committed pause.
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
@@ -1911,10 +1912,9 @@ def settle_task_lease_isolated(
                     )
                     if paused_state is not None:
                         settle_db.commit()
-                        if terminal_event_state is not None:
-                            terminal_event_state.update(paused_state)
-                        if paused_for is not None:
-                            paused_for.append(decision.reason)
+                        if report is not None:
+                            report.control_state = dict(paused_state)
+                            report.paused_for = decision.reason
                         invalidate_task_cache_best_effort(lease.task_id)
                         return True
                     failed = False
@@ -1986,8 +1986,8 @@ def settle_task_lease_isolated(
                         else {}
                     )
                     settle_db.commit()
-                    if terminal_event_state is not None:
-                        terminal_event_state.update(event_state)
+                    if report is not None:
+                        report.control_state = dict(event_state)
                     invalidate_task_cache_best_effort(lease.task_id)
                     return True
 
@@ -2694,8 +2694,7 @@ def _schedule_bg(
 
                 if not defer_settlement_to_ttl_recovery:
                     lease_settled = False
-                    terminal_event_state: dict[str, Any] = {}
-                    paused_for: list[InterruptionReason] = []
+                    report = SettlementReport()
                     try:
                         settled = await run_db_io_cancellation_safe(
                             lambda: settle_task_lease_isolated(
@@ -2707,12 +2706,11 @@ def _schedule_bg(
                                     or CLIENT_SAFE_TASK_FAILURE
                                 ),
                                 client_message_type=client_history_message_type,
-                                terminal_event_state=terminal_event_state,
                                 classify_unknown_tool_effect=(
                                     classify_unknown_tool_effect
                                 ),
                                 interruption=settlement_interruption,
-                                paused_for=paused_for,
+                                report=report,
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":
@@ -2724,12 +2722,10 @@ def _schedule_bg(
                         # coroutine is no longer authoritative for the turn and
                         # must not close its delivery row.
                         lease_settled = bool(settled)
-                        if settled and paused_for:
+                        if settled and report.paused:
                             # Interrupted, not failed: resumable by its user.
                             execution_failed = False
-                            await publish_interruption_pause(
-                                task_id, terminal_event_state, paused_for[0]
-                            )
+                            await publish_settlement_pause(task_id, report)
                         elif settled and broadcast_error_message is not None:
                             try:
                                 await publish_task_result(
@@ -2739,7 +2735,7 @@ def _schedule_bg(
                                             broadcast_error_message,
                                             code=broadcast_error_code,
                                         ),
-                                        **terminal_event_state,
+                                        **report.control_state,
                                     },
                                     task_id,
                                 )

@@ -9,7 +9,6 @@ from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
 
-from ...core.agent.interruption import InterruptionReason
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task, TaskStatus
 from .assistant_history_safety import (
@@ -36,6 +35,7 @@ from .task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
+from .task_settlement_report import SettlementReport
 from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
@@ -57,8 +57,7 @@ def finalize_managed_task_lease_result(
     execution_result: Mapping[str, Any] | None = None,
     completion: tuple[int, dict[str, Any]] | None = None,
     settle_interruption: bool = False,
-    paused_for: list[InterruptionReason] | None = None,
-    terminal_event_state: dict[str, Any] | None = None,
+    report: SettlementReport | None = None,
 ) -> bool:
     """Atomically persist one inline transport result under its exact lease.
 
@@ -79,10 +78,10 @@ def finalize_managed_task_lease_result(
     for TTL recovery; any other decision fault settles as before. Every
     decided interruption is recorded in ``task_auto_recovery``.
 
-    Both out-parameters are filled only after this call commits a pause, and
-    left untouched for every other outcome: ``paused_for`` (when supplied)
-    receives the pause's recorded reason and ``terminal_event_state`` (when
-    supplied) its committed control identity, so the caller can announce it.
+    ``report`` (when supplied) is filled only after this call commits a pause,
+    and left untouched for every other outcome: it receives the pause's
+    recorded reason and its committed control identity, so the caller can
+    announce it.
     """
 
     if status == TaskStatus.RUNNING:
@@ -224,10 +223,9 @@ def finalize_managed_task_lease_result(
         raise
 
     if paused_state is not None and interruption is not None:
-        if terminal_event_state is not None:
-            terminal_event_state.update(paused_state)
-        if paused_for is not None:
-            paused_for.append(interruption.reason)
+        if report is not None:
+            report.control_state = dict(paused_state)
+            report.paused_for = interruption.reason
         logger.warning(
             "task_id=%s run_id=%s component=settlement paused interrupted "
             "channel run (reason=%s): %s",

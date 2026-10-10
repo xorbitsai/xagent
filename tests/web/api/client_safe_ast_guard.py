@@ -230,6 +230,31 @@ def _is_known_non_error_event_type(
     )
 
 
+def _is_settlement_report_control_state(
+    expr: ast.expr, parents: dict[ast.AST, ast.AST]
+) -> bool:
+    """``<name>.control_state`` where every binding of ``name`` is a fresh,
+    empty ``SettlementReport()``; a report built with arguments, a parameter
+    or any other binding is not trusted."""
+    if not (
+        isinstance(expr, ast.Attribute)
+        and expr.attr == "control_state"
+        and isinstance(expr.value, ast.Name)
+    ):
+        return False
+    bindings = _resolved_assignments(
+        _enclosing_functions(expr, parents), expr.value.id, expr, parents
+    )
+    return bool(bindings) and all(
+        isinstance(binding, ast.Call)
+        and isinstance(binding.func, ast.Name)
+        and binding.func.id == "SettlementReport"
+        and not binding.args
+        and not binding.keywords
+        for binding in bindings
+    )
+
+
 def _dict_variants(
     expr: ast.expr,
     reference: ast.AST,
@@ -298,6 +323,10 @@ def _dict_variants(
                 resolving | {expr.id},
             )
         ]
+    if _is_settlement_report_control_state(expr, parents):
+        # ``SettlementReport.control_state`` holds only committed control
+        # identity (run_id, state_version, control_state, status).
+        return [({}, set())]
     if not isinstance(expr, ast.Dict):
         return [({}, SENSITIVE_PAYLOAD_FIELDS.copy())]
 

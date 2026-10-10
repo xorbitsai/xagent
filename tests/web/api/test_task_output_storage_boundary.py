@@ -22,6 +22,7 @@ from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 from xagent.web.services.uploaded_file_store import (
     UploadedFileStore,
     UploadedFileVersionConflict,
@@ -1539,7 +1540,7 @@ async def test_resume_output_staging_finishes_while_heartbeat_is_still_active() 
             "agent_logo_url": None,
             "final_status": TaskStatus.COMPLETED.value,
             "lease_released": True,
-            "control_event_state": {},
+            "report": SettlementReport(),
             "normalized_outputs": [],
             "output": "done",
             "late_result": False,

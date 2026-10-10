@@ -15,9 +15,10 @@ unsuccessful result, so the result paths carry them: a new run's
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import openai
@@ -150,6 +151,7 @@ from xagent.web.services.task_orchestrator import (
     TaskTurnPayload,
     settle_task_lease_isolated,
 )
+from xagent.web.services.task_settlement_report import SettlementReport
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -352,7 +354,7 @@ async def test_invalid_tool_protocol_resume_samples_the_model_again(
     finalized = _settle_new_run(factory, tid, lease, result)
 
     if gate == "today":
-        assert finalized.interruption_pause_reason is None
+        assert finalized.report.paused_for is None
         task, row, events = _state(factory, tid)
         assert task.status == TaskStatus.FAILED
         assert task.error_message == result["error"]
@@ -361,9 +363,7 @@ async def test_invalid_tool_protocol_resume_samples_the_model_again(
             ("interrupted", "failed")
         ]
         return
-    assert finalized.interruption_pause_reason is (
-        InterruptionReason.MODEL_OUTPUT_INVALID
-    )
+    assert finalized.report.paused_for is InterruptionReason.MODEL_OUTPUT_INVALID
     _assert_paused(factory, tid, lease, reason="model_output_invalid")
     assert _settled_facts(factory, tid) == [PAUSED_FACT]
     assert _assistant_lines(factory, tid) == []
@@ -417,7 +417,7 @@ async def test_unavailable_provider_pauses_and_the_run_resumes(
 
     finalized = _settle_new_run(factory, tid, lease, result)
 
-    assert finalized.interruption_pause_reason is InterruptionReason.LLM_UNAVAILABLE
+    assert finalized.report.paused_for is InterruptionReason.LLM_UNAVAILABLE
     row = _assert_paused(factory, tid, lease, reason="llm_unavailable")
     assert row.last_error == result["error"]
     assert _settled_facts(factory, tid) == [PAUSED_FACT]
@@ -510,7 +510,7 @@ async def test_dag_runs_never_pause_for_provider_failures(canonical, pattern, fa
     }
     finalized = _settle_new_run(factory, tid, lease, settled)
 
-    assert finalized.interruption_pause_reason is None
+    assert finalized.report.paused_for is None
     task, row, _events = _state(factory, tid)
     assert task.status == TaskStatus.FAILED
     assert row is None
@@ -639,7 +639,14 @@ def _completed_channel_command(factory, ids, lease) -> tuple[int, dict[str, Any]
 
 
 def _settle_channel(
-    factory, ids, lease, result, *, settle_interruption: bool = True
+    factory,
+    ids,
+    lease,
+    result,
+    *,
+    settle_interruption: bool = True,
+    report: SettlementReport | None = None,
+    finalize_context: Any = None,
 ) -> None:
     """Settle ``result`` as the shared channel leaf does, completing a real
     channel command (its ``channel_result`` and the task output included)."""
@@ -651,7 +658,7 @@ def _settle_channel(
         "output": projection.transcript_content,
         "completion_outcome": projection.completion_outcome,
     }
-    with factory() as db:
+    with factory() as db, finalize_context or contextlib.nullcontext():
         assert finalize_managed_task_lease_result(
             db,
             lease,
@@ -664,6 +671,7 @@ def _settle_channel(
             execution_result=dict(result),
             completion=(command_id, durable_result),
             settle_interruption=settle_interruption,
+            report=report,
         )
 
 
@@ -697,6 +705,41 @@ def _without_settled_reason(projection: dict[str, Any], reason: str):
     for fact in projection["settled"]:
         assert fact["result"].pop("interruption_reason") == reason
     return projection
+
+
+def test_channel_pause_fills_the_report_after_the_commit(canonical):
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    report = SettlementReport()
+
+    _settle_channel(factory, ids, lease, LLM_RESULT, report=report)
+
+    assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
+    assert report.control_state["status"] == "paused"
+    assert report.control_state["run_id"] == lease.run_id
+
+
+def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    report = SettlementReport()
+
+    def failing_commit(self):
+        raise RuntimeError("commit failed")
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        _settle_channel(
+            factory,
+            ids,
+            lease,
+            LLM_RESULT,
+            report=report,
+            finalize_context=patch("sqlalchemy.orm.Session.commit", failing_commit),
+        )
+
+    assert report == SettlementReport()
 
 
 @PAUSE_CASES
@@ -1351,8 +1394,9 @@ async def test_resume_exception_passes_an_llm_reason_and_announces_the_pause():
 
     def settle(lease, **kwargs):
         assert kwargs["interruption"] is InterruptionReason.LLM_UNAVAILABLE
-        kwargs["paused_for"].append(InterruptionReason.LLM_UNAVAILABLE)
-        kwargs["terminal_event_state"].update(status="paused", run_id=lease.run_id)
+        report = kwargs["report"]
+        report.paused_for = InterruptionReason.LLM_UNAVAILABLE
+        report.control_state.update(status="paused", run_id=lease.run_id)
         return True
 
     settle_mock = Mock(side_effect=settle)
@@ -1363,8 +1407,10 @@ async def test_resume_exception_passes_an_llm_reason_and_announces_the_pause():
     settle_mock.assert_called_once()
     publish_pause.assert_awaited_once_with(
         42,
-        {"status": "paused", "run_id": "run-a"},
-        InterruptionReason.LLM_UNAVAILABLE,
+        SettlementReport(
+            control_state={"status": "paused", "run_id": "run-a"},
+            paused_for=InterruptionReason.LLM_UNAVAILABLE,
+        ),
     )
     assert "task_error" not in frames
 
@@ -1373,16 +1419,16 @@ def test_resume_exception_settlement_pauses_for_llm_on_a_real_database(canonical
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
-    paused_for: list[InterruptionReason] = []
+    report = SettlementReport()
 
     assert _settle_resumed_task_lease(
         lease,
         error_message="setup/run error: LLMTimeoutError: provider timed out",
         interruption=InterruptionReason.LLM_UNAVAILABLE,
-        paused_for=paused_for,
+        report=report,
     )
 
-    assert paused_for == [InterruptionReason.LLM_UNAVAILABLE]
+    assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
     projection = _full_projection(factory, ids, lease)
     assert (projection["status"], projection["runner_id"]) == (TaskStatus.PAUSED, None)
     assert projection["settled"] == [PAUSED_FACT]
@@ -1429,7 +1475,7 @@ async def test_exhausted_quota_settles_failed_with_the_switch_on(canonical, tmp_
 
     finalized = _settle_new_run(factory, tid, lease, result)
 
-    assert finalized.interruption_pause_reason is None
+    assert finalized.report.paused_for is None
     task, row, _events = _state(factory, tid)
     assert task.status == TaskStatus.FAILED
     assert row is None

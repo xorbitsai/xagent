@@ -1002,7 +1002,7 @@ def test_late_result_keeps_a_settled_row(
     # The broadcast carries the row's actual status, not the pre-run one.
     assert finalized.final_task_status == status.value
     assert finalized.waiting_for_control is True
-    assert finalized.final_control_snapshot is None
+    assert finalized.report.control_state == {}
     stored = _row(db_session, int(task.id))
     _assert_settled_unchanged(stored, status)
     assert stored.state_version == 3

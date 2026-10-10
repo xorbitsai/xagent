@@ -16,7 +16,6 @@ from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
-from ...core.agent.interruption import InterruptionReason
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -63,6 +62,7 @@ from .task_orchestrator import (
     TaskTurnPayload,
     reserve_task_start_no_commit,
 )
+from .task_settlement_report import SettlementReport
 from .task_start_protocol import (
     ChannelExecutionContext,
     TaskStartPayload,
@@ -753,8 +753,7 @@ async def execute_channel_background(
             },
         }
 
-        paused_for: list[InterruptionReason] = []
-        paused_state: dict[str, Any] = {}
+        report = SettlementReport()
 
         def finalize() -> bool:
             with get_session_local()() as db:
@@ -772,21 +771,18 @@ async def execute_channel_background(
                     # An interrupted run may rest PAUSED instead; its channel
                     # then reads "interrupted", as after lease recovery.
                     settle_interruption=True,
-                    paused_for=paused_for,
-                    terminal_event_state=paused_state,
+                    report=report,
                 )
 
         if not await run_db_io_cancellation_safe(finalize):
             raise TaskLeaseLostError("Channel result no longer owns its execution")
-        if paused_for:
+        if report.paused:
             # The channel has its "interrupted" reply; a web viewer of the
             # task learns of the committed pause here. Best effort, as on
             # the other settlement paths: a failed broadcast is only logged.
-            from .task_orchestrator import publish_interruption_pause
+            from .task_orchestrator import publish_settlement_pause
 
-            await publish_interruption_pause(
-                command.task_id, paused_state, paused_for[0]
-            )
+            await publish_settlement_pause(command.task_id, report)
     finally:
         service.tracer.remove_handler(forwarder)
         try:

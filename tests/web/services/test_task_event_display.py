@@ -694,13 +694,16 @@ async def test_real_failure_notice_keeps_committed_identity_after_new_run(
     )
     from xagent.web.services.task_lease_service import acquire_task_lease
     from xagent.web.services.task_orchestrator import settle_task_lease_isolated
+    from xagent.web.services.task_settlement_report import SettlementReport
 
     factory, task_id = canonical
     with factory() as db:
         lease = acquire_task_lease(db, task_id, new_run=True)
     notice = create_terminal_task_error_event(task_id, "Task failed")
     settle = _settle_resumed_task_lease if resume else settle_task_lease_isolated
-    assert settle(lease, error_message="private failure", terminal_event_state=notice)
+    report = SettlementReport()
+    assert settle(lease, error_message="private failure", report=report)
+    notice.update(report.control_state)
     with factory() as db:
         historical = load_event_display_snapshot(db, task_id).events[-1]
         version = db.get(Task, task_id).state_version

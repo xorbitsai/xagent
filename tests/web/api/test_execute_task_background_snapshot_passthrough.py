@@ -47,6 +47,7 @@ from xagent.web.services.mcp_runtime import (
 )
 from xagent.web.services.task_execution import execute_task_background
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
+from xagent.web.services.task_settlement_report import SettlementReport
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
@@ -178,7 +179,7 @@ def _common_patches(db: Any, agent_service: Any) -> list[Any]:
                 chat_response=None,
                 waiting_for_control=False,
                 terminal_state_committed=True,
-                final_control_snapshot=None,
+                report=SettlementReport(),
                 final_task_status=TaskStatus.COMPLETED.value,
                 broadcast_meta={
                     "id": 42,
@@ -389,7 +390,7 @@ async def test_cancellation_during_finalization_broadcasts_committed_result(
             chat_response=None,
             waiting_for_control=False,
             terminal_state_committed=True,
-            final_control_snapshot=None,
+            report=SettlementReport(),
             final_task_status=TaskStatus.COMPLETED.value,
             broadcast_meta={
                 "id": 42,
@@ -475,7 +476,7 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
             chat_response=None,
             waiting_for_control=False,
             terminal_state_committed=False,
-            final_control_snapshot=None,
+            report=SettlementReport(),
             final_task_status=TaskStatus.RUNNING.value,
             broadcast_meta={
                 "id": 42,
@@ -675,7 +676,7 @@ async def test_task_completed_frame_carries_the_finalized_error_fields() -> None
         chat_response=None,
         waiting_for_control=False,
         terminal_state_committed=True,
-        final_control_snapshot=None,
+        report=SettlementReport(),
         final_task_status=TaskStatus.FAILED.value,
         broadcast_meta={
             "id": 42,

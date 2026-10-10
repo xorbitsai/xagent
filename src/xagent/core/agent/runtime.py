@@ -1254,7 +1254,7 @@ class PatternRuntime:
             await self._maybe_await(
                 finish_trace(
                     name=self._pattern_trace_name(pattern),
-                    status="success",
+                    status="success" if result.get("success") else "error",
                     output=result,
                     metadata={
                         "execution_id": getattr(

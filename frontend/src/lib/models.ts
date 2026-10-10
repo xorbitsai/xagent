@@ -4,6 +4,7 @@
 
 import { getApiUrl } from './utils';
 import { apiRequest, isJsonRecord, parseApiResponse } from './api-wrapper';
+import type { BedrockAuthMode } from './model-provider-settings';
 
 const currentBackendDefaultModelTypes = [
   'general',
@@ -102,6 +103,8 @@ export interface ModelWithAccess {
   model_provider: string;
   model_name: string;
   base_url: string | null;
+  bedrock_region?: string | null;
+  bedrock_auth_mode?: BedrockAuthMode | null;
   temperature: number | null;
   context_window: number | null;
   dimension: number | null;
@@ -136,6 +139,14 @@ const positiveSafeInt = (value: unknown): value is number =>
 const nullableString = (value: unknown): value is string | null =>
   value === null || typeof value === 'string';
 
+const optionalNullableString = (value: unknown): value is string | null | undefined =>
+  value === undefined || nullableString(value);
+
+const optionalNullableBedrockAuthMode = (
+  value: unknown,
+): value is BedrockAuthMode | null | undefined =>
+  value === undefined || value === null || value === 'api_key' || value === 'credentials_chain';
+
 const nullableFinite = (value: unknown): value is number | null =>
   value === null || (typeof value === 'number' && Number.isFinite(value));
 
@@ -160,6 +171,8 @@ export function parseModelList(value: unknown): ModelWithAccess[] | null {
       model_provider,
       model_name,
       base_url,
+      bedrock_region,
+      bedrock_auth_mode,
       temperature,
       context_window,
       dimension,
@@ -183,6 +196,8 @@ export function parseModelList(value: unknown): ModelWithAccess[] | null {
       || typeof model_provider !== 'string'
       || typeof model_name !== 'string'
       || !nullableString(base_url)
+      || !optionalNullableString(bedrock_region)
+      || !optionalNullableBedrockAuthMode(bedrock_auth_mode)
       || !nullableFinite(temperature)
       || !nullableInt(context_window)
       || !nullableInt(dimension)
@@ -206,6 +221,8 @@ export function parseModelList(value: unknown): ModelWithAccess[] | null {
       model_provider,
       model_name,
       base_url,
+      bedrock_region: bedrock_region ?? null,
+      bedrock_auth_mode: bedrock_auth_mode ?? null,
       temperature,
       context_window,
       dimension,
@@ -431,6 +448,7 @@ export interface Provider {
   requires_base_url?: boolean;
   icon?: string;
   default_base_url?: string;
+  supports_model_listing?: boolean;
 }
 
 export interface ProviderModel {

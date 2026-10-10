@@ -13,6 +13,7 @@ from botocore import UNSIGNED
 from botocore.stub import Stubber
 
 from xagent.core.agent.context.message import Message
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.chat.token_context import TokenContextManager
@@ -425,7 +426,8 @@ async def test_converse_stream_accumulates_fragmented_multi_tool_arguments():
     assert final_by_id["a"]["function"]["arguments"] == '{"city":"Paris"}'
     assert final_by_id["b"]["function"]["arguments"] == '{"city":"Tokyo"}'
     assert all(
-        call["function"]["arguments_mode"] == "delta" for call in final_by_id.values()
+        call["function"]["arguments_mode"] == "snapshot"
+        for call in final_by_id.values()
     )
     usage = next(chunk for chunk in chunks if chunk.type is ChunkType.USAGE)
     assert usage.usage["cached_input_tokens"] == 3
@@ -433,6 +435,42 @@ async def test_converse_stream_accumulates_fragmented_multi_tool_arguments():
     assert chunks[-1].type is ChunkType.END
     assert chunks[-1].finish_reason == "tool_calls"
     assert stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_converse_stream_final_tool_snapshot_is_not_appended_twice_by_runtime():
+    stream = _FakeEventStream(
+        [
+            {"messageStart": {"role": "assistant"}},
+            {
+                "contentBlockStart": {
+                    "contentBlockIndex": 0,
+                    "start": {"toolUse": {"toolUseId": "call-1", "name": "weather"}},
+                }
+            },
+            {
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {"toolUse": {"input": '{"city":"Paris"}'}},
+                }
+            },
+            {"contentBlockStop": {"contentBlockIndex": 0}},
+            {"messageStop": {"stopReason": "tool_use"}},
+            {"metadata": {"usage": {"inputTokens": 2, "outputTokens": 3}}},
+        ]
+    )
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    result = await PatternRuntime().run_streaming_llm_call(
+        llm,
+        messages=[{"role": "user", "content": "weather"}],
+        tools=[],
+    )
+
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"city":"Paris"}'
+    assert json.loads(result["tool_calls"][0]["function"]["arguments"]) == {
+        "city": "Paris"
+    }
 
 
 @pytest.mark.asyncio

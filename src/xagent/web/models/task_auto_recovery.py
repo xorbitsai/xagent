@@ -63,6 +63,9 @@ class TaskRecoveryEventType(str, enum.Enum):
     SKIPPED_USER_INTENT = "skipped_user_intent"
     DISPATCH_FAILED = "dispatch_failed"
     STALE = "stale"
+    # A scheduled or dispatched resume was dropped because
+    # XAGENT_TASK_AUTO_RESUME_ENABLED is off; the row rests in ``manual``.
+    SKIPPED_DISABLED = "skipped_disabled"
 
 
 class TaskAutoRecovery(Base):  # type: ignore
@@ -104,7 +107,8 @@ class TaskAutoRecovery(Base):  # type: ignore
     )
     # Fingerprint of the recoverable checkpoint at interruption time.
     progress_marker: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    # When ``state == 'scheduled'``: the time the attempt falls due.
+    # When ``state == 'scheduled'``: the time the attempt falls due. For
+    # ``dispatched``: when the dispatch is next checked; NULL once confirmed.
     next_attempt_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

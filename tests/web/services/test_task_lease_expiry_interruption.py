@@ -24,6 +24,7 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery, TaskRecoveryEvent
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.trigger import (
     AgentTrigger,
@@ -543,17 +544,23 @@ def _progress(factory: sessionmaker, task_id: int, *, messages: int) -> None:
         db.commit()
 
 
+def _mark_dispatched(factory: sessionmaker, task_id: int, **counters: int) -> None:
+    """Stand-in for an automatic dispatch, which is what the counters count."""
+    with factory() as db:
+        row = db.get(TaskAutoRecovery, task_id)
+        row.state = "dispatched"
+        row.last_command_id = "auto-resume:previous"
+        for name, value in counters.items():
+            setattr(row, name, value)
+        db.commit()
+
+
 def test_repeated_interruptions_track_episodes_and_runs(factory):
     with factory() as db:
         task_id = int(_task(db, _user(db), messages=2).id)
     assert _recover() == 1
     _task_row, first, _events = _state(factory, task_id)
-    # Stand-in for Phase 2 dispatches, which are what these counters count.
-    with factory() as db:
-        row = db.get(TaskAutoRecovery, task_id)
-        row.no_progress_resumes, row.total_resumes = 2, 5
-        row.last_command_id = "auto-resume:previous"
-        db.commit()
+    _mark_dispatched(factory, task_id, no_progress_resumes=2, total_resumes=5)
 
     # Same run, same checkpoint: the no-progress episode continues.
     _rerun(factory, task_id)
@@ -570,6 +577,7 @@ def test_repeated_interruptions_track_episodes_and_runs(factory):
     assert len(events) == 2
 
     # Same run with a newer checkpoint: progress starts a new episode.
+    _mark_dispatched(factory, task_id)
     _rerun(factory, task_id)
     _progress(factory, task_id, messages=4)
     assert _recover() == 1
@@ -581,10 +589,7 @@ def test_repeated_interruptions_track_episodes_and_runs(factory):
     assert progressed.last_command_id == "auto-resume:previous"
 
     # A new run resets every counter, even at an identical marker.
-    with factory() as db:
-        row = db.get(TaskAutoRecovery, task_id)
-        row.no_progress_resumes = 1
-        db.commit()
+    _mark_dispatched(factory, task_id, no_progress_resumes=1)
     _rerun(factory, task_id, run_id="run-next")
     with factory() as db:
         task = db.get(Task, task_id)
@@ -606,9 +611,7 @@ def test_missing_marker_continues_the_episode(factory, monkeypatch):
     assert _recover() == 1
     _task_row, first, _events = _state(factory, task_id)
     assert first.progress_marker is not None
-    with factory() as db:
-        db.get(TaskAutoRecovery, task_id).no_progress_resumes = 2
-        db.commit()
+    _mark_dispatched(factory, task_id, no_progress_resumes=2)
 
     # An undecodable checkpoint is unknown, not progress.
     monkeypatch.setattr(
@@ -621,6 +624,157 @@ def test_missing_marker_continues_the_episode(factory, monkeypatch):
     assert row.progress_marker == first.progress_marker
     assert _aware(row.episode_started_at) == _aware(first.episode_started_at)
     assert row.no_progress_resumes == 2
+
+
+_MARKER = "m2:i1:t0:p0:s0"
+_DISPATCH_ID = "auto-resume:3:8:run"
+
+
+def _seed_episode(
+    db: Session, *, state: str, reason: str = "lease_expired"
+) -> tuple[Task, datetime]:
+    """A task whose row has spent resumes in an episode that began earlier."""
+    task = _task(db, _user(db), checkpoint=None)
+    started = utc_now() - timedelta(minutes=10)
+    db.add(
+        TaskAutoRecovery(
+            task_id=task.id,
+            run_id=task.run_id,
+            reason=reason,
+            state=state,
+            paused_state_version=int(task.state_version),
+            interrupted_at=started,
+            episode_started_at=started,
+            no_progress_resumes=2,
+            total_resumes=7,
+            progress_marker=_MARKER,
+            last_command_id=_DISPATCH_ID,
+        )
+    )
+    db.flush()
+    return task, started
+
+
+def _command(db: Session, task: Task, command_id: str, kind: str) -> None:
+    db.add(
+        TaskExecutionCommand(
+            task_id=task.id,
+            command_id=command_id,
+            kind=kind,
+            payload={},
+            status="completed",
+        )
+    )
+    db.flush()
+
+
+def _record_again(
+    db: Session,
+    task: Task,
+    *,
+    reason: InterruptionReason = InterruptionReason.LEASE_EXPIRED,
+    marker: str | None = _MARKER,
+) -> TaskAutoRecovery:
+    row = record_interruption_no_commit(
+        db,
+        task=task,
+        reason=reason,
+        task_status=TaskStatus.PAUSED,
+        interrupted_at=utc_now(),
+        progress_marker=marker,
+        gated_by_settlement_switches=False,
+    )
+    assert row is not None
+    return row
+
+
+@pytest.mark.parametrize(
+    "state", ["exhausted", "manual", "scheduled", "stale", "dispatch_failed"]
+)
+def test_interruption_after_a_non_dispatched_state_restarts_every_counter(
+    factory, state
+):
+    # Nothing automatic resumed the run since the row was written: its user
+    # (or nobody) did, so the run is not held to the resumes spent before.
+    with factory() as db:
+        task, started = _seed_episode(db, state=state)
+        row = _record_again(db, task)
+        assert _aware(row.episode_started_at) == _aware(row.interrupted_at)
+        assert _aware(row.episode_started_at) > _aware(started)
+        assert (row.no_progress_resumes, row.total_resumes) == (0, 0)
+        assert row.last_command_id is None
+
+
+def test_interruption_of_a_dispatched_resume_continues_the_episode(factory):
+    with factory() as db:
+        task, started = _seed_episode(db, state="dispatched")
+        _command(db, task, _DISPATCH_ID, "resume")
+        # A later dispatch of the sweeper's own is not a person acting.
+        _command(db, task, "auto-resume:3:9:run", "resume")
+        row = _record_again(db, task)
+        assert _aware(row.episode_started_at) == _aware(started)
+        assert (row.no_progress_resumes, row.total_resumes) == (2, 7)
+        assert row.last_command_id == _DISPATCH_ID
+
+
+def test_new_reason_after_dispatch_starts_an_episode_but_keeps_the_total(factory):
+    with factory() as db:
+        task, started = _seed_episode(db, state="dispatched")
+        row = _record_again(db, task, reason=InterruptionReason.LLM_UNAVAILABLE)
+        assert _aware(row.episode_started_at) == _aware(row.interrupted_at)
+        assert (row.no_progress_resumes, row.total_resumes) == (0, 7)
+        assert row.last_command_id == _DISPATCH_ID
+
+
+def test_progress_after_dispatch_starts_an_episode_but_keeps_the_total(factory):
+    with factory() as db:
+        task, _started = _seed_episode(db, state="dispatched")
+        row = _record_again(db, task, marker="m5:i2:t0:p0:s0")
+        assert _aware(row.episode_started_at) == _aware(row.interrupted_at)
+        assert (row.no_progress_resumes, row.total_resumes) == (0, 7)
+
+
+@pytest.mark.parametrize(
+    ("command_id", "kind"),
+    [
+        ("message-1", "message"),
+        ("resume-by-hand", "resume"),
+        ("pause-1", "pause"),
+        # Only the sweeper's RESUME counts as automatic; a forged id on any
+        # other kind is a person's command.
+        ("auto-resume:3:9:run", "message"),
+    ],
+)
+def test_user_command_after_dispatch_restarts_every_counter(factory, command_id, kind):
+    with factory() as db:
+        task, _started = _seed_episode(db, state="dispatched")
+        _command(db, task, _DISPATCH_ID, "resume")
+        _command(db, task, command_id, kind)
+        row = _record_again(db, task)
+        assert _aware(row.episode_started_at) == _aware(row.interrupted_at)
+        assert (row.no_progress_resumes, row.total_resumes) == (0, 0)
+        assert row.last_command_id is None
+
+
+def test_user_command_before_the_dispatch_does_not_count(factory):
+    with factory() as db:
+        task, started = _seed_episode(db, state="dispatched")
+        _command(db, task, "message-1", "message")
+        _command(db, task, _DISPATCH_ID, "resume")
+        row = _record_again(db, task)
+        assert _aware(row.episode_started_at) == _aware(started)
+        assert (row.no_progress_resumes, row.total_resumes) == (2, 7)
+
+
+def test_missing_dispatch_command_reads_as_no_intervention(factory):
+    # The dispatch command is gone; a later command cannot be ordered after
+    # it, so the interruption still continues the episode.
+    with factory() as db:
+        task, started = _seed_episode(db, state="dispatched")
+        _command(db, task, "message-1", "message")
+        row = _record_again(db, task)
+        assert _aware(row.episode_started_at) == _aware(started)
+        assert (row.no_progress_resumes, row.total_resumes) == (2, 7)
 
 
 def _projected_task(factory: sessionmaker, *, verdict: str) -> tuple[int, int, int]:

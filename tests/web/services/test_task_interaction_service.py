@@ -3147,6 +3147,27 @@ def test_respond_rejects_an_idempotency_key_that_is_not_url_safe(_respond_db) ->
         )
 
 
+@pytest.mark.parametrize("key", ["auto-resume:7:1:run-1", " auto-resume:x"])
+def test_respond_refuses_the_auto_resume_command_id_namespace(_respond_db, key) -> None:
+    # respond() stages its key as a RESUME command id; the sweeper's prefix
+    # would let a person's answer pass for an automatic resume.
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_owning_principal(user_id),
+            envelope=_respond_envelope(idempotency_key=key),
+        )
+
+        assert outcome == svc.RespondValidationRejected(
+            reason="malformed_idempotency_key"
+        )
+
+
 def test_respond_rejects_answer_values_that_are_not_a_dict(_respond_db) -> None:
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)

@@ -27,6 +27,7 @@ from ..config import (
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
     get_shared_task_execution_enabled,
+    get_task_auto_resume_poll_seconds,
     get_task_cleanup_retry_interval_seconds,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
@@ -125,6 +126,7 @@ from .services.skill_runtime import (
     SkillRuntimeSessionBoundaryError,
     skill_runtime_session_boundary_error_handler,
 )
+from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_interaction_schema import interaction_requests_table_exists
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
@@ -545,6 +547,63 @@ async def stop_task_lease_recovery_task(app_instance: FastAPI) -> None:
                 "Task lease recovery loop stopped after failure",
                 exc_info=exc,
             )
+
+
+def start_task_auto_resume_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the auto-resume sweeper beside lease recovery in this process."""
+
+    from .services.task_execution_host import consumes_task_commands
+
+    if not consumes_task_commands():
+        return None
+
+    existing_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "task_auto_resume_task", None),
+    )
+    if existing_task is not None:
+        if not existing_task.done():
+            return existing_task
+        try:
+            failure = existing_task.exception()
+        except asyncio.CancelledError:
+            failure = None
+        if failure is not None:
+            logger.error("Previous auto-resume sweeper loop failed", exc_info=failure)
+        app_instance.state.task_auto_resume_task = None
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        logger.info("Skipping auto-resume sweeper loop (test environment)")
+        return None
+
+    poll_interval_seconds = get_task_auto_resume_poll_seconds()
+    task = asyncio.create_task(
+        run_task_auto_resume_loop(poll_interval_seconds=poll_interval_seconds)
+    )
+    app_instance.state.task_auto_resume_task = task
+    logger.info(
+        "Started auto-resume sweeper loop (interval=%ss)", poll_interval_seconds
+    )
+    return task
+
+
+async def stop_task_auto_resume_task(app_instance: FastAPI) -> None:
+    """Cancel and drain this process's auto-resume sweeper loop."""
+
+    task = getattr(app_instance.state, "task_auto_resume_task", None)
+    app_instance.state.task_auto_resume_task = None
+    if task is not None and not task.done():
+        logger.info("Cancelling auto-resume sweeper loop...")
+        task.cancel()
+    if task is not None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error("Auto-resume sweeper loop stopped after failure", exc_info=exc)
 
 
 def start_uploaded_file_recovery_task(
@@ -1569,6 +1628,7 @@ async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     if not get_shared_task_execution_enabled():
         start_trigger_dispatcher_task(app_instance)
         start_task_lease_recovery_task(app_instance)
+        start_task_auto_resume_task(app_instance)
     start_uploaded_file_recovery_task(app_instance)
     start_orphan_upload_gc_task(app_instance)
     start_retention_purge_task(app_instance)
@@ -1600,12 +1660,14 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
         background_task_manager.start_accepting()
         start_trigger_dispatcher_task(app_instance)
         start_task_lease_recovery_task(app_instance)
+        start_task_auto_resume_task(app_instance)
         _task_command_dispatcher_task = start_task_command_dispatcher(
             execute_durable_task_command
         )
         app_instance.state.task_command_dispatcher_task = _task_command_dispatcher_task
     except BaseException:
         await stop_task_command_dispatcher()
+        await stop_task_auto_resume_task(app_instance)
         await stop_task_lease_recovery_task(app_instance)
         if _trigger_dispatcher_task is not None:
             _trigger_dispatcher_task.cancel()
@@ -2184,6 +2246,7 @@ async def shutdown_event() -> None:
     await stop_retention_purge_task(app)
     await stop_task_cleanup_retry_task(app)
     await stop_uploaded_file_recovery_task(app)
+    await stop_task_auto_resume_task(app)
     await stop_task_lease_recovery_task(app)
 
     if _sandbox_idle_sweep_task and not _sandbox_idle_sweep_task.done():

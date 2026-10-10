@@ -100,12 +100,23 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         order.append("heartbeat_idle")
 
     async def recovery(**kwargs):
-        await asyncio.Event().wait()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("recovery_stop")
+
+    async def auto_resume(**kwargs):
+        order.append("auto_resume")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            order.append("auto_resume_stop")
 
     monkeypatch.setattr(worker, "stop_task_command_dispatcher", stop_dispatch)
     monkeypatch.setattr(worker, "stop_task_event_bridge", stop_bridge)
     monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", stop_heartbeat)
     monkeypatch.setattr(worker, "run_task_lease_recovery_loop", recovery)
+    monkeypatch.setattr(worker, "run_task_auto_resume_loop", auto_resume)
     monkeypatch.setattr(
         worker,
         "start_task_command_dispatcher",
@@ -115,6 +126,8 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
     async def supervise(executor, stop_event):
         assert executor is worker.execute_durable_task_command
         assert stop_event is stop
+        # Let the background loops start, as the real supervisor's waits do.
+        await asyncio.sleep(0)
         order.append("supervise")
 
     monkeypatch.setattr(worker, "supervise_task_command_dispatcher", supervise)
@@ -130,6 +143,7 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
         assert "accept" not in order
         assert "dispatch" not in order
         assert "supervise" not in order
+        assert "auto_resume" not in order
     else:
         await worker.run_worker(initialize_host=initialize_host, stop=stop)
         assert (
@@ -139,6 +153,15 @@ async def test_runtime_readiness_and_shutdown_order(monkeypatch, bridge_fails):
             < order.index("dispatch")
             < order.index("supervise")
             < order.index("stop_claims")
+        )
+        # The sweeper runs beside lease recovery and is cancelled before it,
+        # after the claims stop.
+        assert order.index("accept") < order.index("auto_resume")
+        assert (
+            order.index("stop_claims")
+            < order.index("auto_resume_stop")
+            < order.index("recovery_stop")
+            < order.index("coordinator_drain")
         )
         # Persistent memory is admitted before this worker will accept a task.
         # The worker process never runs the FastAPI startup, so this is its
@@ -205,6 +228,7 @@ async def test_memory_admission_failure_never_aborts_the_worker_boot(monkeypatch
     monkeypatch.setattr(worker, "stop_task_event_bridge", AsyncMock())
     monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", AsyncMock())
     monkeypatch.setattr(worker, "run_task_lease_recovery_loop", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_auto_resume_loop", AsyncMock())
 
     # Break admission itself, not the startup helper: the helper's own
     # exception isolation is what must keep the boot alive, so stubbing it out

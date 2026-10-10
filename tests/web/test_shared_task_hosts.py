@@ -89,6 +89,16 @@ async def test_shared_web_starts_bridge_before_consumers_and_unwinds_failure(
         "stop_task_lease_recovery_task",
         AsyncMock(side_effect=lambda app: events.append("recovery_stop")),
     )
+    monkeypatch.setattr(
+        app_module,
+        "start_task_auto_resume_task",
+        lambda app: events.append("auto_resume"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "stop_task_auto_resume_task",
+        AsyncMock(side_effect=lambda app: events.append("auto_resume_stop")),
+    )
     monkeypatch.setattr(transport, "start_task_command_dispatcher", start_dispatcher)
     monkeypatch.setattr(
         transport,
@@ -108,17 +118,19 @@ async def test_shared_web_starts_bridge_before_consumers_and_unwinds_failure(
     if fails == "bridge":
         assert events == ["bridge"]
     else:
-        assert events[:6] == [
+        assert events[:7] == [
             "bridge",
             "reconcile",
             "admit",
             "triggers",
             "recovery",
+            "auto_resume",
             "dispatcher",
         ]
         if fails:
-            assert events[6:] == [
+            assert events[7:] == [
                 "claims_stop",
+                "auto_resume_stop",
                 "recovery_stop",
                 "owner_stop",
                 "execution_stop",

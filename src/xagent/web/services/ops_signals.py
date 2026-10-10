@@ -74,6 +74,10 @@ INTERACTION_ANCHOR_CORRUPT = "interaction_anchor_corrupt"
 # process-scoped signal: it reports whether the sweep mechanism is
 # working, not whether a particular task has been repaired.
 CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"
+# Set by the auto-resume sweeper loop (task_auto_resume.py) after three
+# consecutive failed ticks; cleared by its next successful tick. While it is
+# set, scheduled automatic resumes are not being dispatched by this process.
+TASK_AUTO_RESUME_UNAVAILABLE = "task_auto_resume_unavailable"
 
 # Set when a legacy-resume interaction close (task_interaction_close.py)
 # matches more than one active row for a single task -- structurally

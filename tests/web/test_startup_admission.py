@@ -39,6 +39,7 @@ def _patch_runtime_starts(
         ("start_file_storage_startup_sync_task", "file sync"),
         ("start_trigger_dispatcher_task", "trigger dispatcher"),
         ("start_task_lease_recovery_task", "lease recovery"),
+        ("start_task_auto_resume_task", "auto resume"),
         ("start_uploaded_file_recovery_task", "file recovery"),
         ("start_orphan_upload_gc_task", "upload gc"),
     ):
@@ -67,6 +68,7 @@ async def test_no_host_admission_preserves_runtime_startup_order(
         "file sync",
         "trigger dispatcher",
         "lease recovery",
+        "auto resume",
         "file recovery",
         "upload gc",
     ]

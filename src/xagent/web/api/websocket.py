@@ -125,7 +125,10 @@ from ..services.public_trace_events import (
     normalize_public_trace_event,
     public_task_trace_filter,
 )
-from ..services.task_auto_recovery import current_auto_recovery_view
+from ..services.task_auto_recovery import (
+    current_auto_recovery_view,
+    is_auto_resume_command_id,
+)
 from ..services.task_command_execution import _read_task_error_payload_offloop
 from ..services.task_command_transport import (
     COMMAND_FAILED,
@@ -1725,6 +1728,19 @@ async def _enqueue_websocket_task_command(
         # not accepted as written.
         raise ClientVisibleValidationError(
             "Reserved field 'scope' is not accepted from clients",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
+    # ``auto_resume`` and the ``auto-resume:`` id namespace belong to the
+    # auto-resume sweeper: resume_task trusts a RESUME carrying both as the
+    # sweeper's own, so a client may name neither.
+    if "auto_resume" in payload:
+        raise ClientVisibleValidationError(
+            "Reserved field 'auto_resume' is not accepted from clients",
+            error_code=ClientErrorCode.INVALID_MESSAGE,
+        )
+    if is_auto_resume_command_id(resolved_command_id.strip()):
+        raise ClientVisibleValidationError(
+            "Command ids starting with 'auto-resume:' are reserved",
             error_code=ClientErrorCode.INVALID_MESSAGE,
         )
     if kind == TaskCommandKind.MESSAGE:

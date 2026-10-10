@@ -609,6 +609,10 @@ class ResumeCommandOutcome(str, enum.Enum):
     ALREADY_IN_PROGRESS = "already_in_progress"
     DEFERRED = "deferred"
     REJECTED = "rejected"
+    # An automatic resume that no longer applies (the task moved on, or
+    # automatic resume was switched off). A success: the command completes
+    # without an error reply.
+    AUTO_SKIPPED = "auto_skipped"
 
 
 @dataclass(frozen=True)
@@ -3526,6 +3530,38 @@ async def resume_task(
             status=task_status,
         ).as_dict()
 
+        # An automatic resume re-checks, against the same snapshot every
+        # admission decision below uses, that it still applies. The
+        # RESUME_REQUESTED transition is fenced on this snapshot's version,
+        # so a row that moves after the check defers the command and the
+        # retry is checked again.
+        auto_resume = message_data.get("auto_resume")
+        if auto_resume is not None:
+            from .task_auto_resume import (
+                check_auto_resume_claim_sync,
+                publish_recovery_notices,
+            )
+
+            claim = await run_db_io_cancellation_safe(
+                lambda: check_auto_resume_claim_sync(
+                    task_id=task_id,
+                    command_id=message_data.get("_durable_command_id"),
+                    auto_resume=auto_resume,
+                    status=task_status,
+                    control_state=raw_control_state,
+                    run_id=task_fields.run_id,
+                    state_version=task_fields.state_version,
+                    attempt_count=message_data.get("_durable_attempt_count"),
+                )
+            )
+            if not claim.proceed:
+                await publish_recovery_notices(claim.notices)
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.AUTO_SKIPPED,
+                    f"Automatic resume skipped ({claim.why})",
+                    reason_code=claim.why,
+                )
+
         # Compatibility seam into the interaction lifecycle service: both
         # resume paths below (the supports_live_control branch and the
         # bare resume_execution fallback) reach the durable RESUME
@@ -3573,6 +3609,21 @@ async def resume_task(
                 or receipt_interaction_id != active_interaction_id
                 or not receipt_responder_identity
             ):
+                if auto_resume is not None:
+                    # The sweeper cannot answer the question; the run waits
+                    # for its user. Not an error to anyone: housekeeping
+                    # sees the unchanged fence and schedules or stops it.
+                    logger.info(
+                        "auto resume skipped task_id=%s run_id=%s "
+                        "why=interaction_pending component=auto-resume",
+                        task_id,
+                        task_fields.run_id,
+                    )
+                    return ResumeCommandResult(
+                        ResumeCommandOutcome.AUTO_SKIPPED,
+                        "Automatic resume skipped (interaction_pending)",
+                        reason_code="interaction_pending",
+                    )
                 from . import ops_signals
 
                 ops_signals.register_degradation(
@@ -4342,6 +4393,9 @@ async def _execute_durable_task_command(
             "_durable_ack_sent": True,
             "_durable_attempt_count": command.attempt_count,
             "_durable_target_run_id": command.target_run_id,
+            # Lets resume_task tell the sweeper's own commands apart; client
+            # ingress strips every ``_durable_`` field, so it is never forged.
+            "_durable_command_id": command.command_id,
         }
     )
     if command.kind != TaskCommandKind.CANCEL:

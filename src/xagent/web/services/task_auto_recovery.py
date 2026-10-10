@@ -12,8 +12,10 @@ unsuccessful result) writes for an interruption is decided by
 rests PAUSED instead of FAILED, so its user can resume it. Lease-expiry
 recovery keeps its own verdict mapping.
 
-Phase 1 has no executor, so a recorded interruption is never ``scheduled``.
-Its state says only that nothing automatic will act on the run: ``manual``
+The executor (``task_auto_resume``) dispatches only ``scheduled`` rows, and
+recording does not schedule yet, so a recorded interruption is never
+``scheduled``. Its state says only that nothing automatic will act on the
+run: ``manual``
 (only the user can act -- resume a PAUSED task; a FAILED one is terminal and
 the row just records why), ``ineligible`` (a task kind automatic recovery will
 never touch) or ``disabled`` (the interruption would have paused the run but
@@ -54,6 +56,7 @@ from ..models.task_auto_recovery import (
 from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
 from ..utils.db_timezone import format_datetime_for_api
+from .task_command_transport import AUTO_RESUME_COMMAND_PREFIX
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
@@ -192,12 +195,18 @@ def record_interruption_no_commit(
     ``paused_state_version`` is the task's ``state_version`` after the
     settling write, PAUSED or FAILED; only a PAUSED row's fence is ever read.
 
-    Episodes: a recorded interruption of the same run at the same progress
-    marker continues the current no-progress episode (its start and
-    ``no_progress_resumes`` are kept). Any progress starts a new episode, and
-    a different run also restarts ``total_resumes``. A missing marker (an
-    undecodable or absent checkpoint) is unknown, not progress: it continues
-    the episode and keeps the last known marker.
+    Episodes: only an interruption of a run that automatic recovery resumed
+    can continue anything -- the row still describes the same run, rests in
+    ``dispatched``, and no user command reached the task after that dispatch.
+    Such an interruption keeps ``total_resumes``, and keeps the no-progress
+    episode (its start and ``no_progress_resumes``) when the reason and the
+    progress marker are unchanged; a new reason or any progress starts a new
+    episode. Anything else -- a different run, or a person having acted since
+    (a manual resume, a message, a row automatic recovery had already stopped
+    on) -- starts a new episode and restarts ``total_resumes`` too, so a run
+    its user resumed by hand is not held to the attempts spent before. A
+    missing marker (an undecodable or absent checkpoint) is unknown, not
+    progress: it keeps the last known marker.
     """
 
     run_id = task.run_id
@@ -225,11 +234,20 @@ def record_interruption_no_commit(
 
     row = db.get(TaskAutoRecovery, task.id)
     same_run = row is not None and row.run_id == run_id
+    # Unattended since the last automatic dispatch: the absolute cap keeps
+    # counting even if the reason changes, or alternating reasons could loop.
+    continuation = (
+        same_run
+        and row is not None
+        and row.state == TaskAutoRecoveryState.DISPATCHED.value
+        and not _user_command_since_dispatch(db, int(task.id), row.last_command_id)
+    )
     if same_run and row is not None and progress_marker is None:
         progress_marker = row.progress_marker
     same_episode = (
-        same_run
+        continuation
         and row is not None
+        and row.reason == reason.value
         and (row.progress_marker is None or row.progress_marker == progress_marker)
     )
     if row is None:
@@ -238,7 +256,7 @@ def record_interruption_no_commit(
     if not same_episode:
         row.episode_started_at = interrupted_at
         row.no_progress_resumes = 0
-    if not same_run:
+    if not continuation:
         row.total_resumes = 0
         row.last_command_id = None
     row.run_id = run_id
@@ -283,6 +301,69 @@ def record_interruption_no_commit(
         state.value,
     )
     return row
+
+
+def is_auto_resume_command_id(command_id: object) -> bool:
+    """Whether ``command_id`` is in the namespace reserved for the sweeper.
+
+    ``stage_task_command`` refuses the prefix to every caller but the
+    sweeper, so a staged command with it is the sweeper's own.
+    """
+
+    return isinstance(command_id, str) and command_id.startswith(
+        AUTO_RESUME_COMMAND_PREFIX
+    )
+
+
+def auto_resume_schedulable(kind: str | None) -> bool:
+    """Whether an eligible task of ``kind`` may be resumed automatically now.
+
+    Channel tasks are recorded but not scheduled until a resumed channel run
+    can hold the channel and deliver its answer back (PR9): resuming one
+    today would refuse new channel messages as busy while the answer never
+    reached the channel.
+    """
+
+    return kind is not None and kind != "channel"
+
+
+def _user_command_since_dispatch(
+    db: Session, task_id: int, last_command_id: str | None
+) -> bool:
+    """Whether a command other than the sweeper's reached the task after it.
+
+    Commands are ordered by id per task. A dispatch command that is gone
+    (deleted with nothing after it, or never staged) leaves the comparison
+    NULL, which reads as no intervention.
+    """
+
+    if last_command_id is None:
+        return False
+    from sqlalchemy import and_, select
+
+    from ..models.task_command import TaskExecutionCommand
+
+    dispatched_id = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.command_id == last_command_id,
+        )
+        .scalar_subquery()
+    )
+    later = db.execute(
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.id > dispatched_id,
+            ~and_(
+                TaskExecutionCommand.kind == "resume",
+                TaskExecutionCommand.command_id.startswith(AUTO_RESUME_COMMAND_PREFIX),
+            ),
+        )
+        .limit(1)
+    ).first()
+    return later is not None
 
 
 def current_auto_recovery_view(db: Session, task: Task) -> dict[str, Any] | None:

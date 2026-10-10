@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from ..config import (
     get_shared_task_execution_enabled,
+    get_task_auto_resume_poll_seconds,
     get_task_execution_role,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
@@ -39,6 +40,7 @@ from .services.local_browser_runtime import (
     register_local_browser_runtime,
     unregister_local_browser_runtime,
 )
+from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_command_execution import execute_durable_task_command
 from .services.task_command_transport import (
     start_task_command_dispatcher,
@@ -84,6 +86,7 @@ async def run_worker(
     validate_interaction_rollout_at_startup()
     await asyncio.to_thread(lock_deployment_kb_engine)
     recovery = None
+    auto_resume = None
     sandbox = None
     idle_sweep = None
     stop = stop if stop is not None else asyncio.Event()
@@ -122,6 +125,11 @@ async def run_worker(
                 batch_size=get_task_lease_recovery_batch_size(),
             )
         )
+        auto_resume = asyncio.create_task(
+            run_task_auto_resume_loop(
+                poll_interval_seconds=get_task_auto_resume_poll_seconds()
+            )
+        )
         start_task_command_dispatcher(execute_durable_task_command)
         logger.info("Shared task worker ready")
         await supervise_task_command_dispatcher(execute_durable_task_command, stop)
@@ -129,6 +137,9 @@ async def run_worker(
         # Stop every claim path first. Finalizers retain the bridge and runtime
         # resources until execution and its heartbeats have drained.
         await stop_task_command_dispatcher()
+        if auto_resume is not None:
+            auto_resume.cancel()
+            await asyncio.gather(auto_resume, return_exceptions=True)
         if recovery is not None:
             recovery.cancel()
             await asyncio.gather(recovery, return_exceptions=True)

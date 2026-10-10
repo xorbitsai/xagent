@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 from .contracts import (
+    ActiveGenerationStore,
     IngestionStatusStore,
     KBWriteCoordinator,
     MainPointerStore,
@@ -25,6 +26,7 @@ from .contracts import (
     VectorIndexStore,
 )
 from .lancedb_stores import (
+    LanceDBActiveGenerationStore,
     LanceDBIngestionStatusStore,
     LanceDBMainPointerStore,
     LanceDBMetadataStore,
@@ -90,6 +92,7 @@ class StorageFactory:
         self._ingestion_status_store: Optional[IngestionStatusStore] = None
         self._prompt_template_store: Optional[PromptTemplateStore] = None
         self._main_pointer_store: Optional[MainPointerStore] = None
+        self._active_generation_store: Optional[ActiveGenerationStore] = None
         self._coordinator: Optional[KBWriteCoordinator] = None
 
     @classmethod
@@ -119,6 +122,7 @@ class StorageFactory:
             self._ingestion_status_store = None
             self._prompt_template_store = None
             self._main_pointer_store = None
+            self._active_generation_store = None
             self._coordinator = None
 
         # Keep semantic KB coordinator state aligned with factory-backed stores.
@@ -181,6 +185,16 @@ class StorageFactory:
                 if self._prompt_template_store is None:
                     self._prompt_template_store = LanceDBPromptTemplateStore()
         return self._prompt_template_store
+
+    # --- ActiveGenerationStore ---
+
+    def get_active_generation_store(self) -> ActiveGenerationStore:
+        """Get or create active generation pointer store."""
+        if self._active_generation_store is None:
+            with self._lock:
+                if self._active_generation_store is None:
+                    self._active_generation_store = LanceDBActiveGenerationStore()
+        return self._active_generation_store
 
     # --- MainPointerStore ---
 
@@ -314,6 +328,15 @@ def get_main_pointer_store() -> MainPointerStore:
         LanceDBMainPointerStore instance.
     """
     return _get_storage_shim().get_main_pointer_store()
+
+
+def get_active_generation_store() -> ActiveGenerationStore:
+    """Get active generation pointer store.
+
+    Returns:
+        LanceDBActiveGenerationStore instance.
+    """
+    return _get_storage_shim().get_active_generation_store()
 
 
 # ============================================================================

@@ -1,6 +1,8 @@
 """Test Docker sandbox store"""
 
 import json
+import subprocess
+import sys
 from datetime import datetime
 
 import pytest
@@ -251,3 +253,16 @@ class TestDBDockerStore:
             .first()
         )
         assert model is None
+
+
+def test_sandbox_store_imports_without_boxlite():
+    code = (
+        "import sys; sys.modules['boxlite'] = None\n"
+        "import xagent.web.sandbox_store as m\n"
+        "assert m.DBDockerStore\n"
+        "assert not hasattr(m, 'DBBoxliteStore')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr

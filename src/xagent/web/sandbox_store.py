@@ -10,7 +10,6 @@ from datetime import datetime
 from typing import Optional
 
 from ..sandbox import (
-    BoxliteStore,
     DockerStore,
     SandboxConfig,
     SandboxInfo,
@@ -211,10 +210,16 @@ class _DBSandboxStoreBase:
         model.config = json.dumps(info.config.model_dump())  # type: ignore[assignment]
 
 
-class DBBoxliteStore(_DBSandboxStoreBase, BoxliteStore):
-    """Database-backed implementation of BoxliteStore."""
+try:
+    from ..sandbox import BoxliteStore
+except ImportError:  # boxlite is not installed on linux/arm64
+    pass
+else:
 
-    sandbox_type = SANDBOX_TYPE_BOXLITE
+    class DBBoxliteStore(_DBSandboxStoreBase, BoxliteStore):
+        """Database-backed implementation of BoxliteStore."""
+
+        sandbox_type = SANDBOX_TYPE_BOXLITE
 
 
 class DBDockerStore(_DBSandboxStoreBase, DockerStore):

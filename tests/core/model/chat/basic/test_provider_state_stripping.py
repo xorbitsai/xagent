@@ -24,6 +24,7 @@ import pytest
 import xagent.core.model.chat.basic as basic_pkg
 from xagent.core.model.chat.basic.azure_openai import AzureOpenAILLM
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.chat.basic.call_boundary import (
     BoundaryLLM,
     UnavailableVisionModel,
@@ -86,6 +87,22 @@ def test_gemini_message_conversion_drops_internal_keys(gemini_llm_config):
     _system, gemini_messages = llm._convert_messages_to_gemini_format(_MARKED_HISTORY)
 
     _assert_no_internal_keys(gemini_messages)
+
+
+@pytest.mark.asyncio
+async def test_bedrock_chat_strips_internal_keys_before_the_sdk_call(mocker):
+    """Bedrock: the shared internal metadata must not reach Converse."""
+    mock_client = mocker.MagicMock()
+    mock_client.converse.return_value = {
+        "output": {"message": {"role": "assistant", "content": [{"text": "done"}]}},
+        "stopReason": "end_turn",
+    }
+    llm = BedrockLLM("test-model", client=mock_client)
+
+    await llm.chat(_MARKED_HISTORY)
+
+    sent_messages = mock_client.converse.call_args.kwargs["messages"]
+    _assert_no_internal_keys(sent_messages)
 
 
 @pytest.mark.asyncio
@@ -215,7 +232,7 @@ async def test_xinference_stream_chat_strips_internal_keys_before_the_sdk_call(m
 
 # --- Discovery guard: every BaseLLM subclass must be accounted for ---------
 #
-# The tests above cover four clients by name. That list goes stale silently
+# The tests above cover five clients by name. That list goes stale silently
 # the moment a new BaseLLM subclass is added and nobody remembers to give it
 # the same coverage. The two registries and the test below turn that into a
 # loud failure: every concrete BaseLLM subclass found anywhere under
@@ -223,7 +240,8 @@ async def test_xinference_stream_chat_strips_internal_keys_before_the_sdk_call(m
 # discovery test fails and names the class that is missing.
 
 # Classes with a dedicated leak-guard test, here or elsewhere:
-#   - ClaudeLLM / GeminiLLM / ZhipuLLM / XinferenceLLM: the four tests above.
+#   - BedrockLLM / ClaudeLLM / GeminiLLM / ZhipuLLM / XinferenceLLM: the
+#     dedicated tests above.
 #   - OpenAILLM: test_openai.py::test_internal_xagent_message_keys_are_stripped
 #     exercises _build_request_messages -> _strip_internal_message_keys
 #     directly.
@@ -235,6 +253,7 @@ _STRIP_GUARD_COVERED: frozenset[type] = frozenset(
     {
         ClaudeLLM,
         GeminiLLM,
+        BedrockLLM,
         ZhipuLLM,
         XinferenceLLM,
         OpenAILLM,

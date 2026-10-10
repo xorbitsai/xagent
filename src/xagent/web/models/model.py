@@ -24,6 +24,8 @@ if TYPE_CHECKING:
         # as Text in create_model_table().
         api_key = Column(Text, nullable=False)
         base_url = Column(String(500), nullable=True)
+        bedrock_region = Column(String(64), nullable=True)
+        bedrock_auth_mode = Column(String(32), nullable=True)
         temperature = Column(Float, nullable=True)
         dimension = Column(Integer, nullable=True)
         abilities = Column(JSON, nullable=True)

@@ -39,6 +39,7 @@ from xagent.core.model.providers import (
     provider_compatibility_for_provider,
     provider_endpoint_kind,
     provider_requires_base_url,
+    validate_bedrock_settings,
 )
 from xagent.core.utils.security import redact_sensitive_text
 
@@ -496,6 +497,21 @@ async def create_model(
 
         base_url = ARK_BYTEPLUS_BASE_URL
     _validate_provider_model_name(model_provider, model.model_name)
+    if model_provider == "bedrock":
+        if model.category != "llm":
+            raise HTTPException(
+                status_code=400,
+                detail="Amazon Bedrock is supported only for LLM configurations",
+            )
+        try:
+            validate_bedrock_settings(
+                region=model.bedrock_region,
+                auth_mode=model.bedrock_auth_mode,
+                api_key=model.api_key,
+                endpoint_url=base_url,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if model.category == "llm":
         config: ModelConfig = ChatModelConfig(
@@ -509,6 +525,8 @@ async def create_model(
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
+            bedrock_region=model.bedrock_region,
+            bedrock_auth_mode=model.bedrock_auth_mode,
         )
     elif model.category == "embedding":
         config = EmbeddingModelConfig(
@@ -633,6 +651,8 @@ async def create_model(
         "model_provider": db_model.model_provider,
         "model_name": db_model.model_name,
         "base_url": db_model.base_url,
+        "bedrock_region": db_model.bedrock_region,
+        "bedrock_auth_mode": db_model.bedrock_auth_mode,
         "temperature": db_model.temperature,
         "context_window": db_model.context_window,
         "dimension": db_model.dimension,
@@ -820,7 +840,17 @@ async def test_model_connection(
                 "model_name": request.model_name,
                 "api_key": request.api_key,
                 "base_url": base_url,
+                "bedrock_region": request.bedrock_region,
+                "bedrock_auth_mode": request.bedrock_auth_mode,
             }
+
+            if provider == "bedrock":
+                validate_bedrock_settings(
+                    region=request.bedrock_region,
+                    auth_mode=request.bedrock_auth_mode,
+                    api_key=request.api_key,
+                    endpoint_url=base_url,
+                )
 
             # Forward temperature only if the caller explicitly set one and
             # the model isn't a known reasoning model that rejects it.
@@ -2021,10 +2051,38 @@ async def update_model(
     effective_provider = update_data.get("model_provider", db_model.model_provider)
     effective_model_name = update_data.get("model_name", db_model.model_name)
     _validate_provider_model_name(effective_provider, effective_model_name)
+    if effective_provider == "bedrock":
+        effective_category = update_data.get("category", db_model.category)
+        if effective_category != "llm":
+            raise HTTPException(
+                status_code=400,
+                detail="Amazon Bedrock is supported only for LLM configurations",
+            )
+        effective_auth_mode = update_data.get(
+            "bedrock_auth_mode", db_model.bedrock_auth_mode or "api_key"
+        )
+        effective_api_key = update_data.get("api_key") or db_model.api_key
+        if update_data.get("bedrock_auth_mode") == "credentials_chain":
+            effective_api_key = update_data.get("api_key") or None
+        try:
+            validate_bedrock_settings(
+                region=update_data.get("bedrock_region", db_model.bedrock_region),
+                auth_mode=effective_auth_mode,
+                api_key=effective_api_key,
+                endpoint_url=update_data.get("base_url", db_model.base_url),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     effective_category = update_data.get("category", db_model.category)
     identity_changed = any(
         field in update_data and update_data[field] != getattr(db_model, field)
-        for field in ("model_provider", "model_name", "base_url")
+        for field in (
+            "model_provider",
+            "model_name",
+            "base_url",
+            "bedrock_region",
+            "bedrock_auth_mode",
+        )
     )
     incompatible_with_auto = (
         identity_changed
@@ -2088,6 +2146,19 @@ async def update_model(
         # Only set fields that exist on the model
         if hasattr(db_model, field):
             setattr(db_model, field, value)
+
+    if (
+        effective_provider == "bedrock"
+        and update_data.get("bedrock_auth_mode") == "credentials_chain"
+    ):
+        # The generic update contract treats an empty key as "keep the current
+        # secret". Switching Bedrock to the AWS credential chain is the one
+        # case where retaining the explicit token is both unnecessary and
+        # surprising, so clear it deliberately.
+        db_model.api_key = ""
+    elif effective_provider != "bedrock":
+        db_model.bedrock_region = None
+        db_model.bedrock_auth_mode = None
 
     if auto_candidates:
         model_store.refresh_auto_model_abilities(

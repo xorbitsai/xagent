@@ -139,7 +139,11 @@ def create_base_llm(
             region_name=model.bedrock_region,
             api_key=model.api_key,
             endpoint_url=model.base_url,
-            auth_mode=model.bedrock_auth_mode,
+            auth_mode=(
+                "aws_credentials"
+                if model.bedrock_auth_mode == "credentials_chain"
+                else model.bedrock_auth_mode
+            ),
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,

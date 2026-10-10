@@ -86,6 +86,8 @@ def _create_llm_instance(db_model: Model) -> BaseLLM:
             context_window=db_model.context_window,
             abilities=db_model.abilities,
             description=db_model.description,
+            bedrock_region=db_model.bedrock_region,
+            bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
         )
     elif db_model.category == "embedding":
         config = EmbeddingModelConfig(
@@ -150,6 +152,8 @@ class CoreStorage:
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
                 context_window=db_model.context_window,
+                bedrock_region=db_model.bedrock_region,
+                bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
             )
         elif db_model.category == "image":
             from ...core.model.model import ImageModelConfig
@@ -251,6 +255,13 @@ class CoreStorage:
                     "category": "llm",
                 }
             )
+            if model.model_provider == "bedrock":
+                db_data.update(
+                    {
+                        "bedrock_region": model.bedrock_region,
+                        "bedrock_auth_mode": model.bedrock_auth_mode,
+                    }
+                )
         elif isinstance(model, EmbeddingModelConfig):
             db_data.update(
                 {

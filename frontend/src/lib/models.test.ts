@@ -103,7 +103,6 @@ describe("getProviderModels", () => {
       models: [],
       count: 0,
       catalog_unavailable: true,
-      warning: "Enter the model name manually.",
     }))
 
     await expect(getProviderModels("claude", {
@@ -112,7 +111,6 @@ describe("getProviderModels", () => {
     })).resolves.toEqual({
       models: [],
       catalogUnavailable: true,
-      warning: "Enter the model name manually.",
     })
   })
 
@@ -125,8 +123,21 @@ describe("getProviderModels", () => {
     await expect(getProviderModels("claude")).resolves.toEqual({
       models: [{ id: "claude-test" }],
       catalogUnavailable: false,
-      warning: undefined,
     })
+  })
+
+  it("surfaces a structured provider authentication error message", async () => {
+    mockedRequest.mockResolvedValueOnce(jsonResponse({
+      detail: {
+        code: "provider_auth_failed",
+        message: "Invalid Anthropic API key",
+        upstream_status: 401,
+      },
+    }, { status: 422 }))
+
+    await expect(getProviderModels("claude")).rejects.toThrow(
+      "Invalid Anthropic API key",
+    )
   })
 })
 

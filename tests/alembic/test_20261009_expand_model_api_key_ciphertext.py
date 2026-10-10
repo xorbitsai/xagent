@@ -50,7 +50,7 @@ def test_revision_chain_and_postgresql_orm_type():
     )
 
 
-def test_sqlite_upgrade_preserves_ciphertext_and_safe_downgrade(tmp_path):
+def test_sqlite_upgrade_and_downgrade_are_noops(tmp_path):
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'model-key.db'}")
     metadata = sa.MetaData()
     table = _legacy_table(metadata)
@@ -62,7 +62,8 @@ def test_sqlite_upgrade_preserves_ciphertext_and_safe_downgrade(tmp_path):
         migration.upgrade()
         reflected = sa.inspect(connection).get_columns(TABLE)
         encrypted = next(column for column in reflected if column["name"] == COLUMN)
-        assert isinstance(encrypted["type"], sa.Text)
+        assert isinstance(encrypted["type"], sa.String)
+        assert encrypted["type"].length == 500
         assert (
             connection.execute(sa.text(f"SELECT {COLUMN} FROM {TABLE}")).scalar_one()
             == "short-ciphertext"
@@ -72,8 +73,11 @@ def test_sqlite_upgrade_preserves_ciphertext_and_safe_downgrade(tmp_path):
             sa.text(f"UPDATE {TABLE} SET {COLUMN} = :value"),
             {"value": "x" * 1420},
         )
-        with pytest.raises(RuntimeError, match="exceed 500 characters"):
-            migration.downgrade()
+        migration.downgrade()
+        assert (
+            connection.execute(sa.text(f"SELECT {COLUMN} FROM {TABLE}")).scalar_one()
+            == "x" * 1420
+        )
 
 
 @pytest.mark.postgresql
@@ -106,3 +110,40 @@ def test_postgresql_upgrade_accepts_long_ciphertext_and_preserves_it():
             )
             with pytest.raises(RuntimeError, match="exceed 500 characters"):
                 migration.downgrade()
+
+
+@pytest.mark.postgresql
+def test_postgresql_short_ciphertext_survives_upgrade_and_downgrade():
+    with disposable_database_factory("xagent_model_api_key_text") as make:
+        engine = make("round_trip")
+        metadata = sa.MetaData()
+        table = _legacy_table(metadata)
+        metadata.create_all(engine)
+        with engine.begin() as connection:
+            connection.execute(
+                table.insert().values(id=1, **{COLUMN: "short-ciphertext"})
+            )
+
+        with _migration_context(engine) as (migration, connection):
+            migration.upgrade()
+            upgraded = next(
+                column
+                for column in sa.inspect(connection).get_columns(TABLE)
+                if column["name"] == COLUMN
+            )
+            assert isinstance(upgraded["type"], sa.Text)
+
+            migration.downgrade()
+            downgraded = next(
+                column
+                for column in sa.inspect(connection).get_columns(TABLE)
+                if column["name"] == COLUMN
+            )
+            assert isinstance(downgraded["type"], sa.String)
+            assert downgraded["type"].length == 500
+            assert (
+                connection.execute(
+                    sa.text(f"SELECT {COLUMN} FROM {TABLE} WHERE id = 1")
+                ).scalar_one()
+                == "short-ciphertext"
+            )

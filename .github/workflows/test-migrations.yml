@@ -589,6 +589,13 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      - name: Test model API key ciphertext migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20261009_expand_model_api_key_ciphertext.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test MCP OAuth lifecycle fencing (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

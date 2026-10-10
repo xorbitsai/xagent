@@ -55,6 +55,14 @@ test_app.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 client = TestClient(test_app)
 
 
+def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://compatible.example.com/v1/models")
+    response = httpx.Response(status_code, request=request)
+    return httpx.HTTPStatusError(
+        f"upstream returned {status_code}", request=request, response=response
+    )
+
+
 def ensure_system_initialized() -> None:
     status_response = client.get("/api/auth/setup-status")
     assert status_response.status_code == 200
@@ -458,6 +466,7 @@ def test_ordinary_model_create_update_delete_remains_compatible(
 def test_long_model_credential_round_trips_through_runtime_adapter(
     test_db, admin_headers, sample_model_data
 ):
+    """Exercise encrypted credential lifecycle; schema width is tested on Postgres."""
     first_key = "a" * 1000
     payload = {
         **sample_model_data,
@@ -2025,27 +2034,54 @@ class TestModelAPI:
             raise_on_error=True,
         )
 
+    @pytest.mark.parametrize("upstream_status", [401, 403])
+    def test_claude_catalog_auth_failure_uses_provider_error_semantics(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        monkeypatch,
+        upstream_status,
+    ):
+        error = AnthropicAuthenticationError(
+            "Invalid Anthropic API key", upstream_status
+        )
+        fetch = AsyncMock(side_effect=error)
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://compatible.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == {
+            "code": "provider_auth_failed",
+            "message": "Invalid Anthropic API key",
+            "upstream_status": upstream_status,
+        }
+        assert response.json().get("catalog_unavailable") is None
+        assert "synthetic-secret" not in response.text
+
     @pytest.mark.parametrize(
-        ("error", "status_code"),
-        [
-            (AnthropicAuthenticationError("Invalid Anthropic API key", 401), 401),
-            (
-                AnthropicAuthenticationError(
-                    "Anthropic API key is not authorized", 403
-                ),
-                403,
-            ),
-            (httpx.ReadTimeout("timed out"), 502),
-        ],
+        "error",
+        [httpx.ReadTimeout("timed out"), _http_status_error(503)],
+        ids=["timeout", "upstream-503"],
     )
-    def test_claude_catalog_real_failures_are_not_treated_as_missing_catalog(
+    def test_claude_catalog_operational_failure_returns_bad_gateway(
         self,
         test_db,
         regular_user,
         regular_headers,
         monkeypatch,
         error,
-        status_code,
     ):
         fetch = AsyncMock(side_effect=error)
         monkeypatch.setattr(
@@ -2062,9 +2098,35 @@ class TestModelAPI:
             headers=regular_headers,
         )
 
-        assert response.status_code == status_code
+        assert response.status_code == 502
         assert response.json().get("catalog_unavailable") is None
         assert "synthetic-secret" not in response.text
+
+    def test_claude_compatible_provider_uses_strict_catalog_errors(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        fetch = AsyncMock(side_effect=httpx.ReadTimeout("timed out"))
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/kimi-for-coding/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://api.kimi.com/coding",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 502
+        fetch.assert_awaited_once_with(
+            "kimi-for-coding",
+            "synthetic-secret",
+            "https://api.kimi.com/coding",
+            raise_on_error=True,
+        )
 
     def test_fetch_provider_models_requires_base_url_for_openai_compatible(
         self, test_db, regular_user, regular_headers
@@ -2171,7 +2233,9 @@ class TestModelAPI:
             headers=regular_headers,
         )
         assert response.status_code == 200
-        fetch.assert_awaited_once_with("azure_openai", "test-api-key", endpoint)
+        fetch.assert_awaited_once_with(
+            "azure_openai", "test-api-key", endpoint, raise_on_error=False
+        )
 
     def test_list_supported_providers_includes_elevenlabs_audio_generation(
         self, test_db, regular_user, regular_headers

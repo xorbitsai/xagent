@@ -30,7 +30,7 @@ def _column_exists(bind: sa.engine.Connection) -> bool:
 
 def upgrade() -> None:
     bind = op.get_bind()
-    if not _column_exists(bind):
+    if bind.dialect.name != "postgresql" or not _column_exists(bind):
         return
     with op.batch_alter_table(TABLE) as batch_op:
         batch_op.alter_column(
@@ -43,7 +43,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    if not _column_exists(bind):
+    if bind.dialect.name != "postgresql" or not _column_exists(bind):
         return
 
     longest = bind.execute(

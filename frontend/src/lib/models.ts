@@ -451,7 +451,6 @@ export interface ProviderModel {
 export interface ProviderModelCatalog {
   models: ProviderModel[];
   catalogUnavailable: boolean;
-  warning?: string;
 }
 
 /**
@@ -498,19 +497,23 @@ export async function getProviderModels(
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
-    throw new Error(errorData.detail || 'Failed to fetch provider models');
+    const detail = errorData?.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : typeof detail?.message === 'string'
+        ? detail.message
+        : 'Failed to fetch provider models';
+    throw new Error(message);
   }
 
   const data = await response.json();
-  if (data && Array.isArray(data.models)) {
-    return {
-      models: data.models,
-      catalogUnavailable: data.catalog_unavailable === true,
-      warning: typeof data.warning === 'string' ? data.warning : undefined,
-    };
-  }
+  const models = Array.isArray(data?.models)
+    ? data.models
+    : Array.isArray(data)
+      ? data
+      : [];
   return {
-    models: Array.isArray(data) ? data : [],
-    catalogUnavailable: false,
+    models,
+    catalogUnavailable: data?.catalog_unavailable === true,
   };
 }

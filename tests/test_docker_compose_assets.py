@@ -108,3 +108,28 @@ def test_the_milvus_ci_job_starts_the_addon_that_ships():
     assert ci["jobs"]["pytest-milvus"]["env"]["MILVUS_URI"] == (
         "http://localhost:19530"
     )
+
+
+def _storage_mount(service_name: str) -> dict:
+    compose = yaml.safe_load(DOCKER_SANDBOX_OVERLAY.read_text(encoding="utf-8"))
+    mounts = [
+        volume
+        for volume in compose["services"][service_name].get("volumes", [])
+        if volume["target"] == "/root/.xagent"
+    ]
+    assert len(mounts) == 1
+    return mounts[0]
+
+
+def test_overlay_binds_one_host_storage_root_into_every_container_that_reads_it():
+    source = "${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}"
+
+    for service in ("backend", "worker", "scheduler", "nginx"):
+        mount = _storage_mount(service)
+        assert (mount["type"], mount["source"]) == ("bind", source)
+
+
+def test_overlay_keeps_nginx_storage_read_only_and_the_others_writable():
+    assert _storage_mount("nginx")["read_only"] is True
+    for service in ("backend", "worker", "scheduler"):
+        assert not _storage_mount(service).get("read_only")

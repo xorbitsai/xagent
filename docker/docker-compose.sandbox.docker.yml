@@ -21,12 +21,27 @@ services:
         bind:
           create_host_path: false
 
+  nginx:
+    volumes:
+      - type: bind
+        source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
+        target: /root/.xagent
+        read_only: true
+
   worker:
     environment:
       - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
       - XAGENT_SANDBOX_WORKER_ID=celery-worker
+    volumes:
+      - type: bind
+        source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
+        target: /root/.xagent
 
   scheduler:
     environment:
       - XAGENT_SANDBOX_NAMESPACE=${COMPOSE_PROJECT_NAME:?set COMPOSE_PROJECT_NAME to a stable unique value}
       - XAGENT_SANDBOX_WORKER_ID=scheduler
+    volumes:
+      - type: bind
+        source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
+        target: /root/.xagent

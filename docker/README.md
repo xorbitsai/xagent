@@ -255,7 +255,34 @@ container control.
 
 Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
 overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
-and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent`. It
+and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent` in
+`backend`, `worker`, `scheduler` and `nginx` (read-only), so they all see the
+same uploads and data. The host directory stays authoritative for a
+deployment that ran this overlay before: the backend always wrote its uploads,
+LanceDB ledger and `.kb-engine` there. The `xagent_data` volume holds what
+the worker wrote (staged and published uploads, and LanceDB rows and a
+`.kb-engine` from its own ingests such as web ingests). Do not copy the volume's
+`data` over the host directory, because LanceDB cannot be merged by copying
+files. List the volume:
+
+```bash
+docker run --rm -v <project>_xagent_data:/v:ro alpine find /v -type f
+```
+
+If `uploads` holds files the host lacks, copy only those, never overwriting a
+host file (`cp -n` in Alpine's BusyBox skips a whole directory that already
+exists, so use a loop):
+
+```bash
+docker run --rm -v <project>_xagent_data:/v:ro -v <host dir>:/h alpine sh -c '
+  cd /v/uploads && find . -type f | while IFS= read -r f; do
+    [ -e "/h/uploads/$f" ] || { mkdir -p "/h/uploads/$(dirname "$f")"; cp -p "$f" "/h/uploads/$f"; }
+  done'
+```
+
+Documents that only the worker ingested must be ingested again. Other paths
+under `/root/.xagent` that the worker may have written were not checked; inspect
+the listing before removing the volume. The overlay
 also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
 workspace mounts under `/root/.xagent` are translated back to the host storage
 path before they reach the host Docker daemon. When set,

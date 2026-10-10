@@ -29,17 +29,7 @@ docker compose \
   up -d
 ```
 
-With `docker/docker-compose.sandbox.docker.yml`, only `backend` bind-mounts `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` at `/root/.xagent`; `worker` and `scheduler` keep `xagent_data`. The LanceDB ledger, the collection ids and the engine record are then in two places, and the backend and the worker see different ones. Bind the same host path into `worker` and `scheduler` with one more `-f` file, which must come after `docker-compose.yml` and is listed on every command:
-
-```yaml
-services:
-  worker: &storage_root
-    volumes:
-      - type: bind
-        source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
-        target: /root/.xagent
-  scheduler: *storage_root
-```
+With `docker/docker-compose.sandbox.docker.yml`, `backend`, `worker`, `scheduler` and `nginx` all bind `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` at `/root/.xagent`, so the LanceDB ledger, the collection ids and the engine record are in one place.
 
 The add-on adds three services, the same three containers as the official Milvus v2.6.25 standalone Compose file:
 

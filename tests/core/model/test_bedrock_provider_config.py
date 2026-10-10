@@ -24,8 +24,7 @@ def test_validate_bedrock_api_key_settings() -> None:
 
 def test_bedrock_provider_metadata_declares_settings_contract() -> None:
     assert any(
-        provider["id"] == "bedrock"
-        for provider in get_supported_provider_metadata()
+        provider["id"] == "bedrock" for provider in get_supported_provider_metadata()
     )
     assert provider_credential_fields("bedrock") == [
         {

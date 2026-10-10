@@ -3598,6 +3598,60 @@ def _vis_collapse_embedding_table_counts(counts: Dict[str, int]) -> Dict[str, in
     return collapsed
 
 
+def _vis_restrict_pointers_to_owned_docs(
+    *,
+    conn: Any,
+    table_name: str,
+    filter_expr: str,
+    collection: str,
+    user_id: Optional[int],
+    doc_expr: Optional[str] = None,
+) -> str:
+    """Limit a tenant's main_pointers delete to doc_ids it owns in documents.
+
+    main_pointers has no user_id column, so ownership comes from ``documents``.
+    Other tables pass through unchanged.
+    """
+    from ..LanceDB.schema_manager import _safe_close_table
+
+    if table_name != "main_pointers":
+        return filter_expr
+
+    owned_expr = build_lancedb_filter_expression(
+        {"collection": collection}, skip_user_filter=True
+    )
+    if doc_expr:
+        owned_expr = f"{owned_expr} AND {doc_expr}"
+    table = None
+    try:
+        owned_expr = _vis_append_user_filter_if_needed(
+            conn=conn,
+            table_name="documents",
+            base_expr=owned_expr,
+            user_id=user_id,
+            is_admin=False,
+        )
+        table = conn.open_table("documents")
+        rows = query_to_list(
+            table.search().where(owned_expr).select(["doc_id"]).limit(-1)
+        )
+    except Exception:
+        logger.warning(
+            "Owner lookup for main_pointers delete failed in collection %s; "
+            "leaving pointers in place",
+            collection,
+            exc_info=True,
+        )
+        rows = []
+    finally:
+        _safe_close_table(table)
+    owned = sorted({str(row["doc_id"]) for row in rows if row.get("doc_id")})
+    if not owned:
+        # main_pointers has no user_id: the shared no-access filter would be invalid.
+        return f"{filter_expr} AND (doc_id IS NULL AND doc_id IS NOT NULL)"
+    return f"{filter_expr} AND {_vis_doc_ids_filter(owned)}"
+
+
 def _vis_build_collection_filter(
     *,
     conn: Any,
@@ -3625,7 +3679,15 @@ def _vis_build_collection_filter(
                 user_expr = build_user_id_filter_for_table(table, int(user_id))
                 return f"{base_expr} AND {user_expr}"
             # Legacy schemas without user_id must remain compatible.
-            return build_lancedb_filter_expression(base, skip_user_filter=True)
+            return _vis_restrict_pointers_to_owned_docs(
+                conn=conn,
+                table_name=table_name,
+                filter_expr=build_lancedb_filter_expression(
+                    base, skip_user_filter=True
+                ),
+                collection=collection,
+                user_id=user_id,
+            )
         return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
     except Exception:
         # If table introspection fails, keep tenant-safe fallback.
@@ -3659,7 +3721,16 @@ def _vis_build_document_filter(
                 user_expr = build_user_id_filter_for_table(table, int(user_id))
                 return f"{base_expr} AND {user_expr}"
             # Legacy schemas without user_id must remain compatible.
-            return build_lancedb_filter_expression(base, skip_user_filter=True)
+            return _vis_restrict_pointers_to_owned_docs(
+                conn=conn,
+                table_name=table_name,
+                filter_expr=build_lancedb_filter_expression(
+                    base, skip_user_filter=True
+                ),
+                collection=collection,
+                doc_expr=_vis_doc_ids_filter([doc_id]),
+                user_id=user_id,
+            )
         return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
     except Exception:
         # If table introspection fails, keep tenant-safe fallback.
@@ -3708,7 +3779,14 @@ def _vis_build_documents_filter(
                 f"{build_user_id_filter_for_table(table, int(user_id))}"
             )
         # Legacy schemas without user_id stay document-scoped by doc_id.
-        return scoped_expr
+        return _vis_restrict_pointers_to_owned_docs(
+            conn=conn,
+            table_name=table_name,
+            filter_expr=scoped_expr,
+            collection=collection,
+            user_id=user_id,
+            doc_expr=doc_expr,
+        )
     except Exception:
         # If introspection fails, fail closed with an explicit user_id predicate.
         return f"{scoped_expr} AND user_id == {int(user_id)}"

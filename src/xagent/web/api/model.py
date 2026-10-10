@@ -36,13 +36,17 @@ from xagent.core.model.providers import (
     canonical_provider_name,
     default_base_url_for_provider,
     is_auto_router_model,
+    is_aws_bedrock_runtime_endpoint,
+    is_placeholder_api_key,
     provider_compatibility_for_provider,
     provider_endpoint_kind,
     provider_requires_base_url,
+    resolve_bedrock_auth_mode,
+    validate_bedrock_settings,
 )
 from xagent.core.utils.security import redact_sensitive_text
 
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.auto_model import AutoModelCandidate, AutoModelConfig
 from ..models.database import get_db
 from ..models.model import Model as DBModel
@@ -113,6 +117,34 @@ model_router = APIRouter(prefix="/api/models", tags=["models"])
 MAX_TRANSCRIBE_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
+def _normalize_bedrock_api_key(auth_mode: str, api_key: Optional[str]) -> str:
+    if auth_mode == "credentials_chain" and is_placeholder_api_key(api_key):
+        return ""
+    return api_key or ""
+
+
+def _validate_web_bedrock_credentials(
+    *, user: User, auth_mode: str, endpoint_url: Optional[str]
+) -> None:
+    """Keep deployment AWS credentials behind the Web administration boundary."""
+
+    if auth_mode != "credentials_chain":
+        return
+    if not is_admin_user(user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only administrators can configure AWS credential-chain authentication",
+        )
+    if not is_aws_bedrock_runtime_endpoint(endpoint_url):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "AWS credential-chain authentication requires an HTTPS Amazon "
+                "Bedrock runtime endpoint"
+            ),
+        )
+
+
 def _decode_model_identifier(model_id: str) -> str:
     """Decode a model identifier from the URL path."""
 
@@ -165,6 +197,16 @@ def _resolve_accessible_model(
         return model_storage, db_model, shared
 
     raise HTTPException(status_code=404, detail="Model not found or access denied")
+
+
+def _serialize_model_with_access(
+    db: Session, user: User, db_model: DBModel, user_model: UserModel
+) -> ModelWithAccessInfo:
+    return ModelWithAccessInfo.model_validate(
+        ModelStore(db).serialize_model_with_access(
+            db_model, user_model, requesting_user_id=int(user.id)
+        )
+    )
 
 
 def _normalize_provider_model_id(model_id: str) -> str:
@@ -496,6 +538,30 @@ async def create_model(
 
         base_url = ARK_BYTEPLUS_BASE_URL
     _validate_provider_model_name(model_provider, model.model_name)
+    bedrock_api_key = model.api_key or ""
+    if model_provider == "bedrock":
+        if model.category != "llm":
+            raise HTTPException(
+                status_code=400,
+                detail="Amazon Bedrock is supported only for LLM configurations",
+            )
+        bedrock_api_key = _normalize_bedrock_api_key(
+            model.bedrock_auth_mode, model.api_key
+        )
+        try:
+            validate_bedrock_settings(
+                region=model.bedrock_region,
+                auth_mode=model.bedrock_auth_mode,
+                api_key=bedrock_api_key,
+                endpoint_url=base_url,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _validate_web_bedrock_credentials(
+            user=user,
+            auth_mode=model.bedrock_auth_mode,
+            endpoint_url=base_url,
+        )
 
     if model.category == "llm":
         config: ModelConfig = ChatModelConfig(
@@ -503,12 +569,14 @@ async def create_model(
             model_name=model.model_name,
             model_provider=model_provider,
             base_url=base_url,
-            api_key=model.api_key or "",
+            api_key=bedrock_api_key,
             default_temperature=model.temperature,
             context_window=model.context_window,
             timeout=180.0,
             abilities=model.abilities,
             description=model.description,
+            bedrock_region=model.bedrock_region,
+            bedrock_auth_mode=model.bedrock_auth_mode,
         )
     elif model.category == "embedding":
         config = EmbeddingModelConfig(
@@ -633,6 +701,8 @@ async def create_model(
         "model_provider": db_model.model_provider,
         "model_name": db_model.model_name,
         "base_url": db_model.base_url,
+        "bedrock_region": db_model.bedrock_region,
+        "bedrock_auth_mode": db_model.bedrock_auth_mode,
         "temperature": db_model.temperature,
         "context_window": db_model.context_window,
         "dimension": db_model.dimension,
@@ -814,13 +884,34 @@ async def test_model_connection(
             )
             is_deepseek_model = provider == "deepseek"
 
+            connection_api_key = request.api_key
+            if provider == "bedrock":
+                connection_api_key = _normalize_bedrock_api_key(
+                    request.bedrock_auth_mode, request.api_key
+                )
+
             config_kwargs: dict[str, Any] = {
                 "id": "test-model",
                 "model_provider": provider,
                 "model_name": request.model_name,
-                "api_key": request.api_key,
+                "api_key": connection_api_key,
                 "base_url": base_url,
+                "bedrock_region": request.bedrock_region,
+                "bedrock_auth_mode": request.bedrock_auth_mode,
             }
+
+            if provider == "bedrock":
+                validate_bedrock_settings(
+                    region=request.bedrock_region,
+                    auth_mode=request.bedrock_auth_mode,
+                    api_key=connection_api_key,
+                    endpoint_url=base_url,
+                )
+                _validate_web_bedrock_credentials(
+                    user=user,
+                    auth_mode=request.bedrock_auth_mode,
+                    endpoint_url=base_url,
+                )
 
             # Forward temperature only if the caller explicitly set one and
             # the model isn't a known reasoning model that rejects it.
@@ -1057,6 +1148,8 @@ async def test_model_connection(
             error=None,
         )
 
+    except HTTPException:
+        raise
     except asyncio.TimeoutError:
         logger.error(f"Model connection test timed out for {request.model_name}")
         response_time = time.time() - start_time
@@ -1467,32 +1560,7 @@ async def get_default_model(
     if not user_model:
         return None
 
-    is_owner = user_model.user_id == user.id
-    model_data = {
-        "id": user_default.model.id,
-        "model_id": user_default.model.model_id,
-        "category": user_default.model.category,
-        "model_provider": user_default.model.model_provider,
-        "model_name": user_default.model.model_name,
-        "base_url": user_default.model.base_url,
-        "temperature": user_default.model.temperature,
-        "dimension": user_default.model.dimension,
-        "abilities": user_default.model.abilities,
-        "description": user_default.model.description,
-        "created_at": user_default.model.created_at.isoformat()
-        if user_default.model.created_at
-        else None,
-        "updated_at": user_default.model.updated_at.isoformat()
-        if user_default.model.updated_at
-        else None,
-        "is_active": user_default.model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
-
-    return ModelWithAccessInfo.model_validate(model_data)
+    return _serialize_model_with_access(db, user, user_default.model, user_model)
 
 
 @model_router.get("/default/general", response_model=Optional[ModelWithAccessInfo])
@@ -1536,32 +1604,7 @@ async def get_general_default_model(
     if not user_model:
         return None
 
-    is_owner = user_model.user_id == user.id
-    model_data = {
-        "id": user_default.model.id,
-        "model_id": user_default.model.model_id,
-        "category": user_default.model.category,
-        "model_provider": user_default.model.model_provider,
-        "model_name": user_default.model.model_name,
-        "base_url": user_default.model.base_url,
-        "temperature": user_default.model.temperature,
-        "dimension": user_default.model.dimension,
-        "abilities": user_default.model.abilities,
-        "description": user_default.model.description,
-        "created_at": user_default.model.created_at.isoformat()
-        if user_default.model.created_at
-        else None,
-        "updated_at": user_default.model.updated_at.isoformat()
-        if user_default.model.updated_at
-        else None,
-        "is_active": user_default.model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
-
-    return ModelWithAccessInfo.model_validate(model_data)
+    return _serialize_model_with_access(db, user, user_default.model, user_model)
 
 
 @model_router.get("/default/small-fast", response_model=Optional[ModelWithAccessInfo])
@@ -1605,32 +1648,7 @@ async def get_small_fast_default_model(
     if not user_model:
         return None
 
-    is_owner = user_model.user_id == user.id
-    model_data = {
-        "id": user_default.model.id,
-        "model_id": user_default.model.model_id,
-        "category": user_default.model.category,
-        "model_provider": user_default.model.model_provider,
-        "model_name": user_default.model.model_name,
-        "base_url": user_default.model.base_url,
-        "temperature": user_default.model.temperature,
-        "dimension": user_default.model.dimension,
-        "abilities": user_default.model.abilities,
-        "description": user_default.model.description,
-        "created_at": user_default.model.created_at.isoformat()
-        if user_default.model.created_at
-        else None,
-        "updated_at": user_default.model.updated_at.isoformat()
-        if user_default.model.updated_at
-        else None,
-        "is_active": user_default.model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
-
-    return ModelWithAccessInfo.model_validate(model_data)
+    return _serialize_model_with_access(db, user, user_default.model, user_model)
 
 
 @model_router.get("/default/visual", response_model=Optional[ModelWithAccessInfo])
@@ -1674,32 +1692,7 @@ async def get_visual_default_model(
     if not user_model:
         return None
 
-    is_owner = user_model.user_id == user.id
-    model_data = {
-        "id": user_default.model.id,
-        "model_id": user_default.model.model_id,
-        "category": user_default.model.category,
-        "model_provider": user_default.model.model_provider,
-        "model_name": user_default.model.model_name,
-        "base_url": user_default.model.base_url,
-        "temperature": user_default.model.temperature,
-        "dimension": user_default.model.dimension,
-        "abilities": user_default.model.abilities,
-        "description": user_default.model.description,
-        "created_at": user_default.model.created_at.isoformat()
-        if user_default.model.created_at
-        else None,
-        "updated_at": user_default.model.updated_at.isoformat()
-        if user_default.model.updated_at
-        else None,
-        "is_active": user_default.model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
-
-    return ModelWithAccessInfo.model_validate(model_data)
+    return _serialize_model_with_access(db, user, user_default.model, user_model)
 
 
 @model_router.get("/default/compact", response_model=Optional[ModelWithAccessInfo])
@@ -1743,32 +1736,7 @@ async def get_compact_default_model(
     if not user_model:
         return None
 
-    is_owner = user_model.user_id == user.id
-    model_data = {
-        "id": user_default.model.id,
-        "model_id": user_default.model.model_id,
-        "category": user_default.model.category,
-        "model_provider": user_default.model.model_provider,
-        "model_name": user_default.model.model_name,
-        "base_url": user_default.model.base_url,
-        "temperature": user_default.model.temperature,
-        "dimension": user_default.model.dimension,
-        "abilities": user_default.model.abilities,
-        "description": user_default.model.description,
-        "created_at": user_default.model.created_at.isoformat()
-        if user_default.model.created_at
-        else None,
-        "updated_at": user_default.model.updated_at.isoformat()
-        if user_default.model.updated_at
-        else None,
-        "is_active": user_default.model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
-
-    return ModelWithAccessInfo.model_validate(model_data)
+    return _serialize_model_with_access(db, user, user_default.model, user_model)
 
 
 @model_router.get("/default/embedding", response_model=Optional[ModelWithAccessInfo])
@@ -1812,32 +1780,7 @@ async def get_embedding_default_model(
     if not user_model:
         return None
 
-    is_owner = user_model.user_id == user.id
-    model_data = {
-        "id": user_default.model.id,
-        "model_id": user_default.model.model_id,
-        "category": user_default.model.category,
-        "model_provider": user_default.model.model_provider,
-        "model_name": user_default.model.model_name,
-        "base_url": user_default.model.base_url,
-        "temperature": user_default.model.temperature,
-        "dimension": user_default.model.dimension,
-        "abilities": user_default.model.abilities,
-        "description": user_default.model.description,
-        "created_at": user_default.model.created_at.isoformat()
-        if user_default.model.created_at
-        else None,
-        "updated_at": user_default.model.updated_at.isoformat()
-        if user_default.model.updated_at
-        else None,
-        "is_active": user_default.model.is_active,
-        "is_owner": is_owner,
-        "can_edit": is_owner and user_model.can_edit,
-        "can_delete": is_owner and user_model.can_delete,
-        "is_shared": user_model.is_shared,
-    }
-
-    return ModelWithAccessInfo.model_validate(model_data)
+    return _serialize_model_with_access(db, user, user_default.model, user_model)
 
 
 # User Default Model Configuration Endpoints
@@ -2019,12 +1962,72 @@ async def update_model(
             update_data["model_provider"]
         )
     effective_provider = update_data.get("model_provider", db_model.model_provider)
+    provider_changed = effective_provider != db_model.model_provider
+    if effective_provider != "bedrock":
+        update_data.pop("bedrock_region", None)
+        update_data.pop("bedrock_auth_mode", None)
     effective_model_name = update_data.get("model_name", db_model.model_name)
     _validate_provider_model_name(effective_provider, effective_model_name)
+    clear_bedrock_api_key = False
+    if effective_provider == "bedrock":
+        effective_category = update_data.get("category", db_model.category)
+        if effective_category != "llm":
+            raise HTTPException(
+                status_code=400,
+                detail="Amazon Bedrock is supported only for LLM configurations",
+            )
+        bedrock_settings_changed = provider_changed or any(
+            field in update_data
+            for field in ("bedrock_region", "bedrock_auth_mode", "api_key", "base_url")
+        )
+        if provider_changed and "base_url" not in update_data:
+            # A provider-specific endpoint must never cross the provider boundary.
+            update_data["base_url"] = None
+        if bedrock_settings_changed:
+            stored_auth_mode = None if provider_changed else db_model.bedrock_auth_mode
+            effective_auth_mode = resolve_bedrock_auth_mode(
+                update_data.get("bedrock_auth_mode", stored_auth_mode),
+                default="api_key",
+            )
+            if effective_auth_mode == "credentials_chain":
+                effective_api_key = _normalize_bedrock_api_key(
+                    effective_auth_mode, update_data.get("api_key")
+                )
+                clear_bedrock_api_key = True
+            elif provider_changed:
+                effective_api_key = update_data.get("api_key") or ""
+            else:
+                effective_api_key = update_data.get("api_key") or db_model.api_key
+            effective_region = update_data.get(
+                "bedrock_region", None if provider_changed else db_model.bedrock_region
+            )
+            effective_endpoint = update_data.get(
+                "base_url", None if provider_changed else db_model.base_url
+            )
+            try:
+                validate_bedrock_settings(
+                    region=effective_region,
+                    auth_mode=effective_auth_mode,
+                    api_key=effective_api_key,
+                    endpoint_url=effective_endpoint,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            _validate_web_bedrock_credentials(
+                user=user,
+                auth_mode=effective_auth_mode,
+                endpoint_url=effective_endpoint,
+            )
+            update_data["bedrock_auth_mode"] = effective_auth_mode
+            if clear_bedrock_api_key:
+                update_data["api_key"] = ""
     effective_category = update_data.get("category", db_model.category)
+    identity_fields = ["model_provider", "model_name", "base_url"]
+    if effective_provider == "bedrock":
+        identity_fields.extend(("bedrock_region", "bedrock_auth_mode"))
     identity_changed = any(
         field in update_data and update_data[field] != getattr(db_model, field)
-        for field in ("model_provider", "model_name", "base_url")
+        for field in identity_fields
     )
     incompatible_with_auto = (
         identity_changed
@@ -2088,6 +2091,16 @@ async def update_model(
         # Only set fields that exist on the model
         if hasattr(db_model, field):
             setattr(db_model, field, value)
+
+    if effective_provider == "bedrock" and clear_bedrock_api_key:
+        # The generic update contract treats an empty key as "keep the current
+        # secret". Switching Bedrock to the AWS credential chain is the one
+        # case where retaining the explicit token is both unnecessary and
+        # surprising, so clear it deliberately.
+        db_model.api_key = ""
+    elif effective_provider != "bedrock":
+        db_model.bedrock_region = None
+        db_model.bedrock_auth_mode = None
 
     if auto_candidates:
         model_store.refresh_auto_model_abilities(

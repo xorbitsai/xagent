@@ -4,7 +4,7 @@ import logging
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -31,6 +31,7 @@ from ...core.model.providers import (
     ROUTER_PROVIDER,
     is_auto_router_model,
     is_placeholder_api_key,
+    resolve_bedrock_auth_mode,
 )
 from ..models.auto_model import AutoModelCandidate, AutoModelConfig
 from ..models.model import Model
@@ -74,6 +75,13 @@ def _ensure_ordinary_model(model: Model) -> None:
         )
 
 
+def _web_bedrock_auth_mode(auth_mode: str | None) -> str:
+    """Fail closed instead of letting legacy Web rows use ambient credentials."""
+
+    normalized = resolve_bedrock_auth_mode(auth_mode, default="api_key")
+    return "api_key" if normalized == "auto" else normalized
+
+
 def _create_llm_instance(db_model: Model) -> BaseLLM:
     if db_model.category == "llm":
         config: ModelConfig = ChatModelConfig(
@@ -86,6 +94,10 @@ def _create_llm_instance(db_model: Model) -> BaseLLM:
             context_window=db_model.context_window,
             abilities=db_model.abilities,
             description=db_model.description,
+            bedrock_region=db_model.bedrock_region,
+            bedrock_auth_mode=_web_bedrock_auth_mode(
+                cast(Optional[str], db_model.bedrock_auth_mode)
+            ),
         )
     elif db_model.category == "embedding":
         config = EmbeddingModelConfig(
@@ -150,6 +162,10 @@ class CoreStorage:
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
                 context_window=db_model.context_window,
+                bedrock_region=db_model.bedrock_region,
+                bedrock_auth_mode=_web_bedrock_auth_mode(
+                    cast(Optional[str], db_model.bedrock_auth_mode)
+                ),
             )
         elif db_model.category == "image":
             from ...core.model.model import ImageModelConfig
@@ -251,6 +267,13 @@ class CoreStorage:
                     "category": "llm",
                 }
             )
+            if model.model_provider == "bedrock":
+                db_data.update(
+                    {
+                        "bedrock_region": model.bedrock_region,
+                        "bedrock_auth_mode": model.bedrock_auth_mode,
+                    }
+                )
         elif isinstance(model, EmbeddingModelConfig):
             db_data.update(
                 {

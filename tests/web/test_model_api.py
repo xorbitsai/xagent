@@ -4,6 +4,7 @@ import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
@@ -13,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.shared.auth_database import auth_db_override
+from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.chat.basic.claude import AnthropicAuthenticationError
 from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
 from xagent.web.api import model as model_module
@@ -1247,6 +1249,698 @@ class TestModelAPI:
         assert data["can_delete"] is True
         assert data["is_shared"] is False
 
+    def test_bedrock_settings_survive_create_list_and_runtime_reload(
+        self, test_db, regular_user, regular_headers
+    ):
+        payload = {
+            "model_id": "bedrock-profile",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": (
+                "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example"
+            ),
+            "api_key": "b" * 1000,
+            "base_url": "https://bedrock-runtime.us-west-2.amazonaws.com",
+            "bedrock_region": "us-west-2",
+            "bedrock_auth_mode": "api_key",
+            "abilities": ["chat", "tool_calling"],
+        }
+
+        created = client.post("/api/models/", json=payload, headers=regular_headers)
+        assert created.status_code == 200
+        assert created.json()["bedrock_region"] == "us-west-2"
+        assert created.json()["bedrock_auth_mode"] == "api_key"
+
+        listed = client.get("/api/models/", headers=regular_headers)
+        assert listed.status_code == 200
+        saved = next(
+            item for item in listed.json() if item["model_id"] == "bedrock-profile"
+        )
+        assert saved["bedrock_region"] == "us-west-2"
+        assert saved["bedrock_auth_mode"] == "api_key"
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-profile")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-profile")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_region == "us-west-2"
+        assert config.bedrock_auth_mode == "api_key"
+        assert config.api_key == "b" * 1000
+        assert llm is not None
+        assert llm._inner.region_name == "us-west-2"
+        assert llm._inner.auth_mode == "api_key"
+        assert llm._inner.model_name == payload["model_name"]
+
+    def test_bedrock_connection_test_uses_native_runtime(
+        self, test_db, regular_user, regular_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **request: Any) -> dict[str, Any]:
+                assert request["modelId"] == "amazon.nova-lite-v1:0"
+                assert request["messages"][-1]["content"] == [{"text": "Hello"}]
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "Hello from Bedrock"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 2},
+                }
+
+        with patch.object(
+            BedrockLLM,
+            "_build_client",
+            return_value=SyntheticBedrockClient(),
+        ) as build_client:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "amazon.nova-lite-v1:0",
+                    "api_key": "bedrock-test-token",
+                    "bedrock_region": "us-east-1",
+                    "bedrock_auth_mode": "api_key",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        build_client.assert_called_once_with()
+
+    def test_bedrock_credentials_chain_connection_test_as_admin(
+        self, test_db, admin_user, admin_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **_request: Any) -> dict[str, Any]:
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "ok"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1},
+                }
+
+        with patch.object(
+            BedrockLLM,
+            "_build_client",
+            return_value=SyntheticBedrockClient(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "amazon.nova-lite-v1:0",
+                    "api_key": "your-aws-key",
+                    "bedrock_region": "us-east-1",
+                    "bedrock_auth_mode": "credentials_chain",
+                    "category": "llm",
+                },
+                headers=admin_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+
+    def test_bedrock_credentials_chain_does_not_require_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+                "abilities": ["chat", "tool_calling"],
+            },
+            headers=admin_headers,
+        )
+        assert response.status_code == 200
+
+        db = next(get_db())
+        try:
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-chain")
+        finally:
+            db.close()
+        assert llm is not None
+        assert llm._inner.auth_mode == "aws_credentials"
+
+    def test_bedrock_credentials_chain_rejects_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-with-key",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "must-not-be-retained",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 400
+        assert "cannot include an API key" in response.json()["detail"]
+
+    def test_bedrock_credentials_chain_requires_admin(
+        self, test_db, regular_user, regular_headers
+    ):
+        payload = {
+            "model_id": "bedrock-chain-forbidden",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": "amazon.nova-lite-v1:0",
+            "bedrock_region": "us-east-1",
+            "bedrock_auth_mode": "credentials_chain",
+        }
+
+        create_response = client.post(
+            "/api/models/", json=payload, headers=regular_headers
+        )
+        test_response = client.post(
+            "/api/models/test-connection", json=payload, headers=regular_headers
+        )
+
+        assert create_response.status_code == 403
+        assert test_response.status_code == 403
+        assert "Only administrators" in create_response.json()["detail"]
+
+        api_key_payload = {
+            **payload,
+            "model_id": "bedrock-chain-update-forbidden",
+            "api_key": "key",
+            "bedrock_auth_mode": "api_key",
+        }
+        created = client.post(
+            "/api/models/", json=api_key_payload, headers=regular_headers
+        )
+        assert created.status_code == 200
+        update_response = client.put(
+            "/api/models/bedrock-chain-update-forbidden",
+            json={"bedrock_auth_mode": "credentials_chain"},
+            headers=regular_headers,
+        )
+        assert update_response.status_code == 403
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "http://bedrock-runtime.us-east-1.amazonaws.com",
+            "https://sts.us-east-1.amazonaws.com",
+            "https://attacker.example",
+        ],
+    )
+    def test_bedrock_credentials_chain_rejects_unsafe_endpoint(
+        self, test_db, admin_user, admin_headers, endpoint
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-unsafe",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "base_url": endpoint,
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 400
+        assert "HTTPS Amazon Bedrock runtime endpoint" in response.json()["detail"]
+
+    def test_bedrock_credentials_chain_normalizes_placeholder_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-placeholder",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "your-aws-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-chain-placeholder")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-chain-placeholder")
+        finally:
+            db.close()
+        assert config.api_key == ""
+        assert llm is not None
+        assert llm._inner.auth_mode == "aws_credentials"
+
+    def test_admin_shared_credentials_chain_model_remains_available_to_users(
+        self,
+        test_db,
+        admin_user,
+        admin_headers,
+        regular_user,
+        regular_headers,
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-shared",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+                "share_with_users": True,
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200
+        selected = client.post(
+            "/api/models/user-default",
+            json={"model_id": created.json()["id"], "config_type": "general"},
+            headers=admin_headers,
+        )
+        assert selected.status_code == 200
+
+        fetched = client.get(
+            "/api/models/bedrock-chain-shared", headers=regular_headers
+        )
+        defaults = client.get("/api/models/user-default", headers=regular_headers)
+
+        assert fetched.status_code == 200
+        assert fetched.json()["bedrock_auth_mode"] == "credentials_chain"
+        assert fetched.json()["can_edit"] is False
+        assert defaults.status_code == 200
+        fallback = next(
+            item for item in defaults.json() if item["config_type"] == "general"
+        )
+        assert fallback["model"]["bedrock_region"] == "us-east-1"
+        assert fallback["model"]["bedrock_auth_mode"] == "credentials_chain"
+
+    def test_switching_bedrock_to_credentials_chain_clears_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-switch-auth",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-switch-auth",
+            json={"bedrock_auth_mode": "credentials_chain"},
+            headers=admin_headers,
+        )
+        assert updated.status_code == 200
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-switch-auth")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-switch-auth")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_auth_mode == "credentials_chain"
+        assert config.api_key == ""
+        assert llm is not None
+        assert llm._inner.auth_mode == "aws_credentials"
+
+    def test_switching_bedrock_to_credentials_chain_rejects_new_api_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-invalid-switch",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "old-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=admin_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-invalid-switch",
+            json={
+                "bedrock_auth_mode": "credentials_chain",
+                "api_key": "new-key",
+            },
+            headers=admin_headers,
+        )
+
+        assert updated.status_code == 400
+        assert "cannot include an API key" in updated.json()["detail"]
+
+    def test_switching_to_bedrock_does_not_inherit_credentials_or_endpoint(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        created = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert created.status_code == 200
+        switch_payload = {
+            "model_provider": "bedrock",
+            "model_name": "amazon.nova-lite-v1:0",
+            "bedrock_region": "us-east-1",
+        }
+
+        missing_key = client.put(
+            f"/api/models/{sample_model_data['model_id']}",
+            json=switch_payload,
+            headers=regular_headers,
+        )
+        switched = client.put(
+            f"/api/models/{sample_model_data['model_id']}",
+            json={**switch_payload, "api_key": "new-bedrock-key"},
+            headers=regular_headers,
+        )
+
+        assert missing_key.status_code == 400
+        assert "API key is required" in missing_key.json()["detail"]
+        assert switched.status_code == 200
+        assert switched.json()["base_url"] is None
+        assert switched.json()["bedrock_auth_mode"] == "api_key"
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load(sample_model_data["model_id"])
+        finally:
+            db.close()
+        assert config.api_key == "new-bedrock-key"
+        assert config.base_url is None
+        assert config.bedrock_auth_mode == "api_key"
+
+    def test_switching_bedrock_credentials_chain_to_api_key_requires_new_key(
+        self, test_db, admin_user, admin_headers
+    ):
+        payload = {
+            "model_id": "bedrock-chain-to-key",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": "amazon.nova-lite-v1:0",
+            "bedrock_region": "us-east-1",
+            "bedrock_auth_mode": "credentials_chain",
+        }
+        created = client.post("/api/models/", json=payload, headers=admin_headers)
+        assert created.status_code == 200
+
+        missing_key = client.put(
+            "/api/models/bedrock-chain-to-key",
+            json={"bedrock_auth_mode": "api_key"},
+            headers=admin_headers,
+        )
+        updated = client.put(
+            "/api/models/bedrock-chain-to-key",
+            json={"bedrock_auth_mode": "api_key", "api_key": "new-key"},
+            headers=admin_headers,
+        )
+
+        assert missing_key.status_code == 400
+        assert "API key is required" in missing_key.json()["detail"]
+        assert updated.status_code == 200
+        assert updated.json()["bedrock_auth_mode"] == "api_key"
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-chain-to-key")
+        finally:
+            db.close()
+        assert config.api_key == "new-key"
+        assert config.bedrock_auth_mode == "api_key"
+
+    @pytest.mark.parametrize("legacy_auth_mode", [None, "auto"])
+    def test_legacy_bedrock_settings_allow_unrelated_update_but_fail_closed(
+        self, test_db, regular_user, regular_headers, legacy_auth_mode
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "legacy-bedrock",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "legacy-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+        db = next(get_db())
+        try:
+            row = db.query(DBModel).filter_by(model_id="legacy-bedrock").one()
+            row.bedrock_region = None
+            row.bedrock_auth_mode = legacy_auth_mode
+            row.api_key = ""
+            db.commit()
+        finally:
+            db.close()
+
+        updated = client.put(
+            "/api/models/legacy-bedrock",
+            json={"description": "legacy row remains editable"},
+            headers=regular_headers,
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["description"] == "legacy row remains editable"
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("legacy-bedrock")
+            llm = CoreStorage(db, DBModel).get_llm_by_id("legacy-bedrock")
+        finally:
+            db.close()
+        assert config.bedrock_auth_mode == "api_key"
+        assert llm is None
+
+    def test_bedrock_region_update_validates_and_persists_effective_mode(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-region-update",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        invalid = client.put(
+            "/api/models/bedrock-region-update",
+            json={"bedrock_region": "US-EAST-1"},
+            headers=regular_headers,
+        )
+        valid = client.put(
+            "/api/models/bedrock-region-update",
+            json={"bedrock_region": "eu-west-1"},
+            headers=regular_headers,
+        )
+
+        assert invalid.status_code == 400
+        assert valid.status_code == 200
+        assert valid.json()["bedrock_region"] == "eu-west-1"
+        assert valid.json()["bedrock_auth_mode"] == "api_key"
+
+    def test_bedrock_rejects_non_llm_create(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-embedding",
+                "category": "embedding",
+                "model_provider": "bedrock",
+                "model_name": "amazon.titan-embed-text-v2:0",
+                "api_key": "key",
+                "bedrock_region": "us-east-1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "only for LLM" in response.json()["detail"]
+
+    def test_switching_away_from_bedrock_clears_provider_settings(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-to-openai",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "bedrock-key",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-to-openai",
+            json={
+                "model_provider": "openai",
+                "model_name": "gpt-4",
+                "api_key": "openai-key",
+                "base_url": "https://api.openai.com/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert updated.status_code == 200
+        assert updated.json()["bedrock_region"] is None
+        assert updated.json()["bedrock_auth_mode"] is None
+
+    def test_non_bedrock_fields_do_not_prune_auto_references(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        created = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        assert created.status_code == 200
+        db = next(get_db())
+        try:
+            target = (
+                db.query(DBModel)
+                .filter_by(model_id=sample_model_data["model_id"])
+                .one()
+            )
+            router_model = DBModel(
+                model_id="auto-router-bedrock-field-test",
+                category="llm",
+                model_provider="router",
+                model_name="auto",
+                api_key="",
+                abilities=["chat"],
+                is_active=True,
+            )
+            db.add(router_model)
+            db.flush()
+            config = AutoModelConfig(
+                user_id=regular_user["id"],
+                router_model_id=router_model.id,
+                strategy="balanced",
+            )
+            db.add(config)
+            db.flush()
+            candidate = AutoModelCandidate(
+                config_id=config.id,
+                routing_model_id="openai/gpt-5.5",
+                target_model_id=target.id,
+            )
+            db.add(candidate)
+            db.commit()
+            candidate_id = int(candidate.id)
+        finally:
+            db.close()
+
+        response = client.put(
+            f"/api/models/{sample_model_data['model_id']}",
+            json={
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["bedrock_region"] is None
+        assert response.json()["bedrock_auth_mode"] is None
+        db = next(get_db())
+        try:
+            assert db.get(AutoModelCandidate, candidate_id) is not None
+        finally:
+            db.close()
+
+    def test_default_model_response_includes_bedrock_settings(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-default",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "key",
+                "bedrock_region": "us-west-2",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+        selected = client.post(
+            "/api/models/user-default",
+            json={"model_id": created.json()["id"], "config_type": "general"},
+            headers=regular_headers,
+        )
+        assert selected.status_code == 200
+
+        response = client.get("/api/models/default/general", headers=regular_headers)
+
+        assert response.status_code == 200
+        assert response.json()["bedrock_region"] == "us-west-2"
+        assert response.json()["bedrock_auth_mode"] == "api_key"
+
+    def test_bedrock_rejects_mantle_endpoint(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-mantle",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert response.status_code == 400
+        assert "does not support Converse" in response.json()["detail"]
+
     def test_create_shared_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):
@@ -1883,6 +2577,21 @@ class TestModelAPI:
         assert deepseek["name"] == "DeepSeek"
         assert deepseek["category"] == ["llm"]
         assert deepseek["default_base_url"] == "https://api.deepseek.com"
+
+    def test_list_supported_providers_includes_bedrock(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported", headers=regular_headers
+        )
+        assert response.status_code == 200
+        bedrock = next(
+            provider
+            for provider in response.json()["providers"]
+            if provider["id"] == "bedrock"
+        )
+        assert bedrock["category"] == ["llm"]
+        assert bedrock["requires_base_url"] is False
 
     def test_list_supported_providers_includes_multi_category_provider(
         self, test_db, regular_user, regular_headers

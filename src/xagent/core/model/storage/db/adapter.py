@@ -94,6 +94,13 @@ class SQLAlchemyModelHub:
                     "category": "llm",
                 }
             )
+            if model.model_provider == "bedrock":
+                db_data.update(
+                    {
+                        "bedrock_region": model.bedrock_region,
+                        "bedrock_auth_mode": model.bedrock_auth_mode,
+                    }
+                )
         elif isinstance(model, ImageModelConfig):
             db_data.update(
                 {
@@ -192,6 +199,8 @@ class SQLAlchemyModelHub:
                 default_temperature=db_model.temperature,
                 default_max_tokens=db_model.max_tokens,
                 context_window=db_model.context_window,
+                bedrock_region=db_model.bedrock_region,
+                bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
             )
         elif db_model.category == "image":
             return ImageModelConfig(
@@ -257,6 +266,8 @@ class SQLAlchemyModelHub:
                     default_temperature=db_model.temperature,
                     default_max_tokens=db_model.max_tokens,
                     context_window=db_model.context_window,
+                    bedrock_region=db_model.bedrock_region,
+                    bedrock_auth_mode=db_model.bedrock_auth_mode or "auto",
                 )
             elif db_model.category == "image":
                 config = ImageModelConfig(

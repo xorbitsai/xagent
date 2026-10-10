@@ -528,6 +528,18 @@ def test_explicit_api_keys_are_instance_scoped_and_never_touch_environment(monke
             {"endpoint_url": "https://bedrock-mantle.us-east-1.api.aws"},
             "does not support Converse",
         ),
+        (
+            {"endpoint_url": "https://user@example.com/runtime"},
+            "unsupported URL components",
+        ),
+        (
+            {"endpoint_url": "https://example.com/runtime?token=secret"},
+            "unsupported URL components",
+        ),
+        (
+            {"endpoint_url": "https://example.com/runtime#fragment"},
+            "unsupported URL components",
+        ),
         ({"auth_mode": "api_key"}, "requires an api_key"),
         (
             {"api_key": "key", "auth_mode": "aws_credentials"},

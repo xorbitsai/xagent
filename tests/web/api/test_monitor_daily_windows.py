@@ -208,6 +208,75 @@ async def test_active_models_count_empty_names_once(_utc_plus_8_server: None) ->
         db.close()
 
 
+async def test_active_models_do_not_narrow_historical_durations(
+    _utc_plus_8_server: None,
+) -> None:
+    """Only model counts use today's window; durations still use all starts."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="paired-models", updated_at=UTC_TODAY_LATE)
+        for name, started_at, seconds in [
+            ("historical-model", UTC_YESTERDAY_LATE, 10),
+            ("today-model", UTC_TODAY_EARLY, 30),
+        ]:
+            for phase, timestamp in [
+                ("start", started_at),
+                ("end", started_at + timedelta(seconds=seconds)),
+            ]:
+                db.add(
+                    TraceEvent(
+                        task_id=task.id,
+                        event_id=f"{name}-{phase}",
+                        event_type=f"llm_call_{phase}",
+                        timestamp=timestamp,
+                        data={"model_name": name, "step_id": name, "attempt": 1},
+                    )
+                )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 1
+        # Restricting the shared starts to today would incorrectly return 30.
+        assert stats["avgResponseTime"] == 20.0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "pairing_data",
+    [
+        pytest.param({"attempt": 1}, id="missing-step-id"),
+        pytest.param({"step_id": "step-1"}, id="missing-attempt"),
+        pytest.param({"step_id": "step-1", "attempt": 1}, id="missing-end"),
+    ],
+)
+async def test_active_models_do_not_require_duration_pairing(
+    _utc_plus_8_server: None, pairing_data: dict[str, str | int]
+) -> None:
+    """An active model does not need a measurable completed call."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="unpaired-model", updated_at=UTC_TODAY_LATE)
+        db.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="unpaired-start",
+                event_type="llm_call_start",
+                timestamp=UTC_TODAY_EARLY,
+                data={"model_name": "unpaired-model", **pairing_data},
+            )
+        )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 1
+        assert stats["avgResponseTime"] is None
+    finally:
+        db.close()
+
+
 async def test_dashboard_windows_are_the_utc_day(_utc_plus_8_server: None) -> None:
     """``todayCalls`` and ``activeAgents`` use the UTC day boundary.
 

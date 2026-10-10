@@ -4764,10 +4764,10 @@ class LanceDBMainPointerStore(MainPointerStore):
                     field="model_tag", operator=FilterOperator.EQ, value=""
                 )
                 # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
-                model_tag_filter: FilterExpression = (
+                model_tag_filter: FilterExpression = [
                     model_tag_null_cond,
                     model_tag_empty_cond,
-                )  # OR tuple
+                ]  # OR list
                 filter_expr: FilterExpression = (
                     *base_conditions,
                     model_tag_filter,
@@ -4844,10 +4844,12 @@ class LanceDBMainPointerStore(MainPointerStore):
             if doc_id is not None:
                 filters_dict["doc_id"] = doc_id
 
-            filter_expr = build_lancedb_filter_expression(filters_dict)
+            filter_expr = build_lancedb_filter_expression(
+                filters_dict, skip_user_filter=True
+            )
 
             # First check if any pointers exist using efficient count_rows
-            if table.search().where(filter_expr).count_rows() == 0:
+            if table.count_rows(filter_expr) == 0:
                 return []
 
             result = table.search().where(filter_expr).limit(limit).to_arrow()
@@ -4920,10 +4922,10 @@ class LanceDBMainPointerStore(MainPointerStore):
                     field="model_tag", operator=FilterOperator.EQ, value=""
                 )
                 # Combine as: (base) AND (model_tag IS NULL OR model_tag == '')
-                model_tag_filter: FilterExpression = (
+                model_tag_filter: FilterExpression = [
                     model_tag_null_cond,
                     model_tag_empty_cond,
-                )  # OR tuple
+                ]  # OR list
                 filter_expr: FilterExpression = (
                     *base_conditions,
                     model_tag_filter,

@@ -27,7 +27,7 @@ instants from ``monitor_daily_window_shared``.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -36,6 +36,7 @@ from xagent.web.api import monitor as monitor_module
 from xagent.web.api.monitor import get_dashboard_stats, get_monitoring_stats
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.task_execution_event_writer import append_fact_no_commit
 
 from .conftest import _direct_db_session
 from .monitor_daily_window_shared import (
@@ -126,6 +127,83 @@ async def test_stats_today_window_is_the_utc_day(_utc_plus_8_server: None) -> No
 
         assert stats["todayCalls"] == 2
         assert stats["activeModels"] == 1
+    finally:
+        db.close()
+
+
+async def test_active_models_include_utc_midnight_and_v2_events(
+    _utc_plus_8_server: None,
+) -> None:
+    """Count starts at the boundary, excluding historical-only models."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="legacy-models", updated_at=UTC_TODAY_LATE)
+        task.conversation_storage_version = 1
+        midnight = UTC_TODAY_EARLY.replace(minute=0)
+        for event_id, timestamp, name in [
+            ("at-midnight", midnight, "midnight-model"),
+            ("before-midnight", midnight - timedelta(microseconds=1), "late-model"),
+            ("historical", midnight - timedelta(days=2), "historical-model"),
+        ]:
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id=event_id,
+                    event_type="llm_call_start",
+                    timestamp=timestamp,
+                    data={"model_name": name},
+                )
+            )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 1
+        assert stats["todayCalls"] == 1
+
+        v2_task = _seed_task(db, admin, title="v2-models", updated_at=UTC_TODAY_LATE)
+        v2_task.conversation_storage_version = 2
+        append_fact_no_commit(
+            db,
+            task_id=v2_task.id,
+            kind="llm_call_start",
+            key="v2-start",
+            payload={
+                "protocol_event_id": "v2-start",
+                "data": {"model_name": "v2-model"},
+            },
+            occurred_at=UTC_TODAY_EARLY,
+        )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 2
+        assert stats["todayCalls"] == 2
+    finally:
+        db.close()
+
+
+async def test_active_models_count_empty_names_once(_utc_plus_8_server: None) -> None:
+    """Keep /stats' existing empty-string behavior, including deduplication."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="empty-models", updated_at=UTC_TODAY_LATE)
+        for index, name in enumerate(["named-model", "", ""]):
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id=f"empty-name-{index}",
+                    event_type="llm_call_start",
+                    timestamp=UTC_TODAY_EARLY,
+                    data={"model_name": name},
+                )
+            )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 2
+        assert stats["todayCalls"] == 3
     finally:
         db.close()
 

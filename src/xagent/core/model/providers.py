@@ -360,30 +360,50 @@ def canonical_provider_name(provider: str) -> str:
 
 
 _AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
+_AWS_BEDROCK_PUBLIC_ENDPOINT_PATTERN = re.compile(
+    r"^bedrock-runtime(?:-fips)?\.[a-z0-9-]+"
+    r"\.(?:amazonaws\.com(?:\.cn)?|api\.aws)$"
+)
+_AWS_BEDROCK_VPC_ENDPOINT_PATTERN = re.compile(
+    r"^vpce-[a-z0-9-]+\.bedrock-runtime(?:-fips)?\.[a-z0-9-]+"
+    r"\.vpce\.amazonaws\.com(?:\.cn)?$"
+)
 
 
-def validate_bedrock_settings(
-    *,
-    region: Optional[str],
-    auth_mode: str,
-    api_key: Optional[str],
-    endpoint_url: Optional[str],
-) -> None:
-    """Validate the persisted settings for the native Bedrock runtime."""
+def resolve_bedrock_auth_mode(
+    auth_mode: Optional[str], *, default: str = "auto"
+) -> str:
+    """Normalize Bedrock auth vocabulary without hiding the caller's default."""
 
-    normalized_region = (region or "").strip()
-    if not normalized_region or not _AWS_REGION_PATTERN.fullmatch(normalized_region):
-        raise ValueError("A valid AWS region is required for Amazon Bedrock")
-    if auth_mode not in {"api_key", "credentials_chain"}:
+    normalized = (auth_mode or default).strip().lower()
+    if normalized == "aws_credentials":
+        return "credentials_chain"
+    if normalized not in {"auto", "api_key", "credentials_chain"}:
         raise ValueError("Unsupported Amazon Bedrock authentication mode")
-    if auth_mode == "api_key" and is_placeholder_api_key(api_key):
-        raise ValueError(
-            "An Amazon Bedrock API key is required for api_key authentication"
-        )
-    if auth_mode == "credentials_chain" and not is_placeholder_api_key(api_key):
-        raise ValueError(
-            "Amazon Bedrock credentials_chain authentication cannot include an API key"
-        )
+    return normalized
+
+
+def bedrock_runtime_auth_mode(auth_mode: Optional[str]) -> str:
+    """Translate the persisted API vocabulary to the native runtime vocabulary."""
+
+    normalized = resolve_bedrock_auth_mode(auth_mode)
+    return "aws_credentials" if normalized == "credentials_chain" else normalized
+
+
+def bedrock_api_auth_mode(
+    auth_mode: Optional[str], api_key: Optional[str]
+) -> Optional[str]:
+    """Expose only explicit, safe auth modes through the persisted Web contract."""
+
+    normalized = resolve_bedrock_auth_mode(auth_mode)
+    if normalized == "auto":
+        return "api_key" if not is_placeholder_api_key(api_key) else None
+    return normalized
+
+
+def validate_bedrock_endpoint(endpoint_url: Optional[str]) -> None:
+    """Validate endpoint syntax shared by persisted settings and the runtime."""
+
     if not endpoint_url:
         return
     parsed = urlsplit(endpoint_url.strip())
@@ -395,8 +415,55 @@ def validate_bedrock_settings(
         )
     if parsed.hostname.lower().startswith("bedrock-mantle."):
         raise ValueError(
-            "bedrock-mantle endpoints do not support Converse; use a bedrock-runtime endpoint"
+            "bedrock-mantle does not support Converse; use a bedrock-runtime endpoint"
         )
+
+
+def is_aws_bedrock_runtime_endpoint(endpoint_url: Optional[str]) -> bool:
+    """Return whether an explicit endpoint is an AWS-owned Bedrock runtime host."""
+
+    if not endpoint_url:
+        return True
+    try:
+        validate_bedrock_endpoint(endpoint_url)
+    except ValueError:
+        return False
+    parsed = urlsplit(endpoint_url.strip())
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    hostname = parsed.hostname.lower()
+    return bool(
+        _AWS_BEDROCK_PUBLIC_ENDPOINT_PATTERN.fullmatch(hostname)
+        or _AWS_BEDROCK_VPC_ENDPOINT_PATTERN.fullmatch(hostname)
+    )
+
+
+def validate_bedrock_settings(
+    *,
+    region: Optional[str],
+    auth_mode: Optional[str],
+    api_key: Optional[str],
+    endpoint_url: Optional[str],
+) -> None:
+    """Validate the persisted settings for the native Bedrock runtime."""
+
+    normalized_region = (region or "").strip()
+    if not _AWS_REGION_PATTERN.fullmatch(normalized_region):
+        raise ValueError("A valid AWS region is required for Amazon Bedrock")
+    normalized_auth_mode = resolve_bedrock_auth_mode(auth_mode, default="api_key")
+    if normalized_auth_mode == "auto":
+        raise ValueError("Unsupported Amazon Bedrock authentication mode")
+    if normalized_auth_mode == "api_key" and is_placeholder_api_key(api_key):
+        raise ValueError(
+            "An Amazon Bedrock API key is required for api_key authentication"
+        )
+    if normalized_auth_mode == "credentials_chain" and not is_placeholder_api_key(
+        api_key
+    ):
+        raise ValueError(
+            "Amazon Bedrock credentials_chain authentication cannot include an API key"
+        )
+    validate_bedrock_endpoint(endpoint_url)
 
 
 def is_placeholder_api_key(api_key: Optional[str]) -> bool:

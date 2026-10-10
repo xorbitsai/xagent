@@ -11,7 +11,6 @@ import logging
 import threading
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
-from urllib.parse import urlsplit
 
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -26,6 +25,7 @@ from botocore.exceptions import (
 
 from ....runtime_performance import run_in_thread_with_telemetry
 from ....utils.security import redact_sensitive_text
+from ...providers import validate_bedrock_endpoint
 from ..error import matches_context_length_error
 from ..exceptions import LLMContextLengthError, LLMRetryableError
 from ..token_context import add_token_usage
@@ -161,16 +161,7 @@ class BedrockLLM(BaseLLM):
 
     @staticmethod
     def _validate_endpoint(endpoint_url: str | None) -> None:
-        if not endpoint_url:
-            return
-        parsed = urlsplit(endpoint_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError("Bedrock endpoint_url must be an absolute HTTP(S) URL")
-        if parsed.hostname.lower().startswith("bedrock-mantle."):
-            raise ValueError(
-                "Bedrock Converse requires a bedrock-runtime endpoint; "
-                "bedrock-mantle does not support Converse"
-            )
+        validate_bedrock_endpoint(endpoint_url)
 
     @property
     def model_name(self) -> str:

@@ -5,8 +5,12 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 from xagent.core.model.chat.basic.adapter import create_base_llm
 from xagent.core.model.model import ChatModelConfig
 from xagent.core.model.providers import (
+    bedrock_api_auth_mode,
+    bedrock_runtime_auth_mode,
     get_supported_provider_metadata,
+    is_aws_bedrock_runtime_endpoint,
     provider_credential_fields,
+    resolve_bedrock_auth_mode,
     validate_bedrock_settings,
 )
 from xagent.core.model.storage.db.adapter import SQLAlchemyModelHub
@@ -82,6 +86,46 @@ def test_credentials_chain_maps_to_runtime_aws_credentials_mode() -> None:
     assert llm._inner.auth_mode == "aws_credentials"
 
 
+def test_bedrock_auth_mode_normalizer_shares_api_and_runtime_vocabulary() -> None:
+    assert resolve_bedrock_auth_mode(None, default="api_key") == "api_key"
+    assert resolve_bedrock_auth_mode("aws_credentials") == "credentials_chain"
+    assert bedrock_runtime_auth_mode("credentials_chain") == "aws_credentials"
+    assert bedrock_api_auth_mode("auto", "explicit-key") == "api_key"
+    assert bedrock_api_auth_mode("auto", "") is None
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        None,
+        "https://bedrock-runtime.us-east-1.amazonaws.com",
+        "https://bedrock-runtime.cn-north-1.amazonaws.com.cn",
+        "https://bedrock-runtime.us-east-1.api.aws",
+        (
+            "https://vpce-0123456789abcdef0-abc12345.bedrock-runtime."
+            "us-east-1.vpce.amazonaws.com"
+        ),
+    ],
+)
+def test_aws_bedrock_runtime_endpoint_allowlist(endpoint: str | None) -> None:
+    assert is_aws_bedrock_runtime_endpoint(endpoint)
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://bedrock-runtime.us-east-1.amazonaws.com",
+        "https://sts.us-east-1.amazonaws.com",
+        "https://attacker.example",
+        "https://bedrock-runtime.us-east-1.amazonaws.com.attacker.example",
+    ],
+)
+def test_aws_bedrock_runtime_endpoint_allowlist_rejects_unsafe_hosts(
+    endpoint: str,
+) -> None:
+    assert not is_aws_bedrock_runtime_endpoint(endpoint)
+
+
 def test_standalone_model_hub_round_trips_bedrock_settings(monkeypatch) -> None:
     monkeypatch.setenv("ENCRYPTION_KEY", "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc=")
     engine = create_engine("sqlite:///:memory:")
@@ -120,12 +164,34 @@ def test_standalone_model_hub_round_trips_bedrock_settings(monkeypatch) -> None:
     ("field", "value", "message"),
     [
         ("region", "", "valid AWS region"),
+        ("region", "us-east", "valid AWS region"),
+        ("region", "US-EAST-1", "valid AWS region"),
         ("auth_mode", "ambient", "authentication mode"),
         ("api_key", "", "API key is required"),
         (
             "endpoint_url",
+            "ftp://bedrock-runtime.us-east-1.amazonaws.com",
+            r"HTTP\(S\) URL",
+        ),
+        (
+            "endpoint_url",
+            "https://user@example.com",
+            "unsupported URL components",
+        ),
+        (
+            "endpoint_url",
+            "https://example.com/path?token=secret",
+            "unsupported URL components",
+        ),
+        (
+            "endpoint_url",
+            "https://example.com/path#fragment",
+            "unsupported URL components",
+        ),
+        (
+            "endpoint_url",
             "https://bedrock-mantle.us-east-1.api.aws/v1",
-            "do not support Converse",
+            "does not support Converse",
         ),
     ],
 )

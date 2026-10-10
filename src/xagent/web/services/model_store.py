@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import event
 from sqlalchemy.orm import Session, joinedload
 
+from ...core.model.providers import bedrock_api_auth_mode
 from ..models.model import Model as DBModel
 from ..models.user import User, UserDefaultModel, UserModel
 from ..schemas.model import ModelWithAccessInfo, UserDefaultModelResponse
@@ -43,6 +44,15 @@ class ModelSharingConflictError(ValueError):
 
 _PENDING_CACHE_INVALIDATIONS = "xagent_pending_model_cache_invalidations"
 _MODEL_TRANSACTION_COMMITTED = "xagent_model_transaction_committed"
+
+
+def _bedrock_auth_mode_for_response(db_model: DBModel) -> str | None:
+    if db_model.model_provider != "bedrock":
+        return None
+    return bedrock_api_auth_mode(
+        cast(str | None, db_model.bedrock_auth_mode),
+        cast(str | None, db_model.api_key),
+    )
 
 
 def _stage_cache_invalidation(db: Session, user_id: int | None) -> None:
@@ -106,7 +116,7 @@ class ModelStore:
             "model_name": db_model.model_name,
             "base_url": db_model.base_url,
             "bedrock_region": db_model.bedrock_region,
-            "bedrock_auth_mode": db_model.bedrock_auth_mode,
+            "bedrock_auth_mode": _bedrock_auth_mode_for_response(db_model),
             "temperature": db_model.temperature,
             "context_window": db_model.context_window,
             "dimension": db_model.dimension,
@@ -626,6 +636,8 @@ class ModelStore:
             "model_provider": db_model.model_provider,
             "model_name": db_model.model_name,
             "base_url": db_model.base_url,
+            "bedrock_region": db_model.bedrock_region,
+            "bedrock_auth_mode": _bedrock_auth_mode_for_response(db_model),
             "temperature": db_model.temperature,
             "context_window": db_model.context_window,
             "dimension": db_model.dimension,

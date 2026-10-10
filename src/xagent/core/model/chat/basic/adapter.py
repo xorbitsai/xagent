@@ -6,6 +6,7 @@ from ....retry import chat_retry_budget, create_retry_wrapper
 from ...providers import (
     AUTO_MODEL_NAME,
     ROUTER_PROVIDER,
+    bedrock_runtime_auth_mode,
     canonical_provider_name,
     is_auto_router_model,
     is_placeholder_api_key,
@@ -139,11 +140,7 @@ def create_base_llm(
             region_name=model.bedrock_region,
             api_key=model.api_key,
             endpoint_url=model.base_url,
-            auth_mode=(
-                "aws_credentials"
-                if model.bedrock_auth_mode == "credentials_chain"
-                else model.bedrock_auth_mode
-            ),
+            auth_mode=bedrock_runtime_auth_mode(model.bedrock_auth_mode),
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,

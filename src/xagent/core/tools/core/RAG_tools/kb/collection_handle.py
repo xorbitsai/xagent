@@ -4592,6 +4592,14 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             finally:
                 _safe_close_table(table)
 
+        if should_delete:
+            # Per-table failures are caught above, so some tables may be deleted.
+            invalidate = getattr(
+                self.vector_index_store, "invalidate_table_cache", None
+            )
+            if callable(invalidate):
+                invalidate()
+
         deleted_count = sum(table_counts.values())
         if warnings:
             status = "incomplete"

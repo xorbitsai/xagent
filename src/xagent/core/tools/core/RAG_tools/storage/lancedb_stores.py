@@ -3234,13 +3234,18 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         else:
             raise CascadeCleanupError(f"Unsupported scope: {scope}")
 
-        result = _vis_execute_or_plan_by_predicates(
-            conn,
-            predicates,
-            preview_only=preview_only,
-            confirm=confirm,
-            model_tag=model_tag,
-        )
+        try:
+            result = _vis_execute_or_plan_by_predicates(
+                conn,
+                predicates,
+                preview_only=preview_only,
+                confirm=confirm,
+                model_tag=model_tag,
+            )
+        finally:
+            # Earlier tables may already be deleted when a later one raises.
+            if confirm and not preview_only:
+                self.invalidate_table_cache()
         if scope in {"parse", "chunk", "embeddings"}:
             return _vis_collapse_embedding_table_counts(result)
         return result

@@ -21,13 +21,7 @@ a change shows after a moment (``_eventually``). Not covered here:
   removes that owner's pointers (#2859). New engines should not take
   LanceDB as the reference for either main-pointer item;
 - version candidates, promotion and the candidate-cleanup snapshots: covered on
-  LanceDB by ``test_collection_handle_version.py``;
-- count-based reads right after a parse, chunk or embeddings cascade: LanceDB
-  keeps returning pre-delete values from ``collection_stats``, ``chunk_exists``,
-  ``parse_exists`` (parse cascade) and ``read_chunks_needing_embedding()``'s
-  ``total_count`` (parse or chunk cascade), because ``count_rows`` reads through
-  the cached ``_get_table`` handle and only the document cascade invalidates it
-  (#2860).
+  LanceDB by ``test_collection_handle_version.py``.
 """
 
 from __future__ import annotations
@@ -145,6 +139,8 @@ MILVUS_ROWS = {
 MILVUS_UNSUPPORTED = {
     "test_cascade_deletes_its_scope_only_when_confirmed",
     "test_cascade_leaves_other_owners_rows",
+    "test_counts_follow_rows_after_a_cascade",
+    "test_counts_follow_rows_when_a_cascade_fails_midway",
 }
 
 
@@ -944,3 +940,83 @@ async def test_delete_collection_config_follows_tenant_scope(
 
     assert await open_handle(COLLECTION).delete_collection_config() == 1
     assert store.list_collection_config_owner_ids(COLLECTION) == set()
+
+
+def _counts(handle: KBCollectionHandle) -> tuple[object, ...]:
+    stats = handle.collection_stats(None, True)
+    versions = (PARSE, PARSE_V2)
+    return (
+        [handle.parse_exists("doc-1", p, is_admin=True) for p in versions],
+        [handle.chunk_exists("doc-1", p, CONFIG, is_admin=True) for p in versions],
+        [
+            handle.read_chunks_needing_embedding(
+                "doc-1", p, MODEL, is_admin=True
+            ).total_count
+            for p in versions
+        ],
+        stats["chunks"],
+        stats["embeddings"],
+    )
+
+
+@pytest.mark.parametrize(("scope", "kwargs", "expected"), CASCADES)
+def test_counts_follow_rows_after_a_cascade(
+    two_versions: KBCollectionHandle,
+    scope: str,
+    kwargs: dict[str, object],
+    expected: tuple[list[str], ...],
+) -> None:
+    warmed = _counts(two_versions)
+    _cascade(two_versions, scope, "scope", preview_only=False, confirm=True, **kwargs)
+    after = _counts(two_versions)
+    two_versions.vector_index_store.invalidate_table_cache()
+    assert after == _counts(two_versions)
+    assert after != warmed
+
+
+def _assert_counts_are_fresh(handle: KBCollectionHandle, warmed: tuple) -> None:
+    after = _counts(handle)
+    handle.vector_index_store.invalidate_table_cache()
+    assert after == _counts(handle)
+    assert after != warmed
+
+
+def test_counts_follow_rows_after_operation_cleanup(tmp_path: Path) -> None:
+    handle = ENGINES["lancedb"](COLLECTION)
+    _ingest(handle, COLLECTION, "doc-1", ["kiwi apple"], user_id=1, source_dir=tmp_path)
+    _ingest(
+        handle, COLLECTION, "doc-1b", ["cherry plum"], user_id=1, source_dir=tmp_path
+    )
+    warmed = _counts(handle)
+
+    handle.cleanup_embeddings_for_operation(
+        doc_id="doc-1", model_tag=TAG, preview_only=False, confirm=True
+    )
+
+    _assert_counts_are_fresh(handle, warmed)
+
+
+def test_counts_follow_rows_when_a_cascade_fails_midway(
+    two_versions: KBCollectionHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.core.tools.core.RAG_tools.storage import lancedb_stores
+
+    real = lancedb_stores._vis_delete_by_predicates
+
+    def delete_then_fail(*args: object, **kwargs: object) -> dict[str, int]:
+        real(*args, **kwargs)
+        raise RuntimeError("later table failed")
+
+    monkeypatch.setattr(lancedb_stores, "_vis_delete_by_predicates", delete_then_fail)
+    warmed = _counts(two_versions)
+    with pytest.raises(RuntimeError):
+        _cascade(
+            two_versions,
+            "embeddings",
+            "scope",
+            preview_only=False,
+            confirm=True,
+            model_tag=TAG,
+        )
+
+    _assert_counts_are_fresh(two_versions, warmed)

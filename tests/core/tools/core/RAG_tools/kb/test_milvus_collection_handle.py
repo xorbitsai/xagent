@@ -107,7 +107,7 @@ FAMILIES = {
 LEDGER = set(
     f"""{FAMILIES["supports_documents"]} {FAMILIES["supports_parses"]}
     {FAMILIES["supports_chunks"]} capture_document_rows rename_collection_status
-    rename_collection_metadata count_documents
+    rename_collection_metadata count_documents retire_superseded_chunks
     list_collection_documents write_ingestion_status load_ingestion_status
     clear_ingestion_status write_ingestion_status_async load_ingestion_status_async
     clear_ingestion_status_async get_main_pointer set_main_pointer list_main_pointers
@@ -191,7 +191,7 @@ def test_every_interface_method_is_delegated_refused_pending_or_implemented() ->
     }
 
     assert (len(LEDGER), len(UNSUPPORTED), len(PENDING), len(IMPLEMENTED)) == (
-        43,
+        44,
         12,
         5,
         16,

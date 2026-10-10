@@ -34,6 +34,39 @@ def _log(msg: str) -> None:
     sys.stdout.flush()
 
 
+def _reupload_helpers(
+    client: TestClient, auth_headers: dict[str, str], collection: str
+):
+    """Return ``upload(text)`` for one file name and ``found(word)`` for a collection."""
+
+    def upload(text: str) -> dict:
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("notes.txt", text.encode(), "text/plain")},
+            data={"collection": collection, "chunk_size": 100, "chunk_overlap": 0},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200, http_detail(response)
+        assert response.json()["status"] == "success", http_detail(response)
+        return response.json()
+
+    def found(query: str) -> bool:
+        response = client.post(
+            "/api/kb/search",
+            data={
+                "collection": collection,
+                "query_text": query,
+                "embedding_model_id": "e2e-test-embedding",
+                "search_type": "sparse",
+            },
+            headers=auth_headers,
+        )
+        assert response.status_code == 200, http_detail(response)
+        return bool(response.json()["results"])
+
+    return upload, found
+
+
 # ==========================================
 # TEST-SPECIFIC FIXTURES
 # ==========================================
@@ -183,6 +216,157 @@ class TestKBLifecycleE2E:
         assert delete_response.status_code == 200
         eventually(lambda: not found("important information"))
         assert found("markdown document")
+
+    @pytest.mark.e2e
+    @pytest.mark.slow
+    def test_reupload_with_changed_content_replaces_the_old_content(
+        self,
+        client: TestClient,
+        auth_headers: dict[str, str],
+        kb_engine: str,
+    ):
+        """A same-name upload with new text is searchable and drops the old text."""
+        assert deployment_kb_backend().value == kb_engine
+        upload, found = _reupload_helpers(client, auth_headers, "e2e_reupload_changed")
+
+        upload("alpha zebra lantern")
+        eventually(lambda: found("zebra"))
+
+        unchanged = upload("alpha zebra lantern")
+        assert "no pending embeddings" in unchanged["message"]
+        assert found("zebra")
+
+        changed = upload("gamma quokka prism")
+        assert "no pending embeddings" not in changed["message"]
+        eventually(lambda: found("quokka"))
+        eventually(lambda: not found("zebra"))
+
+    @pytest.mark.e2e
+    @pytest.mark.slow
+    def test_failed_reupload_keeps_the_old_content_and_a_retry_replaces_it(
+        self,
+        client: TestClient,
+        auth_headers: dict[str, str],
+        stub_embedding_adapter,
+        monkeypatch: pytest.MonkeyPatch,
+        kb_engine: str,
+    ):
+        """An embedder failure leaves the old text searchable; the retry swaps it."""
+        assert deployment_kb_backend().value == kb_engine
+        upload, found = _reupload_helpers(client, auth_headers, "e2e_reupload_failed")
+        upload("alpha zebra lantern")
+        eventually(lambda: found("zebra"))
+
+        real_encode = stub_embedding_adapter.encode
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("embedder down")
+
+        monkeypatch.setattr(stub_embedding_adapter, "encode", broken)
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("notes.txt", b"gamma quokka prism", "text/plain")},
+            data={"collection": "e2e_reupload_failed", "max_retries": 0},
+            headers=auth_headers,
+        )
+        assert response.status_code == 500, http_detail(response)
+        assert found("zebra")
+        assert not found("quokka")
+
+        monkeypatch.setattr(stub_embedding_adapter, "encode", real_encode)
+        retried = upload("gamma quokka prism")
+        assert "no pending embeddings" not in retried["message"]
+        eventually(lambda: found("quokka"))
+        eventually(lambda: not found("zebra"))
+
+    @pytest.mark.e2e
+    @pytest.mark.slow
+    def test_reverting_to_the_old_content_after_a_failed_upload_drops_the_failed_text(
+        self,
+        client: TestClient,
+        auth_headers: dict[str, str],
+        stub_embedding_adapter,
+        monkeypatch: pytest.MonkeyPatch,
+        kb_engine: str,
+    ):
+        """v1, a v2 whose embedding fails, then v1 again: v2 must not stay searchable."""
+        assert deployment_kb_backend().value == kb_engine
+        upload, found = _reupload_helpers(client, auth_headers, "e2e_reupload_revert")
+        upload("alpha zebra lantern")
+        eventually(lambda: found("zebra"))
+
+        real_encode = stub_embedding_adapter.encode
+        monkeypatch.setattr(
+            stub_embedding_adapter,
+            "encode",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("down")),
+        )
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("notes.txt", b"gamma quokka prism", "text/plain")},
+            data={"collection": "e2e_reupload_revert", "max_retries": 0},
+            headers=auth_headers,
+        )
+        assert response.status_code == 500, http_detail(response)
+        encoded: list[str] = []
+
+        def recording(*args, **kwargs):
+            encoded.append(repr((args, kwargs)))
+            return real_encode(*args, **kwargs)
+
+        monkeypatch.setattr(stub_embedding_adapter, "encode", recording)
+
+        upload("alpha zebra lantern")
+        eventually(lambda: found("zebra"))
+        eventually(lambda: not found("quokka"))
+        assert not any("quokka" in call for call in encoded)
+
+    @pytest.mark.e2e
+    @pytest.mark.slow
+    def test_reupload_with_new_content_and_new_parse_method_drops_the_old_text(
+        self,
+        client: TestClient,
+        auth_headers: dict[str, str],
+        kb_engine: str,
+    ):
+        """A changed parse method gives a new parse_hash; the old chunks still go."""
+        assert deployment_kb_backend().value == kb_engine
+        upload, found = _reupload_helpers(client, auth_headers, "e2e_reupload_parse")
+        upload("alpha zebra lantern")
+        eventually(lambda: found("zebra"))
+
+        response = client.post(
+            "/api/kb/ingest",
+            files={"file": ("notes.txt", b"gamma quokka prism", "text/plain")},
+            data={"collection": "e2e_reupload_parse", "parse_method": "deepdoc"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200, http_detail(response)
+        eventually(lambda: found("quokka"))
+        eventually(lambda: not found("zebra"))
+
+    @pytest.mark.e2e
+    @pytest.mark.slow
+    def test_reupload_replaces_every_chunk_of_a_multi_chunk_document(
+        self,
+        client: TestClient,
+        auth_headers: dict[str, str],
+        kb_engine: str,
+    ):
+        """No chunk of the old text survives when the new text also has several."""
+        assert deployment_kb_backend().value == kb_engine
+        upload, found = _reupload_helpers(client, auth_headers, "e2e_reupload_multi")
+        old_words = ["zebra", "lantern", "walnut", "harbor"]
+        new_words = ["quokka", "prism", "meadow", "falcon"]
+
+        def text(words: list[str]) -> str:
+            return "\n\n".join(f"{word} " * 20 for word in words)
+
+        assert upload(text(old_words))["chunk_count"] > 1
+        eventually(lambda: all(found(word) for word in old_words))
+        assert upload(text(new_words))["chunk_count"] > 1
+        eventually(lambda: all(found(word) for word in new_words))
+        eventually(lambda: not any(found(word) for word in old_words))
 
     @pytest.mark.e2e
     @pytest.mark.slow

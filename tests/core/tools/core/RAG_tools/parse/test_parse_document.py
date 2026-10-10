@@ -509,3 +509,32 @@ class TestParseDocumentFallback:
             # Verify None values are preserved
             assert result.get("title") is None
             assert result.get("language") is None
+
+
+@pytest.mark.parametrize(
+    ("params_json", "expected"),
+    [
+        (None, False),
+        ("", False),
+        ("{}", False),
+        ('{"content_hash": ""}', False),
+        ("not json", False),
+        ('{"content_hash": "other"}', False),
+        ('{"content_hash": "same"}', True),
+    ],
+)
+def test_parse_is_current_needs_a_matching_stored_content_hash(
+    params_json: str | None, expected: bool
+) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from xagent.core.tools.core.RAG_tools.parse.parse_document import (
+        _parse_is_current,
+    )
+
+    handle = MagicMock()
+    handle.read_latest_parse_record.return_value = SimpleNamespace(
+        params_json=params_json
+    )
+    assert _parse_is_current(handle, "d", "p", "same", None, True) is expected

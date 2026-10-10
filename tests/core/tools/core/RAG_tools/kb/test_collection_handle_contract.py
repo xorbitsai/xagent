@@ -214,13 +214,15 @@ def _write_chunks(
     parse_hash: str = PARSE,
 ) -> None:
     now = datetime.now(timezone.utc)
+    document = handle.load_document(doc_id, is_admin=True)
+    made_from = {"content_hash": document.content_hash} if document else {}
     chunks = [
         {
             "chunk_id": f"{doc_id}-c{index}",
             "index": index,
             "text": text,
             "created_at": now,
-            "metadata": {"page": index + 1},
+            "metadata": {"page": index + 1, **made_from},
         }
         for index, text in enumerate(texts, start=start)
     ]
@@ -451,7 +453,9 @@ def test_chunk_rows_round_trip_in_index_order(seeded: KBCollectionHandle) -> Non
         ("doc-1-c0", "kiwi apple"),
         ("doc-1-c1", "cherry plum"),
     ]
-    assert [c["metadata"] for c in chunks] == [{"page": 1}, {"page": 2}]
+    assert [
+        {k: v for k, v in c["metadata"].items() if k != "content_hash"} for c in chunks
+    ] == [{"page": 1}, {"page": 2}]
 
 
 def test_chunks_needing_embedding_resume_after_partial_write(
@@ -545,7 +549,8 @@ def test_dense_search_ranks_nearest_first_with_unit_scores(
 
     top = response.results[0]
     assert (top.chunk_id, top.doc_id, top.text) == ("doc-1-c1", "doc-1", "cherry plum")
-    assert top.parse_hash == PARSE and top.metadata == {"page": 2}
+    assert top.parse_hash == PARSE
+    assert {k: v for k, v in top.metadata.items() if k != "content_hash"} == {"page": 2}
     scores = [result.score for result in response.results]
     assert scores == sorted(scores, reverse=True)
     assert all(0.0 <= score <= 1.0 for score in scores)

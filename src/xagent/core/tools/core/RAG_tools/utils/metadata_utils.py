@@ -36,6 +36,9 @@ def serialize_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
     return json.dumps(metadata, ensure_ascii=False, sort_keys=True)
 
 
+CONTENT_HASH_KEY = "content_hash"  # file content a chunk was made from
+
+
 def deserialize_metadata(metadata_json: Optional[str]) -> Optional[Dict[str, Any]]:
     """Deserialize metadata JSON string from database to dictionary.
 

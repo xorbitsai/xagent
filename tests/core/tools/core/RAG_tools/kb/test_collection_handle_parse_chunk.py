@@ -528,3 +528,110 @@ class TestHandleChunkRollback:
         other = make_handle("coll_b")
         with pytest.raises(DocumentValidationError, match="cannot restore"):
             other.restore_chunks(snapshot)
+
+
+class TestHandleRetireSupersededChunks:
+    @staticmethod
+    def _doc(content_hash) -> None:
+        get_vector_index_store().upsert_documents(
+            [
+                {
+                    "collection": "coll",
+                    "doc_id": "d1",
+                    "file_id": None,
+                    "source_path": "/x.txt",
+                    "file_type": "txt",
+                    "content_hash": content_hash,
+                    "uploaded_at": datetime.now(timezone.utc),
+                    "title": None,
+                    "language": None,
+                    "user_id": None,
+                }
+            ]
+        )
+
+    @staticmethod
+    def _chunk(chunk_id: str, parse_hash: str, config_hash: str, made_from) -> None:
+        from xagent.core.tools.core.RAG_tools.utils.metadata_utils import (
+            serialize_metadata,
+        )
+
+        get_vector_index_store().upsert_chunks(
+            [
+                {
+                    "collection": "coll",
+                    "doc_id": "d1",
+                    "parse_hash": parse_hash,
+                    "chunk_id": chunk_id,
+                    "index": 0,
+                    "text": chunk_id,
+                    "page_number": None,
+                    "section": None,
+                    "anchor": None,
+                    "json_path": None,
+                    "chunk_hash": "x",
+                    "config_hash": config_hash,
+                    "created_at": datetime.now(timezone.utc),
+                    "metadata": serialize_metadata(
+                        {"content_hash": made_from} if made_from else None
+                    ),
+                    "user_id": None,
+                }
+            ]
+        )
+
+    @staticmethod
+    def _ids(handle: LanceDBCollectionHandle) -> set[str]:
+        store = get_vector_index_store()
+        return {
+            row["chunk_id"]
+            for batch in store.iter_batches(
+                table_name="chunks",
+                filters={"collection": "coll", "doc_id": "d1"},
+                user_id=None,
+                is_admin=True,
+            )
+            for row in batch.to_pylist()
+        }
+
+    def test_deletes_chunks_of_other_content_in_every_parse_hash(self) -> None:
+        handle = make_handle("coll")
+        self._doc("C2")
+        self._chunk("old-p1", "p1", "cfg-old1", "C1")
+        self._chunk("old-p2", "p2", "cfg-old2", "C1")
+        self._chunk("new-p1", "p1", "cfg-new", "C2")
+        assert handle.retire_superseded_chunks("d1") == 2
+        assert self._ids(handle) == {"new-p1"}
+
+    def test_keeps_every_chunk_config_made_from_the_current_content(self) -> None:
+        handle = make_handle("coll")
+        self._doc("C2")
+        self._chunk("a", "p1", "cfg-a", "C2")
+        self._chunk("b", "p1", "cfg-b", "C2")
+        self._chunk("c", "p2", "cfg-c", "C2")
+        assert handle.retire_superseded_chunks("d1") == 0
+        assert self._ids(handle) == {"a", "b", "c"}
+
+    def test_chunks_that_record_no_content_are_superseded(self) -> None:
+        handle = make_handle("coll")
+        self._doc("C2")
+        self._chunk("legacy", "p1", "cfg-legacy", None)
+        self._chunk("new", "p1", "cfg-new", "C2")
+        assert handle.retire_superseded_chunks("d1") == 1
+        assert self._ids(handle) == {"new"}
+
+    def test_keeps_a_key_shared_with_a_current_chunk(self) -> None:
+        handle = make_handle("coll")
+        self._doc("C2")
+        self._chunk("old", "p1", "cfg", "C1")
+        self._chunk("new", "p1", "cfg", "C2")
+        assert handle.retire_superseded_chunks("d1") == 0
+        assert self._ids(handle) == {"old", "new"}
+
+    @pytest.mark.parametrize("content_hash", [None, ""])
+    def test_does_nothing_without_a_document_content_hash(self, content_hash) -> None:
+        handle = make_handle("coll")
+        self._doc(content_hash)
+        self._chunk("old", "p1", "cfg", "C1")
+        assert handle.retire_superseded_chunks("d1") == 0
+        assert self._ids(handle) == {"old"}

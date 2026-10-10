@@ -168,13 +168,21 @@ def _chunks(
     from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc)
+    document = handle.load_document(doc_id, is_admin=True)
+    made_from = {"content_hash": document.content_hash} if document else {}
     handle.write_chunks(
         doc_id,
         parse_hash,
         "cfg",
         {},
         [
-            {"chunk_id": c, "index": i, "text": f"kiwi {c}", "created_at": now}
+            {
+                "chunk_id": c,
+                "index": i,
+                "text": f"kiwi {c}",
+                "created_at": now,
+                "metadata": made_from,
+            }
             for i, c in enumerate(ids)
         ],
         user_id=user_id,

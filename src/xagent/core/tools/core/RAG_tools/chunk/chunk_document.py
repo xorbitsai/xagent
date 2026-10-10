@@ -22,6 +22,7 @@ from ..core.exceptions import (
 )
 from ..core.schemas import ChunkStrategy
 from ..utils.hash_utils import compute_chunk_hash
+from ..utils.metadata_utils import CONTENT_HASH_KEY
 from .chunk_strategies import (
     _create_chunk_record,
     apply_fixed_size_strategy,
@@ -198,7 +199,12 @@ def _chunk_document_impl(
 
     # Compute configuration-level hash for this chunking run
     try:
-        config_hash = compute_chunk_hash("", params)
+        document = handle.load_document(doc_id, user_id=user_id, is_admin=is_admin)
+        content_hash = getattr(document, "content_hash", None)
+        # The file hash takes the text slot: new content must not reuse old chunks.
+        content_hash = content_hash if isinstance(content_hash, str) else ""
+        config_hash = compute_chunk_hash(content_hash, params)
+        made_from = {CONTENT_HASH_KEY: content_hash} if content_hash else {}
     except Exception as e:
         raise DocumentValidationError(f"Failed to compute config_hash: {e}") from e
 
@@ -279,7 +285,9 @@ def _chunk_document_impl(
                 "anchor": chunk.get("anchor"),
                 "json_path": chunk.get("json_path"),
                 "created_at": chunk.get("created_at", pd.Timestamp.now(tz="UTC")),
-                "metadata": chunk.get("metadata"),
+                "metadata": {**(chunk.get("metadata") or {}), **made_from}
+                if made_from
+                else chunk.get("metadata"),
             }
         )
 

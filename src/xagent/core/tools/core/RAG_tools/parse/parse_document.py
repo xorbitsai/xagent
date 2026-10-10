@@ -5,6 +5,7 @@ document parsing by calling the unified document parsing tool.
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -114,6 +115,30 @@ def _parse_document_impl(
     return response.model_dump()
 
 
+def _parse_is_current(
+    handle: "KBCollectionHandle",
+    doc_id: str,
+    parse_hash: str,
+    content_hash: str,
+    user_id: Optional[int],
+    is_admin: bool,
+) -> bool:
+    """Whether the stored parse was made from this file content.
+
+    A parse without a recorded content hash counts as stale: parse_hash ignores content.
+    """
+    record = handle.read_latest_parse_record(
+        doc_id, parse_hash=parse_hash, user_id=user_id, is_admin=is_admin
+    )
+    if record is None:
+        return False
+    try:
+        stored = json.loads(record.params_json or "{}").get("content_hash")
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(stored == content_hash)
+
+
 async def _parse_document_internal(
     request: ParseDocumentRequest,
     progress_callback: Optional[Any] = None,
@@ -162,7 +187,14 @@ async def _parse_document_internal(
     parse_hash = compute_parse_hash(str(parse_method), params)
     logger.info("Computed parse hash: %s", parse_hash)
 
-    if handle.parse_exists(doc_id, parse_hash, user_id=user_id, is_admin=is_admin):
+    content_hash = document.get("content_hash")
+    content_hash = content_hash if isinstance(content_hash, str) else ""
+    if handle.parse_exists(doc_id, parse_hash, user_id=user_id, is_admin=is_admin) and (
+        not content_hash
+        or _parse_is_current(
+            handle, doc_id, parse_hash, content_hash, user_id, is_admin
+        )
+    ):
         existing_paragraphs = handle.read_parse_paragraphs(
             doc_id, parse_hash, user_id=user_id, is_admin=is_admin
         )
@@ -281,7 +313,7 @@ async def _parse_document_internal(
         doc_id,
         parse_hash,
         str(parse_method),
-        params,
+        {**params, "content_hash": content_hash} if content_hash else params,
         enriched_paragraphs,
         user_id=user_id,
     )

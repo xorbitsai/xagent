@@ -234,6 +234,7 @@ class TestHandleReadChunksNeedingEmbedding:
         from unittest.mock import MagicMock
 
         handle, store = _mock_store_handle("coll")
+        object.__setattr__(handle, "load_document", MagicMock(return_value=None))
         store.count_rows_or_zero.side_effect = [1, 0]  # 1 chunk, 0 embeddings
         batch = MagicMock()
         batch.to_pylist.return_value = [
@@ -659,13 +660,17 @@ class TestHandleWriteEmbeddingsMechanics:
             )
 
 
-def test_commit_embeddings_does_nothing_on_lancedb():
+def test_commit_embeddings_runs_the_gate_and_writes_nothing_on_lancedb():
     handle = make_handle()
+    gates: list[int] = []
 
-    def gate() -> None:
-        raise AssertionError("the commit gate must not run on LanceDB")
-
-    assert handle.commit_embeddings("d", "p", "m", commit_gate=gate, user_id=1) is None
+    assert (
+        handle.commit_embeddings(
+            "d", "p", "m", commit_gate=lambda: gates.append(1), user_id=1
+        )
+        is None
+    )
+    assert gates == [1]
 
 
 def test_discarding_uncommitted_embeddings_does_nothing_on_lancedb():

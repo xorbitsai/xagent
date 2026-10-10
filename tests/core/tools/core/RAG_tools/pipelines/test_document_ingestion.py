@@ -1455,6 +1455,7 @@ def test_process_document_compacts_storage_after_success(
     _patch_pipeline_dependencies(monkeypatch)
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.return_value = ["documents"]
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1489,6 +1490,7 @@ def test_process_document_succeeds_when_compaction_fails(
     _patch_pipeline_dependencies(monkeypatch)
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.side_effect = RuntimeError("optimize exploded")
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1521,6 +1523,7 @@ def test_process_document_compacts_storage_after_failure(
     monkeypatch.setattr(document_ingestion, "chunk_document", _boom)
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.return_value = []
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):
@@ -1564,6 +1567,7 @@ def test_process_document_compaction_covers_vendor_prefixed_model_ids(
     )
 
     store = Mock()
+    store.iter_batches.return_value = []
     store.compact_tables.return_value = []
 
     with patch.object(StorageFactory, "get_vector_index_store", return_value=store):

@@ -8,6 +8,7 @@ vi.mock("./api-wrapper", async (importOriginal) => ({
 
 import { apiRequest } from "./api-wrapper"
 import {
+  getProviderModels,
   getUserDefaultModels,
   getUserModels,
   hostnameFromUrl,
@@ -96,6 +97,39 @@ beforeEach(() => {
   mockedRequest.mockReset()
 })
 
+describe("getProviderModels", () => {
+  it("preserves a missing-catalog signal so compatible endpoints allow manual entry", async () => {
+    mockedRequest.mockResolvedValueOnce(jsonResponse({
+      models: [],
+      count: 0,
+      catalog_unavailable: true,
+      warning: "Enter the model name manually.",
+    }))
+
+    await expect(getProviderModels("claude", {
+      api_key: "synthetic-key",
+      base_url: "https://bedrock.example.com/anthropic/v1",
+    })).resolves.toEqual({
+      models: [],
+      catalogUnavailable: true,
+      warning: "Enter the model name manually.",
+    })
+  })
+
+  it("keeps ordinary model catalogs distinguishable from a missing catalog", async () => {
+    mockedRequest.mockResolvedValueOnce(jsonResponse({
+      models: [{ id: "claude-test" }],
+      count: 1,
+    }))
+
+    await expect(getProviderModels("claude")).resolves.toEqual({
+      models: [{ id: "claude-test" }],
+      catalogUnavailable: false,
+      warning: undefined,
+    })
+  })
+})
+
 describe("hostnameFromUrl", () => {
   it("returns empty string for missing url", () => {
     expect(hostnameFromUrl(undefined)).toBe("")
@@ -136,6 +170,8 @@ describe("model producer decoders", () => {
     expect(Object.keys(parsed?.[0] ?? {}).sort()).toEqual([
       "abilities",
       "base_url",
+      "bedrock_auth_mode",
+      "bedrock_region",
       "can_delete",
       "can_edit",
       "category",
@@ -155,6 +191,22 @@ describe("model producer decoders", () => {
     ])
     ;(raw.abilities as unknown as string[]).push("mutated")
     expect(parsed?.[0].abilities).toEqual(["chat"])
+  })
+
+  it("preserves Bedrock settings in the UI model payload", () => {
+    const parsed = parseModelList([model({
+      model_provider: "bedrock",
+      model_name: "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example",
+      base_url: "https://bedrock-runtime.us-west-2.amazonaws.com",
+      bedrock_region: "us-west-2",
+      bedrock_auth_mode: "credentials_chain",
+    })])
+
+    expect(parsed?.[0]).toEqual(expect.objectContaining({
+      model_provider: "bedrock",
+      bedrock_region: "us-west-2",
+      bedrock_auth_mode: "credentials_chain",
+    }))
   })
 
   it.each([

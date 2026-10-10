@@ -2090,6 +2090,7 @@ const zh = {
         baseUrlHint: "填写任何兼容 OpenAI API 协议的服务地址,例如 vLLM、Together 或自建的本地服务。",
         testConnection: "测试模型连接",
         testSuccess: "连接成功！模型工作正常。",
+        catalogUnavailable: "此兼容端点不提供模型列表。请手动输入模型名称，然后测试模型连接。",
         selectModelWarning: "请选择一个模型",
         activate: "激活",
         defaultModels: "默认模型",
@@ -2114,6 +2115,10 @@ const zh = {
       apiKeyPlaceholderEdit: "留空以保持不变",
       baseUrl: "基础 URL",
       baseUrlPlaceholder: "https://api.openai.com/v1",
+      region: "AWS 区域",
+      authMode: "认证方式",
+      bedrockApiKey: "Amazon Bedrock API 密钥",
+      awsCredentialsChain: "AWS 凭证链",
       abilities: "能力选择",
       description: "描述",
       selectModel: "选择模型名称",
@@ -2143,6 +2148,9 @@ const zh = {
       rerank: "重排序",
     },
     providers: {
+      bedrock: {
+        description: "通过原生 Converse API 使用 Amazon Bedrock 模型。",
+      },
       openai: {
         description: "访问 GPT-4o、GPT-4 Turbo 和 DALL-E 3 模型。推理和创造力的行业标准。",
       },

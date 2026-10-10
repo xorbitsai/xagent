@@ -41,6 +41,8 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         context_window = Column(
             Integer, nullable=True
         )  # Total context window in tokens
+        bedrock_region = Column(String(64), nullable=True)
+        bedrock_auth_mode = Column(String(32), nullable=True)
         dimension = Column(
             Integer, nullable=True
         )  # Vector dimension for embedding models
@@ -53,7 +55,9 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         created_at = Column(DateTime(timezone=True), server_default=func.now())
         updated_at = Column(DateTime(timezone=True), onupdate=func.now())
         is_active = Column(Boolean, default=True)
-        _api_key_encrypted = Column(String(500), nullable=False)
+        # Fernet expands the plaintext substantially. Cloud credentials and
+        # signed tokens can exceed VARCHAR(500) after encryption.
+        _api_key_encrypted = Column(Text, nullable=False)
 
         # Properties
         @property

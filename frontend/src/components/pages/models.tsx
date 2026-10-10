@@ -78,6 +78,8 @@ export interface Model {
   model_provider: string
   model_name: string
   base_url?: string
+  bedrock_region?: string
+  bedrock_auth_mode?: "api_key" | "credentials_chain"
   temperature?: number
   context_window?: number
   dimension?: number
@@ -99,6 +101,8 @@ export interface ModelCreate {
   model_name: string
   api_key: string
   base_url?: string
+  bedrock_region?: string
+  bedrock_auth_mode?: "api_key" | "credentials_chain"
   temperature?: number
   context_window?: number
   dimension?: number
@@ -117,6 +121,7 @@ export interface ProviderConfig {
   categoryBaseUrls?: Record<string, string>
   category: string[]
   requires_base_url?: boolean
+  supportsModelListing?: boolean
 }
 
 const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
@@ -187,6 +192,9 @@ const LOCAL_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> = {
   claude: {
     icon: <img src="/claude.svg" alt="Claude" className="w-6 h-6" />,
     defaultBaseUrl: "https://api.anthropic.com/v1",
+  },
+  bedrock: {
+    icon: <Box className="w-6 h-6 text-orange-500" />,
   },
   xinference: {
     icon: <img src="/xagent_logo.png" alt="Xinference" className="w-6 h-6" />,
@@ -293,7 +301,8 @@ export function ModelsPage() {
           defaultBaseUrl: p.default_base_url || localConfig.defaultBaseUrl,
           categoryBaseUrls: localConfig.categoryBaseUrls,
           category: p.category || ["llm"],
-          requires_base_url: p.requires_base_url
+          requires_base_url: p.requires_base_url,
+          supportsModelListing: p.supports_model_listing !== false,
         }
       })
       setProviders(mergedProviders)

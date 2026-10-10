@@ -4,15 +4,20 @@ import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 from urllib.parse import quote
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from tests.shared.auth_database import auth_db_override
+from xagent.core.model.chat.basic.claude import AnthropicAuthenticationError
+from xagent.core.model.chat.basic.bedrock import BedrockLLM
 from xagent.core.model.model import ChatModelConfig, EmbeddingModelConfig
+from xagent.core.agent.service import AgentService
 from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
@@ -451,6 +456,53 @@ def test_ordinary_model_create_update_delete_remains_compatible(
 
     deleted = client.delete("/api/models/test-openai-model", headers=admin_headers)
     assert deleted.status_code == 200
+
+
+def test_long_model_credential_round_trips_through_runtime_adapter(
+    test_db, admin_headers, sample_model_data
+):
+    first_key = "a" * 1000
+    payload = {
+        **sample_model_data,
+        "model_id": "long-credential-model",
+        "model_provider": "claude",
+        "model_name": "au.anthropic.claude-opus-5-5",
+        "base_url": "https://bedrock.example.com/anthropic/v1",
+        "api_key": first_key,
+    }
+
+    created = client.post("/api/models/", headers=admin_headers, json=payload)
+    assert created.status_code == 200
+
+    db = next(get_db())
+    try:
+        stored = db.query(DBModel).filter_by(model_id="long-credential-model").one()
+        assert len(stored._api_key_encrypted) > 500
+        assert stored.api_key == first_key
+        runtime = CoreStorage(db, DBModel).get_llm_by_id("long-credential-model")
+        assert runtime is not None
+        assert runtime.api_key == first_key
+        assert runtime.base_url == "https://bedrock.example.com/anthropic/v1"
+    finally:
+        db.close()
+
+    second_key = "b" * 1200
+    updated = client.put(
+        "/api/models/long-credential-model",
+        headers=admin_headers,
+        json={"api_key": second_key},
+    )
+    assert updated.status_code == 200
+
+    db = next(get_db())
+    try:
+        stored = db.query(DBModel).filter_by(model_id="long-credential-model").one()
+        assert len(stored._api_key_encrypted) > 500
+        assert stored.api_key == second_key
+        loaded = CoreStorage(db, DBModel).load("long-credential-model")
+        assert loaded.api_key == second_key
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -1189,6 +1241,318 @@ class TestModelAPI:
         assert data["can_delete"] is True
         assert data["is_shared"] is False
 
+    def test_bedrock_settings_survive_create_list_and_runtime_reload(
+        self, test_db, regular_user, regular_headers
+    ):
+        payload = {
+            "model_id": "bedrock-profile",
+            "category": "llm",
+            "model_provider": "bedrock",
+            "model_name": (
+                "arn:aws:bedrock:us-west-2:123456789012:inference-profile/example"
+            ),
+            "api_key": "bedrock-test-token",
+            "base_url": "https://bedrock-runtime.us-west-2.amazonaws.com",
+            "bedrock_region": "us-west-2",
+            "bedrock_auth_mode": "api_key",
+            "abilities": ["chat", "tool_calling"],
+        }
+
+        created = client.post("/api/models/", json=payload, headers=regular_headers)
+        assert created.status_code == 200
+        assert created.json()["bedrock_region"] == "us-west-2"
+        assert created.json()["bedrock_auth_mode"] == "api_key"
+
+        listed = client.get("/api/models/", headers=regular_headers)
+        assert listed.status_code == 200
+        saved = next(
+            item for item in listed.json() if item["model_id"] == "bedrock-profile"
+        )
+        assert saved["bedrock_region"] == "us-west-2"
+        assert saved["bedrock_auth_mode"] == "api_key"
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-profile")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_region == "us-west-2"
+        assert config.bedrock_auth_mode == "api_key"
+        assert config.api_key == "bedrock-test-token"
+
+    def test_bedrock_connection_test_uses_native_runtime(
+        self, test_db, regular_user, regular_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **request: Any) -> dict[str, Any]:
+                assert request["modelId"] == "amazon.nova-lite-v1:0"
+                assert request["messages"][-1]["content"] == [{"text": "Hello"}]
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "Hello from Bedrock"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 2},
+                }
+
+        synthetic_client = SyntheticBedrockClient()
+        with patch.object(
+            BedrockLLM, "_build_client", return_value=synthetic_client
+        ) as build_client:
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "amazon.nova-lite-v1:0",
+                    "api_key": "bedrock-test-token",
+                    "bedrock_region": "us-east-1",
+                    "bedrock_auth_mode": "api_key",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        build_client.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_bedrock_saved_model_runs_agent_tool_loop_end_to_end(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-agent-e2e",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "amazon.nova-lite-v1:0",
+                "api_key": "bedrock-test-token",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+                "abilities": ["chat", "tool_calling"],
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        db = next(get_db())
+        try:
+            llm = CoreStorage(db, DBModel).get_llm_by_id("bedrock-agent-e2e")
+        finally:
+            db.close()
+        assert llm is not None
+        bedrock = llm._inner
+        assert isinstance(bedrock, BedrockLLM)
+        assert bedrock.region_name == "us-east-1"
+        assert bedrock.auth_mode == "api_key"
+
+        class SyntheticBedrockClient:
+            def __init__(self) -> None:
+                self.requests: list[dict[str, Any]] = []
+
+            def converse_stream(self, **request: Any) -> dict[str, Any]:
+                self.requests.append(request)
+                if len(self.requests) == 1:
+                    events = [
+                        {"messageStart": {"role": "assistant"}},
+                        {
+                            "contentBlockStart": {
+                                "contentBlockIndex": 0,
+                                "start": {
+                                    "toolUse": {
+                                        "toolUseId": "call-weather",
+                                        "name": "weather",
+                                    }
+                                },
+                            }
+                        },
+                        {
+                            "contentBlockDelta": {
+                                "contentBlockIndex": 0,
+                                "delta": {"toolUse": {"input": '{"city":"Paris"}'}},
+                            }
+                        },
+                        {"contentBlockStop": {"contentBlockIndex": 0}},
+                        {"messageStop": {"stopReason": "tool_use"}},
+                        {"metadata": {"usage": {"inputTokens": 2, "outputTokens": 3}}},
+                    ]
+                else:
+                    events = [
+                        {"messageStart": {"role": "assistant"}},
+                        {
+                            "contentBlockDelta": {
+                                "contentBlockIndex": 0,
+                                "delta": {"text": "Paris is 18 C."},
+                            }
+                        },
+                        {"contentBlockStop": {"contentBlockIndex": 0}},
+                        {"messageStop": {"stopReason": "end_turn"}},
+                        {"metadata": {"usage": {"inputTokens": 4, "outputTokens": 5}}},
+                    ]
+                return {"stream": iter(events)}
+
+        class WeatherTool:
+            name = "weather"
+
+            class Metadata:
+                name = "weather"
+                description = "Return synthetic weather for one city."
+
+            metadata = Metadata()
+
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            def args_type(self) -> type:
+                class Args:
+                    @staticmethod
+                    def model_json_schema() -> dict[str, Any]:
+                        return {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"],
+                        }
+
+                return Args
+
+            async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+                self.calls.append(args)
+                return {"city": args["city"], "temperature_c": 18}
+
+            async def setup(self, task_id: str | None = None) -> None:
+                return None
+
+            async def teardown(self, task_id: str | None = None) -> None:
+                return None
+
+        synthetic_client = SyntheticBedrockClient()
+        bedrock._client = synthetic_client
+        weather = WeatherTool()
+        service = AgentService(
+            name="bedrock-e2e",
+            id="bedrock-e2e",
+            pattern="react",
+            llm=llm,
+            tools=[weather],
+            tool_config=None,
+            enable_workspace=False,
+            skills_enabled=False,
+            memory_enabled=False,
+            user_interaction_enabled=False,
+        )
+        service.allowed_skills = []
+
+        result = await service.execute_task(
+            "What is the weather in Paris?", task_id="bedrock-agent-e2e"
+        )
+
+        assert result["success"] is True
+        assert result["output"] == "Paris is 18 C."
+        assert weather.calls == [{"city": "Paris"}]
+        assert len(synthetic_client.requests) == 2
+        tool_result = synthetic_client.requests[1]["messages"][-1]["content"][0]
+        assert tool_result["toolResult"]["toolUseId"] == "call-weather"
+        result_text = tool_result["toolResult"]["content"][0]["text"]
+        assert "'city': 'Paris'" in result_text
+        assert "'temperature_c': 18" in result_text
+
+    def test_bedrock_credentials_chain_does_not_require_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+                "abilities": ["chat", "tool_calling"],
+            },
+            headers=regular_headers,
+        )
+        assert response.status_code == 200
+
+    def test_bedrock_credentials_chain_rejects_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-chain-with-key",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "must-not-be-retained",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "credentials_chain",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 400
+        assert "cannot include an API key" in response.json()["detail"]
+
+    def test_switching_bedrock_to_credentials_chain_clears_api_key(
+        self, test_db, regular_user, regular_headers
+    ):
+        created = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-switch-auth",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert created.status_code == 200
+
+        updated = client.put(
+            "/api/models/bedrock-switch-auth",
+            json={"bedrock_auth_mode": "credentials_chain", "api_key": ""},
+            headers=regular_headers,
+        )
+        assert updated.status_code == 200
+
+        db = next(get_db())
+        try:
+            config = CoreStorage(db, DBModel).load("bedrock-switch-auth")
+        finally:
+            db.close()
+        assert isinstance(config, ChatModelConfig)
+        assert config.bedrock_auth_mode == "credentials_chain"
+        assert config.api_key == ""
+
+    def test_bedrock_rejects_mantle_endpoint(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.post(
+            "/api/models/",
+            json={
+                "model_id": "bedrock-mantle",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "anthropic.claude-sonnet-4-5-v1:0",
+                "api_key": "bedrock-test-token",
+                "base_url": "https://bedrock-mantle.us-east-1.api.aws/v1",
+                "bedrock_region": "us-east-1",
+                "bedrock_auth_mode": "api_key",
+            },
+            headers=regular_headers,
+        )
+        assert response.status_code == 400
+        assert "do not support Converse" in response.json()["detail"]
+
     def test_create_shared_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data
     ):
@@ -1826,6 +2190,22 @@ class TestModelAPI:
         assert deepseek["category"] == ["llm"]
         assert deepseek["default_base_url"] == "https://api.deepseek.com"
 
+    def test_list_supported_providers_marks_bedrock_catalog_optional(
+        self, test_db, regular_user, regular_headers
+    ):
+        response = client.get(
+            "/api/models/providers/supported", headers=regular_headers
+        )
+        assert response.status_code == 200
+        bedrock = next(
+            provider
+            for provider in response.json()["providers"]
+            if provider["id"] == "bedrock"
+        )
+        assert bedrock["category"] == ["llm"]
+        assert bedrock["supports_model_listing"] is False
+        assert bedrock["requires_base_url"] is False
+
     def test_list_supported_providers_includes_multi_category_provider(
         self, test_db, regular_user, regular_headers
     ):
@@ -1935,6 +2315,87 @@ class TestModelAPI:
         assert response.status_code == 200
         assert captured["api_key"] == "test-api-key"
         assert captured["base_url"] == "https://custom.example.com/v1"
+
+    def test_claude_compatible_endpoint_without_catalog_allows_manual_entry(
+        self, test_db, regular_user, regular_headers, monkeypatch
+    ):
+        from xagent.core.model.chat.basic.claude import ModelCatalogUnavailableError
+
+        fetch = AsyncMock(
+            side_effect=ModelCatalogUnavailableError("catalog is unavailable")
+        )
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://bedrock.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "provider": "claude",
+            "models": [],
+            "count": 0,
+            "catalog_unavailable": True,
+            "warning": (
+                "This compatible endpoint does not provide a model catalog. "
+                "Enter the model name manually, then test the model connection."
+            ),
+        }
+        fetch.assert_awaited_once_with(
+            "claude",
+            "synthetic-secret",
+            "https://bedrock.example.com/anthropic/v1",
+            raise_on_error=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "status_code"),
+        [
+            (AnthropicAuthenticationError("Invalid Anthropic API key", 401), 401),
+            (
+                AnthropicAuthenticationError(
+                    "Anthropic API key is not authorized", 403
+                ),
+                403,
+            ),
+            (httpx.ReadTimeout("timed out"), 502),
+        ],
+    )
+    def test_claude_catalog_real_failures_are_not_treated_as_missing_catalog(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        monkeypatch,
+        error,
+        status_code,
+    ):
+        fetch = AsyncMock(side_effect=error)
+        monkeypatch.setattr(
+            "xagent.web.services.model_list_service.fetch_models_from_provider",
+            fetch,
+        )
+
+        response = client.post(
+            "/api/models/providers/claude/models",
+            json={
+                "api_key": "synthetic-secret",
+                "base_url": "https://compatible.example.com/anthropic/v1",
+            },
+            headers=regular_headers,
+        )
+
+        assert response.status_code == status_code
+        assert response.json().get("catalog_unavailable") is None
+        assert "synthetic-secret" not in response.text
 
     def test_fetch_provider_models_requires_base_url_for_openai_compatible(
         self, test_db, regular_user, regular_headers

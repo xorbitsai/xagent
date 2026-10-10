@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -75,6 +75,11 @@ class ChatModelConfig(ModelConfig):
     # deployment-owned models keep the default and their environment-based
     # credentials.
     explicit_credentials_only: bool = False
+    # Amazon Bedrock Converse settings. ``base_url`` remains the optional
+    # Bedrock Runtime endpoint override; these fields carry the settings that
+    # cannot be represented by the generic model configuration.
+    bedrock_region: Optional[str] = None
+    bedrock_auth_mode: Literal["api_key", "credentials_chain"] = "api_key"
 
 
 class ImageModelConfig(ModelConfig):

@@ -26,6 +26,18 @@ from .base import BaseLLM
 logger = logging.getLogger(__name__)
 
 
+class ModelCatalogUnavailableError(RuntimeError):
+    """Raised when a compatible endpoint does not implement model listing."""
+
+
+class AnthropicAuthenticationError(ValueError):
+    """Raised when Anthropic rejects a catalog request's credentials."""
+
+    def __init__(self, message: str, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
     """Normalize Anthropic usage to (input_tokens, cache_read, cache_write).
 
@@ -1287,7 +1299,8 @@ class ClaudeLLM(BaseLLM):
         """
         import httpx
 
-        # Use official API if no custom base_url provided
+        # Use official API if no custom base_url provided. Only custom compatible
+        # endpoints may legitimately omit Anthropic's model catalog endpoint.
         if base_url is None:
             base_url = "https://api.anthropic.com"
 
@@ -1295,6 +1308,9 @@ class ClaudeLLM(BaseLLM):
         base_url = base_url.rstrip("/")
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
+        is_custom_endpoint = httpx.URL(base_url) != httpx.URL(
+            "https://api.anthropic.com"
+        )
 
         url = base_url + "/v1/models"
         headers = {
@@ -1331,7 +1347,17 @@ class ClaudeLLM(BaseLLM):
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error fetching Claude models: {e.response.status_code}")
             if e.response.status_code == 401:
-                raise ValueError("Invalid Anthropic API key") from e
+                raise AnthropicAuthenticationError(
+                    "Invalid Anthropic API key", status_code=401
+                ) from e
+            if e.response.status_code == 403:
+                raise AnthropicAuthenticationError(
+                    "Anthropic API key is not authorized", status_code=403
+                ) from e
+            if e.response.status_code == 404 and is_custom_endpoint:
+                raise ModelCatalogUnavailableError(
+                    "This Anthropic-compatible endpoint does not provide a model catalog"
+                ) from e
             raise
         except Exception as e:
             logger.error(f"Failed to fetch Claude models: {e}")

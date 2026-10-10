@@ -75,18 +75,27 @@ def _ensure_ordinary_model(model: Model) -> None:
 
 
 def _create_llm_instance(db_model: Model) -> BaseLLM:
+    config: ModelConfig
     if db_model.category == "llm":
-        config: ModelConfig = ChatModelConfig(
-            id=db_model.model_id,
-            model_name=db_model.model_name,
-            model_provider=db_model.model_provider,
-            api_key=db_model.api_key,
-            base_url=db_model.base_url,
-            default_temperature=db_model.temperature,
-            context_window=db_model.context_window,
-            abilities=db_model.abilities,
-            description=db_model.description,
-        )
+        chat_fields: dict[str, Any] = {
+            "id": db_model.model_id,
+            "model_name": db_model.model_name,
+            "model_provider": db_model.model_provider,
+            "api_key": db_model.api_key,
+            "base_url": db_model.base_url,
+            "default_temperature": db_model.temperature,
+            "context_window": db_model.context_window,
+            "abilities": db_model.abilities,
+            "description": db_model.description,
+        }
+        if db_model.model_provider == "bedrock":
+            chat_fields.update(
+                {
+                    "bedrock_region": db_model.bedrock_region,
+                    "bedrock_auth_mode": db_model.bedrock_auth_mode or "api_key",
+                }
+            )
+        config = ChatModelConfig(**chat_fields)
     elif db_model.category == "embedding":
         config = EmbeddingModelConfig(
             id=db_model.model_id,
@@ -144,13 +153,21 @@ class CoreStorage:
         }
 
         if db_model.category == "llm":
-            return ChatModelConfig(
+            chat_fields = {
                 **common,
-                model_provider=db_model.model_provider,
-                default_temperature=db_model.temperature,
-                default_max_tokens=db_model.max_tokens,
-                context_window=db_model.context_window,
-            )
+                "model_provider": db_model.model_provider,
+                "default_temperature": db_model.temperature,
+                "default_max_tokens": db_model.max_tokens,
+                "context_window": db_model.context_window,
+            }
+            if db_model.model_provider == "bedrock":
+                chat_fields.update(
+                    {
+                        "bedrock_region": db_model.bedrock_region,
+                        "bedrock_auth_mode": db_model.bedrock_auth_mode or "api_key",
+                    }
+                )
+            return ChatModelConfig(**chat_fields)
         elif db_model.category == "image":
             from ...core.model.model import ImageModelConfig
 
@@ -248,6 +265,8 @@ class CoreStorage:
                     "temperature": model.default_temperature,
                     "max_tokens": model.default_max_tokens,
                     "context_window": model.context_window,
+                    "bedrock_region": getattr(model, "bedrock_region", None),
+                    "bedrock_auth_mode": getattr(model, "bedrock_auth_mode", None),
                     "category": "llm",
                 }
             )

@@ -2,6 +2,7 @@ import copy
 import os
 import re
 from typing import Any, Mapping, Optional
+from urllib.parse import urlsplit
 
 # When an OpenRouter or configured router model carries this name, route the
 # prompt through xrouter-llm (in-process) instead of calling a provider directly.
@@ -329,6 +330,46 @@ def _normalize_provider(provider: str) -> str:
 def canonical_provider_name(provider: str) -> str:
     normalized = _normalize_provider(provider)
     return _PROVIDER_ALIASES.get(normalized, normalized)
+
+
+_AWS_REGION_PATTERN = re.compile(r"^[a-z]{2}(?:-[a-z0-9]+)+-\d+$")
+
+
+def validate_bedrock_settings(
+    *,
+    region: Optional[str],
+    auth_mode: str,
+    api_key: Optional[str],
+    endpoint_url: Optional[str],
+) -> None:
+    """Validate the persisted settings for the native Bedrock runtime."""
+
+    normalized_region = (region or "").strip()
+    if not normalized_region or not _AWS_REGION_PATTERN.fullmatch(normalized_region):
+        raise ValueError("A valid AWS region is required for Amazon Bedrock")
+    if auth_mode not in {"api_key", "credentials_chain"}:
+        raise ValueError("Unsupported Amazon Bedrock authentication mode")
+    if auth_mode == "api_key" and is_placeholder_api_key(api_key):
+        raise ValueError(
+            "An Amazon Bedrock API key is required for api_key authentication"
+        )
+    if auth_mode == "credentials_chain" and not is_placeholder_api_key(api_key):
+        raise ValueError(
+            "Amazon Bedrock credentials_chain authentication cannot include an API key"
+        )
+    if not endpoint_url:
+        return
+    parsed = urlsplit(endpoint_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("The Amazon Bedrock runtime endpoint must be an HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "The Amazon Bedrock runtime endpoint contains unsupported URL components"
+        )
+    if parsed.hostname.lower().startswith("bedrock-mantle."):
+        raise ValueError(
+            "bedrock-mantle endpoints do not support Converse; use a bedrock-runtime endpoint"
+        )
 
 
 def is_placeholder_api_key(api_key: Optional[str]) -> bool:

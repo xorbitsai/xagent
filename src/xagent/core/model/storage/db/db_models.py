@@ -41,6 +41,8 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         context_window = Column(
             Integer, nullable=True
         )  # Total context window in tokens
+        bedrock_region = Column(String(64), nullable=True)
+        bedrock_auth_mode = Column(String(32), nullable=True)
         dimension = Column(
             Integer, nullable=True
         )  # Vector dimension for embedding models

@@ -105,6 +105,8 @@ class ModelStore:
             "model_provider": db_model.model_provider,
             "model_name": db_model.model_name,
             "base_url": db_model.base_url,
+            "bedrock_region": db_model.bedrock_region,
+            "bedrock_auth_mode": db_model.bedrock_auth_mode,
             "temperature": db_model.temperature,
             "context_window": db_model.context_window,
             "dimension": db_model.dimension,

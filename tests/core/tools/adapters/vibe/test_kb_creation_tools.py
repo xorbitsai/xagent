@@ -204,38 +204,6 @@ async def test_agent_kb_service_publish_collection_preserves_existing_backend_bi
 
 
 @pytest.mark.asyncio
-async def test_agent_kb_service_refresh_collection_metadata_forces_realtime_for_admin():
-    refresh_metadata = AsyncMock()
-    service = AgentKnowledgeBaseService(user_id=71, is_admin=True)
-
-    with patch(
-        "xagent.core.tools.core.RAG_tools.management.collections.list_collections",
-        new=refresh_metadata,
-    ):
-        await service.refresh_collection_metadata("agent_url_kb")
-
-    refresh_metadata.assert_awaited_once_with(
-        user_id=71,
-        is_admin=True,
-        force_realtime=True,
-    )
-
-
-@pytest.mark.asyncio
-async def test_agent_kb_service_refresh_collection_metadata_skips_non_admin_refresh():
-    refresh_metadata = AsyncMock()
-    service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
-
-    with patch(
-        "xagent.core.tools.core.RAG_tools.management.collections.list_collections",
-        new=refresh_metadata,
-    ):
-        await service.refresh_collection_metadata("agent_url_kb")
-
-    refresh_metadata.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_agent_kb_service_publish_collection_persists_config():
     metadata_store = MagicMock()
     metadata_store.save_collection_config = AsyncMock()
@@ -288,24 +256,6 @@ async def test_agent_kb_service_publish_collection_raises_on_config_save_failure
 
 
 @pytest.mark.asyncio
-async def test_agent_kb_service_refresh_collection_metadata_raises_on_failure():
-    refresh_metadata = AsyncMock(side_effect=RuntimeError("refresh failed"))
-    service = AgentKnowledgeBaseService(user_id=71, is_admin=True)
-
-    with (
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.collections.list_collections",
-            new=refresh_metadata,
-        ),
-        pytest.raises(
-            AgentKnowledgeBaseError,
-            match="Failed to refresh knowledge base metadata",
-        ),
-    ):
-        await service.refresh_collection_metadata("agent_url_kb")
-
-
-@pytest.mark.asyncio
 async def test_create_kb_from_url_empty_crawl_publishes_nothing(monkeypatch):
     """A crawl with no failures and no documents must not create the KB."""
     monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "auto")
@@ -330,7 +280,6 @@ async def test_create_kb_from_url_empty_crawl_publishes_nothing(monkeypatch):
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch(
@@ -353,7 +302,6 @@ async def test_create_kb_from_url_empty_crawl_publishes_nothing(monkeypatch):
     # The pipeline wrote a metadata row for a collection that now holds nothing;
     # leaving it behind 409-blocks the name while staying invisible to its owner.
     service.cleanup_failed_collection.assert_awaited_once_with("agent_url_kb")
-    service.refresh_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -392,7 +340,6 @@ async def test_create_kb_from_url_blocked_crawl_is_not_reported_as_success(monke
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch(
@@ -443,7 +390,6 @@ async def test_create_kb_from_url_uses_shared_service(monkeypatch):
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
     run_web_ingestion_mock = AsyncMock(return_value=ingest_result)
 
     with (
@@ -469,7 +415,6 @@ async def test_create_kb_from_url_uses_shared_service(monkeypatch):
         == DEFAULT_EMBEDDING_MODEL_ID
     )
     service.publish_collection.assert_awaited_once()
-    service.refresh_collection_metadata.assert_awaited_once_with("agent_url_kb")
     run_web_ingestion_mock.assert_awaited_once()
     _, run_kwargs = run_web_ingestion_mock.await_args
     assert run_kwargs["crawl_config"].tls_impersonate == "auto"
@@ -484,7 +429,6 @@ async def test_create_kb_from_url_returns_error_when_shared_service_fails():
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with patch(
         "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
@@ -506,7 +450,6 @@ async def test_create_kb_from_url_rejects_invalid_start_url():
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with patch(
         "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
@@ -523,7 +466,6 @@ async def test_create_kb_from_url_rejects_invalid_start_url():
         == "Invalid start_url: URL must start with http:// or https://"
     )
     service.prepare_collection.assert_not_awaited()
-    service.refresh_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -565,7 +507,6 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
@@ -591,7 +532,6 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
         == DEFAULT_EMBEDDING_MODEL_ID
     )
     service.publish_collection.assert_awaited_once()
-    service.refresh_collection_metadata.assert_awaited_once_with("agent_file_kb")
     db.close.assert_called_once()
 
 
@@ -646,7 +586,6 @@ async def test_create_kb_from_file_continues_after_unexpected_ingest_error(tmp_p
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
     run_ingestion = Mock(side_effect=fake_run_ingestion)
 
     with (
@@ -677,7 +616,6 @@ async def test_create_kb_from_file_continues_after_unexpected_ingest_error(tmp_p
     # exception text, which pinned that disclosure in place.
     assert "Failed to ingest bad.txt" in result["message"]
     assert "parser exploded" not in result["message"]
-    service.refresh_collection_metadata.assert_awaited_once_with("agent_file_kb")
     # One file landed, so the collection is real: cleaning it up would delete it.
     service.cleanup_failed_collection.assert_not_awaited()
     assert run_ingestion.call_count == 2
@@ -906,7 +844,6 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     service.publish_collection = AsyncMock()
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
     run_ingestion = Mock(return_value=ingest_result)
 
     with (
@@ -933,70 +870,6 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     ensure_local.assert_called_once()
     _, ingestion_kwargs = run_ingestion.call_args
     assert ingestion_kwargs["source_path"] == str(restored_source)
-    db.close.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_create_kb_from_file_returns_error_when_metadata_refresh_fails(tmp_path):
-    source_file = tmp_path / "notes.txt"
-    source_file.write_text("hello", encoding="utf-8")
-    file_record = SimpleNamespace(
-        user_id=7,
-        filename="notes.txt",
-        storage_path=str(source_file),
-        file_id="file-1",
-    )
-
-    query = MagicMock()
-    query.filter.return_value = query
-    query.all.return_value = [file_record]
-
-    db = MagicMock()
-    db.query.return_value = query
-
-    def fake_get_db():
-        yield from _fake_db_generator(db)
-
-    ingest_result = IngestionResult(
-        status="success",
-        doc_id="doc-1",
-        parse_hash="parse-1",
-        chunk_count=2,
-        embedding_count=2,
-        vector_count=2,
-        completed_steps=[_ingestion_step("register_document", doc_id="doc-1")],
-        failed_step=None,
-        message="ok",
-        warnings=[],
-        file_id="file-1",
-    )
-    service = MagicMock()
-    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
-    service.publish_collection = AsyncMock()
-    service.collection_exists = AsyncMock(return_value=False)
-    service.cleanup_failed_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock(
-        side_effect=AgentKnowledgeBaseError("metadata refresh failed")
-    )
-
-    with (
-        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
-        patch(
-            "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
-            return_value=service,
-        ),
-        patch(
-            "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
-            new=Mock(return_value=ingest_result),
-        ),
-    ):
-        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
-        result = await tool.run_json_async(
-            {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
-        )
-
-    assert result["success"] is False
-    assert result["message"] == "metadata refresh failed"
     db.close.assert_called_once()
 
 
@@ -1162,7 +1035,6 @@ async def test_create_kb_from_url_publish_failure_keeps_the_collection_name():
     service.publish_collection = AsyncMock(
         side_effect=AgentKnowledgeBaseError("config store down")
     )
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch(
@@ -1182,7 +1054,6 @@ async def test_create_kb_from_url_publish_failure_keeps_the_collection_name():
     assert result["success"] is False
     assert result["collection_name"] == "agent_url_kb"
     assert "Do not re-import" in result["message"]
-    service.refresh_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1229,7 +1100,6 @@ async def test_create_kb_from_file_publishes_a_partial_it_did_not_roll_back(tmp_
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
     service.publish_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
@@ -1293,7 +1163,6 @@ async def test_create_kb_from_file_publish_failure_keeps_the_collection_name(tmp
     service.publish_collection = AsyncMock(
         side_effect=AgentKnowledgeBaseError("config store down")
     )
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
@@ -1316,7 +1185,6 @@ async def test_create_kb_from_file_publish_failure_keeps_the_collection_name(tmp
     assert "Do not re-import" in result["message"]
     # The document is in the collection, so cleaning up would delete it.
     service.cleanup_failed_collection.assert_not_awaited()
-    service.refresh_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1357,7 +1225,6 @@ async def test_create_kb_from_file_failed_ingest_cleans_up_a_new_collection(tmp_
     service.collection_exists = AsyncMock(return_value=False)
     service.cleanup_failed_collection = AsyncMock()
     service.publish_collection = AsyncMock()
-    service.refresh_collection_metadata = AsyncMock()
 
     with (
         patch("xagent.web.models.database.get_db", side_effect=fake_get_db),

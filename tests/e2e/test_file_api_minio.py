@@ -440,7 +440,6 @@ async def test_create_kb_from_file_tool_restores_durable_only_upload_from_minio(
 
     service = AsyncMock()
     service.prepare_collection.return_value = "agent_file_kb"
-    service.refresh_collection_metadata.return_value = None
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",

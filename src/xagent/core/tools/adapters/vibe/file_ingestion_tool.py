@@ -318,8 +318,6 @@ async def _create_knowledge_base_from_file_impl(
                 ),
                 files_ingested=ingested_count,
             ).model_dump()
-        await kb_service.refresh_collection_metadata(collection_name)
-
         return CreateKnowledgeBaseFromFileResult(
             success=True,
             collection_name=collection_name,

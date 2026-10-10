@@ -342,3 +342,50 @@ def test_rebuild_still_clears_the_model_of_a_kb_without_vectors(monkeypatch) -> 
     rebuilt = _rebuild_with_stored_model(monkeypatch, reported_vectors=0)
 
     assert (rebuilt.embedding_model_id, rebuilt.embedding_dimension) == (None, None)
+
+
+def test_rebuild_leaves_a_kb_the_engine_did_not_report_unchanged(monkeypatch) -> None:
+    asyncio.run(
+        get_metadata_store().save_collection(
+            CollectionInfo(
+                name=KB,
+                embedding_model_id="model-a",
+                embedding_dimension=8,
+                documents=3,
+                embeddings=9,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        KBCoordinator, "aggregate_collection_stats_sync", lambda self, **kwargs: {}
+    )
+
+    for _ in range(2):
+        asyncio.run(rebuild_collection_metadata())
+        kept = asyncio.run(get_metadata_store().get_collection(KB))
+        assert (kept.embedding_model_id, kept.embedding_dimension) == ("model-a", 8)
+        assert (kept.documents, kept.embeddings) == (3, 9)
+
+
+def test_rebuild_unbinds_an_unreported_kb_whose_stored_row_has_no_vectors(
+    monkeypatch,
+) -> None:
+    asyncio.run(
+        get_metadata_store().save_collection(
+            CollectionInfo(
+                name=KB,
+                embedding_model_id="model-a",
+                embedding_dimension=8,
+                documents=0,
+                embeddings=0,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        KBCoordinator, "aggregate_collection_stats_sync", lambda self, **kwargs: {}
+    )
+
+    asyncio.run(rebuild_collection_metadata())
+
+    rebuilt = asyncio.run(get_metadata_store().get_collection(KB))
+    assert (rebuilt.embedding_model_id, rebuilt.embedding_dimension) == (None, None)

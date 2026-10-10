@@ -189,8 +189,6 @@ async def _create_knowledge_base_from_url_impl(
                 ),
                 pages_crawled=result.pages_crawled,
             ).model_dump()
-        await kb_service.refresh_collection_metadata(collection_name)
-
         if result.crawl_blocked_by_site:
             # Narrower than status == "partial" on purpose: a partial caused by
             # individual pages failing to parse keeps reporting success, which

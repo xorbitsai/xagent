@@ -1422,6 +1422,7 @@ async def _rebuild_collection_metadata_impl() -> None:
     """Implementation for rebuild_collection_metadata."""
     from ..kb.collection_handle import ledger_holds_vectors
     from . import collections
+    from .collections import _resolve_coordinator
 
     # Get all existing collections (use is_admin=True to bypass user filtering)
     # force_realtime=True to avoid reading stale metadata cache.
@@ -1433,6 +1434,15 @@ async def _rebuild_collection_metadata_impl() -> None:
 
     if not result.collections:
         return
+
+    # A collection the engine did not report has unknown counts: a stored row
+    # that still counts vectors is left exactly as it is, one without vectors
+    # keeps its counts and goes through the normal binding rule.
+    engine_stats = await asyncio.to_thread(
+        _resolve_coordinator(None).aggregate_collection_stats_sync,
+        user_id=None,
+        is_admin=True,
+    )
 
     # Get connection and find embeddings tables
     vector_store = get_vector_index_store()
@@ -1484,6 +1494,16 @@ async def _rebuild_collection_metadata_impl() -> None:
             # Infer embedding_model_id from embeddings tables
             embedding_model_id = None
             embedding_dimension = None
+
+            if collection.name not in engine_stats:
+                try:
+                    stored = await get_metadata_store().get_collection(collection.name)
+                except Exception:  # noqa: BLE001 - no readable row, rebuild it
+                    stored = None
+                if stored is not None:
+                    if stored.embeddings > 0:
+                        continue
+                    collection = stored
 
             # Redundant at run time; a direct gate the bypass guard can see.
             if collection.embeddings > 0 and ledger_holds_vectors():

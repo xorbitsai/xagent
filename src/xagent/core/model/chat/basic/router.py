@@ -100,7 +100,7 @@ _SERVICE_CACHE: dict[tuple[str, str, str], Any] = {}
 def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
     try:
         import joblib
-        from xrouter_llm import load_benchmark_profiles
+        from xrouter_llm import embedding_backend_from_env, load_benchmark_profiles
         from xrouter_llm.serving import RoutingService, load_router_configs
         from xrouter_llm.store import CallStore
     except ImportError as exc:  # pragma: no cover - dependency missing
@@ -119,7 +119,20 @@ def _build_service(model_path: str, models_dir: str, routers_dir: str) -> Any:
     except Exception as exc:  # noqa: BLE001 - history must not break routing
         logger.warning("xrouter call history disabled (%s)", exc)
         store = _NullStore()
-    return RoutingService(predictor, profiles=profiles, configs=configs, store=store)
+    # XROUTER_EMBEDDING_BACKEND=xinference points the predictor's prompt encoder at a
+    # remote embedding endpoint (XINFERENCE_BASE_URL / XINFERENCE_API_KEY), so this
+    # process never loads the serialized sentence-transformers model. Unset keeps
+    # the in-process backend the artifact was trained with.
+    embedding_backend = embedding_backend_from_env()
+    if embedding_backend is not None:
+        logger.info("xrouter embedding backend: %s", embedding_backend.name)
+    return RoutingService(
+        predictor,
+        profiles=profiles,
+        configs=configs,
+        store=store,
+        embedding_backend=embedding_backend,
+    )
 
 
 def _get_service() -> Any:

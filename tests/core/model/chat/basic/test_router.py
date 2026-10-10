@@ -1111,3 +1111,73 @@ async def test_router_auto_fallback_vision_deepseek_round_trips_reasoning(
     assert result[PROVIDER_STATE_METADATA_KEY] == {
         "deepseek": {"reasoning_content": "Looking at the picture first."}
     }
+
+
+def _stub_service_construction(monkeypatch) -> list[dict[str, Any]]:
+    """Replace the xrouter pieces `_build_service` assembles, recording the service kwargs."""
+    constructed: list[dict[str, Any]] = []
+
+    class _Predictor:
+        def predict(self, *args: Any, **kwargs: Any) -> list[Any]:
+            return []
+
+    class _Service:
+        def __init__(self, predictor: Any, **kwargs: Any) -> None:
+            constructed.append({"predictor": predictor, **kwargs})
+
+    monkeypatch.setattr("joblib.load", lambda _path: _Predictor())
+    monkeypatch.setattr("xrouter_llm.load_benchmark_profiles", lambda _dir: "profiles")
+    monkeypatch.setattr(
+        "xrouter_llm.serving.load_router_configs", lambda _dir: {"auto": "config"}
+    )
+    monkeypatch.setattr("xrouter_llm.serving.RoutingService", _Service)
+    monkeypatch.setattr("xrouter_llm.store.CallStore", lambda _path: "store")
+    return constructed
+
+
+def test_build_service_passes_remote_embedding_backend_from_env(monkeypatch) -> None:
+    from xrouter_llm import XinferenceEmbeddingBackend
+
+    from xagent.core.model.chat.basic import router
+
+    constructed = _stub_service_construction(monkeypatch)
+    monkeypatch.setenv("XROUTER_EMBEDDING_BACKEND", "xinference")
+    monkeypatch.setenv("XROUTER_EMBEDDING_MODEL", "dep_example")
+    monkeypatch.setenv("XINFERENCE_BASE_URL", "https://embeddings.example.test/v1")
+    monkeypatch.setenv("XINFERENCE_API_KEY", "secret")
+
+    router._build_service("model.joblib", "models", "routers")
+
+    assert len(constructed) == 1
+    backend = constructed[0]["embedding_backend"]
+    assert isinstance(backend, XinferenceEmbeddingBackend)
+    assert backend.model_name == "dep_example"
+    assert backend.base_url == "https://embeddings.example.test/v1"
+    assert backend.api_key == "secret"
+    assert constructed[0]["profiles"] == "profiles"
+    assert constructed[0]["configs"] == {"auto": "config"}
+    assert constructed[0]["store"] == "store"
+
+
+def test_build_service_keeps_serialized_backend_without_env(monkeypatch) -> None:
+    from xagent.core.model.chat.basic import router
+
+    constructed = _stub_service_construction(monkeypatch)
+    monkeypatch.delenv("XROUTER_EMBEDDING_BACKEND", raising=False)
+
+    router._build_service("model.joblib", "models", "routers")
+
+    assert len(constructed) == 1
+    assert constructed[0]["embedding_backend"] is None
+
+
+def test_build_service_rejects_unknown_embedding_backend(monkeypatch) -> None:
+    from xagent.core.model.chat.basic import router
+
+    constructed = _stub_service_construction(monkeypatch)
+    monkeypatch.setenv("XROUTER_EMBEDDING_BACKEND", "carrier-pigeon")
+
+    with pytest.raises(ValueError, match="Unknown embedding backend"):
+        router._build_service("model.joblib", "models", "routers")
+
+    assert constructed == []

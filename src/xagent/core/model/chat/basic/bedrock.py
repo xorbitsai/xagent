@@ -18,8 +18,8 @@ from botocore.config import Config
 from botocore.exceptions import (
     BotoCoreError,
     ClientError,
-    ConnectTimeoutError,
     ConnectionClosedError,
+    ConnectTimeoutError,
     EndpointConnectionError,
     ReadTimeoutError,
 )

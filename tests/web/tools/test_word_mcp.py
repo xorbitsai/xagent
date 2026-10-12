@@ -919,6 +919,7 @@ def test_paginated_reads_reject_tiny_output_cap_before_download(monkeypatch, too
         ),
         lambda: word.word_append_paragraph("Report.docx", "New text"),
         lambda: word.word_add_heading("Report.docx", "New heading"),
+        lambda: word.word_insert_page_break("Report.docx"),
         lambda: word.word_replace_text("Report.docx", "find", "replace"),
     ],
 )
@@ -1022,6 +1023,127 @@ def test_append_paragraph(monkeypatch):
     assert result["status"] == "success"
     uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[-1].text == "New paragraph"
+
+
+def test_append_paragraph_can_start_on_new_page(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
+    content = _docx_bytes()
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(
+        word.word_append_paragraph(
+            "Report.docx", "New paragraph", page_break_before=True
+        )
+    )
+
+    assert result["status"] == "success"
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
+    assert uploaded.paragraphs[-1].text == "New paragraph"
+    assert uploaded.paragraphs[-1].paragraph_format.page_break_before is True
+
+
+def test_add_heading_can_start_on_new_page(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
+    content = _docx_bytes()
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(
+        word.word_add_heading("Report.docx", "New heading", page_break_before=True)
+    )
+
+    assert result["status"] == "success"
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
+    assert uploaded.paragraphs[-1].text == "New heading"
+    assert uploaded.paragraphs[-1].paragraph_format.page_break_before is True
+
+
+def test_insert_page_break_at_end(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
+    content = _docx_bytes(lambda d: d.add_paragraph("Existing"))
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_insert_page_break("Report.docx"))
+
+    assert result["status"] == "success"
+    assert result["inserted_after_paragraph_index"] == 0
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
+    assert uploaded.paragraphs[0].text == "Existing"
+    assert uploaded.paragraphs[1].runs[-1]._r.xpath("./w:br[@w:type='page']")
+
+
+def test_insert_page_break_after_paragraph_uses_generation(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
+    content = _docx_bytes(
+        lambda d: (d.add_paragraph("First"), d.add_paragraph("Second"))
+    )
+    generation = hashlib.sha256(content).hexdigest()
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({"uploadUrl": "https://upload.example/session"}),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(
+        word.word_insert_page_break(
+            "Report.docx", after_paragraph_index=0, expected_generation=generation
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["inserted_after_paragraph_index"] == 0
+    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
+    assert uploaded.paragraphs[0].text == "First"
+    assert uploaded.paragraphs[0].runs[-1]._r.xpath("./w:br[@w:type='page']")
+    assert uploaded.paragraphs[1].text == "Second"
+
+
+def test_insert_page_break_at_index_requires_generation(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(word.requests, "request", mock_request)
+
+    result = json.loads(
+        word.word_insert_page_break("Report.docx", after_paragraph_index=0)
+    )
+
+    assert result["status"] == "error"
+    assert "expected_generation" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_add_heading_validates_level():

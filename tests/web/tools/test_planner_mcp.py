@@ -249,6 +249,28 @@ def test_bounded_list_response_uses_real_output_limit_env_name(monkeypatch):
     assert "XAGENT_TOOL_MAX_OUTPUT_LENGTH" in response
 
 
+def test_bounded_plan_list_compact_projection_keeps_web_url(monkeypatch):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 2_000)
+    plans = [
+        {
+            "web_url": f"https://planner.cloud.microsoft/webui/plan/plan-{index}",
+            "id": f"plan-{index}",
+            "title": "x" * 256,
+            "owner": "group-1",
+            "createdDateTime": "2026-01-01T00:00:00Z",
+        }
+        for index in range(5)
+    ]
+
+    response = planner._bounded_list_response(
+        "plans", plans, next_link=None, retry_next_link=None
+    )
+    result = json.loads(response)
+
+    assert result["projection"] == "identity_and_label"
+    assert all("web_url" in plan for plan in result["plans"])
+
+
 @pytest.mark.parametrize("configured_limit", [18, 0, -1])
 def test_bounded_envelopes_remain_valid_below_minimum(monkeypatch, configured_limit):
     monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: configured_limit)

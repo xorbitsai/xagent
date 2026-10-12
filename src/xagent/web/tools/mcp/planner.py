@@ -332,6 +332,8 @@ def _bounded_list_response(
         label = item.get(label_field)
         if isinstance(label, str):
             identity[label_field] = label[:256]
+        if list_field == "plans" and isinstance(item.get("web_url"), str):
+            identity["web_url"] = item["web_url"]
         compact.append(identity)
 
     response = _serialize(compact, truncated=True, mode="identity_and_label")

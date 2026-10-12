@@ -7,7 +7,6 @@ import requests
 
 from xagent.web.tools.mcp import planner
 
-
 TENANT_ID = "11111111-2222-3333-4444-555555555555"
 
 

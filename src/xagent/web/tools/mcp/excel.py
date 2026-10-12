@@ -697,10 +697,11 @@ def excel_list_worksheets(
     file_path is the workbook's path in the document library/drive. By
     default this addresses the caller's own OneDrive; pass site_id (a Graph
     site id -- "root" for the tenant's root site, or a site's own id/path)
-    to address a SharePoint site's document library instead, optionally
-    with drive_id for a non-default library. Pass a returned next_link to
-    retrieve the next page. page_size bounds each server page and applies
-    when starting a listing."""
+    to address a SharePoint site's default document library. Pass drive_id
+    to address a specific drive directly; it takes precedence over site_id
+    when both are supplied. Pass a returned next_link to retrieve the next
+    page. page_size bounds each server page and applies when starting a
+    listing."""
     try:
         validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)

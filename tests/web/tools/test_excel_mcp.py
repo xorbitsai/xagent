@@ -108,6 +108,11 @@ def test_workbook_base_ignores_path_form_site_when_specific_drive_is_supplied():
     )
 
 
+def test_workbook_base_validates_site_with_specific_drive():
+    with pytest.raises(ValueError, match="must not be '.' or '..'"):
+        excel._workbook_base("book.xlsx", "..", "drive-1")
+
+
 def test_workbook_base_rejects_dot_segments():
     with pytest.raises(ValueError, match="must not contain"):
         excel._workbook_base("../secret.xlsx", None, None)
@@ -482,8 +487,8 @@ def test_delete_columns_uses_drive_route_when_site_and_drive_are_supplied(monkey
 
     assert result["status"] == "success"
     kwargs = mock_request.call_args.kwargs
-    assert kwargs["url"].endswith(
-        "/drives/b%21documents-drive/root:/Marketing.xlsx:/workbook/"
+    assert kwargs["url"] == (
+        f"{excel.GRAPH_BASE_URL}/drives/b%21documents-drive/root:/Marketing.xlsx:/workbook/"
         "worksheets('Campaign%20Performance')/range(address='G%3AG')/delete"
     )
 

@@ -76,6 +76,37 @@ class EmptyArgs(BaseModel):
     pass
 
 
+def test_latest_client_safe_tool_error_is_scoped_to_current_user_turn() -> None:
+    previous = SimpleNamespace(
+        role="tool",
+        metadata={"raw_result": {"client_error_message": "stale failure"}},
+    )
+    user = SimpleNamespace(role="user", metadata={})
+    current = SimpleNamespace(
+        role="tool",
+        metadata={"raw_result": {"client_error_message": "current failure"}},
+    )
+    context = SimpleNamespace(messages=[previous, user, current])
+
+    assert ReActPattern._latest_client_safe_tool_error(context) == "current failure"
+
+
+def test_latest_client_safe_tool_error_rejects_unbounded_text() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"client_error_message": "x" * 501},
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_client_safe_tool_error(context) is None
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []

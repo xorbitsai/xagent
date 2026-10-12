@@ -34,6 +34,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _compact_json,
     _durable_upload_fields,
     _exception_indicates_http_401,
+    _excel_client_safe_error,
     _mcp_return_value_as_string,
     _split_url_token,
     _truncated_error_message,
@@ -68,6 +69,36 @@ def _mcp_tool(name: str = "echo") -> SimpleNamespace:
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
     )
+
+
+def test_excel_wac_error_gets_a_fixed_client_safe_projection() -> None:
+    result = {
+        "is_error": True,
+        "content": [
+            {
+                "text": (
+                    '403 - {"error":{"code":"AccessDenied","message":'
+                    '"Could not obtain a WAC access token.","innerError":'
+                    '{"request-id":"secret-diagnostic"}}}'
+                )
+            }
+        ],
+    }
+
+    projected = _excel_client_safe_error(result)
+
+    assert projected is not None
+    assert "workbook editing token" in projected
+    assert "secret-diagnostic" not in projected
+
+
+def test_arbitrary_excel_error_is_not_projected_to_the_client() -> None:
+    result = {
+        "is_error": True,
+        "content": [{"text": "token=secret unexpected connector failure"}],
+    }
+
+    assert _excel_client_safe_error(result) is None
 
 
 class _SdkV2CallToolResult(BaseModel):

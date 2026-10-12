@@ -1355,6 +1355,28 @@ def _normalized_mcp_call_result(
     }
 
 
+_EXCEL_WAC_ACCESS_DENIED_CLIENT_MESSAGE = (
+    "Microsoft Graph could not open the Excel workbook: access was denied "
+    "while obtaining the workbook editing token. Retry with the workbook's "
+    "drive_id, or reconnect the SharePoint account if it persists."
+)
+
+
+def _excel_client_safe_error(result: Mapping[str, Any]) -> str | None:
+    """Project only the known WAC denial; never expose an arbitrary MCP error."""
+    if result.get("is_error") is not True:
+        return None
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    text = "\n".join(
+        str(item.get("text") or "") for item in content if isinstance(item, dict)
+    )
+    if "AccessDenied" not in text or "Could not obtain a WAC access token" not in text:
+        return None
+    return _EXCEL_WAC_ACCESS_DENIED_CLIENT_MESSAGE
+
+
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
     from .selection_spec import normalize_mcp_server_name
 
@@ -2418,7 +2440,16 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            return _normalized_mcp_call_result(result)
+            normalized = _normalized_mcp_call_result(result)
+            from .....builtin_identity import canonicalize_builtin_identity
+
+            if canonicalize_builtin_identity(
+                self.source_server or ""
+            ) == "excel" and self.mcp_tool.name.startswith("excel_"):
+                client_error = _excel_client_safe_error(normalized)
+                if client_error is not None:
+                    normalized["client_error_message"] = client_error
+            return normalized
 
     async def _retry_after_authorization_failure(
         self,

@@ -168,6 +168,8 @@ from .truncation import (
 
 logger = logging.getLogger(__name__)
 
+_CLIENT_SAFE_TOOL_ERROR_MAX_CHARS = 500
+
 
 class ReActReasoningMode(str, Enum):
     """Reasoning strategy used by ReActPattern."""
@@ -1661,11 +1663,35 @@ class ReActPattern(AgentPattern):
             metadata["protocol_code"] = protocol_code
         if finish_reason:
             metadata["finish_reason"] = finish_reason
+        client_error_message = self._latest_client_safe_tool_error(context)
+        if client_error_message is not None:
+            metadata["client_error_message"] = client_error_message
         return PatternResult(
             success=False,
             error=error,
             metadata=metadata,
         ).to_dict()
+
+    @staticmethod
+    def _latest_client_safe_tool_error(context: Any) -> str | None:
+        """Return a curated tool failure from the current user turn only."""
+        for message in reversed(getattr(context, "messages", [])):
+            role = getattr(message, "role", None)
+            if role == "user":
+                break
+            if role != "tool":
+                continue
+            metadata = getattr(message, "metadata", {}) or {}
+            result = metadata.get("raw_result")
+            if not isinstance(result, dict):
+                continue
+            candidate = result.get("client_error_message")
+            if type(candidate) is not str:
+                continue
+            candidate = candidate.strip()
+            if candidate and len(candidate) <= _CLIENT_SAFE_TOOL_ERROR_MAX_CHARS:
+                return candidate
+        return None
 
     async def _close_streamed_answer(
         self,

@@ -16,6 +16,18 @@ from .client_error_messages import (
 )
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
+CLIENT_SAFE_RESULT_ERROR_MAX_CHARS = 500
+
+
+def client_safe_result_error(result: Mapping[str, Any]) -> str | None:
+    """Return an explicitly curated, bounded client error from the runtime."""
+    value = result.get("client_error_message")
+    if type(value) is not str:
+        return None
+    value = value.strip()
+    if not value or len(value) > CLIENT_SAFE_RESULT_ERROR_MAX_CHARS:
+        return None
+    return value
 
 
 def interrupted_channel_result() -> dict[str, Any]:
@@ -105,9 +117,10 @@ def present_failed_result(result: Mapping[str, Any]) -> FailedResultPresentation
         # sentence for every task-stream surface.
         withheld = type(result.get("model_error")) is dict and existing_code is None
         error_details = result.get("error_details")
+        safe_result_error = client_safe_result_error(result)
         return FailedResultPresentation(
             diagnostic_error=diagnostic_error,
-            visible_text=CLIENT_SAFE_TASK_FAILURE if withheld else None,
+            visible_text=(CLIENT_SAFE_TASK_FAILURE if withheld else safe_result_error),
             error_code=existing_code if type(existing_code) is str else None,
             error_details=error_details if type(error_details) is dict else None,
         )
@@ -173,7 +186,10 @@ def project_execution_result_for_channel(
         interactions = []
     elif task_status == TaskStatus.FAILED:
         transcript_content = CLIENT_SAFE_TASK_FAILURE
-        base_text = with_task_reference(CLIENT_SAFE_TASK_FAILURE, task_id)
+        base_text = with_task_reference(
+            client_safe_result_error(result) or CLIENT_SAFE_TASK_FAILURE,
+            task_id,
+        )
         interactions = []
     elif not base_text.strip() and not interactions:
         base_text = EMPTY_CHANNEL_OUTPUT_FALLBACK

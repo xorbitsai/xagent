@@ -164,6 +164,36 @@ def test_project_empty_failure_has_no_diagnostic_and_uses_safe_display() -> None
     assert projection.interactions == []
 
 
+def test_project_failed_result_shows_explicit_bounded_safe_tool_error() -> None:
+    safe_error = (
+        "Microsoft Graph could not open the Excel workbook: access was denied "
+        "while obtaining the workbook editing token."
+    )
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "error": "truncated_tool_arguments",
+            "client_error_message": safe_error,
+        }
+    )
+
+    assert projection.visible_text == safe_error
+    assert projection.transcript_content == CLIENT_SAFE_TASK_FAILURE
+
+
+def test_project_failed_result_rejects_unbounded_safe_tool_error() -> None:
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "client_error_message": "x" * 501,
+        }
+    )
+
+    assert projection.visible_text == CLIENT_SAFE_TASK_FAILURE
+
+
 def test_project_failure_appends_task_id_to_visible_text_only() -> None:
     projection = project_execution_result_for_channel(
         {"success": False, "status": "error", "error": "boom"}, task_id=45

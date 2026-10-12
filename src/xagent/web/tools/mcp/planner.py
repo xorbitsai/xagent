@@ -1,12 +1,11 @@
 import base64
-import binascii
 import json
 import logging
 import os
 import re
 import uuid
 from typing import Any
-from urllib.parse import unquote, urlencode
+from urllib.parse import unquote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -194,22 +193,21 @@ def _tenant_id_from_auth_token() -> str | None:
         if not isinstance(tenant_id, str):
             return None
         return str(uuid.UUID(tenant_id))
-    except (binascii.Error, ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return None
 
 
-def _planner_web_url(plan_id: str) -> str | None:
-    tenant_id = _tenant_id_from_auth_token()
+def _planner_web_url(plan_id: str, tenant_id: str | None) -> str | None:
     if tenant_id is None:
         return None
-    encoded_plan_id = url_path_id(plan_id, "plan_id")
-    return (
-        f"{PLANNER_WEB_BASE_URL}/{encoded_plan_id}/view/board?"
-        f"{urlencode({'tid': tenant_id})}"
-    )
+    try:
+        encoded_plan_id = url_path_id(plan_id, "plan_id")
+    except (TypeError, ValueError):
+        return None
+    return f"{PLANNER_WEB_BASE_URL}/{encoded_plan_id}/view/board?tid={tenant_id}"
 
 
-def _with_plan_web_url(plan: dict[str, Any]) -> dict[str, Any]:
+def _with_plan_web_url(plan: dict[str, Any], tenant_id: str | None) -> dict[str, Any]:
     """Return a plan with its browser URL, never its Graph container URL.
 
     ``plannerPlan.container.url`` identifies the backing Graph resource. It is
@@ -218,9 +216,17 @@ def _with_plan_web_url(plan: dict[str, Any]) -> dict[str, Any]:
     preserves the user-facing link before less important Graph metadata.
     """
     plan_id = plan.get("id")
-    web_url = _planner_web_url(plan_id) if isinstance(plan_id, str) else None
+    web_url = _planner_web_url(plan_id, tenant_id) if isinstance(plan_id, str) else None
     if web_url is None:
-        logger.warning("Planner web URL unavailable: missing valid plan or tenant id")
+        if tenant_id is None:
+            logger.warning(
+                "Planner web URL unavailable: the token has no usable tenant id; "
+                "there is no shareable link, so open the plan from Planner or Teams"
+            )
+        else:
+            logger.warning(
+                "Planner web URL unavailable: the plan id is missing or invalid"
+            )
     return {"web_url": web_url, **plan}
 
 
@@ -332,7 +338,7 @@ def _bounded_list_response(
         label = item.get(label_field)
         if isinstance(label, str):
             identity[label_field] = label[:256]
-        if list_field == "plans" and isinstance(item.get("web_url"), str):
+        if list_field == "plans" and "web_url" in item:
             identity["web_url"] = item["web_url"]
         compact.append(identity)
 
@@ -608,7 +614,9 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
     """List the Planner plans owned by a Microsoft 365 group.
 
     Each returned plan includes ``web_url``. Use it for user-facing links;
-    ``container.url`` is a Graph API endpoint, not a Planner page.
+    ``container.url`` is a Graph API endpoint, not a Planner page. If
+    ``web_url`` is null, no shareable link could be derived from the token;
+    open the plan from Planner or Teams instead of composing a URL.
 
     next_link is optional -- pass the next_link value from a previous
     response to fetch the next page instead of the first."""
@@ -617,11 +625,12 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
             f"/groups/{url_path_id(group_id, 'group_id')}/planner/plans", next_link
         )
         result = _graph_request("GET", path)
+        tenant_id = _tenant_id_from_auth_token()
         plans = result.get("value", [])
         if not isinstance(plans, list):
             raise RuntimeError("Planner returned a non-list value collection")
         plans = [
-            _with_plan_web_url(plan) if isinstance(plan, dict) else plan
+            _with_plan_web_url(plan, tenant_id) if isinstance(plan, dict) else plan
             for plan in plans
         ]
         return _bounded_list_response(
@@ -640,13 +649,16 @@ def planner_get_plan(plan_id: str) -> str:
     """Get a Planner plan's details by id.
 
     ``web_url`` is the browser-safe link to share with users. Never substitute
-    the plan's Graph ``container.url`` for it.
+    the plan's Graph ``container.url`` for it. If ``web_url`` is null, no
+    shareable link could be derived from the token; open the plan from Planner
+    or Teams instead of composing a URL.
     """
     try:
         result = _graph_request(
             "GET", f"/planner/plans/{url_path_id(plan_id, 'plan_id')}"
         )
-        plan = _with_plan_web_url(_graph_object(result, "plan"))
+        tenant_id = _tenant_id_from_auth_token()
+        plan = _with_plan_web_url(_graph_object(result, "plan"), tenant_id)
         return success_with_capped_dict("plan", plan)
     except Exception as e:
         logger.error("Error getting Planner plan %s: %s", plan_id, e)
@@ -658,7 +670,9 @@ def planner_create_plan(group_id: str, title: str) -> str:
     """Create a new Planner plan owned by a Microsoft 365 group.
 
     The returned plan's ``web_url`` is the browser-safe link to share with
-    users. Never substitute the plan's Graph ``container.url`` for it.
+    users. Never substitute the plan's Graph ``container.url`` for it. If
+    ``web_url`` is null, no shareable link could be derived from the token;
+    open the plan from Planner or Teams instead of composing a URL.
 
     The signed-in user must already be a member of the group (Graph
     enforces this; it is not merely a display requirement)."""
@@ -673,7 +687,8 @@ def planner_create_plan(group_id: str, title: str) -> str:
             "title": title,
         }
         result = _graph_request("POST", "/planner/plans", body=body, mutation=True)
-        plan = _with_plan_web_url(_created_object(result, "plan"))
+        tenant_id = _tenant_id_from_auth_token()
+        plan = _with_plan_web_url(_created_object(result, "plan"), tenant_id)
         return success_with_capped_dict("plan", plan)
     except _MutationOutcomeIndeterminate as e:
         return _indeterminate(

@@ -10,7 +10,7 @@ from xagent.web.tools.mcp import planner
 TENANT_ID = "11111111-2222-3333-4444-555555555555"
 
 
-def _graph_token(*, tenant_id: str | None = TENANT_ID) -> str:
+def _graph_token(*, tenant_id: object = TENANT_ID) -> str:
     payload = {} if tenant_id is None else {"tid": tenant_id}
     encoded = (
         base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
@@ -57,7 +57,14 @@ def test_tenant_id_from_auth_token(monkeypatch):
 
 @pytest.mark.parametrize(
     "token",
-    ["opaque-token", _graph_token(tenant_id=None), _graph_token(tenant_id="invalid")],
+    [
+        "opaque-token",
+        "header.bm90LWpzb24.signature",
+        "header.W10.signature",
+        _graph_token(tenant_id=None),
+        _graph_token(tenant_id="invalid"),
+        _graph_token(tenant_id=123),
+    ],
 )
 def test_tenant_id_from_auth_token_rejects_unusable_tokens(monkeypatch, token):
     monkeypatch.setenv("AUTH_TOKEN", token)
@@ -66,9 +73,13 @@ def test_tenant_id_from_auth_token_rejects_unusable_tokens(monkeypatch, token):
 
 
 def test_planner_web_url_uses_plan_and_tenant_ids():
-    assert planner._planner_web_url("plan-1") == (
+    assert planner._planner_web_url("plan-1", TENANT_ID) == (
         f"https://planner.cloud.microsoft/webui/plan/plan-1/view/board?tid={TENANT_ID}"
     )
+
+
+def test_planner_web_url_rejects_invalid_plan_id():
+    assert planner._planner_web_url(" . ", TENANT_ID) is None
 
 
 def test_current_etag_success(monkeypatch):
@@ -270,6 +281,28 @@ def test_bounded_plan_list_compact_projection_keeps_web_url(monkeypatch):
     assert all("web_url" in plan for plan in result["plans"])
 
 
+def test_bounded_plan_list_compact_projection_keeps_null_web_url(monkeypatch):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 800)
+    plans = [
+        {
+            "web_url": None,
+            "id": f"plan-{index}",
+            "title": "t" * 80,
+            "owner": "o" * 256,
+            "createdDateTime": "2026-01-01T00:00:00Z",
+        }
+        for index in range(5)
+    ]
+
+    response = planner._bounded_list_response(
+        "plans", plans, next_link=None, retry_next_link=None
+    )
+    result = json.loads(response)
+
+    assert result["projection"] == "identity_and_label"
+    assert all(plan["web_url"] is None for plan in result["plans"])
+
+
 @pytest.mark.parametrize("configured_limit", [18, 0, -1])
 def test_bounded_envelopes_remain_valid_below_minimum(monkeypatch, configured_limit):
     monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: configured_limit)
@@ -400,6 +433,39 @@ def test_list_plans_fetches_next_page(monkeypatch):
     assert mock_request.call_args.kwargs["url"] == next_link
 
 
+def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch):
+    monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
+    mock_request = Mock(
+        return_value=MockResponse({"value": [{"title": "No id"}, {"id": "plan-1"}]})
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_plans("group-1"))
+
+    assert result["status"] == "success"
+    assert result["plans"] == [
+        {"web_url": None, "title": "No id"},
+        {"web_url": None, "id": "plan-1"},
+    ]
+
+
+def test_list_plans_decodes_tenant_once(monkeypatch):
+    tenant_id = Mock(return_value=TENANT_ID)
+    monkeypatch.setattr(planner, "_tenant_id_from_auth_token", tenant_id)
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"value": [{"id": "plan-1"}, {"id": "plan-2"}]})
+        ),
+    )
+
+    result = json.loads(planner.planner_list_plans("group-1"))
+
+    assert result["status"] == "success"
+    tenant_id.assert_called_once_with()
+
+
 def test_list_plans_rejects_forged_next_link(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(planner.requests, "request", mock_request)
@@ -446,6 +512,20 @@ def test_create_plan_keeps_success_when_web_url_cannot_be_built(monkeypatch):
     assert result["status"] == "success"
     assert result["plan"]["web_url"] is None
     assert result["plan"]["id"] == "plan-1"
+
+
+def test_create_plan_keeps_success_when_plan_id_is_invalid(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"id": " . ", "title": "New plan"})),
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "success"
+    assert result["plan"]["web_url"] is None
+    assert result["plan"]["id"] == " . "
 
 
 def test_create_plan_transport_failure_is_indeterminate(monkeypatch):
@@ -564,6 +644,20 @@ def test_get_plan_success(monkeypatch):
         "title": "Plan",
     }
     assert mock_request.call_args.kwargs["url"].endswith("/planner/plans/plan-1")
+
+
+def test_get_plan_preserves_success_without_tenant(monkeypatch):
+    monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"id": "plan-1", "title": "Plan"})),
+    )
+
+    result = json.loads(planner.planner_get_plan("plan-1"))
+
+    assert result["status"] == "success"
+    assert result["plan"]["web_url"] is None
 
 
 def test_get_plan_caps_large_singleton_response(monkeypatch):

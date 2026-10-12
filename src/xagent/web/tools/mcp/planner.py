@@ -218,16 +218,14 @@ def _with_plan_web_url(plan: dict[str, Any], tenant_id: str | None) -> dict[str,
     plan_id = plan.get("id")
     web_url = _planner_web_url(plan_id, tenant_id) if isinstance(plan_id, str) else None
     if web_url is None:
-        if tenant_id is None:
-            logger.warning(
-                "Planner web URL unavailable: the token has no usable tenant id; "
-                "there is no shareable link, so open the plan from Planner or Teams"
-            )
-        else:
+        if tenant_id is not None:
             logger.warning(
                 "Planner web URL unavailable: the plan id is missing or invalid"
             )
-    return {"web_url": web_url, **plan}
+    return {
+        "web_url": web_url,
+        **{key: value for key, value in plan.items() if key != "web_url"},
+    }
 
 
 def _created_object(result: Any, resource_name: str) -> dict[str, Any]:
@@ -626,6 +624,11 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
         )
         result = _graph_request("GET", path)
         tenant_id = _tenant_id_from_auth_token()
+        if tenant_id is None:
+            logger.warning(
+                "Planner web URLs unavailable: the token has no usable tenant id; "
+                "there is no shareable link, so open plans from Planner or Teams"
+            )
         plans = result.get("value", [])
         if not isinstance(plans, list):
             raise RuntimeError("Planner returned a non-list value collection")
@@ -658,6 +661,11 @@ def planner_get_plan(plan_id: str) -> str:
             "GET", f"/planner/plans/{url_path_id(plan_id, 'plan_id')}"
         )
         tenant_id = _tenant_id_from_auth_token()
+        if tenant_id is None:
+            logger.warning(
+                "Planner web URL unavailable: the token has no usable tenant id; "
+                "there is no shareable link, so open the plan from Planner or Teams"
+            )
         plan = _with_plan_web_url(_graph_object(result, "plan"), tenant_id)
         return success_with_capped_dict("plan", plan)
     except Exception as e:
@@ -688,6 +696,11 @@ def planner_create_plan(group_id: str, title: str) -> str:
         }
         result = _graph_request("POST", "/planner/plans", body=body, mutation=True)
         tenant_id = _tenant_id_from_auth_token()
+        if tenant_id is None:
+            logger.warning(
+                "Planner web URL unavailable: the token has no usable tenant id; "
+                "there is no shareable link, so open the plan from Planner or Teams"
+            )
         plan = _with_plan_web_url(_created_object(result, "plan"), tenant_id)
         return success_with_capped_dict("plan", plan)
     except _MutationOutcomeIndeterminate as e:

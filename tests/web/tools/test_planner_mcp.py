@@ -466,6 +466,25 @@ def test_list_plans_decodes_tenant_once(monkeypatch):
     tenant_id.assert_called_once_with()
 
 
+def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog):
+    monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(
+            return_value=MockResponse({"value": [{"id": "plan-1"}, {"id": "plan-2"}]})
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="planner-mcp"):
+        result = json.loads(planner.planner_list_plans("group-1"))
+
+    assert result["status"] == "success"
+    assert (
+        sum("no usable tenant id" in record.message for record in caplog.records) == 1
+    )
+
+
 def test_list_plans_rejects_forged_next_link(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(planner.requests, "request", mock_request)

@@ -115,6 +115,10 @@ _OUTPUT_DIR_ENV_VAR = "XAGENT_ONEDRIVE_OUTPUT_DIR"
 class _UploadError(RuntimeError):
     """Upload failure whose message is safe to expose to the caller."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class _GraphRequestError(RuntimeError):
     """Graph HTTP failure that keeps its status and Graph error code."""
@@ -393,7 +397,8 @@ def _raise_upload_status(response: Any) -> None:
     except requests.HTTPError as exc:
         status_code = getattr(response, "status_code", "unknown")
         raise _UploadError(
-            f"OneDrive upload fragment failed with HTTP {status_code}"
+            f"OneDrive upload fragment failed with HTTP {status_code}",
+            status_code=status_code if isinstance(status_code, int) else None,
         ) from exc
 
 
@@ -1259,7 +1264,14 @@ def _upload_large_file_content(
                         "instead of success",
                         cancel_response.status_code,
                     )
-            raise RuntimeError(_safe_upload_error_message(exc)) from None
+            # Keep only the numeric status across the upload-URL redaction
+            # boundary. The original exception chain may contain the
+            # preauthenticated session URL, so it must not escape, but callers
+            # still need to distinguish a 423 lock from an ordinary failure.
+            raise _UploadError(
+                _safe_upload_error_message(exc),
+                status_code=_upload_status_code(exc),
+            ) from None
 
     return result
 

@@ -620,7 +620,13 @@ def _upload_document(
         f"{file_path!r} was changed by someone else since this edit "
         "started; re-read it and retry"
     )
-    locked_etag = _checkout_edit_snapshot(snapshot, conflict_message)
+    lock_message = (
+        f"{file_path!r} is locked for editing; close it in Word or Teams and "
+        "retry later, or save a copy to a different path"
+    )
+    locked_etag = _checkout_edit_snapshot(
+        snapshot, conflict_message, lock_message=lock_message
+    )
     locked_snapshot = _EditSnapshot(
         item_path=snapshot.item_path,
         etag=locked_etag,
@@ -628,7 +634,10 @@ def _upload_document(
     )
     try:
         result = _upload_checked_out_document(
-            content, locked_snapshot, conflict_message=conflict_message
+            content,
+            locked_snapshot,
+            conflict_message=conflict_message,
+            lock_message=lock_message,
         )
         _check_in_edit_snapshot(snapshot, content)
         return result
@@ -680,7 +689,12 @@ def _discard_edit_checkout(snapshot: _EditSnapshot) -> None:
     _graph_request("POST", f"{snapshot.item_path}/discardCheckout")
 
 
-def _checkout_edit_snapshot(snapshot: _EditSnapshot, conflict_message: str) -> str:
+def _checkout_edit_snapshot(
+    snapshot: _EditSnapshot,
+    conflict_message: str,
+    *,
+    lock_message: str = "The Word document is locked for editing; retry later",
+) -> str:
     """Lock the item, then prove it still contains the downloaded snapshot."""
     if not snapshot.generation:
         raise RuntimeError("Word edit snapshot is missing its content generation")
@@ -719,17 +733,12 @@ def _checkout_edit_snapshot(snapshot: _EditSnapshot, conflict_message: str) -> s
                 if attempt < _CHECKOUT_RETRY_ATTEMPTS - 1:
                     _sleep_before_checkout_retry(attempt)
                     continue
+                raise _WordEditConflict(lock_message, code="resource_locked") from exc
+            if exc.status_code == 409:
+                raise _WordEditConflict(lock_message, code="resource_locked") from exc
+            if exc.status_code == 412:
                 raise _WordEditConflict(
-                    conflict_message, code="resource_locked"
-                ) from exc
-            if exc.status_code in (409, 412):
-                raise _WordEditConflict(
-                    conflict_message,
-                    code=(
-                        "resource_locked"
-                        if exc.status_code == 409
-                        else "version_conflict"
-                    ),
+                    conflict_message, code="version_conflict"
                 ) from exc
             raise RuntimeError(
                 "Graph could not acquire the checkout required for a "
@@ -762,6 +771,7 @@ def _upload_checked_out_document(
     snapshot: _EditSnapshot,
     *,
     conflict_message: str,
+    lock_message: str,
 ) -> dict[str, Any]:
     try:
         session = _graph_request(
@@ -773,6 +783,8 @@ def _upload_checked_out_document(
     except _GraphRequestError as exc:
         if exc.status_code == 412:
             raise _WordEditConflict(conflict_message, code="version_conflict") from exc
+        if exc.status_code == 423:
+            raise _WordEditConflict(lock_message, code="resource_locked") from exc
         raise
     upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
     if not isinstance(upload_url, str) or not upload_url:
@@ -795,6 +807,8 @@ def _upload_checked_out_document(
             )
             if response.status_code == 412:
                 raise _WordEditConflict(conflict_message, code="version_conflict")
+            if response.status_code == 423:
+                raise _WordEditConflict(lock_message, code="resource_locked")
             if response.status_code in (200, 201):
                 try:
                     result = response.json()

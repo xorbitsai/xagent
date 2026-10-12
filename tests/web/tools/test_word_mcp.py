@@ -37,7 +37,7 @@ def _edit_download_mock(content: bytes, *, etag='"abc"') -> Mock:
 def _bypass_edit_checkout(monkeypatch) -> None:
     """Keep upload-mechanics tests focused; checkout has dedicated coverage."""
     monkeypatch.setattr(
-        word, "_checkout_edit_snapshot", lambda snapshot, _message: snapshot.etag
+        word, "_checkout_edit_snapshot", lambda snapshot, _message, **_kw: snapshot.etag
     )
     monkeypatch.setattr(
         word, "_check_in_edit_snapshot", lambda _snapshot, _content: None
@@ -1883,8 +1883,8 @@ def test_append_paragraph_returns_structured_lock_error_after_retries(monkeypatc
     assert result == {
         "status": "error",
         "message": (
-            "'Report.docx' was changed by someone else since this edit started; "
-            "re-read it and retry"
+            "'Report.docx' is locked for editing; close it in Word or Teams and "
+            "retry later, or save a copy to a different path"
         ),
         "code": "resource_locked",
         "retryable": True,
@@ -1892,6 +1892,46 @@ def test_append_paragraph_returns_structured_lock_error_after_retries(monkeypatc
         "lock_owner": None,
     }
     assert [call.args for call in sleep.call_args_list] == [(1.0,), (2.0,)]
+
+
+@pytest.mark.parametrize("locked_phase", ["create-session", "content-put"])
+def test_append_paragraph_returns_structured_lock_after_checkout(
+    monkeypatch, locked_phase
+):
+    content = _docx_bytes()
+    upload_session_response = (
+        MockResponse({"error": {"code": "notAllowed"}}, status_code=423)
+        if locked_phase == "create-session"
+        else MockResponse({"uploadUrl": "https://upload.example/session"})
+    )
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({}, status_code=204),
+            MockResponse({"eTag": '"checked-out"'}),
+            MockResponse(content=content),
+            upload_session_response,
+            MockResponse({}, status_code=204),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    mock_put = Mock(return_value=MockResponse({}, status_code=423))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(word.word_append_paragraph("Report.docx", "New paragraph"))
+
+    assert result["status"] == "error"
+    assert result["code"] == "resource_locked"
+    assert result["retryable"] is True
+    assert "locked for editing" in result["message"]
+    assert result["suggested_actions"] == [
+        "close_document_and_retry",
+        "save_as_copy",
+    ]
+    assert mock_request.call_args_list[-1].kwargs["url"].endswith("/discardCheckout")
+    assert mock_put.call_count == (1 if locked_phase == "content-put" else 0)
 
 
 def test_check_in_reconciles_when_success_response_is_lost(monkeypatch):

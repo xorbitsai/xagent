@@ -3078,6 +3078,42 @@ def test_upload_file_returns_error_payload_on_api_failure(
     assert "boom" not in result["message"]
 
 
+def test_upload_file_returns_structured_lock_error_without_blind_retry(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"content")
+    request = Mock(
+        return_value=MockResponse(
+            {
+                "error": {
+                    "code": "notAllowed",
+                    "message": "locked; secret=https://download.example/token",
+                }
+            },
+            status_code=423,
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result == {
+        "status": "error",
+        "message": (
+            "The OneDrive item is locked, so it could not be overwritten. "
+            "Close the document in Word or Teams and retry later, or use a "
+            "different destination path to save a copy."
+        ),
+        "code": "resource_locked",
+        "retryable": True,
+        "lock_owner": None,
+        "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+    }
+    assert request.call_count == 1
+    assert "download.example" not in result["message"]
+
+
 def test_upload_file_requires_completed_item_confirmation(
     monkeypatch, _upload_allowed_dirs_env
 ):

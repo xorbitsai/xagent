@@ -86,6 +86,9 @@ _MAX_UPLOAD_BYTES = _MAX_DOWNLOAD_BYTES
 _UPLOAD_RETRY_ATTEMPTS = 3
 _UPLOAD_RETRY_BASE_SECONDS = 1.0
 _UPLOAD_RETRY_MAX_SECONDS = 4.0
+_CHECKOUT_RETRY_ATTEMPTS = 3
+_CHECKOUT_RETRY_BASE_SECONDS = 1.0
+_CHECKOUT_RETRY_MAX_SECONDS = 4.0
 _DEFAULT_TEXT_PAGE_CHARS = 20_000
 _MIN_TEXT_PAGE_CHARS = 10_000
 _MAX_TEXT_PAGE_CHARS = 40_000
@@ -102,6 +105,14 @@ class _GraphRequestError(RuntimeError):
     def __init__(self, message: str, *, status_code: int) -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+class _WordEditConflict(ValueError):
+    """A caller-actionable concurrency conflict while editing a document."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -157,8 +168,22 @@ def _success_with_item(item: dict[str, Any], **payload: Any) -> str:
     return _success()
 
 
-def _error(message: str, *, details: Any = None) -> str:
-    payload: dict[str, Any] = {"status": "error", "message": message}
+def _error(message: str | Exception, *, details: Any = None) -> str:
+    payload: dict[str, Any] = {"status": "error", "message": str(message)}
+    if isinstance(message, _WordEditConflict):
+        payload.update(
+            code=message.code,
+            retryable=True,
+            suggested_actions=(
+                ["close_document_and_retry", "save_as_copy"]
+                if message.code == "resource_locked"
+                else ["reread_and_retry"]
+            ),
+        )
+        if message.code == "resource_locked":
+            # Graph does not reliably return the lock owner for driveItem 423s.
+            # Keep the field stable for consumers without guessing identity.
+            payload["lock_owner"] = None
     if details is not None:
         payload["details"] = details
     encoded = json.dumps(payload, ensure_ascii=False)
@@ -659,41 +684,57 @@ def _checkout_edit_snapshot(snapshot: _EditSnapshot, conflict_message: str) -> s
     """Lock the item, then prove it still contains the downloaded snapshot."""
     if not snapshot.generation:
         raise RuntimeError("Word edit snapshot is missing its content generation")
-    try:
-        _graph_request("POST", f"{snapshot.item_path}/checkout")
-    except requests.RequestException:
-        # The lock may have been acquired before the transport failed. A
-        # delegated discard can release only this user's checkout; HTTP 400
-        # means no checkout existed, while any other cleanup failure remains
-        # an explicit unknown state requiring manual verification.
+    for attempt in range(_CHECKOUT_RETRY_ATTEMPTS):
         try:
-            _discard_edit_checkout(snapshot)
-        except _GraphRequestError as cleanup_error:
-            if cleanup_error.status_code == 400:
+            _graph_request("POST", f"{snapshot.item_path}/checkout")
+            break
+        except requests.RequestException:
+            # The lock may have been acquired before the transport failed. A
+            # delegated discard can release only this user's checkout; HTTP 400
+            # means no checkout existed, while any other cleanup failure remains
+            # an explicit unknown state requiring manual verification.
+            try:
+                _discard_edit_checkout(snapshot)
+            except _GraphRequestError as cleanup_error:
+                if cleanup_error.status_code == 400:
+                    raise RuntimeError(
+                        "Graph could not acquire the checkout required for a "
+                        "concurrency-safe Word edit"
+                    ) from None
                 raise RuntimeError(
-                    "Graph could not acquire the checkout required for a "
-                    "concurrency-safe Word edit"
+                    "Word checkout outcome is unknown; verify the document in "
+                    "Word before retrying"
+                ) from None
+            except requests.RequestException:
+                raise RuntimeError(
+                    "Word checkout outcome is unknown; verify the document in "
+                    "Word before retrying"
                 ) from None
             raise RuntimeError(
-                "Word checkout outcome is unknown; verify the document in "
-                "Word before retrying"
+                "Graph did not confirm the Word checkout; the possible checkout "
+                "was discarded, so the edit was not applied"
             ) from None
-        except requests.RequestException:
+        except _GraphRequestError as exc:
+            if exc.status_code == 423:
+                if attempt < _CHECKOUT_RETRY_ATTEMPTS - 1:
+                    _sleep_before_checkout_retry(attempt)
+                    continue
+                raise _WordEditConflict(
+                    conflict_message, code="resource_locked"
+                ) from exc
+            if exc.status_code in (409, 412):
+                raise _WordEditConflict(
+                    conflict_message,
+                    code=(
+                        "resource_locked"
+                        if exc.status_code == 409
+                        else "version_conflict"
+                    ),
+                ) from exc
             raise RuntimeError(
-                "Word checkout outcome is unknown; verify the document in "
-                "Word before retrying"
-            ) from None
-        raise RuntimeError(
-            "Graph did not confirm the Word checkout; the possible checkout "
-            "was discarded, so the edit was not applied"
-        ) from None
-    except _GraphRequestError as exc:
-        if exc.status_code in (409, 412, 423):
-            raise ValueError(conflict_message) from exc
-        raise RuntimeError(
-            "Graph could not acquire the checkout required for a "
-            "concurrency-safe Word edit"
-        ) from exc
+                "Graph could not acquire the checkout required for a "
+                "concurrency-safe Word edit"
+            ) from exc
     try:
         metadata = _graph_request("GET", snapshot.item_path, params={"$select": "eTag"})
         locked_content = _graph_request(
@@ -703,7 +744,7 @@ def _checkout_edit_snapshot(snapshot: _EditSnapshot, conflict_message: str) -> s
         if not isinstance(locked_etag, str) or not locked_etag:
             raise RuntimeError("Graph did not return an eTag for the checked-out file")
         if hashlib.sha256(locked_content).hexdigest() != snapshot.generation:
-            raise ValueError(conflict_message)
+            raise _WordEditConflict(conflict_message, code="version_conflict")
         return locked_etag
     except Exception:
         try:
@@ -731,7 +772,7 @@ def _upload_checked_out_document(
         )
     except _GraphRequestError as exc:
         if exc.status_code == 412:
-            raise ValueError(conflict_message) from exc
+            raise _WordEditConflict(conflict_message, code="version_conflict") from exc
         raise
     upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
     if not isinstance(upload_url, str) or not upload_url:
@@ -753,7 +794,7 @@ def _upload_checked_out_document(
                 timeout=_BINARY_TIMEOUT_SECONDS,
             )
             if response.status_code == 412:
-                raise ValueError(conflict_message)
+                raise _WordEditConflict(conflict_message, code="version_conflict")
             if response.status_code in (200, 201):
                 try:
                     result = response.json()
@@ -811,6 +852,17 @@ def _sleep_before_upload_retry(attempt: int) -> None:
     delay = min(
         _UPLOAD_RETRY_BASE_SECONDS * (2.0**attempt),
         _UPLOAD_RETRY_MAX_SECONDS,
+    )
+    time.sleep(delay)
+
+
+def _sleep_before_checkout_retry(attempt: int) -> None:
+    """Apply bounded exponential backoff before another checkout attempt."""
+    if attempt >= _CHECKOUT_RETRY_ATTEMPTS - 1:
+        return
+    delay = min(
+        _CHECKOUT_RETRY_BASE_SECONDS * (2.0**attempt),
+        _CHECKOUT_RETRY_MAX_SECONDS,
     )
     time.sleep(delay)
 
@@ -1518,7 +1570,7 @@ def word_set_paragraph_text(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error(e)
 
 
 @mcp.tool()
@@ -1547,7 +1599,7 @@ def word_append_paragraph(
         return _success_with_item(item)
     except Exception as e:
         logger.error("Error appending paragraph to Word document %s: %s", file_path, e)
-        return _error(str(e))
+        return _error(e)
 
 
 @mcp.tool()
@@ -1576,7 +1628,7 @@ def word_add_heading(
         return _success_with_item(item)
     except Exception as e:
         logger.error("Error adding heading to Word document %s: %s", file_path, e)
-        return _error(str(e))
+        return _error(e)
 
 
 @mcp.tool()
@@ -1692,7 +1744,7 @@ def word_replace_text(
         return _success_with_item(item, replacements=replacements)
     except Exception as e:
         logger.error("Error replacing text in Word document %s: %s", file_path, e)
-        return _error(str(e))
+        return _error(e)
 
 
 if __name__ == "__main__":

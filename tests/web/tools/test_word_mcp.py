@@ -1828,6 +1828,72 @@ def test_checkout_revalidation_discards_lock_when_content_changed(monkeypatch):
     assert mock_request.call_args_list[-1].kwargs["url"].endswith("/discardCheckout")
 
 
+def test_checkout_retries_locked_item_before_revalidating(monkeypatch):
+    original = _docx_bytes(lambda d: d.add_paragraph("before"))
+    snapshot = word._EditSnapshot(
+        "/drives/drive-1/items/item-1",
+        '"before"',
+        hashlib.sha256(original).hexdigest(),
+    )
+    responses = iter(
+        [
+            MockResponse({"error": {"code": "notAllowed"}}, status_code=423),
+            MockResponse({"error": {"code": "notAllowed"}}, status_code=423),
+            MockResponse({}, status_code=204),
+            MockResponse({"eTag": '"checked-out"'}),
+            MockResponse(content=original),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    sleep = Mock()
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word.time, "sleep", sleep)
+
+    etag = word._checkout_edit_snapshot(snapshot, "changed by someone else")
+
+    assert etag == '"checked-out"'
+    assert [call.args for call in sleep.call_args_list] == [(1.0,), (2.0,)]
+    assert (
+        sum(
+            call.kwargs["url"].endswith("/checkout")
+            for call in mock_request.call_args_list
+        )
+        == 3
+    )
+
+
+def test_append_paragraph_returns_structured_lock_error_after_retries(monkeypatch):
+    content = _docx_bytes()
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({"error": {"code": "notAllowed"}}, status_code=423),
+            MockResponse({"error": {"code": "notAllowed"}}, status_code=423),
+            MockResponse({"error": {"code": "notAllowed"}}, status_code=423),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    sleep = Mock()
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    monkeypatch.setattr(word.time, "sleep", sleep)
+
+    result = json.loads(word.word_append_paragraph("Report.docx", "New paragraph"))
+
+    assert result == {
+        "status": "error",
+        "message": (
+            "'Report.docx' was changed by someone else since this edit started; "
+            "re-read it and retry"
+        ),
+        "code": "resource_locked",
+        "retryable": True,
+        "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+        "lock_owner": None,
+    }
+    assert [call.args for call in sleep.call_args_list] == [(1.0,), (2.0,)]
+
+
 def test_check_in_reconciles_when_success_response_is_lost(monkeypatch):
     content = _docx_bytes(lambda d: d.add_paragraph("committed"))
     responses = iter(

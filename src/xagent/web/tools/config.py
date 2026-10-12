@@ -3881,6 +3881,7 @@ class WebToolConfig(BaseToolConfig):
             if task_output_dir:
                 env["XAGENT_GOOGLE_DRIVE_OUTPUT_DIR"] = task_output_dir
                 env["XAGENT_ONEDRIVE_OUTPUT_DIR"] = task_output_dir
+                env["XAGENT_SHAREPOINT_OUTPUT_DIR"] = task_output_dir
             transport_config["env"] = env
             return transport_config
 

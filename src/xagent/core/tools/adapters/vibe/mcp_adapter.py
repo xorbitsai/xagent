@@ -294,6 +294,7 @@ _DURABLE_UPLOAD_OWN_FILE_ID_TOOLS: frozenset[tuple[str, str]] = frozenset(
 # when the original process-local output directory is no longer available.
 _WORKSPACE_DOWNLOAD_FIELDS: dict[tuple[str, str], str] = {
     ("onedrive", "onedrive_download_file"): "file_path",
+    ("sharepoint", "sharepoint_download_file"): "file_path",
     ("google-drive", "google_drive_download_file"): "path",
 }
 

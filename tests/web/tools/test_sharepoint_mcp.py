@@ -1,4 +1,6 @@
+import hashlib
 import json
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -550,15 +552,50 @@ def test_get_file_content_decodes_text(monkeypatch):
     assert result["encoding"] == "utf-8"
 
 
-def test_get_file_content_falls_back_to_base64_for_binary(monkeypatch):
+def test_get_file_content_directs_binary_to_workspace_download(monkeypatch):
     binary_content = b"\xff\xd8\xff\xe0binarydata"
     mock_request = Mock(return_value=MockResponse(content=binary_content))
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
     result = json.loads(sharepoint.sharepoint_get_file_content("root", "photo.jpg"))
 
+    assert result["status"] == "error"
+    assert "sharepoint_download_file" in result["message"]
+    assert "base64_content" not in result
+
+
+def test_download_file_writes_binary_to_task_workspace(monkeypatch, tmp_path):
+    binary_content = b"\xff\xd8\xff\xe0binarydata"
+    monkeypatch.setenv("XAGENT_SHAREPOINT_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(content=binary_content)),
+    )
+
+    result = json.loads(
+        sharepoint.sharepoint_download_file("root", "Reports/photo.jpg")
+    )
+
+    output_path = Path(result["file_path"])
     assert result["status"] == "success"
-    assert result["encoding"] == "base64"
+    assert output_path == tmp_path / "output" / "photo.jpg"
+    assert output_path.read_bytes() == binary_content
+    assert result["sha256"] == hashlib.sha256(binary_content).hexdigest()
+
+
+def test_download_file_requires_task_workspace(monkeypatch):
+    monkeypatch.delenv("XAGENT_SHAREPOINT_OUTPUT_DIR", raising=False)
+    monkeypatch.setattr(
+        sharepoint.requests,
+        "request",
+        Mock(return_value=MockResponse(content=b"binary")),
+    )
+
+    result = json.loads(sharepoint.sharepoint_download_file("root", "file.bin"))
+
+    assert result["status"] == "error"
+    assert "XAGENT_SHAREPOINT_OUTPUT_DIR" in result["message"]
 
 
 def test_get_file_content_streams_with_identity_encoding(monkeypatch):
@@ -614,9 +651,9 @@ def test_get_file_content_rejects_raw_content_over_output_limit(monkeypatch):
     assert "too large" in result["message"]
 
 
-def test_get_file_content_rejects_encoded_result_over_output_limit(monkeypatch):
-    # Raw content itself is under the output limit, but base64 inflates it
-    # (4/3x) past the limit -- must still be caught by the second check.
+def test_get_file_content_never_encodes_binary_even_when_it_would_fit(monkeypatch):
+    # Keep binary bytes out of model context regardless of the generic output
+    # limit; the durable workspace download is the only supported path.
     monkeypatch.setattr(sharepoint, "get_tool_max_output_length", lambda: 100)
     binary_content = b"\xff\xd8\xff\xe0" + b"x" * 70  # 74 bytes, base64 ~100+ chars
     mock_request = Mock(return_value=MockResponse(content=binary_content))
@@ -625,7 +662,7 @@ def test_get_file_content_rejects_encoded_result_over_output_limit(monkeypatch):
     result = json.loads(sharepoint.sharepoint_get_file_content("root", "photo.jpg"))
 
     assert result["status"] == "error"
-    assert "too large" in result["message"]
+    assert "sharepoint_download_file" in result["message"]
 
 
 def test_get_file_content_accepts_multibyte_text_over_byte_count_limit(monkeypatch):

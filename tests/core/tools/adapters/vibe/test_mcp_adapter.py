@@ -1044,6 +1044,25 @@ def test_custom_google_drive_server_is_not_trusted_for_download_registration():
     assert "durable file_ref" not in adapter.description
 
 
+def test_sharepoint_download_is_registered_as_durable_file_ref():
+    adapter = _build_mcp_tool_adapter(
+        "SharePoint",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="sharepoint_download_file",
+            description="Download a file",
+            inputSchema={
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+            },
+        ),
+        workspace=object(),
+    )
+
+    assert adapter._workspace_download_field == "file_path"
+    assert "durable file_ref" in adapter.description
+
+
 def test_workspace_download_registration_uses_real_file_ref_for_google_drive(
     tmp_path,
 ):

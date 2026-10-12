@@ -1,3 +1,4 @@
+import base64
 import json
 from unittest.mock import Mock
 
@@ -5,6 +6,17 @@ import pytest
 import requests
 
 from xagent.web.tools.mcp import planner
+
+
+TENANT_ID = "11111111-2222-3333-4444-555555555555"
+
+
+def _graph_token(*, tenant_id: str | None = TENANT_ID) -> str:
+    payload = {} if tenant_id is None else {"tid": tenant_id}
+    encoded = (
+        base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    )
+    return f"header.{encoded}.signature"
 
 
 class MockResponse:
@@ -30,12 +42,34 @@ class MockResponse:
 
 @pytest.fixture(autouse=True)
 def _credentials(monkeypatch):
-    monkeypatch.setenv("AUTH_TOKEN", "test-graph-token")
+    monkeypatch.setenv("AUTH_TOKEN", _graph_token())
 
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+def test_tenant_id_from_auth_token(monkeypatch):
+    monkeypatch.setenv("AUTH_TOKEN", _graph_token())
+
+    assert planner._tenant_id_from_auth_token() == TENANT_ID
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["opaque-token", _graph_token(tenant_id=None), _graph_token(tenant_id="invalid")],
+)
+def test_tenant_id_from_auth_token_rejects_unusable_tokens(monkeypatch, token):
+    monkeypatch.setenv("AUTH_TOKEN", token)
+
+    assert planner._tenant_id_from_auth_token() is None
+
+
+def test_planner_web_url_uses_plan_and_tenant_ids():
+    assert planner._planner_web_url("plan-1") == (
+        f"https://planner.cloud.microsoft/webui/plan/plan-1/view/board?tid={TENANT_ID}"
+    )
 
 
 def test_current_etag_success(monkeypatch):
@@ -317,7 +351,15 @@ def test_list_plans_success(monkeypatch):
     result = json.loads(planner.planner_list_plans("group-1"))
 
     assert result["status"] == "success"
-    assert result["plans"] == [{"id": "plan-1"}]
+    assert result["plans"] == [
+        {
+            "web_url": (
+                "https://planner.cloud.microsoft/webui/plan/plan-1/view/board?"
+                f"tid={TENANT_ID}"
+            ),
+            "id": "plan-1",
+        }
+    ]
     assert result["next_link"] == next_link
     assert mock_request.call_args.kwargs["url"].endswith(
         "/groups/group-1/planner/plans"
@@ -332,7 +374,8 @@ def test_list_plans_fetches_next_page(monkeypatch):
     result = json.loads(planner.planner_list_plans("group-1", next_link=next_link))
 
     assert result["status"] == "success"
-    assert result["plans"] == [{"id": "plan-2"}]
+    assert result["plans"][0]["id"] == "plan-2"
+    assert result["plans"][0]["web_url"].endswith(f"?tid={TENANT_ID}")
     assert mock_request.call_args.kwargs["url"] == next_link
 
 
@@ -359,11 +402,29 @@ def test_create_plan_builds_container_url(monkeypatch):
     result = json.loads(planner.planner_create_plan("group-1", "New plan"))
 
     assert result["status"] == "success"
+    assert result["plan"]["web_url"] == (
+        f"https://planner.cloud.microsoft/webui/plan/plan-1/view/board?tid={TENANT_ID}"
+    )
     kwargs = mock_request.call_args.kwargs
     assert kwargs["json"] == {
         "container": {"url": "https://graph.microsoft.com/v1.0/groups/group-1"},
         "title": "New plan",
     }
+
+
+def test_create_plan_keeps_success_when_web_url_cannot_be_built(monkeypatch):
+    monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"id": "plan-1", "title": "New plan"})),
+    )
+
+    result = json.loads(planner.planner_create_plan("group-1", "New plan"))
+
+    assert result["status"] == "success"
+    assert result["plan"]["web_url"] is None
+    assert result["plan"]["id"] == "plan-1"
 
 
 def test_create_plan_transport_failure_is_indeterminate(monkeypatch):
@@ -473,7 +534,14 @@ def test_get_plan_success(monkeypatch):
     result = json.loads(planner.planner_get_plan("plan-1"))
 
     assert result["status"] == "success"
-    assert result["plan"] == {"id": "plan-1", "title": "Plan"}
+    assert result["plan"] == {
+        "web_url": (
+            "https://planner.cloud.microsoft/webui/plan/plan-1/view/board?"
+            f"tid={TENANT_ID}"
+        ),
+        "id": "plan-1",
+        "title": "Plan",
+    }
     assert mock_request.call_args.kwargs["url"].endswith("/planner/plans/plan-1")
 
 
@@ -492,6 +560,7 @@ def test_get_plan_caps_large_singleton_response(monkeypatch):
     assert len(response) <= 300
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["plan"]["web_url"].endswith(f"?tid={TENANT_ID}")
 
 
 def test_get_plan_caps_and_redacts_large_graph_error(monkeypatch):

@@ -1163,11 +1163,6 @@ def _ensure_can_add_body_paragraph(document: DocumentType) -> None:
         )
 
 
-def _set_page_break_before(paragraph: Any) -> None:
-    """Make Word start this paragraph on a new page."""
-    paragraph.paragraph_format.page_break_before = True
-
-
 def _document_main_body_text_characters(document: DocumentType) -> int:
     return sum(
         len(element.text or "")
@@ -1451,7 +1446,9 @@ def word_list_paragraphs(
     next_text_offset is non-zero only when one unusually large paragraph had
     to be split. limit is normalized to 100-500 paragraphs. Pagination
     requires an output cap of at least 16,384 characters. Pass generation to
-    word_set_paragraph_text with the index."""
+    word_set_paragraph_text with the index. To insert a page break after
+    one of these paragraphs, also pass its generation to
+    word_insert_page_break(after_paragraph_index=..., expected_generation=...)."""
     try:
         _require_pagination_output_budget()
         if (
@@ -1540,7 +1537,9 @@ def word_append_paragraph(
     given, is a built-in Word style name (e.g. "List Bullet", "Quote");
     invalid names raise an error rather than silently falling back to
     Normal. If page_break_before is true, the paragraph starts on a new
-    page."""
+    page. Use page_break_before when adding the content that should start
+    on the new page; do not combine it with word_insert_page_break, which
+    would create an extra blank page."""
     try:
         _require_tool_output_budget()
         document, snapshot, _generation = _download_document(
@@ -1552,7 +1551,7 @@ def word_append_paragraph(
         _ensure_projected_text_budget(document, len(text))
         paragraph = document.add_paragraph(text, style=style)
         if page_break_before:
-            _set_page_break_before(paragraph)
+            paragraph.paragraph_format.page_break_before = True
         item = _upload_document(document, file_path, snapshot)
         return _success_with_item(item)
     except Exception as e:
@@ -1571,7 +1570,9 @@ def word_add_heading(
 ) -> str:
     """Append a heading to the end of a Word document. level is 0 (the
     document title style) through 9. If page_break_before is true, the
-    heading starts on a new page."""
+    heading starts on a new page. Use page_break_before when adding the
+    heading that should start on the new page; do not combine it with
+    word_insert_page_break, which would create an extra blank page."""
     try:
         _require_tool_output_budget()
         if not 0 <= level <= 9:
@@ -1585,7 +1586,7 @@ def word_add_heading(
         _ensure_projected_text_budget(document, len(text))
         paragraph = document.add_heading(text, level=level)
         if page_break_before:
-            _set_page_break_before(paragraph)
+            paragraph.paragraph_format.page_break_before = True
         item = _upload_document(document, file_path, snapshot)
         return _success_with_item(item)
     except Exception as e:
@@ -1606,7 +1607,10 @@ def word_insert_page_break(
     With no paragraph index, a break paragraph is appended to the document.
     When after_paragraph_index is supplied, the break is added after that
     top-level body paragraph. The index must come from word_list_paragraphs
-    and therefore requires its expected_generation value.
+    and therefore requires its expected_generation value. Use this tool when
+    inserting a break before a later edit; when adding the new paragraph or
+    heading in the same operation, prefer page_break_before=True on that
+    tool instead. Do not combine both, or Word will render a blank page.
     """
     try:
         _require_tool_output_budget()
@@ -1626,20 +1630,22 @@ def word_insert_page_break(
         if after_paragraph_index is None:
             _ensure_can_add_body_paragraph(document)
             paragraph = document.add_paragraph()
-            inserted_after = len(paragraphs) - 1 if paragraphs else None
+            page_break_paragraph_index = len(paragraphs)
         else:
             if not 0 <= after_paragraph_index < len(paragraphs):
                 raise ValueError(
                     f"after_paragraph_index {after_paragraph_index} is out of "
                     f"range for a document with {len(paragraphs)} paragraphs"
                 )
-            paragraph = paragraphs[after_paragraph_index]
-            inserted_after = after_paragraph_index
+            _ensure_can_add_body_paragraph(document)
+            paragraph = document.add_paragraph()
+            paragraphs[after_paragraph_index]._p.addnext(paragraph._p)
+            page_break_paragraph_index = after_paragraph_index + 1
         paragraph.add_run().add_break(WD_BREAK.PAGE)
         item = _upload_document(document, file_path, snapshot)
         return _success_with_item(
             item,
-            inserted_after_paragraph_index=inserted_after,
+            page_break_paragraph_index=page_break_paragraph_index,
         )
     except Exception as e:
         logger.error("Error inserting page break in Word document %s: %s", file_path, e)

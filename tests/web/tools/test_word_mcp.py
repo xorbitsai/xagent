@@ -1025,7 +1025,14 @@ def test_append_paragraph(monkeypatch):
     assert uploaded.paragraphs[-1].text == "New paragraph"
 
 
-def test_append_paragraph_can_start_on_new_page(monkeypatch):
+@pytest.mark.parametrize(
+    ("tool", "text"),
+    [
+        (word.word_append_paragraph, "New paragraph"),
+        (word.word_add_heading, "New heading"),
+    ],
+)
+def test_word_mutation_can_start_on_new_page(monkeypatch, tool, text):
     _bypass_edit_checkout(monkeypatch)
     content = _docx_bytes()
     responses = iter(
@@ -1040,46 +1047,22 @@ def test_append_paragraph_can_start_on_new_page(monkeypatch):
     mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
     monkeypatch.setattr(word.requests, "put", mock_put)
 
-    result = json.loads(
-        word.word_append_paragraph(
-            "Report.docx", "New paragraph", page_break_before=True
-        )
-    )
+    result = json.loads(tool("Report.docx", text, page_break_before=True))
 
     assert result["status"] == "success"
     uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
-    assert uploaded.paragraphs[-1].text == "New paragraph"
-    assert uploaded.paragraphs[-1].paragraph_format.page_break_before is True
-
-
-def test_add_heading_can_start_on_new_page(monkeypatch):
-    _bypass_edit_checkout(monkeypatch)
-    content = _docx_bytes()
-    responses = iter(
-        [
-            MockResponse(_edit_metadata()),
-            MockResponse(content=content),
-            MockResponse({"uploadUrl": "https://upload.example/session"}),
-        ]
-    )
-    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
-    monkeypatch.setattr(word.requests, "request", mock_request)
-    mock_put = Mock(return_value=MockResponse({"id": "item-1"}))
-    monkeypatch.setattr(word.requests, "put", mock_put)
-
-    result = json.loads(
-        word.word_add_heading("Report.docx", "New heading", page_break_before=True)
-    )
-
-    assert result["status"] == "success"
-    uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
-    assert uploaded.paragraphs[-1].text == "New heading"
+    assert uploaded.paragraphs[-1].text == text
     assert uploaded.paragraphs[-1].paragraph_format.page_break_before is True
 
 
 def test_insert_page_break_at_end(monkeypatch):
     _bypass_edit_checkout(monkeypatch)
-    content = _docx_bytes(lambda d: d.add_paragraph("Existing"))
+
+    def build(document):
+        document.add_paragraph("Existing")
+        document.add_table(rows=1, cols=1)
+
+    content = _docx_bytes(build)
     responses = iter(
         [
             MockResponse(_edit_metadata()),
@@ -1095,10 +1078,14 @@ def test_insert_page_break_at_end(monkeypatch):
     result = json.loads(word.word_insert_page_break("Report.docx"))
 
     assert result["status"] == "success"
-    assert result["inserted_after_paragraph_index"] == 0
+    assert result["page_break_paragraph_index"] == 1
     uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[0].text == "Existing"
-    assert uploaded.paragraphs[1].runs[-1]._r.xpath("./w:br[@w:type='page']")
+    break_paragraph = uploaded.paragraphs[1]
+    assert break_paragraph.runs[-1]._r.xpath("./w:br[@w:type='page']")
+    assert list(uploaded.element.body).index(uploaded.tables[0]._tbl) < list(
+        uploaded.element.body
+    ).index(break_paragraph._p)
 
 
 def test_insert_page_break_after_paragraph_uses_generation(monkeypatch):
@@ -1126,11 +1113,12 @@ def test_insert_page_break_after_paragraph_uses_generation(monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert result["inserted_after_paragraph_index"] == 0
+    assert result["page_break_paragraph_index"] == 1
     uploaded = Document(io.BytesIO(mock_put.call_args.kwargs["data"]))
     assert uploaded.paragraphs[0].text == "First"
-    assert uploaded.paragraphs[0].runs[-1]._r.xpath("./w:br[@w:type='page']")
-    assert uploaded.paragraphs[1].text == "Second"
+    assert not uploaded.paragraphs[0].runs[-1]._r.xpath("./w:br[@w:type='page']")
+    assert uploaded.paragraphs[1].runs[-1]._r.xpath("./w:br[@w:type='page']")
+    assert uploaded.paragraphs[2].text == "Second"
 
 
 def test_insert_page_break_at_index_requires_generation(monkeypatch):
@@ -1144,6 +1132,64 @@ def test_insert_page_break_at_index_requires_generation(monkeypatch):
     assert result["status"] == "error"
     assert "expected_generation" in result["message"]
     mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("after_paragraph_index", [-1, 1])
+def test_insert_page_break_rejects_out_of_range_index(
+    monkeypatch, after_paragraph_index
+):
+    _bypass_edit_checkout(monkeypatch)
+    content = _docx_bytes(lambda d: d.add_paragraph("Only paragraph"))
+    generation = hashlib.sha256(content).hexdigest()
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock()
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(
+        word.word_insert_page_break(
+            "Report.docx",
+            after_paragraph_index=after_paragraph_index,
+            expected_generation=generation,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "out of range" in result["message"]
+    mock_put.assert_not_called()
+
+
+def test_insert_page_break_rejects_stale_generation(monkeypatch):
+    _bypass_edit_checkout(monkeypatch)
+    content = _docx_bytes(lambda d: d.add_paragraph("Only paragraph"))
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+        ]
+    )
+    mock_request = Mock(side_effect=lambda *a, **k: next(responses))
+    monkeypatch.setattr(word.requests, "request", mock_request)
+    mock_put = Mock()
+    monkeypatch.setattr(word.requests, "put", mock_put)
+
+    result = json.loads(
+        word.word_insert_page_break(
+            "Report.docx",
+            after_paragraph_index=0,
+            expected_generation="0" * 64,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "changed since" in result["message"]
+    mock_put.assert_not_called()
 
 
 def test_add_heading_validates_level():

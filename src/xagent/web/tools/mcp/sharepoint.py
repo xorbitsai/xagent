@@ -1015,9 +1015,12 @@ def _parent_reference(item: dict[str, Any], key: str) -> str | None:
 
 
 def _same_graph_id(left: str | None, right: str | None) -> bool:
-    return (
-        left is not None and right is not None and left.casefold() == right.casefold()
-    )
+    """Compare opaque Graph resource identifiers exactly.
+
+    Graph treats both drive and drive-item ids as case-sensitive. Folding case
+    here can turn two distinct resources into an apparent self-move or no-op.
+    """
+    return left is not None and right is not None and left == right
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))

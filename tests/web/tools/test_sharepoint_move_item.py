@@ -326,11 +326,29 @@ def test_source_outside_the_selected_drive_is_rejected(monkeypatch):
 def test_moving_an_item_into_itself_is_rejected_without_a_request(monkeypatch):
     graph = _install(monkeypatch, _FakeGraph({}))
 
-    result = _move(item_id="folder-b", destination_folder_id="FOLDER-B")
+    result = _move(item_id="folder-b", destination_folder_id="folder-b")
 
     assert result["status"] == "error"
     assert "itself" in result["message"]
     assert graph.calls == []
+
+
+def test_ids_that_differ_only_in_case_are_not_treated_as_the_same_item(monkeypatch):
+    graph = _install(
+        monkeypatch,
+        _FakeGraph(
+            {
+                "folder-b": _file("folder-b"),
+                "FOLDER-B": _folder("FOLDER-B"),
+            }
+        ),
+    )
+
+    result = _move(item_id="folder-b", destination_folder_id="FOLDER-B")
+
+    assert result["status"] == "success"
+    assert result["already_in_destination"] is False
+    assert len(graph.patches) == 1
 
 
 def test_the_drive_root_cannot_be_moved(monkeypatch):
@@ -438,7 +456,7 @@ def test_move_response_without_a_parent_is_not_reported_as_a_failure(monkeypatch
     assert result["already_in_destination"] is False
 
 
-def test_drive_ids_that_differ_only_in_case_are_the_same_drive(monkeypatch):
+def test_drive_ids_that_differ_only_in_case_are_different_drives(monkeypatch):
     destination = _folder()
     destination["parentReference"]["driveId"] = DRIVE_ID.upper()
     graph = _install(
@@ -447,11 +465,12 @@ def test_drive_ids_that_differ_only_in_case_are_the_same_drive(monkeypatch):
 
     result = _move()
 
-    assert result["status"] == "success"
-    assert len(graph.patches) == 1
+    assert result["status"] == "error"
+    assert "between drives" in result["message"]
+    assert graph.patches == []
 
 
-def test_parent_id_that_differs_only_in_case_is_already_in_destination(monkeypatch):
+def test_parent_ids_that_differ_only_in_case_do_not_skip_the_move(monkeypatch):
     graph = _install(
         monkeypatch,
         _FakeGraph({"file-1": _file(parent_id="FOLDER-B"), "folder-b": _folder()}),
@@ -460,8 +479,8 @@ def test_parent_id_that_differs_only_in_case_is_already_in_destination(monkeypat
     result = _move()
 
     assert result["status"] == "success"
-    assert result["already_in_destination"] is True
-    assert graph.patches == []
+    assert result["already_in_destination"] is False
+    assert len(graph.patches) == 1
 
 
 @pytest.mark.parametrize("parent_id", ["folder-a", "folder-b"], ids=["moved", "no-op"])

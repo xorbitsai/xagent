@@ -179,6 +179,7 @@ def test_name_conflict_reports_a_clear_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "already" in result["message"]
+    assert "report.pdf" in result["message"]
     assert "new_name" in result["message"]
 
 
@@ -188,6 +189,42 @@ def test_other_conflicts_keep_graphs_own_error(monkeypatch):
         _FakeGraph(
             {"file-1": _file(), "folder-b": _folder()},
             patch_response=_Response({"error": {"code": "conflict"}}, 409),
+        ),
+    )
+
+    result = _move()
+
+    assert result["status"] == "error"
+    assert "new_name" not in result["message"]
+    assert "409" in result["message"]
+
+
+@pytest.mark.parametrize("status_code", [401, 500])
+def test_get_http_failures_are_reported_without_special_mapping(
+    monkeypatch, status_code
+):
+    _install(
+        monkeypatch,
+        _FakeGraph(
+            {
+                "file-1": _Response({"error": {"code": "graphFailure"}}, status_code),
+                "folder-b": _folder(),
+            }
+        ),
+    )
+
+    result = _move()
+
+    assert result["status"] == "error"
+    assert str(status_code) in result["message"]
+
+
+def test_non_json_name_conflict_keeps_graph_error(monkeypatch):
+    _install(
+        monkeypatch,
+        _FakeGraph(
+            {"file-1": _file(), "folder-b": _folder()},
+            patch_response=_Response("not-json", 409),
         ),
     )
 
@@ -229,6 +266,8 @@ def test_unknown_item_or_destination_fails_before_any_change(
     assert result["status"] == "error"
     assert field in result["message"]
     assert "not found" in result["message"]
+    if field == "destination_folder_id":
+        assert "another document library" in result["message"]
     assert graph.patches == []
 
 
@@ -276,6 +315,19 @@ def test_destination_that_is_a_file_is_rejected(monkeypatch):
 
     assert result["status"] == "error"
     assert "folder" in result["message"]
+    assert graph.patches == []
+
+
+def test_item_without_an_id_is_rejected(monkeypatch):
+    graph = _install(
+        monkeypatch,
+        _FakeGraph({"file-1": {"name": "report.pdf"}, "folder-b": _folder()}),
+    )
+
+    result = _move()
+
+    assert result["status"] == "error"
+    assert "invalid item" in result["message"]
     assert graph.patches == []
 
 
@@ -481,6 +533,33 @@ def test_parent_ids_that_differ_only_in_case_do_not_skip_the_move(monkeypatch):
     assert result["status"] == "success"
     assert result["already_in_destination"] is False
     assert len(graph.patches) == 1
+
+
+def test_non_dict_move_response_is_rejected(monkeypatch):
+    graph = _install(
+        monkeypatch,
+        _FakeGraph({"file-1": _file(), "folder-b": _folder()}, patch_response=[]),
+    )
+
+    result = _move()
+
+    assert result["status"] == "error"
+    assert "invalid item" in result["message"]
+    assert len(graph.patches) == 1
+
+
+def test_invalid_site_id_is_rejected_without_a_request(monkeypatch):
+    graph = _install(
+        monkeypatch,
+        _FakeGraph({"file-1": _file(), "folder-b": _folder()}),
+    )
+
+    result = json.loads(
+        sharepoint.sharepoint_move_item("..", DRIVE_ID, "file-1", "folder-b")
+    )
+
+    assert result["status"] == "error"
+    assert graph.calls == []
 
 
 @pytest.mark.parametrize("parent_id", ["folder-a", "folder-b"], ids=["moved", "no-op"])

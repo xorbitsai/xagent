@@ -995,7 +995,8 @@ def _read_move_item(
     except _GraphRequestError as exc:
         if exc.status_code == 404:
             raise ValueError(
-                f"{field_name} was not found in this SharePoint drive: {item_id}"
+                f"{field_name} was not found in this SharePoint drive: {item_id} "
+                "(a destination in another document library is reported this way)"
             ) from None
         if exc.status_code == 403:
             raise ValueError(
@@ -1019,6 +1020,9 @@ def _same_graph_id(left: str | None, right: str | None) -> bool:
 
     Graph treats both drive and drive-item ids as case-sensitive. Folding case
     here can turn two distinct resources into an apparent self-move or no-op.
+    This intentionally differs from OneDrive's compatibility helper, which
+    preserves a documented workaround for inconsistent drive-id casing in
+    OneDrive Personal responses; SharePoint IDs are compared as returned.
     """
     return left is not None and right is not None and left == right
 
@@ -1034,10 +1038,11 @@ def sharepoint_move_item(
     """Move a file or folder within one SharePoint document library.
 
     ``site_id`` and ``drive_id`` identify the SharePoint site and document
-    library. ``item_id`` and ``destination_folder_id`` are drive-item ids from
-    sharepoint_list_items or sharepoint_search_files; use ``"root"`` as the
-    destination for the document-library root. ``new_name`` optionally renames
-    the item in the same request; leave it empty to keep the current name.
+    library; pass the ``drive_id`` returned by ``sharepoint_list_drives``.
+    ``item_id`` and ``destination_folder_id`` are drive-item ids from
+    ``sharepoint_list_items`` or ``sharepoint_search_files``; use ``"root"`` as
+    the destination for the document-library root. ``new_name`` optionally
+    renames the item in the same request; leave it empty to keep the current name.
 
     Both items are read before anything changes. A missing item, a destination
     that is not a folder, or a destination outside ``drive_id`` fails without
@@ -1045,7 +1050,10 @@ def sharepoint_move_item(
 
     Moving can change who can access an item because it can inherit access from
     the destination folder. Confirm the destination and that possible access
-    change with the user before calling this tool.
+    change with the user before calling this tool. On success, the response
+    contains ``item``, ``destination_folder_id``, ``already_in_destination`` and
+    ``renamed``. A 409 ``nameAlreadyExists`` response identifies the conflicting
+    name; retry with a different ``new_name``.
     """
     try:
         if not isinstance(new_name, str):
@@ -1079,10 +1087,6 @@ def sharepoint_move_item(
         if any(
             candidate is not None and not _same_graph_id(candidate, drive_id)
             for candidate in (source_drive_id, destination_drive_id)
-        ) or (
-            source_drive_id
-            and destination_drive_id
-            and not _same_graph_id(source_drive_id, destination_drive_id)
         ):
             raise ValueError(_CROSS_DRIVE_MOVE_MESSAGE)
 

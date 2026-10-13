@@ -1466,6 +1466,8 @@ async def test_execute_mcp_call_carries_excel_failure_code_from_text_result(
     result = await adapter._execute_mcp_call(adapter.connection, {}, {})
 
     assert result["failure_code"] == "workbook_access_denied"
+    assert result["success"] is False
+    assert result["is_error"] is True
 
 
 @pytest.mark.asyncio

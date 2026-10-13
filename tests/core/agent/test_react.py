@@ -102,7 +102,9 @@ def test_latest_tool_failure_code_rejects_unallowlisted_code() -> None:
             SimpleNamespace(role="user", metadata={}),
             SimpleNamespace(
                 role="tool",
-                metadata={"raw_result": {"failure_code": "arbitrary"}},
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
             ),
         ]
     )
@@ -117,7 +119,52 @@ def test_latest_tool_failure_code_rejects_non_string_code() -> None:
             SimpleNamespace(
                 role="tool",
                 metadata={
-                    "raw_result": {"failure_code": 123},
+                    "raw_result": {"success": False, "failure_code": 123},
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_stops_at_a_later_non_dict_result() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="tool", metadata={"raw_result": "completed"}),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_cross_a_failed_current_turn() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
                 },
             ),
         ]

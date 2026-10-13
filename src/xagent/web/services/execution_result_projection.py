@@ -206,7 +206,11 @@ def project_execution_result_for_channel(
         interactions = []
     elif task_status == TaskStatus.FAILED:
         transcript_content = CLIENT_SAFE_TASK_FAILURE
-        safe_failure = client_safe_failure_message(result)
+        safe_failure = (
+            None
+            if result.get("error_code") is not None
+            else client_safe_failure_message(result)
+        )
         base_text = with_task_reference(
             safe_failure[0] if safe_failure is not None else CLIENT_SAFE_TASK_FAILURE,
             task_id,

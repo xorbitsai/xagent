@@ -12,6 +12,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ....config import get_tool_max_output_length
+from ....core.agent.result import EXCEL_FAILURE_CODES
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -42,11 +43,20 @@ _EXCEL_COLUMN_RE = re.compile(r"^[A-Za-z]{1,3}$")
 
 
 class _GraphRequestError(RuntimeError):
-    """Graph HTTP failure that retains its status without response parsing."""
+    """Graph HTTP failure with the stable fields needed for classification."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        graph_error_code: str | None = None,
+        request_path: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.graph_error_code = graph_error_code
+        self.request_path = request_path
 
 
 class _GraphMutationIndeterminateError(RuntimeError):
@@ -104,25 +114,43 @@ def _error(
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
-    if failure_code in _EXCEL_FAILURE_CODES:
+    if failure_code in EXCEL_FAILURE_CODES:
         payload["failure_code"] = failure_code
     return json.dumps(payload, ensure_ascii=False)
 
 
-_EXCEL_FAILURE_CODES = frozenset(
-    {"workbook_access_denied", "site_not_found", "workbook_locked"}
-)
+def _graph_error_code(response_text: str) -> str | None:
+    try:
+        payload = json.loads(response_text)
+    except (TypeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _is_workbook_resolution_path(path: str | None) -> bool:
+    if not isinstance(path, str):
+        return False
+    path_only = urlsplit(path).path.rstrip("/")
+    return path_only.endswith("/workbook/worksheets") or path_only.endswith(
+        "/workbook/tables"
+    )
 
 
 def _excel_failure_code(exc: BaseException) -> str | None:
     """Classify only stable Graph failures safe for client localization."""
     if not isinstance(exc, _GraphRequestError):
         return None
-    if exc.status_code == 403:
+    graph_code = (exc.graph_error_code or "").lower()
+    if graph_code == "accessdenied":
         return "workbook_access_denied"
-    if exc.status_code == 404:
+    if graph_code == "itemnotfound" and _is_workbook_resolution_path(exc.request_path):
         return "site_not_found"
-    if exc.status_code in {409, 423} and "lock" in str(exc).lower():
+    if graph_code in {"resourcelocked", "itemlocked"} and exc.status_code in {
+        409,
+        423,
+    }:
         return "workbook_locked"
     return None
 
@@ -201,7 +229,12 @@ def _graph_request(
                 message = f"{message} - {response_text}"
             if oversized:
                 message = f"{message} - response body truncated at ingress limit"
-            raise _GraphRequestError(message, status_code=response.status_code) from exc
+            raise _GraphRequestError(
+                message,
+                status_code=response.status_code,
+                graph_error_code=_graph_error_code(response_text),
+                request_path=path,
+            ) from exc
         if oversized:
             raise _GraphResponseTooLargeError(
                 "Graph response exceeded the Excel tool ingress limit"
@@ -219,7 +252,12 @@ def _graph_request(
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
-        raise _GraphRequestError(message, status_code=response.status_code) from exc
+        raise _GraphRequestError(
+            message,
+            status_code=response.status_code,
+            graph_error_code=_graph_error_code(response_text),
+            request_path=path,
+        ) from exc
     if response.status_code == 204:
         return {}
     if not response.content:

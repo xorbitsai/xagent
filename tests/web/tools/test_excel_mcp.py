@@ -1588,9 +1588,9 @@ def test_graph_error_response_is_surfaced_as_error(monkeypatch):
 @pytest.mark.parametrize(
     ("status_code", "body", "failure_code"),
     [
-        (403, {"error": {"code": "AccessDenied"}}, "workbook_access_denied"),
+        (403, {"error": {"code": "accessDenied"}}, "workbook_access_denied"),
         (404, {"error": {"code": "itemNotFound"}}, "site_not_found"),
-        (423, {"error": {"message": "workbook locked"}}, "workbook_locked"),
+        (423, {"error": {"code": "resourceLocked"}}, "workbook_locked"),
     ],
 )
 def test_graph_failures_carry_allowlisted_failure_code(
@@ -1616,6 +1616,25 @@ def test_graph_other_failure_does_not_carry_failure_code(monkeypatch):
     )
 
     result = json.loads(excel.excel_list_worksheets("book.xlsx"))
+
+    assert result["status"] == "error"
+    assert "failure_code" not in result
+
+
+def test_graph_item_not_found_for_a_worksheet_does_not_look_like_missing_workbook(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"error": {"code": "itemNotFound"}}, status_code=404
+            )
+        ),
+    )
+
+    result = json.loads(excel.excel_get_range("book.xlsx", "Missing", address="A1"))
 
     assert result["status"] == "error"
     assert "failure_code" not in result

@@ -44,6 +44,7 @@ from ....file_ref import (
     parse_file_id_ref,
     sanitize_file_ref_for_context,
 )
+from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
 from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import (
     Connection,
@@ -1360,8 +1361,6 @@ def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
     content = result.get("content")
     if not isinstance(content, list):
         return None
-    from ....agent.result import normalize_tool_failure_code
-
     for item in content:
         if not isinstance(item, dict) or not isinstance(item.get("text"), str):
             continue
@@ -1372,7 +1371,7 @@ def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
         if not isinstance(payload, dict):
             continue
         code = normalize_tool_failure_code(payload.get("failure_code"))
-        if code in {"workbook_access_denied", "site_not_found", "workbook_locked"}:
+        if code in EXCEL_FAILURE_CODES:
             return code
     return None
 
@@ -2448,6 +2447,8 @@ class MCPToolAdapter(AbstractBaseTool):
                 failure_code = _excel_failure_code(normalized)
                 if failure_code is not None:
                     normalized["failure_code"] = failure_code
+                    normalized["success"] = False
+                    normalized["is_error"] = True
             return normalized
 
     async def _retry_after_authorization_failure(

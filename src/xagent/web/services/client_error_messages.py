@@ -168,12 +168,12 @@ def client_error_message(code: ClientErrorCode) -> str:
         ),
         ClientErrorCode.TASK_ACCESS_DENIED: "You do not have access to this task.",
         ClientErrorCode.EXCEL_WORKBOOK_ACCESS_DENIED: (
-            "Microsoft Graph could not open the Excel workbook because access was "
-            "denied. Check the workbook permissions or reconnect SharePoint."
+            "The Excel workbook could not be opened. Check that you have edit "
+            "permission or reconnect the Excel connector."
         ),
         ClientErrorCode.EXCEL_SITE_NOT_FOUND: (
-            "The SharePoint site or Excel workbook could not be found. Check the "
-            "site, drive, and workbook path."
+            "The Excel workbook or its SharePoint location could not be found. "
+            "Check the workbook path or reconnect the Excel connector."
         ),
         ClientErrorCode.EXCEL_WORKBOOK_LOCKED: (
             "The Excel workbook is locked. Close it elsewhere and try again."

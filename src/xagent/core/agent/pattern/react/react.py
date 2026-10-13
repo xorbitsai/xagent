@@ -1687,7 +1687,7 @@ class ReActPattern(AgentPattern):
             metadata = getattr(message, "metadata", {}) or {}
             result = metadata.get("raw_result")
             if not isinstance(result, dict):
-                continue
+                return None
             if tool_result_succeeded(result):
                 # A later successful call supersedes an earlier classified
                 # failure in the same user turn; do not surface stale text.

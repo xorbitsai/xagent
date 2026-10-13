@@ -195,6 +195,19 @@ def test_project_failed_result_rejects_unallowlisted_tool_failure() -> None:
     assert projection.visible_text == CLIENT_SAFE_TASK_FAILURE
 
 
+def test_project_failed_result_keeps_an_existing_error_code_over_tool_failure() -> None:
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "quota_exceeded",
+            "error_code": "quota_exceeded",
+            "failure_code": "workbook_access_denied",
+        }
+    )
+
+    assert projection.visible_text == CLIENT_SAFE_TASK_FAILURE
+
+
 def test_project_failure_appends_task_id_to_visible_text_only() -> None:
     projection = project_execution_result_for_channel(
         {"success": False, "status": "error", "error": "boom"}, task_id=45

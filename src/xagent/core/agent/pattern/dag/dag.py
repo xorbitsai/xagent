@@ -34,7 +34,7 @@ from ...language import (
     render_structured_request_language_policy,
     serialize_pending_user_response,
 )
-from ...result import unwrap_final_answer_content
+from ...result import normalize_tool_failure_code, unwrap_final_answer_content
 from ...runtime import (
     ExecutionInterrupted,
     LLMCallInterrupted,
@@ -1057,6 +1057,7 @@ class DAGPattern(AgentPattern):
         # A step id can run again after a replan; the failure recorded for its
         # earlier attempt must not be attached to a later, different failure.
         self._step_model_failures.pop(step.id, None)
+        step.failure_code = None
 
         active_context = self.active_step_contexts.get(step.id)
         output_language = self._output_language(root_context)
@@ -1236,6 +1237,7 @@ class DAGPattern(AgentPattern):
         if not result.get("success"):
             step.status = "failed"
             step.error = result.get("error", f"Step {step.id} failed.")
+            step.failure_code = normalize_tool_failure_code(result.get("failure_code"))
             log_step_failure(
                 task_id=root_context.execution_id,
                 step_id=step.id,
@@ -1473,6 +1475,16 @@ class DAGPattern(AgentPattern):
             metadata.update(extra_metadata)
         if failed_step_id is not None:
             metadata["failed_step_id"] = failed_step_id
+            failed_step = next(
+                (
+                    step
+                    for step in (self.plan.steps if self.plan is not None else [])
+                    if step.id == failed_step_id
+                ),
+                None,
+            )
+            if failed_step is not None and failed_step.failure_code is not None:
+                metadata["failure_code"] = failed_step.failure_code
             # A step that failed on a model-provider error carries the same
             # keys as a failed plan or completion call.
             metadata.update(self._step_model_failures.get(failed_step_id, {}))

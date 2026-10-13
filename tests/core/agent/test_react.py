@@ -79,7 +79,9 @@ class EmptyArgs(BaseModel):
 def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
     previous = SimpleNamespace(
         role="tool",
-        metadata={"raw_result": {"success": False, "failure_code": "site_not_found"}},
+        metadata={
+            "raw_result": {"success": False, "failure_code": "excel_site_not_found"}
+        },
     )
     user = SimpleNamespace(role="user", metadata={})
     current = SimpleNamespace(
@@ -87,13 +89,16 @@ def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
         metadata={
             "raw_result": {
                 "success": False,
-                "failure_code": "workbook_access_denied",
+                "failure_code": "excel_workbook_access_denied",
             }
         },
     )
     context = SimpleNamespace(messages=[previous, user, current])
 
-    assert ReActPattern._latest_tool_failure_code(context) == "workbook_access_denied"
+    assert (
+        ReActPattern._latest_tool_failure_code(context)
+        == "excel_workbook_access_denied"
+    )
 
 
 def test_latest_tool_failure_code_rejects_unallowlisted_code() -> None:
@@ -137,7 +142,7 @@ def test_latest_tool_failure_code_stops_at_a_later_non_dict_result() -> None:
                 metadata={
                     "raw_result": {
                         "success": False,
-                        "failure_code": "site_not_found",
+                        "failure_code": "excel_site_not_found",
                     }
                 },
             ),
@@ -156,7 +161,7 @@ def test_latest_tool_failure_code_does_not_cross_a_failed_current_turn() -> None
                 metadata={
                     "raw_result": {
                         "success": False,
-                        "failure_code": "site_not_found",
+                        "failure_code": "excel_site_not_found",
                     }
                 },
             ),
@@ -179,7 +184,7 @@ def test_latest_tool_failure_code_drops_stale_failure_after_success() -> None:
             SimpleNamespace(role="user", metadata={}),
             SimpleNamespace(
                 role="tool",
-                metadata={"raw_result": {"failure_code": "site_not_found"}},
+                metadata={"raw_result": {"failure_code": "excel_site_not_found"}},
             ),
             SimpleNamespace(
                 role="tool",

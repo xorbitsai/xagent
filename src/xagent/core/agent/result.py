@@ -6,9 +6,9 @@ from typing import Any
 
 EXCEL_FAILURE_CODES = frozenset(
     {
-        "workbook_access_denied",
-        "site_not_found",
-        "workbook_locked",
+        "excel_workbook_access_denied",
+        "excel_site_not_found",
+        "excel_workbook_locked",
     }
 )
 

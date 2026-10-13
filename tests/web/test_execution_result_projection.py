@@ -175,7 +175,7 @@ def test_project_failed_result_maps_classified_tool_failure() -> None:
             "success": False,
             "status": "invalid_tool_protocol",
             "error": "truncated_tool_arguments",
-            "failure_code": "workbook_access_denied",
+            "failure_code": "excel_workbook_access_denied",
         }
     )
 
@@ -201,7 +201,7 @@ def test_project_failed_result_keeps_an_existing_error_code_over_tool_failure() 
             "success": False,
             "status": "quota_exceeded",
             "error_code": "quota_exceeded",
-            "failure_code": "workbook_access_denied",
+            "failure_code": "excel_workbook_access_denied",
         }
     )
 

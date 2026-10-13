@@ -1588,9 +1588,9 @@ def test_graph_error_response_is_surfaced_as_error(monkeypatch):
 @pytest.mark.parametrize(
     ("status_code", "body", "failure_code"),
     [
-        (403, {"error": {"code": "accessDenied"}}, "workbook_access_denied"),
-        (404, {"error": {"code": "itemNotFound"}}, "site_not_found"),
-        (423, {"error": {"code": "resourceLocked"}}, "workbook_locked"),
+        (403, {"error": {"code": "accessDenied"}}, "excel_workbook_access_denied"),
+        (404, {"error": {"code": "itemNotFound"}}, "excel_site_not_found"),
+        (423, {"error": {"code": "resourceLocked"}}, "excel_workbook_locked"),
     ],
 )
 def test_graph_failures_carry_allowlisted_failure_code(

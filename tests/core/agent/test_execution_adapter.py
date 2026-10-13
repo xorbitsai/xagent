@@ -1694,13 +1694,13 @@ def test_execution_adapter_propagates_allowlisted_tool_failure_code() -> None:
             "success": False,
             "status": "invalid_tool_protocol",
             "error": "truncated_tool_arguments",
-            "failure_code": "workbook_access_denied",
+            "failure_code": "excel_workbook_access_denied",
         },
         execution_type="agent_react",
         execution_id="client-safe-error-exec",
     )
 
-    assert result["failure_code"] == "workbook_access_denied"
+    assert result["failure_code"] == "excel_workbook_access_denied"
 
 
 @pytest.mark.parametrize("status", ["error", "max_iterations", "model_error"])
@@ -1710,13 +1710,13 @@ def test_execution_adapter_propagates_failure_code_on_any_failed_status(status):
             "success": False,
             "status": status,
             "error": "failed",
-            "failure_code": "workbook_locked",
+            "failure_code": "excel_workbook_locked",
         },
         execution_type="agent_react",
         execution_id="failure-code-status-exec",
     )
 
-    assert result["failure_code"] == "workbook_locked"
+    assert result["failure_code"] == "excel_workbook_locked"
 
 
 @pytest.mark.parametrize("value", ["arbitrary", "x" * 501, 123, None])

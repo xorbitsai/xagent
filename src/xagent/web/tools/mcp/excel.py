@@ -144,14 +144,14 @@ def _excel_failure_code(exc: BaseException) -> str | None:
         return None
     graph_code = (exc.graph_error_code or "").lower()
     if graph_code == "accessdenied":
-        return "workbook_access_denied"
+        return "excel_workbook_access_denied"
     if graph_code == "itemnotfound" and _is_workbook_resolution_path(exc.request_path):
-        return "site_not_found"
+        return "excel_site_not_found"
     if graph_code in {"resourcelocked", "itemlocked"} and exc.status_code in {
         409,
         423,
     }:
-        return "workbook_locked"
+        return "excel_workbook_locked"
     return None
 
 

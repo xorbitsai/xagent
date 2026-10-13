@@ -74,11 +74,11 @@ def _mcp_tool(name: str = "echo") -> SimpleNamespace:
 def test_excel_failure_code_is_carried_from_connector_payload() -> None:
     result = {
         "content": [
-            {"text": '{"status":"error","failure_code":"workbook_access_denied"}'}
+            {"text": '{"status":"error","failure_code":"excel_workbook_access_denied"}'}
         ],
     }
 
-    assert _excel_failure_code(result) == "workbook_access_denied"
+    assert _excel_failure_code(result) == "excel_workbook_access_denied"
 
 
 def test_arbitrary_excel_error_is_not_projected_to_the_client() -> None:
@@ -1449,7 +1449,7 @@ async def test_execute_mcp_call_carries_excel_failure_code_from_text_result(
                         text=json.dumps(
                             {
                                 "status": "error",
-                                "failure_code": "workbook_access_denied",
+                                "failure_code": "excel_workbook_access_denied",
                             }
                         ),
                     )
@@ -1465,7 +1465,7 @@ async def test_execute_mcp_call_carries_excel_failure_code_from_text_result(
 
     result = await adapter._execute_mcp_call(adapter.connection, {}, {})
 
-    assert result["failure_code"] == "workbook_access_denied"
+    assert result["failure_code"] == "excel_workbook_access_denied"
     assert result["success"] is False
     assert result["is_error"] is True
 

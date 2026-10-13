@@ -20,9 +20,9 @@ from .client_error_messages import (
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
 _TOOL_FAILURE_CLIENT_CODES = {
-    "workbook_access_denied": ClientErrorCode.EXCEL_WORKBOOK_ACCESS_DENIED,
-    "site_not_found": ClientErrorCode.EXCEL_SITE_NOT_FOUND,
-    "workbook_locked": ClientErrorCode.EXCEL_WORKBOOK_LOCKED,
+    "excel_workbook_access_denied": ClientErrorCode.EXCEL_WORKBOOK_ACCESS_DENIED,
+    "excel_site_not_found": ClientErrorCode.EXCEL_SITE_NOT_FOUND,
+    "excel_workbook_locked": ClientErrorCode.EXCEL_WORKBOOK_LOCKED,
 }
 
 

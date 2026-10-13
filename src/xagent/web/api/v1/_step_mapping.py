@@ -230,6 +230,7 @@ class PublicStepProjector:
         # opted out of retention (see the class docstring): those steps
         # are still returned by ``feed``, they are just not kept after.
         self._finished: Optional[List[Dict[str, Any]]] = [] if retain_finished else None
+        self._settlement_reopen_index: Dict[Tuple[str, str], int] = {}
         # ``dag_plan_*`` has no per-plan identifier in the event data, so
         # we synthesize one by counting starts and remembering the
         # currently-open key. Replan in a single task (rare but legal)
@@ -290,6 +291,50 @@ class PublicStepProjector:
         steps = list(self._finished)
         steps.extend(self._pending.values())
         return steps
+
+    def _restore_settlement_position(self, key: Tuple[str, str]) -> None:
+        index = self._settlement_reopen_index.pop(key, None)
+        if index is None or not self._finished:
+            return
+        self._finished.insert(index, self._finished.pop())
+
+    def _reopen_finished_step(
+        self,
+        *,
+        public_type: str,
+        public_key: str,
+        invocation_id: str,
+        origin_step_id: str,
+        pending_key: Tuple[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Reopen the exact original invocation for settlement projection."""
+
+        if self._finished is None:
+            return None
+        candidates = [
+            index
+            for index in range(len(self._finished) - 1, -1, -1)
+            if self._finished[index].get("type") == public_type
+            and self._finished[index].get("id") == f"{public_type}:{public_key}"
+        ]
+        if invocation_id:
+            candidates = [
+                index
+                for index in candidates
+                if self._finished[index].get("_invocation_id") == invocation_id
+            ]
+        elif len(candidates) > 1:
+            candidates = [
+                index
+                for index in candidates
+                if self._finished[index].get("_origin_step_id") == origin_step_id
+            ]
+        if len(candidates) != 1:
+            return None
+        index = candidates[0]
+        step = self._finished.pop(index)
+        self._settlement_reopen_index[pending_key] = index
+        return step
 
     def feed(self, event: Any) -> List[Dict[str, Any]]:
         """Fold one trace event, returning the step(s) it changed.
@@ -404,23 +449,60 @@ class PublicStepProjector:
             # of it for compatibility but has no current producer.
             # step_id alone is unsafe because one step may invoke
             # multiple tools.
-            key = (
+            public_key = (
                 _data_get(event, "tool_execution_id")
                 or _data_get(event, "tool_call_id")
                 or _safe_get(event, "step_id")
                 or _safe_get(event, "event_id")
             )
-            if not key:
+            if not public_key:
                 return []
+            invocation_id = str(_data_get(event, "invocation_id") or "")
+            key = invocation_id or str(public_key)
 
             if event_type == "tool_execution_start":
+                pending_key = (public_type, str(key))
+                origin_step_id = str(_safe_get(event, "step_id") or "")
+                if _data_get(event, "settlement_delivery"):
+                    settlement_step = self._reopen_finished_step(
+                        public_type=public_type,
+                        public_key=str(public_key),
+                        invocation_id=invocation_id,
+                        origin_step_id=origin_step_id,
+                        pending_key=pending_key,
+                    )
+                    if settlement_step is None:
+                        candidate = self._pending.get(pending_key)
+                        if candidate is not None and (
+                            not invocation_id
+                            or candidate.get("_invocation_id") == invocation_id
+                        ):
+                            settlement_step = candidate
+                    if settlement_step is None:
+                        settlement_step = _build_tool_start(
+                            event,
+                            public_type=public_type,
+                            tool_name=tool_name,
+                            key=str(public_key),
+                        )
+                        original_started_at = _data_get(event, "original_started_at")
+                        if original_started_at is not None:
+                            settlement_step["started_at"] = datetime.fromtimestamp(
+                                float(original_started_at), tz=timezone.utc
+                            )
+                    settlement_step["_origin_step_id"] = origin_step_id
+                    settlement_step["_invocation_id"] = invocation_id
+                    self._pending[pending_key] = settlement_step
+                    return []
                 step = _build_tool_start(
                     event,
                     public_type=public_type,
                     tool_name=tool_name,
-                    key=str(key),
+                    key=str(public_key),
                 )
-                self._pending[(public_type, str(key))] = step
+                step["_origin_step_id"] = origin_step_id
+                step["_invocation_id"] = invocation_id
+                self._pending[pending_key] = step
                 return [step]
             if event_type == "tool_execution_end":
                 success = _data_get(event, "success", default=True)
@@ -449,6 +531,8 @@ class PublicStepProjector:
                         }
                     ),
                 )
+                if finalized is not None:
+                    self._restore_settlement_position((public_type, str(key)))
                 return [finalized] if finalized is not None else []
             # tool_execution_failed: v2 runtime emits a dedicated failure
             # event (TraceCategory.TOOL + TraceAction.ERROR) instead of
@@ -467,6 +551,8 @@ class PublicStepProjector:
                     or "Tool execution failed"
                 },
             )
+            if finalized is not None:
+                self._restore_settlement_position((public_type, str(key)))
             return [finalized] if finalized is not None else []
 
         # ===== skill_select_*: surface as tool_call with skill name =====
@@ -828,6 +914,8 @@ def _finalize_pending(
         return None
     step["status"] = status
     step["completed_at"] = _ts(end_event)
+    for stale_key in ("error", "result", "output"):
+        step["data"].pop(stale_key, None)
     if extra_data_fn is not None:
         try:
             extra = extra_data_fn(end_event) or {}

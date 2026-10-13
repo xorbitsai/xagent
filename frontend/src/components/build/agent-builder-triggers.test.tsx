@@ -211,7 +211,7 @@ describe("AgentBuilder trigger summary cards", () => {
       if (url.endsWith("/api/kb/collections")) {
         return Promise.resolve(jsonResponse({ collections: [] }))
       }
-      if (url.endsWith("/api/tools/available")) {
+      if (url.endsWith("/api/tools/available?include_usage=false")) {
         return Promise.resolve(jsonResponse({ tools: [] }))
       }
       if (url.endsWith("/api/skills/") || url.endsWith("/api/mcp/servers")) {
@@ -301,7 +301,7 @@ describe("AgentBuilder trigger summary cards", () => {
       if (url.endsWith("/api/kb/collections")) {
         return Promise.resolve(jsonResponse({ collections: [] }))
       }
-      if (url.endsWith("/api/tools/available")) {
+      if (url.endsWith("/api/tools/available?include_usage=false")) {
         return Promise.resolve(jsonResponse({ tools: [] }))
       }
       if (url.endsWith("/api/skills/") || url.endsWith("/api/mcp/servers")) {
@@ -344,7 +344,7 @@ describe("AgentBuilder trigger summary cards (agent not created yet)", () => {
       if (url.endsWith("/api/kb/collections")) {
         return Promise.resolve(jsonResponse({ collections: [] }))
       }
-      if (url.endsWith("/api/tools/available")) {
+      if (url.endsWith("/api/tools/available?include_usage=false")) {
         return Promise.resolve(jsonResponse({ tools: [] }))
       }
       if (url.endsWith("/api/skills/") || url.endsWith("/api/mcp/servers")) {

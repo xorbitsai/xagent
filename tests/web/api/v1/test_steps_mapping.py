@@ -1842,3 +1842,195 @@ def test_two_full_rounds_interrupted_then_failed_close_independently():
     assert round_one_step["completed_at"] is None
     assert round_two_step["status"] == "failed"
     assert round_two_step["completed_at"] is not None
+
+
+@pytest.mark.parametrize("second_step", ["react_same", "react_other"])
+def test_settlement_projects_exact_invocation_when_provider_id_repeats(second_step):
+    base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="react_same",
+            timestamp=base,
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-first",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="react_same",
+            timestamp=base + timedelta(seconds=1),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-first",
+                "result": {"value": "first"},
+                "success": True,
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id=second_step,
+            timestamp=base + timedelta(seconds=2),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-second",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id=second_step,
+            timestamp=base + timedelta(seconds=3),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-second",
+                "result": {"status": "waiting_for_user"},
+                "success": False,
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id=second_step,
+            timestamp=base + timedelta(seconds=4),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-second",
+                "settlement_delivery": True,
+                "original_started_at": (base + timedelta(seconds=2)).timestamp(),
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id=second_step,
+            timestamp=base + timedelta(seconds=5),
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-second",
+                "settlement_delivery": True,
+                "result": {"value": "settled"},
+                "success": True,
+            },
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+
+    assert len(steps) == 2
+    assert [step["data"].get("result") for step in steps] == [
+        {"value": "first"},
+        {"value": "settled"},
+    ]
+    assert all("error" not in step["data"] for step in steps)
+
+
+def test_settlement_sse_lane_does_not_hijack_another_inflight_invocation():
+    base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    projector = PublicStepProjector(retain_finished=False)
+    assert projector.feed(
+        _ev(
+            "tool_execution_start",
+            step_id="react-a",
+            timestamp=base,
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-live",
+            },
+        )
+    )
+    assert (
+        projector.feed(
+            _ev(
+                "tool_execution_start",
+                step_id="react-b",
+                timestamp=base + timedelta(seconds=10),
+                data={
+                    "tool_name": "approval_gate",
+                    "tool_call_id": "shared",
+                    "invocation_id": "inv-settled",
+                    "settlement_delivery": True,
+                    "original_started_at": (base - timedelta(seconds=5)).timestamp(),
+                },
+            )
+        )
+        == []
+    )
+    [settled] = projector.feed(
+        _ev(
+            "tool_execution_end",
+            step_id="react-b",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-settled",
+                "settlement_delivery": True,
+                "result": {"value": "settled"},
+                "success": True,
+            },
+        )
+    )
+    [live] = projector.feed(
+        _ev(
+            "tool_execution_end",
+            step_id="react-a",
+            data={
+                "tool_name": "approval_gate",
+                "tool_call_id": "shared",
+                "invocation_id": "inv-live",
+                "result": {"value": "live"},
+                "success": True,
+            },
+        )
+    )
+
+    assert settled["data"]["result"] == {"value": "settled"}
+    assert settled["started_at"] == base - timedelta(seconds=5)
+    assert live["data"]["result"] == {"value": "live"}
+
+
+@pytest.mark.parametrize(
+    ("first_success", "settlement_success", "expected_key"),
+    [(False, True, "result"), (True, False, "error")],
+)
+def test_settlement_replaces_stale_outcome_fields_symmetrically(
+    first_success, settlement_success, expected_key
+):
+    common = {"tool_name": "approval_gate", "tool_call_id": "call-1"}
+    original_end = {
+        **common,
+        "success": first_success,
+        "result": {"old": True},
+        "error": "old failure",
+    }
+    settlement_end = {
+        **common,
+        "settlement_delivery": True,
+        "success": settlement_success,
+        "result": {"new": True},
+        "error": "new failure",
+    }
+    steps = map_trace_events_to_public_steps(
+        [
+            _ev("tool_execution_start", step_id="react-a", data=common),
+            _ev("tool_execution_end", step_id="react-a", data=original_end),
+            _ev(
+                "tool_execution_start",
+                step_id="react-a",
+                data={**common, "settlement_delivery": True},
+            ),
+            _ev(
+                "tool_execution_end" if settlement_success else "tool_execution_failed",
+                step_id="react-a",
+                data=settlement_end,
+            ),
+        ]
+    )
+
+    assert len(steps) == 1
+    assert set(steps[0]["data"]).intersection({"error", "result"}) == {expected_key}

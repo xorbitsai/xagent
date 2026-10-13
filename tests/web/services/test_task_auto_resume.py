@@ -42,11 +42,13 @@ from xagent.web.services.task_auto_recovery import (
 )
 from xagent.web.services.task_auto_resume import (
     DISPATCH_CHECK_GRACE_SECONDS,
+    TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_EXPIRED_TRIGGER_ERROR,
     TASK_AUTO_RESUME_SUPERSEDED_TRIGGER_ERROR,
     auto_resume_command_id,
+    public_auto_resume_view,
     run_auto_resume_tick,
 )
 from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
@@ -289,6 +291,124 @@ def test_command_id_is_unique_per_fence_and_attempt_and_fits_the_column():
     )
 
 
+@pytest.mark.parametrize(
+    ("state", "detail", "expected"),
+    [
+        ("scheduled", None, ("scheduled", None)),
+        ("dispatched", None, ("resuming", None)),
+        ("exhausted", None, ("stopped", "limit_reached")),
+        ("expired", None, ("stopped", "expired")),
+        ("superseded", None, ("stopped", "superseded")),
+        ("dispatch_failed", None, ("stopped", "failed")),
+        ("ineligible", "ineligible:preview", ("stopped", "ineligible")),
+        ("manual", "auto_resume_disabled", ("stopped", "disabled")),
+        ("manual", "channel_hold_pending", ("stopped", "ineligible")),
+        ("manual", None, ("stopped", "ineligible")),
+        ("stale", "dispatch:run_id", None),
+        ("disabled", None, None),
+    ],
+)
+def test_public_view_exposes_only_the_client_contract(state, detail, expected):
+    at = datetime(2026, 10, 10, 8, 0, 12, tzinfo=timezone.utc)
+    view = public_auto_resume_view(
+        state,
+        state_detail=detail,
+        reason="lease_expired",
+        attempt=2,
+        next_attempt_at=at,
+    )
+    if expected is None:
+        assert view is None
+        return
+    assert (view["status"], view["stop_reason"]) == expected
+    assert set(view) == {
+        "status",
+        "stop_reason",
+        "reason",
+        "attempt",
+        "next_attempt_at",
+    }
+    assert view["next_attempt_at"] == (
+        "2026-10-10T08:00:12+00:00" if state == "scheduled" else None
+    )
+
+
+def _recorded(state: str, detail: str | None = None) -> Any:
+    from xagent.web.services.task_settlement_report import RecordedInterruption
+
+    return RecordedInterruption(
+        task_id=3,
+        run_id=RUN,
+        reason="lease_expired",
+        state=state,
+        state_detail=detail,
+        paused_state_version=PV,
+        next_attempt_at=(
+            datetime(2026, 10, 10, 8, 0, 12, tzinfo=timezone.utc)
+            if state == "scheduled"
+            else None
+        ),
+        attempt=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "detail", "trigger_error", "notice"),
+    [
+        ("scheduled", None, None, ("scheduled", None)),
+        (
+            "exhausted",
+            None,
+            TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
+            ("stopped", "limit_reached"),
+        ),
+        (
+            "expired",
+            None,
+            TASK_AUTO_RESUME_EXPIRED_TRIGGER_ERROR,
+            ("stopped", "expired"),
+        ),
+        (
+            "superseded",
+            None,
+            TASK_AUTO_RESUME_SUPERSEDED_TRIGGER_ERROR,
+            ("stopped", "superseded"),
+        ),
+        # Recorded manual outcomes keep the caller's message and stay silent:
+        # the pause the client already shows is all there is.
+        ("manual", "auto_resume_disabled", "default", None),
+        ("manual", "channel_hold_pending", "default", None),
+        ("manual", "supersede_check_failed", "default", None),
+        ("manual", None, "default", None),
+        ("ineligible", "ineligible:source_sdk", "default", None),
+    ],
+)
+def test_recorded_interruption_maps_to_trigger_error_and_notice(
+    state, detail, trigger_error, notice
+):
+    recorded = _recorded(state, detail)
+
+    assert (
+        task_auto_resume.trigger_error_for_recorded(recorded, default="default")
+        == trigger_error
+    )
+    built = task_auto_resume.recorded_notice(recorded)
+    if notice is None:
+        assert built is None
+        return
+    assert built is not None
+    assert (built.auto_resume["status"], built.auto_resume["stop_reason"]) == notice
+    assert (built.task_id, built.run_id, built.state_version) == (3, RUN, PV)
+    assert built.auto_resume["next_attempt_at"] == (
+        "2026-10-10T08:00:12+00:00" if state == "scheduled" else None
+    )
+
+
+def test_nothing_recorded_keeps_the_default_trigger_error():
+    assert task_auto_resume.trigger_error_for_recorded(None, default="x") == "x"
+    assert task_auto_resume.recorded_notice(None) is None
+
+
 # --------------------------------------------------------------------------
 # Dispatch
 # --------------------------------------------------------------------------
@@ -335,6 +455,17 @@ def test_due_row_is_dispatched_as_one_fenced_resume_command(factory, notified):
     )
     assert event.detail == {"kind": "normal"}
     assert notified == [1]
+    (notice,) = report.notices
+    assert (notice.task_id, notice.run_id, notice.state_version) == (
+        task_id,
+        RUN,
+        PV,
+    )
+    assert notice.auto_resume["status"] == "resuming"
+    assert notice.auto_resume["attempt"] == 3
+    message = notice.message()
+    assert message["type"] == "task_recovery_update"
+    assert "total_resumes" not in str(message)
 
 
 def test_dispatch_does_not_require_an_empty_runner(factory, notified):
@@ -399,6 +530,8 @@ def test_each_fence_column_makes_the_row_stale(factory, notified, field, task_fi
     assert event.detail["mismatch"] == field
     assert event.detail["at"] == "dispatch"
     assert notified == []
+    # A person's own action moved the task; nothing to announce.
+    assert report.notices == []
 
 
 @pytest.mark.parametrize(
@@ -408,6 +541,11 @@ def test_each_fence_column_makes_the_row_stale(factory, notified, field, task_fi
         (TaskStatus.WAITING_FOR_USER, TriggerRunStatus.RUNNING.value),
         (TaskStatus.COMPLETED, TriggerRunStatus.COMPLETED.value),
         (TaskStatus.FAILED, TriggerRunStatus.FAILED.value),
+        # A user's resume that failed to start rolled the task back to
+        # paused on the same run, two versions on. The row goes stale and
+        # the run stays RUNNING until a later run settles it, as after any
+        # user pause (#2177); deleting the task fails it.
+        (TaskStatus.PAUSED, TriggerRunStatus.RUNNING.value),
     ],
 )
 def test_stale_never_fails_a_trigger_run_it_only_mirrors_an_ended_task(
@@ -416,7 +554,10 @@ def test_stale_never_fails_a_trigger_run_it_only_mirrors_an_ended_task(
     now = utc_now()
     with factory() as db:
         task_id, trigger_run_id = _trigger_task(db, now)
-        db.get(Task, task_id).status = status
+        task = db.get(Task, task_id)
+        task.status = status
+        if status is TaskStatus.PAUSED:
+            task.state_version = int(task.state_version) + 2
         db.commit()
 
     assert run_auto_resume_tick(now=now).stale == 1
@@ -442,24 +583,26 @@ def _channel_task(db: Session, now: datetime) -> int:
 
 
 @pytest.mark.parametrize(
-    ("case", "state", "detail", "event"),
+    ("case", "state", "detail", "event", "stop_reason"),
     [
         (
             "workforce_missing",
             "ineligible",
             "ineligible:workforce_run_missing",
             "ineligible",
+            "ineligible",
         ),
-        ("channel", "manual", "channel_hold_pending", "ineligible"),
-        ("expired", "expired", None, "expired"),
-        ("no_progress", "exhausted", None, "exhausted"),
-        ("total", "exhausted", None, "exhausted"),
-        ("elapsed", "exhausted", None, "exhausted"),
-        ("no_policy", "manual", None, "ineligible"),
+        # Leaving an announced ``scheduled`` row: the client must hear it.
+        ("channel", "manual", "channel_hold_pending", "ineligible", "ineligible"),
+        ("expired", "expired", None, "expired", "expired"),
+        ("no_progress", "exhausted", None, "exhausted", "limit_reached"),
+        ("total", "exhausted", None, "exhausted", "limit_reached"),
+        ("elapsed", "exhausted", None, "exhausted", "limit_reached"),
+        ("no_policy", "manual", None, "ineligible", "ineligible"),
     ],
 )
 def test_dispatch_time_limits_stop_without_a_command(
-    factory, notified, monkeypatch, case, state, detail, event
+    factory, notified, monkeypatch, case, state, detail, event, stop_reason
 ):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     now = utc_now()
@@ -495,6 +638,9 @@ def test_dispatch_time_limits_stop_without_a_command(
     assert recorded.detail["at"] == "dispatch"
     assert report.gave_up == 1
     assert notified == []
+    assert [n.auto_resume["stop_reason"] for n in report.notices] == (
+        [stop_reason] if stop_reason else []
+    )
 
 
 @pytest.mark.parametrize(
@@ -1136,28 +1282,6 @@ def _dispatched(
 # --------------------------------------------------------------------------
 
 
-def test_switch_off_tick_does_nothing(factory, notified, monkeypatch):
-    # Until the drain lands, only the claim-time guard acts while off.
-    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
-    now = utc_now()
-    with factory() as db:
-        scheduled = _seed(db, now)
-        dispatched = _dispatched(db, now, command_status="failed", run_id="run-b")
-        db.commit()
-
-    def unexpected(*_args, **_kwargs):
-        raise AssertionError("the tick must not touch the database while off")
-
-    monkeypatch.setattr(task_auto_resume, "has_due_work", unexpected)
-
-    report = run_auto_resume_tick(now=now)
-
-    assert report == task_auto_resume.AutoResumeTickReport()
-    assert _row(factory, scheduled).state == "scheduled"
-    assert _row(factory, dispatched).state == "dispatched"
-    assert notified == []
-
-
 # --------------------------------------------------------------------------
 # Housekeeping
 # --------------------------------------------------------------------------
@@ -1189,6 +1313,7 @@ def test_housekeeping_marks_a_failed_or_lost_dispatch(
     assert run.status == TriggerRunStatus.FAILED.value
     assert run.error_message == TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR
     assert report.gave_up == 1
+    assert [n.auto_resume["stop_reason"] for n in report.notices] == ["failed"]
 
 
 def test_housekeeping_reschedules_a_completed_resume_that_did_not_happen(
@@ -1213,6 +1338,38 @@ def test_housekeeping_reschedules_a_completed_resume_that_did_not_happen(
     assert (event.event, event.attempt) == ("scheduled", 2)
     assert event.detail == {"at": "housekeeping", "after": "already_in_progress"}
     assert report.rescheduled == 1
+    (notice,) = report.notices
+    assert notice.auto_resume["status"] == "scheduled"
+    assert notice.auto_resume["attempt"] == 2
+    assert notice.auto_resume["next_attempt_at"] is not None
+
+
+def test_an_announced_resume_that_ends_in_manual_is_announced_stopped(
+    factory, notified, monkeypatch
+):
+    """A housekeeping reschedule announced ``scheduled``; when the next
+    dispatch finds the task out of reach (a policy-less reason here), the
+    client must hear that the resume stopped, at the same fence."""
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="completed")
+        db.commit()
+    first = run_auto_resume_tick(now=now)
+    (scheduled,) = first.notices
+    assert scheduled.auto_resume["status"] == "scheduled"
+    with factory() as db:
+        db.get(TaskAutoRecovery, task_id).reason = "user_pause"
+        db.commit()
+
+    later = run_auto_resume_tick(now=now + timedelta(minutes=5))
+
+    assert _row(factory, task_id).state == "manual"
+    (stopped,) = later.notices
+    assert (stopped.auto_resume["status"], stopped.auto_resume["stop_reason"]) == (
+        "stopped",
+        "ineligible",
+    )
+    assert stopped.state_version == scheduled.state_version
 
 
 def test_housekeeping_stops_a_completed_resume_at_its_limit(factory, notified):
@@ -1340,6 +1497,7 @@ def test_housekeeping_confirms_once_the_fence_moved(
     row = _row(factory, task_id)
     assert (row.state, row.next_attempt_at) == ("dispatched", None)
     assert _events(factory, task_id) == []
+    assert report.notices == []
 
 
 def test_housekeeping_fails_a_resume_whose_last_attempt_rolled_back(factory, notified):
@@ -1365,6 +1523,13 @@ def test_housekeeping_fails_a_resume_whose_last_attempt_rolled_back(factory, not
     run = _trigger_run(factory, trigger_run_id)
     assert run.status == TriggerRunStatus.FAILED.value
     assert run.error_message == TASK_AUTO_RESUME_DISPATCH_FAILED_TRIGGER_ERROR
+    # The notice names the pause the client shows (the rolled-back version),
+    # not the row's old fence, or a viewer at that version drops it.
+    (notice,) = report.notices
+    assert (notice.state_version, notice.auto_resume["status"]) == (
+        PV + 2,
+        "stopped",
+    )
 
 
 @pytest.mark.parametrize("command_status", ["pending", "processing"])
@@ -1399,6 +1564,145 @@ def test_housekeeping_ignores_dispatches_not_yet_due(factory, notified):
     run_auto_resume_tick(now=now)
 
     assert _row(factory, task_id).state == "dispatched"
+
+
+# --------------------------------------------------------------------------
+# Drain with the switch off
+# --------------------------------------------------------------------------
+
+
+def test_switch_off_drains_scheduled_rows_to_manual(factory, notified, monkeypatch):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    monkeypatch.setattr(task_auto_resume, "_last_inflight", 7)
+    now = utc_now()
+    with factory() as db:
+        task_id, trigger_run_id = _trigger_task(db, now, due_in=3_600)
+        moved = _seed(db, now, state_version=PV + 1)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert report.inflight is None
+    assert task_auto_resume._last_inflight == 0
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert row.next_attempt_at is None
+    (event,) = _events(factory, task_id)
+    assert event.event == "skipped_disabled"
+    assert event.detail["at"] == "drain"
+    run = _trigger_run(factory, trigger_run_id)
+    assert run.status == TriggerRunStatus.FAILED.value
+    assert run.error_message == TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR
+    assert _row(factory, moved).state == "stale"
+    assert _commands(factory, task_id) == []
+    assert report.gave_up == 1
+    assert notified == []
+    # The stale row is not announced.
+    assert [n.auto_resume["stop_reason"] for n in report.notices] == ["disabled"]
+
+
+@pytest.mark.parametrize("command_status", ["completed", "failed", None])
+def test_switch_off_closes_a_dispatch_whose_command_ended(
+    factory, notified, monkeypatch, command_status
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        user = db.get(User, db.get(Task, task_id).user_id)
+        trigger_run_id, _later = _trigger(db, user, task_id)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert [e.event for e in _events(factory, task_id)] == ["skipped_disabled"]
+    run = _trigger_run(factory, trigger_run_id)
+    assert (run.status, run.error_message) == (
+        TriggerRunStatus.FAILED.value,
+        TASK_AUTO_RESUME_DISABLED_TRIGGER_ERROR,
+    )
+    assert report.gave_up == 1
+    assert [n.auto_resume["stop_reason"] for n in report.notices] == ["disabled"]
+
+
+@pytest.mark.parametrize("command_status", ["pending", "processing"])
+def test_housekeeping_rearms_a_retry_queued_after_a_rollback(
+    factory, notified, monkeypatch, command_status
+):
+    """A rolled-back resume moved the version by two while its retry waits
+    out its backoff: nothing resumed the task, so it is re-checked, not
+    confirmed."""
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status=command_status)
+        db.get(Task, task_id).state_version = PV + 2
+        db.commit()
+    counters = _capture_counters(monkeypatch)
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.confirmed, report.rearmed) == (0, 1)
+    assert "xagent.task.auto_resume.confirmed" not in counters
+    row = _row(factory, task_id)
+    assert row.state == "dispatched"
+    assert row.next_attempt_at is not None
+    assert _events(factory, task_id) == []
+
+
+def test_switch_off_closes_a_resume_whose_last_attempt_rolled_back(
+    factory, notified, monkeypatch
+):
+    """The fence moved only because the failed resume rolled back: with the
+    switch off it is closed like any other ended dispatch, not left racing."""
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="failed")
+        user = db.get(User, db.get(Task, task_id).user_id)
+        trigger_run_id, _later = _trigger(db, user, task_id)
+        db.get(Task, task_id).state_version = PV + 2
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert _trigger_run(factory, trigger_run_id).status == (
+        TriggerRunStatus.FAILED.value
+    )
+    assert report.gave_up == 1
+    (notice,) = report.notices
+    assert (notice.state_version, notice.auto_resume["stop_reason"]) == (
+        PV + 2,
+        "disabled",
+    )
+
+
+def test_switch_off_leaves_a_queued_dispatch_to_the_claim_guard(
+    factory, notified, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    now = utc_now()
+    with factory() as db:
+        queued = _dispatched(db, now, command_status="pending")
+        moved = _dispatched(db, now, command_status="completed", state_version=PV + 2)
+        db.commit()
+
+    report = run_auto_resume_tick(now=now)
+
+    assert (report.rearmed, report.confirmed) == (1, 1)
+    row = _row(factory, queued)
+    assert row.state == "dispatched"
+    assert _aware(row.next_attempt_at) == now + timedelta(
+        seconds=DISPATCH_CHECK_GRACE_SECONDS
+    )
+    assert (_row(factory, moved).state, _row(factory, moved).next_attempt_at) == (
+        "dispatched",
+        None,
+    )
+    assert _events(factory, queued) == []
 
 
 # --------------------------------------------------------------------------
@@ -1462,6 +1766,22 @@ async def test_loop_backs_off_raises_the_signal_and_recovers(monkeypatch, caplog
 
 
 @pytest.mark.asyncio
+async def test_loop_publishes_each_ticks_notices(monkeypatch):
+    published: list[Any] = []
+
+    async def publish(notices):
+        published.extend(notices)
+
+    monkeypatch.setattr(task_auto_resume, "publish_recovery_notices", publish)
+    notice = task_auto_resume.RecoveryNotice(
+        task_id=1, run_id="r", state_version=2, auto_resume={"status": "resuming"}
+    )
+    report = task_auto_resume.AutoResumeTickReport(notices=(notice,))
+    await _run_loop(monkeypatch, [report], clock=[0.0])
+    assert published == [notice]
+
+
+@pytest.mark.asyncio
 async def test_loop_lets_cancellation_through(monkeypatch):
     async def run_inline(operation):
         raise asyncio.CancelledError
@@ -1469,6 +1789,27 @@ async def test_loop_lets_cancellation_through(monkeypatch):
     monkeypatch.setattr(task_auto_resume, "run_db_io_cancellation_safe", run_inline)
     with pytest.raises(asyncio.CancelledError):
         await task_auto_resume.run_task_auto_resume_loop(poll_interval_seconds=5)
+
+
+@pytest.mark.asyncio
+async def test_publish_is_best_effort(monkeypatch):
+    sent: list[tuple[dict[str, Any], int]] = []
+
+    async def sink(message, task_id):
+        sent.append((message, task_id))
+        if len(sent) == 1:
+            raise RuntimeError("socket gone")
+
+    monkeypatch.setattr("xagent.web.services.task_events._task_event_sink", sink)
+    notices = [
+        task_auto_resume.RecoveryNotice(
+            task_id=task_id, run_id="r", state_version=2, auto_resume={}
+        )
+        for task_id in (1, 2)
+    ]
+    await task_auto_resume.publish_recovery_notices(notices)
+    assert [task_id for _message, task_id in sent] == [1, 2]
+    assert sent[0][0]["type"] == "task_recovery_update"
 
 
 # --------------------------------------------------------------------------
@@ -1543,6 +1884,20 @@ def test_nothing_due_costs_one_exists_and_no_counts(factory, notified, monkeypat
     report = run_auto_resume_tick(now=now)
 
     assert (report.dispatched, report.inflight) == (0, None)
+
+
+@pytest.mark.parametrize("enabled", ["true", "false"])
+def test_due_dispatched_rows_alone_make_the_tick_run(
+    factory, notified, monkeypatch, enabled
+):
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", enabled)
+    now = utc_now()
+    with factory() as db:
+        task_id = _dispatched(db, now, command_status="pending")
+        db.commit()
+
+    assert run_auto_resume_tick(now=now).rearmed == 1
+    assert _aware(_row(factory, task_id).next_attempt_at) > now
 
 
 def test_dispatch_cas_requires_the_row_to_still_be_scheduled(
@@ -1629,6 +1984,57 @@ def test_pool_timeout_aborts_the_tick_and_is_not_a_candidate_failure(
     assert "xagent.task.auto_resume.candidate_failed" not in failures
     assert _row(factory, first).state == "scheduled"
     assert _row(factory, second).state == "scheduled"
+
+
+def test_a_tick_that_fails_keeps_what_it_committed_for_announcing(
+    factory, notified, monkeypatch
+):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    now = utc_now()
+    with factory() as db:
+        first = _seed(db, now, due_in=-10)
+        second = _seed(db, now, due_in=-5)
+        db.commit()
+    real = task_auto_resume.auto_recovery_eligibility
+    calls: list[int] = []
+
+    def second_times_out(db, task):
+        calls.append(int(task.id))
+        if int(task.id) == second:
+            raise PoolTimeout("QueuePool limit reached")
+        return real(db, task)
+
+    monkeypatch.setattr(task_auto_resume, "auto_recovery_eligibility", second_times_out)
+
+    with pytest.raises(PoolTimeout) as raised:
+        run_auto_resume_tick(now=now)
+
+    assert _row(factory, first).state == "dispatched"
+    partial = task_auto_resume.committed_tick_report(raised.value)
+    assert partial is not None
+    assert [(n.task_id, n.auto_resume["status"]) for n in partial.notices] == [
+        (first, "resuming")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_loop_announces_what_a_failed_tick_committed(monkeypatch):
+    published: list[Any] = []
+
+    async def publish(notices):
+        published.extend(notices)
+
+    monkeypatch.setattr(task_auto_resume, "publish_recovery_notices", publish)
+    notice = task_auto_resume.RecoveryNotice(
+        task_id=1, run_id="r", state_version=2, auto_resume={"status": "resuming"}
+    )
+    failure = RuntimeError("pool timeout")
+    failure.__dict__["auto_resume_partial_report"] = (
+        task_auto_resume.AutoResumeTickReport(notices=[notice])
+    )
+    await _run_loop(monkeypatch, [failure], clock=[0.0])
+    assert published == [notice]
 
 
 def test_integrity_error_while_staging_is_a_race_and_writes_nothing(
@@ -1741,16 +2147,6 @@ def test_unconfirmed_dispatches_whose_command_ended_are_not_in_flight(
     assert row.state == "dispatched"
     assert _aware(row.next_attempt_at) == now + timedelta(seconds=30)
     assert _events(factory, ended) == []
-
-
-def test_due_dispatched_rows_alone_make_the_tick_run(factory, notified):
-    now = utc_now()
-    with factory() as db:
-        task_id = _dispatched(db, now, command_status="pending")
-        db.commit()
-
-    assert run_auto_resume_tick(now=now).rearmed == 1
-    assert _aware(_row(factory, task_id).next_attempt_at) > now
 
 
 def test_failure_while_postponing_after_a_full_queue_fails_the_tick(

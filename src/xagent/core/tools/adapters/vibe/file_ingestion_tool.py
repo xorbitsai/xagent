@@ -188,10 +188,7 @@ async def _create_knowledge_base_from_file_impl(
             collection_name = f"{base_name}_{int(time.time())}"
 
         config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
-        kb_service = AgentKnowledgeBaseService(
-            user_id=user_id,
-            is_admin=is_admin,
-        )
+        kb_service = AgentKnowledgeBaseService(user_id=user_id)
         collection_name = await kb_service.prepare_collection(collection_name)
         # The ingest pipeline writes a metadata row of its own; remember whether
         # the collection is ours to clean up if every file fails.
@@ -318,8 +315,6 @@ async def _create_knowledge_base_from_file_impl(
                 ),
                 files_ingested=ingested_count,
             ).model_dump()
-        await kb_service.refresh_collection_metadata(collection_name)
-
         return CreateKnowledgeBaseFromFileResult(
             success=True,
             collection_name=collection_name,

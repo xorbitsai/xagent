@@ -302,6 +302,43 @@ describe("TaskConversationPanel", () => {
     expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
   })
 
+  it.each([
+    [{ status: "scheduled" }, "taskInterruption.autoResumeScheduled"],
+    [{ status: "scheduled", nextAttemptAt: "2026-10-10T08:00:12+00:00" }, "taskInterruption.autoResumeScheduledAt"],
+    [{ status: "resuming" }, "taskInterruption.autoResumeResuming"],
+    [{ status: "stopped", stopReason: "limit_reached" }, "taskInterruption.autoResumeStoppedLimit"],
+    [{ status: "stopped", stopReason: "disabled" }, "taskInterruption.autoResumeStoppedDisabled"],
+    [{ status: "stopped", stopReason: "expired" }, "taskInterruption.autoResumeStoppedExpired"],
+    [{ status: "stopped", stopReason: "superseded" }, "taskInterruption.autoResumeStoppedSuperseded"],
+    [{ status: "stopped", stopReason: "failed" }, "taskInterruption.autoResumeStoppedFailed"],
+    // A time that does not parse falls back to the plain scheduled copy.
+    [{ status: "scheduled", nextAttemptAt: "not a time" }, "taskInterruption.autoResumeScheduled"],
+    [{ status: "stopped", stopReason: "ineligible" }, "taskInterruption.autoResumeStopped"],
+  ])("says what automatic resume is doing (%o)", (autoResume, key) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoRecovery: { reason: "lease_expired" },
+      autoResume: { runId: "run-1", stateVersion: 4, ...autoResume },
+    }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.getByTestId("task-interruption-notice")).toHaveTextContent(key)
+    appState.currentTask = { ...appState.currentTask, status: "running" }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("does not show the previous task's automatic-resume notice after a switch", () => {
+    appState.currentTask = {
+      id: "41",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    appState.taskId = 42
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
   it("does not show the previous task's interruption notice after a switch", () => {
     appState.currentTask = { id: "41", status: "paused", autoRecovery: { reason: "lease_expired" } }
     appState.taskId = 42

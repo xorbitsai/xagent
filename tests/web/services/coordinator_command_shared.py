@@ -1,4 +1,8 @@
-"""Admit commands through a real owner for handoff-focused tests."""
+"""Run code as a real lease owner in handoff-focused tests: admit commands,
+or call finalizers directly.
+"""
+
+from contextlib import contextmanager
 
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
@@ -45,5 +49,29 @@ def claim_for_owner(db, owner_lease, command_db_id):
         return transport.claim_task_command(
             db, runner_id=owner_lease.runner_id, command_db_id=command_db_id
         )
+    finally:
+        runtime._current_coordinator.reset(token)
+
+
+class _LeaseOwner:
+    """The in-process owner of one lease, for finalizers called directly.
+
+    It borrows the real ownership comparison, so a mismatched lease is
+    refused exactly as a live coordinator would refuse it.
+    """
+
+    owns_execution = runtime.TaskCoordinator.owns_execution
+
+    def __init__(self, lease):
+        self.task_id = lease.task_id
+        self.lease = lease
+
+
+@contextmanager
+def owning_coordinator(lease):
+    """Run the block as the coordinator that owns ``lease``."""
+    token = runtime._current_coordinator.set(_LeaseOwner(lease))
+    try:
+        yield
     finally:
         runtime._current_coordinator.reset(token)

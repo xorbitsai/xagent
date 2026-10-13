@@ -182,11 +182,13 @@ class _AvailableToolsRouteHarness:
     def __init__(
         self,
         *,
-        cleanup_error: BaseException,
+        cleanup_error: BaseException | None = None,
         primary_error: BaseException | None = None,
+        usage_counts: dict[str, int] | None = None,
     ) -> None:
         self.cleanup_error = cleanup_error
         self.primary_error = primary_error
+        self.usage_counts = usage_counts or {}
         self.events: list[str] = []
         self.close_calls = 0
 
@@ -232,7 +234,8 @@ class _AvailableToolsRouteHarness:
             def close(self) -> None:
                 harness.events.append("close")
                 harness.close_calls += 1
-                raise harness.cleanup_error
+                if harness.cleanup_error is not None:
+                    raise harness.cleanup_error
 
         class Query:
             def __init__(self, model: object) -> None:
@@ -249,8 +252,12 @@ class _AvailableToolsRouteHarness:
             def query(self, model: object) -> Query:
                 return Query(model)
 
+        def load_tool_usage_counts(_db: object) -> dict[str, int]:
+            harness.events.append("tool_usage")
+            return harness.usage_counts
+
         monkeypatch.setattr(
-            "xagent.web.api.tools._tool_usage_query", lambda _db: Query("tool_usage")
+            "xagent.web.api.tools._load_tool_usage_counts", load_tool_usage_counts
         )
 
         class SandboxManager:
@@ -349,6 +356,47 @@ async def test_available_tools_cleanup_failure_follows_complete_route_body(
         "user_overrides",
         "close",
     ]
+
+
+@pytest.mark.asyncio
+async def test_available_tools_reports_usage_counts_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 4})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=db,
+    )
+
+    assert response["tools"][0]["usage_count"] == 4
+    assert "tool_usage" in harness.events
+
+
+@pytest.mark.asyncio
+async def test_available_tools_can_skip_usage_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The agent builder never reads usage_count, so it must not pay for the
+    # aggregation (#3007).
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 4})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=db,
+        include_usage=False,
+    )
+
+    assert [tool["name"] for tool in response["tools"]] == ["test_tool"]
+    assert "usage_count" not in response["tools"][0]
+    assert "tool_usage" not in harness.events
+    assert ToolConfig.__name__ in harness.events
 
 
 class _RoutePrimaryFailure(BaseException):
@@ -610,6 +658,23 @@ class TestToolsAvailableAPI:
         sql_tools = [tool for tool in tools if tool["category"] == "database"]
         assert sql_tools
         assert all(tool["requires_configuration"] is True for tool in sql_tools)
+
+    def test_get_available_tools_include_usage_false_omits_usage_count(self):
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        token = login_response.json()["access_token"]
+
+        response = client.get(
+            "/api/tools/available?include_usage=false",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 200
+        tools = response.json()["tools"]
+        assert tools
+        assert all("usage_count" not in tool for tool in tools)
 
     def test_get_available_tools_tool_categories(self):
         """Test that tools have correct category information."""

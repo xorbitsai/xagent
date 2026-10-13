@@ -15,9 +15,9 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp } from "@/contexts/app-context-chat"
+import { useApp, type TaskAutoResume } from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
@@ -73,6 +73,38 @@ const INTERRUPTION_NOTICE_KEYS = {
 const interruptionNoticeKey = (reason: string) =>
   INTERRUPTION_NOTICE_KEYS[reason as keyof typeof INTERRUPTION_NOTICE_KEYS]
   ?? "taskInterruption.paused"
+
+// Notice text once automatic resume stopped, by its ``stop_reason``. The
+// superseded copy deliberately does not offer "click resume": a later tick
+// of the same scheduled trigger already ran, and resuming this one would
+// duplicate its work.
+const AUTO_RESUME_STOPPED_KEYS = {
+  limit_reached: "taskInterruption.autoResumeStoppedLimit",
+  expired: "taskInterruption.autoResumeStoppedExpired",
+  superseded: "taskInterruption.autoResumeStoppedSuperseded",
+  failed: "taskInterruption.autoResumeStoppedFailed",
+  disabled: "taskInterruption.autoResumeStoppedDisabled",
+} as const
+
+const autoResumeNotice = (
+  autoResume: TaskAutoResume,
+  t: Translate,
+  locale?: string,
+): string => {
+  if (autoResume.status === "resuming") return t("taskInterruption.autoResumeResuming")
+  if (autoResume.status === "stopped") {
+    return t(
+      AUTO_RESUME_STOPPED_KEYS[autoResume.stopReason as keyof typeof AUTO_RESUME_STOPPED_KEYS]
+      ?? "taskInterruption.autoResumeStopped",
+    )
+  }
+  const at = autoResume.nextAttemptAt ? new Date(autoResume.nextAttemptAt) : undefined
+  return at && !Number.isNaN(at.getTime())
+    ? t("taskInterruption.autoResumeScheduledAt", {
+      time: at.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }),
+    })
+    : t("taskInterruption.autoResumeScheduled")
+}
 
 const toTimestampMs = (timestamp: unknown): number => {
   let time: number
@@ -230,7 +262,7 @@ export function TaskConversationPanel({
     isSessionInteractionLocked,
   } = useApp()
   const fileAccess = useFileAccess()
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const [files, setFiles] = useState<File[]>([])
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
   const [dagLayout, setDagLayout] = useState<"TB" | "LR">("TB")
@@ -774,6 +806,12 @@ export function TaskConversationPanel({
     && state.currentTask.autoRecovery.reason !== "user_pause"
     ? state.currentTask.autoRecovery.reason
     : undefined
+  // Automatic resume replaces the "click resume" advice while it applies to
+  // the pause shown (the reducer drops it once the task leaves that fence).
+  const autoResume = state.currentTask?.id === String(state.taskId)
+    && state.currentTask.status === "paused"
+    ? state.currentTask.autoResume
+    : undefined
   const shouldShowVirtualMessage =
     (state.isProcessing ||
       state.currentTask?.status === "paused" ||
@@ -801,9 +839,11 @@ export function TaskConversationPanel({
             {t("sharedStream.interrupted")}
           </div>
         )}
-        {interruptionReason && (
+        {(autoResume || interruptionReason) && (
           <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-            {t(interruptionNoticeKey(interruptionReason))}
+            {autoResume
+              ? autoResumeNotice(autoResume, t, locale)
+              : t(interruptionNoticeKey(interruptionReason as string))}
           </div>
         )}
         <div className="flex-1 overflow-y-auto">

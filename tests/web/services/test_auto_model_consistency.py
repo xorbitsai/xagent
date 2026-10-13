@@ -1,4 +1,5 @@
-"""Auto binding, default resolution and lifecycle regressions against a real DB."""
+"""Auto binding, default resolution and lifecycle regressions against a real DB,
+plus smoke tests against the installed xrouter-llm catalog."""
 
 import asyncio
 from types import SimpleNamespace
@@ -10,7 +11,11 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from xagent.core.model.chat.basic.router import RouterLLM, _ResolvedRouterLLM
+from xagent.core.model.chat.basic.router import (
+    _MODALITY_ABILITIES,
+    RouterLLM,
+    _ResolvedRouterLLM,
+)
 from xagent.web import models
 from xagent.web.api import admin_users, agents
 from xagent.web.api import model as model_api
@@ -349,3 +354,78 @@ def test_editing_legacy_unknown_profile_returns_conflict(env):
         UserAwareModelStorage(env.db).get_llm_by_id(
             cfg.router_model.model_id, env.consumer.id
         )
+
+
+def _bundled_auto_router_models() -> tuple[str, ...]:
+    pytest.importorskip("xrouter_llm")
+    from xrouter_llm import default_routers_dir
+    from xrouter_llm.serving import load_router_configs
+
+    configs = load_router_configs(default_routers_dir())
+    return tuple(configs[auto_model_service.AUTO_ROUTER_CONFIG_NAME].models)
+
+
+def test_bundled_auto_router_profiles_pass_candidate_validation():
+    """Every profile in xrouter-llm's own ``auto`` router config can be bound.
+
+    Uses the installed catalog, not the stub the ``env`` fixture injects.
+    """
+    auto_models = _bundled_auto_router_models()
+    catalog = auto_model_service.load_router_profile_catalog()
+    known = set(catalog.known_model_ids())
+
+    assert auto_models
+    assert [profile_id for profile_id in auto_models if profile_id not in known] == []
+    for profile_id in auto_models:
+        modalities = set(catalog.get(profile_id).input_modalities)
+        abilities = [
+            ability
+            for modality, ability in _MODALITY_ABILITIES.items()
+            if modality in modalities
+        ]
+        auto_model_service.validate_candidate_modalities(catalog, profile_id, abilities)
+
+
+def test_bundled_catalog_has_the_profiles_saved_auto_configs_rebind_across():
+    """Pin the catalog changes at the current xrouter-llm floor that saved Auto
+    configurations have to be rebound across; update together with that floor.
+    """
+    auto_models = set(_bundled_auto_router_models())
+    catalog = auto_model_service.load_router_profile_catalog()
+    known = set(catalog.known_model_ids())
+    removed = {"deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-pro-0813"}
+    added = {
+        "anthropic/claude-fable-5.1",
+        "anthropic/claude-opus-5.5",
+        "anthropic/claude-sonnet-5.5",
+        "deepseek/deepseek-v4.1-flash",
+        "google/gemini-3.8-flash",
+        "openai/gpt-6-astra",
+        "openai/gpt-6-luna",
+        "openai/gpt-6.1-sol",
+        "qwen/qwen3.8-max-0902",
+        "qwen/qwen3.8-omni-flash",
+        "x-ai/grok-4.7",
+        "xiaomi/mimo-v2.6-flash",
+        "xiaomi/mimo-v2.6-pro",
+        "z-ai/glm-5.3",
+        "z-ai/glm-5.3-flashx",
+    }
+
+    assert known.isdisjoint(removed)
+    assert added <= known
+    assert set(catalog.get("deepseek/deepseek-v4.1-flash").input_modalities) == {
+        "text",
+        "image",
+    }
+    assert auto_models.isdisjoint(
+        removed | {"google/gemini-3.5-flash", "google/gemini-3.7-flash"}
+    )
+    assert {
+        "deepseek/deepseek-v4.1-flash",
+        "google/gemini-3.8-flash",
+        "openai/gpt-6-astra",
+        "qwen/qwen3.8-max-0902",
+        "qwen/qwen3.8-omni-flash",
+        "z-ai/glm-5.3",
+    } <= auto_models

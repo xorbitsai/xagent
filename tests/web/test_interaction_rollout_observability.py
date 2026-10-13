@@ -60,7 +60,13 @@ def _reset_state(monkeypatch):
     clear_degradation(INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE)
 
 
-def _set_policy(monkeypatch, *, mode="legacy", native_sources=frozenset()):
+def _set_policy(
+    monkeypatch,
+    *,
+    mode="legacy",
+    native_sources=frozenset(),
+    shared_task_execution=True,
+):
     monkeypatch.setattr(
         ir,
         "_policy",
@@ -68,6 +74,7 @@ def _set_policy(monkeypatch, *, mode="legacy", native_sources=frozenset()):
             mode=mode,
             native_sources=frozenset(native_sources),
             native_protocol_version=1,
+            shared_task_execution=shared_task_execution,
         ),
     )
 
@@ -283,11 +290,12 @@ async def test_to5_non_admin_gets_403_with_exact_detail(
 
 
 async def test_to5b_admin_gets_200(monkeypatch, sqlite_session_with_table):
-    _set_policy(monkeypatch, mode="legacy")
+    _set_policy(monkeypatch, mode="legacy", shared_task_execution=False)
     response = await get_interaction_rollout_diagnostics(
         current_user=_admin_user(), db=sqlite_session_with_table
     )
     assert response["policy"]["mode"] == "legacy"
+    assert response["policy"]["shared_task_execution"] is False
 
 
 async def test_to6_empty_table_returns_zero_active_count_and_no_oldest_age(

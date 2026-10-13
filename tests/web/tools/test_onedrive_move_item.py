@@ -212,6 +212,33 @@ def test_permission_denied_on_move_reports_a_clear_error(monkeypatch):
     assert "permission" in result["message"]
 
 
+@pytest.mark.parametrize("code", ["notAllowed", "resourceLocked", None])
+def test_locked_item_reports_a_clear_error_and_asks_not_to_retry(monkeypatch, code):
+    """Production answered 423 notAllowed for a file most likely open in
+    Word for the web (#3021); the agent got only the raw status and repeated
+    the call."""
+    error = {"error": {"code": code}} if code else {}
+    _install(
+        monkeypatch,
+        _FakeGraph(
+            {"file-1": _file(), "folder-b": _folder()},
+            patch_response=_Response(error, 423),
+        ),
+    )
+
+    result = _move("file-1", "folder-b")
+
+    assert result["status"] == "error"
+    assert "locked" in result["message"]
+    assert "close it or check it in" in result["message"]
+    assert "Do not retry until they confirm" in result["message"]
+    assert "423" not in result["message"]
+    if code is not None:
+        assert f"(Graph error code: {code})" in result["message"]
+    else:
+        assert "Graph error code" not in result["message"]
+
+
 @pytest.mark.parametrize(
     ("missing", "field"),
     [("file-1", "item_id"), ("folder-b", "destination_folder_id")],

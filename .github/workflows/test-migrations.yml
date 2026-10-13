@@ -97,6 +97,9 @@ on:
       - 'src/xagent/web/api/monitor.py'
       - 'tests/web/api/test_monitor_postgresql.py'
       - 'tests/web/api/monitor_daily_window_shared.py'
+      - 'src/xagent/web/api/tools.py'
+      - 'tests/web/api/test_tool_listing_usage_isolation.py'
+      - 'tests/web/api/test_tool_usage_stats.py'
       - 'src/xagent/web/services/task_interaction_staging.py'
       - 'tests/web/services/test_interaction_staging_postgresql.py'
       - 'src/xagent/web/services/task_interaction_service.py'
@@ -307,6 +310,9 @@ jobs:
             src/xagent/web/api/monitor.py
             tests/web/api/test_monitor_postgresql.py
             tests/web/api/monitor_daily_window_shared.py
+            src/xagent/web/api/tools.py
+            tests/web/api/test_tool_listing_usage_isolation.py
+            tests/web/api/test_tool_usage_stats.py
             src/xagent/web/services/task_interaction_staging.py
             tests/web/services/test_interaction_staging_postgresql.py
             src/xagent/web/services/task_interaction_service.py
@@ -723,6 +729,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/api/test_monitor_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test tool listing usage statistics (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/api/test_tool_listing_usage_isolation.py tests/web/api/test_tool_usage_stats.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

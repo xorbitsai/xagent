@@ -17,7 +17,17 @@ user's answer. Callback-less tools use the normal ReAct context and replan path.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Protocol, get_args, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Protocol,
+    TypeAlias,
+    get_args,
+    runtime_checkable,
+)
 
 WAITING_FOR_USER_STATUS = "waiting_for_user"
 ToolInteractionSettlementStatus = Literal[
@@ -162,6 +172,11 @@ class ToolInteractionSettlement:
         return projected
 
 
+ToolInteractionResumeResult: TypeAlias = (
+    "ToolInteractionSettlement | None | Awaitable[ToolInteractionSettlement | None]"
+)
+
+
 @runtime_checkable
 class ResumableUserInteractionTool(Protocol):
     """Optional capability implemented by tools with resumable interactions."""
@@ -171,7 +186,7 @@ class ResumableUserInteractionTool(Protocol):
         *,
         interaction_id: str,
         response: str,
-    ) -> ToolInteractionSettlement | None:
+    ) -> ToolInteractionResumeResult:
         """Accept a response and optionally settle the suspended tool call.
 
         A host may invoke this callback again after a failed checkpoint or
@@ -189,8 +204,28 @@ def tool_result_waits_for_user(result: Any) -> bool:
     )
 
 
-def user_interaction_resume_callable(tool: Any) -> Callable[..., Any] | None:
+def user_interaction_resume_callable(
+    tool: Any,
+) -> Callable[..., ToolInteractionResumeResult] | None:
     """Return a tool's optional user-interaction resume callback."""
 
     resume = getattr(tool, "resume_user_interaction", None)
     return resume if callable(resume) else None
+
+
+if TYPE_CHECKING:
+    # The repository type-checks the source package rather than tests, so keep
+    # both supported callback shapes as source-level conformance fixtures.
+
+    class _SyncResumeProbe:
+        def resume_user_interaction(
+            self, *, interaction_id: str, response: str
+        ) -> ToolInteractionSettlement | None: ...
+
+    class _AsyncResumeProbe:
+        async def resume_user_interaction(
+            self, *, interaction_id: str, response: str
+        ) -> ToolInteractionSettlement | None: ...
+
+    _sync_conformance: ResumableUserInteractionTool = _SyncResumeProbe()
+    _async_conformance: ResumableUserInteractionTool = _AsyncResumeProbe()

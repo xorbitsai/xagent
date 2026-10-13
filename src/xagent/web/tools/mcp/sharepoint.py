@@ -135,11 +135,14 @@ _MIME_TYPE_OVERRIDES = {
 
 
 class _GraphRequestError(RuntimeError):
-    """Graph HTTP failure that retains its status without response parsing."""
+    """Graph HTTP failure that retains its status and Graph error code."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
+    def __init__(
+        self, message: str, *, status_code: int, code: str | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.code = code
 
 
 def _success(**payload: Any) -> str:
@@ -333,11 +336,26 @@ def _graph_request(
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
-        raise _GraphRequestError(message, status_code=response.status_code) from exc
+        raise _GraphRequestError(
+            message,
+            status_code=response.status_code,
+            code=_graph_error_code(response),
+        ) from exc
 
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
+
+
+def _graph_error_code(response: Any) -> str | None:
+    """Return Graph's stable machine-readable error code, when present."""
+    try:
+        payload = response.json()
+    except (ValueError, TypeError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) and code else None
 
 
 def _graph_get_absolute(
@@ -955,6 +973,193 @@ def sharepoint_upload_file(
                 local_file_path,
                 site_id,
             )
+        return _error(str(e))
+
+
+_CROSS_DRIVE_MOVE_MESSAGE = (
+    "destination_folder_id is outside the selected SharePoint document "
+    "library; SharePoint cannot move items between drives"
+)
+
+
+def _read_move_item(
+    site_id: str, drive_id: str, item_id: str, field_name: str
+) -> dict[str, Any]:
+    """Read a move endpoint and name the id that failed on 403/404."""
+    try:
+        item = _graph_request(
+            "GET",
+            f"{_drive_base(site_id, drive_id)}/items/"
+            f"{url_path_id(item_id, field_name)}",
+        )
+    except _GraphRequestError as exc:
+        if exc.status_code == 404:
+            raise ValueError(
+                f"{field_name} was not found in this SharePoint drive: {item_id} "
+                "(a destination in another document library is reported this way)"
+            ) from None
+        if exc.status_code == 403:
+            raise ValueError(
+                f"The connected account has no permission to access {field_name}: "
+                f"{item_id}"
+            ) from None
+        raise
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+        raise RuntimeError(f"SharePoint returned an invalid item for {field_name}")
+    return item
+
+
+def _parent_reference(item: dict[str, Any], key: str) -> str | None:
+    parent = item.get("parentReference")
+    value = parent.get(key) if isinstance(parent, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _same_graph_id(left: str | None, right: str | None) -> bool:
+    """Compare opaque Graph resource identifiers exactly.
+
+    Graph treats both drive and drive-item ids as case-sensitive. Folding case
+    here can turn two distinct resources into an apparent self-move or no-op.
+    This intentionally differs from OneDrive's compatibility helper, which
+    preserves a documented workaround for inconsistent drive-id casing in
+    OneDrive Personal responses; SharePoint IDs are compared as returned.
+    """
+    return left is not None and right is not None and left == right
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True))
+def sharepoint_move_item(
+    site_id: str,
+    drive_id: str,
+    item_id: str,
+    destination_folder_id: str,
+    new_name: str = "",
+) -> str:
+    """Move a file or folder within one SharePoint document library.
+
+    ``site_id`` and ``drive_id`` identify the SharePoint site and document
+    library; pass the ``drive_id`` returned by ``sharepoint_list_drives``.
+    ``item_id`` and ``destination_folder_id`` are drive-item ids from
+    ``sharepoint_list_items`` or ``sharepoint_search_files``; use ``"root"`` as
+    the destination for the document-library root. ``new_name`` optionally
+    renames the item in the same request; leave it empty to keep the current name.
+
+    Both items are read before anything changes. A missing item, a destination
+    that is not a folder, or a destination outside ``drive_id`` fails without
+    moving anything. Cross-library moves need a copy and are not supported.
+
+    Moving can change who can access an item because it can inherit access from
+    the destination folder. Confirm the destination and that possible access
+    change with the user before calling this tool. On success, the response
+    contains ``item``, ``destination_folder_id``, ``already_in_destination`` and
+    ``renamed``. A 409 ``nameAlreadyExists`` response identifies the conflicting
+    name; retry with a different ``new_name``.
+    """
+    try:
+        if not isinstance(new_name, str):
+            raise ValueError("new_name must be a string")
+        requested_name = new_name.strip()
+        if new_name and not requested_name:
+            raise ValueError(
+                "new_name must not be blank; leave it empty to keep the current name"
+            )
+        # Validate the caller-supplied site/drive before either item read.
+        url_path_id(drive_id, "drive_id")
+        _drive_base(site_id, drive_id)
+        url_path_id(item_id, "item_id")
+        url_path_id(destination_folder_id, "destination_folder_id")
+        if _same_graph_id(item_id, destination_folder_id):
+            raise ValueError("An item cannot be moved into itself.")
+
+        source = _read_move_item(site_id, drive_id, item_id, "item_id")
+        if "root" in source:
+            raise ValueError("The document-library root folder cannot be moved")
+        destination = _read_move_item(
+            site_id, drive_id, destination_folder_id, "destination_folder_id"
+        )
+        if "remoteItem" in destination:
+            raise ValueError(_CROSS_DRIVE_MOVE_MESSAGE)
+        if "folder" not in destination:
+            raise ValueError("destination_folder_id must refer to a folder")
+
+        source_drive_id = _parent_reference(source, "driveId")
+        destination_drive_id = _parent_reference(destination, "driveId")
+        if any(
+            candidate is not None and not _same_graph_id(candidate, drive_id)
+            for candidate in (source_drive_id, destination_drive_id)
+        ):
+            raise ValueError(_CROSS_DRIVE_MOVE_MESSAGE)
+
+        # Graph rejects the "root" alias in parentReference.id.
+        resolved_destination_id = destination["id"]
+        if _same_graph_id(source["id"], resolved_destination_id):
+            raise ValueError("An item cannot be moved into itself.")
+
+        already_in_destination = _same_graph_id(
+            _parent_reference(source, "id"), resolved_destination_id
+        )
+        body: dict[str, Any] = {}
+        if not already_in_destination:
+            body["parentReference"] = {"id": resolved_destination_id}
+        if requested_name and requested_name != source.get("name"):
+            body["name"] = requested_name
+        if not body:
+            return _success(
+                item=_caller_safe_drive_item(source),
+                destination_folder_id=resolved_destination_id,
+                already_in_destination=True,
+                renamed=False,
+            )
+
+        try:
+            result = _graph_request(
+                "PATCH",
+                f"{_drive_base(site_id, drive_id)}/items/"
+                f"{url_path_id(source['id'], 'item_id')}",
+                body=body,
+            )
+        except _GraphRequestError as exc:
+            if exc.status_code == 409 and exc.code == "nameAlreadyExists":
+                target_name = body.get("name", source.get("name"))
+                raise ValueError(
+                    "The destination folder already contains an item named "
+                    f"{target_name!r}; retry with a different new_name"
+                ) from None
+            if exc.status_code == 403:
+                raise ValueError(
+                    "The connected account has no permission to move this item "
+                    "or to write to the destination folder"
+                ) from None
+            if exc.status_code == 404:
+                raise ValueError(
+                    "The item or the destination folder no longer exists"
+                ) from None
+            raise
+        if not isinstance(result, dict):
+            raise RuntimeError("SharePoint move returned an invalid item")
+        result_parent_id = _parent_reference(result, "id")
+        if result_parent_id is not None and not _same_graph_id(
+            result_parent_id, resolved_destination_id
+        ):
+            raise RuntimeError(
+                "SharePoint accepted the move but reported a different parent "
+                "folder; the item may have moved. Check its location with "
+                "sharepoint_list_items before retrying"
+            )
+        return _success(
+            item=_caller_safe_drive_item(result),
+            destination_folder_id=resolved_destination_id,
+            already_in_destination=already_in_destination,
+            renamed="name" in body,
+        )
+    except Exception as e:
+        logger.error(
+            "Error moving SharePoint item %s in drive %s for site %s: %s",
+            item_id,
+            drive_id,
+            site_id,
+            e,
+        )
         return _error(str(e))
 
 

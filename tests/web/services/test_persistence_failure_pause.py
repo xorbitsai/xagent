@@ -135,6 +135,18 @@ def _pause_switch_on(monkeypatch):
     monkeypatch.setenv(PAUSE_SWITCH, "true")
 
 
+AUTO_RESUME_SWITCH = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+
+
+@pytest.fixture(autouse=True)
+def _auto_resume_off(monkeypatch):
+    # These suites compare settlement with lease recovery and with settling
+    # as before, on the outcome automatic resume leaves to the user
+    # (``manual``, a FAILED TriggerRun). Tests of what a scheduled resume
+    # changes turn the switch on.
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "false")
+
+
 @pytest.fixture(autouse=True)
 def _late_bound_sessions(monkeypatch):
     """``task_execution`` binds the session factory at import; follow the
@@ -1610,3 +1622,52 @@ async def test_explicit_cancel_is_not_settled_as_an_interruption():
     settle_mock.assert_called_once()
     assert settle_mock.call_args.kwargs["interruption"] is None
     publish_pause.assert_not_awaited()
+
+
+# --------------------------------------------- scheduled automatic resume
+
+
+@pytest.mark.asyncio
+async def test_exception_pause_schedules_a_resume_and_keeps_the_trigger_running(
+    canonical, monkeypatch
+):
+    """S2 with automatic resume on: the shared recording schedules the
+    resume, so the TriggerRun stays RUNNING for the resumed run to settle.
+    Settlement announces its pause; the scheduled resume is announced by the
+    sweeper once it dispatches it."""
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    frames = await _schedule_failing_turn(factory, ids, lease, _persistence_error())
+
+    assert frames == ["task_paused"]
+    projection = _projection(factory, ids, lease)
+    assert projection["status"] == TaskStatus.PAUSED
+    assert projection["trigger_run"] == (TriggerRunStatus.RUNNING.value, None, False)
+    assert projection["workforce_run"] == ("paused", True)
+    _task, row, recorded = _state(factory, ids["task"])
+    assert (row.reason, row.state) == ("persistence_failure", "scheduled")
+    assert row.next_attempt_at is not None
+    assert [(event.event, event.attempt) for event in recorded] == [
+        ("interrupted", None),
+        ("scheduled", 1),
+    ]
+
+
+@RESULT_PATHS
+def test_result_pause_schedules_a_resume_and_keeps_the_trigger_running(
+    canonical, monkeypatch, path
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    _settle_result(path, factory, ids, lease, PERSISTENCE_RESULT)
+
+    _task, row, _events = _state(factory, ids["task"])
+    assert row.state == "scheduled"
+    projection = _projection(factory, ids, lease)
+    assert projection["trigger_run"] == (TriggerRunStatus.RUNNING.value, None, False)

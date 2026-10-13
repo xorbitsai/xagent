@@ -56,6 +56,7 @@ async def get_interaction_rollout_diagnostics(
             "mode": policy.mode,
             "native_sources": sorted(policy.native_sources),
             "native_protocol_version": policy.native_protocol_version,
+            "shared_task_execution": policy.shared_task_execution,
         },
         "counters": counters_snapshot(),
         "degradations": active_degradations(),

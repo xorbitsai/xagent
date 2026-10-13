@@ -249,6 +249,7 @@ def test_a_moved_task_is_skipped_as_stale(factory, snapshot, fields):
     decision = _check(task_id, **snapshot)
 
     assert (decision.proceed, decision.why) == (False, "stale")
+    assert decision.notices == ()
     row = _row(factory, task_id)
     assert row.state == "stale"
     assert row.next_attempt_at is None
@@ -282,6 +283,8 @@ def test_switch_off_at_the_fence_stops_the_row_and_fails_the_trigger_run(
     decision = _check(task_id)
 
     assert (decision.proceed, decision.why) == (False, "auto_resume_disabled")
+    (notice,) = decision.notices
+    assert notice.auto_resume["stop_reason"] == "disabled"
     row = _row(factory, task_id)
     assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
     assert _events(factory, task_id) == ["skipped_disabled"]
@@ -760,7 +763,11 @@ def test_a_claim_the_row_no_longer_names_is_skipped_and_the_row_left_alone(
         ),
     )
 
-    assert (decision.proceed, decision.why) == (False, "not_current")
+    assert (decision.proceed, decision.why, decision.notices) == (
+        False,
+        "not_current",
+        (),
+    )
     after = _row(factory, task_id)
     if before is None:
         assert after is None
@@ -779,10 +786,16 @@ def test_a_claim_the_row_no_longer_names_is_skipped_and_the_row_left_alone(
 
 
 @pytest.mark.asyncio
-async def test_resume_task_with_the_switch_off_never_replies(
+async def test_resume_task_with_the_switch_off_publishes_and_never_replies(
     factory, handler, monkeypatch
 ):
     monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    published: list[Any] = []
+
+    async def publish(notices):
+        published.extend(notices)
+
+    monkeypatch.setattr(task_auto_resume, "publish_recovery_notices", publish)
     with factory() as db:
         task_id, _ = _seed(db)
         db.commit()
@@ -792,6 +805,7 @@ async def test_resume_task_with_the_switch_off_never_replies(
     assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
     assert result.reason_code == "auto_resume_disabled"
     reply.assert_not_awaited()
+    assert [n.auto_resume["stop_reason"] for n in published] == ["disabled"]
     assert _row(factory, task_id).state == "manual"
     assert _task(factory, task_id).state_version == PV
 
@@ -830,3 +844,222 @@ def test_a_database_error_while_closing_a_skipped_claim_propagates(
     with pytest.raises(sa.exc.OperationalError):
         _check(task_id, state_version=PV + 1)
     assert _row(factory, task_id).state == "dispatched"
+
+
+# --------------------------------------------------------------------------
+# A resume this command started and then rolled back; an unanswered question
+# --------------------------------------------------------------------------
+
+
+def test_retry_after_its_own_rolled_back_resume_is_scheduled_again(
+    factory, monkeypatch
+):
+    monkeypatch.setattr(
+        task_auto_resume, "_AUTO_RESUME_RNG", __import__("random").Random(3)
+    )
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.commit()
+    now = utc_now()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert (decision.proceed, decision.why) == (False, "rolled_back")
+    (notice,) = decision.notices
+    assert notice.auto_resume["status"] == "scheduled"
+    assert notice.state_version == PV + 2
+    row = _row(factory, task_id)
+    assert row.state == "scheduled"
+    assert row.paused_state_version == PV + 2
+    assert row.next_attempt_at is not None
+    assert row.next_attempt_at.replace(tzinfo=None) >= now.replace(tzinfo=None)
+    assert _events(factory, task_id) == ["scheduled"]
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "running"
+
+
+def test_rolled_back_retry_with_the_switch_off_stops(factory, monkeypatch):
+    """The re-arm does not schedule while the switch is off, so turning it
+    back on never resumes the row retroactively."""
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.commit()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert (decision.proceed, decision.why) == (False, "rolled_back")
+    assert [n.auto_resume["stop_reason"] for n in decision.notices] == ["disabled"]
+    row = _row(factory, task_id)
+    assert (row.state, row.state_detail) == ("manual", "auto_resume_disabled")
+    assert row.paused_state_version == PV + 2
+    assert row.next_attempt_at is None
+    assert _events(factory, task_id) == ["skipped_disabled"]
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "failed"
+
+
+def test_rolled_back_retry_at_its_limit_stops_with_a_notice(factory):
+    with factory() as db:
+        task_id, trigger_run_id = _seed(db, trigger=True, state_version=PV + 2)
+        db.get(TaskAutoRecovery, task_id).no_progress_resumes = 3
+        db.commit()
+
+    decision = _check(task_id, state_version=PV + 2, attempt_count=2)
+
+    assert decision.why == "rolled_back"
+    assert [n.auto_resume["stop_reason"] for n in decision.notices] == ["limit_reached"]
+    assert _row(factory, task_id).state == "exhausted"
+    with factory() as db:
+        assert db.get(TriggerRun, trigger_run_id).status == "failed"
+
+
+@pytest.mark.parametrize("case", ["first_attempt", "user_command", "three_versions"])
+def test_a_rollback_lookalike_stays_stale(factory, case):
+    with factory() as db:
+        task_id, _ = _seed(
+            db, state_version=PV + (3 if case == "three_versions" else 2)
+        )
+        task = db.get(Task, task_id)
+        for command_id, kind in [(CID, "resume")] + (
+            [("message-1", "message")] if case == "user_command" else []
+        ):
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    actor_user_id=task.user_id,
+                    command_id=command_id,
+                    kind=kind,
+                    payload={},
+                    status="pending",
+                )
+            )
+        db.commit()
+
+    decision = _check(
+        task_id,
+        state_version=PV + (3 if case == "three_versions" else 2),
+        attempt_count=1 if case == "first_attempt" else 2,
+    )
+
+    assert decision.why == "stale"
+    assert _row(factory, task_id).state == "stale"
+
+
+@pytest.mark.asyncio
+async def test_resume_task_reschedules_after_its_own_rollback(factory, handler):
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.manager.register_reserved_resume.side_effect = RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _resume(factory, task_id)
+
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("paused", PV + 2)
+    handler.manager.register_reserved_resume.side_effect = None
+    retry, reply = await _resume(factory, task_id, attempt_count=2)
+
+    assert retry.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert retry.reason_code == "rolled_back"
+    reply.assert_not_awaited()
+    row = _row(factory, task_id)
+    assert (row.state, row.paused_state_version) == ("scheduled", PV + 2)
+
+
+@pytest.mark.asyncio
+async def test_resume_task_skips_an_unanswered_question_without_an_error(
+    factory, handler, monkeypatch
+):
+    from xagent.web.services.task_interaction_close import ActiveInteractionFound
+
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionFound(interaction_id=9)
+
+    result, reply = await _resume(factory, task_id)
+
+    assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert result.reason_code == "interaction_pending"
+    reply.assert_not_awaited()
+    handler.manager.try_reserve_resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_run_is_resumed_without_its_user(factory, handler, monkeypatch):
+    """End to end from the crash: lease recovery records ``scheduled``, the
+    sweeper dispatches the resume once it is due, and the durable dispatcher
+    runs it through ``resume_task`` to RESUME_REQUESTED."""
+    from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+    from xagent.web.models.task import TraceEvent
+    from xagent.web.services import task_lease_recovery
+    from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
+
+    monkeypatch.setattr(
+        task_lease_recovery, "invalidate_task_cache_best_effort", lambda _id: None
+    )
+    monkeypatch.setattr(
+        task_auto_resume, "notify_task_command_dispatcher", lambda: None
+    )
+    with factory() as db:
+        user = User(username=f"crash-{uuid.uuid4().hex[:8]}", password_hash="x")
+        db.add(user)
+        db.flush()
+        task = Task(
+            user_id=user.id,
+            title="Crashed",
+            description="crashed run",
+            execution_mode="balanced",
+            status=TaskStatus.RUNNING,
+            control_state="running",
+            runner_id="dead-runner",
+            run_id=RUN,
+            state_version=PV - 1,
+            lease_expires_at=utc_now() - timedelta(seconds=5),
+        )
+        db.add(task)
+        db.flush()
+        db.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="checkpoint-crash",
+                event_type="system_update_general",
+                timestamp=utc_now(),
+                data={
+                    "checkpoint_type": CHECKPOINT_TYPE,
+                    "snapshot": {"type": "checkpoint"},
+                    TASK_RUN_ID_TRACE_FIELD: RUN,
+                },
+            )
+        )
+        task.last_checkpoint_event_id = "checkpoint-crash"
+        db.commit()
+        task_id = int(task.id)
+
+    batch = task_lease_recovery.recover_expired_task_leases_batch_isolated(
+        cutoff=utc_now(), batch_size=10, after=None
+    )
+    assert batch.recovered == 1
+    row = _row(factory, task_id)
+    assert (row.state, row.paused_state_version) == ("scheduled", PV)
+    # Not due yet: nothing is dispatched.
+    assert run_auto_resume_tick(now=utc_now()).dispatched == 0
+
+    due = row.next_attempt_at + timedelta(seconds=1)
+    assert run_auto_resume_tick(now=due).dispatched == 1
+    command = await _dispatch_auto_command(factory, task_id)
+
+    assert command.command_id == CID
+    assert command.status == "completed"
+    assert command.result["resume_outcome"] == "scheduled"
+    task = _task(factory, task_id)
+    assert (task.status, task.control_state, task.state_version) == (
+        TaskStatus.PAUSED,
+        "resume_requested",
+        PV + 1,
+    )
+    assert task.run_id == RUN
+    handler.background.assert_called_once()
+    assert _events(factory, task_id) == ["interrupted", "scheduled", "auto_resumed"]

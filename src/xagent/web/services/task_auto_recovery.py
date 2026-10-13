@@ -2,9 +2,10 @@
 
 When a run is interrupted rather than finished, the settling transaction
 records why in ``task_auto_recovery`` (one row per task) and appends a
-``task_recovery_events`` row. Those rows are metadata only: recording them
-changes no task status, control state, error message or lifecycle
-projection.
+``task_recovery_events`` row. Recording them changes no task status,
+control state or error message; the one projection it decides is the
+TriggerRun of a PAUSED task, which stays RUNNING while an automatic resume
+is scheduled (see :func:`apply_interruption_outcome_no_commit`).
 
 Which outcome a run-settling path (a run that raised, or returned an
 unsuccessful result) writes for an interruption is decided by
@@ -12,13 +13,16 @@ unsuccessful result) writes for an interruption is decided by
 rests PAUSED instead of FAILED, so its user can resume it. Lease-expiry
 recovery keeps its own verdict mapping.
 
-The executor (``task_auto_resume``) dispatches only ``scheduled`` rows, and
-recording does not schedule yet, so a recorded interruption is never
-``scheduled``. Its state says only that nothing automatic will act on the
-run: ``manual``
-(only the user can act -- resume a PAUSED task; a FAILED one is terminal and
-the row just records why), ``ineligible`` (a task kind automatic recovery will
-never touch) or ``disabled`` (the interruption would have paused the run but
+A PAUSED interruption that automatic recovery may act on is ``scheduled``
+with its first ``next_attempt_at``, for the executor (``task_auto_resume``) to
+dispatch; the policy may instead stop it at once (``exhausted``,
+``expired``), or a later run of its scheduled trigger may have replaced it
+(``superseded``). Otherwise the state says that nothing automatic will act on
+the run: ``manual`` (only the user can act -- resume a PAUSED task; a FAILED
+one is terminal and the row just records why; ``state_detail`` names a
+switched-off executor, a channel task or a failed supersede check),
+``ineligible`` (a task kind automatic recovery will never touch) or
+``disabled`` (the interruption would have paused the run but
 ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` is off, see
 :func:`settlement_pause_enabled`).
 """
@@ -28,7 +32,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -36,6 +40,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_shared_task_execution_enabled,
+    get_task_auto_resume_enabled,
     get_task_infra_failure_pause_enabled,
 )
 from ...core.agent.checkpoint import checkpoint_progress_marker
@@ -45,6 +50,7 @@ from ...core.agent.interruption import (
     classify_run_result,
     is_database_unavailable,
 )
+from ...core.runtime_performance import increment_counter
 from ..models.task import Task, TaskStatus
 from ..models.task_auto_recovery import (
     TASK_AUTO_RECOVERY_LAST_ERROR_MAX_CHARS,
@@ -56,6 +62,12 @@ from ..models.task_auto_recovery import (
 from ..models.trigger import TriggerType
 from ..models.workforce import WorkforceRun
 from ..utils.db_timezone import format_datetime_for_api
+from .task_auto_recovery_policy import (
+    auto_resume_policy,
+    auto_resume_recovery_state,
+    plan_auto_resume,
+    scheduled_trigger_superseded,
+)
 from .task_command_transport import AUTO_RESUME_COMMAND_PREFIX
 from .task_execution_controller import TaskControlState
 from .task_lease_service import (
@@ -70,9 +82,36 @@ from .task_lease_service import (
     task_lease_attempt_predicate,
     utc_now,
 )
+from .task_settlement_report import RecordedInterruption
 from .workforce_runtime import extract_workforce_run_id
 
 logger = logging.getLogger(__name__)
+
+# ``state_detail`` of a PAUSED row that automatic resume leaves to its user:
+# the executor is switched off (XAGENT_TASK_AUTO_RESUME_ENABLED), the task is a
+# channel task (until a resumed channel run can hold its channel), or the
+# check for a later run of its scheduled trigger failed.
+AUTO_RESUME_DISABLED_DETAIL = "auto_resume_disabled"
+CHANNEL_HOLD_PENDING_DETAIL = "channel_hold_pending"
+SUPERSEDE_CHECK_FAILED_DETAIL = "supersede_check_failed"
+
+# The recorded states automatic resume has a plan for: each is logged as an
+# extra event of its own name and announced as ``task_recovery_update``
+# (``task_auto_resume.recorded_notice``).
+PLANNED_RECOVERY_EVENTS = {
+    TaskAutoRecoveryState.SCHEDULED: TaskRecoveryEventType.SCHEDULED,
+    TaskAutoRecoveryState.EXHAUSTED: TaskRecoveryEventType.EXHAUSTED,
+    TaskAutoRecoveryState.EXPIRED: TaskRecoveryEventType.EXPIRED,
+    TaskAutoRecoveryState.SUPERSEDED: TaskRecoveryEventType.SUPERSEDED,
+}
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Aware UTC; SQLite returns naive values for timezone-aware columns."""
+
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def interruption_pause_result() -> dict[str, Any]:
@@ -178,6 +217,7 @@ def record_interruption_no_commit(
     progress_marker: str | None,
     gated_by_settlement_switches: bool,
     last_error: str | None = None,
+    now: datetime | None = None,
 ) -> TaskAutoRecovery | None:
     """Upsert ``task``'s recovery row for one interruption and log the event.
 
@@ -207,6 +247,19 @@ def record_interruption_no_commit(
     its user resumed by hand is not held to the attempts spent before. A
     missing marker (an undecodable or absent checkpoint) is unknown, not
     progress: it keeps the last known marker.
+
+    Scheduling: an eligible PAUSED interruption whose reason has a policy is
+    planned with :func:`plan_auto_resume` at ``now`` (default
+    ``interrupted_at``) -- ``scheduled`` with its first ``next_attempt_at``,
+    or stopped at once: ``exhausted``, or ``expired`` when the run stopped
+    longer ago than the window (lease recovery after a long outage passes
+    the time the lease expired as ``interrupted_at``) -- unless a later run
+    of its scheduled trigger already started (``superseded``).
+    It rests in ``manual`` instead, with ``state_detail`` saying why, when
+    automatic resume is switched off (``auto_resume_disabled``), for a channel
+    task (``channel_hold_pending``) and when the supersede check fails
+    (``supersede_check_failed``; the row is still written). A reason without
+    a policy (a user pause, an unknown input outcome) stays plain ``manual``.
     """
 
     run_id = task.run_id
@@ -214,6 +267,20 @@ def record_interruption_no_commit(
         return None
 
     eligibility = auto_recovery_eligibility(db, task)
+    plannable = (
+        eligibility.eligible
+        and task_status is TaskStatus.PAUSED
+        and auto_resume_policy(reason) is not None
+    )
+    enabled = get_task_auto_resume_enabled()
+    # Before any change to the session: the check's own SAVEPOINT rolls back
+    # nothing of the caller's on failure. ``None`` means it failed, and the
+    # safe direction is not to schedule.
+    superseded: bool | None = (
+        _superseded_or_unknown(db, task)
+        if plannable and enabled and auto_resume_schedulable(eligibility.kind)
+        else False
+    )
     # Ineligibility is permanent and the switch is not, so it wins: a
     # ``disabled`` row always means "turning the switch on would help". A
     # reason settlement does not pause for yet is not disabled -- no switch
@@ -272,6 +339,33 @@ def record_interruption_no_commit(
         if last_error is not None
         else None
     )
+    if plannable and state is TaskAutoRecoveryState.MANUAL:
+        if not enabled:
+            state_detail = AUTO_RESUME_DISABLED_DETAIL
+        elif not auto_resume_schedulable(eligibility.kind):
+            state_detail = CHANNEL_HOLD_PENDING_DETAIL
+        elif superseded is None:
+            state_detail = SUPERSEDE_CHECK_FAILED_DETAIL
+        elif superseded:
+            state = TaskAutoRecoveryState.SUPERSEDED
+        else:
+            from . import task_auto_resume
+
+            verdict = plan_auto_resume(
+                reason=reason,
+                kind=eligibility.kind,
+                interrupted_at=interrupted_at,
+                episode_started_at=row.episode_started_at,
+                no_progress_resumes=int(row.no_progress_resumes or 0),
+                total_resumes=int(row.total_resumes or 0),
+                now=now or interrupted_at,
+                # One RNG for every automatic-resume jitter; tests seed it.
+                rng=task_auto_resume._AUTO_RESUME_RNG,
+            )
+            state = auto_resume_recovery_state(verdict.outcome)
+            row.next_attempt_at = verdict.next_attempt_at
+        row.state = state.value
+        row.state_detail = state_detail
 
     detail: dict[str, Any] = {"task_status": task_status.value, "state": state.value}
     if state_detail is not None:
@@ -291,16 +385,65 @@ def record_interruption_no_commit(
             detail=detail,
         )
     )
+    planned_event = PLANNED_RECOVERY_EVENTS.get(state)
+    if planned_event is not None:
+        db.add(
+            TaskRecoveryEvent(
+                task_id=task.id,
+                run_id=run_id,
+                event=planned_event.value,
+                reason=reason.value,
+                attempt=RecordedInterruption.from_row(row).attempt,
+                next_attempt_at=row.next_attempt_at,
+                detail={"at": "record"},
+            )
+        )
     db.flush()
-    logger.info(
+    increment_counter(
+        "xagent.task.auto_resume.recorded",
+        attributes={"outcome": state.value, "operation": reason.value},
+    )
+    log = (
+        logger.warning
+        if state in (TaskAutoRecoveryState.EXHAUSTED, TaskAutoRecoveryState.EXPIRED)
+        or state_detail == SUPERSEDE_CHECK_FAILED_DETAIL
+        else logger.info
+    )
+    log(
         "Recorded task interruption: task_id=%s run_id=%s reason=%s state=%s "
-        "component=auto-recovery",
+        "state_detail=%s next_attempt_at=%s component=auto-recovery",
         task.id,
         run_id,
         reason.value,
         state.value,
+        state_detail,
+        row.next_attempt_at,
     )
     return row
+
+
+def _superseded_or_unknown(db: Session, task: Task) -> bool | None:
+    """Whether a later run of ``task``'s scheduled trigger already started.
+
+    Reads in its own SAVEPOINT; a failed read is rolled back to it, logged
+    and reported as ``None``. A SAVEPOINT that cannot be opened or rolled back
+    propagates to the caller's (the whole row is then skipped).
+    """
+
+    savepoint = db.begin_nested()
+    try:
+        superseded = scheduled_trigger_superseded(db, task)
+    except Exception:
+        savepoint.rollback()
+        logger.warning(
+            "component=auto-resume task_id=%s checking for a later scheduled "
+            "trigger run failed; leaving the resume to its user",
+            task.id,
+            exc_info=True,
+        )
+        return None
+    savepoint.commit()
+    return superseded
 
 
 def is_auto_resume_command_id(command_id: object) -> bool:
@@ -515,8 +658,11 @@ def record_lease_expiry_interruption_no_commit(
     resolution: CheckpointRecoveryResolution,
     task_status: TaskStatus,
     recovered_at: datetime,
-) -> None:
+) -> RecordedInterruption | None:
     """Record a lease recovery's interruption inside its open transaction.
+
+    Returns what was recorded, or ``None`` when nothing was (no reason for
+    the verdict, or the recording failed and was skipped).
 
     Runs in a SAVEPOINT and does not raise past it for a failure inside the
     recording itself:
@@ -546,18 +692,22 @@ def record_lease_expiry_interruption_no_commit(
 
     reason = lease_expiry_interruption_reason(candidate, resolution.verdict)
     if reason is None:
-        return
+        return None
     savepoint = db.begin_nested()
     try:
-        record_interruption_no_commit(
+        row = record_interruption_no_commit(
             db,
             task=task,
             reason=reason,
             task_status=task_status,
-            interrupted_at=recovered_at,
+            # The run stopped when its lease lapsed, not when a host noticed:
+            # after an outage longer than the window it is not resumed.
+            interrupted_at=min(recovered_at, _as_utc(candidate.lease_expires_at)),
+            now=recovered_at,
             progress_marker=resolution_progress_marker(db, int(task.id), resolution),
             gated_by_settlement_switches=False,
         )
+        recorded = RecordedInterruption.from_row(row) if row is not None else None
     except Exception:
         savepoint.rollback()
         logger.exception(
@@ -565,8 +715,9 @@ def record_lease_expiry_interruption_no_commit(
             "recovering it without auto-recovery metadata",
             task.id,
         )
-        return
+        return None
     savepoint.commit()
+    return recorded
 
 
 # Interruption reasons the run-settling paths act on. Settlement keeps its
@@ -836,14 +987,21 @@ def apply_interruption_outcome_no_commit(
     ``error`` becomes the row's operator-only ``last_error``. The row is
     gated by the settlement switch (``disabled`` when it is off for an eligible
     task and a reason it would pause for).
+
+    With ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` on, a pause recorded here
+    is scheduled like a lease-expiry pause, and its TriggerRun stays RUNNING
+    for the resumed run to settle. The settling paths announce only their
+    ``task_paused`` for now, not the scheduled resume: a viewer learns of it
+    when the sweeper dispatches it (``resuming``), or from a later stop.
     """
 
     if decision.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT:
         setattr(task, "error_message", TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR)
     db.flush()
+    recorded: RecordedInterruption | None = None
     savepoint = db.begin_nested()
     try:
-        record_interruption_no_commit(
+        row = record_interruption_no_commit(
             db,
             task=task,
             reason=decision.reason,
@@ -857,6 +1015,7 @@ def apply_interruption_outcome_no_commit(
             gated_by_settlement_switches=True,
             last_error=error,
         )
+        snapshot = RecordedInterruption.from_row(row) if row is not None else None
     except Exception:
         savepoint.rollback()
         logger.exception(
@@ -866,26 +1025,32 @@ def apply_interruption_outcome_no_commit(
         )
     else:
         savepoint.commit()
+        recorded = snapshot
     if decision.pause:
-        _project_interruption_pause_no_commit(db, task)
+        _project_interruption_pause_no_commit(db, task, recorded)
 
 
-def _project_interruption_pause_no_commit(db: Session, task: Task) -> None:
+def _project_interruption_pause_no_commit(
+    db: Session, task: Task, recorded: RecordedInterruption | None
+) -> None:
     """Project an interruption's PAUSED outcome as lease recovery does.
 
-    The workforce run follows the task to ``paused``; a PENDING or RUNNING
-    TriggerRun ends FAILED with the manual-resume message, since nothing
-    resumes the task without its user yet. The message names a system
-    interruption, not a lease expiry, which keeps its own message.
+    The workforce run follows the task to ``paused``. A PENDING or RUNNING
+    TriggerRun stays RUNNING while automatic resume is scheduled -- the
+    resumed run settles it -- and otherwise ends FAILED with the message for
+    what was recorded (:func:`trigger_error_for_recorded`); the default names
+    a system interruption, not a lease expiry, which keeps its own message.
     """
 
+    from .task_auto_resume import trigger_error_for_recorded
     from .task_orchestrator import sync_trigger_run_status
     from .workforce_runtime import sync_workforce_run_status
 
     sync_workforce_run_status(db, task, TaskStatus.PAUSED)
-    sync_trigger_run_status(
-        db,
-        task,
-        TaskStatus.PAUSED,
-        error_message=TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
+    trigger_error = trigger_error_for_recorded(
+        recorded, default=TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
     )
+    if trigger_error is not None:
+        sync_trigger_run_status(
+            db, task, TaskStatus.PAUSED, error_message=trigger_error
+        )

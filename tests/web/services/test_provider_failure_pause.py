@@ -171,6 +171,18 @@ def _switch_defaults(monkeypatch):
     monkeypatch.setenv(PAUSE_SWITCH, "true")
 
 
+AUTO_RESUME_SWITCH = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+
+
+@pytest.fixture(autouse=True)
+def _auto_resume_off(monkeypatch):
+    # These suites compare settlement with lease recovery and with settling
+    # as before, on the outcome automatic resume leaves to the user
+    # (``manual``, a FAILED TriggerRun). Tests of what a scheduled resume
+    # changes turn the switch on.
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "false")
+
+
 # ------------------------------------------------- real runs, then resumed
 
 
@@ -1197,8 +1209,11 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
 ):
     """The shared channel leaf pauses an eligible interrupted run. Its
     channel gets the same "interrupted" reply a lease-expiry pause produces
-    (until a later change holds the reply across an automatic resume)."""
+    (until a later change holds the reply across an automatic resume).
+    Automatic resume leaves channel tasks to their user until then, so the
+    pause records ``manual`` and announces no resume."""
 
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     published = _capture_task_events(monkeypatch)
 
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])
@@ -1223,9 +1238,10 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
             == interrupted_channel_result()
         )
         row = db.get(TaskAutoRecovery, tid)
-        assert (row.reason, row.state, row.run_id) == (
+        assert (row.reason, row.state, row.state_detail, row.run_id) == (
             reason,
             "manual",
+            "channel_hold_pending",
             selected.run_id,
         )
         assert row.paused_state_version == task.state_version
@@ -1251,6 +1267,7 @@ async def test_shared_channel_turn_pauses_and_its_channel_reads_interrupted(
         paused[0]["state_version"],
     ) == (tid, "paused", "paused", selected.run_id, state_version)
     assert RESULTS[reason]["error"] not in str(paused)
+    assert not [e for e in published if e["type"] == "task_recovery_update"]
 
 
 @pytest.mark.asyncio

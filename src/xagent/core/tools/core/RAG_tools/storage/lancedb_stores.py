@@ -315,40 +315,6 @@ class LanceDBMetadataStore(MetadataStore):
         finally:
             _safe_close_table(table)
 
-    async def save_collections(self, collections: Sequence[CollectionInfo]) -> None:
-        if not collections:
-            return
-        await asyncio.to_thread(self._save_collections_sync, collections)
-
-    def _save_collections_sync(self, collections: Sequence[CollectionInfo]) -> None:
-        """Blocking body of :meth:`save_collections`; must not run on the loop."""
-        from ..LanceDB.schema_manager import _safe_close_table
-
-        conn = self.get_raw_connection()
-        self._ensure_collection_metadata_table_sync(conn)
-
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
-        rows_by_name = OrderedDict()
-        for collection in collections:
-            if not collection.name:
-                continue
-            data = collection.to_storage()
-            data["updated_at"] = data.get("updated_at") or now
-            rows_by_name[collection.name] = data
-
-        if not rows_by_name:
-            return
-
-        table = conn.open_table("collection_metadata")
-        try:
-            table.merge_insert(
-                ["name"]
-            ).when_matched_update_all().when_not_matched_insert_all().execute(
-                list(rows_by_name.values())
-            )
-        finally:
-            _safe_close_table(table)
-
     async def list_collections(
         self,
         user_id: Optional[int] = None,

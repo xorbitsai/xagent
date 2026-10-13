@@ -190,6 +190,57 @@ async def test_concurrent_tool_error_pairs_by_tool_call_id(
 
 
 @pytest.mark.asyncio
+async def test_reused_tool_call_id_pairs_by_invocation_id(
+    mocker, monkeypatch, langfuse_client_reset
+):
+    _enable_langfuse_env(monkeypatch)
+    _, mock_langfuse = create_langfuse_mock(mocker)
+    root = _make_observation(mocker, "root")
+    obs_a = _make_observation(mocker, "obs-a")
+    obs_b = _make_observation(mocker, "obs-b")
+    mock_langfuse.start_observation.return_value = root
+    root.start_observation.side_effect = [obs_a, obs_b]
+
+    handler = create_langfuse_trace_handler(task_id="task-reused-id")
+    assert handler is not None
+    tracer = Tracer()
+    tracer.add_handler(handler)
+
+    for invocation_id in ("invocation-a", "invocation-b"):
+        await trace_action_start(
+            tracer,
+            "task-reused-id",
+            "step-1",
+            TraceCategory.TOOL,
+            data={
+                "tool_name": "web_search",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": invocation_id,
+            },
+        )
+    for invocation_id, result in (
+        ("invocation-a", "RES_A"),
+        ("invocation-b", "RES_B"),
+    ):
+        await trace_action_end(
+            tracer,
+            "task-reused-id",
+            "step-1",
+            TraceCategory.TOOL,
+            data={
+                "tool_name": "web_search",
+                "tool_call_id": "tool_call_0",
+                "invocation_id": invocation_id,
+                "result": result,
+                "success": True,
+            },
+        )
+
+    assert obs_a.update.call_args.kwargs["output"]["result"] == "RES_A"
+    assert obs_b.update.call_args.kwargs["output"]["result"] == "RES_B"
+
+
+@pytest.mark.asyncio
 async def test_single_tool_without_tool_call_id_still_pairs(
     mocker, monkeypatch, langfuse_client_reset
 ):

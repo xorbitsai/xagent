@@ -104,6 +104,7 @@ def test_tv7_internal_only_allowlist_does_not_let_channel_traffic_through(
             mode="native",
             native_sources=frozenset({"internal"}),
             native_protocol_version=1,
+            shared_task_execution=True,
         ),
     )
     decision = ir.evaluate_native_publication(

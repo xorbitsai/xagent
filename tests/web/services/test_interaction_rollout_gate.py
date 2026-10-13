@@ -54,7 +54,13 @@ def _reset_state(monkeypatch):
     clear_degradation(INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE)
 
 
-def _set_policy(monkeypatch, *, mode="native", native_sources=frozenset()):
+def _set_policy(
+    monkeypatch,
+    *,
+    mode="native",
+    native_sources=frozenset(),
+    shared_task_execution=True,
+):
     monkeypatch.setattr(
         ir,
         "_policy",
@@ -62,6 +68,7 @@ def _set_policy(monkeypatch, *, mode="native", native_sources=frozenset()):
             mode=mode,
             native_sources=frozenset(native_sources),
             native_protocol_version=1,
+            shared_task_execution=shared_task_execution,
         ),
     )
 
@@ -223,3 +230,39 @@ def test_tg11_gate_function_body_has_no_try_except():
         assert not isinstance(node, ast.Try), (
             "gate must not silently degrade via try/except"
         )
+
+
+@pytest.mark.parametrize(
+    "source", ["bogus", "sdk"], ids=["unknown_source", "allowed_source"]
+)
+def test_tg12_native_without_shared_execution_blocks_on_topology_before_any_source_check(
+    monkeypatch, source
+):
+    """A process that is not running shared task execution is blocked on
+    topology before any source check and before the schema query: no
+    degradation is registered, and only the topology counter moves."""
+    _set_policy(
+        monkeypatch,
+        mode="native",
+        native_sources={"sdk"},
+        shared_task_execution=False,
+    )
+    degradations_before = active_degradations()
+
+    decision = ir.evaluate_native_publication(_PoisonSession(), _FakeTask(source))
+
+    assert decision is ir.NativePublicationDecision.BLOCKED_TOPOLOGY
+    assert decision.protocol_version is None
+    assert ir.counters_snapshot() == {ir.COUNTER_ROLLOUT_DECISION_BLOCKED_TOPOLOGY: 1}
+    assert active_degradations() == degradations_before
+
+
+def test_tg13_non_native_mode_without_shared_execution_still_blocks_on_mode_first(
+    monkeypatch,
+):
+    _set_policy(monkeypatch, mode="legacy", shared_task_execution=False)
+
+    decision = ir.evaluate_native_publication(_PoisonSession(), _FakeTask("sdk"))
+
+    assert decision is ir.NativePublicationDecision.BLOCKED_MODE
+    assert ir.counters_snapshot() == {ir.COUNTER_ROLLOUT_DECISION_BLOCKED_MODE: 1}

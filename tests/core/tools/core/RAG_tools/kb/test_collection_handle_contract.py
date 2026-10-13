@@ -23,6 +23,7 @@ a change shows after a moment (``_eventually``). Not covered here:
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib
 import inspect
 import os
@@ -36,6 +37,7 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.exceptions import VectorValidationError
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     ChunkEmbeddingData,
+    CollectionInfo,
     ParsedParagraph,
     RegisterDocumentRequest,
 )
@@ -52,6 +54,7 @@ from xagent.core.tools.core.RAG_tools.kb.models import (
     KBUserScope,
 )
 from xagent.core.tools.core.RAG_tools.LanceDB.model_tag_utils import to_model_tag
+from xagent.core.tools.core.RAG_tools.management.collections import list_collections
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_ingestion_status_store,
     get_main_pointer_store,
@@ -117,6 +120,8 @@ MILVUS_SKELETON = {
     "test_validate_query_vector_rejects_malformed_vectors",
 }
 MILVUS_ROWS = {
+    "test_admin_list_counts_follow_rows_not_persisted_counters",
+    "test_admin_list_writes_no_metadata",
     "test_rewriting_embeddings_does_not_duplicate_rows",
     "test_search_returns_only_rows_the_caller_may_see",
     "test_search_never_crosses_collections",
@@ -974,6 +979,54 @@ async def test_delete_collection_config_follows_tenant_scope(
 
     assert await open_handle(COLLECTION).delete_collection_config() == 1
     assert store.list_collection_config_owner_ids(COLLECTION) == set()
+
+
+def test_admin_list_counts_follow_rows_not_persisted_counters(
+    seeded: KBCollectionHandle,
+) -> None:
+    stale = CollectionInfo(
+        name=COLLECTION,
+        documents=99,
+        parses=99,
+        chunks=99,
+        embeddings=99,
+        processed_documents=99,
+    )
+    asyncio.run(get_metadata_store().save_collection(stale))
+    seeded.write_parse(
+        "doc-1", PARSE, "default", {}, [ParsedParagraph(text="p")], user_id=1
+    )
+
+    def listed() -> tuple[int, int, int, int]:
+        result = asyncio.run(list_collections(user_id=None, is_admin=True))
+        [info] = [c for c in result.collections if c.name == COLLECTION]
+        return info.documents, info.chunks, info.embeddings, info.processed_documents
+
+    _eventually(lambda: _assert_eq(listed(), (2, 3, 3, 1)))
+    seeded.delete_documents_data(["doc-1"], user_id=None, is_admin=True)
+    _eventually(lambda: _assert_eq(listed(), (1, 1, 1, 0)))
+    seeded.delete_documents_data(["doc-2"], user_id=None, is_admin=True)
+    _eventually(lambda: _assert_eq(listed(), (0, 0, 0, 0)))
+
+
+def test_admin_list_writes_no_metadata(seeded: KBCollectionHandle) -> None:
+    store = get_metadata_store()
+
+    def admin_list() -> list[str]:
+        result = asyncio.run(list_collections(user_id=None, is_admin=True))
+        return [c.name for c in result.collections]
+
+    assert admin_list() == [COLLECTION]
+    with pytest.raises(ValueError):
+        asyncio.run(store.get_collection(COLLECTION))
+
+    asyncio.run(store.save_collection(CollectionInfo(name=COLLECTION, documents=99)))
+    assert admin_list() == [COLLECTION]
+    assert asyncio.run(store.get_collection(COLLECTION)).documents == 99
+
+
+def _assert_eq(actual: object, expected: object) -> None:
+    assert actual == expected
 
 
 def _counts(handle: KBCollectionHandle) -> tuple[object, ...]:

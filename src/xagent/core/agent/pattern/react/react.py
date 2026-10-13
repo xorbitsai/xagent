@@ -258,6 +258,8 @@ class ToolCallRecord:
     # ``turn_id`` so the original call keeps its execution identity while the
     # duplicate-write guard can protect the one resumed turn that follows it.
     settlement_turn_id: str | None = None
+    # Durable obligation to emit both settlement lifecycle trace events.
+    settlement_trace_pending: bool = False
     # The ReAct step that issued the call. Persisted so a rebuilt runtime can
     # resume the exact gate identity instead of inventing a new execution slot.
     step_id: str | None = None
@@ -278,6 +280,7 @@ class ToolCallRecord:
             "settlement_status": self.settlement_status,
             "turn_id": self.turn_id,
             "settlement_turn_id": self.settlement_turn_id,
+            "settlement_trace_pending": self.settlement_trace_pending,
             "step_id": self.step_id,
             "issued_at": self.issued_at,
         }
@@ -306,6 +309,7 @@ class ToolCallRecord:
                 if data.get("settlement_turn_id") is not None
                 else None
             ),
+            settlement_trace_pending=bool(data.get("settlement_trace_pending", False)),
             step_id=str(data["step_id"]) if data.get("step_id") else None,
             issued_at=(
                 float(data["issued_at"]) if data.get("issued_at") is not None else None
@@ -843,6 +847,7 @@ class ReActPattern(AgentPattern):
                 context=context,
                 runtime=runtime,
             )
+            await self._replay_unemitted_settlement_traces(runtime=runtime)
             result = await self._run_tool_calling_loop(
                 context=context,
                 tools=context_tools,
@@ -2993,6 +2998,7 @@ class ReActPattern(AgentPattern):
             # turn, ReAct step) instead of inventing a new one.
             resume_call = {
                 "id": str(pending.get("tool_call_id") or ""),
+                "invocation_id": record.invocation_id,
                 "name": tool_name,
                 "turn_id": record.turn_id,
                 "step_id": record.step_id,
@@ -3022,14 +3028,16 @@ class ReActPattern(AgentPattern):
                         "external outcome is unknown and automatic retry is disabled."
                     )
                 )
-            settled = isinstance(resumed, ToolInteractionSettlement)
+            settlement = (
+                resumed if isinstance(resumed, ToolInteractionSettlement) else None
+            )
 
             popped = False
             try:
-                if settled:
+                if settlement is not None:
                     self._project_tool_interaction_settlement(
                         record=record,
-                        settlement=resumed,
+                        settlement=settlement,
                         context=context,
                         runtime=runtime,
                     )
@@ -3049,7 +3057,9 @@ class ReActPattern(AgentPattern):
                         "tool_call_id": pending.get("tool_call_id", ""),
                         "invocation_id": record.invocation_id,
                         "interaction_id": pending.get("interaction_id", ""),
-                        "settlement_status": resumed.status if settled else None,
+                        "settlement_status": (
+                            settlement.status if settlement is not None else None
+                        ),
                     },
                 )
             except BaseException:
@@ -3062,10 +3072,19 @@ class ReActPattern(AgentPattern):
                 if popped:
                     self.pending_tool_interaction_responses.insert(0, pending)
                 raise
-            if settled:
+            if settlement is not None:
+                settled_record = (
+                    self._find_tool_record(
+                        tool_call_id=record.tool_call_id,
+                        invocation_id=record.invocation_id,
+                    )
+                    or record
+                )
                 await self._trace_tool_interaction_settlement(
-                    record=record,
-                    settlement=resumed,
+                    record=settled_record,
+                    status=settlement.status,
+                    result=settled_record.result,
+                    error=settled_record.error,
                     runtime=runtime,
                 )
 
@@ -3100,7 +3119,10 @@ class ReActPattern(AgentPattern):
 
         tool_name = str(pending.get("tool_name") or "")
         tool_call_id = str(pending.get("tool_call_id") or "")
-        candidate = self._record_for_tool_call_id(tool_call_id)
+        candidate = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=self._normalized_invocation_id(pending.get("invocation_id")),
+        )
         # Only a record for this exact call AND this exact tool is ours.
         record = (
             candidate
@@ -3189,9 +3211,18 @@ class ReActPattern(AgentPattern):
             if popped:
                 self.pending_tool_interaction_responses.insert(0, pending)
             raise
+        settled_record = (
+            self._find_tool_record(
+                tool_call_id=record.tool_call_id,
+                invocation_id=record.invocation_id,
+            )
+            or record
+        )
         await self._trace_tool_interaction_settlement(
-            record=record,
-            settlement=settlement,
+            record=settled_record,
+            status=settlement.status,
+            result=settled_record.result,
+            error=settled_record.error,
             runtime=runtime,
         )
 
@@ -3232,41 +3263,31 @@ class ReActPattern(AgentPattern):
         self,
         *,
         record: ToolCallRecord,
-        settlement: ToolInteractionSettlement,
+        status: str,
+        result: Any,
+        error: str | None,
         runtime: PatternRuntime,
     ) -> None:
-        """Emit a paired lifecycle after the settlement is durably checkpointed.
-
-        The pause already emitted a full start/end pair for this tool_call_id
-        (the end carrying ``waiting_for_user``), so the frontend renderer needs
-        a fresh *running* action before it can close the call — an unpaired end
-        event would be mis-attributed to an unrelated card. The events are
-        written straight to the tracer rather than through
-        ``runtime.on_tool_start``: that method unconditionally calls
-        ``add_tool_call_usage(1)``, which would durably bill the user a second
-        tool call for a resume that executes no tool. The payload otherwise
-        mirrors what ``PatternRuntime.on_tool_start`` / ``on_tool_end`` /
-        ``on_tool_error`` write, and the ``settlement_delivery`` marker lets
-        consumers tell a settlement pair from an execution pair.
-        """
+        """Emit the durable settlement lifecycle without billing another call."""
 
         tracer = getattr(runtime, "tracer", None)
         trace_event = getattr(tracer, "trace_event", None)
         if not callable(trace_event):
             return
-        result = settlement.projected_result()
-        succeeded = settlement.status == "succeeded"
+        succeeded = status == "succeeded"
         base: dict[str, Any] = {
             "tool_name": record.tool_name,
             "tool_call_id": record.tool_call_id,
             "settlement_delivery": True,
-            "settlement_status": settlement.status,
+            "settlement_status": status,
         }
         if record.invocation_id:
             base["invocation_id"] = record.invocation_id
-        turn_id = getattr(runtime, "active_turn_id", None)
+        turn_id = record.settlement_turn_id or getattr(runtime, "active_turn_id", None)
         if turn_id:
             base["turn_id"] = str(turn_id)
+        if record.issued_at is not None:
+            base["original_started_at"] = record.issued_at
         start_data = {**base, "tool_params": copy.deepcopy(record.args)}
         if succeeded:
             end_type = TraceEventType(
@@ -3280,8 +3301,7 @@ class ReActPattern(AgentPattern):
             }
         else:
             error_message = str(
-                settlement.error
-                or (result.get("error") if isinstance(result, dict) else result)
+                error or (result.get("error") if isinstance(result, dict) else result)
             )
             end_type = TraceEventType(
                 TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL
@@ -3294,18 +3314,50 @@ class ReActPattern(AgentPattern):
                 "result": result,
                 "success": False,
             }
-        await self._emit_settlement_trace_event(
+        settlement_step_id = record.step_id or getattr(
+            runtime, "active_react_step_id", None
+        )
+        started = await self._emit_settlement_trace_event(
             trace_event,
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
             runtime=runtime,
+            step_id=settlement_step_id,
             data=start_data,
         )
-        await self._emit_settlement_trace_event(
+        ended = await self._emit_settlement_trace_event(
             trace_event,
             end_type,
             runtime=runtime,
+            step_id=settlement_step_id,
             data=end_data,
         )
+        if started and ended:
+            self._clear_settlement_trace_pending(record)
+
+    def _clear_settlement_trace_pending(self, settled_record: ToolCallRecord) -> None:
+        record = self._find_tool_record(
+            tool_call_id=settled_record.tool_call_id,
+            invocation_id=settled_record.invocation_id,
+        )
+        if record is None or not record.settlement_trace_pending:
+            return
+        self.tool_ledger[self._ledger_key(record)] = replace(
+            record, settlement_trace_pending=False
+        )
+
+    async def _replay_unemitted_settlement_traces(
+        self, *, runtime: PatternRuntime
+    ) -> None:
+        for record in list(self.tool_ledger.values()):
+            if not (record.settlement_status and record.settlement_trace_pending):
+                continue
+            await self._trace_tool_interaction_settlement(
+                record=record,
+                status=record.settlement_status,
+                result=record.result,
+                error=record.error,
+                runtime=runtime,
+            )
 
     @staticmethod
     async def _emit_settlement_trace_event(
@@ -3313,28 +3365,26 @@ class ReActPattern(AgentPattern):
         event_type: TraceEventType,
         *,
         runtime: PatternRuntime,
+        step_id: str | None,
         data: dict[str, Any],
-    ) -> None:
-        """Persist settlement facts strictly and deliver observers best-effort."""
+    ) -> bool:
+        """Require persistence and report whether the trace event landed."""
 
         execution_id = getattr(runtime, "execution_id", None)
-        step_id = getattr(runtime, "active_react_step_id", None)
         try:
             emitted = trace_event(
                 event_type,
                 task_id=str(execution_id or ""),
                 step_id=str(step_id or execution_id or "root"),
                 data=data,
+                require_persisted=True,
             )
             if inspect.isawaitable(emitted):
                 await emitted
-        except ExecutionEventPersistenceError:
-            raise
         except Exception:
-            # UI trace events are best-effort, exactly as in
-            # PatternRuntime._emit_trace_event; a tracer fault must not undo a
-            # settlement that is already durable.
             logger.debug("settlement trace event failed", exc_info=True)
+            return False
+        return True
 
     def _validate_tool_interaction_settlement_target(
         self,
@@ -3345,7 +3395,11 @@ class ReActPattern(AgentPattern):
         """Validate every durable identity before a resume callback can run."""
 
         tool_call_id = str(pending.get("tool_call_id") or "")
-        record = self._record_for_tool_call_id(tool_call_id)
+        invocation_id = self._normalized_invocation_id(pending.get("invocation_id"))
+        record = self._find_tool_record(
+            tool_call_id=tool_call_id,
+            invocation_id=invocation_id,
+        )
         if record is None:
             raise RuntimeError(
                 "Cannot settle resumed tool interaction without its original "
@@ -3371,6 +3425,11 @@ class ReActPattern(AgentPattern):
             for message in messages
             if getattr(message, "role", None) == "tool"
             and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or getattr(message, "metadata", {}).get("invocation_id")
+                == invocation_id
+            )
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -3433,6 +3492,7 @@ class ReActPattern(AgentPattern):
                 result=result,
                 settlement_status=settlement.status,
                 settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
             )
         else:
             error = str(
@@ -3446,6 +3506,7 @@ class ReActPattern(AgentPattern):
                 error=error,
                 settlement_status=settlement.status,
                 settlement_turn_id=settlement_turn_id,
+                settlement_trace_pending=True,
             )
         # A rejection or an unknown dispatch anywhere in the delivery batch is
         # an authorization boundary for the whole resumed turn. Maintainers
@@ -3520,6 +3581,11 @@ class ReActPattern(AgentPattern):
             for index, message in enumerate(messages)
             if getattr(message, "role", None) == "tool"
             and getattr(message, "tool_call_id", None) == tool_call_id
+            and (
+                not invocation_id
+                or getattr(message, "metadata", {}).get("invocation_id")
+                == invocation_id
+            )
         ]
         if len(matching_indexes) != 1:
             raise RuntimeError(
@@ -6165,6 +6231,7 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
         settlement_status: str | None = None,
         settlement_turn_id: str | None = None,
+        settlement_trace_pending: bool = False,
         index_tool_call_id: bool = True,
     ) -> None:
         tool_call_id = str(
@@ -6199,6 +6266,7 @@ class ReActPattern(AgentPattern):
             settlement_turn_id=(
                 str(settlement_turn_id) if settlement_turn_id else None
             ),
+            settlement_trace_pending=settlement_trace_pending,
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
             issued_at=issued_at,
         )

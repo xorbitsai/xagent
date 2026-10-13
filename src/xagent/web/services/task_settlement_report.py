@@ -3,9 +3,48 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from ...core.agent.interruption import InterruptionReason
+from ..models.task_auto_recovery import TaskAutoRecovery, TaskAutoRecoveryState
+
+
+@dataclass(frozen=True)
+class RecordedInterruption:
+    """What recording an interruption wrote to the task's recovery row.
+
+    A detached snapshot, safe to read after the recording transaction
+    commits. ``attempt`` is the automatic resume the row is scheduled for
+    (``total_resumes + 1``), or for any other state the resumes already made.
+    """
+
+    task_id: int
+    run_id: str
+    reason: str
+    state: str
+    state_detail: str | None
+    paused_state_version: int
+    next_attempt_at: datetime | None
+    attempt: int
+
+    @classmethod
+    def from_row(cls, row: TaskAutoRecovery) -> RecordedInterruption:
+        total = int(row.total_resumes or 0)
+        return cls(
+            task_id=int(row.task_id),
+            run_id=str(row.run_id),
+            reason=str(row.reason),
+            state=str(row.state),
+            state_detail=row.state_detail,
+            paused_state_version=int(row.paused_state_version),
+            next_attempt_at=row.next_attempt_at,
+            attempt=(
+                total + 1
+                if row.state == TaskAutoRecoveryState.SCHEDULED.value
+                else total
+            ),
+        )
 
 
 @dataclass

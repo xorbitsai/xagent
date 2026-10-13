@@ -308,22 +308,6 @@ class KBToolCompatibilityFacade:
                 deleted,
             )
 
-    async def refresh_agent_collection_metadata(
-        self,
-        collection_name: str,
-        *,
-        user_id: int,
-        is_admin: bool = False,
-    ) -> None:
-        from ....adapters.vibe import agent_kb_service
-
-        with self._storage_context():
-            await agent_kb_service._refresh_collection_metadata_impl(
-                collection_name=collection_name,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-
     async def ensure_agent_collection_backend_binding(
         self,
         collection: str,

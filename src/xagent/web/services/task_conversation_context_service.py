@@ -102,6 +102,7 @@ class _PendingToolStart:
     # empty string when absent (legacy rows, or a call whose start event
     # fell outside this query's window).
     turn_id: str = ""
+    invocation_id: str = ""
 
 
 @dataclass
@@ -123,6 +124,8 @@ class _ToolExchange:
     # (see AgentRunner._ensure_user_message_turn_id). An empty turn_id means
     # the exchange is omitted rather than placed by guesswork.
     turn_id: str = ""
+    step_id: str = ""
+    invocation_id: str = ""
 
 
 @dataclass
@@ -383,13 +386,22 @@ def _load_tool_exchanges(
         step_discriminator = str(trace_row.step_id or "")
 
         if trace_row.event_type == "tool_execution_start":
+            if data.get("settlement_delivery"):
+                # Settlement reopens an existing exchange; its end replaces
+                # the waiting observation below.
+                continue
             call_id = str(data.get("tool_call_id") or "") or f"recon-{row_id}"
             assistant_content = str(data.get("assistant_content") or "").strip()
             start_turn_id = str(data.get("turn_id") or "")
+            invocation_id = str(data.get("invocation_id") or "")
             start_key: tuple[str, ...] = (
-                (step_discriminator, call_id, start_turn_id)
-                if start_turn_id
-                else (step_discriminator, call_id)
+                ("invocation", invocation_id)
+                if invocation_id
+                else (
+                    (step_discriminator, call_id, start_turn_id)
+                    if start_turn_id
+                    else (step_discriminator, call_id)
+                )
             )
             pending[start_key] = _PendingToolStart(
                 assistant_content=assistant_content,
@@ -397,6 +409,7 @@ def _load_tool_exchanges(
                 tool_params=data.get("tool_params"),
                 sort_key=(row_timestamp, row_id),
                 turn_id=start_turn_id,
+                invocation_id=invocation_id,
             )
             continue
 
@@ -404,13 +417,18 @@ def _load_tool_exchanges(
         # each start is consumed by exactly one end.
         raw_call_id = str(data.get("tool_call_id") or "")
         end_turn_id = str(data.get("turn_id") or "")
+        end_invocation_id = str(data.get("invocation_id") or "")
         start = None
         call_id = raw_call_id
         if raw_call_id:
             end_key: tuple[str, ...] = (
-                (step_discriminator, raw_call_id, end_turn_id)
-                if end_turn_id
-                else (step_discriminator, raw_call_id)
+                ("invocation", end_invocation_id)
+                if end_invocation_id
+                else (
+                    (step_discriminator, raw_call_id, end_turn_id)
+                    if end_turn_id
+                    else (step_discriminator, raw_call_id)
+                )
             )
             start = pending.pop(end_key, None)
         if start is None:
@@ -419,7 +437,8 @@ def _load_tool_exchanges(
             # step id doesn't match this end's). Fall back to a synthesized
             # key so pairing always has an identity.
             call_id = raw_call_id or f"recon-{row_id}"
-            stats.tool_ends_without_start += 1
+            if not data.get("settlement_delivery"):
+                stats.tool_ends_without_start += 1
 
         tool_name = str(data.get("tool_name") or "").strip()
         if not tool_name and start is not None:
@@ -444,6 +463,31 @@ def _load_tool_exchanges(
             tool_params = {}
 
         result = _resolve_tool_result(cast(str, trace_row.event_type), data)
+
+        if data.get("settlement_delivery") and raw_call_id:
+            candidates = [
+                exchange
+                for exchange in exchanges
+                if (
+                    exchange.invocation_id == end_invocation_id
+                    if end_invocation_id
+                    else exchange.call_id == raw_call_id
+                )
+            ]
+            superseded: Optional[_ToolExchange] = None
+            if len(candidates) == 1:
+                superseded = candidates[0]
+            elif len(candidates) > 1:
+                exact = [
+                    exchange
+                    for exchange in candidates
+                    if exchange.step_id == step_discriminator
+                ]
+                if len(exact) == 1:
+                    superseded = exact[0]
+            if superseded is not None:
+                superseded.result = result
+                continue
 
         # Dedup of prose repeated across a parallel tool-call batch happens
         # below, in final sort-key order -- not here. Trace rows are iterated
@@ -474,6 +518,9 @@ def _load_tool_exchanges(
                 assistant_content=assistant_content,
                 sort_key=sort_key,
                 turn_id=turn_id,
+                step_id=step_discriminator,
+                invocation_id=end_invocation_id
+                or (start.invocation_id if start else ""),
             )
         )
 

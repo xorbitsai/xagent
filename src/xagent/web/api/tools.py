@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import case, func
+from sqlalchemy import case, func, text
 from sqlalchemy.orm import Query, Session
 
 from ...config import get_uploads_dir
@@ -52,6 +52,37 @@ def _tool_usage_query(db: Session) -> Query[Any]:
         .group_by(tool_name)
     )
     return query
+
+
+# Counts are decoration on the tool list, so they get a short budget of their own
+# rather than the database-wide statement timeout.
+_USAGE_STATS_STATEMENT_TIMEOUT_MS = 3_000
+
+
+def _load_tool_usage_counts(db: Session) -> dict[str, int]:
+    """Best-effort usage counts for the tool list; empty when they cannot be read.
+
+    The query runs in a SAVEPOINT that is always rolled back. On PostgreSQL that
+    both recovers the request transaction after a failed statement and undoes
+    the transaction-local timeout, so later reads on ``db`` are unaffected.
+    """
+    try:
+        savepoint = db.begin_nested()
+        try:
+            if db.get_bind().dialect.name == "postgresql":
+                # On the connection, not ``db.execute``: a text() statement would
+                # mark the request session as possibly written.
+                db.connection().execute(
+                    text("SELECT set_config('statement_timeout', :statement, true)"),
+                    {"statement": f"{_USAGE_STATS_STATEMENT_TIMEOUT_MS}ms"},
+                )
+            rows = _tool_usage_query(db).all()
+            return {row.tool_name: row.usage_count for row in rows}
+        finally:
+            savepoint.rollback()
+    except Exception as e:
+        logger.error("Failed to fetch tool usage stats: %s", e)
+        return {}
 
 
 def _require_user_id(current_user: User) -> int:
@@ -282,11 +313,15 @@ def _withheld_edit_image_row(
 async def get_available_tools(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    include_usage: bool = True,
 ) -> dict[str, Any]:
     """Get list of all available tools, including MCP tools.
 
     Tools are self-describing - each tool declares its own category via
     metadata.category field. No manual category mapping needed.
+
+    ``include_usage=false`` skips the usage aggregation and omits
+    ``usage_count`` for callers that only need the tool list.
     """
 
     # Create a temporary request object (simulating WebToolConfig requirements)
@@ -413,19 +448,10 @@ async def get_available_tools(
         if withheld is not None:
             tools.append(withheld)
 
-        from collections import defaultdict
-
-        usage_map: defaultdict[str, int] = defaultdict(int)
-        try:
-            usage_stats = await asyncio.to_thread(lambda: _tool_usage_query(db).all())
-            for stat in usage_stats:
-                usage_map[stat.tool_name] = stat.usage_count
-        except Exception as e:
-            logger.error(f"Failed to fetch tool usage stats: {e}")
-
-        for tool_item in tools:
-            tool_name = tool_item.get("name", "")
-            tool_item["usage_count"] = usage_map[tool_name]
+        if include_usage:
+            usage_map = await asyncio.to_thread(_load_tool_usage_counts, db)
+            for tool_item in tools:
+                tool_item["usage_count"] = usage_map.get(tool_item.get("name", ""), 0)
 
         default_configs = {
             item["tool_name"]: item for item in get_default_tool_configs()

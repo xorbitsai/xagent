@@ -220,7 +220,7 @@ function installApi() {
       return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
     if (url.endsWith("/api/skills/"))
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-    if (url.endsWith("/api/tools/available"))
+    if (url.endsWith("/api/tools/available?include_usage=false"))
       return Promise.resolve(new Response(JSON.stringify({ tools: [] }), { status: 200 }))
     if (url.endsWith("/api/models/?category=llm"))
       return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))

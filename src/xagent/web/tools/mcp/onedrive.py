@@ -1785,7 +1785,9 @@ def onedrive_move_item(
     destination that is not a folder, or a folder in another drive (such as
     one shared with the user) fails without moving anything. If OneDrive
     reports that the destination already holds an item with that name, the
-    error says so; retry with a different ``new_name``.
+    error says so; retry with a different ``new_name``. If the item is
+    locked, typically because it is open in an Office app or checked out,
+    the error says so; do not retry until the user confirms it is closed.
 
     On success the response holds ``item`` (the item after the call),
     ``destination_folder_id``, ``already_in_destination`` (true when the item
@@ -1875,6 +1877,21 @@ def onedrive_move_item(
             if exc.status_code == 404:
                 raise ValueError(
                     "The item or the destination folder no longer exists"
+                ) from None
+            # Graph answers 423 whatever its error code (production sent
+            # notAllowed) while the file is open or checked out elsewhere;
+            # repeating the call at once only meets the same lock. The code
+            # stays in the message because the tool result is what reaches
+            # the trace.
+            if exc.status_code == 423:
+                raise ValueError(
+                    "OneDrive refused the move because the item, or a file in "
+                    "it, is locked, typically because it is open in Word, "
+                    "Excel, PowerPoint or Teams (possibly by someone else) or "
+                    "checked out. Ask the user to close it or check it in; a "
+                    "lock can take a few minutes to clear after the file is "
+                    "closed. Do not retry until they confirm"
+                    + (f" (Graph error code: {exc.code})" if exc.code else "")
                 ) from None
             raise
         if not isinstance(result, dict):

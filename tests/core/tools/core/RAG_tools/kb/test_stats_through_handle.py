@@ -342,3 +342,104 @@ def test_rebuild_still_clears_the_model_of_a_kb_without_vectors(monkeypatch) -> 
     rebuilt = _rebuild_with_stored_model(monkeypatch, reported_vectors=0)
 
     assert (rebuilt.embedding_model_id, rebuilt.embedding_dimension) == (None, None)
+
+
+def test_rebuild_leaves_a_kb_the_engine_did_not_report_unchanged(monkeypatch) -> None:
+    asyncio.run(
+        get_metadata_store().save_collection(
+            CollectionInfo(
+                name=KB,
+                embedding_model_id="model-a",
+                embedding_dimension=8,
+                documents=3,
+                embeddings=9,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        KBCoordinator, "aggregate_collection_stats_sync", lambda self, **kwargs: {}
+    )
+
+    for _ in range(2):
+        asyncio.run(rebuild_collection_metadata())
+        kept = asyncio.run(get_metadata_store().get_collection(KB))
+        assert (kept.embedding_model_id, kept.embedding_dimension) == ("model-a", 8)
+        assert (kept.documents, kept.embeddings) == (3, 9)
+
+
+def test_rebuild_unbinds_an_unreported_kb_whose_stored_row_has_no_vectors(
+    monkeypatch,
+) -> None:
+    asyncio.run(
+        get_metadata_store().save_collection(
+            CollectionInfo(
+                name=KB,
+                embedding_model_id="model-a",
+                embedding_dimension=8,
+                documents=0,
+                embeddings=0,
+            )
+        )
+    )
+    monkeypatch.setattr(
+        KBCoordinator, "aggregate_collection_stats_sync", lambda self, **kwargs: {}
+    )
+
+    asyncio.run(rebuild_collection_metadata())
+
+    rebuilt = asyncio.run(get_metadata_store().get_collection(KB))
+    assert (rebuilt.embedding_model_id, rebuilt.embedding_dimension) == (None, None)
+
+
+def test_rebuild_takes_counts_and_reported_from_one_engine_read(monkeypatch) -> None:
+    _seed_document(KB, "d1", 1)
+    asyncio.run(
+        get_metadata_store().save_collection(
+            CollectionInfo(name=KB, embedding_model_id="model-a", embedding_dimension=2)
+        )
+    )
+    reads = iter(
+        [{}, {KB: {"documents": 1, "parses": 1, "chunks": 1, "embeddings": 3}}]
+    )
+    monkeypatch.setattr(
+        KBCoordinator, "aggregate_collection_stats_sync", lambda self, **kw: next(reads)
+    )
+
+    asyncio.run(rebuild_collection_metadata())
+
+    rebuilt = asyncio.run(get_metadata_store().get_collection(KB))
+    assert (rebuilt.embedding_model_id, rebuilt.embedding_dimension) == ("model-a", 2)
+    assert (rebuilt.documents, rebuilt.chunks, rebuilt.embeddings) == (1, 1, 3)
+
+
+def _validation_error() -> Exception:
+    try:
+        CollectionInfo.model_validate({})
+    except ValueError as e:
+        return e
+    raise AssertionError("expected a validation error")
+
+
+@pytest.mark.parametrize(
+    "error", [OSError("table open failed"), _validation_error()], ids=["io", "corrupt"]
+)
+def test_rebuild_leaves_a_row_it_cannot_read_untouched(monkeypatch, error) -> None:
+    row = CollectionInfo(
+        name=KB, embedding_model_id="model-a", embedding_dimension=8, embeddings=9
+    )
+    store = get_metadata_store()
+    asyncio.run(store.save_collection(row))
+
+    async def _boom(name):
+        raise error
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            KBCoordinator, "aggregate_collection_stats_sync", lambda self, **kw: {}
+        )
+        patched.setattr(store, "get_collection", _boom)
+        asyncio.run(rebuild_collection_metadata())
+
+    kept = asyncio.run(store.get_collection(KB))
+    assert (kept.embedding_model_id, kept.embedding_dimension) == ("model-a", 8)
+    assert kept.embeddings == 9

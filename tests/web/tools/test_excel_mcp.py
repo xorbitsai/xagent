@@ -78,10 +78,10 @@ def test_workbook_base_uses_drive_id_only():
     )
 
 
-def test_workbook_base_uses_site_and_drive():
+def test_workbook_base_uses_globally_addressable_drive_when_site_is_also_supplied():
     assert (
         excel._workbook_base("book.xlsx", "root", "drive-1")
-        == "/sites/root/drives/drive-1/root:/book.xlsx:/workbook"
+        == "/drives/drive-1/root:/book.xlsx:/workbook"
     )
 
 
@@ -99,13 +99,18 @@ def test_workbook_base_terminates_path_form_site_before_default_drive():
     )
 
 
-def test_workbook_base_terminates_path_form_site_before_specific_drive():
+def test_workbook_base_ignores_path_form_site_when_specific_drive_is_supplied():
     assert (
         excel._workbook_base(
             "book.xlsx", "contoso.sharepoint.com:/teams/finance", "drive-1"
         )
-        == "/sites/contoso.sharepoint.com:/teams/finance:/drives/drive-1/root:/book.xlsx:/workbook"
+        == "/drives/drive-1/root:/book.xlsx:/workbook"
     )
+
+
+def test_workbook_base_validates_site_with_specific_drive():
+    with pytest.raises(ValueError, match="must not be '.' or '..'"):
+        excel._workbook_base("book.xlsx", "..", "drive-1")
 
 
 def test_workbook_base_rejects_dot_segments():
@@ -463,6 +468,29 @@ def test_delete_columns_uses_structural_left_shift(
         f"worksheets('Sheet1')/range(address='{expected.replace(':', '%3A')}')/delete"
     )
     assert kwargs["json"] == {"shift": "Left"}
+
+
+def test_delete_columns_uses_drive_route_when_site_and_drive_are_supplied(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({}, status_code=204, content=b""))
+    monkeypatch.setattr(excel.requests, "request", mock_request)
+
+    result = json.loads(
+        excel.excel_delete_columns(
+            "Marketing.xlsx",
+            "Campaign Performance",
+            "G",
+            "G",
+            site_id="contoso.sharepoint.com,site-id,web-id",
+            drive_id="b!documents-drive",
+        )
+    )
+
+    assert result["status"] == "success"
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["url"] == (
+        f"{excel.GRAPH_BASE_URL}/drives/b%21documents-drive/root:/Marketing.xlsx:/workbook/"
+        "worksheets('Campaign%20Performance')/range(address='G%3AG')/delete"
+    )
 
 
 @pytest.mark.parametrize("label", ["$L", "L1", "Sheet1!L", "ß", "ﬀ", "ı"])

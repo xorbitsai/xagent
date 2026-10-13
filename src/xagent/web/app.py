@@ -510,6 +510,7 @@ def start_task_lease_recovery_task(
 
     if os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Skipping task lease recovery loop (test environment)")
+        app_instance.state.task_lease_recovery_task = None
         return None
 
     poll_interval_seconds = get_task_lease_recovery_interval_seconds()
@@ -576,6 +577,7 @@ def start_task_auto_resume_task(
 
     if os.getenv("PYTEST_CURRENT_TEST"):
         logger.info("Skipping auto-resume sweeper loop (test environment)")
+        app_instance.state.task_auto_resume_task = None
         return None
 
     poll_interval_seconds = get_task_auto_resume_poll_seconds()

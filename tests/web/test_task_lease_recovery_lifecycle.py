@@ -136,7 +136,8 @@ def test_task_lease_recovery_start_skips_automatic_task_under_pytest(
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "test")
 
     assert app_module.start_task_lease_recovery_task(app_module.app) is None
-    assert app_module.app.state.task_lease_recovery_task is None
+    # Independent of whether an earlier test left the attribute behind.
+    assert getattr(app_module.app.state, "task_lease_recovery_task", None) is None
 
 
 @pytest.mark.asyncio

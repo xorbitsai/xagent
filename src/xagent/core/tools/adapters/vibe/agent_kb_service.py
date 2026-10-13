@@ -21,11 +21,10 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
 
 
 class AgentKnowledgeBaseService:
-    """Shared collection setup/refresh flow for agent-triggered KB creation."""
+    """Shared collection setup flow for agent-triggered KB creation."""
 
-    def __init__(self, user_id: int, is_admin: bool = False) -> None:
+    def __init__(self, user_id: int) -> None:
         self.user_id = user_id
-        self.is_admin = is_admin
 
     async def prepare_collection(self, collection_name: str) -> str:
         """Resolve the target name. Writes nothing, so a failure leaves nothing."""
@@ -57,13 +56,6 @@ class AgentKnowledgeBaseService:
             ingestion_config=ingestion_config,
             user_id=self.user_id,
             collection_existed_before=collection_existed_before,
-        )
-
-    async def refresh_collection_metadata(self, collection_name: str) -> None:
-        await _get_tool_compatibility_facade().refresh_agent_collection_metadata(
-            collection_name,
-            user_id=self.user_id,
-            is_admin=self.is_admin,
         )
 
 
@@ -136,34 +128,4 @@ async def _publish_collection_impl(
         )
         raise AgentKnowledgeBaseError(
             f"Failed to save collection config for knowledge base '{collection_name}'"
-        ) from exc
-
-
-async def _refresh_collection_metadata_impl(
-    *,
-    collection_name: str,
-    user_id: int,
-    is_admin: bool = False,
-) -> None:
-    from ...core.RAG_tools.management.collections import list_collections
-
-    if not is_admin:
-        # Non-admin realtime refreshes do not persist metadata and only add scan cost.
-        return
-
-    try:
-        # Refresh metadata cache so agent-created KBs are visible like API-created ones.
-        await list_collections(
-            user_id=user_id,
-            is_admin=is_admin,
-            force_realtime=True,
-        )
-    except Exception as exc:
-        logger.error(
-            "Failed to refresh collection metadata after agent ingestion for %s: %s",
-            collection_name,
-            exc,
-        )
-        raise AgentKnowledgeBaseError(
-            f"Failed to refresh knowledge base metadata for '{collection_name}'"
         ) from exc

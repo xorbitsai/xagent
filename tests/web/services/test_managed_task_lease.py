@@ -13,6 +13,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 import xagent.config as config
 import xagent.web.services.interaction_rollout as ir
 import xagent.web.services.managed_task_lease as managed_task_lease
+from tests.web.services.coordinator_command_shared import owning_coordinator
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -809,6 +810,11 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
 ) -> None:
     """Omitting execution_result must not publish a clarification even when
     native-mode rollout would otherwise allow one.
+
+    The test sets up the two conditions a shared channel finalizer has in
+    production -- shared task execution frozen into the rollout policy, and
+    an owning coordinator in context -- so the zero row count below does
+    not depend on either of them being absent.
     """
 
     monkeypatch.delenv(config.INTERACTION_PROTOCOL_MODE, raising=False)
@@ -816,23 +822,34 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
     monkeypatch.setattr(ir, "_policy", None)
     monkeypatch.setenv(config.INTERACTION_PROTOCOL_MODE, "native")
     monkeypatch.setenv(config.INTERACTION_NATIVE_SOURCES, "sdk")
+    monkeypatch.setenv(config.SHARED_TASK_EXECUTION_ENABLED, "true")
     policy = ir.validate_interaction_rollout_at_startup()
     assert policy.mode == "native"
+    assert policy.shared_task_execution is True
 
     task = _create_task(db_session)
     task.source = "sdk"
     db_session.commit()
+    assert (
+        ir.evaluate_native_publication(db_session, task)
+        is ir.NativePublicationDecision.ALLOWED
+    )
     lease = acquire_task_lease(db_session, int(task.id), new_run=True)
     assert lease is not None
 
-    assert (
-        finalize_managed_task_lease_result(
-            db_session,
-            lease,
-            status=TaskStatus.WAITING_FOR_USER,
-            assistant_content="Please confirm",
+    with owning_coordinator(lease):
+        assert (
+            finalize_managed_task_lease_result(
+                db_session,
+                lease,
+                status=TaskStatus.WAITING_FOR_USER,
+                assistant_content="Please confirm",
+            )
+            is True
         )
-        is True
-    )
 
+    # Released under its owning coordinator, the task row keeps its runner
+    # for that coordinator to give up; without one it would be cleared here.
+    db_session.refresh(task)
+    assert task.runner_id == lease.runner_id
     assert db_session.query(TaskInteractionRequest).count() == 0

@@ -15,6 +15,7 @@ from defusedxml import ElementTree as DefusedElementTree
 from defusedxml.common import DefusedXmlException
 from docx import Document
 from docx.document import Document as DocumentType
+from docx.enum.text import WD_BREAK
 from docx.oxml.ns import qn
 from docx.text.run import Run
 from mcp.server.fastmcp import FastMCP
@@ -1497,7 +1498,9 @@ def word_list_paragraphs(
     next_text_offset is non-zero only when one unusually large paragraph had
     to be split. limit is normalized to 100-500 paragraphs. Pagination
     requires an output cap of at least 16,384 characters. Pass generation to
-    word_set_paragraph_text with the index."""
+    word_set_paragraph_text with the index. To insert a page break after
+    one of these paragraphs, also pass its generation to
+    word_insert_page_break(after_paragraph_index=..., expected_generation=...)."""
     try:
         _require_pagination_output_budget()
         if (
@@ -1585,11 +1588,15 @@ def word_append_paragraph(
     style: str | None = None,
     site_id: str | None = None,
     drive_id: str | None = None,
+    page_break_before: bool = False,
 ) -> str:
     """Append a new paragraph to the end of a Word document. style, if
     given, is a built-in Word style name (e.g. "List Bullet", "Quote");
     invalid names raise an error rather than silently falling back to
-    Normal.
+    Normal. If page_break_before is true, the paragraph starts on a new
+    page. Use page_break_before when adding the content that should start
+    on the new page; do not combine it with word_insert_page_break, which
+    would create an extra blank page.
 
     If the response has code="resource_locked", do not retry immediately:
     close the document in Word or Teams and retry later. This connector edits
@@ -1604,7 +1611,9 @@ def word_append_paragraph(
         _validate_mutation_text(text, field_name="text")
         _ensure_can_add_body_paragraph(document)
         _ensure_projected_text_budget(document, len(text))
-        document.add_paragraph(text, style=style)
+        paragraph = document.add_paragraph(text, style=style)
+        if page_break_before:
+            paragraph.paragraph_format.page_break_before = True
         item = _upload_document(document, file_path, snapshot)
         return _success_with_item(item)
     except Exception as e:
@@ -1619,9 +1628,13 @@ def word_add_heading(
     level: int = 1,
     site_id: str | None = None,
     drive_id: str | None = None,
+    page_break_before: bool = False,
 ) -> str:
     """Append a heading to the end of a Word document. level is 0 (the
-    document title style) through 9.
+    document title style) through 9. If page_break_before is true, the
+    heading starts on a new page. Use page_break_before when adding the
+    heading that should start on the new page; do not combine it with
+    word_insert_page_break, which would create an extra blank page.
 
     If the response has code="resource_locked", do not retry immediately:
     close the document in Word or Teams and retry later. This connector edits
@@ -1638,12 +1651,72 @@ def word_add_heading(
         _validate_mutation_text(text, field_name="text")
         _ensure_can_add_body_paragraph(document)
         _ensure_projected_text_budget(document, len(text))
-        document.add_heading(text, level=level)
+        paragraph = document.add_heading(text, level=level)
+        if page_break_before:
+            paragraph.paragraph_format.page_break_before = True
         item = _upload_document(document, file_path, snapshot)
         return _success_with_item(item)
     except Exception as e:
         logger.error("Error adding heading to Word document %s: %s", file_path, e)
         return _error(e)
+
+
+@mcp.tool()
+def word_insert_page_break(
+    file_path: str,
+    after_paragraph_index: int | None = None,
+    site_id: str | None = None,
+    drive_id: str | None = None,
+    expected_generation: str | None = None,
+) -> str:
+    """Insert a real page break in a Word document.
+
+    With no paragraph index, a break paragraph is appended to the document.
+    When after_paragraph_index is supplied, the break is added after that
+    top-level body paragraph. The index must come from word_list_paragraphs
+    and therefore requires its expected_generation value. Use this tool when
+    inserting a break before a later edit; when adding the new paragraph or
+    heading in the same operation, prefer page_break_before=True on that
+    tool instead. Do not combine both, or Word will render a blank page.
+    """
+    try:
+        _require_tool_output_budget()
+        if after_paragraph_index is not None and not expected_generation:
+            raise ValueError(
+                "expected_generation from word_list_paragraphs is required "
+                "when after_paragraph_index is supplied"
+            )
+        document, snapshot, _generation = _download_document(
+            file_path,
+            site_id,
+            drive_id,
+            expected_generation=expected_generation,
+        )
+        assert snapshot is not None
+        paragraphs = document.paragraphs
+        if after_paragraph_index is None:
+            _ensure_can_add_body_paragraph(document)
+            paragraph = document.add_paragraph()
+            page_break_paragraph_index = len(paragraphs)
+        else:
+            if not 0 <= after_paragraph_index < len(paragraphs):
+                raise ValueError(
+                    f"after_paragraph_index {after_paragraph_index} is out of "
+                    f"range for a document with {len(paragraphs)} paragraphs"
+                )
+            _ensure_can_add_body_paragraph(document)
+            paragraph = document.add_paragraph()
+            paragraphs[after_paragraph_index]._p.addnext(paragraph._p)
+            page_break_paragraph_index = after_paragraph_index + 1
+        paragraph.add_run().add_break(WD_BREAK.PAGE)
+        item = _upload_document(document, file_path, snapshot)
+        return _success_with_item(
+            item,
+            page_break_paragraph_index=page_break_paragraph_index,
+        )
+    except Exception as e:
+        logger.error("Error inserting page break in Word document %s: %s", file_path, e)
+        return _error(str(e))
 
 
 @mcp.tool()

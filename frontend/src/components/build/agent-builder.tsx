@@ -866,7 +866,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         const [kbRes, skillsRes, toolsRes, modelsRes, userDefaultsRes, mcpRes] = await Promise.all([
           apiRequest(`${getApiUrl()}/api/kb/collections`),
           apiRequest(`${getApiUrl()}/api/skills/`),
-          apiRequest(`${getApiUrl()}/api/tools/available`),
+          apiRequest(`${getApiUrl()}/api/tools/available?include_usage=false`),
           apiRequest(`${getApiUrl()}/api/models/?category=llm`),
           apiRequest(`${getApiUrl()}/api/models/user-default`),
           apiRequest(`${getApiUrl()}/api/mcp/servers`)

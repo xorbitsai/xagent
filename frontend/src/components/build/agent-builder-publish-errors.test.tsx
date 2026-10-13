@@ -274,7 +274,7 @@ function installBaseApiMocks(overrides: ApiOverride) {
     if (url.endsWith("/api/kb/collections"))
       return Promise.resolve(jsonResponse({ collections: [] }))
     if (url.endsWith("/api/skills/")) return Promise.resolve(jsonResponse([]))
-    if (url.endsWith("/api/tools/available"))
+    if (url.endsWith("/api/tools/available?include_usage=false"))
       return Promise.resolve(jsonResponse({ tools: [] }))
     if (url.endsWith("/api/models/?category=llm"))
       return Promise.resolve(jsonResponse([]))

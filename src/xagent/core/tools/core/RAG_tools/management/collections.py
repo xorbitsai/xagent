@@ -768,8 +768,6 @@ async def _list_collections_impl(
         metadata_collections: List[CollectionInfo] = []
         metadata_collection_names: Set[str] = set()
         metadata_collections_by_name: Dict[str, CollectionInfo] = {}
-        metadata_stats_by_name: Dict[str, Dict[str, int]] = {}
-        metadata_processed_documents_by_name: Dict[str, int] = {}
         try:
             metadata_collections = list(
                 await metadata_store.list_collections(
@@ -787,21 +785,6 @@ async def _list_collections_impl(
                 for collection in metadata_collections
                 if collection.name
             }
-            metadata_stats_by_name = {
-                collection.name: {
-                    "documents": collection.documents,
-                    "parses": collection.parses,
-                    "chunks": collection.chunks,
-                    "embeddings": collection.embeddings,
-                }
-                for collection in metadata_collections
-                if collection.name
-            }
-            metadata_processed_documents_by_name = {
-                collection.name: collection.processed_documents
-                for collection in metadata_collections
-                if collection.name
-            }
         except Exception as exc:
             logger.warning("Could not load persisted collection metadata: %s", exc)
 
@@ -816,22 +799,8 @@ async def _list_collections_impl(
 
         collection_keys = sorted(document_names.keys() | metadata_collection_names)
 
-        # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
+        # Step 2: Stats are always read from the engine; persisted counters can drift.
         stats: Dict[str, Dict[str, int]] = {}
-        if not force_realtime and is_admin:
-            try:
-                for info in metadata_collections:
-                    if info.name in collection_keys or is_admin:
-                        stats[info.name] = {
-                            "documents": info.documents,
-                            "parses": info.parses,
-                            "chunks": info.chunks,
-                            "embeddings": info.embeddings,
-                        }
-            except Exception as exc:
-                logger.debug(
-                    "Metadata cache unavailable, falling back to realtime: %s", exc
-                )
 
         def _build_collection_info(
             collection_name: str,
@@ -902,66 +871,18 @@ async def _list_collections_impl(
                 collection_kwargs["last_accessed_at"] = timestamp_now
             return CollectionInfo(**collection_kwargs)
 
-        # Fallback to realtime aggregation for missing collections or cache failure
-        used_realtime = False
-        realtime_timestamp: Optional[datetime] = None
-        if (
-            force_realtime
-            or not stats
-            or any(key not in stats for key in collection_keys)
-        ):
-            used_realtime = True
-            realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
-            realtime_stats = await asyncio.to_thread(
-                _resolve_coordinator(coordinator).aggregate_collection_stats_sync,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-            for key in collection_keys:
-                if key not in stats:
-                    if key in realtime_stats:
-                        stats[key] = realtime_stats[key]
-                    elif is_admin and key in metadata_stats_by_name:
-                        stats[key] = metadata_stats_by_name[key]
-                    else:
-                        stats[key] = {
-                            "documents": 0,
-                            "parses": 0,
-                            "chunks": 0,
-                            "embeddings": 0,
-                        }
-
-        # Async write stats back to metadata cache for next request
-        if used_realtime and is_admin:
-            try:
-                metadata_store = get_metadata_store()
-                refreshed_infos: Dict[str, CollectionInfo] = {}
-                for collection in collection_keys:
-                    existing_metadata_info = metadata_collections_by_name.get(
-                        collection
-                    )
-                    info = _build_collection_info(
-                        collection,
-                        metadata_info=existing_metadata_info,
-                        ingestion_config=(
-                            existing_metadata_info.ingestion_config
-                            if existing_metadata_info
-                            else None
-                        ),
-                        processed_documents=stats[collection]["parses"],
-                        timestamp_now=realtime_timestamp,
-                    )
-                    refreshed_infos[collection] = info
-                await metadata_store.save_collections(list(refreshed_infos.values()))
-                metadata_collections_by_name.update(refreshed_infos)
-                for collection in refreshed_infos:
-                    metadata_collection_names.add(collection)
-            except Exception as exc:
-                logger.debug("Failed to cache collection metadata: %s", exc)
-        collection_keys = sorted(
-            stats.keys() | document_names.keys() | metadata_collection_names
+        realtime_timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+        realtime_stats = await asyncio.to_thread(
+            _resolve_coordinator(coordinator).aggregate_collection_stats_sync,
+            user_id=user_id,
+            is_admin=is_admin,
         )
-
+        for key in collection_keys:
+            engine = realtime_stats.get(key) or {}
+            stats[key] = {
+                name: engine.get(name, 0)
+                for name in ("documents", "parses", "chunks", "embeddings")
+            }
         # Load configs for collections (admin sees cross-tenant configs)
         collection_configs: Dict[str, IngestionConfig] = {}
         try:
@@ -971,19 +892,6 @@ async def _list_collections_impl(
         except Exception as e:
             logger.warning("Could not load collection configs: %s", e)
 
-        # Ensure all collections have complete stats
-        for collection in collection_keys:
-            if collection not in stats:
-                stats[collection] = {
-                    "documents": 0,
-                    "parses": 0,
-                    "chunks": 0,
-                    "embeddings": 0,
-                }
-            for key in ["documents", "parses", "chunks", "embeddings"]:
-                if key not in stats[collection]:
-                    stats[collection][key] = 0
-
         collections = []
         for collection in collection_keys:
             metadata_info = metadata_collections_by_name.get(collection)
@@ -992,16 +900,8 @@ async def _list_collections_impl(
                     collection,
                     metadata_info=metadata_info,
                     ingestion_config=collection_configs.get(collection),
-                    processed_documents=(
-                        stats[collection]["parses"]
-                        if stats[collection]["parses"] > 0
-                        else (
-                            metadata_processed_documents_by_name.get(collection, 0)
-                            if is_admin
-                            else 0
-                        )
-                    ),
-                    timestamp_now=realtime_timestamp if used_realtime else None,
+                    processed_documents=stats[collection]["parses"],
+                    timestamp_now=None if is_admin else realtime_timestamp,
                 )
             )
 

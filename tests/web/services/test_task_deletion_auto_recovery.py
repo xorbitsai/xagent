@@ -77,3 +77,69 @@ def test_user_purge_removes_recovery_rows(engine, fk_enforced):
         db.commit()
         assert _counts(db, first) == (0, 0)
         assert _counts(db, second) == (0, 0)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        ("scheduled", "failed"),
+        ("dispatched", "failed"),
+        # A user pause or a wait for the user leaves the run RUNNING as well
+        # (#2177); deleting the task is the last chance to settle it.
+        ("manual", "failed"),
+        (None, "failed"),
+    ],
+)
+def test_deleting_a_task_fails_its_unsettled_trigger_run(engine, state, expected):
+    from xagent.web.models.agent import Agent
+    from xagent.web.models.trigger import (
+        AgentTrigger,
+        TriggerRun,
+        TriggerRunStatus,
+        TriggerType,
+    )
+    from xagent.web.services.task_deletion import (
+        TASK_DELETED_TRIGGER_ERROR,
+    )
+
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        _user_id, first, _second = _seed(
+            db, username=f"trigger-owner-{state or 'none'}"
+        )
+        task = db.get(Task, first)
+        if state is None:
+            db.delete(db.get(TaskAutoRecovery, first))
+        else:
+            db.get(TaskAutoRecovery, first).state = state
+        agent = Agent(user_id=task.user_id, name="tick agent")
+        db.add(agent)
+        db.flush()
+        trigger = AgentTrigger(
+            user_id=task.user_id,
+            agent_id=agent.id,
+            type=TriggerType.SCHEDULED.value,
+            name="tick",
+            config={},
+        )
+        db.add(trigger)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger.id,
+            task_id=first,
+            status=TriggerRunStatus.RUNNING.value,
+            idempotency_key=f"tick-{first}",
+        )
+        db.add(run)
+        db.commit()
+        run_id = int(run.id)
+
+        assert purge_task_rows(db, task_id=first, detached_reason="task_deleted")
+        db.commit()
+
+        db.expire_all()
+        run = db.get(TriggerRun, run_id)
+        assert run.status == expected
+        if expected == "failed":
+            assert run.error_message == TASK_DELETED_TRIGGER_ERROR
+            assert run.finished_at is not None

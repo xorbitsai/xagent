@@ -3538,7 +3538,10 @@ async def resume_task(
         # retry is checked again.
         auto_resume = message_data.get("auto_resume")
         if auto_resume is not None:
-            from .task_auto_resume import check_auto_resume_claim_sync
+            from .task_auto_resume import (
+                check_auto_resume_claim_sync,
+                publish_recovery_notices,
+            )
 
             claim = await run_db_io_cancellation_safe(
                 lambda: check_auto_resume_claim_sync(
@@ -3553,6 +3556,7 @@ async def resume_task(
                 )
             )
             if not claim.proceed:
+                await publish_recovery_notices(claim.notices)
                 return ResumeCommandResult(
                     ResumeCommandOutcome.AUTO_SKIPPED,
                     f"Automatic resume skipped ({claim.why})",
@@ -3606,6 +3610,27 @@ async def resume_task(
                 or receipt_interaction_id != active_interaction_id
                 or not receipt_responder_identity
             ):
+                if auto_resume is not None:
+                    # The sweeper cannot answer the question; the run waits
+                    # for its user. Not an error to anyone. Housekeeping then
+                    # sees the unchanged fence and reschedules it, so a run
+                    # that keeps waiting is eventually stopped as
+                    # ``exhausted`` rather than as waiting on its user.
+                    # Unreachable until a task records
+                    # ``interaction_protocol_version``; the change that makes
+                    # it reachable should stop the row here instead
+                    # (``manual``, ``interaction_pending``).
+                    logger.info(
+                        "auto resume skipped task_id=%s run_id=%s "
+                        "why=interaction_pending component=auto-resume",
+                        task_id,
+                        task_fields.run_id,
+                    )
+                    return ResumeCommandResult(
+                        ResumeCommandOutcome.AUTO_SKIPPED,
+                        "Automatic resume skipped (interaction_pending)",
+                        reason_code="interaction_pending",
+                    )
                 from . import ops_signals
 
                 ops_signals.register_degradation(

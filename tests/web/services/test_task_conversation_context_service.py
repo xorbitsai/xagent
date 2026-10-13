@@ -2421,3 +2421,153 @@ def test_same_prose_separated_by_a_prose_less_exchange_is_kept():
         assert assistant_contents == [repeated_prose, "", repeated_prose]
     finally:
         db_session.close()
+
+
+def test_settlement_supersedes_exact_invocation_when_step_and_call_id_repeat():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="run both calls",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        for offset, tool_name, invocation_id, result in (
+            (0, "search", "invocation-a", {"value": "earlier"}),
+            (2, "publish_post", "invocation-b", {"status": "waiting_for_user"}),
+        ):
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_start",
+                timestamp=_ts(offset),
+                step_id="react_same",
+                turn_id="turn-1",
+                data={
+                    "tool_name": tool_name,
+                    "tool_call_id": "tool_call_0",
+                    "invocation_id": invocation_id,
+                },
+            )
+            _add_trace_event(
+                db_session,
+                task,
+                event_type="tool_execution_end",
+                timestamp=_ts(offset + 1),
+                step_id="react_same",
+                turn_id="turn-1",
+                data={
+                    "tool_name": tool_name,
+                    "tool_call_id": "tool_call_0",
+                    "invocation_id": invocation_id,
+                    "result": result,
+                },
+            )
+        for event_type, offset, extra in (
+            ("tool_execution_start", 4, {}),
+            ("tool_execution_end", 5, {"result": {"value": "settled"}}),
+        ):
+            _add_trace_event(
+                db_session,
+                task,
+                event_type=event_type,
+                timestamp=_ts(offset),
+                step_id="react_same",
+                turn_id="turn-2",
+                data={
+                    "tool_name": "publish_post",
+                    "tool_call_id": "tool_call_0",
+                    "invocation_id": "invocation-b",
+                    "settlement_delivery": True,
+                    **extra,
+                },
+            )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        results = {
+            message["tool_name"]: message["raw_result"]
+            for message in messages
+            if message["role"] == "tool"
+        }
+        assert results == {
+            "search": {"value": "earlier"},
+            "publish_post": {"value": "settled"},
+        }
+    finally:
+        db_session.close()
+
+
+def test_legacy_settlement_supersedes_unambiguous_provider_call():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        _add_chat_message(
+            db_session,
+            task,
+            role="user",
+            content="publish",
+            created_at=_ts(-1),
+            turn_id="turn-1",
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(0),
+            step_id="react-a",
+            turn_id="turn-1",
+            data={"tool_name": "publish_post", "tool_call_id": "legacy-call"},
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(1),
+            step_id="react-a",
+            turn_id="turn-1",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "legacy-call",
+                "result": {"status": "waiting_for_user"},
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_start",
+            timestamp=_ts(2),
+            step_id="react-b",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "legacy-call",
+                "settlement_delivery": True,
+            },
+        )
+        _add_trace_event(
+            db_session,
+            task,
+            event_type="tool_execution_end",
+            timestamp=_ts(3),
+            step_id="react-b",
+            turn_id="turn-2",
+            data={
+                "tool_name": "publish_post",
+                "tool_call_id": "legacy-call",
+                "settlement_delivery": True,
+                "result": {"value": "settled"},
+            },
+        )
+
+        messages = load_task_conversation_context_sync(db_session, int(task.id))
+        results = [
+            message["raw_result"]
+            for message in messages
+            if message["role"] == "tool" and message["tool_name"] == "publish_post"
+        ]
+        assert results == [{"value": "settled"}]
+    finally:
+        db_session.close()

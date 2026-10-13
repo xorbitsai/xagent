@@ -217,6 +217,8 @@ function StateProbe() {
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
       <div data-testid="task-outcome">{state.currentTask?.completionOutcome || ""}</div>
       <div data-testid="task-auto-recovery">{JSON.stringify(state.currentTask?.autoRecovery ?? null)}</div>
+      <div data-testid="task-auto-resume">{JSON.stringify(state.currentTask?.autoResume ?? null)}</div>
+      <div data-testid="task-state-version">{state.currentTask?.stateVersion ?? ""}</div>
       <div data-testid="waiting-request-id">{state.currentTask?.waitingRequestId || ""}</div>
       <div data-testid="waiting-interactions">{JSON.stringify(state.currentTask?.waitingInteractions || [])}</div>
       <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
@@ -513,6 +515,28 @@ function SeedExistingTask() {
       },
     })
   }, [dispatch])
+
+  return null
+}
+
+function SeedTaskWith({ fields }: { fields: Record<string, unknown> }) {
+  const { dispatch } = useApp()
+
+  React.useEffect(() => {
+    dispatch({ type: "SET_TASK_ID", payload: 1 })
+    dispatch({
+      type: "SET_CURRENT_TASK",
+      payload: {
+        id: "1",
+        title: "Test task",
+        status: "running",
+        description: "Test task",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:00:00Z",
+        ...fields,
+      } as never,
+    })
+  }, [dispatch, fields])
 
   return null
 }
@@ -2884,6 +2908,214 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
+  })
+
+  it.each([
+    [
+      "a finished task with no known version",
+      { status: "completed" },
+      { stateVersion: 4, view: { status: "resuming" } },
+      "completed",
+      null,
+    ],
+    [
+      "an older notice for a task seeded at v6 (no versioned event seen)",
+      { status: "paused", stateVersion: 6, runId: "run-1", controlState: "paused" },
+      { stateVersion: 5, view: { status: "stopped", stop_reason: "expired" } },
+      "paused",
+      null,
+    ],
+    [
+      "a same-fence notice while the task runs",
+      { status: "running", stateVersion: 4, runId: "run-1", controlState: "running" },
+      { stateVersion: 4, view: { status: "scheduled" } },
+      "running",
+      null,
+    ],
+    [
+      "a paused task with no known version",
+      { status: "paused", runId: "run-1" },
+      { stateVersion: 4, view: { status: "scheduled" } },
+      "paused",
+      "scheduled",
+    ],
+  ])("orders task_recovery_update against what it knows: %s", async (
+    _label,
+    fields,
+    notice,
+    expectedStatus,
+    expectedAutoResume,
+  ) => {
+    render(
+      <AppProvider token="token">
+        <SeedTaskWith fields={fields} />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe(fields.status)
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: notice.stateVersion,
+        data: {
+          auto_resume: { stop_reason: null, reason: "lease_expired", attempt: 1, next_attempt_at: null, ...notice.view },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+
+    expect(screen.getByTestId("task-status").textContent).toBe(expectedStatus)
+    const autoResume = JSON.parse(screen.getByTestId("task-auto-resume").textContent || "null")
+    expect(autoResume?.status ?? null).toBe(expectedAutoResume)
+  })
+
+  it("tracks task_recovery_update at its fence and drops it once the task moves on", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    const autoResume = () => JSON.parse(screen.getByTestId("task-auto-resume").textContent || "null")
+    const autoRecovery = () => JSON.parse(screen.getByTestId("task-auto-recovery").textContent || "null")
+    const update = (
+      stateVersion: number,
+      view: Record<string, unknown>,
+      runId = "run-1",
+    ) => act(() => {
+      // The shape useWebSocket hands over: body in ``data``, envelope at
+      // the root.
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: runId,
+        state_version: stateVersion,
+        data: {
+          type: "task_recovery_update",
+          task_id: 1,
+          run_id: runId,
+          state_version: stateVersion,
+          auto_resume: { stop_reason: null, reason: "lease_expired", attempt: 1, next_attempt_at: null, ...view },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        status: "paused",
+        run_id: "run-1",
+        state_version: 4,
+        control_state: "paused",
+        interruption_reason: "llm_unavailable",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    })
+
+    update(4, { status: "scheduled", next_attempt_at: "2026-05-27T05:00:15+00:00" })
+    expect(autoResume()).toEqual({
+      status: "scheduled",
+      nextAttemptAt: "2026-05-27T05:00:15+00:00",
+      runId: "run-1",
+      stateVersion: 4,
+    })
+    // A notice for an older fence, or another run at this one, is stale.
+    update(3, { status: "stopped", stop_reason: "expired" })
+    update(4, { status: "stopped", stop_reason: "expired" }, "run-0")
+    expect(autoResume()).toMatchObject({ status: "scheduled" })
+
+    update(4, { status: "resuming" })
+    expect(autoResume()).toMatchObject({ status: "resuming" })
+    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+
+    act(() => {
+      onMessage?.({
+        type: "task_resumed",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        status: "running",
+        run_id: "run-1",
+        state_version: 5,
+        control_state: "running",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+    expect(autoResume()).toBeNull()
+    // The "resuming" notice for the old fence arriving late changes nothing.
+    update(4, { status: "resuming" })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(autoResume()).toBeNull()
+
+    // Lease-expiry recovery announces only this: the task rests paused at
+    // the newer fence.
+    update(7, { status: "scheduled" })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    })
+    expect(screen.getByTestId("task-state-version").textContent).toBe("7")
+    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 7 })
+
+    update(7, { status: "stopped", stop_reason: "limit_reached" })
+    expect(autoResume()).toMatchObject({ status: "stopped", stopReason: "limit_reached" })
+
+    // A new pause at a later fence starts without a notice.
+    act(() => {
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 1,
+        status: "paused",
+        run_id: "run-1",
+        state_version: 9,
+        control_state: "paused",
+        interruption_reason: "user_pause",
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-state-version").textContent).toBe("9")
+    })
+    expect(autoResume()).toBeNull()
+  })
+
+  it("ignores a malformed task_recovery_update", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: { status: "unknown" },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(screen.getByTestId("task-auto-resume").textContent).toBe("null")
   })
 
   it("keeps a task_paused event's interruption reason until the task leaves paused", async () => {

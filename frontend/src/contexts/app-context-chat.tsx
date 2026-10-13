@@ -103,6 +103,7 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "ADD_STEP",
   "UPDATE_STEP",
   "UPDATE_TASK_STATUS",
+  "APPLY_AUTO_RESUME_NOTICE",
   "SET_CURRENT_TASK",
   "SET_PROCESSING",
   "SET_HISTORY_LOADING",
@@ -702,11 +703,69 @@ const normalizeAutoRecovery = (value: unknown): TaskAutoRecovery | undefined =>
     ? { reason: value.reason }
     : undefined
 
+// Automatic resume of a paused task, from the latest ``task_recovery_update``
+// event: scheduled, under way, or stopped (``stopReason`` says why). It is
+// tied to the fence it was announced at and kept only while the task rests
+// there.
+export interface TaskAutoResume {
+  status: "scheduled" | "resuming" | "stopped"
+  stopReason?: string
+  nextAttemptAt?: string
+  runId: string
+  stateVersion: number
+}
+
+const AUTO_RESUME_STATUSES = new Set(["scheduled", "resuming", "stopped"])
+
+// ``task_recovery_update`` -> the task it is for and its notice, or nothing
+// for a malformed event.
+export const parseAutoResumeNotice = (
+  message: unknown,
+): { taskId: number; reason?: string; notice: TaskAutoResume } | undefined => {
+  const root = asMessageRecord(message)
+  // useWebSocket moves an unrecognised event's body into ``data`` and keeps
+  // the control envelope (task_id, run_id, state_version) at the root.
+  const view = asMessageRecord(root.auto_resume ?? asMessageRecord(root.data).auto_resume)
+  const taskId = parseInteger(root.task_id)
+  const stateVersion = parseInteger(root.state_version)
+  const status = view.status
+  if (
+    taskId === undefined
+    || stateVersion === undefined
+    || typeof root.run_id !== "string"
+    || typeof status !== "string"
+    || !AUTO_RESUME_STATUSES.has(status)
+  ) return undefined
+  return {
+    taskId,
+    reason: typeof view.reason === "string" && view.reason ? view.reason : undefined,
+    notice: {
+      status: status as TaskAutoResume["status"],
+      stopReason: typeof view.stop_reason === "string" ? view.stop_reason : undefined,
+      nextAttemptAt: typeof view.next_attempt_at === "string" ? view.next_attempt_at : undefined,
+      runId: root.run_id,
+      stateVersion,
+    },
+  }
+}
+
+// An automatic-resume notice only describes the fence it was announced at.
+const autoResumeAtFence = (task: Task): TaskAutoResume | undefined =>
+  task.status === "paused"
+  && task.autoResume?.stateVersion === task.stateVersion
+  && task.autoResume?.runId === task.runId
+    ? task.autoResume
+    : undefined
+
 // A task's interruption only describes it while it rests paused.
-const clearStaleAutoRecovery = (task: Task | null): Task | null =>
-  task && task.status !== "paused" && task.autoRecovery !== undefined
-    ? { ...task, autoRecovery: undefined }
-    : task
+const clearStaleAutoRecovery = (task: Task | null): Task | null => {
+  if (!task) return task
+  const autoRecovery = task.status === "paused" ? task.autoRecovery : undefined
+  const autoResume = autoResumeAtFence(task)
+  return autoRecovery === task.autoRecovery && autoResume === task.autoResume
+    ? task
+    : { ...task, autoRecovery, autoResume }
+}
 
 export interface Task {
   id: string
@@ -739,6 +798,7 @@ export interface Task {
   stateVersion?: number
   controlState?: TaskControlState
   autoRecovery?: TaskAutoRecovery
+  autoResume?: TaskAutoResume
   // Frontend-only, distinct from updatedAt: stamped once by UPDATE_TASK_STATUS
   // when this run actually terminates (completed/failed), cleared when it
   // starts running again, and deliberately preserved across SET_CURRENT_TASK
@@ -1291,6 +1351,7 @@ type AppAction =
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; completionOutcome?: TaskCompletionOutcome; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; autoRecovery?: TaskAutoRecovery; updatedAt?: string } }
+  | { type: "APPLY_AUTO_RESUME_NOTICE"; payload: { taskId: number; reason?: string; notice: TaskAutoResume; knownVersion?: number } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -1790,8 +1851,54 @@ function projectAppState(state: AppState, action: AppAction): AppState {
           autoRecovery: nextStatus === "paused"
             ? action.payload.autoRecovery ?? state.currentTask.autoRecovery
             : undefined,
+          // Kept only while the task rests at the fence it was announced at.
+          autoResume: autoResumeAtFence({
+            ...state.currentTask,
+            status: nextStatus,
+            runId: action.payload.runId ?? state.currentTask.runId,
+            stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
+          }),
         },
       }
+    }
+
+    case "APPLY_AUTO_RESUME_NOTICE": {
+      const { taskId, reason, notice, knownVersion } = action.payload
+      const task = state.currentTask
+      if (!task || task.id !== String(taskId)) return state
+      // The task's own version, else the last one a versioned event set.
+      const known = task.stateVersion ?? knownVersion
+      if (known === undefined) {
+        // Nothing to order it against: only annotate a pause already shown,
+        // never move a running or finished task.
+        if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
+          return state
+        }
+        return { ...state, currentTask: { ...task, autoResume: notice } }
+      }
+      if (notice.stateVersion < known) return state
+      if (notice.stateVersion === known) {
+        // Same fence: annotate the pause the client already shows.
+        if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
+          return state
+        }
+        return { ...state, currentTask: { ...task, autoResume: notice } }
+      }
+      // A newer fence: the server rests the task paused there (a lease-expiry
+      // pause announces nothing else), so apply that pause first.
+      const paused = projectAppState(state, {
+        type: "UPDATE_TASK_STATUS",
+        payload: {
+          status: "paused",
+          runId: notice.runId,
+          stateVersion: notice.stateVersion,
+          controlState: "paused",
+          autoRecovery: reason ? { reason } : undefined,
+        },
+      })
+      return paused.currentTask
+        ? { ...paused, isProcessing: false, currentTask: { ...paused.currentTask, autoResume: notice } }
+        : paused
     }
 
     case "SET_DAG_EXECUTION":
@@ -6108,6 +6215,27 @@ export function AppProvider({
           },
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
+        break
+      }
+
+      case "task_recovery_update": {
+        const parsed = parseAutoResumeNotice(message)
+        if (!parsed) break
+        // Read before the check below records this notice's version.
+        const knownVersion = taskStateVersionsRef.current.get(parsed.taskId)?.version
+        // Not a versioned control event, but it names the fence it was
+        // announced at: an older one is stale.
+        if (!acceptTaskControlVersion(
+          message,
+          {
+            isStateEvent: true,
+            taskId: parsed.taskId,
+            runId: parsed.notice.runId,
+            stateVersion: parsed.notice.stateVersion,
+          },
+          taskStateVersionsRef.current,
+        )) break
+        dispatch({ type: "APPLY_AUTO_RESUME_NOTICE", payload: { ...parsed, knownVersion } })
         break
       }
 

@@ -25,6 +25,7 @@ from xagent.web.models.database import (
     init_db,
 )
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_auto_recovery import TaskAutoRecovery
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.trigger import (
     AgentTrigger,
@@ -234,9 +235,11 @@ def _attach_workforce_and_trigger(db, *, task: Task, user: User) -> tuple:
     return workforce_run, trigger_run
 
 
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
 def test_expired_lease_with_checkpoint_pauses_all_lifecycle_projections(
-    db_session,
+    db_session, monkeypatch: pytest.MonkeyPatch, auto_resume: str
 ) -> None:
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", auto_resume)
     user = _create_user(db_session, suffix="checkpoint")
     task = _create_expired_task(
         db_session,
@@ -264,9 +267,18 @@ def test_expired_lease_with_checkpoint_pauses_all_lifecycle_projections(
     assert task.error_message is None
     assert workforce_run.status == "paused"
     assert workforce_run.completed_at is None
-    assert trigger_run.status == TriggerRunStatus.FAILED.value
-    assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
-    assert trigger_run.finished_at is not None
+    if auto_resume == "true":
+        # Automatic resume is scheduled: the resumed run settles the
+        # TriggerRun.
+        assert trigger_run.status == TriggerRunStatus.RUNNING.value
+        assert trigger_run.error_message is None
+        assert trigger_run.finished_at is None
+        recovery = db_session.get(TaskAutoRecovery, task.id)
+        assert (recovery.state, recovery.reason) == ("scheduled", "lease_expired")
+    else:
+        assert trigger_run.status == TriggerRunStatus.FAILED.value
+        assert trigger_run.error_message == TASK_LEASE_PAUSED_TRIGGER_ERROR
+        assert trigger_run.finished_at is not None
 
 
 def test_expired_lease_without_checkpoint_fails_and_clears_stale_output(

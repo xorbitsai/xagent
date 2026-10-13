@@ -10,7 +10,7 @@ The blocking calls live at two layers, and each is asserted where it belongs:
 * The vector-store scans (``iter_batches`` behind ``_scan_document_rows``, and
   ``aggregate_collection_stats`` behind the coordinator's batched stats entry)
   are plain sync methods, so ``_list_collections_impl`` dispatches them itself.
-* The metadata-store calls (``list_collections``, ``save_collections``,
+* The metadata-store calls (``list_collections``,
   ``get_collection_config``) are ``async def`` on the ``MetadataStore`` ABC, so
   the caller *cannot* wrap them: ``asyncio.to_thread`` on a coroutine function
   hands the worker thread a coroutine object and never runs it. Their dispatch
@@ -109,9 +109,6 @@ class _EmptyMetadataStore:
 
     async def list_collections(self, *, user_id, is_admin):
         return []
-
-    async def save_collections(self, infos):
-        return None
 
     async def get_collection_config(self, collection, user_id, is_admin=False):
         return None
@@ -263,17 +260,6 @@ async def test_metadata_store_list_collections_runs_off_the_event_loop():
         await store.list_collections(user_id=None, is_admin=True)
 
     heartbeat.assert_yielded_the_loop("list_collections")
-
-
-@pytest.mark.asyncio
-async def test_metadata_store_save_collections_runs_off_the_event_loop():
-    from xagent.core.tools.core.RAG_tools.storage.contracts import CollectionInfo
-
-    async with _Heartbeat() as heartbeat:
-        store = _store_with(_FakeConnection(heartbeat, "save_collections"))
-        await store.save_collections([CollectionInfo(name="kb1")])
-
-    heartbeat.assert_yielded_the_loop("save_collections")
 
 
 @pytest.mark.asyncio

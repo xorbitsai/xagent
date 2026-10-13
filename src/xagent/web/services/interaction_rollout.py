@@ -56,8 +56,10 @@ from typing import TYPE_CHECKING, Literal, cast
 from ...config import (
     INTERACTION_NATIVE_SOURCES,
     INTERACTION_PROTOCOL_MODE,
+    SHARED_TASK_EXECUTION_ENABLED,
     get_interaction_native_sources,
     get_interaction_protocol_mode,
+    get_shared_task_execution_enabled,
 )
 from ..models.task_interaction import (
     INTERACTION_ORIGIN_VOCABULARY,
@@ -154,6 +156,7 @@ def gating_key(task: "Task") -> str | None:
 # ---------------------------------------------------------------------------
 COUNTER_ROLLOUT_DECISION_ALLOWED = "rollout.decision.allowed"
 COUNTER_ROLLOUT_DECISION_BLOCKED_MODE = "rollout.decision.blocked_mode"
+COUNTER_ROLLOUT_DECISION_BLOCKED_TOPOLOGY = "rollout.decision.blocked_topology"
 COUNTER_ROLLOUT_DECISION_BLOCKED_SOURCE = "rollout.decision.blocked_source"
 COUNTER_ROLLOUT_DECISION_BLOCKED_UNKNOWN_SOURCE = (
     "rollout.decision.blocked_unknown_source"
@@ -245,6 +248,10 @@ class InteractionRolloutPolicy:
     mode: Literal["legacy", "read", "native"]
     native_sources: frozenset[str]
     native_protocol_version: int
+    # Set from get_shared_task_execution_enabled() by
+    # validate_interaction_rollout_at_startup(). No default, so every place
+    # that builds a policy has to choose a topology explicitly.
+    shared_task_execution: bool
 
 
 _policy: InteractionRolloutPolicy | None = None
@@ -255,8 +262,8 @@ _policy_lock = threading.Lock()
 # forever (the table is only ever added, never dropped, so a stale True
 # cannot occur) and let False re-query every time (the table may not exist
 # yet during a legitimate "service rolled before migration ran" window).
-# This latch is consumed only by /ready -- the gate's own schema check
-# (evaluate_native_publication step 5) always queries fresh.
+# This latch is consumed only by /ready -- the gate's own schema-existence
+# check in evaluate_native_publication always queries fresh.
 _native_schema_ready = False
 
 
@@ -337,6 +344,10 @@ def validate_interaction_rollout_at_startup() -> InteractionRolloutPolicy:
             )
 
         native_sources = frozenset(tokens)
+        # Read once and frozen with the rest of the policy:
+        # get_shared_task_execution_enabled() reads the environment on every
+        # call, while the publication gate only reads this frozen value.
+        shared_task_execution = get_shared_task_execution_enabled()
 
         # legacy/read with a non-empty source list is normal --
         # operators pre-stage the source list before flipping the mode
@@ -359,6 +370,19 @@ def validate_interaction_rollout_at_startup() -> InteractionRolloutPolicy:
                 "hidden tasks with no interactive responder, so native "
                 "publication for them will never be answered.",
                 INTERACTION_NATIVE_SOURCES,
+            )
+
+        # A process set to native that is not running shared task execution
+        # keeps starting: the topology is a deployment choice, not an invalid
+        # configuration, so operators get a WARNING instead of a startup
+        # failure.
+        if mode == "native" and not shared_task_execution:
+            logger.warning(
+                "%s=native but this process is not running shared task "
+                "execution (see %s), so native publication will never "
+                "happen in this process.",
+                INTERACTION_PROTOCOL_MODE,
+                SHARED_TASK_EXECUTION_ENABLED,
             )
 
         # Normalization (case/whitespace) changing the raw value is by
@@ -384,6 +408,7 @@ def validate_interaction_rollout_at_startup() -> InteractionRolloutPolicy:
             mode=cast('Literal["legacy", "read", "native"]', mode),
             native_sources=native_sources,
             native_protocol_version=INTERACTION_PROTOCOL_VERSION,
+            shared_task_execution=shared_task_execution,
         )
 
         # Unconditional, same shape as app.py's "Agent runtime configured:"
@@ -392,10 +417,11 @@ def validate_interaction_rollout_at_startup() -> InteractionRolloutPolicy:
         # on failure.
         logger.info(
             "Interaction rollout policy configured: mode=%s native_sources=%s "
-            "native_protocol_version=%s",
+            "native_protocol_version=%s shared_task_execution=%s",
             policy.mode,
             sorted(policy.native_sources),
             policy.native_protocol_version,
+            policy.shared_task_execution,
         )
 
         _policy = policy
@@ -456,7 +482,7 @@ def _truncated_repr(value: object, *, limit: int = 64) -> str:
 
 
 class NativePublicationDecision(enum.Enum):
-    """The five possible outcomes of :func:`evaluate_native_publication`.
+    """The six possible outcomes of :func:`evaluate_native_publication`.
 
     ``ALLOWED`` is the only member carrying a payload:
     :attr:`protocol_version`, which mirrors ``INTERACTION_PROTOCOL_VERSION``
@@ -472,6 +498,7 @@ class NativePublicationDecision(enum.Enum):
 
     ALLOWED = "allowed"
     BLOCKED_MODE = "blocked_mode"
+    BLOCKED_TOPOLOGY = "blocked_topology"
     BLOCKED_UNKNOWN_SOURCE = "blocked_unknown_source"
     BLOCKED_SOURCE = "blocked_source"
     BLOCKED_SCHEMA_ABSENT = "blocked_schema_absent"
@@ -500,10 +527,23 @@ def evaluate_native_publication(
        compare -- no environment read happens here, unlike in earlier,
        unfrozen designs) drives the gate's total cost to zero queries for
        the common case.
-    2. The schema-existence check is the only step that issues a query, so
+    2. The topology check runs second. It reads the frozen
+       ``shared_task_execution`` field, never the environment, and issues
+       no query. It registers no degradation: a process that is not running
+       shared task execution is a deployment fact that startup already
+       reported with a WARNING, not a fault. It runs before the unknown-
+       source check so that such a process set to native mode never
+       registers the unknown-source degradation. Why the step exists: it
+       is a rollout-scope choice, not a precondition of any other step in
+       this gate. Task coordinators are only created under shared task
+       execution, and ``task_command_transport`` only claims START and
+       RESUME_INPUT commands there, so native publication is rolled out on
+       that one topology while every other process keeps asking questions
+       as chat messages. Relaxing this step is a policy decision.
+    3. The schema-existence check is the only step that issues a query, so
        it runs last among the blocking checks -- after every check capable
        of rejecting for free has had its turn.
-    3. Unknown source is checked before allow-list membership, not after:
+    4. Unknown source is checked before allow-list membership, not after:
        an unrecognized ``Task.source`` value is a data anomaly worth a
        human's attention, while a recognized-but-not-yet-allowed source is
        ordinary rollout progress. Merging the two into one outcome would
@@ -520,6 +560,13 @@ def evaluate_native_publication(
         logger.debug("Native publication blocked: mode=%s", policy.mode)
         increment_counter(COUNTER_ROLLOUT_DECISION_BLOCKED_MODE)
         return NativePublicationDecision.BLOCKED_MODE
+
+    if not policy.shared_task_execution:
+        logger.debug(
+            "Native publication blocked: process is not running shared task execution"
+        )
+        increment_counter(COUNTER_ROLLOUT_DECISION_BLOCKED_TOPOLOGY)
+        return NativePublicationDecision.BLOCKED_TOPOLOGY
 
     key = gating_key(task)
     if key is None:

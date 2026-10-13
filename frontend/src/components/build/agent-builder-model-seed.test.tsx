@@ -207,7 +207,7 @@ function installApi(opts: {
         )
       if (url.endsWith("/api/skills/"))
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
-      if (url.endsWith("/api/tools/available"))
+      if (url.endsWith("/api/tools/available?include_usage=false"))
         return Promise.resolve(new Response(JSON.stringify({ tools: [] }), { status: 200 }))
       if (url.endsWith("/api/models/?category=llm"))
         // The default general model is always in this list for real: both go

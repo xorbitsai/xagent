@@ -643,21 +643,18 @@ def _workbook_base(file_path: str, site_id: str | None, drive_id: str | None) ->
     """Build the "/.../root:/{path}:/workbook" base path for a workbook
     (.xlsx) driveItem, addressed either in the caller's own OneDrive
     (default), a specific drive (drive_id only), or a SharePoint site's
-    document library (site_id, optionally with drive_id for a non-default
-    library).
+    document library (site_id for its default library, or drive_id for a
+    specific library). A drive id is globally addressable in Graph, so it
+    takes precedence when both identifiers are supplied.
     """
     normalized = _normalize_relative_path(file_path)
-    if site_id is not None:
-        site_segment = _site_segment(site_id)
+    site_segment = _site_segment(site_id) if site_id is not None else None
+    if drive_id is not None:
+        drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
+    elif site_segment is not None:
         if ":/" in site_segment and not site_segment.endswith(":"):
             site_segment += ":"
-        drive_base = (
-            f"/sites/{site_segment}/drives/{url_path_id(drive_id, 'drive_id')}"
-            if drive_id is not None
-            else f"/sites/{site_segment}/drive"
-        )
-    elif drive_id is not None:
-        drive_base = f"/drives/{url_path_id(drive_id, 'drive_id')}"
+        drive_base = f"/sites/{site_segment}/drive"
     else:
         drive_base = "/me/drive"
     return f"{drive_base}/root:/{quote(normalized, safe='/')}:/workbook"
@@ -700,10 +697,11 @@ def excel_list_worksheets(
     file_path is the workbook's path in the document library/drive. By
     default this addresses the caller's own OneDrive; pass site_id (a Graph
     site id -- "root" for the tenant's root site, or a site's own id/path)
-    to address a SharePoint site's document library instead, optionally
-    with drive_id for a non-default library. Pass a returned next_link to
-    retrieve the next page. page_size bounds each server page and applies
-    when starting a listing."""
+    to address a SharePoint site's default document library. Pass drive_id
+    to address a specific drive directly; it takes precedence over site_id
+    when both are supplied. Pass a returned next_link to retrieve the next
+    page. page_size bounds each server page and applies when starting a
+    listing."""
     try:
         validated_page_size = _validate_page_size(page_size)
         base = _workbook_base(file_path, site_id, drive_id)

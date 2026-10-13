@@ -35,10 +35,7 @@ from xagent.core.agent.pattern.react.react import (
     FORCED_ANSWER_READS_USED_UP_TEXT,
     _normalize_ask_user_interactions,
 )
-from xagent.core.agent.result import (
-    CLIENT_SAFE_EXCEL_WAC_ERROR,
-    tool_result_succeeded,
-)
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -79,52 +76,67 @@ class EmptyArgs(BaseModel):
     pass
 
 
-def test_latest_client_safe_tool_error_is_scoped_to_current_user_turn() -> None:
+def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
     previous = SimpleNamespace(
         role="tool",
-        metadata={"raw_result": {"client_error_message": "stale failure"}},
+        metadata={"raw_result": {"failure_code": "site_not_found"}},
     )
     user = SimpleNamespace(role="user", metadata={})
     current = SimpleNamespace(
         role="tool",
-        metadata={"raw_result": {"client_error_message": CLIENT_SAFE_EXCEL_WAC_ERROR}},
+        metadata={"raw_result": {"failure_code": "workbook_access_denied"}},
     )
     context = SimpleNamespace(messages=[previous, user, current])
 
-    assert (
-        ReActPattern._latest_client_safe_tool_error(context)
-        == CLIENT_SAFE_EXCEL_WAC_ERROR
-    )
+    assert ReActPattern._latest_tool_failure_code(context) == "workbook_access_denied"
 
 
-def test_latest_client_safe_tool_error_rejects_unallowlisted_text() -> None:
+def test_latest_tool_failure_code_rejects_unallowlisted_code() -> None:
     context = SimpleNamespace(
         messages=[
             SimpleNamespace(role="user", metadata={}),
             SimpleNamespace(
                 role="tool",
-                metadata={"raw_result": {"client_error_message": "arbitrary"}},
+                metadata={"raw_result": {"failure_code": "arbitrary"}},
             ),
         ]
     )
 
-    assert ReActPattern._latest_client_safe_tool_error(context) is None
+    assert ReActPattern._latest_tool_failure_code(context) is None
 
 
-def test_latest_client_safe_tool_error_rejects_unbounded_text() -> None:
+def test_latest_tool_failure_code_rejects_non_string_code() -> None:
     context = SimpleNamespace(
         messages=[
             SimpleNamespace(role="user", metadata={}),
             SimpleNamespace(
                 role="tool",
                 metadata={
-                    "raw_result": {"client_error_message": "x" * 501},
+                    "raw_result": {"failure_code": 123},
                 },
             ),
         ]
     )
 
-    assert ReActPattern._latest_client_safe_tool_error(context) is None
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_drops_stale_failure_after_success() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"failure_code": "site_not_found"}},
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"status": "success"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
 
 
 class FakeTool:

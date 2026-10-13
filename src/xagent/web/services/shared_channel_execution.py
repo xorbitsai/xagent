@@ -24,6 +24,7 @@ from ...core.agent.trace import (
     TraceHandler,
     TraceScope,
 )
+from ...core.agent.result import normalize_tool_failure_code
 from ...core.execution_scope import resolve_execution_scope
 from ...core.runtime_performance import increment_counter
 from ...core.workspace import TaskWorkspace
@@ -752,6 +753,9 @@ async def execute_channel_background(
                 "interactions": projection.interactions,
             },
         }
+        failure_code = normalize_tool_failure_code(result.get("failure_code"))
+        if failure_code is not None:
+            durable_result["failure_code"] = failure_code
 
         report = SettlementReport()
 

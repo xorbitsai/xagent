@@ -12,7 +12,7 @@ import pytest
 
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig, ReActPattern
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
-from xagent.core.agent.result import CLIENT_SAFE_EXCEL_WAC_ERROR, NO_OUTPUT_PLACEHOLDER
+from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
@@ -1688,23 +1688,39 @@ def test_execution_adapter_promotes_model_error_keys_and_keeps_output_backfill()
     assert result["error"] == aggregate
 
 
-def test_execution_adapter_propagates_allowlisted_client_safe_tool_error() -> None:
+def test_execution_adapter_propagates_allowlisted_tool_failure_code() -> None:
     result = _plain_react_adapter()._normalize_result(
         result={
             "success": False,
             "status": "invalid_tool_protocol",
             "error": "truncated_tool_arguments",
-            "client_error_message": CLIENT_SAFE_EXCEL_WAC_ERROR,
+            "failure_code": "workbook_access_denied",
         },
         execution_type="agent_react",
         execution_id="client-safe-error-exec",
     )
 
-    assert result["client_error_message"] == CLIENT_SAFE_EXCEL_WAC_ERROR
+    assert result["failure_code"] == "workbook_access_denied"
+
+
+@pytest.mark.parametrize("status", ["error", "max_iterations", "model_error"])
+def test_execution_adapter_propagates_failure_code_on_any_failed_status(status):
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": status,
+            "error": "failed",
+            "failure_code": "workbook_locked",
+        },
+        execution_type="agent_react",
+        execution_id="failure-code-status-exec",
+    )
+
+    assert result["failure_code"] == "workbook_locked"
 
 
 @pytest.mark.parametrize("value", ["arbitrary", "x" * 501, 123, None])
-def test_execution_adapter_rejects_unallowlisted_client_safe_tool_error(
+def test_execution_adapter_rejects_unallowlisted_tool_failure_code(
     value: Any,
 ) -> None:
     result = _plain_react_adapter()._normalize_result(
@@ -1712,13 +1728,13 @@ def test_execution_adapter_rejects_unallowlisted_client_safe_tool_error(
             "success": False,
             "status": "invalid_tool_protocol",
             "error": "truncated_tool_arguments",
-            "client_error_message": value,
+            "failure_code": value,
         },
         execution_type="agent_react",
         execution_id="invalid-client-safe-error-exec",
     )
 
-    assert "client_error_message" not in result
+    assert "failure_code" not in result
 
 
 @pytest.mark.parametrize(

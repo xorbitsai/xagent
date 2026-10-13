@@ -1585,6 +1585,42 @@ def test_graph_error_response_is_surfaced_as_error(monkeypatch):
     assert "Not Found" in result["message"]
 
 
+@pytest.mark.parametrize(
+    ("status_code", "body", "failure_code"),
+    [
+        (403, {"error": {"code": "AccessDenied"}}, "workbook_access_denied"),
+        (404, {"error": {"code": "itemNotFound"}}, "site_not_found"),
+        (423, {"error": {"message": "workbook locked"}}, "workbook_locked"),
+    ],
+)
+def test_graph_failures_carry_allowlisted_failure_code(
+    monkeypatch, status_code, body, failure_code
+):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse(body, status_code=status_code)),
+    )
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx"))
+
+    assert result["status"] == "error"
+    assert result["failure_code"] == failure_code
+
+
+def test_graph_other_failure_does_not_carry_failure_code(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "bad request"}, status_code=400)),
+    )
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx"))
+
+    assert result["status"] == "error"
+    assert "failure_code" not in result
+
+
 def test_missing_auth_token_is_reported(monkeypatch):
     monkeypatch.delenv("AUTH_TOKEN", raising=False)
 

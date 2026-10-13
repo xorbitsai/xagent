@@ -98,11 +98,37 @@ def _success_with_bounded_collection(
     )
 
 
-def _error(message: str, *, details: Any = None) -> str:
+def _error(
+    message: str, *, details: Any = None, failure_code: str | None = None
+) -> str:
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
+    if failure_code in _EXCEL_FAILURE_CODES:
+        payload["failure_code"] = failure_code
     return json.dumps(payload, ensure_ascii=False)
+
+
+_EXCEL_FAILURE_CODES = frozenset(
+    {"workbook_access_denied", "site_not_found", "workbook_locked"}
+)
+
+
+def _excel_failure_code(exc: BaseException) -> str | None:
+    """Classify only stable Graph failures safe for client localization."""
+    if not isinstance(exc, _GraphRequestError):
+        return None
+    if exc.status_code == 403:
+        return "workbook_access_denied"
+    if exc.status_code == 404:
+        return "site_not_found"
+    if exc.status_code in {409, 423} and "lock" in str(exc).lower():
+        return "workbook_locked"
+    return None
+
+
+def _error_from_exception(exc: BaseException) -> str:
+    return _error(str(exc), failure_code=_excel_failure_code(exc))
 
 
 def _indeterminate(message: str) -> str:
@@ -731,7 +757,7 @@ def excel_list_worksheets(
         )
     except Exception as e:
         logger.error("Error listing worksheets for %s: %s", file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -762,7 +788,7 @@ def excel_add_worksheet(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding worksheet to %s: %s", file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -789,7 +815,7 @@ def excel_delete_worksheet(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error deleting worksheet %s from %s: %s", worksheet, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -826,7 +852,7 @@ def excel_get_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -877,7 +903,7 @@ def excel_update_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
@@ -928,7 +954,7 @@ def excel_delete_columns(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
@@ -986,7 +1012,7 @@ def excel_delete_rows(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1023,7 +1049,7 @@ def excel_clear_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1061,7 +1087,7 @@ def excel_get_used_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 def _bounded_query_rows(
@@ -1171,7 +1197,7 @@ def excel_count_values(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1239,7 +1265,7 @@ def excel_find_rows(
         logger.error(
             "Error finding %r on worksheet %s in %s: %s", query, worksheet, file_path, e
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1281,7 +1307,7 @@ def excel_list_tables(
         )
     except Exception as e:
         logger.error("Error listing tables in %s: %s", file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1307,7 +1333,7 @@ def excel_add_table(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding table %s in %s: %s", address, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1372,7 +1398,7 @@ def excel_list_table_rows(
         )
     except Exception as e:
         logger.error("Error listing rows for table %s in %s: %s", table, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1418,7 +1444,7 @@ def excel_add_table_rows(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding rows to table %s in %s: %s", table, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1452,7 +1478,7 @@ def excel_delete_table_row(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 if __name__ == "__main__":

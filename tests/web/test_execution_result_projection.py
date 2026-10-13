@@ -2,7 +2,11 @@ import pytest
 
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.web.models.task import TaskStatus
-from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    ClientErrorCode,
+    client_error_message,
+)
 from xagent.web.services.execution_result_projection import (
     EMPTY_CHANNEL_OUTPUT_FALLBACK,
     execution_result_diagnostic_error,
@@ -164,17 +168,14 @@ def test_project_empty_failure_has_no_diagnostic_and_uses_safe_display() -> None
     assert projection.interactions == []
 
 
-def test_project_failed_result_shows_explicit_bounded_safe_tool_error() -> None:
-    safe_error = (
-        "Microsoft Graph could not open the Excel workbook: access was denied "
-        "while obtaining the workbook editing token."
-    )
+def test_project_failed_result_maps_classified_tool_failure() -> None:
+    safe_error = client_error_message(ClientErrorCode.EXCEL_WORKBOOK_ACCESS_DENIED)
     projection = project_execution_result_for_channel(
         {
             "success": False,
             "status": "invalid_tool_protocol",
             "error": "truncated_tool_arguments",
-            "client_error_message": safe_error,
+            "failure_code": "workbook_access_denied",
         }
     )
 
@@ -182,12 +183,12 @@ def test_project_failed_result_shows_explicit_bounded_safe_tool_error() -> None:
     assert projection.transcript_content == CLIENT_SAFE_TASK_FAILURE
 
 
-def test_project_failed_result_rejects_unbounded_safe_tool_error() -> None:
+def test_project_failed_result_rejects_unallowlisted_tool_failure() -> None:
     projection = project_execution_result_for_channel(
         {
             "success": False,
             "status": "invalid_tool_protocol",
-            "client_error_message": "x" * 501,
+            "failure_code": "arbitrary",
         }
     )
 

@@ -124,7 +124,7 @@ from ...grounding import evidence_facts, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
-    normalize_client_safe_tool_error,
+    normalize_tool_failure_code,
     tool_result_requires_authentication,
     tool_result_succeeded,
     unwrap_final_answer_content,
@@ -1461,14 +1461,18 @@ class ReActPattern(AgentPattern):
 
         self.status = "max_iterations"
         await runtime.checkpoint("max_iterations", context=context, pattern=self)
+        failure_code = self._latest_tool_failure_code(context)
+        metadata = {
+            "iterations": self.max_iterations,
+            "status": self.status,
+            "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
+        }
+        if failure_code is not None:
+            metadata["failure_code"] = failure_code
         return PatternResult(
             success=False,
             error="ReActPattern reached max iterations without a final answer.",
-            metadata={
-                "iterations": self.max_iterations,
-                "status": self.status,
-                "forced_answer_extra_iterations": self.forced_answer_extra_iterations,
-            },
+            metadata=metadata,
         ).to_dict()
 
     async def _deliver_at_iteration_limit(
@@ -1662,9 +1666,9 @@ class ReActPattern(AgentPattern):
             metadata["protocol_code"] = protocol_code
         if finish_reason:
             metadata["finish_reason"] = finish_reason
-        client_error_message = self._latest_client_safe_tool_error(context)
-        if client_error_message is not None:
-            metadata["client_error_message"] = client_error_message
+        failure_code = self._latest_tool_failure_code(context)
+        if failure_code is not None:
+            metadata["failure_code"] = failure_code
         return PatternResult(
             success=False,
             error=error,
@@ -1672,8 +1676,8 @@ class ReActPattern(AgentPattern):
         ).to_dict()
 
     @staticmethod
-    def _latest_client_safe_tool_error(context: Any) -> str | None:
-        """Return a curated tool failure from the current user turn only."""
+    def _latest_tool_failure_code(context: Any) -> str | None:
+        """Return an allowlisted tool failure from the current user turn only."""
         for message in reversed(getattr(context, "messages", [])):
             role = getattr(message, "role", None)
             if role == "user":
@@ -1684,11 +1688,13 @@ class ReActPattern(AgentPattern):
             result = metadata.get("raw_result")
             if not isinstance(result, dict):
                 continue
-            candidate = normalize_client_safe_tool_error(
-                result.get("client_error_message")
-            )
-            if candidate is not None:
-                return candidate
+            if tool_result_succeeded(result):
+                # A later successful call supersedes an earlier classified
+                # failure in the same user turn; do not surface stale text.
+                return None
+            failure_code = normalize_tool_failure_code(result.get("failure_code"))
+            if failure_code is not None:
+                return failure_code
         return None
 
     async def _close_streamed_answer(
@@ -5696,13 +5702,17 @@ class ReActPattern(AgentPattern):
             pattern=self,
             metadata={"safe_point": label, "reason": runtime.interrupt_reason},
         )
+        metadata: dict[str, Any] = {
+            "status": self.status,
+            "interrupt_reason": runtime.interrupt_reason,
+        }
+        failure_code = self._latest_tool_failure_code(context)
+        if failure_code is not None:
+            metadata["failure_code"] = failure_code
         return PatternResult(
             success=False,
             error="ReActPattern interrupted.",
-            metadata={
-                "status": self.status,
-                "interrupt_reason": runtime.interrupt_reason,
-            },
+            metadata=metadata,
         ).to_dict()
 
     def _suppressed_duplicate_write_result(

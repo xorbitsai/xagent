@@ -15,7 +15,6 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-
 _ROCKETLANE_SERVER = "rocketlane"
 _ROCKETLANE_PROJECT_TOOL = "get_projects"
 _PAGE_TOKEN_KEYS = frozenset({"cursor", "nextpagetoken", "pagetoken"})

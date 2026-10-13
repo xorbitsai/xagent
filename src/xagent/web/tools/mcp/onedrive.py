@@ -1570,9 +1570,9 @@ def onedrive_upload_file(
     a relative path resolves against this process's working directory.
     remote_path: the OneDrive path to upload to (e.g. "Reports/report.pdf"),
     overwriting any existing file there; defaults to the local file's own
-    name at the OneDrive root. Prefer the format-specific Word or Excel tools
-    when editing an existing Office document. If an existing
-    item is locked, this tool returns code="resource_locked"; do not retry the
+    name at the OneDrive root. Prefer the format-specific connector when one
+    supports editing the existing Office document. If an existing item is
+    locked, this tool returns code="resource_locked"; do not retry the
     same destination immediately. Close the document and retry later, or ask
     the user before choosing a different remote_path to save a copy.
     mime_type: defaults to a guess from the remote filename, then the local

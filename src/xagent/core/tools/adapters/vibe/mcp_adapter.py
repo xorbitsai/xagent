@@ -39,7 +39,6 @@ from pydantic import BaseModel, Field, ValidationError, create_model
 
 from ..... import config as _root_config
 from .....sandbox.base import Sandbox
-from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
 from ....file_ref import (
     build_workspace_file_ref,
     parse_file_id_ref,
@@ -1358,6 +1357,8 @@ def _normalized_mcp_call_result(
 
 def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
     """Carry the Excel connector's allowlisted failure code to the runtime."""
+    from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
+
     content = result.get("content")
     if not isinstance(content, list):
         return None

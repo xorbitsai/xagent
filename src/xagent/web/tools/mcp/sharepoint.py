@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import logging
@@ -36,11 +35,10 @@ _BINARY_UPLOAD_TIMEOUT_SECONDS = 120
 # rather than silently attempted and possibly failed by Graph.
 _SIMPLE_UPLOAD_MAX_BYTES = 4_000_000
 
-# sharepoint_get_file_content buffers the whole download into memory (and then
-# again as a base64 string in the tool result), so an unbounded download of a
-# large document-library file risks exhausting worker memory and blowing up
-# the tool output. Capped at the same order of magnitude as the simple-upload
-# limit above.
+# Both SharePoint content tools buffer the response before returning or
+# publishing it. Keep a hard 10 MB cap so a large document-library file cannot
+# exhaust worker memory; sharepoint_download_file documents this limit to
+# callers because it is also the maximum downloadable artifact size.
 _MAX_DOWNLOAD_BYTES = 10_000_000
 
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"
@@ -555,13 +553,6 @@ def _caller_safe_drive_item(item: Any) -> Any:
     return item
 
 
-def _decode_bytes(content: bytes) -> tuple[str | None, str | None]:
-    try:
-        return content.decode("utf-8"), None
-    except UnicodeDecodeError:
-        return None, base64.b64encode(content).decode("ascii")
-
-
 def _download_output_dir() -> Path:
     """Return the current task's output directory for binary downloads."""
     base = os.environ.get(_OUTPUT_DIR_ENV_VAR, "").strip()
@@ -816,23 +807,25 @@ def sharepoint_get_file_content(
 
     Binary content is never returned inline. Use sharepoint_download_file so
     the real bytes become a durable workspace FileRef instead of Base64 in the
-    model context.
+    model context. This tool only returns UTF-8 text; use the download tool for
+    files in another encoding (such as UTF-16 or GBK) as well.
     """
     try:
-        content = _graph_request(
-            "GET", _drive_content_path(site_id, file_path, drive_id), raw=True
-        )
-        # UTF-8 validity alone is not a reliable binary check: a mislabeled
-        # Office/archive file can contain only valid UTF-8 bytes and would
-        # otherwise be copied into the model context as text.  Use the same
-        # default-deny extension policy as the text-upload tool before the
-        # decode heuristic, while retaining the latter for text files whose
-        # bytes are genuinely not UTF-8.
+        content_path = _drive_content_path(site_id, file_path, drive_id)
         if _name_looks_binary(file_path):
             return _error(
                 f"{file_path!r} looks like a binary file and is not returned "
                 "inline. Use sharepoint_download_file to store it in the task "
                 "workspace."
+            )
+        content = _graph_request("GET", content_path, raw=True)
+        try:
+            text_content = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return _error(
+                f"{file_path!r} is not UTF-8 text and is not returned inline. "
+                "Use sharepoint_download_file to store the original bytes in "
+                "the task workspace."
             )
         # The runtime's generic output filter truncates any string value --
         # the JSON envelope _success returns below is one -- at
@@ -843,17 +836,10 @@ def sharepoint_get_file_content(
         # before that filter ever sees it, trades that for an honest,
         # actionable error.
         max_output_length = get_tool_max_output_length()
-        text_content, base64_content = _decode_bytes(content)
-        if base64_content is not None:
-            return _error(
-                f"{file_path!r} is binary and is not returned inline. Use "
-                "sharepoint_download_file to store it in the task workspace."
-            )
         result = _success(
             file_path=file_path,
             text_content=text_content,
-            base64_content=base64_content,
-            encoding="utf-8" if text_content is not None else "base64",
+            encoding="utf-8",
         )
         if len(result) > max_output_length:
             return _error(
@@ -883,22 +869,26 @@ def sharepoint_download_file(
 
     The MCP host registers the resulting path as a durable FileRef. Use this
     for Office documents, PDFs, images, and other binary content instead of
-    putting Base64 into the model context.
+    putting Base64 into the model context. When a specialized Office tool is
+    available, prefer it for in-place edits; this tool is for retrieving the
+    real bytes for downstream processing. Downloads are capped at 10 MB.
     """
     output_path: Path | None = None
     try:
-        content = _graph_request(
-            "GET", _drive_content_path(site_id, file_path, drive_id), raw=True
-        )
+        content_path = _drive_content_path(site_id, file_path, drive_id)
         output_dir = _download_output_dir()
         output_name = _safe_download_filename(filename or Path(file_path).name)
+        content = _graph_request("GET", content_path, raw=True)
         output_path = _write_download_file(output_dir, output_name, content)
+        mime_type = _guess_mime_type(output_path.name)
+        if mime_type in (None, "application/octet-stream"):
+            mime_type = _guess_mime_type(Path(file_path).name) or mime_type
         return _success(
             file_path=str(output_path),
             filename=output_path.name,
             size=len(content),
             sha256=hashlib.sha256(content).hexdigest(),
-            mime_type=_guess_mime_type(output_path.name) or "application/octet-stream",
+            mime_type=mime_type or "application/octet-stream",
         )
     except Exception as e:
         if output_path is not None:

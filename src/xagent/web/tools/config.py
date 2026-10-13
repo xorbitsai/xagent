@@ -1960,7 +1960,8 @@ class WebToolConfig(BaseToolConfig):
 
     def _build_mcp_task_output_dir(self) -> str:
         """Single write-target root for connectors that create new files in
-        the task workspace (currently Google Drive and OneDrive download tools).
+        the task workspace (currently Google Drive, OneDrive, and SharePoint
+        download tools).
 
         Deliberately distinct from _mcp_file_allowed_dir_paths() above:
         that method builds a read allowlist that may reasonably include
@@ -3870,8 +3871,8 @@ class WebToolConfig(BaseToolConfig):
                 env["XAGENT_SHAREPOINT_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GOOGLE_DRIVE_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_JIRA_FILE_ALLOWED_DIRS"] = allowed_file_dirs
-            # Distinct from the read allowlists above: Google Drive and
-            # OneDrive download tools write NEW files into the task workspace, so they
+            # Distinct from the read allowlists above: Google Drive, OneDrive,
+            # and SharePoint download tools write NEW files into the task workspace, so they
             # get their own single-value, task-dir-only vars rather than
             # reusing the read-allowlist shape (see
             # _build_mcp_task_output_dir's docstring for why that would be

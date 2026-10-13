@@ -20,7 +20,7 @@ from .interruption import (
 )
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
-from .result import NO_OUTPUT_PLACEHOLDER
+from .result import NO_OUTPUT_PLACEHOLDER, normalize_client_safe_tool_error
 from .runner import AgentRunner, UserMessageInjectionOutcome
 from .tracing import TraceEventCallback
 
@@ -490,6 +490,12 @@ class AgentExecutionAdapter:
         model_error = result.get("model_error")
         if type(model_error) is dict:
             normalized["model_error"] = model_error
+        if status == "invalid_tool_protocol":
+            client_error_message = normalize_client_safe_tool_error(
+                result.get("client_error_message")
+            )
+            if client_error_message is not None:
+                normalized["client_error_message"] = client_error_message
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

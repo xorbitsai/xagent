@@ -31,6 +31,26 @@ CONTROL_TOOL_NAMES = frozenset(
 NO_OUTPUT_PLACEHOLDER = "No output provided"
 NO_RESPONSE_PLACEHOLDER = "No response generated"
 
+# Only explicitly allowlisted, bounded tool errors may cross the execution
+# boundary into a client-facing result.  Tool payloads are untrusted input, so
+# a generic length check is not enough to establish that a message is safe.
+CLIENT_SAFE_TOOL_ERROR_MAX_CHARS = 500
+CLIENT_SAFE_EXCEL_WAC_ERROR = (
+    "Microsoft Graph could not open the Excel workbook: access was denied "
+    "while obtaining the workbook editing token. Retry with the workbook's "
+    "drive_id, or reconnect the SharePoint account if it persists."
+)
+
+
+def normalize_client_safe_tool_error(value: Any) -> str | None:
+    """Return the exact bounded tool error approved for client display."""
+    if type(value) is not str:
+        return None
+    value = value.strip()
+    if len(value) > CLIENT_SAFE_TOOL_ERROR_MAX_CHARS:
+        return None
+    return value if value == CLIENT_SAFE_EXCEL_WAC_ERROR else None
+
 
 def normalize_tool_failure_code(value: Any) -> str | None:
     """Return an exact public tool failure code when it is allowlisted."""

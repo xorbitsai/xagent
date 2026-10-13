@@ -1355,13 +1355,6 @@ def _normalized_mcp_call_result(
     }
 
 
-_EXCEL_WAC_ACCESS_DENIED_CLIENT_MESSAGE = (
-    "Microsoft Graph could not open the Excel workbook: access was denied "
-    "while obtaining the workbook editing token. Retry with the workbook's "
-    "drive_id, or reconnect the SharePoint account if it persists."
-)
-
-
 def _excel_client_safe_error(result: Mapping[str, Any]) -> str | None:
     """Project only the known WAC denial; never expose an arbitrary MCP error."""
     if result.get("is_error") is not True:
@@ -1374,7 +1367,11 @@ def _excel_client_safe_error(result: Mapping[str, Any]) -> str | None:
     )
     if "AccessDenied" not in text or "Could not obtain a WAC access token" not in text:
         return None
-    return _EXCEL_WAC_ACCESS_DENIED_CLIENT_MESSAGE
+    # Keep this module independent from the agent package at import time; the
+    # adapter is also used by the standalone MCP loader and has a layering test.
+    from ....agent.result import CLIENT_SAFE_EXCEL_WAC_ERROR
+
+    return CLIENT_SAFE_EXCEL_WAC_ERROR
 
 
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:

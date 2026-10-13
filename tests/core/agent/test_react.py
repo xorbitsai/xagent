@@ -35,7 +35,10 @@ from xagent.core.agent.pattern.react.react import (
     FORCED_ANSWER_READS_USED_UP_TEXT,
     _normalize_ask_user_interactions,
 )
-from xagent.core.agent.result import tool_result_succeeded
+from xagent.core.agent.result import (
+    CLIENT_SAFE_EXCEL_WAC_ERROR,
+    tool_result_succeeded,
+)
 from xagent.core.agent.runtime import NO_DELIVERABLE_FINAL_ANSWER_REASON
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -84,11 +87,28 @@ def test_latest_client_safe_tool_error_is_scoped_to_current_user_turn() -> None:
     user = SimpleNamespace(role="user", metadata={})
     current = SimpleNamespace(
         role="tool",
-        metadata={"raw_result": {"client_error_message": "current failure"}},
+        metadata={"raw_result": {"client_error_message": CLIENT_SAFE_EXCEL_WAC_ERROR}},
     )
     context = SimpleNamespace(messages=[previous, user, current])
 
-    assert ReActPattern._latest_client_safe_tool_error(context) == "current failure"
+    assert (
+        ReActPattern._latest_client_safe_tool_error(context)
+        == CLIENT_SAFE_EXCEL_WAC_ERROR
+    )
+
+
+def test_latest_client_safe_tool_error_rejects_unallowlisted_text() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"client_error_message": "arbitrary"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_client_safe_tool_error(context) is None
 
 
 def test_latest_client_safe_tool_error_rejects_unbounded_text() -> None:

@@ -124,6 +124,7 @@ from ...grounding import evidence_facts, grounding_rule
 from ...language import final_answer_language_rule
 from ...result import (
     CONTROL_TOOL_NAMES,
+    normalize_client_safe_tool_error,
     tool_result_requires_authentication,
     tool_result_succeeded,
     unwrap_final_answer_content,
@@ -167,8 +168,6 @@ from .truncation import (
 )
 
 logger = logging.getLogger(__name__)
-
-_CLIENT_SAFE_TOOL_ERROR_MAX_CHARS = 500
 
 
 class ReActReasoningMode(str, Enum):
@@ -1685,11 +1684,10 @@ class ReActPattern(AgentPattern):
             result = metadata.get("raw_result")
             if not isinstance(result, dict):
                 continue
-            candidate = result.get("client_error_message")
-            if type(candidate) is not str:
-                continue
-            candidate = candidate.strip()
-            if candidate and len(candidate) <= _CLIENT_SAFE_TOOL_ERROR_MAX_CHARS:
+            candidate = normalize_client_safe_tool_error(
+                result.get("client_error_message")
+            )
+            if candidate is not None:
                 return candidate
         return None
 

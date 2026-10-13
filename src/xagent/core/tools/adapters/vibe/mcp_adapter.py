@@ -33,10 +33,8 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
-from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
-from jsonschema.exceptions import (  # type: ignore[import-untyped]
-    SchemaError as JSONSchemaError,
-)
+import jsonschema.exceptions as jsonschema_exceptions  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
 from mcp.types import CallToolResult
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, ValidationError, create_model
@@ -1977,7 +1975,7 @@ class MCPToolAdapter(AbstractBaseTool):
             schema = self._args_type.model_json_schema()
             Draft202012Validator.check_schema(schema)
             return Draft202012Validator(schema)
-        except (JSONSchemaError, TypeError, ValueError) as exc:
+        except (jsonschema_exceptions.SchemaError, TypeError, ValueError) as exc:
             logger.warning(
                 "MCP tool %s argument schema could not be compiled for nested "
                 "validation: %s",

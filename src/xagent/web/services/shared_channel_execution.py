@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
+from ...core.agent.result import normalize_tool_failure_code
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -24,7 +25,6 @@ from ...core.agent.trace import (
     TraceHandler,
     TraceScope,
 )
-from ...core.agent.result import normalize_tool_failure_code
 from ...core.execution_scope import resolve_execution_scope
 from ...core.runtime_performance import increment_counter
 from ...core.workspace import TaskWorkspace

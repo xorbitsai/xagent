@@ -31,6 +31,8 @@ def client_safe_failure_message(
 ) -> tuple[str, ClientErrorCode] | None:
     """Map an allowlisted tool failure to a fixed client-facing message."""
     failure_code = normalize_tool_failure_code(result.get("failure_code"))
+    if failure_code is None:
+        return None
     client_code = _TOOL_FAILURE_CLIENT_CODES.get(failure_code)
     if client_code is None:
         return None

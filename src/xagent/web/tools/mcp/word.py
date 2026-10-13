@@ -86,9 +86,6 @@ _MAX_UPLOAD_BYTES = _MAX_DOWNLOAD_BYTES
 _UPLOAD_RETRY_ATTEMPTS = 3
 _UPLOAD_RETRY_BASE_SECONDS = 1.0
 _UPLOAD_RETRY_MAX_SECONDS = 4.0
-_CHECKOUT_RETRY_ATTEMPTS = 3
-_CHECKOUT_RETRY_BASE_SECONDS = 1.0
-_CHECKOUT_RETRY_MAX_SECONDS = 4.0
 _DEFAULT_TEXT_PAGE_CHARS = 20_000
 _MIN_TEXT_PAGE_CHARS = 10_000
 _MAX_TEXT_PAGE_CHARS = 40_000
@@ -175,7 +172,7 @@ def _error(message: str | Exception, *, details: Any = None) -> str:
             code=message.code,
             retryable=True,
             suggested_actions=(
-                ["close_document_and_retry", "save_as_copy"]
+                ["close_document_and_retry"]
                 if message.code == "resource_locked"
                 else ["reread_and_retry"]
             ),
@@ -548,9 +545,10 @@ def _download_document(
             metadata.get("publication") if isinstance(metadata, dict) else None
         )
         if isinstance(publication, dict) and publication.get("level") == "checkout":
-            raise ValueError(
+            raise _WordEditConflict(
                 f"{file_path!r} is already checked out; check it in or discard "
-                "that checkout before editing it with this connector"
+                "that checkout before editing it with this connector",
+                code="resource_locked",
             )
         if (
             not isinstance(item_id, str)
@@ -622,7 +620,8 @@ def _upload_document(
     )
     lock_message = (
         f"{file_path!r} is locked for editing; close it in Word or Teams and "
-        "retry later, or save a copy to a different path"
+        "retry later. This tool edits in place; use onedrive_download_file "
+        "and onedrive_upload_file with a new path to save a copy"
     )
     locked_etag = _checkout_edit_snapshot(
         snapshot, conflict_message, lock_message=lock_message
@@ -698,7 +697,7 @@ def _checkout_edit_snapshot(
     """Lock the item, then prove it still contains the downloaded snapshot."""
     if not snapshot.generation:
         raise RuntimeError("Word edit snapshot is missing its content generation")
-    for attempt in range(_CHECKOUT_RETRY_ATTEMPTS):
+    for attempt in range(_UPLOAD_RETRY_ATTEMPTS):
         try:
             _graph_request("POST", f"{snapshot.item_path}/checkout")
             break
@@ -729,12 +728,10 @@ def _checkout_edit_snapshot(
                 "was discarded, so the edit was not applied"
             ) from None
         except _GraphRequestError as exc:
-            if exc.status_code == 423:
-                if attempt < _CHECKOUT_RETRY_ATTEMPTS - 1:
-                    _sleep_before_checkout_retry(attempt)
-                    continue
-                raise _WordEditConflict(lock_message, code="resource_locked") from exc
-            if exc.status_code == 409:
+            if exc.status_code == 423 and attempt < _UPLOAD_RETRY_ATTEMPTS - 1:
+                _sleep_before_retry(attempt, _UPLOAD_RETRY_ATTEMPTS)
+                continue
+            if exc.status_code in (409, 423):
                 raise _WordEditConflict(lock_message, code="resource_locked") from exc
             if exc.status_code == 412:
                 raise _WordEditConflict(
@@ -783,7 +780,7 @@ def _upload_checked_out_document(
     except _GraphRequestError as exc:
         if exc.status_code == 412:
             raise _WordEditConflict(conflict_message, code="version_conflict") from exc
-        if exc.status_code == 423:
+        if exc.status_code in (409, 423):
             raise _WordEditConflict(lock_message, code="resource_locked") from exc
         raise
     upload_url = session.get("uploadUrl") if isinstance(session, dict) else None
@@ -807,7 +804,7 @@ def _upload_checked_out_document(
             )
             if response.status_code == 412:
                 raise _WordEditConflict(conflict_message, code="version_conflict")
-            if response.status_code == 423:
+            if response.status_code in (409, 423):
                 raise _WordEditConflict(lock_message, code="resource_locked")
             if response.status_code in (200, 201):
                 try:
@@ -846,12 +843,12 @@ def _upload_checked_out_document(
                 next_offset = _next_upload_offset(progress, len(content))
                 if next_offset is not None:
                     offset = next_offset
-                    _sleep_before_upload_retry(attempt)
+                    _sleep_before_retry(attempt, _UPLOAD_RETRY_ATTEMPTS)
                     continue
         except requests.RequestException:
             pass
 
-        _sleep_before_upload_retry(attempt)
+        _sleep_before_retry(attempt, _UPLOAD_RETRY_ATTEMPTS)
 
     raise RuntimeError(
         "Word document upload outcome is unknown; its checkout must be "
@@ -859,24 +856,13 @@ def _upload_checked_out_document(
     )
 
 
-def _sleep_before_upload_retry(attempt: int) -> None:
-    """Apply bounded exponential backoff before another upload attempt."""
-    if attempt >= _UPLOAD_RETRY_ATTEMPTS - 1:
+def _sleep_before_retry(attempt: int, attempts: int) -> None:
+    """Apply bounded exponential backoff before another bounded retry."""
+    if attempt >= attempts - 1:
         return
     delay = min(
         _UPLOAD_RETRY_BASE_SECONDS * (2.0**attempt),
         _UPLOAD_RETRY_MAX_SECONDS,
-    )
-    time.sleep(delay)
-
-
-def _sleep_before_checkout_retry(attempt: int) -> None:
-    """Apply bounded exponential backoff before another checkout attempt."""
-    if attempt >= _CHECKOUT_RETRY_ATTEMPTS - 1:
-        return
-    delay = min(
-        _CHECKOUT_RETRY_BASE_SECONDS * (2.0**attempt),
-        _CHECKOUT_RETRY_MAX_SECONDS,
     )
     time.sleep(delay)
 
@@ -1014,13 +1000,13 @@ def _create_only_upload(
                 next_offset = _next_upload_offset(progress, len(content))
                 if next_offset is not None:
                     offset = next_offset
-                    _sleep_before_upload_retry(attempt)
+                    _sleep_before_retry(attempt, _UPLOAD_RETRY_ATTEMPTS)
                     continue
             if outcome_ambiguous and status.status_code in (404, 410):
                 break
         except requests.RequestException:
             pass
-        _sleep_before_upload_retry(attempt)
+        _sleep_before_retry(attempt, _UPLOAD_RETRY_ATTEMPTS)
 
     raise RuntimeError(
         "Word document creation outcome is unknown; verify whether the file "
@@ -1551,7 +1537,12 @@ def word_set_paragraph_text(
     character formatting; does not preserve formatting that varied across
     multiple runs within the paragraph. expected_generation is required from
     the word_list_paragraphs response that supplied paragraph_index, preventing
-    an intervening edit from redirecting the index to different content."""
+    an intervening edit from redirecting the index to different content.
+
+    If the response has code="resource_locked", do not retry immediately:
+    close the document in Word or Teams and retry later. This connector edits
+    in place; to save a copy, use onedrive_download_file and
+    onedrive_upload_file with a new remote_path."""
     try:
         _require_tool_output_budget()
         if not expected_generation:
@@ -1598,7 +1589,12 @@ def word_append_paragraph(
     """Append a new paragraph to the end of a Word document. style, if
     given, is a built-in Word style name (e.g. "List Bullet", "Quote");
     invalid names raise an error rather than silently falling back to
-    Normal."""
+    Normal.
+
+    If the response has code="resource_locked", do not retry immediately:
+    close the document in Word or Teams and retry later. This connector edits
+    in place; to save a copy, use onedrive_download_file and
+    onedrive_upload_file with a new remote_path."""
     try:
         _require_tool_output_budget()
         document, snapshot, _generation = _download_document(
@@ -1625,7 +1621,12 @@ def word_add_heading(
     drive_id: str | None = None,
 ) -> str:
     """Append a heading to the end of a Word document. level is 0 (the
-    document title style) through 9."""
+    document title style) through 9.
+
+    If the response has code="resource_locked", do not retry immediately:
+    close the document in Word or Teams and retry later. This connector edits
+    in place; to save a copy, use onedrive_download_file and
+    onedrive_upload_file with a new remote_path."""
     try:
         _require_tool_output_budget()
         if not 0 <= level <= 9:
@@ -1681,7 +1682,12 @@ def word_replace_text(
     guard prevents; or a content control or field's cached result, since
     rewriting that text in place would desync it from the control's data
     binding or the field's own instruction, with no way for this tool to
-    update either to match."""
+    update either to match.
+
+    If the response has code="resource_locked", do not retry immediately:
+    close the document in Word or Teams and retry later. This connector edits
+    in place; to save a copy, use onedrive_download_file and
+    onedrive_upload_file with a new remote_path."""
     try:
         _require_tool_output_budget()
         if not find:

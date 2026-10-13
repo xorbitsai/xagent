@@ -332,41 +332,31 @@ def _caller_safe_drive_item(item: Any) -> Any:
     return item
 
 
-def _error(
-    message: str,
-    *,
-    details: Any = None,
-    code: str | None = None,
-    retryable: bool | None = None,
-    lock_owner: str | None = None,
-    suggested_actions: list[str] | None = None,
-) -> str:
+def _error(message: str, *, details: Any = None) -> str:
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
-    if code is not None:
-        payload["code"] = code
-    if retryable is not None:
-        payload["retryable"] = retryable
-    if code == "resource_locked":
-        # Graph commonly omits the owner for driveItem 423 responses. Keep a
-        # stable field without exposing or guessing an identity.
-        payload["lock_owner"] = lock_owner
-    if suggested_actions is not None:
-        payload["suggested_actions"] = suggested_actions
     return json.dumps(payload, ensure_ascii=False)
 
 
 def _resource_locked_error(operation: str) -> str:
     """Return a stable, caller-actionable contract for a Graph 423."""
-    return _error(
-        f"The OneDrive item is locked, so it could not be {operation}. "
-        "Close the document in Word or Teams and retry later, or use a "
-        "different destination path to save a copy.",
-        code="resource_locked",
-        retryable=True,
-        lock_owner=None,
-        suggested_actions=["close_document_and_retry", "save_as_copy"],
+    return json.dumps(
+        {
+            "status": "error",
+            "message": (
+                f"The OneDrive item is locked, so it could not be {operation}. "
+                "Close the document in Word or Teams and retry later, or use a "
+                "different destination path to save a copy."
+            ),
+            "code": "resource_locked",
+            "retryable": True,
+            # Graph commonly omits the owner for driveItem 423 responses. Keep
+            # a stable field without exposing or guessing an identity.
+            "lock_owner": None,
+            "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+        },
+        ensure_ascii=False,
     )
 
 
@@ -397,8 +387,7 @@ def _raise_upload_status(response: Any) -> None:
     except requests.HTTPError as exc:
         status_code = getattr(response, "status_code", "unknown")
         raise _UploadError(
-            f"OneDrive upload fragment failed with HTTP {status_code}",
-            status_code=status_code if isinstance(status_code, int) else None,
+            f"OneDrive upload fragment failed with HTTP {status_code}"
         ) from exc
 
 
@@ -1581,8 +1570,8 @@ def onedrive_upload_file(
     a relative path resolves against this process's working directory.
     remote_path: the OneDrive path to upload to (e.g. "Reports/report.pdf"),
     overwriting any existing file there; defaults to the local file's own
-    name at the OneDrive root. Prefer the format-specific Word, Excel, or
-    PowerPoint tools when editing an existing Office document. If an existing
+    name at the OneDrive root. Prefer the format-specific Word or Excel tools
+    when editing an existing Office document. If an existing
     item is locked, this tool returns code="resource_locked"; do not retry the
     same destination immediately. Close the document and retry later, or ask
     the user before choosing a different remote_path to save a copy.
@@ -1676,7 +1665,7 @@ def onedrive_upload_file(
             logger.exception(
                 "Unexpected error uploading OneDrive file %s", local_file_path
             )
-        if _upload_status_code(e) == 423:
+        if _upload_status_code(e) in (409, 423):
             return _resource_locked_error("overwritten")
         return _error(str(e))
 

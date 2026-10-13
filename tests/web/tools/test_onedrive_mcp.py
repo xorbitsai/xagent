@@ -3171,6 +3171,33 @@ def test_upload_file_maps_large_upload_423_to_structured_lock_error(
     ]
 
 
+def test_upload_file_maps_create_session_423_from_cause_to_lock_error(
+    monkeypatch, _upload_allowed_dirs_env
+):
+    local_file = _upload_allowed_dirs_env / "report.docx"
+    local_file.write_bytes(b"content")
+    monkeypatch.setattr(
+        onedrive.os,
+        "fstat",
+        Mock(return_value=Mock(st_size=onedrive._SIMPLE_UPLOAD_MAX_BYTES + 1)),
+    )
+    monkeypatch.setattr(
+        onedrive.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"error": {"code": "notAllowed"}}, status_code=423
+            )
+        ),
+    )
+
+    result = json.loads(onedrive.onedrive_upload_file(str(local_file)))
+
+    assert result["status"] == "error"
+    assert result["code"] == "resource_locked"
+    assert result["retryable"] is True
+
+
 def test_upload_file_requires_completed_item_confirmation(
     monkeypatch, _upload_allowed_dirs_env
 ):

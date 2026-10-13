@@ -1862,6 +1862,35 @@ def test_checkout_retries_locked_item_before_revalidating(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("status_code", "expected_code"),
+    [(409, "resource_locked"), (412, "version_conflict")],
+)
+def test_checkout_conflicts_have_structured_codes(
+    monkeypatch, status_code, expected_code
+):
+    original = _docx_bytes(lambda d: d.add_paragraph("before"))
+    snapshot = word._EditSnapshot(
+        "/drives/drive-1/items/item-1",
+        '"before"',
+        hashlib.sha256(original).hexdigest(),
+    )
+    monkeypatch.setattr(
+        word.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"error": {"code": "conflict"}}, status_code=status_code
+            )
+        ),
+    )
+
+    with pytest.raises(word._WordEditConflict) as exc_info:
+        word._checkout_edit_snapshot(snapshot, "version conflict")
+
+    assert exc_info.value.code == expected_code
+
+
 def test_append_paragraph_returns_structured_lock_error_after_retries(monkeypatch):
     content = _docx_bytes()
     responses = iter(
@@ -1884,14 +1913,40 @@ def test_append_paragraph_returns_structured_lock_error_after_retries(monkeypatc
         "status": "error",
         "message": (
             "'Report.docx' is locked for editing; close it in Word or Teams and "
-            "retry later, or save a copy to a different path"
+            "retry later. This tool edits in place; use onedrive_download_file "
+            "and onedrive_upload_file with a new path to save a copy"
         ),
         "code": "resource_locked",
         "retryable": True,
-        "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+        "suggested_actions": ["close_document_and_retry"],
         "lock_owner": None,
     }
     assert [call.args for call in sleep.call_args_list] == [(1.0,), (2.0,)]
+
+
+def test_append_paragraph_returns_structured_version_conflict(monkeypatch):
+    content = _docx_bytes()
+    responses = iter(
+        [
+            MockResponse(_edit_metadata()),
+            MockResponse(content=content),
+            MockResponse({}, status_code=204),
+            MockResponse({"eTag": '"checked-out"'}),
+            MockResponse(content=content),
+            MockResponse({"error": {"code": "preconditionFailed"}}, status_code=412),
+            MockResponse({}, status_code=204),
+        ]
+    )
+    monkeypatch.setattr(
+        word.requests, "request", Mock(side_effect=lambda *a, **k: next(responses))
+    )
+
+    result = json.loads(word.word_append_paragraph("Report.docx", "New paragraph"))
+
+    assert result["status"] == "error"
+    assert result["code"] == "version_conflict"
+    assert result["retryable"] is True
+    assert result["suggested_actions"] == ["reread_and_retry"]
 
 
 @pytest.mark.parametrize("locked_phase", ["create-session", "content-put"])
@@ -1926,10 +1981,7 @@ def test_append_paragraph_returns_structured_lock_after_checkout(
     assert result["code"] == "resource_locked"
     assert result["retryable"] is True
     assert "locked for editing" in result["message"]
-    assert result["suggested_actions"] == [
-        "close_document_and_retry",
-        "save_as_copy",
-    ]
+    assert result["suggested_actions"] == ["close_document_and_retry"]
     assert mock_request.call_args_list[-1].kwargs["url"].endswith("/discardCheckout")
     assert mock_put.call_count == (1 if locked_phase == "content-put" else 0)
 
@@ -2189,9 +2241,10 @@ def test_download_document_refuses_to_adopt_existing_checkout(monkeypatch):
     mock_request = Mock(return_value=MockResponse(metadata))
     monkeypatch.setattr(word.requests, "request", mock_request)
 
-    with pytest.raises(ValueError, match="already checked out"):
+    with pytest.raises(word._WordEditConflict, match="already checked out") as exc_info:
         word._download_document("Report.docx", None, None)
 
+    assert exc_info.value.code == "resource_locked"
     assert mock_request.call_count == 1
 
 

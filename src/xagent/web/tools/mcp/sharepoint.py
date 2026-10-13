@@ -822,6 +822,18 @@ def sharepoint_get_file_content(
         content = _graph_request(
             "GET", _drive_content_path(site_id, file_path, drive_id), raw=True
         )
+        # UTF-8 validity alone is not a reliable binary check: a mislabeled
+        # Office/archive file can contain only valid UTF-8 bytes and would
+        # otherwise be copied into the model context as text.  Use the same
+        # default-deny extension policy as the text-upload tool before the
+        # decode heuristic, while retaining the latter for text files whose
+        # bytes are genuinely not UTF-8.
+        if _name_looks_binary(file_path):
+            return _error(
+                f"{file_path!r} looks like a binary file and is not returned "
+                "inline. Use sharepoint_download_file to store it in the task "
+                "workspace."
+            )
         # The runtime's generic output filter truncates any string value --
         # the JSON envelope _success returns below is one -- at
         # get_tool_max_output_length() characters without parsing it first,

@@ -564,6 +564,17 @@ def test_get_file_content_directs_binary_to_workspace_download(monkeypatch):
     assert "base64_content" not in result
 
 
+def test_get_file_content_rejects_binary_extension_even_for_utf8_bytes(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(content=b"valid utf-8 bytes"))
+    monkeypatch.setattr(sharepoint.requests, "request", mock_request)
+
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "report.docx"))
+
+    assert result["status"] == "error"
+    assert "sharepoint_download_file" in result["message"]
+    mock_request.assert_called_once()
+
+
 def test_download_file_writes_binary_to_task_workspace(monkeypatch, tmp_path):
     binary_content = b"\xff\xd8\xff\xe0binarydata"
     monkeypatch.setenv("XAGENT_SHAREPOINT_OUTPUT_DIR", str(tmp_path))
@@ -645,7 +656,7 @@ def test_get_file_content_rejects_raw_content_over_output_limit(monkeypatch):
     mock_request = Mock(return_value=MockResponse(content=b"x" * 200))
     monkeypatch.setattr(sharepoint.requests, "request", mock_request)
 
-    result = json.loads(sharepoint.sharepoint_get_file_content("root", "medium.bin"))
+    result = json.loads(sharepoint.sharepoint_get_file_content("root", "medium.txt"))
 
     assert result["status"] == "error"
     assert "too large" in result["message"]

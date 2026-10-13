@@ -21,6 +21,10 @@ from pydantic import BaseModel, ConfigDict, create_model
 from pydantic.alias_generators import to_camel
 
 from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
+from xagent.core.model.chat.basic.gemini import (
+    _flatten_json_schema,
+    _sanitize_schema_for_gemini,
+)
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.config import MCPUnavailableSummary
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -1846,10 +1850,10 @@ def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_digit_limit_value_er
 def test_normalize_args_by_schema_recovers_edge_case_shapes(value, expected):
     """Pins the current, intentional behavior for shapes the recovery
     doesn't specially validate: item types inside a recovered list aren't
-    checked against the schema's `items` type here (a real MCP tool call
-    still gets independently validated against its own typed arg model
-    downstream), and a decoded empty string is treated like any other
-    decoded scalar rather than being special-cased as "no value"."""
+    checked against the schema's `items` type in this normalization helper
+    (``run_json_async`` validates the emitted nested schema before calling the
+    server), and a decoded empty string is treated like any other decoded
+    scalar rather than being special-cased as "no value"."""
     adapter = MCPToolAdapter(
         mcp_tool=_google_analytics_run_report_mcp_tool(),
         connection={"transport": "stdio", "command": "python", "args": []},
@@ -4770,36 +4774,169 @@ def test_nested_bool_and_number_enum_members_stay_apart(
     assert ("enum" in carrier) is enum_expected
 
 
-def test_nested_field_metadata_is_not_extracted():
-    """Only the tool's own top-level fields are read.
-
-    A nested object or an array item schema is flattened to a bare Python
-    type here, so metadata written inside one does not reach the model. This
-    pins the documented boundary rather than asserting it is desirable.
-    """
+def test_nested_object_and_array_schema_reaches_the_model():
+    """Nested MCP requirements survive the adapter boundary."""
     emitted = _emitted_schema(
         {
             "address": {
                 "type": "object",
                 "description": "Postal address.",
                 "properties": {
-                    "street": {"type": "string", "description": "STREET_DESC"}
+                    "street": {
+                        "type": "string",
+                        "description": "STREET_DESC",
+                        "enum": ["Main", "High"],
+                    }
                 },
+                "required": ["street"],
+                "additionalProperties": False,
             },
             "tags": {
                 "type": "array",
                 "description": "Labels.",
-                "items": {"type": "string", "description": "ITEM_DESC"},
+                "items": {
+                    "type": "string",
+                    "description": "ITEM_DESC",
+                    "enum": ["urgent", "normal"],
+                },
             },
         },
         ["address", "tags"],
     )
-    serialized = _compact_json(emitted)
+    address = emitted["properties"]["address"]
+    tags = emitted["properties"]["tags"]
 
-    assert emitted["properties"]["address"]["description"] == "Postal address."
-    assert emitted["properties"]["tags"]["description"] == "Labels."
-    assert "STREET_DESC" not in serialized
-    assert "ITEM_DESC" not in serialized
+    assert address["description"] == "Postal address."
+    assert address["required"] == ["street"]
+    assert address["additionalProperties"] is False
+    assert address["properties"]["street"] == {
+        "description": "STREET_DESC",
+        "enum": ["Main", "High"],
+        "type": "string",
+    }
+    assert tags["description"] == "Labels."
+    assert tags["items"] == {
+        "description": "ITEM_DESC",
+        "enum": ["urgent", "normal"],
+        "type": "string",
+    }
+
+
+def test_nested_mcp_schema_survives_claude_and_gemini_provider_passes():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+                "additionalProperties": False,
+            }
+        },
+        ["params"],
+    )
+
+    claude = _fix_pydantic_schema_for_claude(emitted)
+    gemini = _sanitize_schema_for_gemini(_flatten_json_schema(emitted))
+
+    for provider_schema in (claude, gemini):
+        params = provider_schema["properties"]["params"]
+        assert params["required"] == ["includeFields"]
+        assert params["properties"]["includeFields"]["items"]["enum"] == [
+            "customer",
+            "owner",
+            "dates",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_nested_required_argument_is_rejected_before_mcp_execution(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+            }
+        },
+        ["params"],
+        tool_name="get_projects",
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"params": {}})
+
+    assert result == {
+        "content": [
+            {
+                "text": (
+                    "Invalid MCP tool arguments at params.includeFields: "
+                    "a required value is missing. Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_nested_enum_argument_is_rejected_before_mcp_execution(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+            }
+        },
+        ["params"],
+        tool_name="get_projects",
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(
+        {"params": {"includeFields": ["customerName"]}}
+    )
+
+    assert result == {
+        "content": [
+            {
+                "text": (
+                    "Invalid MCP tool arguments at params.includeFields.0: "
+                    "the value is outside the allowed enum. "
+                    "Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+    create_session_mock.assert_not_called()
 
 
 def test_an_unusable_numeric_bound_costs_only_its_own_key():

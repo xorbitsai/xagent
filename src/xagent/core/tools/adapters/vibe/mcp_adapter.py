@@ -33,6 +33,10 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import (  # type: ignore[import-untyped]
+    SchemaError as JSONSchemaError,
+)
 from mcp.types import CallToolResult
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, ValidationError, create_model
@@ -596,6 +600,10 @@ _READ_FIELD_SCHEMA_KEYS = frozenset(
         "anyOf",
         "oneOf",
         "allOf",
+        "properties",
+        "required",
+        "items",
+        "additionalProperties",
     }
 )
 # Numeric field-schema keys carried through, in the order they are emitted,
@@ -830,6 +838,149 @@ def _tool_field_metadata(
         metadata[field_name] = _FieldMetadata(emitted_default, description, extra)
 
     return _ToolFieldMetadata(metadata, rejected_keys, unreadable_fields)
+
+
+_JSON_SCHEMA_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_NESTED_SCHEMA_MAX_DEPTH = 16
+_NESTED_SCHEMA_MAX_NODES = 1024
+
+
+def _schema_type_for_emission(value: Any) -> str | list[str] | None:
+    """Return a provider-safe JSON Schema type declaration, if readable."""
+    if isinstance(value, str):
+        return value if value in _JSON_SCHEMA_TYPES else None
+    if not isinstance(value, list) or not value:
+        return None
+    types: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item not in _JSON_SCHEMA_TYPES:
+            return None
+        if item not in types:
+            types.append(item)
+    return types or None
+
+
+def _nested_schema_for_emission(
+    schema: Any,
+    *,
+    is_required: bool,
+    depth: int = 0,
+    _node_budget: list[int] | None = None,
+) -> dict[str, Any]:
+    """Build the bounded nested schema exposed to the model and validator.
+
+    MCP input schemas are remote-controlled.  Preserve the structural subset
+    needed to describe nested argument objects and arrays, but run every
+    model-facing string, enum, numeric bound, and recursive child through the
+    same guards as a top-level field.  Unsupported or malformed fragments are
+    dropped locally instead of being copied verbatim into every LLM request.
+    """
+    if _node_budget is None:
+        _node_budget = [0]
+    if (
+        not isinstance(schema, Mapping)
+        or depth >= _NESTED_SCHEMA_MAX_DEPTH
+        or _node_budget[0] >= _NESTED_SCHEMA_MAX_NODES
+    ):
+        return {}
+    _node_budget[0] += 1
+
+    emitted: dict[str, Any] = {}
+    schema_type = _schema_type_for_emission(schema.get("type"))
+    if schema_type is not None:
+        emitted["type"] = schema_type
+
+    if is_required:
+        emitted_default: Any = None
+        default_is_authored = False
+    else:
+        emitted_default, default_is_authored = _emitted_default(schema)
+    candidates, _ = _field_metadata_candidates(
+        schema,
+        emitted_default=emitted_default,
+        default_is_authored=default_is_authored,
+    )
+    for key, value in candidates:
+        emitted[key] = value
+
+    for union_key in ("anyOf", "oneOf", "allOf"):
+        raw_options = schema.get(union_key)
+        if not isinstance(raw_options, list) or not raw_options:
+            continue
+        options = [
+            _nested_schema_for_emission(
+                option,
+                is_required=True,
+                depth=depth + 1,
+                _node_budget=_node_budget,
+            )
+            for option in raw_options
+        ]
+        options = [option for option in options if option]
+        if options:
+            emitted[union_key] = options
+
+    raw_properties = schema.get("properties")
+    if isinstance(raw_properties, Mapping):
+        raw_required = schema.get("required")
+        required_names = (
+            {
+                name
+                for name in raw_required
+                if isinstance(name, str) and name in raw_properties
+            }
+            if isinstance(raw_required, list)
+            else set()
+        )
+        properties: dict[str, Any] = {}
+        for name, child_schema in raw_properties.items():
+            if not isinstance(name, str):
+                continue
+            child = _nested_schema_for_emission(
+                child_schema,
+                is_required=name in required_names,
+                depth=depth + 1,
+                _node_budget=_node_budget,
+            )
+            if child:
+                properties[name] = child
+        if properties:
+            emitted["properties"] = properties
+            required = [name for name in raw_properties if name in required_names]
+            if required:
+                emitted["required"] = required
+            if "type" not in emitted:
+                emitted["type"] = "object"
+
+    raw_items = schema.get("items")
+    if isinstance(raw_items, Mapping):
+        items = _nested_schema_for_emission(
+            raw_items,
+            is_required=True,
+            depth=depth + 1,
+            _node_budget=_node_budget,
+        )
+        if items:
+            emitted["items"] = items
+            if "type" not in emitted:
+                emitted["type"] = "array"
+
+    additional_properties = schema.get("additionalProperties")
+    if isinstance(additional_properties, bool):
+        emitted["additionalProperties"] = additional_properties
+    elif isinstance(additional_properties, Mapping):
+        nested_additional = _nested_schema_for_emission(
+            additional_properties,
+            is_required=True,
+            depth=depth + 1,
+            _node_budget=_node_budget,
+        )
+        if nested_additional:
+            emitted["additionalProperties"] = nested_additional
+
+    return emitted
 
 
 def _bounded_exception_nodes(
@@ -1531,6 +1682,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
         # Build models from MCP tool schema
         self._args_type = self._build_args_model()
+        self._args_validator = self._build_args_validator()
         self._return_type = self._build_return_model()
 
     @property
@@ -1694,14 +1846,10 @@ class MCPToolAdapter(AbstractBaseTool):
 
         Field-level metadata the connector author wrote (description, enum,
         pattern, format and the length/range bounds) is carried through to the
-        emitted schema as presentation only: it goes in as
-        ``json_schema_extra``, which never becomes a Pydantic validator, so
-        argument validation behaves exactly as it would without it.
-
-        Only the tool's own top-level fields are read. A nested ``object`` or
-        an ``array`` item schema is already flattened to a bare Python type
-        here, so metadata a connector wrote on a nested sub-field or on an
-        array's items is not extracted and does not reach the model.
+        emitted schema through ``json_schema_extra``. Nested object properties,
+        required names and array items are recursively carried through the same
+        bounded sanitizer. ``_build_args_validator`` then validates the parsed
+        arguments against exactly that emitted schema before a remote call.
 
         The metadata is attached to the field's annotation rather than placed
         beside the field. For an optional field Pydantic emits an ``anyOf``
@@ -1732,9 +1880,14 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Extract properties and required fields
             properties = schema.get("properties", {})
-            required = schema.get("required", [])
+            raw_required = schema.get("required", [])
+            required = (
+                {name for name in raw_required if isinstance(name, str)}
+                if isinstance(raw_required, list)
+                else set()
+            )
 
-            if not properties:
+            if not isinstance(properties, Mapping) or not properties:
                 return EmptyArgsModel
 
             # Build field definitions for create_model
@@ -1752,8 +1905,21 @@ class MCPToolAdapter(AbstractBaseTool):
                 # every field reaching here has a record.
                 field_metadata = metadata[field_name]
                 annotation: Any = self._json_schema_to_python_type(field_schema)
+                emitted_fragment = _nested_schema_for_emission(
+                    field_schema,
+                    is_required=field_name in required,
+                )
+                description = emitted_fragment.pop(
+                    "description", field_metadata.description
+                )
+                # Pydantic emits the annotation's type itself. Retaining the
+                # connector's identical scalar type is harmless, but dropping
+                # it avoids allowing malformed remote input to override the
+                # Python type selected above. Object/array structure stays in
+                # the fragment via properties/required/items.
+                emitted_fragment.pop("type", None)
 
-                if field_metadata.description is not None or field_metadata.extra:
+                if description is not None or emitted_fragment:
                     # Carried on the annotation so it lands inside the
                     # non-null branch of the `anyOf` an optional field gets.
                     # A field with nothing to say is left alone, so its
@@ -1761,8 +1927,8 @@ class MCPToolAdapter(AbstractBaseTool):
                     annotation = Annotated[
                         annotation,
                         Field(
-                            description=field_metadata.description,
-                            json_schema_extra=field_metadata.extra or None,
+                            description=description,
+                            json_schema_extra=emitted_fragment or None,
                         ),
                     ]
 
@@ -1798,6 +1964,71 @@ class MCPToolAdapter(AbstractBaseTool):
             )
 
             return EmptyArgsModel
+
+    def _build_args_validator(self) -> Any | None:
+        """Compile the exact model-visible argument schema for local checks.
+
+        A malformed remote schema must not make the whole connector unload.
+        ``_build_args_model`` already drops unsupported fragments; if the
+        remaining Pydantic schema is still invalid, preserve the historical
+        Pydantic-only validation path and log only the exception class.
+        """
+        try:
+            schema = self._args_type.model_json_schema()
+            Draft202012Validator.check_schema(schema)
+            return Draft202012Validator(schema)
+        except (JSONSchemaError, TypeError, ValueError) as exc:
+            logger.warning(
+                "MCP tool %s argument schema could not be compiled for nested "
+                "validation: %s",
+                self.mcp_tool.name,
+                type(exc).__name__,
+            )
+            return None
+
+    def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
+        if self._args_validator is None:
+            return None
+        return next(self._args_validator.iter_errors(dict(args)), None)
+
+    @staticmethod
+    def _invalid_arguments_result(error: Any) -> dict[str, Any]:
+        path = [str(part) for part in error.absolute_path]
+        if error.validator == "required" and isinstance(error.instance, Mapping):
+            required = error.validator_value
+            if isinstance(required, list):
+                missing = next(
+                    (
+                        name
+                        for name in required
+                        if isinstance(name, str) and name not in error.instance
+                    ),
+                    None,
+                )
+                if missing is not None:
+                    path.append(missing)
+        location = ".".join(path) or "arguments"
+        if error.validator == "required":
+            reason = "a required value is missing"
+        elif error.validator == "enum":
+            reason = "the value is outside the allowed enum"
+        elif error.validator == "type":
+            reason = "the value has the wrong type"
+        elif error.validator == "additionalProperties":
+            reason = "an unsupported field was supplied"
+        else:
+            reason = f"the {error.validator or 'schema'} constraint was not satisfied"
+        return {
+            "content": [
+                {
+                    "text": (
+                        f"Invalid MCP tool arguments at {location}: {reason}. "
+                        "Check the tool schema and retry."
+                    )
+                }
+            ],
+            "is_error": True,
+        }
 
     def _build_return_model(self) -> Type[BaseModel]:
         """Build return model for MCP tool output."""
@@ -2331,6 +2562,9 @@ class MCPToolAdapter(AbstractBaseTool):
             parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
             tool_args.update(self._runtime_tool_arguments())
+            argument_error = self._nested_argument_error(tool_args)
+            if argument_error is not None:
+                return self._invalid_arguments_result(argument_error)
             # Snapshot before the call, and attach in this shared layer so
             # subclass calls and authorization retries retain the same evidence.
             bound_args = self._runtime_tool_arguments(

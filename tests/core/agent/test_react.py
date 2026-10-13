@@ -79,12 +79,17 @@ class EmptyArgs(BaseModel):
 def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
     previous = SimpleNamespace(
         role="tool",
-        metadata={"raw_result": {"failure_code": "site_not_found"}},
+        metadata={"raw_result": {"success": False, "failure_code": "site_not_found"}},
     )
     user = SimpleNamespace(role="user", metadata={})
     current = SimpleNamespace(
         role="tool",
-        metadata={"raw_result": {"failure_code": "workbook_access_denied"}},
+        metadata={
+            "raw_result": {
+                "success": False,
+                "failure_code": "workbook_access_denied",
+            }
+        },
     )
     context = SimpleNamespace(messages=[previous, user, current])
 

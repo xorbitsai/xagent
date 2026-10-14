@@ -227,6 +227,26 @@ async def test_unconfigured_shared_execution_refuses_startup_before_database(
 
 
 @pytest.mark.asyncio
+async def test_invalid_auth_configuration_refuses_startup_before_database(
+    monkeypatch,
+):
+    initialize = AsyncMock()
+    monkeypatch.setattr(
+        app_module, "_initialize_database_and_admit_runtime", initialize
+    )
+
+    def reject_auth_configuration():
+        raise RuntimeError("invalid auth configuration")
+
+    monkeypatch.setattr(app_module, "validate_auth_config", reject_auth_configuration)
+
+    with pytest.raises(RuntimeError, match="invalid auth configuration"):
+        await app_module.startup_event()
+
+    initialize.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_trace_configuration_failure_stops_ingress_and_names_phase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

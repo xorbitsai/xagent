@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.responses import Response
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
@@ -183,7 +183,7 @@ class PublicWidgetCORSMiddleware:
             await response(scope, receive, send)
             return
 
-        async def send_widget_response(message: dict[str, Any]) -> None:
+        async def send_widget_response(message: Message) -> None:
             if message["type"] == "http.response.start":
                 response_headers = MutableHeaders(scope=message)
                 response_headers["Access-Control-Allow-Origin"] = origin

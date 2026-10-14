@@ -3,6 +3,18 @@ import pytest
 from xagent.web import auth_config
 
 
+@pytest.fixture(autouse=True)
+def _clear_auth_environment(monkeypatch):
+    for name in (
+        "ENVIRONMENT",
+        "XAGENT_ENVIRONMENT",
+        "XAGENT_JWT_SECRET",
+        "XAGENT_REQUIRE_SECURE_SECRETS",
+        "XAGENT_SESSION_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def test_development_allows_the_development_secret(monkeypatch):
     monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
     monkeypatch.delenv("ENVIRONMENT", raising=False)
@@ -24,6 +36,13 @@ def test_non_development_rejects_blank_and_placeholder_secrets(
         monkeypatch.setenv("XAGENT_JWT_SECRET", placeholder)
         with pytest.raises(RuntimeError, match="XAGENT_JWT_SECRET"):
             auth_config.validate_auth_config()
+
+
+def test_non_development_rejects_unset_secret(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+
+    with pytest.raises(RuntimeError, match="XAGENT_JWT_SECRET"):
+        auth_config.validate_auth_config()
 
 
 def test_non_development_accepts_a_configured_secret(monkeypatch):

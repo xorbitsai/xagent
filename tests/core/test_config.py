@@ -3931,3 +3931,21 @@ def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
     monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
     with pytest.raises(ValueError, match="must not exceed"):
         get_execution_budget_defaults()
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", " development ", "DEVELOPMENT"])
+def test_environment_defaults_and_normalizes_development(monkeypatch, value):
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    if value is None:
+        monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_ENVIRONMENT", value)
+
+    assert config.get_environment() == "development"
+
+
+def test_legacy_environment_alias_is_normalized(monkeypatch):
+    monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", " Production ")
+
+    assert config.get_environment() == "production"

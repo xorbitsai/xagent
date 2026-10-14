@@ -499,7 +499,7 @@ const zh = {
       errors: {
         fill_all: "请填写所有密码字段",
         mismatch: "新密码和确认密码不匹配",
-        too_short: "新密码长度至少8位",
+        too_short: "新密码长度至少 {min} 位",
         network: "网络错误，请稍后重试",
       },
       success: "密码更新成功",
@@ -561,7 +561,7 @@ const zh = {
       email: "邮箱",
       email_placeholder: "请输入邮箱地址",
       password: "密码",
-      password_placeholder: "请输入密码（至少8位）",
+      password_placeholder: "请输入密码",
       confirm_password: "确认密码",
       confirm_password_placeholder: "请再次输入密码",
       submit: "创建账户",
@@ -572,7 +572,7 @@ const zh = {
       failed: "注册失败",
       failed_retry: "注册失败，请稍后重试",
       password_mismatch: "密码不匹配",
-      password_too_short: "密码长度至少8位",
+      password_too_short: "密码长度至少 {min} 位",
       invalid_email: "请输入有效的邮箱地址",
     },
     login_hint: {
@@ -731,7 +731,7 @@ const zh = {
     errors: {
       required: "请填写用户名、邮箱和密码",
       invalidEmail: "请输入有效的邮箱地址",
-      passwordTooShort: "密码至少 8 位",
+      passwordTooShort: "密码至少 {min} 位",
       passwordMismatch: "两次输入的密码不一致",
       failed: "初始化失败",
     },
@@ -762,7 +762,7 @@ const zh = {
     description: "请输入您的新密码并确认",
     form: {
       password: "新密码",
-      password_placeholder: "请输入新密码（至少8位）",
+      password_placeholder: "请输入新密码",
       confirm_password: "确认新密码",
       confirm_password_placeholder: "请再次输入新密码",
       submit: "更新密码",
@@ -773,7 +773,7 @@ const zh = {
       failed: "密码重置失败",
       failed_retry: "密码重置失败，请稍后重试",
       password_mismatch: "两次输入的密码不一致",
-      password_too_short: "密码长度至少8位",
+      password_too_short: "密码长度至少 {min} 位",
       invalid_token: "重置链接无效或缺少 token",
     },
     back_to_login: "返回登录？",

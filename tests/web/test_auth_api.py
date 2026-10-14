@@ -1654,6 +1654,7 @@ class TestAuthAPI:
         assert status_before.status_code == 200
         data_before = status_before.json()
         assert data_before["needs_setup"] is True
+        assert data_before["password_min_length"] == auth_api.PASSWORD_MIN_LENGTH
 
         setup_first_admin()
 

@@ -2141,11 +2141,12 @@ def get_cors_origins() -> list[str]:
 
 def get_environment() -> str:
     """Return the normalized deployment environment name."""
-    return (
+    normalized = (
         (os.getenv(XAGENT_ENVIRONMENT) or os.getenv(ENVIRONMENT) or "development")
         .strip()
         .lower()
     )
+    return normalized or "development"
 
 
 def get_require_secure_secrets() -> bool:

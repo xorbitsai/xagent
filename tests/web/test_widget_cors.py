@@ -44,6 +44,19 @@ def test_widget_preflight_allows_foreign_origin_without_credentials() -> None:
     assert "access-control-allow-credentials" not in response.headers
 
 
+def test_widget_response_allows_foreign_origin_without_credentials() -> None:
+    response = _client().post(
+        "/api/widget/embed-ticket",
+        headers={"Origin": "https://customer.example"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == (
+        "https://customer.example"
+    )
+    assert "access-control-allow-credentials" not in response.headers
+
+
 def test_non_widget_preflight_keeps_credentialed_allowlist() -> None:
     response = _client().options(
         "/api/private",

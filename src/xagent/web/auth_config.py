@@ -7,15 +7,14 @@ from ..config import (
     get_session_secret,
 )
 
-_INSECURE_JWT_SECRET = INSECURE_SECRET_PLACEHOLDER
 _INSECURE_JWT_SECRET_VALUES = {
-    _INSECURE_JWT_SECRET,
+    INSECURE_SECRET_PLACEHOLDER,
     "change-me",
     "secret",
     "replace-with-a-long-random-secret",
     "change-me-to-a-random-session-secret",
 }
-JWT_SECRET_KEY = os.getenv("XAGENT_JWT_SECRET", _INSECURE_JWT_SECRET)
+JWT_SECRET_KEY = os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
 JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
 
 
@@ -24,7 +23,12 @@ def validate_auth_config() -> None:
     environment = get_environment()
     requires_secure_secret = environment != "development"
     requires_secure_secret = requires_secure_secret or get_require_secure_secrets()
-    configured_secret = os.getenv("XAGENT_JWT_SECRET", JWT_SECRET_KEY).strip()
+    # Read the environment again here rather than trusting the import-time JWT
+    # constant. Startup validation must catch a missing deployment setting even
+    # when another test or an embedding process imported this module earlier.
+    configured_secret = os.getenv(
+        "XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER
+    ).strip()
     if requires_secure_secret and (
         not configured_secret
         or configured_secret.lower() in _INSECURE_JWT_SECRET_VALUES

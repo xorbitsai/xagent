@@ -912,11 +912,25 @@ def _schema_is_null_option(schema: Any) -> bool:
 def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
     """Remove a validator keyword without treating property names as keywords."""
     if isinstance(schema, Mapping):
+        schema_maps = {"properties", "patternProperties", "$defs", "definitions"}
+        schema_lists = {"prefixItems", "anyOf", "oneOf", "allOf"}
+        schema_values = {
+            "additionalProperties",
+            "contains",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        }
         cleaned: dict[str, Any] = {}
         for key, value in schema.items():
             if key == keyword:
                 continue
-            if key in {"properties", "patternProperties", "$defs", "definitions"}:
+            if key in schema_maps:
                 if isinstance(value, Mapping):
                     cleaned[key] = {
                         name: _remove_schema_keyword(child, keyword)
@@ -924,11 +938,17 @@ def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
                     }
                 else:
                     cleaned[key] = value
-            else:
+            elif key in schema_lists and isinstance(value, list):
+                cleaned[key] = [
+                    _remove_schema_keyword(child, keyword) for child in value
+                ]
+            elif key in schema_values and isinstance(value, Mapping):
                 cleaned[key] = _remove_schema_keyword(value, keyword)
+            else:
+                # enum/default/examples and other literal values are data,
+                # not schema nodes; do not rewrite object members inside them.
+                cleaned[key] = value
         return cleaned
-    if isinstance(schema, list):
-        return [_remove_schema_keyword(value, keyword) for value in schema]
     return schema
 
 
@@ -1043,15 +1063,17 @@ def _nested_schema_for_emission(
         raw_property_names = [name for name in raw_properties if isinstance(name, str)]
         properties_complete = len(raw_property_names) == len(raw_properties)
         raw_required = schema.get("required")
-        required_order = (
-            [
-                name
-                for name in raw_required
-                if isinstance(name, str) and name in raw_properties
-            ]
-            if isinstance(raw_required, list)
-            else []
-        )
+        required_order: list[str] = []
+        if isinstance(raw_required, list):
+            seen_required: set[str] = set()
+            for name in raw_required:
+                if (
+                    isinstance(name, str)
+                    and name in raw_properties
+                    and name not in seen_required
+                ):
+                    required_order.append(name)
+                    seen_required.add(name)
         required_names = set(required_order)
         properties: dict[str, Any] = {}
         for name, child_schema in raw_properties.items():
@@ -1067,6 +1089,13 @@ def _nested_schema_for_emission(
                 if name not in required_names and not _schema_allows_null(child):
                     child = {"anyOf": [child, {"type": "null"}]}
                 properties[name] = child
+            elif name in required_names:
+                # Preserve the required key when a remote $ref, opaque Any,
+                # or exhausted budget leaves no readable child schema. An
+                # unconstrained placeholder is safer than silently relaxing
+                # the server's required contract.
+                properties[name] = {}
+                properties_complete = False
             else:
                 properties_complete = False
         emitted["properties"] = properties
@@ -2034,6 +2063,26 @@ class MCPToolAdapter(AbstractBaseTool):
                 # every field reaching here has a record.
                 field_metadata = metadata[field_name]
                 annotation: Any = self._json_schema_to_python_type(field_schema)
+                nullable_object_union = (
+                    isinstance(field_schema, Mapping)
+                    and any(
+                        isinstance(field_schema.get(union_key), list)
+                        for union_key in ("anyOf", "oneOf")
+                    )
+                    and isinstance(field_schema.get("properties"), Mapping)
+                )
+                if (
+                    field_name in required
+                    and _schema_allows_null(field_schema)
+                    and not nullable_object_union
+                ):
+                    # Required and nullable are independent JSON Schema
+                    # concepts. Keep the key required while allowing an
+                    # explicit null value; optional fields are wrapped below
+                    # and must stay on the non-null annotation so metadata is
+                    # not nested under two nullable unions.
+                    if annotation is not Any:
+                        annotation = self._build_union_type([annotation, type(None)])
                 emitted_fragment = _nested_schema_for_emission(
                     field_schema,
                     is_required=field_name in required,
@@ -2130,14 +2179,41 @@ class MCPToolAdapter(AbstractBaseTool):
     def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
         if self._args_validator is None:
             return None
-        error = jsonschema_exceptions.best_match(
-            self._args_validator.iter_errors(dict(args))
-        )
-        while error is not None and error.validator in {"anyOf", "oneOf"}:
-            nested = jsonschema_exceptions.best_match(error.context)
-            if nested is None or nested is error:
-                break
-            error = nested
+        errors = list(self._args_validator.iter_errors(dict(args)))
+        for candidate in errors:
+            if candidate.validator not in {"anyOf", "oneOf"}:
+                continue
+            options = (
+                candidate.schema.get(candidate.validator)
+                if isinstance(candidate.schema, Mapping)
+                else None
+            )
+            is_optional_union = (
+                isinstance(options, list)
+                and len(options) == 2
+                and sum(_schema_is_null_option(option) for option in options) == 1
+            )
+            if not is_optional_union:
+                # For a discriminated union, best_match may select a
+                # misleading enum/required error from the wrong branch.
+                return candidate
+
+        error = jsonschema_exceptions.best_match(errors)
+        if error is not None and error.validator in {"anyOf", "oneOf"}:
+            options = (
+                error.schema.get(error.validator)
+                if isinstance(error.schema, Mapping)
+                else None
+            )
+            is_optional_union = (
+                isinstance(options, list)
+                and len(options) == 2
+                and sum(_schema_is_null_option(option) for option in options) == 1
+            )
+            if is_optional_union:
+                nested = jsonschema_exceptions.best_match(error.context)
+                if nested is not None:
+                    error = nested
         return error
 
     @staticmethod
@@ -2166,6 +2242,18 @@ class MCPToolAdapter(AbstractBaseTool):
             reason = f"the value is outside the allowed enum {allowed}"
         elif error.validator == "type":
             reason = "the value has the wrong type"
+        elif error.validator in {
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "minLength",
+            "maxLength",
+        }:
+            reason = (
+                f"the {error.validator} constraint "
+                f"({_compact_json(error.validator_value)}) was not satisfied"
+            )
         elif error.validator == "additionalProperties":
             allowed_names: set[str] = set()
             if isinstance(error.schema, Mapping):
@@ -2180,9 +2268,14 @@ class MCPToolAdapter(AbstractBaseTool):
                 if name not in allowed_names
             )
             if unexpected:
-                reason = f"an unsupported field was supplied: {', '.join(unexpected)}"
+                unexpected_text = ", ".join(unexpected)
+                if len(unexpected_text) > 160:
+                    unexpected_text = unexpected_text[:157] + "..."
+                reason = f"an unsupported field was supplied: {unexpected_text}"
             else:
                 reason = "an unsupported field was supplied"
+        elif error.validator in {"anyOf", "oneOf"}:
+            reason = "the value does not match any allowed variant"
         else:
             reason = f"the {error.validator or 'schema'} constraint was not satisfied"
         return {
@@ -2729,9 +2822,15 @@ class MCPToolAdapter(AbstractBaseTool):
             parsed_args = self._args_type(**normalized_args)
             supplied_argument_names = set(normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
+            # ``exclude_none`` omits defaults and optional omissions, but an
+            # explicitly supplied null is still a real MCP argument. Preserve
+            # it so required-and-nullable fields remain present for both the
+            # local JSON Schema check and the remote call.
+            for name in supplied_argument_names:
+                if normalized_args.get(name) is None:
+                    tool_args[name] = None
             runtime_arguments = self._runtime_tool_arguments()
             tool_args.update(runtime_arguments)
-            supplied_argument_names.update(runtime_arguments)
             # Snapshot before the call, and attach in this shared layer so
             # subclass calls and authorization retries retain the same evidence.
             bound_args = self._runtime_tool_arguments(
@@ -2752,9 +2851,11 @@ class MCPToolAdapter(AbstractBaseTool):
                 return {"content": [{"text": message}], "is_error": True}
 
             # Pydantic inserts declared defaults before this point. Validate
-            # only values supplied by the model (plus runtime-bound values),
-            # so a connector's self-contradictory default does not reject an
-            # otherwise valid call that omitted the field.
+            # only values supplied by the model. Runtime-bound fields are
+            # intentionally absent from the args model, so validating them
+            # here would report them as unexpected properties. This also
+            # prevents a connector's self-contradictory default from rejecting
+            # an otherwise valid call that omitted the field.
             validation_args = {
                 name: value
                 for name, value in tool_args.items()

@@ -2201,6 +2201,61 @@ def test_build_args_model_handles_multi_value_type_list():
     assert args_model(value=123).value == 123
 
 
+def test_build_args_model_preserves_required_nullable_schema():
+    mcp_tool = SimpleNamespace(
+        name="required_nullable_tool",
+        description="Accept a required string or null",
+        inputSchema={
+            "type": "object",
+            "properties": {"value": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            "required": ["value"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    args_model = adapter.args_type()
+
+    assert args_model(value=None).value is None
+    assert args_model(value="abc").value == "abc"
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_preserves_explicit_null_for_required_nullable(
+    monkeypatch,
+):
+    adapter = _schema_adapter(
+        {
+            "value": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+            }
+        },
+        ["value"],
+    )
+    called: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"value": None})
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"value": None}
+
+
 @pytest.mark.asyncio
 async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
     monkeypatch,
@@ -4997,15 +5052,18 @@ def test_dropped_nested_properties_do_not_leave_a_closed_unsatisfiable_object():
     )
 
     params = emitted["properties"]["params"]
-    assert set(params["properties"]) == {"a", "c"}
-    assert params["required"] == ["a"]
+    assert set(params["properties"]) == {"a", "dropped", "c"}
+    assert params["required"] == ["a", "dropped"]
     assert params["additionalProperties"] is True
 
 
 def test_nested_budget_exhaustion_falls_back_to_later_top_level_metadata():
     wide_object = {
         "type": "object",
-        "properties": {f"field_{index}": {"type": "string"} for index in range(1023)},
+        "properties": {
+            f"field_{index}": {"type": "string"}
+            for index in range(mcp_adapter_module._NESTED_SCHEMA_MAX_NODES - 1)
+        },
     }
     emitted = _emitted_schema(
         {
@@ -5053,6 +5111,31 @@ def test_property_named_pattern_is_not_removed_from_local_validation():
     assert adapter._nested_argument_error({"filter": {"pattern": "*.py"}}) is None
 
 
+def test_pattern_inside_object_enum_literal_is_not_removed():
+    adapter = _schema_adapter(
+        {"value": {"type": "object", "enum": [{"pattern": "*.py"}]}}
+    )
+
+    assert adapter._nested_argument_error({"value": {"pattern": "*.py"}}) is None
+
+
+def test_duplicate_nested_required_names_are_deduplicated():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x", "x"],
+            }
+        },
+        ["params"],
+    )
+
+    emitted = adapter.args_type().model_json_schema()
+    assert emitted["properties"]["params"]["required"] == ["x"]
+    assert adapter._args_validator is not None
+
+
 def test_nested_union_does_not_hide_object_siblings_from_claude():
     emitted = _emitted_schema(
         {
@@ -5070,6 +5153,37 @@ def test_nested_union_does_not_hide_object_siblings_from_claude():
     assert "anyOf" not in params
     claude = _fix_pydantic_schema_for_claude(emitted)
     assert claude["properties"]["params"]["required"] == ["name"]
+
+
+def test_discriminated_union_error_stays_at_union_boundary():
+    adapter = _schema_adapter(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "alpha"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["kind", "name"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            }
+        },
+        ["choice"],
+    )
+
+    error = adapter._nested_argument_error({"choice": {"kind": "alpha"}})
+
+    assert error is not None
+    assert error.validator == "anyOf"
+    assert list(error.path) == ["choice"]
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,10 @@
 from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, text
-from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from sqlalchemy.types import TypeDecorator
 
-from .database import Base
 from ...core.utils.encryption import decrypt_value, encrypt_value
+from .database import Base
 
 
 class EncryptedOAuthToken(TypeDecorator[str]):
@@ -18,6 +18,7 @@ class EncryptedOAuthToken(TypeDecorator[str]):
 
     def process_result_value(self, value: str | None, dialect: object) -> str | None:
         return decrypt_value(value) if value else value
+
 
 USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
 _ORDINARY_OWNER_CLAUSE = text("resource_owner_key IS NULL")

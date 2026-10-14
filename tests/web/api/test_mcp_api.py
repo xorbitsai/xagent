@@ -47,6 +47,18 @@ from xagent.web.models.mcp import MCPServer
 from xagent.web.models.user import User
 
 
+@pytest.fixture(autouse=True)
+def _stub_synthetic_mcp_dns(monkeypatch):
+    real_validator = mcp_module.validate_public_http_url
+
+    async def validate(url: str) -> list[str]:
+        if url == "https://mcp.example.test":
+            return []
+        return await real_validator(url)
+
+    monkeypatch.setattr(mcp_module, "validate_public_http_url", validate)
+
+
 @pytest.mark.asyncio
 async def test_connection_test_rejects_stdio_transport_before_loading():
     with pytest.raises(HTTPException) as error:
@@ -75,6 +87,33 @@ async def test_connection_test_rejects_private_remote_endpoint():
         )
 
     assert error.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_connection_test_transport_cannot_be_overridden_by_config(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    async def fake_load(connection: dict[str, Any]) -> MCPLoadResult:
+        captured.update(connection)
+        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
+
+    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", fake_load)
+
+    await run_mcp_connection_test(
+        MCPConnectionTest(
+            name="remote",
+            transport="SSE",
+            config={
+                "transport": "stdio",
+                "command": "sh",
+                "args": ["-c", "id"],
+            },
+        ),
+        MagicMock(),
+    )
+
+    assert captured["transport"] == "sse"
+    assert captured["name"] == "remote"
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:

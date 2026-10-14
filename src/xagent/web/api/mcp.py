@@ -9,7 +9,6 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import ipaddress
 import json
 import logging
 import secrets
@@ -56,6 +55,7 @@ from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
+from ...core.utils.security import validate_public_http_url
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
@@ -93,6 +93,7 @@ from ..services.mcp_oauth import (
     MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
+    SafeOAuthAsyncHTTPTransport,
     _same_url,
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
@@ -5650,39 +5651,42 @@ async def test_mcp_connection(
     would otherwise execute an arbitrary command in the API process.
     """
     del db, current_user  # kept in the signature for dependency enforcement
-    if str(test_data.transport or "").strip().lower() not in HTTP_MCP_TRANSPORTS:
+    normalized_transport = str(test_data.transport or "").strip().lower()
+    if normalized_transport not in HTTP_MCP_TRANSPORTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Connection tests only support remote HTTP MCP transports",
         )
-    endpoint = (
-        test_data.config.get("url") if isinstance(test_data.config, dict) else None
-    )
+    connection: dict[str, Any] = {
+        **test_data.config,
+        "name": test_data.name,
+        "transport": normalized_transport,
+    }
+    endpoint = connection.get("url")
     if endpoint:
-        parsed_endpoint = urlsplit(str(endpoint))
-        hostname = (parsed_endpoint.hostname or "").lower().rstrip(".")
-        blocked_host = hostname in {
-            "localhost",
-            "localhost.localdomain",
-            "metadata.google.internal",
-        }
         try:
-            blocked_host = blocked_host or ipaddress.ip_address(hostname).is_private
-        except ValueError:
-            pass
-        if blocked_host:
+            await validate_public_http_url(str(endpoint))
+        except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Private and loopback MCP endpoints are not allowed",
-            )
+                detail="MCP endpoints must resolve to a public HTTP(S) host",
+            ) from exc
+
+    def _create_safe_mcp_http_client(
+        headers: dict[str, str] | None = None,
+        timeout: httpx.Timeout | None = None,
+        auth: httpx.Auth | None = None,
+    ) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            headers=headers,
+            timeout=timeout or httpx.Timeout(30.0),
+            auth=auth,
+            follow_redirects=False,
+            transport=SafeOAuthAsyncHTTPTransport(),
+        )
 
     try:
-        connection: dict[str, Any] = {
-            "name": test_data.name,
-            "transport": test_data.transport,
-        }
-
-        connection.update(**test_data.config)
+        connection["httpx_client_factory"] = _create_safe_mcp_http_client
 
         try:
             load_result = await _load_mcp_connection_test_tools(connection)

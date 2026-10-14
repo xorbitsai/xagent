@@ -1043,6 +1043,22 @@ class TestToolsGovernanceAPI:
         assert upsert.status_code == 400
         assert "Unsupported SQLAlchemy URL scheme" in upsert.json()["detail"]
 
+    def test_sql_connection_put_rejects_platform_database(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres:5432/xagent")
+        response = client.put(
+            "/api/tools/sql-connections/platform-copy",
+            headers=self._admin_headers(),
+            json={
+                "connection_url": (
+                    "postgresql+psycopg://other@public.example/other"
+                    "?host=postgres&dbname=xagent"
+                )
+            },
+        )
+
+        assert response.status_code == 400
+        assert "platform database" in response.json()["detail"]
+
     def test_sql_connections_are_user_scoped(self):
         user1_headers = self._user_headers("user1")
         user2_headers = self._user_headers("user2")

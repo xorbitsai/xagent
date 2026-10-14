@@ -5655,7 +5655,9 @@ async def test_mcp_connection(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Connection tests only support remote HTTP MCP transports",
         )
-    endpoint = test_data.config.get("url") if isinstance(test_data.config, dict) else None
+    endpoint = (
+        test_data.config.get("url") if isinstance(test_data.config, dict) else None
+    )
     if endpoint:
         parsed_endpoint = urlsplit(str(endpoint))
         hostname = (parsed_endpoint.hostname or "").lower().rstrip(".")

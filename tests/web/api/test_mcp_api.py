@@ -11,8 +11,8 @@ from typing import Any, Callable
 from unittest.mock import MagicMock
 
 import pytest
-from pydantic import ValidationError
 from fastapi import HTTPException
+from pydantic import ValidationError
 
 import xagent.web.api.mcp as mcp_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
@@ -194,7 +194,9 @@ async def test_connection_test_reports_successful_structured_load(monkeypatch):
 
     response = await run_mcp_connection_test(
         MCPConnectionTest(
-            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
         ),
         MagicMock(),
     )
@@ -229,7 +231,9 @@ async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
 
     response = await run_mcp_connection_test(
         MCPConnectionTest(
-            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
         ),
         MagicMock(),
     )
@@ -273,7 +277,9 @@ async def test_connection_test_reports_structured_load_failure_without_exception
 
     response = await run_mcp_connection_test(
         MCPConnectionTest(
-            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
         ),
         MagicMock(),
     )
@@ -309,7 +315,9 @@ async def test_connection_test_reports_no_tools_as_failure(monkeypatch):
 
     response = await run_mcp_connection_test(
         MCPConnectionTest(
-            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
         ),
         MagicMock(),
     )

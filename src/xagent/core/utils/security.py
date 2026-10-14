@@ -314,6 +314,47 @@ def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:
     return connect_url, host_header, hostname
 
 
+class PublicNetworkAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    """HTTP transport that validates and pins every outbound request host."""
+
+    def __init__(self) -> None:
+        self._transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(max_keepalive_connections=0),
+            trust_env=False,
+            verify=build_ca_bundle_ssl_context(),
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original_url = request.url
+        original_host = request.headers.get("Host")
+        resolved_ips = await validate_public_http_url(str(original_url))
+        last_error: httpx.TransportError | None = None
+        for resolved_ip in resolved_ips:
+            connect_url, host_header, sni = _pin_url_to_ip(
+                urlsplit(str(original_url)), resolved_ip
+            )
+            request.url = httpx.URL(connect_url)
+            request.headers["Host"] = host_header
+            if original_url.scheme == "https":
+                request.extensions["sni_hostname"] = sni
+            try:
+                return await self._transport.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_error = exc
+            finally:
+                request.url = original_url
+                if original_host is None:
+                    request.headers.pop("Host", None)
+                else:
+                    request.headers["Host"] = original_host
+        if last_error is not None:
+            raise last_error
+        raise ValueError("Public host did not resolve to a usable address")
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
 _MAX_REDIRECTS = 5
 
 

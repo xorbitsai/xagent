@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from urllib.parse import unquote, urlsplit
 
+import httpx
+
 from ....config import (
     get_browser_allow_unsandboxed,
     get_browser_tool_default_locale,
     get_browser_tool_default_timezone,
 )
-from ...utils.security import validate_public_http_url
+from ...utils.security import PublicNetworkAsyncHTTPTransport, validate_public_http_url
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -129,6 +131,7 @@ class BrowserSession:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._playwright: Any = None
+        self._http_client: httpx.AsyncClient | None = None
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
@@ -173,22 +176,56 @@ class BrowserSession:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale=self.locale,
                 timezone_id=self.timezone_id,
+                service_workers="block",
             )
 
-            self._page = await self._context.new_page()
+            self._http_client = httpx.AsyncClient(
+                transport=PublicNetworkAsyncHTTPTransport(),
+                follow_redirects=False,
+                timeout=httpx.Timeout(30.0),
+            )
 
             async def guard_route(route: Any) -> None:
                 try:
+                    request_url = route.request.url
                     await _validate_browser_target(
-                        route.request.url,
+                        request_url,
                         workspace_root=self.workspace_root,
                     )
-                except (TypeError, ValueError):
+                    if urlsplit(request_url).scheme == "file":
+                        await route.continue_()
+                        return
+                    assert self._http_client is not None
+                    request_headers = await route.request.all_headers()
+                    response = await self._http_client.request(
+                        route.request.method,
+                        request_url,
+                        headers=request_headers,
+                        content=route.request.post_data_buffer,
+                    )
+                    response_headers = dict(response.headers)
+                    for header in (
+                        "connection",
+                        "content-encoding",
+                        "content-length",
+                        "transfer-encoding",
+                    ):
+                        response_headers.pop(header, None)
+                    await route.fulfill(
+                        status=response.status_code,
+                        headers=response_headers,
+                        body=response.content,
+                    )
+                except (OSError, TypeError, ValueError, httpx.HTTPError):
                     await route.abort()
-                    return
-                await route.continue_()
 
-            await self._page.route("**/*", guard_route)
+            await self._context.route("**/*", guard_route)
+            if hasattr(self._context, "route_web_socket"):
+                await self._context.route_web_socket(
+                    "**/*", lambda websocket: websocket.close(code=1008)
+                )
+
+            self._page = await self._context.new_page()
 
             # Languages mirror the context's own locale instead of a fixed
             # list, so the spoofed navigator.languages stays consistent with
@@ -271,6 +308,13 @@ class BrowserSession:
                 self._browser = None
         except Exception:
             pass  # Ignore browser close errors
+
+        try:
+            if self._http_client:
+                await self._http_client.aclose()
+                self._http_client = None
+        except Exception:
+            pass  # Ignore client close errors
 
         try:
             # Stop playwright
@@ -473,14 +517,14 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             str(url),
             workspace_root=workspace_root if isinstance(workspace_root, str) else None,
         )
-    except (TypeError, ValueError):
+    except (OSError, TypeError, ValueError) as exc:
         return {
             "success": False,
             "session_id": session_id,
             "url": url,
             "title": "",
             "message": "",
-            "error": "Only public network URLs are allowed",
+            "error": str(exc) or "Only public network URLs are allowed",
         }
     headless = kwargs.get("headless", False)
     wait_until = kwargs.get("wait_until", "networkidle")
@@ -506,20 +550,18 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
     page = await session.get_page()
 
     try:
-        wait_until_local = wait_until
-
         # Log navigation attempt for debugging
         import logging
 
         logger = logging.getLogger(__name__)
         logger.info(
-            f"[browser_navigate] Navigating to {url} (headless={headless}, wait_until={wait_until_local})"
+            f"[browser_navigate] Navigating to {url} (headless={headless}, wait_until={wait_until})"
         )
 
         # Add timeout to prevent hanging (default 30 seconds)
         # Using wait_until parameter (default: 'networkidle', but can be 'domcontentloaded' or 'load')
         # networkidle can hang on pages with continuous background requests
-        await page.goto(url, wait_until=wait_until_local, timeout=30000)
+        await page.goto(url, wait_until=wait_until, timeout=30000)
         # Get title (no timeout parameter available for title())
         title = await page.title()
 

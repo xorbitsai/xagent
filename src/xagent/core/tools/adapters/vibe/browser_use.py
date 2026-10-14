@@ -399,6 +399,9 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         if self._workspace is not None:
             args = dict(args)
             args["_workspace_root"] = str(self._workspace.workspace_dir)
+        elif "_workspace_root" in args:
+            args = dict(args)
+            args.pop("_workspace_root", None)
 
         # Debug logging
         import logging

@@ -67,7 +67,7 @@ class TestBrowserNavigate:
                 result = asyncio.run(
                     browser_use.browser_navigate(session_id="test-session", url=url)
                 )
-                assert result["error"] == "Only public network URLs are allowed"
+                assert "private network" in result["error"]
 
     def test_navigate_allows_workspace_file_only(self, tmp_path):
         import asyncio
@@ -91,7 +91,7 @@ class TestBrowserNavigate:
             )
 
         assert "Only public network URLs are allowed" not in allowed["error"]
-        assert blocked["error"] == "Only public network URLs are allowed"
+        assert blocked["error"] == "Only workspace files are allowed"
 
 
 class TestBrowserClick:

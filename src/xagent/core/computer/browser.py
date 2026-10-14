@@ -171,11 +171,15 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self._browser_session: Any | None = None
 
     async def _get_page(self, *, reject_recreated_session: bool) -> Any:
+        workspace_dir = getattr(self.workspace, "workspace_dir", None)
+        session_kwargs: dict[str, Any] = {
+            "headless": self.headless,
+            "locale": self.locale,
+        }
+        if workspace_dir is not None:
+            session_kwargs["workspace_root"] = str(workspace_dir)
         session = await self.manager.get_or_create(
-            self._manager_session_id,
-            headless=self.headless,
-            locale=self.locale,
-            workspace_root=str(self.workspace.workspace_dir),
+            self._manager_session_id, **session_kwargs
         )
         recreated = (
             self._browser_session is not None and session is not self._browser_session
@@ -344,7 +348,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             target_url = self._resolve_navigation_url(action.url)
             try:
                 await validate_public_http_url(target_url)
-            except ValueError as exc:
+            except (OSError, ValueError) as exc:
                 raise ValueError("Only public HTTP(S) URLs are allowed") from exc
             await page.goto(
                 target_url,

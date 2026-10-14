@@ -578,15 +578,14 @@ def _is_non_negative_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-# Every field-schema key this adapter reads: the eight it carries into the
-# emitted schema, the four `_json_schema_to_python_type` resolves a type from,
-# and `default`. A key outside this set reaches neither the emitted schema nor
-# the field's type, so it is dropped -- `items`, `const`, `multipleOf`,
-# `exclusiveMinimum` and `title` among them -- and is counted as such.
+# Every field-schema key this adapter reads for metadata, structure, or type
+# conversion. A key outside this set reaches neither the emitted schema nor
+# the field's type, so it is dropped and counted as such.
 _READ_FIELD_SCHEMA_KEYS = frozenset(
     {
         "description",
         "enum",
+        "const",
         "pattern",
         "format",
         "minLength",
@@ -673,6 +672,8 @@ def _field_metadata_candidates(
 
     if "enum" in field_schema:
         raw_enum = field_schema["enum"]
+        raw_const = field_schema.get("const")
+        has_const = "const" in field_schema
         # An over-long enum is dropped whole rather than shortened: a clipped
         # list still reads as the complete set of legal values, so it would
         # tell the model that a value the server accepts is illegal.
@@ -695,11 +696,33 @@ def _field_metadata_candidates(
             and _is_json_serializable(raw_enum)
             and len(_compact_json(raw_enum)) <= _FIELD_TEXT_MAX_CHARS
             and (
+                not has_const
+                or (
+                    _is_json_serializable(raw_const)
+                    and len(_compact_json(raw_const)) <= _FIELD_TEXT_MAX_CHARS
+                    and any(_json_equal(raw_const, member) for member in raw_enum)
+                )
+            )
+            and (
                 not default_is_authored
-                or any(_json_equal(emitted_default, member) for member in raw_enum)
+                or _json_equal(
+                    emitted_default,
+                    raw_const if has_const else next(iter(raw_enum)),
+                )
             )
         ):
-            candidates.append(("enum", list(raw_enum)))
+            candidates.append(("enum", [raw_const] if has_const else list(raw_enum)))
+        else:
+            rejected += 1
+
+    if "const" in field_schema and "enum" not in field_schema:
+        raw_const = field_schema["const"]
+        if (
+            _is_json_serializable(raw_const)
+            and len(_compact_json(raw_const)) <= _FIELD_TEXT_MAX_CHARS
+            and (not default_is_authored or _json_equal(emitted_default, raw_const))
+        ):
+            candidates.append(("enum", [raw_const]))
         else:
             rejected += 1
 
@@ -860,6 +883,23 @@ def _schema_type_for_emission(value: Any) -> str | list[str] | None:
     return types or None
 
 
+def _schema_allows_null(schema: Any) -> bool:
+    if not isinstance(schema, Mapping):
+        return False
+    schema_type = schema.get("type")
+    if schema_type == "null":
+        return True
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return True
+    for union_key in ("anyOf", "oneOf"):
+        options = schema.get(union_key)
+        if isinstance(options, list) and any(
+            _schema_allows_null(option) for option in options
+        ):
+            return True
+    return False
+
+
 def _nested_schema_for_emission(
     schema: Any,
     *,
@@ -903,25 +943,37 @@ def _nested_schema_for_emission(
     for key, value in candidates:
         emitted[key] = value
 
-    for union_key in ("anyOf", "oneOf", "allOf"):
+    union_options: list[dict[str, Any]] = []
+    union_is_lossless = True
+    for union_key in ("anyOf", "oneOf"):
         raw_options = schema.get(union_key)
         if not isinstance(raw_options, list) or not raw_options:
             continue
-        options = [
-            _nested_schema_for_emission(
+        if not all(isinstance(option, Mapping) for option in raw_options):
+            union_is_lossless = False
+            continue
+        for option in raw_options:
+            emitted_option = _nested_schema_for_emission(
                 option,
                 is_required=True,
                 depth=depth + 1,
                 _node_budget=_node_budget,
             )
-            for option in raw_options
-        ]
-        options = [option for option in options if option]
-        if options:
-            emitted[union_key] = options
+            if not emitted_option:
+                union_is_lossless = False
+            else:
+                union_options.append(emitted_option)
+    if union_options and union_is_lossless:
+        # Gemini accepts anyOf but rejects oneOf. A lossy union is omitted
+        # instead of being narrowed to the surviving branches.
+        emitted["anyOf"] = union_options
 
     raw_properties = schema.get("properties")
+    raw_property_names: list[str] = []
+    properties_complete = True
     if isinstance(raw_properties, Mapping):
+        raw_property_names = [name for name in raw_properties if isinstance(name, str)]
+        properties_complete = len(raw_property_names) == len(raw_properties)
         raw_required = schema.get("required")
         required_names = (
             {
@@ -943,14 +995,17 @@ def _nested_schema_for_emission(
                 _node_budget=_node_budget,
             )
             if child:
+                if name not in required_names and not _schema_allows_null(child):
+                    child = {"anyOf": [child, {"type": "null"}]}
                 properties[name] = child
-        if properties:
-            emitted["properties"] = properties
-            required = [name for name in raw_properties if name in required_names]
-            if required:
-                emitted["required"] = required
-            if "type" not in emitted:
-                emitted["type"] = "object"
+            else:
+                properties_complete = False
+        emitted["properties"] = properties
+        required = [name for name in required_names if name in properties]
+        if required:
+            emitted["required"] = required
+        if "type" not in emitted:
+            emitted["type"] = "object"
 
     raw_items = schema.get("items")
     if isinstance(raw_items, Mapping):
@@ -966,7 +1021,12 @@ def _nested_schema_for_emission(
                 emitted["type"] = "array"
 
     additional_properties = schema.get("additionalProperties")
-    if isinstance(additional_properties, bool):
+    additional_properties_safe = properties_complete and not (
+        "patternProperties" in schema or "propertyNames" in schema
+    )
+    if isinstance(additional_properties, bool) and (
+        additional_properties or additional_properties_safe
+    ):
         emitted["additionalProperties"] = additional_properties
     elif isinstance(additional_properties, Mapping):
         nested_additional = _nested_schema_for_emission(
@@ -975,7 +1035,7 @@ def _nested_schema_for_emission(
             depth=depth + 1,
             _node_budget=_node_budget,
         )
-        if nested_additional:
+        if nested_additional and additional_properties_safe:
             emitted["additionalProperties"] = nested_additional
 
     return emitted
@@ -1847,7 +1907,8 @@ class MCPToolAdapter(AbstractBaseTool):
         emitted schema through ``json_schema_extra``. Nested object properties,
         required names and array items are recursively carried through the same
         bounded sanitizer. ``_build_args_validator`` then validates the parsed
-        arguments against exactly that emitted schema before a remote call.
+        arguments against the adapter-visible schema before a remote call;
+        provider-specific schema rewrites may be less restrictive.
 
         The metadata is attached to the field's annotation rather than placed
         beside the field. For an optional field Pydantic emits an ``anyOf``
@@ -1895,6 +1956,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 properties, required, runtime_bound_args
             )
             metadata = tool_metadata.fields
+            nested_node_budget = [0]
 
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
@@ -1906,6 +1968,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 emitted_fragment = _nested_schema_for_emission(
                     field_schema,
                     is_required=field_name in required,
+                    _node_budget=nested_node_budget,
                 )
                 description = emitted_fragment.pop(
                     "description", field_metadata.description
@@ -1987,7 +2050,9 @@ class MCPToolAdapter(AbstractBaseTool):
     def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
         if self._args_validator is None:
             return None
-        return next(self._args_validator.iter_errors(dict(args)), None)
+        return jsonschema_exceptions.best_match(
+            self._args_validator.iter_errors(dict(args))
+        )
 
     @staticmethod
     def _invalid_arguments_result(error: Any) -> dict[str, Any]:

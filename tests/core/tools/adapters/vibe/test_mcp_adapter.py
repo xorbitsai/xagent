@@ -4526,8 +4526,9 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
         "bad_minimum": {"type": "number", "minimum": float("inf")},
         "bad_format": {"type": "string", "format": "not-a-known-format"},
         "bad_description": {"type": "string", "description": 123},
-        # Four keys this adapter never reads: they reach neither the emitted
-        # schema nor the field's type.
+        # Three keys this adapter never reads: they reach neither the emitted
+        # schema nor the field's type. ``const`` is converted to a single-value
+        # enum and therefore is intentionally retained.
         "unread_keys": {
             "type": "integer",
             "exclusiveMinimum": 1,
@@ -4549,7 +4550,7 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
     ]
     assert len(lines) == 1
     assert lines[0] == (
-        "MCP tool reject_probe dropped 7 field schema metadata keys and 1 unreadable field schemas"
+        "MCP tool reject_probe dropped 6 field schema metadata keys and 1 unreadable field schemas"
     )
 
 
@@ -4854,6 +4855,118 @@ def test_nested_mcp_schema_survives_claude_and_gemini_provider_passes():
             "owner",
             "dates",
         ]
+
+
+def test_union_schema_is_gemini_compatible_and_const_discriminators_survive():
+    from google.genai import types
+
+    emitted = _emitted_schema(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "alpha"}},
+                        "required": ["kind"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            },
+            "bounded": {
+                "allOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "string", "maxLength": 32},
+                ]
+            },
+        },
+        ["choice", "bounded"],
+    )
+
+    choice = emitted["properties"]["choice"]
+    assert "oneOf" not in choice
+    assert "anyOf" in choice
+    assert [option["properties"]["kind"]["enum"] for option in choice["anyOf"]] == [
+        ["alpha"],
+        ["beta"],
+    ]
+    assert "allOf" not in emitted["properties"]["bounded"]
+
+    gemini = _sanitize_schema_for_gemini(_flatten_json_schema(emitted))
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="probe",
+                description="probe",
+                parameters=gemini,
+            )
+        ]
+    )
+
+
+def test_lossy_union_is_omitted_instead_of_narrowed_to_null():
+    emitted = _emitted_schema(
+        {
+            "value": {
+                "oneOf": [
+                    {"$ref": "#/$defs/Model"},
+                    {"type": "null"},
+                ]
+            }
+        }
+    )
+
+    value = emitted["properties"]["value"]
+    assert "oneOf" not in value
+    assert any(option != {"type": "null"} for option in value.get("anyOf", []))
+
+
+def test_dropped_nested_properties_do_not_leave_a_closed_unsatisfiable_object():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "dropped": {"$ref": "#/$defs/Missing"},
+                    "c": {"type": "integer"},
+                },
+                "required": ["a", "dropped"],
+                "additionalProperties": False,
+            }
+        },
+        ["params"],
+    )
+
+    params = emitted["properties"]["params"]
+    assert set(params["properties"]) == {"a", "c"}
+    assert params["required"] == ["a"]
+    assert params["additionalProperties"] is True
+
+
+def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }
+        },
+        ["params"],
+    )
+
+    assert adapter._nested_argument_error({"params": {"limit": None}}) is None
+
+
+def test_invalid_nested_pattern_disables_only_local_schema_validation():
+    adapter = _schema_adapter(
+        {"params": {"type": "string", "pattern": "["}}, ["params"]
+    )
+
+    assert adapter._args_validator is None
 
 
 @pytest.mark.asyncio

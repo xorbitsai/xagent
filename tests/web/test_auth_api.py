@@ -1520,6 +1520,36 @@ class TestAuthAPI:
         )
         db.close()
 
+    def test_register_enforces_configured_password_minimum(self, test_db, monkeypatch):
+        monkeypatch.setattr(auth_api, "PASSWORD_MIN_LENGTH", 8)
+        setup_first_admin()
+
+        too_short = client.post(
+            "/api/auth/register",
+            json={
+                "username": "short-password-user",
+                "email": "short-password@example.com",
+                "password": "1234567",
+            },
+        )
+        exact_minimum = client.post(
+            "/api/auth/register",
+            json={
+                "username": "minimum-password-user",
+                "email": "minimum-password@example.com",
+                "password": "12345678",
+            },
+        )
+
+        assert too_short.status_code == 200
+        assert too_short.json() == {
+            "success": False,
+            "message": "Password must be at least 8 characters",
+            "user": None,
+        }
+        assert exact_minimum.status_code == 200
+        assert exact_minimum.json()["success"] is True
+
     def test_register_duplicate_username(self, test_db, test_user_data):
         """Test registration with duplicate username"""
         setup_first_admin()

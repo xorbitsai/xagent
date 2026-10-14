@@ -667,6 +667,12 @@ Any browser session or password-reset token previously signed with the example
 placeholder is intentionally invalid after that first startup, so users must
 sign in again.
 
+This release also replaces wildcard credentialed CORS for private API routes
+with `XAGENT_CORS_ORIGINS` (default: `XAGENT_FRONTEND_URL`). Before upgrading,
+list every other trusted browser origin that calls non-widget APIs as a
+comma-separated value. Public `/api/widget/` embedding remains origin-agnostic
+and credential-free.
+
 ### Volumes
 
 Data persists in Docker volumes:

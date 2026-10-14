@@ -18,6 +18,11 @@ JWT_SECRET_KEY = os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
 JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
 
 
+def _is_insecure_secret(value: str) -> bool:
+    normalized = value.strip().lower()
+    return not normalized or normalized in _INSECURE_JWT_SECRET_VALUES
+
+
 def validate_auth_config() -> None:
     """Fail production startup when the JWT signing secret is not configured."""
     environment = get_environment()
@@ -29,15 +34,10 @@ def validate_auth_config() -> None:
     configured_secret = os.getenv(
         "XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER
     ).strip()
-    if requires_secure_secret and (
-        not configured_secret
-        or configured_secret.lower() in _INSECURE_JWT_SECRET_VALUES
-    ):
+    if requires_secure_secret and _is_insecure_secret(configured_secret):
         raise RuntimeError("XAGENT_JWT_SECRET must be set to a unique deployment value")
     session_secret = get_session_secret().strip()
-    if requires_secure_secret and (
-        not session_secret or session_secret.lower() in _INSECURE_JWT_SECRET_VALUES
-    ):
+    if requires_secure_secret and _is_insecure_secret(session_secret):
         raise RuntimeError(
             "XAGENT_SESSION_SECRET or XAGENT_JWT_SECRET must provide a unique "
             "session signing value"

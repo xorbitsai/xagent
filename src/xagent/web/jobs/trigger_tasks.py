@@ -158,3 +158,27 @@ def scan_due_triggers() -> dict[str, Any]:
         }
     finally:
         db.close()
+
+
+@celery_app.task(name="xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows")
+def purge_leftover_milvus_rows() -> dict[str, Any]:
+    """Celery Beat entrypoint for the periodic leftover Milvus row purge."""
+    logger.info("Milvus cleanup tick")
+    try:
+        from ...core.tools.core.RAG_tools.kb.milvus_cleanup import (
+            purge_leftover_milvus_rows as purge,
+        )
+
+        deleted = purge()
+    except Exception as exc:  # noqa: BLE001 - a failed purge must not break dispatch
+        logger.warning("Milvus cleanup failed: %s", exc, exc_info=True)
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }

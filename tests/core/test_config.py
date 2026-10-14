@@ -58,6 +58,7 @@ from xagent.config import (
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
     KB_COLLECTIONS_TIMEOUT_SECONDS,
+    KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
     KB_SEARCH_TIMEOUT_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
@@ -169,6 +170,7 @@ from xagent.config import (
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
     get_kb_collections_timeout_seconds,
+    get_kb_milvus_cleanup_interval_seconds,
     get_kb_search_timeout_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
@@ -826,6 +828,20 @@ class TestCeleryBackgroundJobConfig:
         assert get_background_job_max_retries() == 3
         assert get_background_job_stale_seconds() == 7200
         assert get_background_job_sweep_interval_seconds() == 300
+
+    def test_kb_milvus_cleanup_interval_default(self, monkeypatch):
+        monkeypatch.delenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, raising=False)
+        assert get_kb_milvus_cleanup_interval_seconds() == 3600
+
+    def test_kb_milvus_cleanup_interval_env_override(self, monkeypatch):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, "600")
+        assert get_kb_milvus_cleanup_interval_seconds() == 600
+
+    def test_kb_milvus_cleanup_interval_below_minimum_falls_back_to_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, "299")
+        assert get_kb_milvus_cleanup_interval_seconds() == 3600
 
     def test_trigger_dispatcher_tuning(self, monkeypatch):
         monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)

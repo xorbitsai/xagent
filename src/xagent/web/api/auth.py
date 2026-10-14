@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-from collections import defaultdict, deque
 import hashlib
 import html
 import json
@@ -10,13 +9,14 @@ import logging
 import os
 import re
 import secrets
-import time
 import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
 
-import requests
 import bcrypt
+import requests
 
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -1612,8 +1612,8 @@ def hash_password(password: str) -> str:
     SHA-256 rows are accepted by ``verify_password`` once and transparently
     upgraded by the login path.
     """
-    password_material = hashlib.sha256(password.encode("utf-8")).hexdigest().encode(
-        "ascii"
+    password_material = (
+        hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
     )
     return bcrypt.hashpw(password_material, bcrypt.gensalt()).decode("ascii")
 
@@ -1622,8 +1622,8 @@ def verify_password(password: str, password_hash: str) -> bool:
     """Verify bcrypt passwords and transparently support legacy SHA-256 rows."""
     if password_hash.startswith(("$2a$", "$2b$", "$2y$")):
         try:
-            password_material = hashlib.sha256(password.encode("utf-8")).hexdigest().encode(
-                "ascii"
+            password_material = (
+                hashlib.sha256(password.encode("utf-8")).hexdigest().encode("ascii")
             )
             return bcrypt.checkpw(password_material, password_hash.encode("ascii"))
         except (ValueError, UnicodeEncodeError):

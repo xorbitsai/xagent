@@ -160,7 +160,12 @@ def scan_due_triggers() -> dict[str, Any]:
         db.close()
 
 
-@celery_app.task(name="xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows")
+@celery_app.task(
+    name="xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows",
+    # A lost purge is redone next interval; the global acks_late=True plus the
+    # 3600s visibility timeout would redeliver a long purge instead.
+    acks_late=False,
+)
 def purge_leftover_milvus_rows() -> dict[str, Any]:
     """Celery Beat entrypoint for the periodic leftover Milvus row purge."""
     logger.info("Milvus cleanup tick")

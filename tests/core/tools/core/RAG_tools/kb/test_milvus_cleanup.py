@@ -70,12 +70,23 @@ def client() -> Any:
     return _milvus()
 
 
+@pytest.fixture(autouse=True)
+def only_own_collections(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Scope the purge to this test's collections in the shared CI Milvus."""
+    names: list[str] = []
+    monkeypatch.setattr(
+        milvus_cleanup, "_milvus_collections", lambda _client: list(names)
+    )
+    return names
+
+
 @pytest.fixture
-def model(client: Any) -> str:
+def model(client: Any, only_own_collections: list[str]) -> str:
     model = f"cleanup-{uuid.uuid4().hex[:12]}"
-    ensure_milvus_collection(client, model, 3)
+    name = ensure_milvus_collection(client, model, 3)
+    only_own_collections.append(name)
     yield model
-    client.drop_collection(milvus_collection_name(model))
+    client.drop_collection(name)
 
 
 def _open(user_id: int | None = 1) -> KBCollectionHandle:
@@ -410,11 +421,15 @@ def test_the_cap_is_respected(
 
 
 def test_a_failing_collection_lets_the_others_purge_then_raises(
-    client: Any, model: str, monkeypatch: pytest.MonkeyPatch
+    client: Any,
+    model: str,
+    monkeypatch: pytest.MonkeyPatch,
+    only_own_collections: list[str],
 ) -> None:
     _kb_id(1)
     other = f"cleanup-{uuid.uuid4().hex[:12]}"
-    ensure_milvus_collection(client, other, 3)
+    other_name = ensure_milvus_collection(client, other, 3)
+    only_own_collections.append(other_name)
     try:
         orphan = uuid.uuid4().hex
         _upsert(client, model, [_row("c1", orphan, "doc-a", created_at=_old())])

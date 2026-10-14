@@ -24,7 +24,6 @@ from ..config import (
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
-    get_kb_milvus_cleanup_interval_seconds,
     get_orphan_upload_sweep_interval_seconds,
     get_session_secret,
     get_shared_task_execution_enabled,
@@ -347,14 +346,6 @@ async def _run_trigger_dispatcher(
         finally:
             db.close()
 
-    def _purge_leftover_milvus_rows_tick() -> dict[str, int]:
-        # A deployment without Celery Beat must still purge; the purge is idempotent.
-        from ..core.tools.core.RAG_tools.kb.milvus_cleanup import (
-            purge_leftover_milvus_rows,
-        )
-
-        return purge_leftover_milvus_rows()
-
     def _scan_due_gmail_watch_renewals_tick() -> int:
         SessionLocal = get_session_local()
         db = SessionLocal()
@@ -379,24 +370,6 @@ async def _run_trigger_dispatcher(
     loop = asyncio.get_running_loop()
     next_gmail_watch_scan_at = 0.0
     next_preview_run_reap_at = 0.0
-    next_kb_milvus_cleanup_at = 0.0
-    cleanup_task: asyncio.Task[None] | None = None
-
-    async def _run_kb_milvus_cleanup() -> None:
-        # Runs un-awaited so a hung pymilvus call cannot stall trigger dispatch;
-        # CancelledError is not caught and so still propagates.
-        try:
-            deleted = await asyncio.to_thread(_purge_leftover_milvus_rows_tick)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Milvus cleanup failed: %s", exc, exc_info=True)
-            return
-        if deleted:
-            logger.info("Trigger dispatcher purged leftover Milvus rows: %s", deleted)
-
-    def _cancel_cleanup() -> None:
-        if cleanup_task is not None and not cleanup_task.done():
-            cleanup_task.cancel()
-
     while True:
         try:
             now = loop.time()
@@ -453,16 +426,6 @@ async def _run_trigger_dispatcher(
                         now + get_background_job_sweep_interval_seconds()
                     )
 
-            # Own coarse timer; background so a hung Milvus call cannot
-            # stall trigger dispatch.
-            if now >= next_kb_milvus_cleanup_at and (
-                cleanup_task is None or cleanup_task.done()
-            ):
-                cleanup_task = asyncio.create_task(_run_kb_milvus_cleanup())
-                next_kb_milvus_cleanup_at = (
-                    now + get_kb_milvus_cleanup_interval_seconds()
-                )
-
             SessionLocal = get_session_local()
             db = SessionLocal()
             try:
@@ -472,16 +435,11 @@ async def _run_trigger_dispatcher(
             finally:
                 db.close()
         except asyncio.CancelledError:
-            _cancel_cleanup()
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Trigger dispatcher tick failed: %s", exc, exc_info=True)
 
-        try:
-            await asyncio.sleep(poll_interval_seconds)
-        except asyncio.CancelledError:
-            _cancel_cleanup()
-            raise
+        await asyncio.sleep(poll_interval_seconds)
 
 
 def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | None:

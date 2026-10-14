@@ -1,10 +1,12 @@
-"""Purge Milvus rows that no live ledger record keeps, re-checking before delete."""
+"""Purge Milvus rows that no live ledger record keeps; the grace cutoff is
+re-applied in each delete filter, without re-reading the ledger before a delete."""
 
 from __future__ import annotations
 
 import logging
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from typing import Any
@@ -53,34 +55,39 @@ def _epoch_seconds(value: Any) -> float | None:
 def _read_table(
     store: Any, table_name: str, columns: list[str]
 ) -> list[dict[str, Any]] | None:
-    """Read a whole ledger table; ``None`` when it does not exist, raise on failure."""
+    """Read a whole ledger table; ``None`` when it does not exist, raise on failure.
+
+    ``count_rows`` and ``iter_batches`` use separate handles, so a concurrent
+    delete-then-add can make one read short; the whole read is retried once.
+    """
     table = None
     try:
         conn = store.get_raw_connection()
         if table_name not in list_table_names(conn):
             return None
         table = conn.open_table(table_name)
-        counted = _safe_count_rows(table, None, on_error="raise")
-        rows = (
-            [
-                row
-                for batch in store.iter_batches(
-                    table_name=table_name,
-                    columns=columns,
-                    user_id=None,
-                    is_admin=True,
-                )
-                for row in batch.to_pylist()
-            ]
-            if counted
-            else []
-        )
-        if len(rows) < counted:
-            raise DatabaseOperationError(
-                f"Read {len(rows)} of {counted} ledger {table_name} rows; "
-                "aborting the Milvus cleanup"
+        for _attempt in range(2):
+            counted = _safe_count_rows(table, None, on_error="raise")
+            rows = (
+                [
+                    row
+                    for batch in store.iter_batches(
+                        table_name=table_name,
+                        columns=columns,
+                        user_id=None,
+                        is_admin=True,
+                    )
+                    for row in batch.to_pylist()
+                ]
+                if counted
+                else []
             )
-        return rows
+            if len(rows) >= counted:
+                return rows
+        raise DatabaseOperationError(
+            f"Read {len(rows)} of {counted} ledger {table_name} rows; "
+            "aborting the Milvus cleanup"
+        )
     except DatabaseOperationError:
         raise
     except Exception as error:
@@ -167,55 +174,48 @@ def _batches(doc_ids: list[str]) -> Iterable[list[str]]:
         yield doc_ids[start : start + size]
 
 
-def _delete_candidates(
-    client: Any,
-    name: str,
-    kb_id: str,
-    doc_ids: list[str],
-    cutoff: int,
-    *,
-    invisible_only: bool,
-    budget: int,
-) -> tuple[int, int]:
-    if budget <= 0:
-        return 0, budget
-    deleted = _delete_rows(
-        client, name, kb_id, doc_ids, cutoff, invisible_only=invisible_only
-    )
-    return deleted, budget - deleted
+@dataclass
+class _RunState:
+    """Mutable per-run counters; a raise must not lose completed deletes."""
+
+    budget_left: int
+    result: dict[str, int]
 
 
 def _purge_collection(
     client: Any,
     name: str,
     scanned: dict[tuple[str, str], bool],
-    kb_owners: dict[str, str],
-    documents: set[tuple[str, str]] | None,
-    document_collections: set[str],
+    kb_owners: dict[str, tuple[str, int | None]],
+    document_keys: set[tuple[str, str]] | None,
+    document_pairs: set[tuple[str, int | None]],
     run_keys: set[tuple[str, str]] | None,
     cutoff: int,
-    budget: int,
-    warned_collections: set[str],
-) -> tuple[int, int]:
-    """Delete the leftover rows of ``name``; returns ``(deleted, budget_left)``."""
+    state: _RunState,
+    warned_pairs: set[tuple[str, int | None]],
+) -> None:
+    """Delete the leftover rows of ``name``, recording every delete in ``state``."""
     orphans: dict[str, set[str]] = {}
     missing: dict[str, set[str]] = {}
     uncommitted: dict[str, set[str]] = {}
     for (kb_id, doc_id), has_invisible in scanned.items():
-        collection = kb_owners.get(kb_id)
-        if collection is None:
+        owner = kb_owners.get(kb_id)
+        if owner is None:
             orphans.setdefault(kb_id, set()).add(doc_id)
             continue
-        if documents is not None:
-            if collection not in document_collections:
-                if collection not in warned_collections:
-                    warned_collections.add(collection)
+        collection, user_id = owner
+        if document_keys is not None:
+            pair = (collection, user_id)
+            if pair not in document_pairs:
+                if pair not in warned_pairs:
+                    warned_pairs.add(pair)
                     logger.warning(
-                        "Ledger documents has no row for collection %s; "
+                        "Ledger documents has no row for collection %s owner %s; "
                         "skipping the missing-document check for its kb_ids",
                         collection,
+                        user_id,
                     )
-            elif (collection, doc_id) not in documents:
+            elif (collection, doc_id) not in document_keys:
                 missing.setdefault(kb_id, set()).add(doc_id)
                 continue
         if not has_invisible or run_keys is None:
@@ -223,50 +223,26 @@ def _purge_collection(
         if (collection, doc_id) in run_keys:
             uncommitted.setdefault(kb_id, set()).add(doc_id)
 
-    deleted_total = 0
-    for kb_id in sorted(orphans):
-        for batch in _batches(sorted(orphans[kb_id])):
-            deleted, budget = _delete_candidates(
-                client,
-                name,
-                kb_id,
-                batch,
-                cutoff,
-                invisible_only=False,
-                budget=budget,
-            )
-            deleted_total += deleted
-            if budget <= 0:
-                return deleted_total, budget
-    for kb_id in sorted(missing):
-        for batch in _batches(sorted(missing[kb_id])):
-            deleted, budget = _delete_candidates(
-                client,
-                name,
-                kb_id,
-                batch,
-                cutoff,
-                invisible_only=False,
-                budget=budget,
-            )
-            deleted_total += deleted
-            if budget <= 0:
-                return deleted_total, budget
-    for kb_id in sorted(uncommitted):
-        for batch in _batches(sorted(uncommitted[kb_id])):
-            deleted, budget = _delete_candidates(
-                client,
-                name,
-                kb_id,
-                batch,
-                cutoff,
-                invisible_only=True,
-                budget=budget,
-            )
-            deleted_total += deleted
-            if budget <= 0:
-                return deleted_total, budget
-    return deleted_total, budget
+    for candidates, invisible_only in (
+        (orphans, False),
+        (missing, False),
+        (uncommitted, True),
+    ):
+        for kb_id in sorted(candidates):
+            for batch in _batches(sorted(candidates[kb_id])):
+                if state.budget_left <= 0:
+                    return
+                deleted = _delete_rows(
+                    client,
+                    name,
+                    kb_id,
+                    batch,
+                    cutoff,
+                    invisible_only=invisible_only,
+                )
+                state.budget_left -= deleted
+                if deleted:
+                    state.result[name] = state.result.get(name, 0) + deleted
 
 
 def purge_leftover_milvus_rows(
@@ -307,10 +283,19 @@ def purge_leftover_milvus_rows(
             continue
         if scanned is not None:
             scans[name] = scanned
+    if not any(scans.values()):
+        # No old row anywhere: the ledger cannot change the outcome, so do not
+        # read it (and do not log the empty-kb_ids error) on an idle interval.
+        if first_error is not None:
+            raise first_error
+        return {}
 
     store = StorageFactory.get_factory().get_vector_index_store()
     conn = store.get_raw_connection()
-    kb_owners = {row["kb_id"]: row["collection"] for row in _read_rows(conn, None)}
+    kb_owners = {
+        row["kb_id"]: (row["collection"], row["user_id"])
+        for row in _read_rows(conn, None)
+    }
     if not kb_owners:
         logger.error(
             "Ledger holds no kb_ids while the Milvus cleanup needs them; "
@@ -319,7 +304,7 @@ def purge_leftover_milvus_rows(
         if first_error is not None:
             raise first_error
         return {}
-    documents = _read_table(store, "documents", ["collection", "doc_id"])
+    documents = _read_table(store, "documents", ["collection", "doc_id", "user_id"])
     runs = _read_table(
         store,
         "ingestion_runs",
@@ -338,30 +323,25 @@ def purge_leftover_milvus_rows(
             "Ledger ingestion_runs table is missing; skipping the uncommitted check"
         )
     documents = documents or []
-    document_keys = (
-        None
-        if not documents
-        else {(row["collection"], row["doc_id"]) for row in documents}
-    )
-    document_collections = {row["collection"] for row in documents}
+    document_keys = {(row["collection"], row["doc_id"]) for row in documents} or None
+    document_pairs = {(row["collection"], row["user_id"]) for row in documents}
     run_keys = None if runs is None else _purgeable_run_keys(runs, cutoff)
 
-    result: dict[str, int] = {}
-    budget = MAX_DELETES_PER_RUN
-    warned_collections: set[str] = set()
+    state = _RunState(budget_left=MAX_DELETES_PER_RUN, result={})
+    warned_pairs: set[tuple[str, int | None]] = set()
     for name, scanned in scans.items():
         try:
-            deleted, budget = _purge_collection(
+            _purge_collection(
                 client,
                 name,
                 scanned,
                 kb_owners,
                 document_keys,
-                document_collections,
+                document_pairs,
                 run_keys,
                 cutoff,
-                budget,
-                warned_collections,
+                state,
+                warned_pairs,
             )
         except Exception as error:
             logger.error(
@@ -373,9 +353,7 @@ def purge_leftover_milvus_rows(
             if first_error is None:
                 first_error = error
             continue
-        if deleted:
-            result[name] = result.get(name, 0) + deleted
-        if budget <= 0:
+        if state.budget_left <= 0:
             logger.warning(
                 "Milvus cleanup reached the soft %s-row cap; the next run continues",
                 MAX_DELETES_PER_RUN,
@@ -383,4 +361,4 @@ def purge_leftover_milvus_rows(
             break
     if first_error is not None:
         raise first_error
-    return result
+    return state.result

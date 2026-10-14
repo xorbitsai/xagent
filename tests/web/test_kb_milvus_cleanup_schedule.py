@@ -1,8 +1,20 @@
-"""The Milvus cleanup beat tick and its failure containment."""
+"""The Milvus cleanup beat tick, its routing, and its failure containment."""
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
+
+_TASK = "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows"
+
+
+def _shipped_worker_queues() -> set[str]:
+    compose = (Path(__file__).resolve().parents[2] / "docker-compose.yml").read_text()
+    match = re.search(r'"-Q",\s*"([^"]+)"', compose)
+    assert match, "the shipped worker command has no -Q queue list"
+    return set(match.group(1).split(","))
 
 
 def test_beat_schedule_includes_the_cleanup_task(
@@ -14,9 +26,36 @@ def test_beat_schedule_includes_the_cleanup_task(
     app = create_celery_app()
     entry = app.conf.beat_schedule["purge-leftover-milvus-rows"]
 
-    assert entry["task"] == "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows"
+    assert entry["task"] == _TASK
     assert entry["schedule"] == 777.0
-    assert "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows" in app.tasks
+    # An unconsumed enqueue must expire on the configured interval, not pile up.
+    assert entry["options"]["expires"] == entry["schedule"]
+    assert _TASK in app.tasks
+
+
+def test_the_cleanup_task_is_routed_to_a_consumed_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS", "777")
+    from xagent.web.jobs.celery_app import create_celery_app
+
+    app = create_celery_app()
+    route = app.conf.task_routes[_TASK]
+
+    assert route == {"queue": "kb"}
+    # The shipped worker consumes only the queues in its -Q list.
+    assert route["queue"] in _shipped_worker_queues()
+
+
+def test_the_cleanup_task_does_not_use_late_acks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS", "777")
+    from xagent.web.jobs.celery_app import create_celery_app
+
+    app = create_celery_app()
+
+    assert app.tasks[_TASK].acks_late is False
 
 
 def test_the_task_reports_a_failed_purge_without_raising(

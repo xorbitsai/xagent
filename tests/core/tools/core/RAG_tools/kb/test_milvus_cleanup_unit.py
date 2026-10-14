@@ -5,6 +5,7 @@ The Milvus server tests cover the same paths against a real collection.
 
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -39,15 +40,17 @@ class _NotLoaded(Exception):
 
 
 class _Iterator:
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    def __init__(self, rows: list[dict[str, Any]], batch_size: int) -> None:
         self._rows = rows
-        self._done = False
+        self._batch_size = batch_size
+        self._pos = 0
 
     def next(self) -> list[dict[str, Any]]:
-        if self._done:
+        if self._pos >= len(self._rows):
             return []
-        self._done = True
-        return self._rows
+        batch = self._rows[self._pos : self._pos + self._batch_size]
+        self._pos += self._batch_size
+        return batch
 
     def close(self) -> None:
         return None
@@ -85,7 +88,8 @@ class FakeMilvus:
                 dict(row)
                 for row in self.collections.get(name, [])
                 if row["created_at"] < cutoff
-            ]
+            ],
+            batch_size,
         )
 
     def delete(
@@ -442,6 +446,38 @@ def test_a_scan_error_still_aborts_when_the_ledger_has_no_kb_ids(
     assert fake.deletes == []
 
 
+@pytest.mark.parametrize(
+    "collections",
+    [{}, {NAME: []}],
+    ids=["no-collections", "empty-collection"],
+)
+def test_no_scanned_rows_returns_before_reading_the_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    collections: dict[str, list[dict[str, Any]]],
+) -> None:
+    now = _now()
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    client = FakeMilvus(collections)
+    monkeypatch.setattr(
+        MilvusConnectionManager, "get_shared_client_from_env", lambda _self: client
+    )
+    reads: list[str] = []
+    real_read = milvus_cleanup._read_rows
+
+    def read(*args: Any, **kwargs: Any) -> Any:
+        reads.append("ledger")
+        return real_read(*args, **kwargs)
+
+    monkeypatch.setattr(milvus_cleanup, "_read_rows", read)
+
+    with caplog.at_level("ERROR"):
+        assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {}
+
+    assert reads == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
 def test_many_rows_of_one_document_are_one_candidate_and_one_delete(
     fake: FakeMilvus,
 ) -> None:
@@ -465,6 +501,31 @@ def test_many_rows_of_one_document_are_one_candidate_and_one_delete(
     assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {NAME: 49}
     assert [row["chunk_id"] for row in fake.collections[NAME]] == ["c-visible"]
     assert len(fake.deletes) == 1
+
+
+@pytest.mark.parametrize("invisible_last", [True, False])
+def test_an_invisible_row_in_a_later_batch_still_marks_its_document(
+    fake: FakeMilvus, monkeypatch: pytest.MonkeyPatch, invisible_last: bool
+) -> None:
+    now = _now()
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    _seed_run(
+        COLLECTION,
+        "doc",
+        1,
+        status="success",
+        updated_at=datetime.fromtimestamp(now - 3600, tz=timezone.utc),
+    )
+    visible = _row("c-visible", "kb-1", "doc", visible=True, created_at=int(now) - 3600)
+    invisible = _row("c-invisible", "kb-1", "doc", created_at=int(now) - 3600)
+    fake.collections[NAME] = (
+        [visible, invisible] if invisible_last else [invisible, visible]
+    )
+    # One row per batch: the aggregate must OR the batches, not keep the last.
+    monkeypatch.setattr(milvus_cleanup, "_CLEANUP_ROW_BATCH", 1)
+
+    assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {NAME: 1}
+    assert [row["chunk_id"] for row in fake.collections[NAME]] == ["c-visible"]
 
 
 def test_a_missing_documents_table_skips_only_the_document_check(
@@ -560,6 +621,32 @@ def test_a_short_ledger_read_aborts_before_any_delete(
     assert fake.deletes == []
 
 
+def test_a_short_ledger_read_is_retried_once_then_succeeds(
+    fake: FakeMilvus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = _now()
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    _seed_document(COLLECTION, "doc", 1)
+    fake.collections[NAME] = [_row("c1", "kb-1", "doc", created_at=int(now) - 3600)]
+    store = get_vector_index_store()
+    real = store.iter_batches
+    calls = {"documents": 0}
+
+    def flaky(**kwargs: Any) -> Any:
+        if kwargs.get("table_name") == "documents":
+            calls["documents"] += 1
+            if calls["documents"] == 1:
+                return iter(())
+        return real(**kwargs)
+
+    monkeypatch.setattr(store, "iter_batches", flaky)
+
+    # The second, complete read wins; the document is present so nothing is deleted.
+    assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {}
+    assert calls["documents"] == 2
+    assert len(fake.collections[NAME]) == 1
+
+
 def test_the_cap_stops_the_run_and_leaves_the_rest(
     fake: FakeMilvus, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -593,12 +680,37 @@ def test_another_users_same_doc_id_is_untouched(
     assert [row["kb_id"] for row in fake.collections[NAME]] == ["kb-1", "kb-2"]
 
 
+def test_a_renaming_owners_rows_are_kept_when_only_the_other_owner_has_documents(
+    fake: FakeMilvus,
+) -> None:
+    now = _now()
+    # Owners 1 and 2 both use collection "kb"; only owner 2 has a documents row.
+    # Owner 1 renamed the collection between the kb_ids and documents reads, so
+    # its (collection, user_id) pair is absent and its rows must not look missing.
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    _seed_kb_id("kb-2", COLLECTION, 2)
+    _seed_document(COLLECTION, "doc-b", 2)
+    fake.collections[NAME] = [
+        _row(
+            "c-a", "kb-1", "doc-a", user_id=1, visible=True, created_at=int(now) - 3600
+        ),
+        _row(
+            "c-b", "kb-2", "doc-b", user_id=2, visible=True, created_at=int(now) - 3600
+        ),
+    ]
+
+    # A guard keyed by collection name alone would delete owner 1's visible row.
+    assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {}
+    assert [row["chunk_id"] for row in fake.collections[NAME]] == ["c-a", "c-b"]
+
+
 def test_a_collection_absent_from_documents_skips_its_missing_check(
     fake: FakeMilvus, caplog: pytest.LogCaptureFixture
 ) -> None:
     now = _now()
     # kb_ids says these kb_ids live in "renamed", but documents has no such row:
     # a stale/partial ledger must not make every scanned document look missing.
+    # The guard is per owner pair, so each of the two owners warns once.
     _seed_kb_id("kb-1", "renamed", 1)
     _seed_kb_id("kb-2", "renamed", 2)
     _seed_document("other", "doc", 1)
@@ -611,7 +723,7 @@ def test_a_collection_absent_from_documents_skips_its_missing_check(
         assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {}
 
     assert len(fake.collections[NAME]) == 2
-    assert caplog.text.count("renamed") == 1
+    assert caplog.text.count("renamed") == 2
 
 
 def test_the_scan_finishes_before_the_first_ledger_read(
@@ -660,6 +772,69 @@ def test_the_orphan_pass_batches_and_stops_at_the_soft_cap(
     # two batches (200) and the third, later batch of documents remains.
     assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {NAME: 2 * size}
     assert len(fake.collections[NAME]) == 50
+
+
+def test_a_failing_delete_keeps_completed_batches_in_the_shared_run_state(
+    fake: FakeMilvus,
+) -> None:
+    now = _now()
+    size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
+    other = milvus_collection_name("cleanup-state")
+    cutoff = int(now - 60)
+    # Two collections of orphans; the first collection's second delete raises.
+    fake.collections[NAME] = [
+        _row(f"a{i}", "kb-gone-1", f"doc-a-{i}", created_at=int(now) - 3600)
+        for i in range(size + 1)
+    ]
+    fake.collections[other] = [
+        _row(f"b{i}", "kb-gone-2", f"doc-b-{i}", created_at=int(now) - 3600)
+        for i in range(2 * size)
+    ]
+    calls = {"n": 0}
+
+    def fail_second(_name: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("milvus delete failed")
+
+    fake.before_delete = fail_second
+    state = milvus_cleanup._RunState(budget_left=size + 50, result={})
+
+    with pytest.raises(RuntimeError):
+        milvus_cleanup._purge_collection(
+            fake,
+            NAME,
+            milvus_cleanup._scan_rows(fake, NAME, cutoff, set()),
+            {},
+            None,
+            set(),
+            None,
+            cutoff,
+            state,
+            set(),
+        )
+
+    # The first batch is counted even though the collection raised, and its
+    # budget is gone, so the next collection only sees what is left.
+    assert state.result == {NAME: size}
+    assert state.budget_left == 50
+
+    fake.before_delete = None
+    milvus_cleanup._purge_collection(
+        fake,
+        other,
+        milvus_cleanup._scan_rows(fake, other, cutoff, set()),
+        {},
+        None,
+        set(),
+        None,
+        cutoff,
+        state,
+        set(),
+    )
+    assert state.result[other] == size
+    assert state.budget_left == 50 - size
+    assert len(fake.collections[other]) == size
 
 
 def test_a_non_terminal_run_row_protects_the_document(

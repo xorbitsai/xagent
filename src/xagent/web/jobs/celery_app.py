@@ -48,6 +48,9 @@ def create_celery_app() -> Any:
             "xagent.web.jobs.trigger_tasks.scan_due_triggers": {
                 "queue": "triggers",
             },
+            "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows": {
+                "queue": "kb",
+            },
         },
         beat_schedule={
             "scan-due-triggers-and-stale-jobs": {
@@ -57,6 +60,8 @@ def create_celery_app() -> Any:
             "purge-leftover-milvus-rows": {
                 "task": "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows",
                 "schedule": float(cleanup_interval),
+                # An unconsumed enqueue expires instead of piling up in Redis.
+                "options": {"expires": float(cleanup_interval)},
             },
         },
         task_serializer="json",

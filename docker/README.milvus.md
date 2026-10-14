@@ -85,10 +85,14 @@ Milvus stores each chunk's text in a field of at most 65,535 UTF-8 bytes. An ing
 
 The knowledge-base state is in two places that have to agree: the LanceDB ledger (documents, parses, chunks, ingestion status, and the collection ids that Milvus rows are filed under), on `xagent_data` or on the host directory bound at `/root/.xagent` when the sandbox overlay is used, and the three Milvus volumes (`milvus_etcd_data`, `milvus_minio_data`, `milvus_data`). Back them up together, from the same moment, along with `postgres_data` as described under [Backup](README.md#backup). The simplest consistent copy is a cold one: stop the stack, copy the volumes, start it again.
 
-Restoring them to different points in time is not detected or repaired:
+Restoring them to different points in time leaves the two out of step:
 
 - Milvus older than the ledger, or empty: the ledger lists documents whose chunks Milvus lacks, and search does not find them. Re-ingest such a document: it compares the ledger's chunks with the rows Milvus holds under the same collection id and document id and embeds only the missing ones. Deleting the document and importing it again also works.
-- Milvus newer than the ledger: rows that belong to a document the ledger does not list are still searched, because search filters on the collection id, but they are listed nowhere, and nothing removes them. Delete them by hand in Milvus (filter on `kb_id` and `doc_id`). Rows of a collection whose id is not in the ledger are not reached at all.
+- Milvus newer than the ledger: rows that belong to a document the ledger does not list are still searched, because search filters on the collection id, but they are listed nowhere. [Scheduled cleanup](#scheduled-cleanup) removes them after its grace window; until then, delete them by hand in Milvus (filter on `kb_id` and `doc_id`).
+
+### Scheduled cleanup
+
+Celery Beat (the shipped `scheduler` service) runs a Milvus-only purge task every `XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS` seconds (default 3600). It removes leftover (uncommitted) rows, and rows whose document or knowledge base is gone from the ledger, once they are older than a grace window of twice `XAGENT_BACKGROUND_JOB_STALE_SECONDS`. Deployments without Beat do not run it, which is harmless: uncommitted rows are never searched and orphans only cost space. It deletes nothing when the ledger has no `kb_ids`. A restore to mismatched points in time therefore has its extra Milvus rows removed by this job.
 
 ## Differences from LanceDB
 

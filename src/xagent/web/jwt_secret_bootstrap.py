@@ -12,6 +12,7 @@ from pathlib import Path
 
 _MIN_SECRET_LENGTH = 32
 _KNOWN_WEAK_SECRETS = {
+    "your-secret-key-change-in-production",
     "change-me",
     "change-me-to-a-random-session-secret",
     "replace-with-a-long-random-secret",
@@ -27,6 +28,15 @@ def _validate_secret(secret: str, path: Path) -> None:
 def load_or_create_jwt_secret(path: Path) -> tuple[str, bool]:
     """Return a strong persistent secret and whether this call created it."""
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # A valid secret on a read-only mounted volume is reusable without needing
+    # to create or chmod a sibling lock file. The locked branch below still
+    # handles first creation and races between replicas.
+    if path.exists():
+        secret = path.read_text(encoding="utf-8").strip()
+        _validate_secret(secret, path)
+        return secret, False
+
     lock_path = path.with_name(f"{path.name}.lock")
     with lock_path.open("a+", encoding="utf-8") as lock_file:
         os.chmod(lock_path, 0o600)
@@ -35,7 +45,6 @@ def load_or_create_jwt_secret(path: Path) -> tuple[str, bool]:
         if path.exists():
             secret = path.read_text(encoding="utf-8").strip()
             _validate_secret(secret, path)
-            os.chmod(path, 0o600)
             return secret, False
 
         secret = secrets.token_urlsafe(48)

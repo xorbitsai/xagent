@@ -2125,7 +2125,7 @@ def get_frontend_url() -> str:
 def get_cors_origins() -> list[str]:
     """Return the explicit browser origins allowed to call the API."""
     configured = os.getenv(CORS_ORIGINS)
-    if configured is not None:
+    if configured and configured.strip():
         origins = [
             origin.strip().rstrip("/")
             for origin in configured.split(",")
@@ -2141,12 +2141,11 @@ def get_cors_origins() -> list[str]:
 
 def get_environment() -> str:
     """Return the normalized deployment environment name."""
-    normalized = (
-        (os.getenv(XAGENT_ENVIRONMENT) or os.getenv(ENVIRONMENT) or "development")
-        .strip()
-        .lower()
-    )
-    return normalized or "development"
+    for setting in (XAGENT_ENVIRONMENT, ENVIRONMENT):
+        value = os.getenv(setting)
+        if value and value.strip():
+            return value.strip().lower()
+    return "development"
 
 
 def get_require_secure_secrets() -> bool:

@@ -575,9 +575,10 @@ class TestAuthEmailConfig:
             "https://admin.example.com",
         ]
 
-    def test_cors_origins_allow_an_explicit_empty_list(self, monkeypatch):
+    def test_cors_origins_treat_blank_as_unset(self, monkeypatch):
         monkeypatch.setenv(CORS_ORIGINS, "")
-        assert get_cors_origins() == []
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", "https://app.example.com")
+        assert get_cors_origins() == ["https://app.example.com"]
 
     def test_cors_origins_reject_wildcard_with_credentials(self, monkeypatch):
         monkeypatch.setenv(CORS_ORIGINS, "*")
@@ -3948,4 +3949,10 @@ def test_legacy_environment_alias_is_normalized(monkeypatch):
     monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
     monkeypatch.setenv("ENVIRONMENT", " Production ")
 
+    assert config.get_environment() == "production"
+
+
+def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "  ")
+    monkeypatch.setenv("ENVIRONMENT", " production ")
     assert config.get_environment() == "production"

@@ -7,6 +7,8 @@ from ..config import (
     get_session_secret,
 )
 
+MIN_SECRET_LENGTH = 32
+
 _INSECURE_JWT_SECRET_VALUES = {
     INSECURE_SECRET_PLACEHOLDER,
     "change-me",
@@ -20,7 +22,10 @@ JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
 
 def _is_insecure_secret(value: str) -> bool:
     normalized = value.strip().lower()
-    return not normalized or normalized in _INSECURE_JWT_SECRET_VALUES
+    return (
+        len(normalized) < MIN_SECRET_LENGTH
+        or normalized in _INSECURE_JWT_SECRET_VALUES
+    )
 
 
 def validate_auth_config() -> None:

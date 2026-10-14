@@ -90,9 +90,12 @@ class TestGetConnectionUrl:
         "candidate_template",
         [
             "sqlite:///file:{path}?uri=on",
+            "sqlite:///file:{path}?uri=t",
+            "sqlite:///file:{path}?uri=y",
             "sqlite:///file:{encoded_path}?uri=true",
             "sqlite:///file://localhost{path}?uri=yes",
             "sqlite:///file:{path}?uri=false&uri=true",
+            "sqlite:///file:{path}?uri=0&uri=0",
         ],
     )
     def test_rejects_platform_sqlite_file_uri(
@@ -174,6 +177,21 @@ class TestGetConnectionUrl:
             validate_external_database_url(
                 "postgresql://other@public/xagent?host=postgres,public"
             )
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            "postgresql://other@postgres,public/xagent",
+            "postgresql://xagent:xagent_password@postgres:5432",
+        ],
+    )
+    def test_rejects_driver_effective_postgres_target_spellings(
+        self, monkeypatch, candidate
+    ):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres:5432/xagent")
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", candidate)
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
 
     def test_mariadb_and_mysql_are_same_backend(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://platform@db/xagent")

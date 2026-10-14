@@ -901,6 +901,14 @@ def _schema_allows_null(schema: Any) -> bool:
     return False
 
 
+def _schema_is_null_option(schema: Any) -> bool:
+    """Return whether a union option is exactly the JSON null type."""
+    if not isinstance(schema, Mapping):
+        return False
+    schema_type = schema.get("type")
+    return schema_type == "null" or schema_type == ["null"]
+
+
 def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
     """Remove a validator keyword without treating property names as keywords."""
     if isinstance(schema, Mapping):
@@ -969,24 +977,58 @@ def _nested_schema_for_emission(
 
     union_options: list[dict[str, Any]] = []
     union_is_lossless = True
-    for union_key in ("anyOf", "oneOf"):
-        raw_options = schema.get(union_key)
-        if not isinstance(raw_options, list) or not raw_options:
-            continue
-        if not all(isinstance(option, Mapping) for option in raw_options):
-            union_is_lossless = False
-            continue
-        for option in raw_options:
-            emitted_option = _nested_schema_for_emission(
-                option,
-                is_required=True,
-                depth=depth + 1,
-                _node_budget=_node_budget,
-            )
-            if not emitted_option:
+    union_keys = [
+        union_key
+        for union_key in ("anyOf", "oneOf")
+        if isinstance(schema.get(union_key), list) and schema[union_key]
+    ]
+    merged_optional_union = False
+    if len(union_keys) == 1:
+        raw_options = schema[union_keys[0]]
+        if (
+            isinstance(raw_options, list)
+            and len(raw_options) == 2
+            and all(isinstance(option, Mapping) for option in raw_options)
+        ):
+            non_null_options = [
+                option for option in raw_options if not _schema_is_null_option(option)
+            ]
+            if len(non_null_options) == 1:
+                emitted_option = _nested_schema_for_emission(
+                    non_null_options[0],
+                    is_required=True,
+                    depth=depth + 1,
+                    _node_budget=_node_budget,
+                )
+                if emitted_option:
+                    # Pydantic already supplies the nullable wrapper for an
+                    # Optional annotation. Flattening this common shape keeps
+                    # outer metadata (especially description) on the branch
+                    # Claude retains instead of nesting anyOf twice.
+                    emitted_option.update(emitted)
+                    emitted = emitted_option
+                    merged_optional_union = True
+
+    if not merged_optional_union:
+        for union_key in union_keys:
+            raw_options = schema[union_key]
+            if not isinstance(raw_options, list):
                 union_is_lossless = False
-            else:
-                union_options.append(emitted_option)
+                continue
+            if not all(isinstance(option, Mapping) for option in raw_options):
+                union_is_lossless = False
+                continue
+            for option in raw_options:
+                emitted_option = _nested_schema_for_emission(
+                    option,
+                    is_required=True,
+                    depth=depth + 1,
+                    _node_budget=_node_budget,
+                )
+                if not emitted_option:
+                    union_is_lossless = False
+                else:
+                    union_options.append(emitted_option)
     raw_properties = schema.get("properties")
     if union_options and union_is_lossless and not isinstance(raw_properties, Mapping):
         # Gemini accepts anyOf but rejects oneOf. A lossy union is omitted

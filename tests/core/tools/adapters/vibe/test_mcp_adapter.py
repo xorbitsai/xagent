@@ -4669,6 +4669,24 @@ def test_optional_field_metadata_is_nested_in_the_non_null_branch():
     assert "enum" not in field
 
 
+def test_optional_union_description_survives_claude_schema_fix():
+    emitted = _emitted_schema(
+        {
+            "city": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": "City name",
+            }
+        }
+    )
+
+    fixed = _fix_pydantic_schema_for_claude(emitted)
+
+    assert fixed["properties"]["city"] == {
+        "description": "City name",
+        "type": "string",
+    }
+
+
 @pytest.mark.parametrize("is_required", [True, False])
 def test_field_metadata_survives_the_claude_schema_pass(is_required):
     """Metadata reaches Anthropic providers, whether or not the field is optional.

@@ -47,6 +47,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _excel_failure_code,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    _normalized_mcp_call_result,
     _split_url_token,
     _truncated_error_message,
     classify_non_idempotent_write,
@@ -6920,3 +6921,72 @@ async def test_registry_path_hides_auth_rejected_placeholder_after_summary(
     (entry,) = summary.failures
     assert (entry.server_name, entry.reason) == ("Rejected", "auth_rejected")
     assert (entry.cause_type, entry.status_code) == ("HTTPStatusError", 403)
+def _mcp_tool_adapter(tool_name: str, name_prefix: str = "mcp_Xero_") -> MCPToolAdapter:
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name=tool_name,
+            description=tool_name,
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        name_prefix=name_prefix,
+    )
+
+
+def test_mcp_tool_adapter_decision_group_is_the_tool_name():
+    """MCP tools share ``ToolCategory.MCP``; without an explicit group every
+    tool of every server would count as one repeated-action stream."""
+    invoices = _mcp_tool_adapter("list_invoices")
+    contacts = _mcp_tool_adapter("list_contacts")
+
+    assert invoices.decision_group == "mcp_Xero_list_invoices"
+    assert contacts.decision_group == "mcp_Xero_list_contacts"
+    assert invoices.metadata.decision_group != contacts.metadata.decision_group
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Error listing aged receivables by contact: An unexpected error occurred "
+        "while communicating with Xero.",
+        "Error listing invoices: 429 Too Many Requests",
+    ],
+)
+def test_normalized_mcp_call_result_flags_plain_text_error(text):
+    result = _normalized_mcp_call_result(
+        CallToolResult(content=[TextContent(type="text", text=text)])
+    )
+
+    assert result["is_error"] is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [TextContent(type="text", text="Found 10 invoices:")],
+        [TextContent(type="text", text="No errors found: all clear")],
+        # A payload that merely starts with the word is not one line.
+        [TextContent(type="text", text="Error budget: 99.9%\nRemaining: 0.1%")],
+        # Two content items are a listing, never a lone failure line.
+        [
+            TextContent(type="text", text="Error listing invoices: boom"),
+            TextContent(type="text", text="Invoice: INV-1"),
+        ],
+        [TextContent(type="text", text="Error listing invoices: " + "x" * 2000)],
+    ],
+)
+def test_normalized_mcp_call_result_keeps_ordinary_text_successful(content):
+    result = _normalized_mcp_call_result(CallToolResult(content=content))
+
+    assert result["is_error"] is False
+
+
+def test_normalized_mcp_call_result_preserves_server_reported_error():
+    result = _normalized_mcp_call_result(
+        CallToolResult(
+            content=[TextContent(type="text", text="Something broke")],
+            isError=True,
+        )
+    )
+
+    assert result["is_error"] is True

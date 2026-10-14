@@ -14306,3 +14306,81 @@ async def test_skipped_checkpoint_reports_the_queued_request_identity() -> None:
     skipped = _checkpoint_metadata(tracer, "tool_interaction_response_skipped")
     assert skipped["reason"] == "resume_callback_unavailable"
     assert skipped["invocation_id"] == "queued-invocation"
+
+
+def _record_completed_calls(
+    pattern: ReActPattern, calls: list[tuple[str, dict[str, Any]]]
+) -> None:
+    for index, (tool_name, args) in enumerate(calls):
+        record = ToolCallRecord(
+            tool_call_id=f"call_{index}",
+            invocation_id=f"inv_{index}",
+            tool_name=tool_name,
+            args=args,
+            args_hash=f"hash_{index}",
+            status="completed",
+            result={"content": [{"text": "ok"}], "is_error": False},
+        )
+        pattern.tool_ledger[record.invocation_id] = record
+        pattern.tool_call_id_index[record.tool_call_id] = record.invocation_id
+
+
+def test_react_repeated_guard_counts_each_decision_group_separately() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    pattern._tool_decision_groups_by_name = {
+        "mcp_Xero_list_invoices": "mcp_Xero_list_invoices",
+        "mcp_Xero_list_aged_receivables": "mcp_Xero_list_aged_receivables",
+    }
+    _record_completed_calls(
+        pattern,
+        [
+            ("mcp_Xero_list_invoices", {"page": 2}),
+            ("mcp_Xero_list_invoices", {"page": 3}),
+            ("mcp_Xero_list_invoices", {"page": 4}),
+            ("mcp_Xero_list_aged_receivables", {"contactId": "c1"}),
+        ],
+    )
+
+    assert (
+        pattern._repeated_tool_call_metadata(
+            {"name": "mcp_Xero_list_aged_receivables", "args": {}}
+        )
+        is None
+    )
+
+
+def test_react_repeated_guard_marks_paged_runs() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=3)
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": page}) for page in (1, 2, 3)],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+    messages = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )
+    prompt = messages[-1]["content"]
+    assert "paging through a list" in prompt
+    assert "more pages may exist" in prompt
+
+
+def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
+    _record_completed_calls(
+        pattern,
+        [("web_search", {"query": "a"}), ("web_search", {"query": "b"})],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "web_search"})
+
+    assert metadata is not None
+    assert "paginated" not in metadata
+    messages = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )
+    prompt = messages[-1]["content"]
+    assert "paging through a list" not in prompt

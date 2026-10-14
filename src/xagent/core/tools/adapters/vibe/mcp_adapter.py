@@ -1730,6 +1730,27 @@ def _mcp_return_value_as_string(value: Any) -> str:
         return str(value)
 
 
+# Some MCP servers (e.g. the Xero server) report a failed call as one line of
+# ordinary text, ``Error <doing something>: <cause>``, without setting
+# ``isError``. Left alone, such a result counts as a success for the agent's
+# repeated-tool accounting.
+_PLAIN_TEXT_ERROR_PATTERN = re.compile(r"Error [^:\n]{1,80}: [^\n]+")
+_PLAIN_TEXT_ERROR_MAX_CHARS = 1000
+
+
+def _is_plain_text_error_result(content: list[dict[str, Any]]) -> bool:
+    if len(content) != 1:
+        return False
+    item = content[0]
+    text = item.get("text")
+    if item.get("type") != "text" or not isinstance(text, str):
+        return False
+    return (
+        len(text) <= _PLAIN_TEXT_ERROR_MAX_CHARS
+        and _PLAIN_TEXT_ERROR_PATTERN.fullmatch(text.strip()) is not None
+    )
+
+
 def _normalized_mcp_call_result(
     value: Any, *, validate_wire: bool = False
 ) -> dict[str, Any]:
@@ -1763,7 +1784,8 @@ def _normalized_mcp_call_result(
     return {
         "content": content,
         "structured_content": other_fields.get("structuredContent"),
-        "is_error": bool(other_fields.get("isError")),
+        "is_error": bool(other_fields.get("isError"))
+        or _is_plain_text_error_result(content),
     }
 
 
@@ -1896,6 +1918,9 @@ class MCPToolAdapter(AbstractBaseTool):
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
+        # Every MCP tool shares ``ToolCategory.MCP``, which would otherwise
+        # make unrelated tools of any server one repeated-action stream.
+        self.decision_group = self.name
 
         # Build models from MCP tool schema
         self._args_type = self._build_args_model()

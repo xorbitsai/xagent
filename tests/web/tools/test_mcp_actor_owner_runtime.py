@@ -1092,8 +1092,8 @@ async def test_xero_uses_exact_actor_token(db_session, owner) -> None:
     expected_token = "alice-token" if owner == OWNER_A else "bob-token"
     other_token = "bob-token" if owner == OWNER_A else "alice-token"
     assert len(configs) == 1
-    assert configs[0]["config"]["command"] == "npx"
-    assert configs[0]["config"]["args"] == ["-y", "@xeroapi/xero-mcp-server@latest"]
+    assert configs[0]["config"]["command"] == "python"
+    assert configs[0]["config"]["args"] == ["-m", "xagent.web.tools.mcp.xero"]
     assert configs[0]["config"]["env"]["XERO_CLIENT_BEARER_TOKEN"] == expected_token
     assert "workspace-token" not in str(configs)
     assert other_token not in str(configs)

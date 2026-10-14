@@ -155,8 +155,8 @@ def test_xero_catalog_contract():
     assert app["is_visible_in_connector"] is True
     assert app["oauth_scopes"] == XERO_APP_SCOPES
     assert app["launch_config"] == {
-        "command": "npx",
-        "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.xero"],
         "env_mapping": {"XERO_CLIENT_BEARER_TOKEN": "access_token"},
     }
 

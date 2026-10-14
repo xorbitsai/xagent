@@ -5664,12 +5664,40 @@ async def test_mcp_connection(
     }
     endpoint = connection.get("url")
     if endpoint:
+        endpoint_for_validation = str(endpoint)
+        if normalized_transport == "websocket":
+            parsed_endpoint = urlsplit(endpoint_for_validation)
+            if parsed_endpoint.scheme not in {"ws", "wss"}:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="WebSocket MCP endpoints must use ws:// or wss://",
+                )
+            endpoint_for_validation = urlunsplit(
+                (
+                    "https" if parsed_endpoint.scheme == "wss" else "http",
+                    parsed_endpoint.netloc,
+                    parsed_endpoint.path,
+                    parsed_endpoint.query,
+                    parsed_endpoint.fragment,
+                )
+            )
         try:
-            await validate_public_http_url(str(endpoint))
+            validation = validate_public_http_url(endpoint_for_validation)
+            timeout_seconds = get_mcp_tool_init_timeout_seconds()
+            if timeout_seconds > 0:
+                await asyncio.wait_for(validation, timeout=timeout_seconds)
+            else:
+                await validation
+        except (OSError, TimeoutError):
+            return MCPConnectionTestResponse(
+                success=False,
+                message=f"Failed to connect to {test_data.name}.",
+                details={"error": "mcp_endpoint_resolution_failed"},
+            )
         except (TypeError, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="MCP endpoints must resolve to a public HTTP(S) host",
+                detail="MCP endpoints must resolve to a public network host",
             ) from exc
 
     def _create_safe_mcp_http_client(
@@ -5686,7 +5714,8 @@ async def test_mcp_connection(
         )
 
     try:
-        connection["httpx_client_factory"] = _create_safe_mcp_http_client
+        if normalized_transport != "websocket":
+            connection["httpx_client_factory"] = _create_safe_mcp_http_client
 
         try:
             load_result = await _load_mcp_connection_test_tools(connection)

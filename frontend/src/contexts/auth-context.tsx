@@ -119,6 +119,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
   const logout = useCallback(async () => {
     ++operationRef.current
+    // Revoke the server-side rotating refresh token before dropping the
+    // browser session. Local cleanup still happens when the request fails so
+    // a transient network issue cannot leave credentials visible in the UI.
+    try {
+      await apiRequest(`${getApiUrl()}/api/auth/logout`, { method: "POST" })
+    } catch { /* local logout remains authoritative for this browser */ }
     const result = await clearStoredAuth()
     if (result.credentialsCleared && mountedRef.current) setProjection(null)
     if (result.status !== "cleared") return false

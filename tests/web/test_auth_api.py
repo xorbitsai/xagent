@@ -1387,7 +1387,7 @@ class TestAuthAPI:
         )
         response = client.patch(
             "/api/auth/email",
-            json={"email": "updated@example.com"},
+            json={"email": "updated@example.com", "current_password": test_user_data["password"]},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
@@ -1420,7 +1420,7 @@ class TestAuthAPI:
         token = login_and_get_token("seconduser", "password123")
         response = client.patch(
             "/api/auth/email",
-            json={"email": "first@example.com"},
+            json={"email": "first@example.com", "current_password": "password123"},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
@@ -1594,7 +1594,7 @@ class TestAuthAPI:
         )
         assert user is not None
         assert user.password_hash != test_user_data["password"]  # Should be hashed
-        assert len(str(user.password_hash)) == 64
+        assert str(user.password_hash).startswith("$2b$")
 
         db.close()
 
@@ -1896,7 +1896,7 @@ class TestAuthAPI:
         token = login_and_get_token("updater", "password123")
         conflict_response = client.patch(
             "/api/auth/email",
-            json={"email": "legacy@example.com"},
+            json={"email": "legacy@example.com", "current_password": "password123"},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert conflict_response.status_code == 200

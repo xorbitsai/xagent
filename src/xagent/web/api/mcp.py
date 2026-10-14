@@ -9,6 +9,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import secrets
@@ -5638,9 +5639,41 @@ async def get_mcp_server_logs(
 
 @mcp_router.post("/test-connection", response_model=MCPConnectionTestResponse)
 async def test_mcp_connection(
-    test_data: MCPConnectionTest, db: Session = Depends(get_db)
+    test_data: MCPConnectionTest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ) -> MCPConnectionTestResponse:
-    """Test MCP server connection without saving."""
+    """Test an unsaved remote MCP connection for the authenticated user.
+
+    Stdio MCP connections are intentionally rejected here.  The connection
+    test endpoint accepts user-controlled configuration and the stdio loader
+    would otherwise execute an arbitrary command in the API process.
+    """
+    del db, current_user  # kept in the signature for dependency enforcement
+    if str(test_data.transport or "").strip().lower() not in HTTP_MCP_TRANSPORTS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Connection tests only support remote HTTP MCP transports",
+        )
+    endpoint = test_data.config.get("url") if isinstance(test_data.config, dict) else None
+    if endpoint:
+        parsed_endpoint = urlsplit(str(endpoint))
+        hostname = (parsed_endpoint.hostname or "").lower().rstrip(".")
+        blocked_host = hostname in {
+            "localhost",
+            "localhost.localdomain",
+            "metadata.google.internal",
+        }
+        try:
+            blocked_host = blocked_host or ipaddress.ip_address(hostname).is_private
+        except ValueError:
+            pass
+        if blocked_host:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Private and loopback MCP endpoints are not allowed",
+            )
+
     try:
         connection: dict[str, Any] = {
             "name": test_data.name,

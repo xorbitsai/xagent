@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from collections import defaultdict, deque
 import hashlib
 import html
 import json
@@ -10,10 +11,12 @@ import os
 import re
 import secrets
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
 
 import requests
+import bcrypt
 
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -105,6 +108,56 @@ _MAX_USER_ID = 2_147_483_647
 _ACTOR_OAUTH_FLOW_TTL = timedelta(minutes=10)
 _ACTOR_OAUTH_COOKIE_PREFIX = "xagent_actor_oauth_"
 _ACTOR_OWNER_CLAIM_VERSION = 1
+_ORDINARY_OAUTH_STATE_COOKIE = "xagent_oauth_state"
+_LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
+_LOGIN_FAILURE_LIMIT = 5
+_login_failure_lock = threading.Lock()
+_login_failures: dict[str, deque[float]] = defaultdict(deque)
+_oauth_state_lock = threading.Lock()
+_used_ordinary_oauth_states: dict[str, float] = {}
+
+
+def _login_attempt_key(request: Request | None, identifier: str) -> str:
+    client_host = request.client.host if request and request.client else "unknown"
+    normalized = identifier.strip().lower()
+    return hashlib.sha256(f"{client_host}\0{normalized}".encode()).hexdigest()
+
+
+def _login_is_blocked(key: str, now: float | None = None) -> bool:
+    current = time.monotonic() if now is None else now
+    with _login_failure_lock:
+        attempts = _login_failures[key]
+        while attempts and current - attempts[0] >= _LOGIN_FAILURE_WINDOW_SECONDS:
+            attempts.popleft()
+        return len(attempts) >= _LOGIN_FAILURE_LIMIT
+
+
+def _record_login_failure(key: str, now: float | None = None) -> None:
+    current = time.monotonic() if now is None else now
+    with _login_failure_lock:
+        attempts = _login_failures[key]
+        while attempts and current - attempts[0] >= _LOGIN_FAILURE_WINDOW_SECONDS:
+            attempts.popleft()
+        attempts.append(current)
+
+
+def _clear_login_failures(key: str) -> None:
+    with _login_failure_lock:
+        _login_failures.pop(key, None)
+
+
+def _claim_ordinary_oauth_state(state: str) -> bool:
+    """Claim a browser-bound OAuth state once per process lifetime window."""
+    now = time.time()
+    digest = hashlib.sha256(state.encode("ascii", "ignore")).hexdigest()
+    with _oauth_state_lock:
+        for key, expires_at in list(_used_ordinary_oauth_states.items()):
+            if expires_at <= now:
+                _used_ordinary_oauth_states.pop(key, None)
+        if digest in _used_ordinary_oauth_states:
+            return False
+        _used_ordinary_oauth_states[digest] = now + 600
+        return True
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
@@ -1413,6 +1466,7 @@ class UserProfileResponse(BaseModel):
 
 class UpdateEmailRequest(BaseModel):
     email: str
+    current_password: str
 
 
 class UpdateEmailResponse(BaseModel):
@@ -1551,13 +1605,39 @@ class ResetPasswordResponse(BaseModel):
 
 
 def hash_password(password: str) -> str:
-    """Hash password using SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash a password with bcrypt (with a SHA-256 pre-hash for long inputs).
+
+    The pre-hash avoids bcrypt's historical 72-byte input truncation while the
+    resulting value remains a standard bcrypt string. Existing unsalted
+    SHA-256 rows are accepted by ``verify_password`` once and transparently
+    upgraded by the login path.
+    """
+    password_material = hashlib.sha256(password.encode("utf-8")).hexdigest().encode(
+        "ascii"
+    )
+    return bcrypt.hashpw(password_material, bcrypt.gensalt()).decode("ascii")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    """Verify password against hash"""
-    return hash_password(password) == password_hash
+    """Verify bcrypt passwords and transparently support legacy SHA-256 rows."""
+    if password_hash.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            password_material = hashlib.sha256(password.encode("utf-8")).hexdigest().encode(
+                "ascii"
+            )
+            return bcrypt.checkpw(password_material, password_hash.encode("ascii"))
+        except (ValueError, UnicodeEncodeError):
+            return False
+
+    # Legacy rows were stored as a bare SHA-256 digest. Keep this fallback
+    # only for migration; successful authentication is upgraded immediately.
+    legacy_digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return secrets.compare_digest(legacy_digest, password_hash)
+
+
+def needs_password_rehash(password_hash: str) -> bool:
+    """Return whether a successful login should replace a legacy hash."""
+    return not password_hash.startswith(("$2a$", "$2b$", "$2y$"))
 
 
 def normalize_email(email: str) -> str:
@@ -1848,6 +1928,8 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
         valid = verify_password(request.password, str(user.password_hash))
     if not valid:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
+    if needs_password_rehash(str(user.password_hash)):
+        setattr(user, "password_hash", hash_password(request.password))
     with observe_duration("xagent.auth.login.token_creation.duration"):
         identity = {"sub": user.username, "user_id": user.id}
         access_token = create_access_token(
@@ -1892,18 +1974,28 @@ def _login_in_worker(
 async def login(
     request: LoginRequest,
     db: SyncAuthSessionFactory = Depends(get_auth_db),
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> Dict[str, Any]:
     """Authenticate with a single worker-owned database transaction."""
     started_at = time.perf_counter()
     outcome = "error"
+    attempt_key = _login_attempt_key(http_request, request.username)
+    if _login_is_blocked(attempt_key):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many failed login attempts. Try again later.",
+            headers={"Retry-After": str(_LOGIN_FAILURE_WINDOW_SECONDS)},
+        )
     try:
         response = await run_auth_db_worker(
             "login_database_transaction", lambda: _login_in_worker(request, db)
         )
         outcome = "succeeded"
+        _clear_login_failures(attempt_key)
         return response
     except HTTPException:
         outcome = "rejected"
+        _record_login_failure(attempt_key)
         raise
     except Exception:
         # SQL errors may contain bound refresh tokens. Never expose them to clients.
@@ -2123,6 +2215,10 @@ async def change_password(
 
         # Update password
         setattr(user, "password_hash", hash_password(request.new_password))
+        # A password change invalidates every currently issued refresh
+        # session. Access tokens remain short-lived and will expire normally.
+        setattr(user, "refresh_token", None)
+        setattr(user, "refresh_token_expires_at", None)
         db.commit()
 
         return ChangePasswordResponse(
@@ -2158,6 +2254,11 @@ async def update_current_user_email(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdateEmailResponse:
+    if not verify_password(request.current_password, str(user.password_hash)):
+        return UpdateEmailResponse(
+            success=False, message="Current password is incorrect"
+        )
+
     email = normalize_email(request.email)
     if not is_valid_email(email):
         return UpdateEmailResponse(success=False, message="Invalid email address")
@@ -2173,6 +2274,10 @@ async def update_current_user_email(
         return UpdateEmailResponse(success=False, message=email_namespace_error)
 
     setattr(user, "email", email)
+    # Email is an account-recovery identifier; changing it revokes the
+    # current refresh session so a stolen token cannot survive the change.
+    setattr(user, "refresh_token", None)
+    setattr(user, "refresh_token_expires_at", None)
     db.commit()
     db.refresh(user)
 
@@ -2463,6 +2568,18 @@ async def refresh_token(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Token refresh is temporarily unavailable",
         )
+
+
+@auth_router.post("/logout")
+async def logout(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Revoke the user's rotating refresh session at logout."""
+    setattr(user, "refresh_token", None)
+    setattr(user, "refresh_token_expires_at", None)
+    db.commit()
+    return {"success": True, "message": "Logged out successfully"}
 
 
 @auth_router.get("/check")
@@ -3395,6 +3512,9 @@ def _generic_oauth_login(
         auth_url = account_endpoints.authorize_url
         bound_account = account_endpoints.account
 
+    browser_state_nonce = (
+        secrets.token_urlsafe(32) if actor_flow_nonce is None else None
+    )
     state_payload = {
         "type": "oauth_state",
         "user_id": user_id,
@@ -3402,6 +3522,10 @@ def _generic_oauth_login(
         "app_id": app_id,
         "redirect": redirect,
     }
+    if browser_state_nonce is not None:
+        state_payload["browser_nonce_hash"] = hashlib.sha256(
+            browser_state_nonce.encode("ascii")
+        ).hexdigest()
     if bound_account is not None:
         state_payload["oauth_account"] = bound_account
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
@@ -3596,7 +3720,22 @@ def _generic_oauth_login(
 
     separator = "&" if "?" in auth_url else "?"
     full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
-    return RedirectResponse(full_auth_url)
+    response = RedirectResponse(full_auth_url)
+    if browser_state_nonce is not None:
+        response.set_cookie(
+            _ORDINARY_OAUTH_STATE_COOKIE,
+            browser_state_nonce,
+            max_age=600,
+            httponly=True,
+            secure=(
+                os.getenv("XAGENT_ENVIRONMENT")
+                or os.getenv("ENVIRONMENT")
+                or "development"
+            ).lower()
+            in {"prod", "production", "stage", "staging"},
+            samesite="lax",
+        )
+    return response
 
 
 class AppNotOAuthError(ValueError):
@@ -3805,6 +3944,23 @@ def generic_oauth_callback(
         return HTMLResponse(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
+
+    browser_nonce_hash = payload.get("browser_nonce_hash")
+    if browser_nonce_hash:
+        browser_nonce = request.cookies.get(_ORDINARY_OAUTH_STATE_COOKIE)
+        if not browser_nonce or not secrets.compare_digest(
+            str(browser_nonce_hash),
+            hashlib.sha256(browser_nonce.encode("ascii", "ignore")).hexdigest(),
+        ):
+            _log_oauth_callback_rejection(provider, "state_browser_binding_failed")
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
+        if not _claim_ordinary_oauth_state(state):
+            _log_oauth_callback_rejection(provider, "state_replayed")
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
 
     actor_flow_nonce = payload.get("actor_flow_nonce")
     actor_owner_claim = payload.get("resource_owner_key")

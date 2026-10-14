@@ -7,9 +7,12 @@ automatically cleaned up after a timeout period.
 """
 
 import asyncio
+import ipaddress
 import json
+import os
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Dict, Optional
+from urllib.parse import urlparse
 
 from ....config import (
     get_browser_tool_default_locale,
@@ -56,6 +59,24 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
         return f"{context}\nError: {str(error)}\n\nTraceback:\n{tb_str}"
     else:
         return f"Error: {str(error)}\n\nTraceback:\n{tb_str}"
+
+
+def _is_private_browser_target(url: str) -> bool:
+    parsed = urlparse(url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if hostname in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return bool(
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_unspecified
+    )
 
 
 class BrowserSession:
@@ -105,22 +126,21 @@ class BrowserSession:
             self._playwright = await async_playwright().start()
 
             # Launch browser with anti-detection settings
+            browser_args = [
+                # Disable WebDriver detection
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+            ]
+            if os.getenv("XAGENT_BROWSER_ALLOW_UNSANDBOXED", "").lower() in {
+                "1",
+                "true",
+                "yes",
+            }:
+                browser_args.append("--no-sandbox")
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless,
-                args=[
-                    # Disable WebDriver detection
-                    "--disable-blink-features=AutomationControlled",
-                    # Other anti-detection flags
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    # Allow local file access
-                    "--allow-file-access-from-files",
-                    "--allow-file-access",
-                    # No sandbox for local file access in some environments
-                    "--no-sandbox",
-                    # Disable web security for file:// URLs (required for local files)
-                    "--disable-web-security",
-                ],
+                args=browser_args,
             )
 
             # Create context with realistic settings. locale comes from the
@@ -408,6 +428,17 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
+    if urlparse(str(url)).scheme.lower() in {"file", "data", "javascript"} or _is_private_browser_target(
+        str(url)
+    ):
+        return {
+            "success": False,
+            "session_id": session_id,
+            "url": url,
+            "title": "",
+            "message": "",
+            "error": "Only public network URLs are allowed",
+        }
     headless = kwargs.get("headless", False)
     wait_until = kwargs.get("wait_until", "networkidle")
     locale = kwargs.get("locale")
@@ -427,15 +458,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
     page = await session.get_page()
 
     try:
-        # For local files, use 'domcontentloaded' or 'load' instead of 'networkidle'
-        # because local files don't have network activity
-        if url.startswith("file://"):
-            # Override wait_until for local files
-            wait_until_local = (
-                wait_until if wait_until != "networkidle" else "domcontentloaded"
-            )
-        else:
-            wait_until_local = wait_until
+        wait_until_local = wait_until
 
         # Log navigation attempt for debugging
         import logging

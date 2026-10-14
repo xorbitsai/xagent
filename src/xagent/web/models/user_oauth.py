@@ -1,8 +1,23 @@
 from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, text
+from sqlalchemy.types import TypeDecorator
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
+from ...core.utils.encryption import decrypt_value, encrypt_value
+
+
+class EncryptedOAuthToken(TypeDecorator[str]):
+    """Encrypt OAuth bearer/refresh tokens whenever they cross the DB boundary."""
+
+    impl = String
+    cache_ok = True
+
+    def process_bind_param(self, value: str | None, dialect: object) -> str | None:
+        return encrypt_value(value) if value else value
+
+    def process_result_value(self, value: str | None, dialect: object) -> str | None:
+        return decrypt_value(value) if value else value
 
 USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
 _ORDINARY_OWNER_CLAUSE = text("resource_owner_key IS NULL")
@@ -50,8 +65,8 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
     resource_owner_key = Column(
         String(USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH), nullable=True
     )
-    access_token = Column(String, nullable=False)
-    refresh_token = Column(String, nullable=True)
+    access_token = Column(EncryptedOAuthToken, nullable=False)
+    refresh_token = Column(EncryptedOAuthToken, nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
     token_type = Column(String(50), nullable=True)
     scope = Column(String, nullable=True)

@@ -13,13 +13,16 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
+from pathlib import PurePosixPath
 
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_cors_origins,
     get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
@@ -183,8 +186,22 @@ get_external_upload_dirs()
 
 
 # FastAPI app creation here
+_runtime_environment = (
+    os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development"
+).strip().lower()
+_is_production_environment = _runtime_environment in {
+    "prod",
+    "production",
+    "stage",
+    "staging",
+}
 app = FastAPI(
-    title="xagent", description="The Agent Operating System", redirect_slashes=False
+    title="xagent",
+    description="The Agent Operating System",
+    redirect_slashes=False,
+    docs_url=None if _is_production_environment else "/docs",
+    redoc_url=None if _is_production_environment else "/redoc",
+    openapi_url=None if _is_production_environment else "/openapi.json",
 )
 
 # Track background migration task for graceful shutdown cleanup.
@@ -1456,7 +1473,7 @@ app.add_exception_handler(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: "*" should not be used in production
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1464,12 +1481,40 @@ app.add_middleware(
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next: Any) -> Any:
+    """Add browser hardening headers to API and uploaded-file responses."""
+    response = await call_next(request)
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; object-src 'none'; "
+        "frame-ancestors 'none'; img-src 'self' data: blob: https:; "
+        "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:",
+    )
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    return response
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 
 # For static files
+class SafeUploadsStaticFiles(StaticFiles):
+    """Serve only non-active content from the legacy public uploads mount."""
+
+    _BLOCKED_EXTENSIONS = frozenset({".html", ".htm", ".svg", ".svgz", ".xml"})
+
+    async def get_response(self, path: str, scope: Scope) -> Any:
+        if PurePosixPath(path).suffix.lower() in self._BLOCKED_EXTENSIONS:
+            return PlainTextResponse("Not found", status_code=404)
+        return await super().get_response(path, scope)
+
+
 app.mount(
     "/uploads",
-    StaticFiles(directory=str(uploads_dir)),
+    SafeUploadsStaticFiles(directory=str(uploads_dir)),
     name="uploads",
 )
 
@@ -1687,7 +1732,9 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
 async def startup_event() -> None:
     global _migration_task
     from ..config import get_task_execution_role, validate_task_execution_host_config
+    from .auth_config import validate_auth_config
 
+    validate_auth_config()
     validate_task_execution_host_config()
     if get_task_execution_role() == "worker":
         raise ValueError("Use python -m xagent.web.worker for the worker role")

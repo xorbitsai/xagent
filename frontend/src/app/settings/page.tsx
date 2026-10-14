@@ -24,6 +24,7 @@ export default function SettingsPage() {
   const { user, session } = useAuth()
   const { t, locale, setLocale } = useI18n()
   const [email, setEmail] = useState(user?.email || "")
+  const [emailCurrentPassword, setEmailCurrentPassword] = useState("")
   const [isProfileLoading, setIsProfileLoading] = useState(true)
   const [isSavingEmail, setIsSavingEmail] = useState(false)
   const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -150,6 +151,18 @@ export default function SettingsPage() {
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder={t("settings.email.placeholder")}
                 disabled={isProfileLoading || isSavingEmail}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="account-email-password">Current password</Label>
+              <Input
+                id="account-email-password"
+                type="password"
+                value={emailCurrentPassword}
+                onChange={(e) => setEmailCurrentPassword(e.target.value)}
+                disabled={isProfileLoading || isSavingEmail}
+                autoComplete="current-password"
               />
             </div>
 
@@ -295,6 +308,7 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({
           email,
+          current_password: emailCurrentPassword,
         })
       })
 
@@ -305,6 +319,7 @@ export default function SettingsPage() {
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
+          setEmailCurrentPassword("")
           setEmailMessage({ type: 'success', text: t("settings.email.success") })
         } else if (updated.status === "advanced") {
           applyCanonicalEmail()

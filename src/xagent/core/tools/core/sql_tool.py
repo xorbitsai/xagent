@@ -75,6 +75,17 @@ def _get_connection_url(
     if not url:
         raise ValueError(f"Database connection '{connection_name}' not found.")
 
+    # Never allow the SQL tool to reuse the platform's own database URL. The
+    # external connection namespace is intentionally separate; an accidental
+    # pass-through here would let a same-process tool read tenant/auth tables.
+    platform_urls = {
+        value
+        for key in ("DATABASE_URL", "XAGENT_DATABASE_URL", "POSTGRES_URL")
+        if (value := os.getenv(key))
+    }
+    if url in platform_urls:
+        raise ValueError("The platform database cannot be used by the SQL tool")
+
     # Validate URL format using SQLAlchemy
     return make_url(url)
 

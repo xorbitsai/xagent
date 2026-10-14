@@ -275,6 +275,7 @@ GOOGLE_OIDC_CLIENT_ID = "XAGENT_GOOGLE_OIDC_CLIENT_ID"
 GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
 GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
 FRONTEND_URL = "XAGENT_FRONTEND_URL"
+CORS_ORIGINS = "XAGENT_CORS_ORIGINS"
 OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
@@ -2115,6 +2116,14 @@ def get_frontend_url() -> str:
     if value and value.strip():
         return value.strip().rstrip("/")
     return "http://localhost:3000"
+
+
+def get_cors_origins() -> list[str]:
+    """Return the explicit browser origins allowed to call the API."""
+    configured = os.getenv(CORS_ORIGINS)
+    if configured is not None:
+        return [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+    return [get_frontend_url()]
 
 
 def get_oidc_login_ttl_seconds() -> int:

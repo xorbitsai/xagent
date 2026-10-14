@@ -58,9 +58,7 @@ def test_the_cleanup_task_does_not_use_late_acks(
     assert app.tasks[_TASK].acks_late is False
 
 
-def test_the_task_reports_a_failed_purge_without_raising(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_failed_purge_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     from xagent.core.tools.core.RAG_tools.kb import milvus_cleanup
     from xagent.web.jobs import trigger_tasks
 
@@ -68,17 +66,35 @@ def test_the_task_reports_a_failed_purge_without_raising(
         raise RuntimeError("milvus is down")
 
     monkeypatch.setattr(milvus_cleanup, "purge_leftover_milvus_rows", explode)
+    monkeypatch.setattr(trigger_tasks, "get_kb_milvus_cleanup_enabled", lambda: True)
+
+    with pytest.raises(RuntimeError, match="milvus is down"):
+        trigger_tasks.purge_leftover_milvus_rows()
+
+
+def test_the_task_skips_the_purge_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.core.tools.core.RAG_tools.kb import milvus_cleanup
+    from xagent.web.jobs import trigger_tasks
+
+    def explode() -> dict[str, int]:
+        raise AssertionError("the purge must not run while disabled")
+
+    monkeypatch.setattr(milvus_cleanup, "purge_leftover_milvus_rows", explode)
+    monkeypatch.setenv("XAGENT_KB_MILVUS_CLEANUP_ENABLED", "false")
 
     result = trigger_tasks.purge_leftover_milvus_rows()
 
-    assert result["status"] == "failed"
-    assert "milvus is down" in result["error"]
+    assert result["status"] == "disabled"
+    assert "processed_at" in result
 
 
 def test_the_task_reports_success(monkeypatch: pytest.MonkeyPatch) -> None:
     from xagent.core.tools.core.RAG_tools.kb import milvus_cleanup
     from xagent.web.jobs import trigger_tasks
 
+    monkeypatch.setattr(trigger_tasks, "get_kb_milvus_cleanup_enabled", lambda: True)
     monkeypatch.setattr(milvus_cleanup, "purge_leftover_milvus_rows", lambda: {"c": 2})
 
     result = trigger_tasks.purge_leftover_milvus_rows()

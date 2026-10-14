@@ -92,7 +92,7 @@ Restoring them to different points in time leaves the two out of step:
 
 ### Scheduled cleanup
 
-Celery Beat (the shipped `scheduler` service) runs a Milvus-only purge task every `XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS` seconds (default 3600). It removes leftover (uncommitted) rows, and rows whose document or knowledge base is gone from the ledger, once they are older than a grace window of twice `XAGENT_BACKGROUND_JOB_STALE_SECONDS`. Deployments without Beat do not run it, which is harmless: uncommitted rows are never searched and orphans only cost space. It deletes nothing when the ledger has no `kb_ids`. A restore to mismatched points in time therefore has its extra Milvus rows removed by this job.
+Celery Beat (the shipped `scheduler` service) runs a Milvus-only purge task every `XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS` seconds (default 3600). It removes leftover (uncommitted) rows, and rows whose document or knowledge base is gone from the ledger, once they are older than a grace window of twice `XAGENT_BACKGROUND_JOB_STALE_SECONDS`. Setting `XAGENT_KB_MILVUS_CLEANUP_ENABLED=false` turns the job off without touching the Beat entry. Deployments without Beat do not run it: uncommitted rows are never searched; rows of a document missing from the ledger (kb_id still listed) stay searchable, while rows under a kb_id absent from the ledger are unreachable and only cost space; all stay until removed by hand (filter on `kb_id` and `doc_id`). It deletes nothing when the ledger has no `kb_ids`. A restore to mismatched points in time therefore has its extra Milvus rows removed by this job.
 
 ## Differences from LanceDB
 

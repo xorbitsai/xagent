@@ -16,7 +16,8 @@ from xagent.core.tools.core.RAG_tools.core.config import (
     DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE,
 )
 from xagent.core.tools.core.RAG_tools.core.exceptions import DatabaseOperationError
-from xagent.core.tools.core.RAG_tools.kb import milvus_cleanup
+from xagent.core.tools.core.RAG_tools.core.schemas import DocumentProcessingStatus
+from xagent.core.tools.core.RAG_tools.kb import collection_handle, milvus_cleanup
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import milvus_collection_name
 from xagent.core.tools.core.RAG_tools.kb.milvus_cleanup import (
     purge_leftover_milvus_rows,
@@ -56,6 +57,54 @@ class _Iterator:
         return None
 
 
+class _FakeLedgerTable:
+    """A LanceDB-like handle whose row count is fixed at open time."""
+
+    def __init__(self, count: int) -> None:
+        self._count = count
+
+    def count_rows(self) -> int:
+        return self._count
+
+    def close(self) -> None:
+        return None
+
+
+class _FakeLedgerBatch:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+
+    def to_pylist(self) -> list[dict[str, Any]]:
+        return self._rows
+
+
+class _FakeLedgerStore:
+    """A ledger store whose first opened handle reports a stale count.
+
+    The stale count would stick on a pinned handle, so the read can only
+    finish if every attempt opens (and closes) its own table handles.
+    """
+
+    def __init__(self, *, true_count: int, stale_count: int) -> None:
+        self._true = true_count
+        self._stale = stale_count
+        self.opens = 0
+
+    def get_raw_connection(self) -> "_FakeLedgerStore":
+        return self
+
+    def list_tables(self) -> list[str]:
+        return ["documents"]
+
+    def open_table(self, _name: str) -> _FakeLedgerTable:
+        self.opens += 1
+        return _FakeLedgerTable(self._stale if self.opens == 1 else self._true)
+
+    def iter_batches(self, **_kwargs: Any) -> Any:
+        rows = [{"doc_id": f"d{i}"} for i in range(self._true)]
+        return iter([_FakeLedgerBatch(rows)])
+
+
 class FakeMilvus:
     """A tiny in-memory Milvus: query_iterator filters, delete removes matches."""
 
@@ -63,11 +112,19 @@ class FakeMilvus:
         self.collections = {name: list(rows) for name, rows in collections.items()}
         self.deletes: list[tuple[str, str, dict[str, Any]]] = []
         self.not_loaded: set[str] = set()
+        self.delete_not_loaded: set[str] = set()
         self.fail_query: set[str] = set()
         self.before_delete = None
 
     def list_collections(self) -> list[str]:
         return list(self.collections)
+
+    def describe_collection(self, name: str) -> dict[str, Any]:
+        """Enough of a description for ``_with_loaded`` to load the collection."""
+        return {
+            "properties": {"xagent.model_id": MODEL},
+            "fields": [{"name": "dense", "params": {"dim": 8}}],
+        }
 
     def query_iterator(
         self,
@@ -95,6 +152,8 @@ class FakeMilvus:
     def delete(
         self, name: str, *, filter: str, filter_params: dict[str, Any]
     ) -> dict[str, int]:
+        if name in self.delete_not_loaded:
+            raise _NotLoaded("collection is not loaded")
         if self.before_delete is not None:
             self.before_delete(name)
         # Scope off the clauses in the expression, not the params, so dropping
@@ -266,8 +325,16 @@ def test_lancedb_engine_returns_empty_before_touching_anything(
     assert touched == []
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        DocumentProcessingStatus.SUCCESS.value,
+        DocumentProcessingStatus.FAILED.value,
+        DocumentProcessingStatus.CANCELLED.value,
+    ],
+)
 def test_an_invisible_row_with_an_old_terminal_run_is_deleted(
-    fake: FakeMilvus,
+    fake: FakeMilvus, status: str
 ) -> None:
     now = _now()
     _seed_kb_id("kb-1", COLLECTION, 1)
@@ -275,7 +342,7 @@ def test_an_invisible_row_with_an_old_terminal_run_is_deleted(
         COLLECTION,
         "doc",
         1,
-        status="success",
+        status=status,
         updated_at=datetime.fromtimestamp(now - 3600, tz=timezone.utc),
     )
     fake.collections[NAME] = [_row("c1", "kb-1", "doc", created_at=int(now) - 3600)]
@@ -284,7 +351,15 @@ def test_an_invisible_row_with_an_old_terminal_run_is_deleted(
     assert fake.collections[NAME] == []
 
 
-@pytest.mark.parametrize("status", ["running", "pending", "chunked"])
+@pytest.mark.parametrize(
+    "status",
+    [
+        DocumentProcessingStatus.RUNNING.value,
+        DocumentProcessingStatus.PENDING.value,
+        DocumentProcessingStatus.CHUNKED.value,
+        DocumentProcessingStatus.PARTIALLY_EMBEDDED.value,
+    ],
+)
 def test_an_invisible_row_with_a_non_terminal_run_is_kept(
     fake: FakeMilvus, status: str
 ) -> None:
@@ -301,6 +376,38 @@ def test_an_invisible_row_with_a_non_terminal_run_is_kept(
 
     assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {}
     assert len(fake.collections[NAME]) == 1
+
+
+@pytest.mark.parametrize(
+    "updated_at", [None, "not-a-date"], ids=["missing", "unparsable"]
+)
+def test_a_run_row_without_a_usable_updated_at_is_not_purgeable(
+    updated_at: Any,
+) -> None:
+    rows = [
+        {
+            "collection": COLLECTION,
+            "doc_id": "doc",
+            "status": DocumentProcessingStatus.SUCCESS.value,
+            "updated_at": updated_at,
+        }
+    ]
+
+    # The key stays out, with no exception, so the uncommitted check cannot fire.
+    assert milvus_cleanup._purgeable_run_keys(rows, cutoff=10**12) == set()
+
+
+def test_an_old_terminal_run_row_is_purgeable() -> None:
+    rows = [
+        {
+            "collection": COLLECTION,
+            "doc_id": "doc",
+            "status": DocumentProcessingStatus.SUCCESS.value,
+            "updated_at": 100,
+        }
+    ]
+
+    assert milvus_cleanup._purgeable_run_keys(rows, cutoff=200) == {(COLLECTION, "doc")}
 
 
 def test_an_invisible_row_with_a_terminal_run_inside_the_grace_is_kept(
@@ -621,30 +728,19 @@ def test_a_short_ledger_read_aborts_before_any_delete(
     assert fake.deletes == []
 
 
-def test_a_short_ledger_read_is_retried_once_then_succeeds(
-    fake: FakeMilvus, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("stale_count", [0, 5], ids=["stale-low", "stale-high"])
+def test_a_stale_handle_count_is_retried_with_a_fresh_handle(
+    stale_count: int,
 ) -> None:
-    now = _now()
-    _seed_kb_id("kb-1", COLLECTION, 1)
-    _seed_document(COLLECTION, "doc", 1)
-    fake.collections[NAME] = [_row("c1", "kb-1", "doc", created_at=int(now) - 3600)]
-    store = get_vector_index_store()
-    real = store.iter_batches
-    calls = {"documents": 0}
+    # The first handle's count disagrees with the three rows the iterator
+    # yields; only reopening on the retry can see the consistent count.
+    store = _FakeLedgerStore(true_count=3, stale_count=stale_count)
 
-    def flaky(**kwargs: Any) -> Any:
-        if kwargs.get("table_name") == "documents":
-            calls["documents"] += 1
-            if calls["documents"] == 1:
-                return iter(())
-        return real(**kwargs)
+    rows = milvus_cleanup._read_table(store, "documents", ["doc_id"])
 
-    monkeypatch.setattr(store, "iter_batches", flaky)
-
-    # The second, complete read wins; the document is present so nothing is deleted.
-    assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {}
-    assert calls["documents"] == 2
-    assert len(fake.collections[NAME]) == 1
+    assert rows == [{"doc_id": "d0"}, {"doc_id": "d1"}, {"doc_id": "d2"}]
+    # One handle to count and iterate, one to re-count, per attempt.
+    assert store.opens == 4
 
 
 def test_the_cap_stops_the_run_and_leaves_the_rest(
@@ -804,7 +900,7 @@ def test_a_failing_delete_keeps_completed_batches_in_the_shared_run_state(
         milvus_cleanup._purge_collection(
             fake,
             NAME,
-            milvus_cleanup._scan_rows(fake, NAME, cutoff, set()),
+            milvus_cleanup._scan_rows(fake, NAME, cutoff),
             {},
             None,
             set(),
@@ -823,7 +919,7 @@ def test_a_failing_delete_keeps_completed_batches_in_the_shared_run_state(
     milvus_cleanup._purge_collection(
         fake,
         other,
-        milvus_cleanup._scan_rows(fake, other, cutoff, set()),
+        milvus_cleanup._scan_rows(fake, other, cutoff),
         {},
         None,
         set(),
@@ -935,6 +1031,70 @@ def test_a_failing_collection_still_lets_the_others_purge_then_reraises(
     assert client.collections[other] == []
 
 
+def test_each_delete_batch_logs_one_info_line(
+    fake: FakeMilvus, caplog: pytest.LogCaptureFixture
+) -> None:
+    now = _now()
+    old = datetime.fromtimestamp(now - 3600, tz=timezone.utc)
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    _seed_document(COLLECTION, "doc", 1)
+    _seed_run(COLLECTION, "doc", 1, status="success", updated_at=old)
+    fake.collections[NAME] = [
+        _row("c-orphan", "kb-gone", "d-orphan", created_at=int(now) - 3600),
+        _row("c-missing", "kb-1", "gone", created_at=int(now) - 3600),
+        _row("c-uncommitted", "kb-1", "doc", created_at=int(now) - 3600),
+    ]
+
+    with caplog.at_level("INFO"):
+        assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {NAME: 3}
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "deleted batch" in record.getMessage()
+    ]
+    assert len(lines) == 3
+    text = "\n".join(lines)
+    assert f"collection={NAME}" in text
+    assert "kb_id=kb-gone" in text
+    assert "reason=orphan" in text
+    assert "reason=missing document" in text
+    assert "reason=uncommitted" in text
+    assert "doc_ids=1" in text
+    assert "deleted=1" in text
+
+
+def test_a_raising_collection_logs_the_partial_result_before_reraising(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    now = _now()
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    other = milvus_collection_name("cleanup-partial")
+    client = FakeMilvus(
+        {
+            NAME: [_row("c1", "kb-gone", "doc-a", created_at=int(now) - 3600)],
+            other: [_row("c2", "kb-gone", "doc-b", created_at=int(now) - 3600)],
+        }
+    )
+    monkeypatch.setattr(
+        MilvusConnectionManager, "get_shared_client_from_env", lambda _self: client
+    )
+    client.fail_query = {NAME}
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(RuntimeError):
+            purge_leftover_milvus_rows(grace_seconds=60, now=now)
+
+    partial = [
+        record.getMessage()
+        for record in caplog.records
+        if "partial result" in record.getMessage()
+    ]
+    assert len(partial) == 1
+    assert str({other: 1}) in partial[0]
+    assert client.collections[other] == []
+
+
 def test_a_not_loaded_collection_is_skipped_with_a_warning(
     fake: FakeMilvus, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -948,3 +1108,45 @@ def test_a_not_loaded_collection_is_skipped_with_a_warning(
 
     assert "not loaded" in caplog.text
     assert len(fake.collections[NAME]) == 1
+
+
+def test_the_cap_accounts_deleted_rows_not_batch_document_ids(
+    fake: FakeMilvus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = _now()
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    monkeypatch.setattr(milvus_cleanup, "MAX_DELETES_PER_RUN", 2)
+    monkeypatch.setattr(milvus_cleanup, "DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE", 1)
+    # Three single-doc batches of two rows each: charging the budget per deleted
+    # row stops after one batch, while charging per doc_id would run two.
+    fake.collections[NAME] = [
+        _row(f"c-{doc}-{i}", "kb-gone", f"doc-{doc}", created_at=int(now) - 3600)
+        for doc in range(3)
+        for i in range(2)
+    ]
+
+    assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {NAME: 2}
+    assert len(fake.deletes) == 1
+    assert len(fake.collections[NAME]) == 4
+
+
+def test_delete_rows_loads_an_unloaded_collection_before_deleting(
+    fake: FakeMilvus, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = _now()
+    _seed_kb_id("kb-1", COLLECTION, 1)
+    fake.collections[NAME] = [_row("c1", "kb-gone", "doc", created_at=int(now) - 3600)]
+    # The scan succeeds; only the first delete reports the collection not loaded.
+    fake.delete_not_loaded = {NAME}
+    loaded: list[tuple[Any, str, int]] = []
+
+    def ensure(client: Any, model: str, dimension: int) -> None:
+        loaded.append((client, model, dimension))
+        fake.delete_not_loaded.discard(NAME)
+
+    monkeypatch.setattr(collection_handle, "ensure_milvus_collection", ensure)
+
+    assert purge_leftover_milvus_rows(grace_seconds=60, now=now) == {NAME: 1}
+    assert fake.collections[NAME] == []
+    assert len(fake.deletes) == 1
+    assert loaded == [(fake, MODEL, 8)]

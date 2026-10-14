@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...config import get_kb_milvus_cleanup_enabled
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local, init_db
 from ..services.background_jobs import (
@@ -167,21 +168,22 @@ def scan_due_triggers() -> dict[str, Any]:
     acks_late=False,
 )
 def purge_leftover_milvus_rows() -> dict[str, Any]:
-    """Celery Beat entrypoint for the periodic leftover Milvus row purge."""
-    logger.info("Milvus cleanup tick")
-    try:
-        from ...core.tools.core.RAG_tools.kb.milvus_cleanup import (
-            purge_leftover_milvus_rows as purge,
-        )
+    """Celery Beat entrypoint for the periodic leftover Milvus row purge.
 
-        deleted = purge()
-    except Exception as exc:  # noqa: BLE001 - a failed purge must not break dispatch
-        logger.warning("Milvus cleanup failed: %s", exc, exc_info=True)
+    A failed purge raises so Celery records FAILURE; the next Beat tick runs it again.
+    """
+    if not get_kb_milvus_cleanup_enabled():
+        logger.info("Milvus cleanup disabled")
         return {
-            "status": "failed",
-            "error": str(exc),
+            "status": "disabled",
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
+    logger.info("Milvus cleanup tick")
+    from ...core.tools.core.RAG_tools.kb.milvus_cleanup import (
+        purge_leftover_milvus_rows as purge,
+    )
+
+    deleted = purge()
     return {
         "status": "ok",
         "deleted": deleted,

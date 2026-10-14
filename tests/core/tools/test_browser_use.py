@@ -8,7 +8,6 @@ Run with: pytest tests/core/tools/test_browser_use.py
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-
 import pytest
 
 from xagent.core.tools.core import browser_use

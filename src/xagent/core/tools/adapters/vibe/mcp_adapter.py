@@ -601,6 +601,9 @@ _READ_FIELD_SCHEMA_KEYS = frozenset(
         "required",
         "items",
         "additionalProperties",
+        "patternProperties",
+        "propertyNames",
+        "nullable",
     }
 )
 # Numeric field-schema keys carried through, in the order they are emitted,
@@ -887,6 +890,8 @@ def _schema_type_for_emission(value: Any) -> str | list[str] | None:
 def _schema_allows_null(schema: Any) -> bool:
     if not isinstance(schema, Mapping):
         return False
+    if schema.get("nullable") is True:
+        return True
     schema_type = schema.get("type")
     if schema_type == "null":
         return True
@@ -907,6 +912,15 @@ def _schema_is_null_option(schema: Any) -> bool:
         return False
     schema_type = schema.get("type")
     return schema_type == "null" or schema_type == ["null"]
+
+
+def _is_optional_union_options(options: Any) -> bool:
+    """Return whether options contain one concrete branch and one null branch."""
+    return (
+        isinstance(options, list)
+        and len(options) == 2
+        and sum(_schema_is_null_option(option) for option in options) == 1
+    )
 
 
 def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
@@ -1136,6 +1150,13 @@ def _nested_schema_for_emission(
         )
         if nested_additional and additional_properties_safe:
             emitted["additionalProperties"] = nested_additional
+
+    if (
+        schema.get("nullable") is True
+        and not flatten_nullable_union
+        and not _schema_allows_null(emitted)
+    ):
+        return {"anyOf": [emitted, {"type": "null"}]}
 
     return emitted
 
@@ -2016,7 +2037,7 @@ class MCPToolAdapter(AbstractBaseTool):
         beside the wrapper would be dropped there, which is exactly the shape
         the fix is for.
 
-        A field's default is the one exception, and it is not presentation: a
+        Defaults also affect execution rather than only presentation: a
         non-finite default is replaced by ``None``, so such a field is omitted
         from the arguments sent to the server instead of carrying a value no
         provider client can serialize.
@@ -2177,15 +2198,26 @@ class MCPToolAdapter(AbstractBaseTool):
                 if isinstance(candidate.schema, Mapping)
                 else None
             )
-            is_optional_union = (
-                isinstance(options, list)
-                and len(options) == 2
-                and sum(_schema_is_null_option(option) for option in options) == 1
-            )
-            if not is_optional_union:
-                # For a discriminated union, best_match may select a
-                # misleading enum/required error from the wrong branch.
-                return candidate
+            if _is_optional_union_options(options):
+                for nested_candidate in candidate.context:
+                    nested_options = (
+                        nested_candidate.schema.get(nested_candidate.validator)
+                        if nested_candidate.validator in {"anyOf", "oneOf"}
+                        and isinstance(nested_candidate.schema, Mapping)
+                        else None
+                    )
+                    if nested_candidate.validator in {
+                        "anyOf",
+                        "oneOf",
+                    } and not _is_optional_union_options(nested_options):
+                        # Keep the outer Optional[T] boundary so its absolute
+                        # field path is retained, rather than selecting an
+                        # enum/required failure from an unrelated T branch.
+                        return candidate
+                continue
+            # For a discriminated union, best_match may select a misleading
+            # enum/required error from the wrong branch.
+            return candidate
 
         error = jsonschema_exceptions.best_match(errors)
         if error is not None and error.validator in {"anyOf", "oneOf"}:
@@ -2194,12 +2226,20 @@ class MCPToolAdapter(AbstractBaseTool):
                 if isinstance(error.schema, Mapping)
                 else None
             )
-            is_optional_union = (
-                isinstance(options, list)
-                and len(options) == 2
-                and sum(_schema_is_null_option(option) for option in options) == 1
-            )
-            if is_optional_union:
+            if _is_optional_union_options(options):
+                for nested_candidate in error.context:
+                    if nested_candidate.validator not in {"anyOf", "oneOf"}:
+                        continue
+                    nested_options = (
+                        nested_candidate.schema.get(nested_candidate.validator)
+                        if isinstance(nested_candidate.schema, Mapping)
+                        else None
+                    )
+                    if not _is_optional_union_options(nested_options):
+                        # The outer union only represents Optional[T]. Keep a
+                        # multi-branch T error at its boundary instead of
+                        # descending into an unrelated discriminated branch.
+                        return error
                 nested = jsonschema_exceptions.best_match(error.context)
                 if nested is not None:
                     error = nested
@@ -2230,7 +2270,10 @@ class MCPToolAdapter(AbstractBaseTool):
                 allowed = allowed[:157] + "..."
             reason = f"the value is outside the allowed enum {allowed}"
         elif error.validator == "type":
-            reason = "the value has the wrong type"
+            expected = _compact_json(error.validator_value)
+            if len(expected) > 160:
+                expected = expected[:157] + "..."
+            reason = f"the value has the wrong type (expected {expected})"
         elif error.validator in {
             "minimum",
             "maximum",

@@ -5039,6 +5039,10 @@ def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
             "type": "object",
             "properties": {
                 "nullable": {"type": ["string", "null"]},
+                "nullable_enum": {
+                    "type": "string",
+                    "enum": ["a", "b", None],
+                },
                 "numbers": {"type": "integer", "enum": [1, 2]},
                 "numeric_const": {"type": "integer", "const": 1},
                 "const": {"type": "string"},
@@ -5051,6 +5055,8 @@ def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
     types_schema = emitted["properties"]["nullable"]
     assert types_schema["type"] == "string"
     assert types_schema["nullable"] is True
+    assert emitted["properties"]["nullable_enum"]["enum"] == ["a", "b"]
+    assert emitted["properties"]["nullable_enum"]["nullable"] is True
     assert "enum" not in emitted["properties"]["numbers"]
     assert "const" not in emitted["properties"]["numeric_const"]
     assert set(emitted["properties"]) >= {
@@ -5158,8 +5164,12 @@ def test_nested_required_nullable_properties_and_items_accept_null():
                         "type": "array",
                         "items": {"anyOf": [{"type": "string"}, {"type": "null"}]},
                     },
+                    "openapi_nullable": {
+                        "type": "string",
+                        "nullable": True,
+                    },
                 },
-                "required": ["value", "values"],
+                "required": ["value", "values", "openapi_nullable"],
             }
         },
         ["params"],
@@ -5167,7 +5177,13 @@ def test_nested_required_nullable_properties_and_items_accept_null():
 
     assert (
         adapter._nested_argument_error(
-            {"params": {"value": None, "values": ["a", None]}}
+            {
+                "params": {
+                    "value": None,
+                    "values": ["a", None],
+                    "openapi_nullable": None,
+                }
+            }
         )
         is None
     )
@@ -5263,6 +5279,59 @@ def test_discriminated_union_error_stays_at_union_boundary():
     assert error is not None
     assert error.validator == "anyOf"
     assert list(error.path) == ["choice"]
+
+
+def test_optional_discriminated_union_error_stays_at_union_boundary():
+    adapter = _schema_adapter(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "alpha"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["kind", "name"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            }
+        }
+    )
+
+    error = adapter._nested_argument_error({"choice": {"kind": "alpha"}})
+
+    assert error is not None
+    assert error.validator == "anyOf"
+    assert list(error.path) == ["choice"]
+
+
+def test_wrong_type_error_names_the_expected_type():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+            }
+        },
+        ["params"],
+    )
+
+    error = adapter._nested_argument_error({"params": {"count": "many"}})
+
+    assert error is not None
+    result = adapter._invalid_arguments_result(error)
+    assert result["content"][0]["text"] == (
+        "Invalid MCP tool arguments at params.count: "
+        'the value has the wrong type (expected "integer"). '
+        "Check the tool schema and retry."
+    )
 
 
 @pytest.mark.asyncio

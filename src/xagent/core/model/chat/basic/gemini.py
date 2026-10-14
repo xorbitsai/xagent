@@ -145,9 +145,16 @@ def _sanitize_schema_for_gemini(schema: Any) -> Any:
             else:
                 sanitized.pop("type", None)
         enum = sanitized.get("enum")
-        if not isinstance(enum, list) or not all(
-            isinstance(item, str) for item in enum
-        ):
+        if isinstance(enum, list):
+            string_members = [item for item in enum if isinstance(item, str)]
+            has_null = any(item is None for item in enum)
+            if string_members and len(string_members) + int(has_null) == len(enum):
+                sanitized["enum"] = string_members
+                if has_null:
+                    sanitized["nullable"] = True
+            else:
+                sanitized.pop("enum", None)
+        else:
             sanitized.pop("enum", None)
         one_of = sanitized.pop("oneOf", None)
         if isinstance(one_of, list):

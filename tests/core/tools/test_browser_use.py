@@ -417,8 +417,11 @@ class TestBrowserSession:
         fulfill = route.fulfill.await_args.kwargs
         assert fulfill["body"] == b"encoded-body"
         assert fulfill["headers"]["content-encoding"] == "br"
-        cookies = session._context.add_cookies.await_args.args[0]
-        assert [cookie["name"] for cookie in cookies] == ["first", "second"]
+        cookie_calls = session._context.add_cookies.await_args_list
+        assert [call.args[0][0]["name"] for call in cookie_calls] == [
+            "first",
+            "second",
+        ]
 
     @pytest.mark.asyncio
     async def test_guard_route_aborts_oversized_response(self, monkeypatch):

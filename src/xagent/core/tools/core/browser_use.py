@@ -8,13 +8,15 @@ automatically cleaned up after a timeout period.
 
 import asyncio
 import json
+import logging
 from collections.abc import Sequence
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, cast
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
@@ -70,6 +72,28 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
 
 _BROWSER_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 _BROWSER_REQUEST_DEADLINE_SECONDS = 30.0
+
+
+class _NoStoreCookiePolicy(DefaultCookiePolicy):
+    """Keep upstream cookies out of httpx; Chromium owns the cookie jar."""
+
+    def set_ok(self, cookie: Any, request: Any) -> bool:
+        return False
+
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_browser_url(value: str) -> str:
+    """Keep credentials and query tokens out of browser security logs."""
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname or ""
+        if parsed.port:
+            hostname = f"{hostname}:{parsed.port}"
+        return urlunsplit((parsed.scheme, hostname, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        return "<invalid-url>"
 
 
 def _allowed_file_path(
@@ -173,6 +197,10 @@ class BrowserSession:
                     "Then download browsers: playwright install chromium"
                 )
 
+            # Resolve the proxy before allocating Playwright resources. A
+            # configured but untrusted ambient proxy must fail without leaving
+            # a browser process behind for the next request.
+            proxy_url = get_trusted_proxy_url()
             self._playwright = await async_playwright().start()
 
             # Launch browser with anti-detection settings
@@ -206,11 +234,11 @@ class BrowserSession:
                 service_workers="block",
             )
 
-            proxy_url = get_trusted_proxy_url()
             self._http_client = httpx.AsyncClient(
                 transport=PublicNetworkAsyncHTTPTransport(proxy_url=proxy_url),
                 follow_redirects=False,
                 timeout=httpx.Timeout(30.0),
+                cookies=CookieJar(policy=_NoStoreCookiePolicy()),
             )
 
             await self._context.route("**/*", self._guard_route)
@@ -268,13 +296,13 @@ class BrowserSession:
     async def _guard_route(self, route: Any) -> None:
         """Proxy one browser request through the pinned, bounded HTTP client."""
         acquired = False
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _BROWSER_REQUEST_DEADLINE_SECONDS
         try:
+            loop = asyncio.get_running_loop()
             await asyncio.wait_for(
                 self._route_gate.acquire(), _BROWSER_REQUEST_DEADLINE_SECONDS
             )
             acquired = True
+            deadline = loop.time() + _BROWSER_REQUEST_DEADLINE_SECONDS
             request_url = route.request.url
             if urlsplit(request_url).scheme == "file":
                 await _validate_browser_target(
@@ -334,13 +362,24 @@ class BrowserSession:
             await self._apply_response_cookies(
                 request_url, response.headers.get_list("set-cookie")
             )
+            # Chromium's Cookie header was forwarded explicitly above. Never
+            # let httpx replay upstream Set-Cookie values on another request.
+            self._http_client.cookies.clear()
             await route.fulfill(
                 status=response.status_code,
                 headers=response_headers,
                 body=b"".join(chunks),
             )
-        except Exception:
-            await route.abort()
+        except Exception as exc:
+            logger.warning(
+                "Browser request blocked (%s): %s",
+                type(exc).__name__,
+                _sanitize_browser_url(getattr(route.request, "url", "")),
+            )
+            try:
+                await route.abort()
+            except Exception:
+                logger.debug("Browser route was already closed", exc_info=True)
         finally:
             if acquired:
                 self._route_gate.release()
@@ -352,7 +391,9 @@ class BrowserSession:
         if not set_cookie_headers or self._context is None:
             return
         request_host = (urlsplit(request_url).hostname or "").rstrip(".").lower()
-        cookies: list[dict[str, Any]] = []
+        request_parts = urlsplit(request_url)
+        request_path = request_parts.path or "/"
+        default_path = request_path.rsplit("/", 1)[0] or "/"
         for header in set_cookie_headers:
             parsed = SimpleCookie()
             try:
@@ -363,7 +404,8 @@ class BrowserSession:
                 cookie: dict[str, Any] = {
                     "name": morsel.key,
                     "value": morsel.value,
-                    "url": request_url,
+                    "domain": request_host,
+                    "path": morsel["path"] or default_path,
                 }
                 if morsel["domain"]:
                     cookie_domain = morsel["domain"].lstrip(".").rstrip(".").lower()
@@ -371,9 +413,7 @@ class BrowserSession:
                         f".{cookie_domain}"
                     ):
                         continue
-                    cookie.pop("url")
                     cookie["domain"] = morsel["domain"]
-                    cookie["path"] = morsel["path"] or "/"
                 if morsel["secure"]:
                     cookie["secure"] = True
                 if morsel["httponly"]:
@@ -395,9 +435,12 @@ class BrowserSession:
                         ).timestamp()
                     except (TypeError, ValueError):
                         pass
-                cookies.append(cookie)
-        if cookies:
-            await self._context.add_cookies(cast(Any, cookies))
+                try:
+                    await self._context.add_cookies(cast(Any, [cookie]))
+                except Exception:
+                    # A malformed cookie must not discard an otherwise valid
+                    # response. Chromium applies the same best-effort rule.
+                    logger.debug("Ignoring invalid upstream cookie", exc_info=True)
 
     async def get_page(self) -> Page:
         """
@@ -507,16 +550,10 @@ class BrowserSessionManager:
                         f"{existing.locale!r}; requested locale {locale!r} ignored "
                         "(a session's locale is frozen at creation)"
                     )
-                if allowed_file_roots:
-                    existing.allowed_file_roots = tuple(
-                        dict.fromkeys(
-                            (*existing.allowed_file_roots, *allowed_file_roots)
-                        )
-                    )
-                if allowed_files:
-                    existing.allowed_files = tuple(
-                        dict.fromkeys((*existing.allowed_files, *allowed_files))
-                    )
+                # A session id can be supplied by a model. Replace grants on
+                # every call so a previous call cannot authorize a later one.
+                existing.allowed_file_roots = tuple(allowed_file_roots)
+                existing.allowed_files = tuple(allowed_files)
                 existing._last_used = datetime.now()
                 return existing
 

@@ -309,6 +309,11 @@ ENV XAGENT_BUILD_TIME=${XAGENT_BUILD_TIME}
 # private key at this path; Compose mounts it on the persistent secrets volume.
 ENV XAGENT_WORKER_COUNT=2
 ENV XAGENT_ENCRYPTION_KEY_FILE=/run/xagent-secrets/encryption.key
+# The stock image runs the backend as root. Playwright cannot start Chromium's
+# user-namespace sandbox as root, so preserve the existing browser behavior
+# explicitly; set this to false only when running the image as a non-root user
+# with a working Chromium sandbox.
+ENV XAGENT_BROWSER_ALLOW_UNSANDBOXED=true
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

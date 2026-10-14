@@ -346,7 +346,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             try:
                 await validate_public_http_url(target_url)
             except (OSError, ValueError) as exc:
-                raise ValueError("Only public HTTP(S) URLs are allowed") from exc
+                raise ValueError(str(exc)) from exc
             await page.goto(
                 target_url,
                 wait_until="domcontentloaded",

@@ -16,6 +16,7 @@ from xagent.core.tools.core.sql_tool import (
     is_platform_database_url,
 )
 from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
+from xagent.web.services.tool_credentials import set_sql_connection
 
 
 class TestGetConnectionUrl:
@@ -83,6 +84,26 @@ class TestGetConnectionUrl:
         )
         assert is_platform_database_url("sqlite:////tmp/xagent.db")
 
+    def test_rejects_platform_sqlite_file_uri(self, monkeypatch, tmp_path):
+        platform_db = tmp_path / "platform.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{platform_db}")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST",
+            f"sqlite:///file:{platform_db}?uri=true",
+        )
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
+
+    @pytest.mark.parametrize("override", ["host", "port", "dbname", "database"])
+    def test_rejects_network_target_query_overrides(self, monkeypatch, override):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres/xagent")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST",
+            f"postgresql://other@public.example/other?{override}=postgres",
+        )
+        with pytest.raises(ValueError, match="target overrides"):
+            _get_connection_url("test")
+
 
 class TestGetDatabaseType:
     """Test database type detection."""
@@ -110,6 +131,21 @@ class TestGetDatabaseType:
         monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///test.db")
         with pytest.raises(ValueError, match="not found"):
             get_database_type("missing")
+
+
+def test_saved_sql_connection_rejects_platform_database(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db.example/app")
+    db = MagicMock()
+
+    with pytest.raises(ValueError, match="platform database"):
+        set_sql_connection(
+            db,
+            user_id=1,
+            name="platform",
+            connection_url="postgresql+psycopg://other@DB.EXAMPLE:5432/app",
+        )
+
+    db.commit.assert_not_called()
 
 
 class TestRowToDict:
@@ -143,11 +179,18 @@ class TestExecuteSqlQuery:
         with pytest.raises(ValueError, match="not found"):
             execute_sql_query("missing", "SELECT 1")
 
-    def test_sqlite_attach_is_rejected_before_engine_creation(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "ATTACH DATABASE '/tmp/other.db' AS other",
+            "ATTACH '/tmp/other.db' AS other",
+        ],
+    )
+    def test_sqlite_attach_is_rejected_before_engine_creation(self, monkeypatch, query):
         monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")
         with patch("xagent.core.tools.core.sql_tool.create_engine") as create_engine:
-            with pytest.raises(ValueError, match="ATTACH DATABASE"):
-                execute_sql_query("test", "ATTACH DATABASE '/tmp/other.db' AS other")
+            with pytest.raises(ValueError, match="ATTACH"):
+                execute_sql_query("test", query)
         create_engine.assert_not_called()
 
     @patch("xagent.core.tools.core.sql_tool.create_engine")

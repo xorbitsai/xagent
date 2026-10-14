@@ -33,6 +33,10 @@ if TYPE_CHECKING:
     from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
+PLATFORM_DATABASE_ERROR = "The platform database cannot be used by the SQL tool"
+_CONNECTION_TARGET_QUERY_KEYS = frozenset(
+    {"host", "port", "dbname", "database", "unix_socket"}
+)
 
 
 def _database_identity(url: URL) -> tuple[str, str, int | None, str]:
@@ -40,6 +44,9 @@ def _database_identity(url: URL) -> tuple[str, str, int | None, str]:
     backend = url.get_backend_name().lower()
     if backend == "sqlite":
         database = url.database or ":memory:"
+        uri_mode = str(url.query.get("uri", "")).lower() in {"1", "true", "yes"}
+        if uri_mode and database.startswith("file:"):
+            database = database.removeprefix("file:")
         if database != ":memory:":
             database = str(Path(database).expanduser().resolve())
         return backend, "", None, database
@@ -54,7 +61,7 @@ def _database_identity(url: URL) -> tuple[str, str, int | None, str]:
 def is_platform_database_url(candidate: str | URL) -> bool:
     """Whether a candidate URL points at the application's own database."""
     try:
-        candidate_url = candidate if isinstance(candidate, URL) else make_url(candidate)
+        candidate_url = make_url(candidate)
         platform_raw = get_database_url()
         if not platform_raw:
             return False
@@ -63,6 +70,18 @@ def is_platform_database_url(candidate: str | URL) -> bool:
         )
     except (TypeError, ValueError):
         return False
+
+
+def validate_external_database_url(candidate: str | URL) -> URL:
+    """Parse and reject connection spellings that can target the platform DB."""
+    parsed = make_url(candidate)
+    if parsed.get_backend_name().lower() != "sqlite" and (
+        _CONNECTION_TARGET_QUERY_KEYS.intersection(parsed.query)
+    ):
+        raise ValueError("Database target overrides are not allowed in URL queries")
+    if is_platform_database_url(parsed):
+        raise ValueError(PLATFORM_DATABASE_ERROR)
+    return parsed
 
 
 class SQLQueryArgs(BaseModel):
@@ -110,11 +129,7 @@ def _get_connection_url(
     # Never allow the SQL tool to reuse the platform's own database. Compare
     # parsed identities so driver aliases, credentials, casing, and equivalent
     # SQLite paths cannot bypass the isolation boundary.
-    parsed_url = make_url(url)
-    if is_platform_database_url(parsed_url):
-        raise ValueError("The platform database cannot be used by the SQL tool")
-
-    return parsed_url
+    return validate_external_database_url(url)
 
 
 def get_database_type(
@@ -171,9 +186,9 @@ def execute_sql_query(
     # Get connection URL from environment
     url = _get_connection_url(connection_name, connection_url)
     if url.get_backend_name().lower() == "sqlite" and re.search(
-        r"(?is)\battach\s+database\b", query
+        r"(?is)\battach\b", query
     ):
-        raise ValueError("SQLite ATTACH DATABASE is not allowed")
+        raise ValueError("SQLite ATTACH is not allowed")
     stmt = text(query)
     engine = create_engine(url)
 

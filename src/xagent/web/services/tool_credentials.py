@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from ...core.tools.core.sql_tool import is_platform_database_url
+from ...core.tools.core.sql_tool import validate_external_database_url
 from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig
 
@@ -328,8 +328,7 @@ def set_sql_connection(
             f"Unsupported SQLAlchemy URL scheme '{parsed.drivername}'. "
             f"Allowed schemes: {allowed_schemes_text}"
         )
-    if is_platform_database_url(parsed):
-        raise ValueError("The platform database cannot be used by the SQL tool")
+    validate_external_database_url(parsed)
 
     config = _get_user_sql_tool_config(db, user_id)
     storage = _get_user_sql_connection_store(config)

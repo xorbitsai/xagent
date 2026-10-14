@@ -2197,6 +2197,16 @@ class TestBrowserToolDefaultLocaleConfig:
         assert config.get_browser_tool_default_timezone() is None
 
 
+class TestBrowserSandboxConfig:
+    def test_defaults_to_sandboxed(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_ALLOW_UNSANDBOXED, raising=False)
+        assert config.get_browser_allow_unsandboxed() is False
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_ALLOW_UNSANDBOXED, "true")
+        assert config.get_browser_allow_unsandboxed() is True
+
+
 class TestCheckpointStorageConfig:
     """Config for checkpoint trace-event storage encoding and retention."""
 

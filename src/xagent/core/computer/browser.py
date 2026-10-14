@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import TypeAdapter, ValidationError
 
 from ..tools.core.browser_use import BrowserSessionManager, get_browser_manager
+from ..utils.security import validate_public_http_url
 from .environment import (
     ComputerEnvironment,
     ComputerFrameMismatchError,
@@ -174,6 +175,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
             self._manager_session_id,
             headless=self.headless,
             locale=self.locale,
+            workspace_root=str(self.workspace.workspace_dir),
         )
         recreated = (
             self._browser_session is not None and session is not self._browser_session
@@ -339,8 +341,13 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if action.type is ComputerActionType.NAVIGATE:
             if action.url is None:
                 raise ValueError("navigate action requires a URL")
+            target_url = self._resolve_navigation_url(action.url)
+            try:
+                await validate_public_http_url(target_url)
+            except ValueError as exc:
+                raise ValueError("Only public HTTP(S) URLs are allowed") from exc
             await page.goto(
-                self._resolve_navigation_url(action.url),
+                target_url,
                 wait_until="domcontentloaded",
                 timeout=30_000,
             )

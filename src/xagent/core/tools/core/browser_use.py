@@ -428,9 +428,11 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
-    if urlparse(str(url)).scheme.lower() in {"file", "data", "javascript"} or _is_private_browser_target(
-        str(url)
-    ):
+    if urlparse(str(url)).scheme.lower() in {
+        "file",
+        "data",
+        "javascript",
+    } or _is_private_browser_target(str(url)):
         return {
             "success": False,
             "session_id": session_id,
@@ -471,7 +473,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         # Add timeout to prevent hanging (default 30 seconds)
         # Using wait_until parameter (default: 'networkidle', but can be 'domcontentloaded' or 'load')
         # networkidle can hang on pages with continuous background requests
-        await page.goto(url, wait_until=wait_until_local, timeout=30000)  # type: ignore[arg-type]
+        await page.goto(url, wait_until=wait_until_local, timeout=30000)
         # Get title (no timeout parameter available for title())
         title = await page.title()
 

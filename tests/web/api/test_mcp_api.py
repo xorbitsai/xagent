@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
+from fastapi import HTTPException
 
 import xagent.web.api.mcp as mcp_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
@@ -44,6 +45,36 @@ from xagent.web.api.mcp import test_mcp_connection as run_mcp_connection_test
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.user import User
+
+
+@pytest.mark.asyncio
+async def test_connection_test_rejects_stdio_transport_before_loading():
+    with pytest.raises(HTTPException) as error:
+        await run_mcp_connection_test(
+            MCPConnectionTest(
+                name="local",
+                transport="stdio",
+                config={"command": "sh", "args": ["-c", "id"]},
+            ),
+            MagicMock(),
+        )
+
+    assert error.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_connection_test_rejects_private_remote_endpoint():
+    with pytest.raises(HTTPException) as error:
+        await run_mcp_connection_test(
+            MCPConnectionTest(
+                name="internal",
+                transport="streamable_http",
+                config={"url": "http://127.0.0.1:8080/mcp"},
+            ),
+            MagicMock(),
+        )
+
+    assert error.value.status_code == 400
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
@@ -162,7 +193,9 @@ async def test_connection_test_reports_successful_structured_load(monkeypatch):
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MCPConnectionTest(
+            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+        ),
         MagicMock(),
     )
 
@@ -195,7 +228,9 @@ async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MCPConnectionTest(
+            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+        ),
         MagicMock(),
     )
 
@@ -237,7 +272,9 @@ async def test_connection_test_reports_structured_load_failure_without_exception
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MCPConnectionTest(
+            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+        ),
         MagicMock(),
     )
 
@@ -271,7 +308,9 @@ async def test_connection_test_reports_no_tools_as_failure(monkeypatch):
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MCPConnectionTest(
+            name="mail", transport="streamable_http", config={"url": "https://mcp.example.test"}
+        ),
         MagicMock(),
     )
 
@@ -436,7 +475,9 @@ async def test_connection_test_deadline_matches_loader_timeout(
             start = time.monotonic()
             response = await run_mcp_connection_test(
                 MCPConnectionTest(
-                    name="mail", transport="stdio", config={"command": "python"}
+                    name="mail",
+                    transport="streamable_http",
+                    config={"url": "https://mcp.example.test"},
                 ),
                 MagicMock(),
             )
@@ -502,7 +543,9 @@ async def test_connection_test_real_loader_timeout_error_lines(monkeypatch, capl
         start = time.monotonic()
         response = await run_mcp_connection_test(
             MCPConnectionTest(
-                name="mail", transport="stdio", config={"command": "python"}
+                name="mail",
+                transport="streamable_http",
+                config={"url": "https://mcp.example.test"},
             ),
             MagicMock(),
         )

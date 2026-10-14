@@ -73,10 +73,10 @@ class TestKbAccessControlContract:
     ) -> None:
         """Another tenant cannot read parse results for a foreign collection name."""
         t1 = _register_and_login(
-            client, "ac_parse_t1", "pw-t1-", "ac_parse_t1@example.com"
+            client, "ac_parse_t1", "pw-t1-123", "ac_parse_t1@example.com"
         )
         t2 = _register_and_login(
-            client, "ac_parse_t2", "pw-t2-", "ac_parse_t2@example.com"
+            client, "ac_parse_t2", "pw-t2-123", "ac_parse_t2@example.com"
         )
 
         coll = "ac_parse_coll_t1"
@@ -97,7 +97,7 @@ class TestKbAccessControlContract:
     ) -> None:
         """A collection name that does not exist anywhere yields 404 (not 403)."""
         token = _register_and_login(
-            client, "ac_parse_404", "pw-404-", "ac_parse_404@example.com"
+            client, "ac_parse_404", "pw-404-123", "ac_parse_404@example.com"
         )
         missing = "ac_no_such_collection_xyz"
         doc_id = "legit-doc-id-02"
@@ -113,8 +113,12 @@ class TestKbAccessControlContract:
         self, client: TestClient, tmp_path: Path
     ) -> None:
         """Renaming into a taken name is a naming conflict, not an access violation."""
-        t1 = _register_and_login(client, "ac_rn_t1", "pw-r1-", "ac_rn_t1@example.com")
-        t2 = _register_and_login(client, "ac_rn_t2", "pw-r2-", "ac_rn_t2@example.com")
+        t1 = _register_and_login(
+            client, "ac_rn_t1", "pw-r1-123", "ac_rn_t1@example.com"
+        )
+        t2 = _register_and_login(
+            client, "ac_rn_t2", "pw-r2-123", "ac_rn_t2@example.com"
+        )
 
         coll_a = "ac_rename_source_coll"
         coll_b = "ac_rename_target_coll"
@@ -141,7 +145,7 @@ class TestKbAccessControlContract:
         Only the cross-tenant branch above has to stay vague about ownership.
         """
         token = _register_and_login(
-            client, "ac_rn_own", "pw-ro-", "ac_rn_own@example.com"
+            client, "ac_rn_own", "pw-ro-123", "ac_rn_own@example.com"
         )
 
         coll_a = "ac_rename_own_source"
@@ -164,8 +168,12 @@ class TestKbAccessControlContract:
 
         It creates nothing, so it must not answer with a naming-conflict status.
         """
-        t1 = _register_and_login(client, "ac_chk_t1", "pw-c1-", "ac_chk_t1@example.com")
-        t2 = _register_and_login(client, "ac_chk_t2", "pw-c2-", "ac_chk_t2@example.com")
+        t1 = _register_and_login(
+            client, "ac_chk_t1", "pw-c1-123", "ac_chk_t1@example.com"
+        )
+        t2 = _register_and_login(
+            client, "ac_chk_t2", "pw-c2-123", "ac_chk_t2@example.com"
+        )
 
         coll = "ac_check_foreign_coll"
         sample = _write_sample_txt(tmp_path / "ac_chk.txt")
@@ -190,8 +198,12 @@ class TestKbAccessControlContract:
         access attempt -- and "pick a different name" would point at an input the
         form does not have. Hence ``taken_name_is_conflict=False``.
         """
-        t1 = _register_and_login(client, "ac_cfg_t1", "pw-g1-", "ac_cfg_t1@example.com")
-        t2 = _register_and_login(client, "ac_cfg_t2", "pw-g2-", "ac_cfg_t2@example.com")
+        t1 = _register_and_login(
+            client, "ac_cfg_t1", "pw-g1-123", "ac_cfg_t1@example.com"
+        )
+        t2 = _register_and_login(
+            client, "ac_cfg_t2", "pw-g2-123", "ac_cfg_t2@example.com"
+        )
 
         coll = "ac_config_foreign_coll"
         sample = _write_sample_txt(tmp_path / "ac_cfg.txt")
@@ -229,10 +241,10 @@ class TestKbAccessControlContract:
         rather than accuse the caller of an access violation.
         """
         t1 = _register_and_login(
-            client, f"ac_ing_{slug}_t1", "pw-i1-", f"ac_ing_{slug}_t1@example.com"
+            client, f"ac_ing_{slug}_t1", "pw-i1-123", f"ac_ing_{slug}_t1@example.com"
         )
         t2 = _register_and_login(
-            client, f"ac_ing_{slug}_t2", "pw-i2-", f"ac_ing_{slug}_t2@example.com"
+            client, f"ac_ing_{slug}_t2", "pw-i2-123", f"ac_ing_{slug}_t2@example.com"
         )
 
         coll = f"ac_ingest_foreign_coll_{slug}"

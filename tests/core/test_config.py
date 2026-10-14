@@ -26,6 +26,7 @@ from xagent.config import (
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
+    CORS_ORIGINS,
     DATABASE_URL,
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
@@ -135,6 +136,7 @@ from xagent.config import (
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
+    get_cors_origins,
     get_database_url,
     get_db_max_overflow,
     get_db_pool_size,
@@ -557,6 +559,21 @@ class TestAuthEmailConfig:
         assert get_slack_client_secret() is None
         assert get_slack_app_token() is None
         assert get_slack_oauth_redirect_uri() is None
+
+    def test_cors_origins_default_to_frontend_url(self, monkeypatch):
+        monkeypatch.delenv(CORS_ORIGINS, raising=False)
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", " https://app.example.com/ ")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_parse_explicit_list(self, monkeypatch):
+        monkeypatch.setenv(
+            CORS_ORIGINS,
+            " https://app.example.com/ , https://admin.example.com ",
+        )
+        assert get_cors_origins() == [
+            "https://app.example.com",
+            "https://admin.example.com",
+        ]
 
     def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
         monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")

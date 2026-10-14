@@ -20,6 +20,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_cors_origins,
     get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
@@ -98,6 +99,7 @@ from .api.v1.errors import V1ApiError, V1ErrorCode, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
+from .auth_config import validate_auth_config
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -1456,7 +1458,7 @@ app.add_exception_handler(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: "*" should not be used in production
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1688,6 +1690,7 @@ async def startup_event() -> None:
     global _migration_task
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
+    validate_auth_config()
     validate_task_execution_host_config()
     if get_task_execution_role() == "worker":
         raise ValueError("Use python -m xagent.web.worker for the worker role")

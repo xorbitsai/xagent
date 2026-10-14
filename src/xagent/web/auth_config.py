@@ -1,6 +1,12 @@
 import os
 
 _INSECURE_JWT_SECRET = "your-secret-key-change-in-production"
+_INSECURE_JWT_SECRET_VALUES = {
+    _INSECURE_JWT_SECRET,
+    "change-me",
+    "secret",
+    "replace-with-a-long-random-secret",
+}
 JWT_SECRET_KEY = os.getenv("XAGENT_JWT_SECRET", _INSECURE_JWT_SECRET)
 JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
 
@@ -12,12 +18,14 @@ def validate_auth_config() -> None:
         .strip()
         .lower()
     )
-    requires_secure_secret = environment in {"prod", "production", "stage", "staging"}
+    requires_secure_secret = environment != "development"
     requires_secure_secret = requires_secure_secret or os.getenv(
         "XAGENT_REQUIRE_SECURE_SECRETS", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
+    configured_secret = os.getenv("XAGENT_JWT_SECRET", JWT_SECRET_KEY).strip()
     if requires_secure_secret and (
-        not JWT_SECRET_KEY or JWT_SECRET_KEY == _INSECURE_JWT_SECRET
+        not configured_secret
+        or configured_secret.lower() in _INSECURE_JWT_SECRET_VALUES
     ):
         raise RuntimeError(
             "XAGENT_JWT_SECRET must be set to a unique value before starting "

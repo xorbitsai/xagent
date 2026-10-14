@@ -7,17 +7,16 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.types import ASGIApp, Receive, Scope, Send
-from pathlib import PurePosixPath
 
 from ..config import (
     get_agent_runtime,
@@ -187,8 +186,10 @@ get_external_upload_dirs()
 
 # FastAPI app creation here
 _runtime_environment = (
-    os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development"
-).strip().lower()
+    (os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development")
+    .strip()
+    .lower()
+)
 _is_production_environment = _runtime_environment in {
     "prod",
     "production",
@@ -1498,7 +1499,9 @@ async def security_headers(request: Request, call_next: Any) -> Any:
     response.headers.setdefault("X-Frame-Options", "DENY")
     return response
 
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
+
 
 # For static files
 class SafeUploadsStaticFiles(StaticFiles):

@@ -396,6 +396,9 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
         # Convert workspace-relative paths to file:// URLs
         url = args.get("url", "")
+        if self._workspace is not None:
+            args = dict(args)
+            args["_workspace_root"] = str(self._workspace.workspace_dir)
 
         # Debug logging
         import logging
@@ -434,7 +437,6 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
                 )
 
                 if resolved_path.exists():
-                    args = dict(args)  # Make a mutable copy
                     args["url"] = resolved_path.as_uri()
                     logger.info(
                         f"[BrowserNavigateTool] Converted to file:// URL: {args['url']}"

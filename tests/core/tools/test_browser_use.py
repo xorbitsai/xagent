@@ -59,6 +59,40 @@ class TestBrowserNavigate:
         # For now, just test the error handling without Playwright
         pass
 
+    def test_navigate_rejects_private_and_alternate_ip_targets(self):
+        import asyncio
+
+        with patch("xagent.core.tools.core.browser_use.PLAYWRIGHT_AVAILABLE", False):
+            for url in ("http://127.0.0.1/", "http://127.1/", "http://2130706433/"):
+                result = asyncio.run(
+                    browser_use.browser_navigate(session_id="test-session", url=url)
+                )
+                assert result["error"] == "Only public network URLs are allowed"
+
+    def test_navigate_allows_workspace_file_only(self, tmp_path):
+        import asyncio
+
+        html_path = tmp_path / "report.html"
+        html_path.write_text("<html><body>ok</body></html>", encoding="utf-8")
+
+        with patch("xagent.core.tools.core.browser_use.PLAYWRIGHT_AVAILABLE", False):
+            allowed = asyncio.run(
+                browser_use.browser_navigate(
+                    session_id="test-session",
+                    url=html_path.as_uri(),
+                    _workspace_root=str(tmp_path),
+                )
+            )
+            blocked = asyncio.run(
+                browser_use.browser_navigate(
+                    session_id="test-session",
+                    url=html_path.as_uri(),
+                )
+            )
+
+        assert "Only public network URLs are allowed" not in allowed["error"]
+        assert blocked["error"] == "Only public network URLs are allowed"
+
 
 class TestBrowserClick:
     """Tests for browser_click function."""

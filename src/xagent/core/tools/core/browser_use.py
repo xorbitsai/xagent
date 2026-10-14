@@ -7,17 +7,18 @@ automatically cleaned up after a timeout period.
 """
 
 import asyncio
-import ipaddress
 import json
-import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlsplit
 
 from ....config import (
+    get_browser_allow_unsandboxed,
     get_browser_tool_default_locale,
     get_browser_tool_default_timezone,
 )
+from ...utils.security import validate_public_http_url
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -61,22 +62,39 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
         return f"Error: {str(error)}\n\nTraceback:\n{tb_str}"
 
 
-def _is_private_browser_target(url: str) -> bool:
-    parsed = urlparse(url)
-    hostname = (parsed.hostname or "").lower().rstrip(".")
-    if hostname in {"localhost", "localhost.localdomain", "metadata.google.internal"}:
-        return True
+def _workspace_file_path(url: str, workspace_root: str | None) -> Path | None:
+    """Return a workspace-contained file path, or ``None`` for unsafe URLs."""
+    if not workspace_root:
+        return None
     try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        return False
-    return bool(
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_reserved
-        or address.is_unspecified
-    )
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() != "file" or parsed.netloc:
+            return None
+        root = Path(workspace_root).expanduser().resolve()
+        candidate = Path(unquote(parsed.path)).expanduser().resolve()
+        candidate.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    return candidate if candidate.is_file() else None
+
+
+async def _validate_browser_target(
+    url: str, *, workspace_root: str | None = None
+) -> None:
+    """Validate a browser target and every request made by its page."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ValueError("Malformed browser URL") from exc
+
+    scheme = parsed.scheme.lower()
+    if scheme == "file":
+        if _workspace_file_path(url, workspace_root) is None:
+            raise ValueError("Only workspace files are allowed")
+        return
+    if scheme not in {"http", "https"}:
+        raise ValueError("Only HTTP(S) URLs are allowed")
+    await validate_public_http_url(url)
 
 
 class BrowserSession:
@@ -87,6 +105,7 @@ class BrowserSession:
         session_id: str,
         headless: bool = True,
         locale: Optional[str] = None,
+        workspace_root: str | None = None,
     ):
         """
         Initialize a browser session.
@@ -101,6 +120,7 @@ class BrowserSession:
         self.session_id = session_id
         self.headless = headless
         self.locale = locale or get_browser_tool_default_locale()
+        self.workspace_root = workspace_root
         # No caller ever supplies a per-request timezone (no tool schema
         # exposes it, and _with_default_session only injects locale) -- this
         # is deployment-configured only, unlike locale.
@@ -132,15 +152,13 @@ class BrowserSession:
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ]
-            if os.getenv("XAGENT_BROWSER_ALLOW_UNSANDBOXED", "").lower() in {
-                "1",
-                "true",
-                "yes",
-            }:
+            allow_unsandboxed = get_browser_allow_unsandboxed()
+            if allow_unsandboxed:
                 browser_args.append("--no-sandbox")
             self._browser = await self._playwright.chromium.launch(
                 headless=self.headless,
                 args=browser_args,
+                chromium_sandbox=not allow_unsandboxed,
             )
 
             # Create context with realistic settings. locale comes from the
@@ -158,6 +176,19 @@ class BrowserSession:
             )
 
             self._page = await self._context.new_page()
+
+            async def guard_route(route: Any) -> None:
+                try:
+                    await _validate_browser_target(
+                        route.request.url,
+                        workspace_root=self.workspace_root,
+                    )
+                except (TypeError, ValueError):
+                    await route.abort()
+                    return
+                await route.continue_()
+
+            await self._page.route("**/*", guard_route)
 
             # Languages mirror the context's own locale instead of a fixed
             # list, so the spoofed navigator.languages stays consistent with
@@ -274,6 +305,7 @@ class BrowserSessionManager:
         session_id: str,
         headless: bool = False,
         locale: Optional[str] = None,
+        workspace_root: str | None = None,
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -303,6 +335,8 @@ class BrowserSessionManager:
                         f"{existing.locale!r}; requested locale {locale!r} ignored "
                         "(a session's locale is frozen at creation)"
                     )
+                if workspace_root and not existing.workspace_root:
+                    existing.workspace_root = workspace_root
                 existing._last_used = datetime.now()
                 return existing
 
@@ -311,7 +345,12 @@ class BrowserSessionManager:
                 self._cleanup_task = asyncio.create_task(self._cleanup_loop())
 
             # Create new session with specified settings
-            new_session = BrowserSession(session_id, headless, locale=locale)
+            new_session = BrowserSession(
+                session_id,
+                headless,
+                locale=locale,
+                workspace_root=workspace_root,
+            )
             self._sessions[session_id] = new_session
             new_session._last_used = datetime.now()
             # Log the resolved locale (falls back to the deployment default
@@ -428,11 +467,13 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
-    if urlparse(str(url)).scheme.lower() in {
-        "file",
-        "data",
-        "javascript",
-    } or _is_private_browser_target(str(url)):
+    workspace_root = kwargs.get("_workspace_root")
+    try:
+        await _validate_browser_target(
+            str(url),
+            workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+        )
+    except (TypeError, ValueError):
         return {
             "success": False,
             "session_id": session_id,
@@ -456,7 +497,12 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         }
 
     manager = get_browser_manager()
-    session = await manager.get_or_create(session_id, headless, locale=locale)
+    session = await manager.get_or_create(
+        session_id,
+        headless,
+        locale=locale,
+        workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+    )
     page = await session.get_page()
 
     try:

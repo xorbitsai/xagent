@@ -4,12 +4,25 @@ import datetime
 import ssl
 from typing import Any
 
+import httpx
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from xagent.core.utils import security
+
+
+class _RecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.urls: list[str] = []
+        self.hosts: list[str | None] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.urls.append(str(request.url))
+        self.hosts.append(request.headers.get("Host"))
+        return httpx.Response(200, request=request, content=b"ok")
 
 
 def _generate_test_ca_pem() -> bytes:
@@ -98,3 +111,48 @@ class TestBuildCaBundleSslContext:
             for cert in context.get_ca_certs()
             for rdn in cert["subject"]
         )
+
+
+class TestPublicNetworkAsyncHTTPTransport:
+    @pytest.mark.asyncio
+    async def test_direct_request_connects_to_validated_ip(self, monkeypatch) -> None:
+        inner = _RecordingTransport()
+
+        async def resolve(_url: str) -> list[str]:
+            return ["203.0.113.8"]
+
+        monkeypatch.setattr(security, "validate_public_http_url", resolve)
+        monkeypatch.setattr(security.httpx, "AsyncHTTPTransport", lambda **_: inner)
+        transport = security.PublicNetworkAsyncHTTPTransport()
+        request = httpx.Request("GET", "https://public.example/path")
+
+        response = await transport.handle_async_request(request)
+
+        assert response.status_code == 200
+        assert inner.urls == ["https://203.0.113.8/path"]
+        assert inner.hosts == ["public.example"]
+        assert str(request.url) == "https://public.example/path"
+
+    @pytest.mark.asyncio
+    async def test_trusted_proxy_preserves_hostname_after_validation(
+        self, monkeypatch
+    ) -> None:
+        inner = _RecordingTransport()
+        validated: list[str] = []
+
+        async def resolve(url: str) -> list[str]:
+            validated.append(url)
+            return ["203.0.113.8"]
+
+        monkeypatch.setattr(security, "validate_public_http_url", resolve)
+        monkeypatch.setattr(security.httpx, "AsyncHTTPTransport", lambda **_: inner)
+        transport = security.PublicNetworkAsyncHTTPTransport(
+            proxy_url="http://proxy.example:8080"
+        )
+        request = httpx.Request("GET", "https://public.example/path")
+
+        response = await transport.handle_async_request(request)
+
+        assert response.status_code == 200
+        assert validated == ["https://public.example/path"]
+        assert inner.urls == ["https://public.example/path"]

@@ -360,7 +360,10 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         inspection or rendered output is required, and use browser_extract_text when page
         text is required.
 
-        Workspace files: Use filename (e.g., "poster.html") - auto-searches input/output/temp dirs.
+        Network policy: HTTP(S) targets must resolve to public addresses. Intranet,
+        loopback, data:, about:, and WebSocket targets are rejected. Workspace files:
+        use a filename (e.g., "poster.html"); authorized input/output/temp/upload
+        locations are searched automatically.
 
         Default: headless=False (shows browser window for debugging/interaction).
         Set headless=True only for simple content extraction without user interaction.
@@ -396,12 +399,15 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
         # Convert workspace-relative paths to file:// URLs
         url = args.get("url", "")
-        if self._workspace is not None:
-            args = dict(args)
-            args["_workspace_root"] = str(self._workspace.workspace_dir)
-        elif "_workspace_root" in args:
-            args = dict(args)
-            args.pop("_workspace_root", None)
+        args = {
+            **args,
+            "_allowed_file_roots": (
+                self._workspace.get_allowed_dirs()
+                if self._workspace is not None
+                else []
+            ),
+            "_allowed_files": [],
+        }
 
         # Debug logging
         import logging
@@ -427,9 +433,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         if (
             self._workspace
             and url
-            and not url.startswith(
-                ("http://", "https://", "file://", "about:", "data:")
-            )
+            and not url.startswith(("http://", "https://", "file://"))
         ):
             # Use workspace's intelligent file search (input → output → temp → root)
             try:
@@ -441,6 +445,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
                 if resolved_path.exists():
                     args["url"] = resolved_path.as_uri()
+                    args["_allowed_files"] = [str(resolved_path)]
                     logger.info(
                         f"[BrowserNavigateTool] Converted to file:// URL: {args['url']}"
                     )

@@ -317,17 +317,25 @@ def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:
 class PublicNetworkAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """HTTP transport that validates and pins every outbound request host."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, proxy_url: str | None = None) -> None:
+        self._proxy_url = proxy_url
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,
             verify=build_ca_bundle_ssl_context(),
+            proxy=proxy_url,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         original_url = request.url
         original_host = request.headers.get("Host")
         resolved_ips = await validate_public_http_url(str(original_url))
+        if self._proxy_url is not None:
+            # A trusted egress proxy performs the actual DNS lookup and TCP
+            # connection. The explicit opt-in represented by proxy_url means
+            # it is responsible for enforcing the same private-range policy;
+            # rewriting the CONNECT target to an IP would also break TLS SNI.
+            return await self._transport.handle_async_request(request)
         last_error: httpx.TransportError | None = None
         for resolved_ip in resolved_ips:
             connect_url, host_header, sni = _pin_url_to_ip(

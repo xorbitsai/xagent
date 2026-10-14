@@ -172,14 +172,11 @@ class BrowserComputerEnvironment(ComputerEnvironment):
 
     async def _get_page(self, *, reject_recreated_session: bool) -> Any:
         workspace_dir = getattr(self.workspace, "workspace_dir", None)
-        session_kwargs: dict[str, Any] = {
-            "headless": self.headless,
-            "locale": self.locale,
-        }
-        if workspace_dir is not None:
-            session_kwargs["workspace_root"] = str(workspace_dir)
         session = await self.manager.get_or_create(
-            self._manager_session_id, **session_kwargs
+            self._manager_session_id,
+            headless=self.headless,
+            locale=self.locale,
+            allowed_file_roots=(str(workspace_dir),) if workspace_dir else (),
         )
         recreated = (
             self._browser_session is not None and session is not self._browser_session

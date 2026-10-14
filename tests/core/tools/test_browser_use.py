@@ -5,7 +5,9 @@ These tests use mocking to avoid requiring actual browser installation.
 Run with: pytest tests/core/tools/test_browser_use.py
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
 
 import pytest
 
@@ -38,9 +40,14 @@ def reset_manager():
 class TestBrowserNavigate:
     """Tests for browser_navigate function."""
 
-    def test_navigate_without_playwright(self):
+    def test_navigate_without_playwright(self, monkeypatch):
         """Test that navigate fails gracefully without Playwright."""
         import asyncio
+
+        async def public_target(_url: str) -> list[str]:
+            return ["203.0.113.10"]
+
+        monkeypatch.setattr(browser_use, "validate_public_http_url", public_target)
 
         with patch("xagent.core.tools.core.browser_use.PLAYWRIGHT_AVAILABLE", False):
             result = asyncio.run(
@@ -80,7 +87,7 @@ class TestBrowserNavigate:
                 browser_use.browser_navigate(
                     session_id="test-session",
                     url=html_path.as_uri(),
-                    _workspace_root=str(tmp_path),
+                    _allowed_file_roots=[str(tmp_path)],
                 )
             )
             blocked = asyncio.run(
@@ -91,7 +98,10 @@ class TestBrowserNavigate:
             )
 
         assert "Only public network URLs are allowed" not in allowed["error"]
-        assert blocked["error"] == "Only workspace files are allowed"
+        assert (
+            blocked["error"]
+            == "Only authorized workspace or uploaded files are allowed"
+        )
 
 
 class TestBrowserClick:
@@ -318,3 +328,123 @@ class TestBrowserSession:
             assert session.session_id == "test-session"
             assert session.headless is True
             assert session._initialized is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("allow_unsandboxed", "expected_sandbox", "expected_no_sandbox"),
+        [(False, True, False), (True, False, True)],
+    )
+    async def test_launch_security_flags_follow_explicit_setting(
+        self, monkeypatch, allow_unsandboxed, expected_sandbox, expected_no_sandbox
+    ):
+        context = MagicMock()
+        context.route = AsyncMock()
+        context.route_web_socket = AsyncMock()
+        page = MagicMock()
+        page.add_init_script = AsyncMock()
+        context.new_page = AsyncMock(return_value=page)
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        chromium = MagicMock()
+        chromium.launch = AsyncMock(return_value=browser)
+        playwright = MagicMock(chromium=chromium)
+        playwright.stop = AsyncMock()
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=playwright)
+
+        monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+        monkeypatch.setattr(browser_use, "async_playwright", lambda: starter)
+        monkeypatch.setattr(
+            browser_use, "get_browser_allow_unsandboxed", lambda: allow_unsandboxed
+        )
+        monkeypatch.setattr(browser_use, "get_trusted_proxy_url", lambda: None)
+        monkeypatch.setattr(
+            browser_use,
+            "PublicNetworkAsyncHTTPTransport",
+            lambda **_kwargs: httpx.MockTransport(lambda _request: httpx.Response(200)),
+        )
+
+        session = browser_use.BrowserSession("security-flags")
+        try:
+            await session._ensure_initialized()
+        finally:
+            await session.close()
+
+        launch_kwargs = chromium.launch.await_args.kwargs
+        assert launch_kwargs["chromium_sandbox"] is expected_sandbox
+        assert ("--no-sandbox" in launch_kwargs["args"]) is expected_no_sandbox
+        context.route_web_socket.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_route_preserves_encoded_body_and_multiple_cookies(self):
+        captured: list[httpx.Request] = []
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            return httpx.Response(
+                200,
+                request=request,
+                headers=[
+                    ("content-encoding", "br"),
+                    ("set-cookie", "first=1; Path=/; HttpOnly"),
+                    ("set-cookie", "second=2; Path=/; SameSite=Lax"),
+                ],
+                stream=httpx.ByteStream(b"encoded-body"),
+            )
+
+        session = browser_use.BrowserSession("guard")
+        session._http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), follow_redirects=False
+        )
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+        route = MagicMock()
+        route.request.url = "https://public.example/page"
+        route.request.method = "GET"
+        route.request.post_data_buffer = None
+        route.request.all_headers = AsyncMock(
+            return_value={"accept-encoding": "br, gzip", "host": "public.example"}
+        )
+        route.fulfill = AsyncMock()
+        route.abort = AsyncMock()
+
+        try:
+            await session._guard_route(route)
+        finally:
+            await session._http_client.aclose()
+
+        assert captured[0].headers["accept-encoding"] == "identity"
+        route.abort.assert_not_awaited()
+        fulfill = route.fulfill.await_args.kwargs
+        assert fulfill["body"] == b"encoded-body"
+        assert fulfill["headers"]["content-encoding"] == "br"
+        cookies = session._context.add_cookies.await_args.args[0]
+        assert [cookie["name"] for cookie in cookies] == ["first", "second"]
+
+    @pytest.mark.asyncio
+    async def test_guard_route_aborts_oversized_response(self, monkeypatch):
+        async def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, request=request, stream=httpx.ByteStream(b"1234")
+            )
+
+        monkeypatch.setattr(browser_use, "_BROWSER_RESPONSE_MAX_BYTES", 3)
+        session = browser_use.BrowserSession("guard-limit")
+        session._http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+        route = MagicMock()
+        route.request.url = "https://public.example/large"
+        route.request.method = "GET"
+        route.request.post_data_buffer = None
+        route.request.all_headers = AsyncMock(return_value={})
+        route.fulfill = AsyncMock()
+        route.abort = AsyncMock()
+
+        try:
+            await session._guard_route(route)
+        finally:
+            await session._http_client.aclose()
+
+        route.fulfill.assert_not_awaited()
+        route.abort.assert_awaited_once()

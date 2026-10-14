@@ -8,9 +8,12 @@ automatically cleaned up after a timeout period.
 
 import asyncio
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
+from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional, cast
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -21,6 +24,7 @@ from ....config import (
     get_browser_tool_default_timezone,
 )
 from ...utils.security import PublicNetworkAsyncHTTPTransport, validate_public_http_url
+from .web_content import get_trusted_proxy_url
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -64,24 +68,37 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
         return f"Error: {str(error)}\n\nTraceback:\n{tb_str}"
 
 
-def _workspace_file_path(url: str, workspace_root: str | None) -> Path | None:
-    """Return a workspace-contained file path, or ``None`` for unsafe URLs."""
-    if not workspace_root:
-        return None
+_BROWSER_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
+_BROWSER_REQUEST_DEADLINE_SECONDS = 30.0
+
+
+def _allowed_file_path(
+    url: str,
+    *,
+    allowed_roots: Sequence[str] = (),
+    allowed_files: Sequence[str] = (),
+) -> Path | None:
+    """Return an explicitly authorized local file, or ``None``."""
     try:
         parsed = urlsplit(url)
-        if parsed.scheme.lower() != "file" or parsed.netloc:
+        if parsed.scheme != "file" or parsed.netloc:
             return None
-        root = Path(workspace_root).expanduser().resolve()
-        candidate = Path(unquote(parsed.path)).expanduser().resolve()
-        candidate.relative_to(root)
+        candidate = Path(unquote(parsed.path)).resolve()
+        roots = tuple(Path(root).resolve() for root in allowed_roots)
+        files = tuple(Path(path).resolve() for path in allowed_files)
     except (OSError, ValueError):
         return None
-    return candidate if candidate.is_file() else None
+    authorized = candidate in files or any(
+        candidate.is_relative_to(root) for root in roots
+    )
+    return candidate if authorized and candidate.is_file() else None
 
 
 async def _validate_browser_target(
-    url: str, *, workspace_root: str | None = None
+    url: str,
+    *,
+    allowed_file_roots: Sequence[str] = (),
+    allowed_files: Sequence[str] = (),
 ) -> None:
     """Validate a browser target and every request made by its page."""
     try:
@@ -91,8 +108,13 @@ async def _validate_browser_target(
 
     scheme = parsed.scheme.lower()
     if scheme == "file":
-        if _workspace_file_path(url, workspace_root) is None:
-            raise ValueError("Only workspace files are allowed")
+        if (
+            _allowed_file_path(
+                url, allowed_roots=allowed_file_roots, allowed_files=allowed_files
+            )
+            is None
+        ):
+            raise ValueError("Only authorized workspace or uploaded files are allowed")
         return
     if scheme not in {"http", "https"}:
         raise ValueError("Only HTTP(S) URLs are allowed")
@@ -107,7 +129,8 @@ class BrowserSession:
         session_id: str,
         headless: bool = True,
         locale: Optional[str] = None,
-        workspace_root: str | None = None,
+        allowed_file_roots: Sequence[str] = (),
+        allowed_files: Sequence[str] = (),
     ):
         """
         Initialize a browser session.
@@ -122,7 +145,8 @@ class BrowserSession:
         self.session_id = session_id
         self.headless = headless
         self.locale = locale or get_browser_tool_default_locale()
-        self.workspace_root = workspace_root
+        self.allowed_file_roots = tuple(allowed_file_roots)
+        self.allowed_files = tuple(allowed_files)
         # No caller ever supplies a per-request timezone (no tool schema
         # exposes it, and _with_default_session only injects locale) -- this
         # is deployment-configured only, unlike locale.
@@ -132,6 +156,9 @@ class BrowserSession:
         self._page: Optional[Page] = None
         self._playwright: Any = None
         self._http_client: httpx.AsyncClient | None = None
+        # Bound aggregate buffered response memory for one browser session:
+        # eight routes times _BROWSER_RESPONSE_MAX_BYTES at most.
+        self._route_gate = asyncio.Semaphore(8)
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
@@ -179,51 +206,17 @@ class BrowserSession:
                 service_workers="block",
             )
 
+            proxy_url = get_trusted_proxy_url()
             self._http_client = httpx.AsyncClient(
-                transport=PublicNetworkAsyncHTTPTransport(),
+                transport=PublicNetworkAsyncHTTPTransport(proxy_url=proxy_url),
                 follow_redirects=False,
                 timeout=httpx.Timeout(30.0),
             )
 
-            async def guard_route(route: Any) -> None:
-                try:
-                    request_url = route.request.url
-                    await _validate_browser_target(
-                        request_url,
-                        workspace_root=self.workspace_root,
-                    )
-                    if urlsplit(request_url).scheme == "file":
-                        await route.continue_()
-                        return
-                    assert self._http_client is not None
-                    request_headers = await route.request.all_headers()
-                    response = await self._http_client.request(
-                        route.request.method,
-                        request_url,
-                        headers=request_headers,
-                        content=route.request.post_data_buffer,
-                    )
-                    response_headers = dict(response.headers)
-                    for header in (
-                        "connection",
-                        "content-encoding",
-                        "content-length",
-                        "transfer-encoding",
-                    ):
-                        response_headers.pop(header, None)
-                    await route.fulfill(
-                        status=response.status_code,
-                        headers=response_headers,
-                        body=response.content,
-                    )
-                except (OSError, TypeError, ValueError, httpx.HTTPError):
-                    await route.abort()
-
-            await self._context.route("**/*", guard_route)
-            if hasattr(self._context, "route_web_socket"):
-                await self._context.route_web_socket(
-                    "**/*", lambda websocket: websocket.close(code=1008)
-                )
+            await self._context.route("**/*", self._guard_route)
+            await self._context.route_web_socket(
+                "**/*", lambda websocket: websocket.close(code=1008)
+            )
 
             self._page = await self._context.new_page()
 
@@ -271,6 +264,140 @@ class BrowserSession:
             await self._page.add_init_script(init_script)
 
             self._initialized = True
+
+    async def _guard_route(self, route: Any) -> None:
+        """Proxy one browser request through the pinned, bounded HTTP client."""
+        acquired = False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _BROWSER_REQUEST_DEADLINE_SECONDS
+        try:
+            await asyncio.wait_for(
+                self._route_gate.acquire(), _BROWSER_REQUEST_DEADLINE_SECONDS
+            )
+            acquired = True
+            request_url = route.request.url
+            if urlsplit(request_url).scheme == "file":
+                await _validate_browser_target(
+                    request_url,
+                    allowed_file_roots=self.allowed_file_roots,
+                    allowed_files=self.allowed_files,
+                )
+                await route.continue_()
+                return
+            assert self._http_client is not None
+            request_headers = await route.request.all_headers()
+            for header in (
+                "accept-encoding",
+                "connection",
+                "content-length",
+                "host",
+                "proxy-authorization",
+                "proxy-connection",
+            ):
+                request_headers.pop(header, None)
+            # Keep encoded bytes out of Python's decoder. Chromium can still
+            # decode a server that ignores this preference, while normal
+            # responses arrive uncompressed and bounded.
+            request_headers["accept-encoding"] = "identity"
+            request = self._http_client.build_request(
+                route.request.method,
+                request_url,
+                headers=request_headers,
+                content=route.request.post_data_buffer,
+            )
+            async with asyncio.timeout(max(0.0, deadline - loop.time())):
+                response = await self._http_client.send(request, stream=True)
+                try:
+                    chunks: list[bytes] = []
+                    content_size = 0
+                    async for chunk in response.aiter_raw():
+                        content_size += len(chunk)
+                        if content_size > _BROWSER_RESPONSE_MAX_BYTES:
+                            raise ValueError("Browser response exceeded size limit")
+                        chunks.append(chunk)
+                finally:
+                    await response.aclose()
+            response_headers: dict[str, str] = {}
+            for header, value in response.headers.multi_items():
+                key = header.lower()
+                if key in {
+                    "connection",
+                    "content-length",
+                    "set-cookie",
+                    "transfer-encoding",
+                }:
+                    continue
+                if key in response_headers:
+                    response_headers[key] = f"{response_headers[key]}, {value}"
+                else:
+                    response_headers[key] = value
+            await self._apply_response_cookies(
+                request_url, response.headers.get_list("set-cookie")
+            )
+            await route.fulfill(
+                status=response.status_code,
+                headers=response_headers,
+                body=b"".join(chunks),
+            )
+        except Exception:
+            await route.abort()
+        finally:
+            if acquired:
+                self._route_gate.release()
+
+    async def _apply_response_cookies(
+        self, request_url: str, set_cookie_headers: Sequence[str]
+    ) -> None:
+        """Transfer every Set-Cookie line without collapsing duplicates."""
+        if not set_cookie_headers or self._context is None:
+            return
+        request_host = (urlsplit(request_url).hostname or "").rstrip(".").lower()
+        cookies: list[dict[str, Any]] = []
+        for header in set_cookie_headers:
+            parsed = SimpleCookie()
+            try:
+                parsed.load(header)
+            except Exception:
+                continue
+            for morsel in parsed.values():
+                cookie: dict[str, Any] = {
+                    "name": morsel.key,
+                    "value": morsel.value,
+                    "url": request_url,
+                }
+                if morsel["domain"]:
+                    cookie_domain = morsel["domain"].lstrip(".").rstrip(".").lower()
+                    if request_host != cookie_domain and not request_host.endswith(
+                        f".{cookie_domain}"
+                    ):
+                        continue
+                    cookie.pop("url")
+                    cookie["domain"] = morsel["domain"]
+                    cookie["path"] = morsel["path"] or "/"
+                if morsel["secure"]:
+                    cookie["secure"] = True
+                if morsel["httponly"]:
+                    cookie["httpOnly"] = True
+                same_site = morsel["samesite"].capitalize()
+                if same_site in {"Strict", "Lax", "None"}:
+                    cookie["sameSite"] = same_site
+                if morsel["max-age"]:
+                    try:
+                        cookie["expires"] = datetime.now().timestamp() + int(
+                            morsel["max-age"]
+                        )
+                    except ValueError:
+                        pass
+                elif morsel["expires"]:
+                    try:
+                        cookie["expires"] = parsedate_to_datetime(
+                            morsel["expires"]
+                        ).timestamp()
+                    except (TypeError, ValueError):
+                        pass
+                cookies.append(cookie)
+        if cookies:
+            await self._context.add_cookies(cast(Any, cookies))
 
     async def get_page(self) -> Page:
         """
@@ -349,7 +476,8 @@ class BrowserSessionManager:
         session_id: str,
         headless: bool = False,
         locale: Optional[str] = None,
-        workspace_root: str | None = None,
+        allowed_file_roots: Sequence[str] = (),
+        allowed_files: Sequence[str] = (),
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -379,8 +507,16 @@ class BrowserSessionManager:
                         f"{existing.locale!r}; requested locale {locale!r} ignored "
                         "(a session's locale is frozen at creation)"
                     )
-                if workspace_root and not existing.workspace_root:
-                    existing.workspace_root = workspace_root
+                if allowed_file_roots:
+                    existing.allowed_file_roots = tuple(
+                        dict.fromkeys(
+                            (*existing.allowed_file_roots, *allowed_file_roots)
+                        )
+                    )
+                if allowed_files:
+                    existing.allowed_files = tuple(
+                        dict.fromkeys((*existing.allowed_files, *allowed_files))
+                    )
                 existing._last_used = datetime.now()
                 return existing
 
@@ -393,7 +529,8 @@ class BrowserSessionManager:
                 session_id,
                 headless,
                 locale=locale,
-                workspace_root=workspace_root,
+                allowed_file_roots=allowed_file_roots,
+                allowed_files=allowed_files,
             )
             self._sessions[session_id] = new_session
             new_session._last_used = datetime.now()
@@ -511,11 +648,21 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
-    workspace_root = kwargs.get("_workspace_root")
+    allowed_file_roots = kwargs.get("_allowed_file_roots")
+    if not isinstance(allowed_file_roots, (list, tuple)) or not all(
+        isinstance(root, str) for root in allowed_file_roots
+    ):
+        allowed_file_roots = ()
+    allowed_files = kwargs.get("_allowed_files")
+    if not isinstance(allowed_files, (list, tuple)) or not all(
+        isinstance(path, str) for path in allowed_files
+    ):
+        allowed_files = ()
     try:
         await _validate_browser_target(
             str(url),
-            workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+            allowed_file_roots=allowed_file_roots,
+            allowed_files=allowed_files,
         )
     except (OSError, TypeError, ValueError) as exc:
         return {
@@ -545,7 +692,8 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         session_id,
         headless,
         locale=locale,
-        workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+        allowed_file_roots=allowed_file_roots,
+        allowed_files=allowed_files,
     )
     page = await session.get_page()
 

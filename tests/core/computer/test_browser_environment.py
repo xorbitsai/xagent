@@ -157,6 +157,7 @@ class FakeManager:
         session_id: str,
         headless: bool,
         locale: str | None = None,
+        allowed_file_roots: tuple[str, ...] = (),
     ) -> FakeSession:
         self.calls.append((session_id, headless, locale))
         return self.session
@@ -306,7 +307,15 @@ async def test_browser_element_lookup_fails_with_clear_target_error(
 
 
 @pytest.mark.asyncio
-async def test_browser_navigation_returns_new_observation(browser_environment) -> None:
+async def test_browser_navigation_returns_new_observation(
+    browser_environment, monkeypatch
+) -> None:
+    async def public_target(_url: str) -> list[str]:
+        return ["203.0.113.10"]
+
+    monkeypatch.setattr(
+        "xagent.core.computer.browser.validate_public_http_url", public_target
+    )
     environment, page, _store = browser_environment
     first = await environment.observe()
 

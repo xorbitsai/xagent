@@ -956,6 +956,7 @@ def _nested_schema_for_emission(
     schema: Any,
     *,
     is_required: bool,
+    flatten_nullable_union: bool = False,
     depth: int = 0,
     _node_budget: list[int] | None = None,
 ) -> dict[str, Any]:
@@ -1003,7 +1004,7 @@ def _nested_schema_for_emission(
         if isinstance(schema.get(union_key), list) and schema[union_key]
     ]
     merged_optional_union = False
-    if len(union_keys) == 1:
+    if flatten_nullable_union and len(union_keys) == 1:
         raw_options = schema[union_keys[0]]
         if (
             isinstance(raw_options, list)
@@ -1021,10 +1022,10 @@ def _nested_schema_for_emission(
                     _node_budget=_node_budget,
                 )
                 if emitted_option:
-                    # Pydantic already supplies the nullable wrapper for an
-                    # Optional annotation. Flattening this common shape keeps
-                    # outer metadata (especially description) on the branch
-                    # Claude retains instead of nesting anyOf twice.
+                    # The top-level Pydantic annotation supplies the nullable
+                    # wrapper. Flattening only at that boundary keeps outer
+                    # metadata on Claude's retained branch without dropping
+                    # null from nested required properties or array items.
                     emitted_option.update(emitted)
                     emitted = emitted_option
                     merged_optional_union = True
@@ -2063,29 +2064,11 @@ class MCPToolAdapter(AbstractBaseTool):
                 # every field reaching here has a record.
                 field_metadata = metadata[field_name]
                 annotation: Any = self._json_schema_to_python_type(field_schema)
-                nullable_object_union = (
-                    isinstance(field_schema, Mapping)
-                    and any(
-                        isinstance(field_schema.get(union_key), list)
-                        for union_key in ("anyOf", "oneOf")
-                    )
-                    and isinstance(field_schema.get("properties"), Mapping)
-                )
-                if (
-                    field_name in required
-                    and _schema_allows_null(field_schema)
-                    and not nullable_object_union
-                ):
-                    # Required and nullable are independent JSON Schema
-                    # concepts. Keep the key required while allowing an
-                    # explicit null value; optional fields are wrapped below
-                    # and must stay on the non-null annotation so metadata is
-                    # not nested under two nullable unions.
-                    if annotation is not Any:
-                        annotation = self._build_union_type([annotation, type(None)])
+                field_allows_null = _schema_allows_null(field_schema)
                 emitted_fragment = _nested_schema_for_emission(
                     field_schema,
                     is_required=field_name in required,
+                    flatten_nullable_union=True,
                     _node_budget=nested_node_budget,
                 )
                 if not emitted_fragment and field_metadata.extra:
@@ -2118,6 +2101,12 @@ class MCPToolAdapter(AbstractBaseTool):
 
                 # Check if field is required
                 if field_name in required:
+                    # Required controls key presence, not whether the value
+                    # may be null. Wrap after attaching metadata so Pydantic
+                    # puts that metadata inside the non-null branch Claude
+                    # retains when simplifying Optional[T].
+                    if field_allows_null and annotation is not Any:
+                        annotation = self._build_union_type([annotation, type(None)])
                     fields[field_name] = (annotation, ...)
                 else:
                     # Optional field with default
@@ -2822,12 +2811,26 @@ class MCPToolAdapter(AbstractBaseTool):
             parsed_args = self._args_type(**normalized_args)
             supplied_argument_names = set(normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
-            # ``exclude_none`` omits defaults and optional omissions, but an
-            # explicitly supplied null is still a real MCP argument. Preserve
-            # it so required-and-nullable fields remain present for both the
-            # local JSON Schema check and the remote call.
-            for name in supplied_argument_names:
-                if normalized_args.get(name) is None:
+            input_schema = self.mcp_tool.inputSchema
+            raw_required = (
+                input_schema.get("required", [])
+                if isinstance(input_schema, Mapping)
+                else []
+            )
+            required_names = (
+                {name for name in raw_required if isinstance(name, str)}
+                if isinstance(raw_required, list)
+                else set()
+            )
+            input_properties = self._input_schema_properties()
+            # ``exclude_none`` preserves the historical behavior for
+            # optional fields. Restore null only when the server explicitly
+            # requires the key and its schema allows null; never reintroduce
+            # ignored/unknown keys.
+            for name in supplied_argument_names & required_names:
+                if normalized_args.get(name) is None and _schema_allows_null(
+                    input_properties.get(name)
+                ):
                     tool_args[name] = None
             runtime_arguments = self._runtime_tool_arguments()
             tool_args.update(runtime_arguments)

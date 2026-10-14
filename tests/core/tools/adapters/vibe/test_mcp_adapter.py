@@ -2207,7 +2207,15 @@ def test_build_args_model_preserves_required_nullable_schema():
         description="Accept a required string or null",
         inputSchema={
             "type": "object",
-            "properties": {"value": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["a", "b"]},
+                        {"type": "null"},
+                    ],
+                    "description": "Required nullable value",
+                }
+            },
             "required": ["value"],
         },
     )
@@ -2219,7 +2227,14 @@ def test_build_args_model_preserves_required_nullable_schema():
     args_model = adapter.args_type()
 
     assert args_model(value=None).value is None
-    assert args_model(value="abc").value == "abc"
+    assert args_model(value="a").value == "a"
+
+    fixed = _fix_pydantic_schema_for_claude(args_model.model_json_schema())
+    assert fixed["properties"]["value"] == {
+        "description": "Required nullable value",
+        "enum": ["a", "b"],
+        "type": "string",
+    }
 
 
 @pytest.mark.asyncio
@@ -2254,6 +2269,43 @@ async def test_run_json_async_preserves_explicit_null_for_required_nullable(
 
     assert result["is_error"] is False
     assert called["arguments"] == {"value": None}
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_drops_optional_and_unknown_explicit_nulls(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "required_value": {"type": "string"},
+            "optional_value": {"type": "string"},
+        },
+        ["required_value"],
+    )
+    called: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "required_value": "required",
+            "optional_value": None,
+            "unknown": None,
+        }
+    )
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"required_value": "required"}
 
 
 @pytest.mark.asyncio
@@ -5095,6 +5147,32 @@ def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
     assert adapter._nested_argument_error({"params": {"limit": None}}) is None
 
 
+def test_nested_required_nullable_properties_and_items_accept_null():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "value": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "values": {
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    },
+                },
+                "required": ["value", "values"],
+            }
+        },
+        ["params"],
+    )
+
+    assert (
+        adapter._nested_argument_error(
+            {"params": {"value": None, "values": ["a", None]}}
+        )
+        is None
+    )
+
+
 def test_property_named_pattern_is_not_removed_from_local_validation():
     adapter = _schema_adapter(
         {
@@ -5150,7 +5228,8 @@ def test_nested_union_does_not_hide_object_siblings_from_claude():
     )
 
     params = emitted["properties"]["params"]
-    assert "anyOf" not in params
+    assert params["anyOf"][1] == {"type": "null"}
+    assert params["anyOf"][0]["required"] == ["name"]
     claude = _fix_pydantic_schema_for_claude(emitted)
     assert claude["properties"]["params"]["required"] == ["name"]
 

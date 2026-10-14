@@ -31,3 +31,19 @@ def test_non_development_accepts_a_configured_secret(monkeypatch):
     monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
     monkeypatch.setenv("XAGENT_JWT_SECRET", "a-real-secret-from-the-deployment")
     auth_config.validate_auth_config()
+
+
+def test_secure_secret_override_is_enforced_in_development(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "development")
+    monkeypatch.setenv("XAGENT_REQUIRE_SECURE_SECRETS", "true")
+    monkeypatch.setenv("XAGENT_JWT_SECRET", "change-me")
+    with pytest.raises(RuntimeError, match="XAGENT_JWT_SECRET"):
+        auth_config.validate_auth_config()
+
+
+def test_non_development_rejects_explicit_session_placeholder(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_JWT_SECRET", "a-real-secret-from-the-deployment")
+    monkeypatch.setenv("XAGENT_SESSION_SECRET", "change-me-to-a-random-session-secret")
+    with pytest.raises(RuntimeError, match="SESSION_SECRET"):
+        auth_config.validate_auth_config()

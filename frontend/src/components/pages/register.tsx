@@ -61,7 +61,7 @@ export function RegisterPage() {
     }
 
     // Verify password length
-    if (formData.password.length < 6) {
+    if (formData.password.length < 8) {
       setError(t("register.alerts.password_too_short"))
       return
     }

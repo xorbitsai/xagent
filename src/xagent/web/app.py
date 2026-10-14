@@ -14,7 +14,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import Response
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from ..config import (
@@ -142,6 +144,55 @@ setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 logger = logging.getLogger(__name__)
 
 __all__ = ["app"]
+
+
+class PublicWidgetCORSMiddleware:
+    """Allow credential-free widget calls from customer embedding origins."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not str(scope.get("path", "")).startswith(
+            "/api/widget/"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request_headers = Headers(scope=scope)
+        origin = request_headers.get("origin")
+        if not origin:
+            await self.app(scope, receive, send)
+            return
+
+        if scope.get("method") == "OPTIONS" and request_headers.get(
+            "access-control-request-method"
+        ):
+            response = Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": request_headers.get(
+                        "access-control-request-headers", ""
+                    ),
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_widget_response(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers["Access-Control-Allow-Origin"] = origin
+                if "access-control-allow-credentials" in response_headers:
+                    del response_headers["access-control-allow-credentials"]
+                response_headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_widget_response)
 
 
 @contextmanager
@@ -1463,6 +1514,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 

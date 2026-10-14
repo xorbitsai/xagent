@@ -37,7 +37,7 @@ export function SetupPage() {
       setError(t("setup.errors.invalidEmail"))
       return
     }
-    if (password.length < 6) {
+    if (password.length < 8) {
       setError(t("setup.errors.passwordTooShort"))
       return
     }

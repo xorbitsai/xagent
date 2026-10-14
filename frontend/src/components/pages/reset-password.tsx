@@ -35,7 +35,7 @@ export function ResetPasswordPage() {
       setError(t("resetPassword.alerts.invalid_token"))
       return
     }
-    if (password.length < 6) {
+    if (password.length < 8) {
       setError(t("resetPassword.alerts.password_too_short"))
       return
     }

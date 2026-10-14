@@ -575,6 +575,15 @@ class TestAuthEmailConfig:
             "https://admin.example.com",
         ]
 
+    def test_cors_origins_allow_an_explicit_empty_list(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "")
+        assert get_cors_origins() == []
+
+    def test_cors_origins_reject_wildcard_with_credentials(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "*")
+        with pytest.raises(ValueError, match=r"cannot contain '\*'"):
+            get_cors_origins()
+
     def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
         monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")
         monkeypatch.setenv(SLACK_CLIENT_SECRET, " client-secret ")

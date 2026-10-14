@@ -240,7 +240,7 @@ export default function SettingsPage() {
       return
     }
 
-    if (newPassword.length < 6) {
+    if (newPassword.length < 8) {
       setPasswordMessage({ type: 'error', text: t("settings.password.errors.too_short") })
       return
     }

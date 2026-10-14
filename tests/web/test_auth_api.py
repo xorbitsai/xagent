@@ -1670,12 +1670,13 @@ class TestAuthAPI:
             json={
                 "username": "root2",
                 "email": "root2@example.com",
-                "password": "root234",
+                "password": "root2345",
             },
         )
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is False
+        assert data["message"] == "Setup already completed"
 
     def test_forgot_password_and_reset_password(
         self, test_db, test_user_data, monkeypatch

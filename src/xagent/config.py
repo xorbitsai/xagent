@@ -49,6 +49,7 @@ TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
 # Public development fallback; runtime credential storage must reject it.
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
 TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
@@ -276,6 +277,9 @@ GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
 GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
 FRONTEND_URL = "XAGENT_FRONTEND_URL"
 CORS_ORIGINS = "XAGENT_CORS_ORIGINS"
+XAGENT_ENVIRONMENT = "XAGENT_ENVIRONMENT"
+ENVIRONMENT = "ENVIRONMENT"
+REQUIRE_SECURE_SECRETS = "XAGENT_REQUIRE_SECURE_SECRETS"
 OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
@@ -2122,12 +2126,31 @@ def get_cors_origins() -> list[str]:
     """Return the explicit browser origins allowed to call the API."""
     configured = os.getenv(CORS_ORIGINS)
     if configured is not None:
-        return [
+        origins = [
             origin.strip().rstrip("/")
             for origin in configured.split(",")
             if origin.strip()
         ]
+        if "*" in origins:
+            raise ValueError(
+                "XAGENT_CORS_ORIGINS cannot contain '*' when credentials are enabled"
+            )
+        return origins
     return [get_frontend_url()]
+
+
+def get_environment() -> str:
+    """Return the normalized deployment environment name."""
+    return (
+        (os.getenv(XAGENT_ENVIRONMENT) or os.getenv(ENVIRONMENT) or "development")
+        .strip()
+        .lower()
+    )
+
+
+def get_require_secure_secrets() -> bool:
+    """Whether development should also enforce production secret checks."""
+    return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
 
 
 def get_oidc_login_ttl_seconds() -> int:
@@ -2145,7 +2168,7 @@ def get_session_secret() -> str:
     value = os.getenv(SESSION_SECRET)
     if value and value.strip():
         return value.strip()
-    return os.getenv("XAGENT_JWT_SECRET", "your-secret-key-change-in-production")
+    return os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
 
 
 def get_web_dir() -> Path:

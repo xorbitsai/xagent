@@ -36,6 +36,7 @@ services:
     restart: unless-stopped
     # Don't expose ports, only accessible through nginx
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
@@ -91,6 +92,7 @@ services:
         "--loglevel=INFO",
       ]
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
@@ -129,6 +131,7 @@ services:
         "--loglevel=INFO",
       ]
     environment:
+      - XAGENT_ENVIRONMENT=${XAGENT_ENVIRONMENT:-production}
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_REDIS_URL=redis://redis:6379/0

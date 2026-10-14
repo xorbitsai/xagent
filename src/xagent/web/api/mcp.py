@@ -55,7 +55,6 @@ from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
-from ...core.utils.security import validate_public_http_url
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
     get_all_mcp_apps,
@@ -263,7 +262,9 @@ class MCPConnectionTest(BaseModel):
     """Request model for testing MCP connection."""
 
     name: str = Field(..., description="Connection name")
-    transport: str = Field(..., description="Transport type")
+    transport: str = Field(
+        ..., description="Remote transport type: sse or streamable_http"
+    )
     config: dict[str, Any] = Field(..., description="Connection configuration")
 
 
@@ -5638,67 +5639,41 @@ async def get_mcp_server_logs(
         )
 
 
-@mcp_router.post("/test-connection", response_model=MCPConnectionTestResponse)
+_TESTABLE_REMOTE_MCP_TRANSPORTS = frozenset({"sse", "streamable_http"})
+
+
+@mcp_router.post(
+    "/test-connection",
+    response_model=MCPConnectionTestResponse,
+    dependencies=[Depends(get_current_user)],
+)
 async def test_mcp_connection(
     test_data: MCPConnectionTest,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
 ) -> MCPConnectionTestResponse:
     """Test an unsaved remote MCP connection for the authenticated user.
 
-    Stdio MCP connections are intentionally rejected here.  The connection
-    test endpoint accepts user-controlled configuration and the stdio loader
-    would otherwise execute an arbitrary command in the API process.
+    This endpoint only tests SSE and streamable-HTTP connections. Stdio would
+    execute a user-controlled command in the API process, while the websocket
+    client cannot pin the DNS result used by the socket and therefore cannot
+    enforce the endpoint's public-network-only policy across DNS rebinding.
+
+    This policy is intentionally scoped to the unsaved connection-test
+    endpoint. Persisted-server creation and runtime loading have separate
+    authorization and network-policy paths.
     """
-    del db, current_user  # kept in the signature for dependency enforcement
-    normalized_transport = str(test_data.transport or "").strip().lower()
-    if normalized_transport not in HTTP_MCP_TRANSPORTS:
+    normalized_transport = test_data.transport.strip().lower()
+    if normalized_transport not in _TESTABLE_REMOTE_MCP_TRANSPORTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connection tests only support remote HTTP MCP transports",
+            detail=(
+                "Connection tests only support the sse and streamable_http transports"
+            ),
         )
     connection: dict[str, Any] = {
         **test_data.config,
         "name": test_data.name,
         "transport": normalized_transport,
     }
-    endpoint = connection.get("url")
-    if endpoint:
-        endpoint_for_validation = str(endpoint)
-        if normalized_transport == "websocket":
-            parsed_endpoint = urlsplit(endpoint_for_validation)
-            if parsed_endpoint.scheme not in {"ws", "wss"}:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="WebSocket MCP endpoints must use ws:// or wss://",
-                )
-            endpoint_for_validation = urlunsplit(
-                (
-                    "https" if parsed_endpoint.scheme == "wss" else "http",
-                    parsed_endpoint.netloc,
-                    parsed_endpoint.path,
-                    parsed_endpoint.query,
-                    parsed_endpoint.fragment,
-                )
-            )
-        try:
-            validation = validate_public_http_url(endpoint_for_validation)
-            timeout_seconds = get_mcp_tool_init_timeout_seconds()
-            if timeout_seconds > 0:
-                await asyncio.wait_for(validation, timeout=timeout_seconds)
-            else:
-                await validation
-        except (OSError, TimeoutError):
-            return MCPConnectionTestResponse(
-                success=False,
-                message=f"Failed to connect to {test_data.name}.",
-                details={"error": "mcp_endpoint_resolution_failed"},
-            )
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="MCP endpoints must resolve to a public network host",
-            ) from exc
 
     def _create_safe_mcp_http_client(
         headers: dict[str, str] | None = None,
@@ -5709,50 +5684,42 @@ async def test_mcp_connection(
             headers=headers,
             timeout=timeout or httpx.Timeout(30.0),
             auth=auth,
-            follow_redirects=False,
+            # SafeOAuthAsyncHTTPTransport resolves and pins every redirected
+            # request independently, so common /mcp -> /mcp/ redirects remain
+            # usable without reopening redirect or DNS-rebinding SSRF.
+            follow_redirects=True,
             transport=SafeOAuthAsyncHTTPTransport(),
         )
 
+    connection["httpx_client_factory"] = _create_safe_mcp_http_client
+
     try:
-        if normalized_transport != "websocket":
-            connection["httpx_client_factory"] = _create_safe_mcp_http_client
+        load_result = await _load_mcp_connection_test_tools(connection)
 
-        try:
-            load_result = await _load_mcp_connection_test_tools(connection)
-
-            projection = _project_mcp_tool_load_result(load_result)
-            details: dict[str, Any] = {"tool_count": len(projection.tools)}
-            if projection.failures:
-                details["failures"] = list(projection.failures)
-            if projection.tools:
-                return MCPConnectionTestResponse(
-                    success=True,
-                    message=f"Successfully connected to {test_data.name}. Loaded {len(projection.tools)} tools.",
-                    details=details,
-                )
+        projection = _project_mcp_tool_load_result(load_result)
+        details: dict[str, Any] = {"tool_count": len(projection.tools)}
+        if projection.failures:
+            details["failures"] = list(projection.failures)
+        if projection.tools:
             return MCPConnectionTestResponse(
-                success=False,
-                message=projection.failure_message,
+                success=True,
+                message=f"Successfully connected to {test_data.name}. Loaded {len(projection.tools)} tools.",
                 details=details,
             )
-
-        except Exception as conn_error:
-            logger.warning(
-                "MCP connection test failed for '%s' (%s)",
-                test_data.name,
-                type(conn_error).__name__,
-            )
-            return MCPConnectionTestResponse(
-                success=False,
-                message=f"Failed to connect to {test_data.name}.",
-                details={"error": "mcp_connection_test_failed"},
-            )
-
-    except Exception as e:
-        logger.error("Failed to test MCP connection (%s)", type(e).__name__)
         return MCPConnectionTestResponse(
             success=False,
-            message="Connection test failed.",
+            message=projection.failure_message,
+            details=details,
+        )
+    except Exception as conn_error:
+        logger.warning(
+            "MCP connection test failed for '%s' (%s)",
+            test_data.name,
+            type(conn_error).__name__,
+        )
+        return MCPConnectionTestResponse(
+            success=False,
+            message=f"Failed to connect to {test_data.name}.",
             details={"error": "mcp_connection_test_failed"},
         )
 

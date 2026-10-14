@@ -47,18 +47,6 @@ from xagent.web.models.mcp import MCPServer
 from xagent.web.models.user import User
 
 
-@pytest.fixture(autouse=True)
-def _stub_synthetic_mcp_dns(monkeypatch):
-    real_validator = mcp_module.validate_public_http_url
-
-    async def validate(url: str) -> list[str]:
-        if url == "https://mcp.example.test":
-            return []
-        return await real_validator(url)
-
-    monkeypatch.setattr(mcp_module, "validate_public_http_url", validate)
-
-
 @pytest.mark.asyncio
 async def test_connection_test_rejects_stdio_transport_before_loading():
     with pytest.raises(HTTPException) as error:
@@ -67,84 +55,62 @@ async def test_connection_test_rejects_stdio_transport_before_loading():
                 name="local",
                 transport="stdio",
                 config={"command": "sh", "args": ["-c", "id"]},
-            ),
-            MagicMock(),
+            )
         )
 
     assert error.value.status_code == 400
 
 
 @pytest.mark.asyncio
-async def test_connection_test_rejects_private_remote_endpoint():
+async def test_connection_test_rejects_websocket_before_loading(monkeypatch):
     loader = AsyncMock()
-    original_loader = mcp_module._load_mcp_connection_test_tools
-    mcp_module._load_mcp_connection_test_tools = loader
+    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", loader)
+
     with pytest.raises(HTTPException) as error:
-        try:
-            await run_mcp_connection_test(
-                MCPConnectionTest(
-                    name="internal",
-                    transport="streamable_http",
-                    config={"url": "http://127.0.0.1:8080/mcp"},
-                ),
-                MagicMock(),
+        await run_mcp_connection_test(
+            MCPConnectionTest(
+                name="socket",
+                transport="websocket",
+                config={"url": "wss://mcp.example.test/socket"},
             )
-        finally:
-            mcp_module._load_mcp_connection_test_tools = original_loader
+        )
 
     assert error.value.status_code == 400
     loader.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_connection_test_dns_failure_is_a_normal_failure(monkeypatch):
-    async def fail_dns(_url: str) -> list[str]:
-        raise OSError("name resolution failed")
+async def test_connection_test_uses_pinned_transport_and_follows_safe_redirects(
+    monkeypatch,
+):
+    safe_transport = AsyncMock()
+    transport_factory = MagicMock(return_value=safe_transport)
 
-    loader = AsyncMock()
-    monkeypatch.setattr(mcp_module, "validate_public_http_url", fail_dns)
-    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", loader)
+    async def inspect_factory(connection: dict[str, Any]) -> MCPLoadResult:
+        client = connection["httpx_client_factory"](
+            headers={"X-Test": "yes"}, timeout=None, auth=None
+        )
+        try:
+            assert client._transport is safe_transport
+            assert client.follow_redirects is True
+            assert client.headers["X-Test"] == "yes"
+        finally:
+            await client.aclose()
+        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
+
+    monkeypatch.setattr(mcp_module, "SafeOAuthAsyncHTTPTransport", transport_factory)
+    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", inspect_factory)
 
     response = await run_mcp_connection_test(
         MCPConnectionTest(
-            name="typo",
+            name="remote",
             transport="streamable_http",
-            config={"url": "https://typo.invalid/mcp"},
-        ),
-        MagicMock(),
+            config={"url": "https://mcp.example.test/mcp"},
+        )
     )
 
     assert response.success is False
-    assert response.details == {"error": "mcp_endpoint_resolution_failed"}
-    loader.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_connection_test_websocket_keeps_websocket_parameters(monkeypatch):
-    captured: dict[str, Any] = {}
-
-    async def fake_validate(url: str) -> list[str]:
-        assert url == "https://mcp.example.test/socket"
-        return ["203.0.113.1"]
-
-    async def fake_load(connection: dict[str, Any]) -> MCPLoadResult:
-        captured.update(connection)
-        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
-
-    monkeypatch.setattr(mcp_module, "validate_public_http_url", fake_validate)
-    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", fake_load)
-
-    await run_mcp_connection_test(
-        MCPConnectionTest(
-            name="socket",
-            transport="websocket",
-            config={"url": "wss://mcp.example.test/socket"},
-        ),
-        MagicMock(),
-    )
-
-    assert captured["transport"] == "websocket"
-    assert "httpx_client_factory" not in captured
+    transport_factory.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -166,8 +132,7 @@ async def test_connection_test_transport_cannot_be_overridden_by_config(monkeypa
                 "command": "sh",
                 "args": ["-c", "id"],
             },
-        ),
-        MagicMock(),
+        )
     )
 
     assert captured["transport"] == "sse"
@@ -294,8 +259,7 @@ async def test_connection_test_reports_successful_structured_load(monkeypatch):
             name="mail",
             transport="streamable_http",
             config={"url": "https://mcp.example.test"},
-        ),
-        MagicMock(),
+        )
     )
 
     assert response.success is True
@@ -331,8 +295,7 @@ async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
             name="mail",
             transport="streamable_http",
             config={"url": "https://mcp.example.test"},
-        ),
-        MagicMock(),
+        )
     )
 
     assert response.success is True
@@ -377,8 +340,7 @@ async def test_connection_test_reports_structured_load_failure_without_exception
             name="mail",
             transport="streamable_http",
             config={"url": "https://mcp.example.test"},
-        ),
-        MagicMock(),
+        )
     )
 
     assert response.success is False
@@ -415,8 +377,7 @@ async def test_connection_test_reports_no_tools_as_failure(monkeypatch):
             name="mail",
             transport="streamable_http",
             config={"url": "https://mcp.example.test"},
-        ),
-        MagicMock(),
+        )
     )
 
     assert response.success is False
@@ -583,8 +544,7 @@ async def test_connection_test_deadline_matches_loader_timeout(
                     name="mail",
                     transport="streamable_http",
                     config={"url": "https://mcp.example.test"},
-                ),
-                MagicMock(),
+                )
             )
             elapsed = time.monotonic() - start
 
@@ -651,8 +611,7 @@ async def test_connection_test_real_loader_timeout_error_lines(monkeypatch, capl
                 name="mail",
                 transport="streamable_http",
                 config={"url": "https://mcp.example.test"},
-            ),
-            MagicMock(),
+            )
         )
         elapsed = time.monotonic() - start
         await _wait_until(direct_load_cancelled.is_set)

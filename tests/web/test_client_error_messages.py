@@ -92,8 +92,8 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
         "authentication_required": "Authentication is required to send this message.",
         "task_access_denied": "You do not have access to this task.",
         "excel_workbook_access_denied": (
-            "The Excel workbook could not be opened. Check that you have edit "
-            "permission or reconnect the Excel connector."
+            "The Excel workbook could not be opened or modified. Check that you "
+            "have edit permission or reconnect the Excel connector."
         ),
         "excel_site_not_found": (
             "The Excel workbook or its SharePoint location could not be found. "

@@ -184,11 +184,41 @@ def test_latest_tool_failure_code_drops_stale_failure_after_success() -> None:
             SimpleNamespace(role="user", metadata={}),
             SimpleNamespace(
                 role="tool",
-                metadata={"raw_result": {"failure_code": "excel_site_not_found"}},
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
             ),
             SimpleNamespace(
                 role="tool",
                 metadata={"raw_result": {"status": "success"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_reuse_older_code_after_uncoded_failure() -> (
+    None
+):
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"success": False, "error": "other failure"}},
             ),
         ]
     )

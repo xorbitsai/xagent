@@ -921,6 +921,36 @@ async def test_runner_returns_aggregate_error_when_all_patterns_fail(
     assert "interruption_reason" not in result
 
 
+@pytest.mark.asyncio
+async def test_runner_does_not_promote_code_from_only_one_failed_pattern(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "status": "invalid_tool_protocol",
+                    "failure_code": "excel_workbook_access_denied",
+                }
+            ),
+            FailingPattern("unclassified failure"),
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Impossible", execution_id="exec-mixed-failure-codes"
+    )
+
+    assert result["success"] is False
+    assert "failure_code" not in result
+
+
 class ErrorRaisingPattern:
     def __init__(self, error: Exception) -> None:
         self.error = error

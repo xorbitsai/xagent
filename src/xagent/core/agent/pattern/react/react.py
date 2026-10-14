@@ -1692,9 +1692,10 @@ class ReActPattern(AgentPattern):
                 # A later successful call supersedes an earlier classified
                 # failure in the same user turn; do not surface stale text.
                 return None
-            failure_code = normalize_tool_failure_code(result.get("failure_code"))
-            if failure_code is not None:
-                return failure_code
+            # The first failed tool result is authoritative, even when it
+            # carries no classified code. Do not fall through to an older
+            # failure from a different tool call.
+            return normalize_tool_failure_code(result.get("failure_code"))
         return None
 
     async def _close_streamed_answer(

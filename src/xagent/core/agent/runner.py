@@ -790,19 +790,15 @@ class AgentRunner:
                 "context": context,
             }
             failure_codes = {
-                failure_code
-                for entry in pattern_errors
-                if (
-                    failure_code := normalize_tool_failure_code(
-                        entry.get("result", {}).get("failure_code")
-                        if isinstance(entry.get("result"), dict)
-                        else None
-                    )
+                normalize_tool_failure_code(
+                    entry.get("result", {}).get("failure_code")
+                    if isinstance(entry.get("result"), dict)
+                    else None
                 )
-                is not None
+                for entry in pattern_errors
             }
-            if len(failure_codes) == 1:
-                result["failure_code"] = failure_codes.pop()
+            if len(failure_codes) == 1 and None not in failure_codes:
+                result["failure_code"] = next(iter(failure_codes))
             # Only an interruption every pattern agrees on describes the run;
             # a mix means at least one pattern failed for a terminal reason.
             reasons = {entry.get(INTERRUPTION_REASON_KEY) for entry in pattern_errors}

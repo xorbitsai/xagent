@@ -12,7 +12,6 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ....config import get_tool_max_output_length
-from ....core.agent.result import EXCEL_FAILURE_CODES
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -114,7 +113,7 @@ def _error(
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
-    if failure_code in EXCEL_FAILURE_CODES:
+    if failure_code is not None:
         payload["failure_code"] = failure_code
     return json.dumps(payload, ensure_ascii=False)
 
@@ -143,7 +142,7 @@ def _excel_failure_code(exc: BaseException) -> str | None:
     if not isinstance(exc, _GraphRequestError):
         return None
     graph_code = (exc.graph_error_code or "").lower()
-    if graph_code == "accessdenied":
+    if graph_code == "accessdenied" and exc.status_code == 403:
         return "excel_workbook_access_denied"
     if graph_code == "itemnotfound" and _is_workbook_resolution_path(exc.request_path):
         return "excel_site_not_found"

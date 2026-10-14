@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from unittest.mock import Mock
 
 import pytest
@@ -6,6 +8,23 @@ import requests
 
 from xagent.config import get_tool_max_output_length
 from xagent.web.tools.mcp import excel
+
+
+def test_excel_mcp_does_not_import_agent_package() -> None:
+    probe = (
+        "import sys; "
+        "import xagent.web.tools.mcp.excel; "
+        "print(len([n for n in sys.modules "
+        "if n.startswith('xagent.core.agent')]))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert completed.stdout.strip() == "0"
 
 
 class MockResponse:
@@ -1606,6 +1625,16 @@ def test_graph_failures_carry_allowlisted_failure_code(
 
     assert result["status"] == "error"
     assert result["failure_code"] == failure_code
+
+
+def test_access_denied_with_non_forbidden_status_does_not_carry_failure_code():
+    error = excel._GraphRequestError(
+        "denied",
+        status_code=401,
+        graph_error_code="accessDenied",
+    )
+
+    assert excel._excel_failure_code(error) is None
 
 
 def test_graph_other_failure_does_not_carry_failure_code(monkeypatch):

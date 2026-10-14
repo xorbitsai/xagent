@@ -566,6 +566,135 @@ def test_overdue_defaults_to_today(
 
 
 # --------------------------------------------------------------------------- #
+# Receivables ageing
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("days", "bucket"),
+    [
+        (-3, "Current"),
+        (0, "Current"),
+        (1, "1-15"),
+        (15, "1-15"),
+        (16, "16-30"),
+        (30, "16-30"),
+        (31, "31-45"),
+        (45, "31-45"),
+        (46, "46-60"),
+        (60, "46-60"),
+        (61, "61-75"),
+        (75, "61-75"),
+        (76, "76+"),
+        (542, "76+"),
+    ],
+)
+def test_receivable_bucket_edges(days: int, bucket: str) -> None:
+    assert xero._receivable_bucket(days) == bucket
+
+
+def test_ageing_has_one_named_row_per_contact_with_every_bucket(
+    fake: FakeXero,
+) -> None:
+    fake.responder = _overdue_pages(
+        [
+            [
+                _invoice("INV-1", "2026-11-01", 100, contact="Acme", contact_id="a"),
+                _invoice("INV-2", "2026-10-13", 40, contact="Acme", contact_id="a"),
+                _invoice("INV-3", "2026-10-01", 10, contact="Acme", contact_id="a"),
+                _invoice("INV-4", "2025-04-20", 1617, contact="Heebie", contact_id="h"),
+                _invoice("INV-5", "2026-10-05", 5, contact="Beta", contact_id="b"),
+                _invoice("INV-6", "2026-10-05", 0, contact="Beta", contact_id="b"),
+                _invoice(
+                    "INV-7",
+                    "2026-09-01",
+                    7,
+                    contact="Acme",
+                    contact_id="a",
+                    currency="USD",
+                ),
+            ]
+        ]
+    )
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    assert result["total_invoice_count"] == 6
+    assert result["bucket_names"] == list(xero.RECEIVABLE_BUCKETS)
+    rows = result["rows"]
+    assert [(row["contact_name"], row["currency"]) for row in rows] == [
+        ("Heebie", "AUD"),
+        ("Acme", "AUD"),
+        ("Acme", "USD"),
+        ("Beta", "AUD"),
+    ]
+    heebie = rows[0]
+    assert heebie["buckets"]["76+"] == "1617.00"
+    assert heebie["total_due"] == "1617.00"
+    assert set(heebie["buckets"]) == set(xero.RECEIVABLE_BUCKETS)
+    acme_aud = rows[1]
+    assert acme_aud["currency"] == "AUD"
+    assert acme_aud["buckets"]["Current"] == "140.00"
+    assert acme_aud["buckets"]["1-15"] == "10.00"
+    assert acme_aud["invoice_count"] == 3
+    assert rows[3]["total_due"] == "5.00"
+    aud = result["totals_by_currency"]["AUD"]
+    assert aud["total_due"] == "1772.00"
+    assert aud["buckets"]["Current"] == "140.00"
+    assert aud["invoice_count"] == 5
+    assert result["totals_by_currency"]["USD"]["buckets"]["31-45"] == "7.00"
+
+
+def test_ageing_reads_every_page_and_does_not_narrow_by_due_date(
+    fake: FakeXero,
+) -> None:
+    pages = [[_invoice(f"INV-{p}", "2026-12-01", 10)] for p in range(3)]
+    fake.responder = _overdue_pages(pages)
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    sent = [call["params"] for call in fake.calls if "params" in call]
+    assert [params["page"] for params in sent] == [1, 2, 3]
+    assert sent[0]["where"] == 'Type=="ACCREC"'
+    assert sent[0]["Statuses"] == "AUTHORISED"
+    assert result["total_invoice_count"] == 3
+    assert result["totals_by_currency"]["AUD"]["buckets"]["Current"] == "30.00"
+
+
+def test_ageing_rows_window_resumes_with_next_skip(fake: FakeXero) -> None:
+    invoices = [
+        _invoice(f"INV-{i}", "2026-09-01", 100 - i, contact=f"C{i}", contact_id=f"c{i}")
+        for i in range(6)
+    ]
+    fake.responder = _overdue_pages([invoices])
+
+    first = _call_tool("list_receivables_ageing", asOfDate="2026-10-13", limit=4)
+    second = _call_tool(
+        "list_receivables_ageing",
+        asOfDate="2026-10-13",
+        limit=4,
+        skip=first["next_skip"],
+    )
+
+    assert first["has_more"] is True and first["next_skip"] == 4
+    assert [r["contact_name"] for r in second["rows"]] == ["C4", "C5"]
+    assert second["has_more"] is False
+    assert first["totals_by_currency"] == second["totals_by_currency"]
+
+
+def test_ageing_supports_payables(fake: FakeXero) -> None:
+    bill = _invoice("BILL-1", "2026-09-01", 50)
+    bill["Type"] = "ACCPAY"
+    fake.responder = _overdue_pages([[bill, _invoice("INV-1", "2026-09-01", 99)]])
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13", type="ACCPAY")
+
+    assert result["invoice_type"] == "ACCPAY"
+    assert result["total_invoice_count"] == 1
+    assert fake.calls[-1]["params"]["where"] == 'Type=="ACCPAY"'
+
+
+# --------------------------------------------------------------------------- #
 # Dates and reports
 # --------------------------------------------------------------------------- #
 
@@ -921,8 +1050,11 @@ def _registered_tools() -> dict[str, Any]:
     return {tool.name: tool for tool in tools}
 
 
-def test_every_preserved_tool_is_registered_plus_the_overdue_tool() -> None:
-    assert set(_registered_tools()) == PRESERVED_TOOLS | {"list_overdue_invoices"}
+def test_every_preserved_tool_is_registered_plus_the_new_ones() -> None:
+    assert set(_registered_tools()) == PRESERVED_TOOLS | {
+        "list_overdue_invoices",
+        "list_receivables_ageing",
+    }
 
 
 def test_read_tools_are_declared_read_only_and_writes_are_not() -> None:

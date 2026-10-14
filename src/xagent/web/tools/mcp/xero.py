@@ -949,6 +949,87 @@ def _ageing_bucket(days_overdue: int) -> str:
     return "90+"
 
 
+def _collect_open_invoices(
+    as_of: date,
+    invoice_type: str,
+    contact_ids: list[str] | None,
+    *,
+    min_days_overdue: int | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read every Authorised invoice of ``invoice_type`` that still has an
+    amount due, across all pages.
+
+    With ``min_days_overdue`` only invoices at least that many days past due
+    are kept; with None every open invoice is kept (including not-yet-due ones,
+    whose ``days_overdue`` is zero or negative). Returns the invoice views and
+    whether the whole list was read.
+    """
+    params: dict[str, Any] = {
+        "where": f'Type=="{invoice_type}"',
+        "Statuses": "AUTHORISED",
+        "order": "DueDate",
+        "pageSize": XERO_MAX_PAGE_SIZE,
+    }
+    narrowed_where: str | None = None
+    if min_days_overdue is not None:
+        # DueDate <= asOf - n  <=>  DueDate < asOf - n + 1 day
+        cutoff = as_of - timedelta(days=min_days_overdue - 1)
+        # The DueDate clause only saves Xero from sending invoices that are not
+        # due yet; every invoice is re-checked below. Xero's documentation
+        # shows no DueDate example for ``where``, so a 400 retries once without
+        # the clause.
+        narrowed_where = f"{params['where']} AND DueDate<{_where_date(cutoff)}"
+        params["where"] = narrowed_where
+    if contact_ids:
+        params["ContactIDs"] = ",".join(_guid_list(contact_ids, "contactIds"))
+
+    found: list[dict[str, Any]] = []
+    complete = True
+    page = 1
+    while True:
+        try:
+            data = _request(
+                "GET", "Invoices", scope="invoices", params={**params, "page": page}
+            )
+        except RuntimeError as error:
+            if (
+                narrowed_where is not None
+                and page == 1
+                and params["where"] == narrowed_where
+                and "status 400" in str(error)
+            ):
+                logger.warning("Xero rejected the DueDate filter; retrying without it")
+                params["where"] = f'Type=="{invoice_type}"'
+                continue
+            raise
+        records = data.get("Invoices") or []
+        for record in records:
+            amount_due = Decimal(str(record.get("AmountDue") or 0))
+            due = _doc_date(record, "DueDate")
+            if record.get("Type") != invoice_type or amount_due <= 0 or not due:
+                continue
+            days = (as_of - date.fromisoformat(due[:10])).days
+            if min_days_overdue is not None and days < min_days_overdue:
+                continue
+            view = _invoice_view(record)
+            view["days_overdue"] = days
+            found.append(view)
+        pagination = data.get("pagination") or {}
+        page_count = pagination.get("pageCount")
+        finished = (
+            page >= int(page_count)
+            if page_count is not None
+            else len(records) < XERO_MAX_PAGE_SIZE
+        )
+        if finished:
+            break
+        if page >= OVERDUE_MAX_PAGES:
+            complete = False
+            break
+        page += 1
+    return found, complete
+
+
 @mcp.tool(annotations=READ_ONLY)
 def list_overdue_invoices(
     asOfDate: str | None = None,
@@ -983,64 +1064,9 @@ def list_overdue_invoices(
     min_days = max(1, int(minDaysOverdue))
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), OVERDUE_MAX_LIMIT))
-    # DueDate <= asOf - min_days  <=>  DueDate < asOf - min_days + 1 day
-    cutoff = as_of - timedelta(days=min_days - 1)
-    # The DueDate clause only saves Xero from sending invoices that are not due
-    # yet; every invoice is re-checked below. Xero's documentation shows no
-    # DueDate example for ``where``, so a 400 retries once without the clause.
-    narrowed_where = f'Type=="{type}" AND DueDate<{_where_date(cutoff)}'
-    params: dict[str, Any] = {
-        "where": narrowed_where,
-        "Statuses": "AUTHORISED",
-        "order": "DueDate",
-        "pageSize": XERO_MAX_PAGE_SIZE,
-    }
-    if contactIds:
-        params["ContactIDs"] = ",".join(_guid_list(contactIds, "contactIds"))
-
-    overdue: list[dict[str, Any]] = []
-    complete = True
-    page = 1
-    while True:
-        try:
-            data = _request(
-                "GET", "Invoices", scope="invoices", params={**params, "page": page}
-            )
-        except RuntimeError as error:
-            if (
-                page == 1
-                and params["where"] == narrowed_where
-                and "status 400" in str(error)
-            ):
-                logger.warning("Xero rejected the DueDate filter; retrying without it")
-                params["where"] = f'Type=="{type}"'
-                continue
-            raise
-        records = data.get("Invoices") or []
-        for record in records:
-            amount_due = Decimal(str(record.get("AmountDue") or 0))
-            due = _doc_date(record, "DueDate")
-            if record.get("Type") != type or amount_due <= 0 or not due:
-                continue
-            days = (as_of - date.fromisoformat(due[:10])).days
-            if days < min_days:
-                continue
-            view = _invoice_view(record)
-            view["days_overdue"] = days
-            overdue.append(view)
-        pagination = data.get("pagination") or {}
-        page_count = pagination.get("pageCount")
-        finished = (
-            page >= int(page_count)
-            if page_count is not None
-            else len(records) < XERO_MAX_PAGE_SIZE
-        )
-        if finished:
-            break
-        if page >= OVERDUE_MAX_PAGES:
-            complete = False
-            break
-        page += 1
+    overdue, complete = _collect_open_invoices(
+        as_of, type, contactIds, min_days_overdue=min_days
+    )
 
     overdue.sort(key=lambda view: (view["due_date"], view.get("invoice_number", "")))
     totals: dict[str, Decimal] = {}
@@ -1121,6 +1147,147 @@ def list_overdue_invoices(
             payload["note"] = (
                 f"Stopped after {OVERDUE_MAX_PAGES} pages; narrow with contactIds "
                 "or minDaysOverdue to read the rest."
+            )
+        return payload
+
+    return _fit_list(build, window)
+
+
+RECEIVABLE_BUCKETS = ("Current", "1-15", "16-30", "31-45", "46-60", "61-75", "76+")
+RECEIVABLES_DEFAULT_LIMIT = 100
+RECEIVABLES_MAX_LIMIT = 500
+
+
+def _receivable_bucket(days_overdue: int) -> str:
+    """Xero's aged-receivables buckets; due today or later is Current."""
+    if days_overdue <= 0:
+        return "Current"
+    for upper, name in ((15, "1-15"), (30, "16-30"), (45, "31-45"), (60, "46-60")):
+        if days_overdue <= upper:
+            return name
+    return "61-75" if days_overdue <= 75 else "76+"
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_receivables_ageing(
+    asOfDate: str | None = None,
+    contactIds: list[str] | None = None,
+    type: Literal["ACCREC", "ACCPAY"] = "ACCREC",
+    skip: int = 0,
+    limit: int = RECEIVABLES_DEFAULT_LIMIT,
+) -> str:
+    """
+    Aged receivables summary for ALL contacts in one call: one row per contact
+    with the amount still due in each bucket (Current, 1-15, 16-30, 31-45,
+    46-60, 61-75, 76+ days overdue) and a total, largest balance first. Every
+    row carries the contact's name.
+
+    Built from the open invoices themselves, so it does not depend on Xero's
+    aged-receivables report. Current means not yet due (due today or later).
+    Only Authorised invoices with an amount still due count; paid, draft and
+    voided invoices are excluded. This tool reads every page from Xero itself.
+
+    The result always carries the complete picture in totals_by_currency,
+    even when only part of the rows fit in one response. When has_more is true,
+    call again with next_skip to read the remaining rows.
+
+    asOfDate: YYYY-MM-DD the organisation's local "today" (default: today in
+        UTC).
+    contactIds: only these contacts (from list_contacts).
+    type: ACCREC for customer invoices (default), ACCPAY for bills you owe.
+    skip, limit: window into the contact rows (limit 1-500, default 100).
+    """
+    as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _today()
+    skip = max(0, int(skip))
+    limit = max(1, min(int(limit), RECEIVABLES_MAX_LIMIT))
+    invoices, complete = _collect_open_invoices(
+        as_of, type, contactIds, min_days_overdue=None
+    )
+
+    def empty_buckets() -> dict[str, Decimal]:
+        return {name: Decimal(0) for name in RECEIVABLE_BUCKETS}
+
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    totals: dict[str, dict[str, Any]] = {}
+    for view in invoices:
+        currency = view.get("currency") or "UNKNOWN"
+        amount = Decimal(str(view.get("amount_due") or 0))
+        bucket = _receivable_bucket(view["days_overdue"])
+        contact = view.get("contact") or {}
+        key = (contact.get("id") or contact.get("name") or "unknown", currency)
+        row = rows.setdefault(
+            key,
+            {
+                "contact_id": contact.get("id"),
+                "contact_name": contact.get("name"),
+                "currency": currency,
+                "invoice_count": 0,
+                "buckets": empty_buckets(),
+            },
+        )
+        row["invoice_count"] += 1
+        row["buckets"][bucket] += amount
+        total = totals.setdefault(currency, {**empty_buckets(), "invoice_count": 0})
+        total[bucket] += amount
+        total["invoice_count"] += 1
+
+    def render(buckets: dict[str, Decimal]) -> dict[str, str]:
+        return {name: f"{buckets[name]:.2f}" for name in RECEIVABLE_BUCKETS}
+
+    ordered = sorted(
+        rows.values(),
+        key=lambda row: (
+            -sum(row["buckets"].values(), Decimal(0)),
+            row["contact_name"] or "",
+        ),
+    )
+    rendered_rows = [
+        _compact(
+            {
+                "contact_id": row["contact_id"],
+                "contact_name": row["contact_name"],
+                "currency": row["currency"],
+                "invoice_count": row["invoice_count"],
+                "buckets": render(row["buckets"]),
+                "total_due": f"{sum(row['buckets'].values(), Decimal(0)):.2f}",
+            }
+        )
+        for row in ordered
+    ]
+    totals_by_currency = {
+        currency: {
+            "invoice_count": total["invoice_count"],
+            "buckets": render(total),
+            "total_due": f"{sum((total[n] for n in RECEIVABLE_BUCKETS), Decimal(0)):.2f}",
+        }
+        for currency, total in sorted(totals.items())
+    }
+    window = rendered_rows[skip : skip + limit]
+
+    def build(shown: list[Any], truncated: bool) -> dict[str, Any]:
+        next_skip = skip + len(shown)
+        has_more = next_skip < len(rendered_rows)
+        payload: dict[str, Any] = {
+            "as_of_date": as_of.isoformat(),
+            "invoice_type": type,
+            "bucket_names": list(RECEIVABLE_BUCKETS),
+            "total_invoice_count": len(invoices),
+            "total_rows": len(rendered_rows),
+            "totals_by_currency": totals_by_currency,
+            "complete": complete,
+            "skip": skip,
+            "returned": len(shown),
+            "has_more": has_more,
+            "rows": shown,
+        }
+        if has_more:
+            payload["next_skip"] = next_skip
+        if truncated:
+            payload["truncated"] = True
+        if not complete:
+            payload["note"] = (
+                f"Stopped after {OVERDUE_MAX_PAGES} pages; narrow with contactIds "
+                "to read the rest."
             )
         return payload
 
@@ -1483,8 +1650,9 @@ def list_aged_receivables_by_contact(
     invoicesToDate: str | None = None,
 ) -> str:
     """
-    Aged receivables for one contact up to a report date. For the overdue
-    invoices of ALL contacts use list_overdue_invoices instead.
+    Xero's aged receivables report for one contact up to a report date. For
+    every contact at once use list_receivables_ageing (the same buckets, built
+    from the invoices), or list_overdue_invoices for the overdue invoices.
 
     reportDate: YYYY-MM-DD (default: end of the current month).
     invoicesFromDate / invoicesToDate: YYYY-MM-DD window for the invoices.

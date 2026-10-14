@@ -18,6 +18,7 @@ import csv
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -25,12 +26,43 @@ from pydantic import BaseModel, Field
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.engine import CursorResult, Row, make_url
 
+from ....config import get_database_url
 from ...file_ref import build_workspace_file_ref
 
 if TYPE_CHECKING:
     from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
+
+
+def _database_identity(url: URL) -> tuple[str, str, int | None, str]:
+    """Return the server/database identity, ignoring credentials and drivers."""
+    backend = url.get_backend_name().lower()
+    if backend == "sqlite":
+        database = url.database or ":memory:"
+        if database != ":memory:":
+            database = str(Path(database).expanduser().resolve())
+        return backend, "", None, database
+
+    default_ports = {"postgresql": 5432, "mysql": 3306, "mariadb": 3306, "mssql": 1433}
+    host = (url.host or "").rstrip(".").lower()
+    port = url.port or default_ports.get(backend)
+    database = (url.database or "").lstrip("/")
+    return backend, host, port, database
+
+
+def is_platform_database_url(candidate: str | URL) -> bool:
+    """Whether a candidate URL points at the application's own database."""
+    try:
+        candidate_url = candidate if isinstance(candidate, URL) else make_url(candidate)
+        platform_raw = get_database_url()
+        if not platform_raw:
+            return False
+        return _database_identity(candidate_url) == _database_identity(
+            make_url(platform_raw)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 class SQLQueryArgs(BaseModel):
@@ -75,19 +107,14 @@ def _get_connection_url(
     if not url:
         raise ValueError(f"Database connection '{connection_name}' not found.")
 
-    # Never allow the SQL tool to reuse the platform's own database URL. The
-    # external connection namespace is intentionally separate; an accidental
-    # pass-through here would let a same-process tool read tenant/auth tables.
-    platform_urls = {
-        value
-        for key in ("DATABASE_URL", "XAGENT_DATABASE_URL", "POSTGRES_URL")
-        if (value := os.getenv(key))
-    }
-    if url in platform_urls:
+    # Never allow the SQL tool to reuse the platform's own database. Compare
+    # parsed identities so driver aliases, credentials, casing, and equivalent
+    # SQLite paths cannot bypass the isolation boundary.
+    parsed_url = make_url(url)
+    if is_platform_database_url(parsed_url):
         raise ValueError("The platform database cannot be used by the SQL tool")
 
-    # Validate URL format using SQLAlchemy
-    return make_url(url)
+    return parsed_url
 
 
 def get_database_type(
@@ -143,6 +170,10 @@ def execute_sql_query(
     """
     # Get connection URL from environment
     url = _get_connection_url(connection_name, connection_url)
+    if url.get_backend_name().lower() == "sqlite" and re.search(
+        r"(?is)\battach\s+database\b", query
+    ):
+        raise ValueError("SQLite ATTACH DATABASE is not allowed")
     stmt = text(query)
     engine = create_engine(url)
 

@@ -372,6 +372,44 @@ def isolate_task_keyed_process_state() -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True, scope="function")
+def check_task_extension_registry_leaks() -> Iterator[None]:
+    """Fail the test that leaves the task-extension registry changed.
+
+    The registry in ``xagent.web.services.task_runtime`` is process-wide. A
+    provider left registered (e.g. by running the web app's startup without
+    its shutdown) makes every later test that consults
+    ``registered_task_extensions()`` take the provider branch, which then
+    fails far from the cause depending on xdist scheduling. The registry is
+    restored before failing so the leak cannot cascade.
+    """
+    task_runtime = sys.modules.get("xagent.web.services.task_runtime")
+    before = (
+        dict(task_runtime._task_runtime_extensions) if task_runtime is not None else {}
+    )
+    yield
+    task_runtime = sys.modules.get("xagent.web.services.task_runtime")
+    if task_runtime is None:
+        return
+    with task_runtime._task_runtime_extensions_lock:
+        after = dict(task_runtime._task_runtime_extensions)
+        if after == before:
+            return
+        task_runtime._task_runtime_extensions.clear()
+        task_runtime._task_runtime_extensions.update(before)
+    leaked = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    replaced = sorted(
+        name for name in set(after) & set(before) if after[name] is not before[name]
+    )
+    pytest.fail(
+        "Test changed the process-wide task extension registry without "
+        f"restoring it (leaked={leaked}, removed={removed}, replaced={replaced}); "
+        "unregister providers the test registers, or run the app shutdown.",
+        pytrace=False,
+    )
+
+
+@pytest.fixture(autouse=True, scope="function")
 def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Clear ambient proxy env vars so tests are deterministic across hosts.
 

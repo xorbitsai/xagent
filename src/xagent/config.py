@@ -2122,7 +2122,11 @@ def get_cors_origins() -> list[str]:
     """Return the explicit browser origins allowed to call the API."""
     configured = os.getenv(CORS_ORIGINS)
     if configured is not None:
-        return [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+        return [
+            origin.strip().rstrip("/")
+            for origin in configured.split(",")
+            if origin.strip()
+        ]
     return [get_frontend_url()]
 
 

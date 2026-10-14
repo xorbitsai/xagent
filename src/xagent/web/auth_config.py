@@ -8,8 +8,10 @@ JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
 def validate_auth_config() -> None:
     """Fail production startup when the JWT signing secret is not configured."""
     environment = (
-        os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development"
-    ).strip().lower()
+        (os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development")
+        .strip()
+        .lower()
+    )
     requires_secure_secret = environment in {"prod", "production", "stage", "staging"}
     requires_secure_secret = requires_secure_secret or os.getenv(
         "XAGENT_REQUIRE_SECURE_SECRETS", ""

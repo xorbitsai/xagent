@@ -705,9 +705,10 @@ def _field_metadata_candidates(
             )
             and (
                 not default_is_authored
-                or _json_equal(
-                    emitted_default,
-                    raw_const if has_const else next(iter(raw_enum)),
+                or (has_const and _json_equal(emitted_default, raw_const))
+                or (
+                    not has_const
+                    and any(_json_equal(emitted_default, member) for member in raw_enum)
                 )
             )
         ):
@@ -898,6 +899,19 @@ def _schema_allows_null(schema: Any) -> bool:
         ):
             return True
     return False
+
+
+def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
+    """Return a recursively copied schema without one validator keyword."""
+    if isinstance(schema, Mapping):
+        return {
+            key: _remove_schema_keyword(value, keyword)
+            for key, value in schema.items()
+            if key != keyword
+        }
+    if isinstance(schema, list):
+        return [_remove_schema_keyword(value, keyword) for value in schema]
+    return schema
 
 
 def _nested_schema_for_emission(
@@ -1970,6 +1984,11 @@ class MCPToolAdapter(AbstractBaseTool):
                     is_required=field_name in required,
                     _node_budget=nested_node_budget,
                 )
+                if not emitted_fragment and field_metadata.extra:
+                    # A shared nested budget may be exhausted by an earlier
+                    # field. Keep this field's independent scalar metadata
+                    # instead of silently making the output order-dependent.
+                    emitted_fragment = dict(field_metadata.extra)
                 description = emitted_fragment.pop(
                     "description", field_metadata.description
                 )
@@ -2036,6 +2055,12 @@ class MCPToolAdapter(AbstractBaseTool):
         """
         try:
             schema = self._args_type.model_json_schema()
+            # Regexes supplied by an MCP server are model-facing hints, not a
+            # safe event-loop validator. In particular, Python's backtracking
+            # engine can be blocked by a pathological pattern, and ECMA-only
+            # patterns can make the entire schema invalid. Keep the pattern in
+            # the provider schema but omit it from local pre-call checks.
+            schema = _remove_schema_keyword(schema, "pattern")
             Draft202012Validator.check_schema(schema)
             return Draft202012Validator(schema)
         except (jsonschema_exceptions.SchemaError, TypeError, ValueError) as exc:
@@ -2625,9 +2650,6 @@ class MCPToolAdapter(AbstractBaseTool):
             parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
             tool_args.update(self._runtime_tool_arguments())
-            argument_error = self._nested_argument_error(tool_args)
-            if argument_error is not None:
-                return self._invalid_arguments_result(argument_error)
             # Snapshot before the call, and attach in this shared layer so
             # subclass calls and authorization retries retain the same evidence.
             bound_args = self._runtime_tool_arguments(
@@ -2646,6 +2668,11 @@ class MCPToolAdapter(AbstractBaseTool):
                     own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
+
+            argument_error = self._nested_argument_error(tool_args)
+            if argument_error is not None:
+                await self._discard_external_upload_args(staged_uploads)
+                return self._invalid_arguments_result(argument_error)
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",

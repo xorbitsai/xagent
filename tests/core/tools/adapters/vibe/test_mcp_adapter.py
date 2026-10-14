@@ -510,7 +510,7 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
         inputSchema={
             "type": "object",
             "properties": {
-                "local_file_path": {"type": "string"},
+                "local_file_path": {"type": "string", "pattern": r"^/task/"},
                 "remote_path": {"type": "string"},
             },
         },
@@ -4618,6 +4618,7 @@ def test_enum_survives_when_a_non_finite_default_was_replaced():
     "declared_default,enum_expected",
     [
         ("metric", True),
+        ("imperial", True),
         (None, False),
         ("celsius", False),
     ],
@@ -4907,6 +4908,35 @@ def test_union_schema_is_gemini_compatible_and_const_discriminators_survive():
     )
 
 
+def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
+    emitted = _sanitize_schema_for_gemini(
+        {
+            "type": "object",
+            "properties": {
+                "nullable": {"type": ["string", "null"]},
+                "numbers": {"type": "integer", "enum": [1, 2]},
+                "numeric_const": {"type": "integer", "const": 1},
+            },
+        }
+    )
+
+    types_schema = emitted["properties"]["nullable"]
+    assert types_schema["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert "enum" not in emitted["properties"]["numbers"]
+    assert "const" not in emitted["properties"]["numeric_const"]
+    from google.genai import types
+
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="probe",
+                description="probe",
+                parameters=emitted,
+            )
+        ]
+    )
+
+
 def test_lossy_union_is_omitted_instead_of_narrowed_to_null():
     emitted = _emitted_schema(
         {
@@ -4947,6 +4977,27 @@ def test_dropped_nested_properties_do_not_leave_a_closed_unsatisfiable_object():
     assert params["additionalProperties"] is True
 
 
+def test_nested_budget_exhaustion_falls_back_to_later_top_level_metadata():
+    wide_object = {
+        "type": "object",
+        "properties": {f"field_{index}": {"type": "string"} for index in range(1023)},
+    }
+    emitted = _emitted_schema(
+        {
+            "wide": wide_object,
+            "later": {
+                "type": "string",
+                "description": "later field",
+                "enum": ["a", "b"],
+            },
+        }
+    )
+
+    later = _metadata_carrier(emitted["properties"]["later"])
+    assert later["description"] == "later field"
+    assert later["enum"] == ["a", "b"]
+
+
 def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
     adapter = _schema_adapter(
         {
@@ -4961,12 +5012,13 @@ def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
     assert adapter._nested_argument_error({"params": {"limit": None}}) is None
 
 
-def test_invalid_nested_pattern_disables_only_local_schema_validation():
+def test_nested_pattern_is_omitted_from_local_validation():
     adapter = _schema_adapter(
         {"params": {"type": "string", "pattern": "["}}, ["params"]
     )
 
-    assert adapter._args_validator is None
+    assert adapter._args_validator is not None
+    assert adapter._nested_argument_error({"params": "anything"}) is None
 
 
 @pytest.mark.asyncio

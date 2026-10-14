@@ -902,13 +902,23 @@ def _schema_allows_null(schema: Any) -> bool:
 
 
 def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
-    """Return a recursively copied schema without one validator keyword."""
+    """Remove a validator keyword without treating property names as keywords."""
     if isinstance(schema, Mapping):
-        return {
-            key: _remove_schema_keyword(value, keyword)
-            for key, value in schema.items()
-            if key != keyword
-        }
+        cleaned: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == keyword:
+                continue
+            if key in {"properties", "patternProperties", "$defs", "definitions"}:
+                if isinstance(value, Mapping):
+                    cleaned[key] = {
+                        name: _remove_schema_keyword(child, keyword)
+                        for name, child in value.items()
+                    }
+                else:
+                    cleaned[key] = value
+            else:
+                cleaned[key] = _remove_schema_keyword(value, keyword)
+        return cleaned
     if isinstance(schema, list):
         return [_remove_schema_keyword(value, keyword) for value in schema]
     return schema
@@ -977,27 +987,30 @@ def _nested_schema_for_emission(
                 union_is_lossless = False
             else:
                 union_options.append(emitted_option)
-    if union_options and union_is_lossless:
+    raw_properties = schema.get("properties")
+    if union_options and union_is_lossless and not isinstance(raw_properties, Mapping):
         # Gemini accepts anyOf but rejects oneOf. A lossy union is omitted
-        # instead of being narrowed to the surviving branches.
+        # instead of being narrowed to the surviving branches. Claude treats
+        # a union beside object siblings as the whole schema, so leave that
+        # shape broad rather than dropping its properties and required names.
         emitted["anyOf"] = union_options
 
-    raw_properties = schema.get("properties")
     raw_property_names: list[str] = []
     properties_complete = True
     if isinstance(raw_properties, Mapping):
         raw_property_names = [name for name in raw_properties if isinstance(name, str)]
         properties_complete = len(raw_property_names) == len(raw_properties)
         raw_required = schema.get("required")
-        required_names = (
-            {
+        required_order = (
+            [
                 name
                 for name in raw_required
                 if isinstance(name, str) and name in raw_properties
-            }
+            ]
             if isinstance(raw_required, list)
-            else set()
+            else []
         )
+        required_names = set(required_order)
         properties: dict[str, Any] = {}
         for name, child_schema in raw_properties.items():
             if not isinstance(name, str):
@@ -1015,7 +1028,7 @@ def _nested_schema_for_emission(
             else:
                 properties_complete = False
         emitted["properties"] = properties
-        required = [name for name in required_names if name in properties]
+        required = [name for name in required_order if name in properties]
         if required:
             emitted["required"] = required
         if "type" not in emitted:
@@ -2046,7 +2059,7 @@ class MCPToolAdapter(AbstractBaseTool):
             return EmptyArgsModel
 
     def _build_args_validator(self) -> Any | None:
-        """Compile the exact model-visible argument schema for local checks.
+        """Compile the adapter-visible argument schema for local checks.
 
         A malformed remote schema must not make the whole connector unload.
         ``_build_args_model`` already drops unsupported fragments; if the
@@ -2075,9 +2088,15 @@ class MCPToolAdapter(AbstractBaseTool):
     def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
         if self._args_validator is None:
             return None
-        return jsonschema_exceptions.best_match(
+        error = jsonschema_exceptions.best_match(
             self._args_validator.iter_errors(dict(args))
         )
+        while error is not None and error.validator in {"anyOf", "oneOf"}:
+            nested = jsonschema_exceptions.best_match(error.context)
+            if nested is None or nested is error:
+                break
+            error = nested
+        return error
 
     @staticmethod
     def _invalid_arguments_result(error: Any) -> dict[str, Any]:
@@ -2099,11 +2118,29 @@ class MCPToolAdapter(AbstractBaseTool):
         if error.validator == "required":
             reason = "a required value is missing"
         elif error.validator == "enum":
-            reason = "the value is outside the allowed enum"
+            allowed = _compact_json(error.validator_value)
+            if len(allowed) > 160:
+                allowed = allowed[:157] + "..."
+            reason = f"the value is outside the allowed enum {allowed}"
         elif error.validator == "type":
             reason = "the value has the wrong type"
         elif error.validator == "additionalProperties":
-            reason = "an unsupported field was supplied"
+            allowed_names: set[str] = set()
+            if isinstance(error.schema, Mapping):
+                properties = error.schema.get("properties")
+                if isinstance(properties, Mapping):
+                    allowed_names.update(properties)
+            unexpected = sorted(
+                str(name)
+                for name in (
+                    error.instance if isinstance(error.instance, Mapping) else {}
+                )
+                if name not in allowed_names
+            )
+            if unexpected:
+                reason = f"an unsupported field was supplied: {', '.join(unexpected)}"
+            else:
+                reason = "an unsupported field was supplied"
         else:
             reason = f"the {error.validator or 'schema'} constraint was not satisfied"
         return {
@@ -2648,8 +2685,11 @@ class MCPToolAdapter(AbstractBaseTool):
                     normalized_args.pop(field_name, None)
             self._validate_strict_integer_args(normalized_args)
             parsed_args = self._args_type(**normalized_args)
+            supplied_argument_names = set(normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
-            tool_args.update(self._runtime_tool_arguments())
+            runtime_arguments = self._runtime_tool_arguments()
+            tool_args.update(runtime_arguments)
+            supplied_argument_names.update(runtime_arguments)
             # Snapshot before the call, and attach in this shared layer so
             # subclass calls and authorization retries retain the same evidence.
             bound_args = self._runtime_tool_arguments(
@@ -2669,10 +2709,25 @@ class MCPToolAdapter(AbstractBaseTool):
                 )
                 return {"content": [{"text": message}], "is_error": True}
 
-            argument_error = self._nested_argument_error(tool_args)
+            # Pydantic inserts declared defaults before this point. Validate
+            # only values supplied by the model (plus runtime-bound values),
+            # so a connector's self-contradictory default does not reject an
+            # otherwise valid call that omitted the field.
+            validation_args = {
+                name: value
+                for name, value in tool_args.items()
+                if name in supplied_argument_names
+            }
+            argument_error = self._nested_argument_error(validation_args)
             if argument_error is not None:
                 await self._discard_external_upload_args(staged_uploads)
-                return self._invalid_arguments_result(argument_error)
+                result = self._invalid_arguments_result(argument_error)
+                logger.warning(
+                    "MCP tool %s rejected supplied arguments locally: %s",
+                    self.mcp_tool.name,
+                    result["content"][0]["text"],
+                )
+                return result
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",

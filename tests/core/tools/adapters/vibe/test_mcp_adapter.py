@@ -4916,14 +4916,23 @@ def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
                 "nullable": {"type": ["string", "null"]},
                 "numbers": {"type": "integer", "enum": [1, 2]},
                 "numeric_const": {"type": "integer", "const": 1},
+                "const": {"type": "string"},
+                "allOf": {"type": "string"},
+                "additionalProperties": {"type": "string"},
             },
         }
     )
 
     types_schema = emitted["properties"]["nullable"]
-    assert types_schema["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert types_schema["type"] == "string"
+    assert types_schema["nullable"] is True
     assert "enum" not in emitted["properties"]["numbers"]
     assert "const" not in emitted["properties"]["numeric_const"]
+    assert set(emitted["properties"]) >= {
+        "const",
+        "allOf",
+        "additionalProperties",
+    }
     from google.genai import types
 
     types.Tool(
@@ -4938,20 +4947,18 @@ def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
 
 
 def test_lossy_union_is_omitted_instead_of_narrowed_to_null():
-    emitted = _emitted_schema(
+    emitted = mcp_adapter_module._nested_schema_for_emission(
         {
-            "value": {
-                "oneOf": [
-                    {"$ref": "#/$defs/Model"},
-                    {"type": "null"},
-                ]
-            }
-        }
+            "oneOf": [
+                {"$ref": "#/$defs/Model"},
+                {"type": "null"},
+            ]
+        },
+        is_required=False,
     )
 
-    value = emitted["properties"]["value"]
-    assert "oneOf" not in value
-    assert any(option != {"type": "null"} for option in value.get("anyOf", []))
+    assert "oneOf" not in emitted
+    assert "anyOf" not in emitted
 
 
 def test_dropped_nested_properties_do_not_leave_a_closed_unsatisfiable_object():
@@ -5010,6 +5017,66 @@ def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
     )
 
     assert adapter._nested_argument_error({"params": {"limit": None}}) is None
+
+
+def test_property_named_pattern_is_not_removed_from_local_validation():
+    adapter = _schema_adapter(
+        {
+            "filter": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
+            }
+        },
+        ["filter"],
+    )
+
+    assert adapter._nested_argument_error({"filter": {"pattern": "*.py"}}) is None
+
+
+def test_nested_union_does_not_hide_object_siblings_from_claude():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "oneOf": [{"type": "object"}, {"type": "null"}],
+            }
+        },
+        ["params"],
+    )
+
+    params = emitted["properties"]["params"]
+    assert "anyOf" not in params
+    claude = _fix_pydantic_schema_for_claude(emitted)
+    assert claude["properties"]["params"]["required"] == ["name"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_default_does_not_reject_omitted_argument(monkeypatch):
+    adapter = _schema_adapter({"limit": {"type": "integer", "default": "10"}})
+    called = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"limit": "10"}
 
 
 def test_nested_pattern_is_omitted_from_local_validation():
@@ -5094,7 +5161,7 @@ async def test_nested_enum_argument_is_rejected_before_mcp_execution(monkeypatch
             {
                 "text": (
                     "Invalid MCP tool arguments at params.includeFields.0: "
-                    "the value is outside the allowed enum. "
+                    'the value is outside the allowed enum ["customer","owner","dates"]. '
                     "Check the tool schema and retry."
                 )
             }

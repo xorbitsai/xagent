@@ -93,11 +93,20 @@ def _sanitize_schema_for_gemini(schema: Any) -> Any:
     }
 
     if isinstance(schema, dict):
-        sanitized = {
-            key: _sanitize_schema_for_gemini(value)
-            for key, value in schema.items()
-            if key not in unsupported_keys
-        }
+        sanitized: Dict[str, Any] = {}
+        for key, value in schema.items():
+            if key in unsupported_keys:
+                continue
+            if key in {"properties", "patternProperties", "$defs", "definitions"}:
+                if isinstance(value, dict):
+                    sanitized[key] = {
+                        name: _sanitize_schema_for_gemini(child)
+                        for name, child in value.items()
+                    }
+                else:
+                    sanitized[key] = value
+            else:
+                sanitized[key] = _sanitize_schema_for_gemini(value)
         # Gemini's Schema model accepts one type string and string enum
         # members. JSON Schema permits a type list and arbitrary JSON enum
         # values, so normalize or drop those provider-incompatible forms.
@@ -122,6 +131,10 @@ def _sanitize_schema_for_gemini(schema: Any) -> Any:
             )
             if len(valid_types) == 1:
                 sanitized["type"] = valid_types[0]
+            elif "null" in valid_types and len(valid_types) == 2:
+                non_null_type = next(item for item in valid_types if item != "null")
+                sanitized["type"] = non_null_type
+                sanitized["nullable"] = True
             elif valid_types:
                 sanitized.pop("type", None)
                 existing_any_of = sanitized.get("anyOf")
@@ -132,7 +145,9 @@ def _sanitize_schema_for_gemini(schema: Any) -> Any:
             else:
                 sanitized.pop("type", None)
         enum = sanitized.get("enum")
-        if isinstance(enum, list) and not all(isinstance(item, str) for item in enum):
+        if not isinstance(enum, list) or not all(
+            isinstance(item, str) for item in enum
+        ):
             sanitized.pop("enum", None)
         one_of = sanitized.pop("oneOf", None)
         if isinstance(one_of, list):

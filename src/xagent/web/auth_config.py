@@ -23,8 +23,7 @@ JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
 def _is_insecure_secret(value: str) -> bool:
     normalized = value.strip().lower()
     return (
-        len(normalized) < MIN_SECRET_LENGTH
-        or normalized in _INSECURE_JWT_SECRET_VALUES
+        len(normalized) < MIN_SECRET_LENGTH or normalized in _INSECURE_JWT_SECRET_VALUES
     )
 
 

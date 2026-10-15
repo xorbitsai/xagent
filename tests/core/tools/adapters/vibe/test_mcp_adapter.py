@@ -6921,6 +6921,8 @@ async def test_registry_path_hides_auth_rejected_placeholder_after_summary(
     (entry,) = summary.failures
     assert (entry.server_name, entry.reason) == ("Rejected", "auth_rejected")
     assert (entry.cause_type, entry.status_code) == ("HTTPStatusError", 403)
+
+
 def _mcp_tool_adapter(tool_name: str, name_prefix: str = "mcp_Xero_") -> MCPToolAdapter:
     return MCPToolAdapter(
         mcp_tool=SimpleNamespace(

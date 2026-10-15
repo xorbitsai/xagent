@@ -1788,10 +1788,7 @@ def _normalized_mcp_call_result(
         "content": content,
         "structured_content": other_fields.get("structuredContent"),
         "is_error": bool(other_fields.get("isError"))
-        or (
-            detect_legacy_plain_text_error
-            and _is_plain_text_error_result(content)
-        ),
+        or (detect_legacy_plain_text_error and _is_plain_text_error_result(content)),
     }
 
 
@@ -3135,9 +3132,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
             normalized = _normalized_mcp_call_result(
                 result,
-                detect_legacy_plain_text_error=(
-                    self._detect_legacy_plain_text_error
-                ),
+                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
             )
             if self._is_excel_tool:
                 failure_code = _excel_failure_code(normalized)
@@ -3413,9 +3408,7 @@ class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
             return _normalized_mcp_call_result(
                 result,
                 validate_wire=True,
-                detect_legacy_plain_text_error=(
-                    self._detect_legacy_plain_text_error
-                ),
+                detect_legacy_plain_text_error=(self._detect_legacy_plain_text_error),
             )
         except ChromeSessionContractError:
             await self._chrome_pool.close_shielded(self._chrome_scope)

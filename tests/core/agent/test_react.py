@@ -14385,9 +14385,9 @@ def test_react_repeated_guard_marks_skip_paged_runs(argument: str) -> None:
 
     assert metadata is not None
     assert metadata["paginated"] is True
-    prompt = pattern._messages_for_repeated_tool_decision(
-        ExecutionContext(), metadata
-    )[-1]["content"]
+    prompt = pattern._messages_for_repeated_tool_decision(ExecutionContext(), metadata)[
+        -1
+    ]["content"]
     assert "offset, or skip" in prompt
 
 

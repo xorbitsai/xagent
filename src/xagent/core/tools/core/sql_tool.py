@@ -52,18 +52,6 @@ def _query_values(url: URL, name: str) -> tuple[str, ...]:
     return ()
 
 
-def _single_query_value(url: URL, name: str) -> str | None:
-    values = _query_values(url, name)
-    if not values:
-        return None
-    if len(values) != 1:
-        raise ValueError(f"Database URL repeats the target parameter {name!r}")
-    value = values[0]
-    if name in {"host", "hostaddr", "port"} and "," in value:
-        raise ValueError(f"Database URL contains multiple {name!r} targets")
-    return value
-
-
 def _opaque_target_query_keys(url: URL) -> list[str]:
     return sorted(key for key in _OPAQUE_TARGET_QUERY_KEYS if _query_values(url, key))
 
@@ -127,9 +115,12 @@ def _database_identity(url: URL) -> tuple[str, tuple[str, ...], int | None, str]
         if any("," in value for value in _query_values(url, key)):
             raise ValueError(f"Database URL contains multiple '{key}' targets")
     connect_args = _effective_connect_args(url)
-    raw_hosts = []
-    for key in ("host", "hostaddr"):
-        raw_hosts.extend(_split_hosts(connect_args.get(key)))
+    # libpq treats hostaddr as the actual destination when both host and
+    # hostaddr are present. Compare that effective destination, rather than
+    # allowing a public host name to hide a platform hostaddr override.
+    raw_hosts = _split_hosts(connect_args.get("hostaddr"))
+    if not raw_hosts:
+        raw_hosts = _split_hosts(connect_args.get("host"))
     if not raw_hosts and url.host:
         raw_hosts.extend(_split_hosts(url.host))
     unix_socket = connect_args.get("unix_socket")
@@ -184,9 +175,11 @@ def is_platform_database_url(candidate: str | URL) -> bool:
         # A MySQL account can qualify table names across schemas, so sharing
         # the same server is sufficient to make the platform target unsafe.
         hosts_overlap = bool(set(candidate_identity[1]) & set(platform_identity[1]))
-        if candidate_identity[0] == "mysql":
-            return hosts_overlap and candidate_identity[2] == platform_identity[2]
-        return hosts_overlap and candidate_identity[2:] == platform_identity[2:]
+        # A connection to the platform server is unsafe even when it names a
+        # different database: the deployment credentials may be allowed to
+        # create/drop databases or use server-side links. Database names are
+        # therefore not an isolation boundary for the SQL tool.
+        return hosts_overlap and candidate_identity[2] == platform_identity[2]
     except Exception:
         # This helper protects a security boundary. A malformed platform URL
         # or ambiguous target parameter must disable external SQL rather than
@@ -221,7 +214,7 @@ def validate_external_database_url(candidate: str | URL) -> URL:
         _database_identity(parsed)
     except ValueError:
         raise
-    except (OSError, RuntimeError, TypeError) as exc:
+    except Exception as exc:
         raise ValueError("Unable to determine the database target") from exc
     if is_platform_database_url(parsed):
         raise ValueError(PLATFORM_DATABASE_ERROR)

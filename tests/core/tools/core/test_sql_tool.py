@@ -75,9 +75,17 @@ class TestGetConnectionUrl:
     def test_allows_distinct_platform_database(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db.example/app")
         monkeypatch.setenv(
-            "XAGENT_EXTERNAL_DB_TEST", "postgresql://other@db.example/other"
+            "XAGENT_EXTERNAL_DB_TEST", "postgresql://other@other.example/other"
         )
         assert _get_connection_url("test").database == "other"
+
+    def test_rejects_other_database_on_platform_server(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db.example/app")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST", "postgresql://other@db.example/other"
+        )
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
 
     def test_default_platform_sqlite_database_is_compared(self, monkeypatch):
         monkeypatch.delenv("DATABASE_URL", raising=False)

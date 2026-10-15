@@ -2,13 +2,12 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
-from cryptography.fernet import Fernet
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+from cryptography.fernet import Fernet
 from sqlalchemy import create_engine, text
 
 from xagent.core.utils.encryption import decrypt_value, get_cipher
-
 
 VERSIONS = Path(__file__).parent.parent.parent / "src/xagent/migrations/versions"
 

@@ -2,10 +2,11 @@
 
 import asyncio
 from pathlib import Path
+
 import pytest
 
-from xagent.web.app import _blocked_upload_extension, _security_header_values
 from xagent.web.api.files import _inline_preview_response
+from xagent.web.app import _blocked_upload_extension, _security_header_values
 
 
 @pytest.mark.parametrize(

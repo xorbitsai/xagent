@@ -1379,6 +1379,7 @@ class SetupStatusResponse(BaseModel):
     initialized: bool
     needs_setup: bool
     registration_enabled: bool
+    password_min_length: int
 
 
 class RegisterSwitchRequest(BaseModel):
@@ -1636,6 +1637,7 @@ async def setup_status(db: Session = Depends(get_db)) -> SetupStatusResponse:
         initialized=initialized,
         needs_setup=not initialized,
         registration_enabled=registration_enabled,
+        password_min_length=PASSWORD_MIN_LENGTH,
     )
 
 

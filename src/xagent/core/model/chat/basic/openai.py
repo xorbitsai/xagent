@@ -28,6 +28,7 @@ from ..exceptions import (
     ModelProviderRetryableError,
     format_model_provider_error,
 )
+from ..stream_deadline import await_before_deadline
 from ..stream_progress import (
     NO_PROGRESS_FINISH_REASON,
     STREAM_ABORTED_KEY,
@@ -1364,7 +1365,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         Raises:
             RuntimeError: API call failed
-            TimeoutError: First token timeout or token interval timeout
+            LLMTimeoutError: First token or token interval deadline expired
         """
         await self._ensure_client_async()
         assert self._client is not None
@@ -1425,9 +1426,30 @@ class OpenAICompatibleLLM(BaseLLM):
                     )
                 return await client.chat.completions.create(**completion_params)
 
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent (#3056). The first-token deadline also covers
+            # opening the stream.
+            loop = asyncio.get_running_loop()
+            start_time = time.time()
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
+
             while True:
                 try:
-                    stream = await _create_stream()
+                    stream = await await_before_deadline(
+                        _create_stream(),
+                        deadline=first_token_deadline,
+                        timeout_message=first_token_message,
+                    )
                     break
                 except openai.BadRequestError as e:
                     error_msg = _format_openai_error("OpenAI bad request", e)
@@ -1449,11 +1471,6 @@ class OpenAICompatibleLLM(BaseLLM):
                     # degrade removes or renames a parameter and fires only
                     # while it is still in the request.
 
-            # Timeout control
-            first_token = True
-            last_token_time = None
-            start_time = time.time()
-
             # Accumulate tool calls (across multiple chunks)
             accumulated_tool_calls: Dict[str, Dict] = {}
             accumulated_reasoning_content = ""
@@ -1471,31 +1488,33 @@ class OpenAICompatibleLLM(BaseLLM):
             saw_content = False
             raw_chunk_count = 0
 
-            async for raw_chunk in stream:
-                current_time = time.time()
+            chunks = aiter(stream)
+            while True:
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if raw_chunk_count:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                else:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                try:
+                    raw_chunk = await await_before_deadline(
+                        anext(chunks),
+                        deadline=deadline,
+                        timeout_message=timeout_message,
+                    )
+                except StopAsyncIteration:
+                    break
+                except LLMTimeoutError:
+                    await _close_stream(stream)
+                    raise
+                if not raw_chunk_count:
+                    logger.debug(
+                        "First token received after %.2fs", time.time() - start_time
+                    )
                 raw_chunk_count += 1
-
-                # Check first token timeout
-                if first_token:
-                    elapsed = current_time - start_time
-                    if elapsed > self.timeout_config.first_token_timeout:
-                        logger.error(f"First token timeout after {elapsed}s")
-                        raise LLMTimeoutError(
-                            f"First token timeout: {elapsed}s > {self.timeout_config.first_token_timeout}s"
-                        )
-                    first_token = False
-                    logger.debug(f"First token received after {elapsed:.2f}s")
-
-                # Check token interval timeout
-                if last_token_time is not None:
-                    interval = current_time - last_token_time
-                    if interval > self.timeout_config.token_interval_timeout:
-                        logger.error(f"Token interval timeout: {interval}s")
-                        raise LLMTimeoutError(
-                            f"Token interval timeout: {interval}s > {self.timeout_config.token_interval_timeout}s"
-                        )
-
-                last_token_time = current_time
 
                 # Store last raw chunk for potential usage extraction
                 last_raw_chunk = raw_chunk

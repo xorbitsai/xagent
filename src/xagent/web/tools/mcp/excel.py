@@ -42,11 +42,20 @@ _EXCEL_COLUMN_RE = re.compile(r"^[A-Za-z]{1,3}$")
 
 
 class _GraphRequestError(RuntimeError):
-    """Graph HTTP failure that retains its status without response parsing."""
+    """Graph HTTP failure with the stable fields needed for classification."""
 
-    def __init__(self, message: str, *, status_code: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        graph_error_code: str | None = None,
+        request_path: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.graph_error_code = graph_error_code
+        self.request_path = request_path
 
 
 class _GraphMutationIndeterminateError(RuntimeError):
@@ -98,11 +107,55 @@ def _success_with_bounded_collection(
     )
 
 
-def _error(message: str, *, details: Any = None) -> str:
+def _error(
+    message: str, *, details: Any = None, failure_code: str | None = None
+) -> str:
     payload: dict[str, Any] = {"status": "error", "message": message}
     if details is not None:
         payload["details"] = details
+    if failure_code is not None:
+        payload["failure_code"] = failure_code
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _graph_error_code(response_text: str) -> str | None:
+    try:
+        payload = json.loads(response_text)
+    except (TypeError, ValueError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
+def _is_workbook_resolution_path(path: str | None) -> bool:
+    if not isinstance(path, str):
+        return False
+    path_only = urlsplit(path).path.rstrip("/")
+    return path_only.endswith("/workbook/worksheets") or path_only.endswith(
+        "/workbook/tables"
+    )
+
+
+def _excel_failure_code(exc: BaseException) -> str | None:
+    """Classify only stable Graph failures safe for client localization."""
+    if not isinstance(exc, _GraphRequestError):
+        return None
+    graph_code = (exc.graph_error_code or "").lower()
+    if graph_code == "accessdenied" and exc.status_code == 403:
+        return "excel_workbook_access_denied"
+    if graph_code == "itemnotfound" and _is_workbook_resolution_path(exc.request_path):
+        return "excel_site_not_found"
+    if graph_code in {"resourcelocked", "itemlocked"} and exc.status_code in {
+        409,
+        423,
+    }:
+        return "excel_workbook_locked"
+    return None
+
+
+def _error_from_exception(exc: BaseException) -> str:
+    return _error(str(exc), failure_code=_excel_failure_code(exc))
 
 
 def _indeterminate(message: str) -> str:
@@ -175,7 +228,12 @@ def _graph_request(
                 message = f"{message} - {response_text}"
             if oversized:
                 message = f"{message} - response body truncated at ingress limit"
-            raise _GraphRequestError(message, status_code=response.status_code) from exc
+            raise _GraphRequestError(
+                message,
+                status_code=response.status_code,
+                graph_error_code=_graph_error_code(response_text),
+                request_path=path,
+            ) from exc
         if oversized:
             raise _GraphResponseTooLargeError(
                 "Graph response exceeded the Excel tool ingress limit"
@@ -193,7 +251,12 @@ def _graph_request(
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
-        raise _GraphRequestError(message, status_code=response.status_code) from exc
+        raise _GraphRequestError(
+            message,
+            status_code=response.status_code,
+            graph_error_code=_graph_error_code(response_text),
+            request_path=path,
+        ) from exc
     if response.status_code == 204:
         return {}
     if not response.content:
@@ -729,7 +792,7 @@ def excel_list_worksheets(
         )
     except Exception as e:
         logger.error("Error listing worksheets for %s: %s", file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -760,7 +823,7 @@ def excel_add_worksheet(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding worksheet to %s: %s", file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -787,7 +850,7 @@ def excel_delete_worksheet(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error deleting worksheet %s from %s: %s", worksheet, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -824,7 +887,7 @@ def excel_get_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -875,7 +938,7 @@ def excel_update_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
@@ -926,7 +989,7 @@ def excel_delete_columns(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
@@ -984,7 +1047,7 @@ def excel_delete_rows(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1021,7 +1084,7 @@ def excel_clear_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1059,7 +1122,7 @@ def excel_get_used_range(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 def _bounded_query_rows(
@@ -1169,7 +1232,7 @@ def excel_count_values(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1237,7 +1300,7 @@ def excel_find_rows(
         logger.error(
             "Error finding %r on worksheet %s in %s: %s", query, worksheet, file_path, e
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1279,7 +1342,7 @@ def excel_list_tables(
         )
     except Exception as e:
         logger.error("Error listing tables in %s: %s", file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1305,7 +1368,7 @@ def excel_add_table(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding table %s in %s: %s", address, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1370,7 +1433,7 @@ def excel_list_table_rows(
         )
     except Exception as e:
         logger.error("Error listing rows for table %s in %s: %s", table, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1416,7 +1479,7 @@ def excel_add_table_rows(
         return _indeterminate(str(e))
     except Exception as e:
         logger.error("Error adding rows to table %s in %s: %s", table, file_path, e)
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 @mcp.tool()
@@ -1450,7 +1513,7 @@ def excel_delete_table_row(
             file_path,
             e,
         )
-        return _error(str(e))
+        return _error_from_exception(e)
 
 
 if __name__ == "__main__":

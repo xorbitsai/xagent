@@ -360,9 +360,7 @@ async def test_tool_workspace_lives_inside_the_tree_the_sandbox_binds(
                 new=AsyncMock(return_value=[]),
             )
         )
-        stack.enter_context(
-            patch("xagent.web.models.database.get_session_local", return_value=None)
-        )
+        stack.enter_context(patch("xagent.web.models.database._SessionLocal", object()))
         _tools, tool_config = await create_default_tools(
             db=None,
             user=_make_user(),

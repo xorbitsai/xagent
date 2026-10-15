@@ -138,7 +138,7 @@ async def test_admin_user_delete_is_fk_safe_under_enforced_foreign_keys() -> Non
     """The batched purge must still satisfy strict foreign keys (M2 guard)."""
 
     _admin_headers()
-    _register_second_user("fk-user", "fkpass1")
+    _register_second_user("fk-user", "fkpass01")
     engine = get_engine()
 
     def _enable_fk(dbapi_connection, connection_record) -> None:

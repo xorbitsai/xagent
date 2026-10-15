@@ -94,6 +94,7 @@ from .task_auto_recovery_policy import (
     auto_resume_recovery_state,
     next_auto_resume_at,
     scheduled_trigger_superseded,
+    staleness_window_seconds,
 )
 from .task_command_transport import (
     AUTO_RESUME_COMMAND_PREFIX,
@@ -1840,3 +1841,179 @@ def _refence_rolled_back_claim_no_commit(
     return _reschedule_dispatched_no_commit(
         db, task, row, now=utc_now(), at="claim", after="resume_rolled_back"
     )
+
+
+# --------------------------------------------------------------------------
+# Channel reply hold
+# --------------------------------------------------------------------------
+
+# Read side only: absorbs clock skew between the host that dispatches and the
+# host that reads a channel reply. Dispatch compares the same
+# ``interrupted_at`` with the channel window, so a ``scheduled`` row past
+# ``interrupted_at + window`` is never dispatched again.
+CHANNEL_HOLD_CLOCK_GRACE_SECONDS = 60
+
+
+def _hold_snapshot(db: Session, task_id: int) -> Any:
+    """The task, its recovery row and the row's dispatched command, read once.
+
+    One statement on purpose: under PostgreSQL's READ COMMITTED two reads
+    could straddle a resume that was interrupted and recorded again, pairing
+    one interruption's ``state_version`` with another's
+    ``paused_state_version`` and releasing a reply that should wait.
+    """
+
+    command_status = (
+        select(TaskExecutionCommand.status)
+        .where(
+            TaskExecutionCommand.task_id == TaskAutoRecovery.task_id,
+            TaskExecutionCommand.command_id == TaskAutoRecovery.last_command_id,
+        )
+        .correlate(TaskAutoRecovery)
+        .scalar_subquery()
+    )
+    return db.execute(
+        select(
+            Task.status,
+            Task.control_state,
+            Task.run_id,
+            Task.state_version,
+            TaskAutoRecovery.run_id.label("row_run_id"),
+            TaskAutoRecovery.state.label("row_state"),
+            TaskAutoRecovery.paused_state_version,
+            TaskAutoRecovery.interrupted_at,
+            command_status.label("dispatch_status"),
+        )
+        .select_from(Task)
+        .outerjoin(TaskAutoRecovery, TaskAutoRecovery.task_id == Task.id)
+        .where(Task.id == task_id)
+    ).one_or_none()
+
+
+def _auto_resume_holds(snap: Any, *, run_id: str, now: datetime) -> bool:
+    """Snapshot of a task PAUSED on ``run_id``: is an automatic resume still
+    due or starting?
+
+    A dispatched command still queued or running holds whatever the version
+    (a retry after a rolled-back resume moves it by two). No deadline bounds
+    that branch: the command's own liveness does (an expired claim is
+    reclaimed and run; a command that fails leaves this branch, and the row
+    then holds only until housekeeping closes it as ``dispatch_failed`` or
+    the window ends); housekeeping only re-arms a command that is still
+    queued. Every other hold ends at the channel window from the latest
+    interruption, plus a clock grace: past it the sweeper can no longer
+    dispatch the row.
+    """
+
+    if snap.row_run_id != run_id:
+        return False
+    if snap.row_state == _DISPATCHED.value and snap.dispatch_status in (
+        COMMAND_PENDING,
+        COMMAND_PROCESSING,
+    ):
+        return True
+    if snap.row_state not in (
+        _SCHEDULED.value,
+        _DISPATCHED.value,
+        TaskAutoRecoveryState.STALE.value,
+    ):
+        return False
+    deadline = _utc(snap.interrupted_at) + timedelta(
+        seconds=staleness_window_seconds("channel") + CHANNEL_HOLD_CLOCK_GRACE_SECONDS
+    )
+    if now > deadline:
+        return False
+    # A resume (automatic, or a person's from the web, which the sweeper may
+    # meanwhile have closed as ``stale``) is handing off: wait for its run.
+    if snap.control_state == TaskControlState.RESUME_REQUESTED.value:
+        return True
+    return (
+        snap.row_state in (_SCHEDULED.value, _DISPATCHED.value)
+        and snap.control_state == TaskControlState.PAUSED.value
+        and int(snap.state_version or 0) == int(snap.paused_state_version)
+    )
+
+
+def channel_reply_waits_for_auto_resume(
+    db: Session, *, task_id: int, run_id: str, now: datetime
+) -> bool:
+    """Whether a channel reply for ``run_id`` waits for an automatic resume.
+
+    The caller (``_read_channel_result``) replies "interrupted" on False and
+    reads again later on True. False when one consistent read shows the task
+    PAUSED on ``run_id`` with no automatic resume pending or starting, and
+    when the task is gone (deleted since the caller read it), so that reply
+    is "interrupted" too. A task that moved otherwise since the caller read
+    it is True: the next read's other branches decide.
+    """
+
+    snap = _hold_snapshot(db, task_id)
+    if snap is None:
+        return False
+    if snap.status != TaskStatus.PAUSED or snap.run_id != run_id:
+        return True
+    return _auto_resume_holds(snap, run_id=run_id, now=now)
+
+
+def supersede_pending_auto_resume_no_commit(
+    db: Session, task: Task, *, now: datetime
+) -> bool:
+    """A new turn accepted on ``task`` replaces the automatic resume its run
+    waits for; no commit.
+
+    Caller: channel acceptance, holding the task row lock (FOR UPDATE) after
+    reserving the START in this transaction, before reading the version the
+    START is staged at. Lock order is the module's: ``tasks``, then the
+    recovery row. Acts only while the resume has not begun its hand-off
+    (``control_state='paused'``). It moves ``state_version`` so that the
+    RESUME_REQUESTED transition of an already-claimed automatic RESUME, fenced
+    on the version it admitted from, can no longer succeed; it defers, and
+    the claim guard skips the retry (``stale``: its snapshot is past the
+    fence, and the row no longer names the command). Marking the row ``stale`` alone
+    would let that transition resume the old run and reject the new START.
+    """
+
+    if (
+        task.status != TaskStatus.PAUSED
+        or task.control_state != TaskControlState.PAUSED.value
+        or task.run_id is None
+    ):
+        return False
+    snap = _hold_snapshot(db, int(task.id))
+    if snap is None or not _auto_resume_holds(snap, run_id=str(task.run_id), now=now):
+        return False
+    row = db.get(
+        TaskAutoRecovery, int(task.id), with_for_update=True, populate_existing=True
+    )
+    if row is None or row.state not in (_SCHEDULED.value, _DISPATCHED.value):
+        return False
+    bumped = _rowcount(
+        db.execute(
+            update(Task)
+            .where(
+                Task.id == task.id,
+                Task.run_id == task.run_id,
+                Task.state_version == task.state_version,
+                task_status_predicate.eq(TaskStatus.PAUSED),
+                Task.control_state == TaskControlState.PAUSED.value,
+            )
+            .values(state_version=func.coalesce(Task.state_version, 0) + 1)
+            .execution_options(synchronize_session=False)
+        )
+    )
+    if bumped != 1:
+        # Not under the caller's lock; leave the resume alone.
+        return False
+    _give_up_no_commit(
+        db,
+        task,
+        row,
+        TaskAutoRecoveryState.STALE,
+        from_state=TaskAutoRecoveryState(row.state),
+        at="new_turn",
+        state_detail="new_turn",
+        event_detail={"mismatch": "new_turn"},
+        fenced=False,
+    )
+    increment_counter("xagent.task.auto_resume.superseded_by_turn")
+    return True

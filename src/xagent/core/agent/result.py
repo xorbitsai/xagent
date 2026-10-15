@@ -4,13 +4,24 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-TOOL_FAILURE_CODES = frozenset(
+EXCEL_FAILURE_CODES = frozenset(
     {
-        "authentication_required",
-        "oauth_token_required",
-        "unsupported_nested_interaction",
-        "missing_delegated_output",
+        "excel_workbook_access_denied",
+        "excel_site_not_found",
+        "excel_workbook_locked",
     }
+)
+
+TOOL_FAILURE_CODES = (
+    frozenset(
+        {
+            "authentication_required",
+            "oauth_token_required",
+            "unsupported_nested_interaction",
+            "missing_delegated_output",
+        }
+    )
+    | EXCEL_FAILURE_CODES
 )
 
 # Pseudo-tools that drive the run rather than retrieve evidence. They flow

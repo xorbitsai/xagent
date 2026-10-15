@@ -1469,10 +1469,7 @@ def test_postgresql_batch_does_not_count_a_failed_candidate_transaction(
         "get_next_expired_task_lease_candidate_for_update",
         select_next_candidate,
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: TestSessionLocal,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", TestSessionLocal)
 
     batch = (
         task_lease_recovery._recover_expired_task_leases_batch_with_postgresql_locks(

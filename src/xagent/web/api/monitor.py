@@ -16,7 +16,7 @@ from ..models.database import get_db
 from ..models.task import Task
 from ..models.user import User
 from ..services.task_event_metrics import monitoring_trace_source
-from ..utils.db_timezone import safe_timestamp_to_unix
+from ..utils.db_timezone import normalize_datetime_from_db, safe_timestamp_to_unix
 
 logger = logging.getLogger(__name__)
 
@@ -413,25 +413,21 @@ async def get_monitoring_stats(
             else None
         )
 
-        # Get active model count
-        try:
-            # Use safe JSON field extraction to avoid NULL character issues
-            model_name_expr = safe_get_json_field(TraceEvent.data, "model_name", db)
-            active_models = (
-                db.query(model_name_expr)
-                .filter(
-                    TraceEvent.event_type == "llm_call_start",
-                    TraceEvent.timestamp >= today_start,
-                    TraceEvent.data.isnot(None),
-                    model_name_expr.isnot(None),
-                    *trace_event_filter,
-                )
-                .distinct()
-                .count()
-            )
-        except Exception as e:
-            logger.error(f"Failed to query active models: {e}")
-            active_models = 0
+        # Reuse all starts, independently of duration matching. Empty names count.
+        active_model_names: set[str] = set()
+        for event in llm_starts:
+            if not isinstance(event.data, dict):
+                continue
+
+            model_name = event.data.get("model_name")
+            if not isinstance(model_name, str):
+                continue
+
+            timestamp = normalize_datetime_from_db(event.timestamp)
+            if timestamp >= today_start:
+                active_model_names.add(model_name)
+
+        active_models = len(active_model_names)
 
         # Get total token count
         token_sum = 0

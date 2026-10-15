@@ -1,4 +1,6 @@
 import json
+import subprocess
+import sys
 from unittest.mock import Mock
 
 import pytest
@@ -6,6 +8,23 @@ import requests
 
 from xagent.config import get_tool_max_output_length
 from xagent.web.tools.mcp import excel
+
+
+def test_excel_mcp_does_not_import_agent_package() -> None:
+    probe = (
+        "import sys; "
+        "import xagent.web.tools.mcp.excel; "
+        "print(len([n for n in sys.modules "
+        "if n.startswith('xagent.core.agent')]))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert completed.stdout.strip() == "0"
 
 
 class MockResponse:
@@ -1611,6 +1630,71 @@ def test_graph_error_response_is_surfaced_as_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "Not Found" in result["message"]
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "failure_code"),
+    [
+        (403, {"error": {"code": "accessDenied"}}, "excel_workbook_access_denied"),
+        (404, {"error": {"code": "itemNotFound"}}, "excel_site_not_found"),
+        (423, {"error": {"code": "resourceLocked"}}, "excel_workbook_locked"),
+    ],
+)
+def test_graph_failures_carry_allowlisted_failure_code(
+    monkeypatch, status_code, body, failure_code
+):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse(body, status_code=status_code)),
+    )
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx"))
+
+    assert result["status"] == "error"
+    assert result["failure_code"] == failure_code
+
+
+def test_access_denied_with_non_forbidden_status_does_not_carry_failure_code():
+    error = excel._GraphRequestError(
+        "denied",
+        status_code=401,
+        graph_error_code="accessDenied",
+    )
+
+    assert excel._excel_failure_code(error) is None
+
+
+def test_graph_other_failure_does_not_carry_failure_code(monkeypatch):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(return_value=MockResponse({"error": "bad request"}, status_code=400)),
+    )
+
+    result = json.loads(excel.excel_list_worksheets("book.xlsx"))
+
+    assert result["status"] == "error"
+    assert "failure_code" not in result
+
+
+def test_graph_item_not_found_for_a_worksheet_does_not_look_like_missing_workbook(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        excel.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"error": {"code": "itemNotFound"}}, status_code=404
+            )
+        ),
+    )
+
+    result = json.loads(excel.excel_get_range("book.xlsx", "Missing", address="A1"))
+
+    assert result["status"] == "error"
+    assert "failure_code" not in result
 
 
 def test_missing_auth_token_is_reported(monkeypatch):

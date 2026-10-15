@@ -81,9 +81,7 @@ def test_delete_recreate_output_preserves_retained_file(
         metadata.tables["tasks"].dialect_options["sqlite"]["autoincrement"] = False
     metadata.create_all(engine)
     sessions = sessionmaker(bind=engine)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: sessions
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", sessions)
     monkeypatch.setattr(
         "xagent.web.services.uploaded_file_store.get_session_local", lambda: sessions
     )

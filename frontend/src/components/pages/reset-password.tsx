@@ -12,6 +12,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
 import { AuthFormCard } from "@/components/auth/auth-form-card"
+import { useSetupStatus } from "@/hooks/use-setup-status"
 
 export function ResetPasswordPage() {
   const branding = getBrandingFromEnv()
@@ -25,6 +26,7 @@ export function ResetPasswordPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState("")
   const [success, setSuccess] = useState("")
+  const { passwordMinLength } = useSetupStatus()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -35,8 +37,12 @@ export function ResetPasswordPage() {
       setError(t("resetPassword.alerts.invalid_token"))
       return
     }
-    if (password.length < 6) {
-      setError(t("resetPassword.alerts.password_too_short"))
+    if (password.length < passwordMinLength) {
+      setError(
+        t("resetPassword.alerts.password_too_short", {
+          min: passwordMinLength,
+        })
+      )
       return
     }
     if (password !== confirmPassword) {
@@ -140,6 +146,7 @@ export function ResetPasswordPage() {
               <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#A0A9B8]" />
               <Input
                 type={showPassword ? "text" : "password"}
+                minLength={passwordMinLength}
                 value={password}
                 onChange={(event) => {
                   setPassword(event.target.value)

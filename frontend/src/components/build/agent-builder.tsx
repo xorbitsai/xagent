@@ -18,6 +18,8 @@ import { getApiUrl } from "@/lib/utils"
 import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { OfficialMcpSettingsDialog, type AppIntegration } from "@/components/mcp/official-mcp-settings-dialog"
+import { NeedsReconnectBadge } from "@/components/mcp/needs-reconnect-badge"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useAuth } from "@/contexts/auth-context"
@@ -54,6 +56,7 @@ import { toast } from "@/components/ui/sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { findMatchingMcpApp, findMatchingMcpServer, mcpNameMatches, resolveMcpToolSelector } from "@/lib/mcp-lookup"
+import { isMcpSelectionConnected, needsReconnect } from "@/lib/mcp-connection-status"
 import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
@@ -336,6 +339,17 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     mcpServers, setMcpServers, mcpSettled,
   } = useBuilderCatalog({ ownerScopedMcpRef, isEditMode, setModelConfig })
   const [isConnectMcpOpen, setIsConnectMcpOpen] = useState(false)
+  // Catalog entry whose settings dialog runs the reconnect login (#2931).
+  const [reconnectApp, setReconnectApp] = useState<AppIntegration | null>(null)
+  const refreshConnectors = () => {
+    refreshMcpApps().catch(console.error)
+    // Keep the current list unless the refresh returns one: an error
+    // body here would break every connector lookup at render.
+    apiRequest(`${getApiUrl()}/api/mcp/servers`)
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => { if (Array.isArray(data)) setMcpServers(data) })
+      .catch(console.error)
+  }
 
   const refreshTriggerSummary = useCallback(async () => {
     if (!localAgentId) {
@@ -1900,7 +1914,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       const isSelected = selectedMcpServers.some((name) => mcpNameMatches(name, serverName))
       const connectedServer = findMatchingMcpServer(mcpServers, serverName)
       const connectedApp = findMatchingMcpApp(officialApps, serverName)
-      const isConnected = Boolean(connectedServer || connectedApp?.is_connected)
+      const isConnected = isMcpSelectionConnected(connectedServer, connectedApp)
       return !isSelected || !isConnected
     })
   )
@@ -2775,12 +2789,25 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             {selectedMcpServers.map((serverName, index) => {
               const connectedServer = findMatchingMcpServer(mcpServers, serverName)
               const matchingApp = findMatchingMcpApp(officialApps, serverName)
-              const isConnected = Boolean(connectedServer || matchingApp?.is_connected)
+              // The row stays listed after its grant stops working, so its
+              // presence alone is not "connected". Display only: the row must
+              // stay in mcpServers, which resolves the saved mcp: selector.
+              const reconnectNeeded = needsReconnect(connectedServer)
+              const isConnected = isMcpSelectionConnected(connectedServer, matchingApp)
               const isSupported = Boolean(matchingApp)
+              // An admin viewing another user's agent sees the owner's rows; a
+              // login started here would reconnect the admin's own account.
+              // builtin_oauth matches the gate the reconnect dialog applies.
+              const canReconnect = reconnectNeeded
+                && matchingApp?.auth_type === "builtin_oauth"
+                && !readOnly
+                && !ownerScopedMcpRef.current
 
               let statusDesc = ""
 
-              if (connectedServer) {
+              if (reconnectNeeded) {
+                statusDesc = t("tools.mcp.needsReconnectDescription")
+              } else if (connectedServer) {
                 statusDesc = connectedServer.description || ""
               } else if (matchingApp?.is_connected) {
                 statusDesc = matchingApp.description || ""
@@ -2795,10 +2822,10 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
               const server = { name: matchingApp?.name || connectedServer?.name || serverName, description: statusDesc }
               const icon = getAppIcon(server.name)
               return (
-                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && "opacity-50 bg-muted/50")}>
+                <div key={index} className={cn("flex items-center gap-3 p-2 rounded-md border", !isConnected && !reconnectNeeded && "opacity-50 bg-muted/50")}>
                   <div className="bg-slate-100 p-1.5 rounded">
                     {icon ? (
-                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && "grayscale")} />
+                      <img src={icon} alt={server.name} className={cn("h-5 w-5 object-contain", !isConnected && !reconnectNeeded && "grayscale")} />
                     ) : (
                       <span className="text-xl">🔌</span>
                     )}
@@ -2806,7 +2833,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                   <div>
                     <div className="text-sm font-medium flex items-center gap-2">
                       {server.name}
-                      {!isConnected && (
+                      {reconnectNeeded ? (
+                        <NeedsReconnectBadge />
+                      ) : !isConnected && (
                         <span className="text-[10px] bg-yellow-100 text-yellow-700 px-1.5 py-0.5 rounded font-normal whitespace-nowrap">
                           {t("tools.mcp.mcpUnavailable")}
                         </span>
@@ -2814,7 +2843,18 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
                     </div>
                     <div className="text-xs text-muted-foreground">{server.description}</div>
                   </div>
-                  <div className="ml-auto">
+                  <div className="ml-auto flex items-center gap-1">
+                    {canReconnect && matchingApp && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs"
+                        onClick={() => setReconnectApp({ ...matchingApp, connection_status: connectedServer.connection_status })}
+                      >
+                        {t("tools.mcp.dialog.reconnect")}
+                      </Button>
+                    )}
                     <Button
                       type="button"
                       variant="ghost"
@@ -3247,15 +3287,15 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           onConnectSelected={(selectedApps) => {
             setSelectedMcpServers(selectedApps)
           }}
-          onSuccess={() => {
-            refreshMcpApps().catch(console.error)
-            // Keep the current list unless the refresh returns one: an error
-            // body here would break every connector lookup at render.
-            apiRequest(`${getApiUrl()}/api/mcp/servers`)
-              .then(res => (res.ok ? res.json() : null))
-              .then(data => { if (Array.isArray(data)) setMcpServers(data) })
-              .catch(console.error)
-          }}
+          onSuccess={refreshConnectors}
+        />
+      )}
+      {!readOnly && !loadingAgent && (
+        <OfficialMcpSettingsDialog
+          open={reconnectApp !== null}
+          onOpenChange={(nextOpen) => { if (!nextOpen) setReconnectApp(null) }}
+          app={reconnectApp}
+          onSuccess={refreshConnectors}
         />
       )}
     </div>

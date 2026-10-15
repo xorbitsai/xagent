@@ -648,7 +648,7 @@ async def test_rollback_before_execution_completion_uses_existing_lease_health(
 
     monkeypatch.setattr(runtime, "get_task_lease_heartbeat_seconds", lambda: 0.1)
     factory = sessionmaker(engine, expire_on_commit=False)
-    monkeypatch.setattr(database, "get_session_local", lambda: factory)
+    monkeypatch.setattr(database, "_SessionLocal", factory)
     registry = runtime.TaskCoordinatorRegistry(factory)
     failed = Event()
 

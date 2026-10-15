@@ -35,6 +35,69 @@ class TestClaudeLLM:
         """Fixture providing Claude LLM instance."""
         return ClaudeLLM(**claude_llm_config)
 
+    @pytest.mark.asyncio
+    async def test_auto_only_model_normalizes_required_tool_choice(self, mocker):
+        llm = ClaudeLLM(model_name="claude-opus-5-5-20261001", api_key="test-key")
+        client = mocker.AsyncMock()
+        client.messages.create.return_value = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="Done")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+        llm._client = client
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        await llm.chat(
+            [{"role": "user", "content": "hello"}],
+            tools=tools,
+            tool_choice="required",
+        )
+
+        assert llm.supports_forced_tool_choice is False
+        assert client.messages.create.call_args.kwargs["tool_choice"] == {
+            "type": "auto"
+        }
+
+    @pytest.mark.asyncio
+    async def test_auto_only_model_normalizes_stream_tool_choice(self, mocker):
+        llm = ClaudeLLM(model_name="claude-opus-5-5", api_key="test-key")
+        client = mocker.AsyncMock()
+        client.messages.create.return_value = _AsyncEventStream([])
+        llm._client = client
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "hello"}],
+                tools=tools,
+                tool_choice="required",
+            )
+        ]
+
+        assert chunks == []
+        assert client.messages.create.call_args.kwargs["tool_choice"] == {
+            "type": "auto"
+        }
+
     def test_schema_fix_preserves_property_named_type(self):
         """Claude schema fixer must not treat properties maps as schema objects."""
         schema = {

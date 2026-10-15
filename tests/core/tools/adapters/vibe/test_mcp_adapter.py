@@ -21,8 +21,16 @@ from pydantic import BaseModel, ConfigDict, create_model
 from pydantic.alias_generators import to_camel
 
 from xagent.core.model.chat.basic.claude import _fix_pydantic_schema_for_claude
+from xagent.core.model.chat.basic.gemini import (
+    _flatten_json_schema,
+    _sanitize_schema_for_gemini,
+)
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
-from xagent.core.tools.adapters.vibe.config import MCPUnavailableSummary
+from xagent.core.tools.adapters.vibe.config import (
+    MCPFailurePolicy,
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _FIELD_TEXT_MAX_CHARS,
@@ -36,6 +44,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _build_mcp_tool_adapter,
     _compact_json,
     _durable_upload_fields,
+    _excel_failure_code,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
     _split_url_token,
@@ -45,7 +54,10 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     load_mcp_tools_as_agent_tools,
     redact_urls_in_text,
 )
-from xagent.core.tools.adapters.vibe.mcp_tools import _build_mcp_load_summary
+from xagent.core.tools.adapters.vibe.mcp_tools import (
+    _build_mcp_load_summary,
+    _finish_mcp_setup,
+)
 from xagent.core.tools.adapters.vibe.tool_naming_limits import (
     MAX_AGENT_TOOL_NAME_LENGTH,
 )
@@ -72,6 +84,24 @@ def _mcp_tool(name: str = "echo") -> SimpleNamespace:
         description=f"{name} tool",
         inputSchema={"type": "object", "properties": {}},
     )
+
+
+def test_excel_failure_code_is_carried_from_connector_payload() -> None:
+    result = {
+        "content": [
+            {"text": '{"status":"error","failure_code":"excel_workbook_access_denied"}'}
+        ],
+    }
+
+    assert _excel_failure_code(result) == "excel_workbook_access_denied"
+
+
+def test_arbitrary_excel_error_is_not_projected_to_the_client() -> None:
+    result = {
+        "content": [{"text": '{"status":"error","failure_code":"arbitrary"}'}],
+    }
+
+    assert _excel_failure_code(result) is None
 
 
 class _SdkV2CallToolResult(BaseModel):
@@ -506,7 +536,7 @@ async def test_mcp_upload_file_ref_is_staged_and_cleaned_after_connector_call(
         inputSchema={
             "type": "object",
             "properties": {
-                "local_file_path": {"type": "string"},
+                "local_file_path": {"type": "string", "pattern": r"^/task/"},
                 "remote_path": {"type": "string"},
             },
         },
@@ -1432,6 +1462,49 @@ async def test_execute_mcp_call_forwards_structured_content(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_execute_mcp_call_carries_excel_failure_code_from_text_result(
+    monkeypatch,
+):
+    adapter = MCPToolAdapter(
+        mcp_tool=_mcp_tool("excel_list_worksheets"),
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+        source_server="excel",
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "status": "error",
+                                "failure_code": "excel_workbook_access_denied",
+                            }
+                        ),
+                    )
+                ],
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["failure_code"] == "excel_workbook_access_denied"
+    assert result["success"] is False
+    assert result["is_error"] is True
+
+
+@pytest.mark.asyncio
 async def test_execute_mcp_call_structured_content_defaults_to_none(monkeypatch):
     mcp_tool = _mcp_tool("echo")
     adapter = MCPToolAdapter(
@@ -1846,10 +1919,10 @@ def test_normalize_args_by_schema_falls_back_to_raw_wrap_on_digit_limit_value_er
 def test_normalize_args_by_schema_recovers_edge_case_shapes(value, expected):
     """Pins the current, intentional behavior for shapes the recovery
     doesn't specially validate: item types inside a recovered list aren't
-    checked against the schema's `items` type here (a real MCP tool call
-    still gets independently validated against its own typed arg model
-    downstream), and a decoded empty string is treated like any other
-    decoded scalar rather than being special-cased as "no value"."""
+    checked against the schema's `items` type in this normalization helper
+    (``run_json_async`` validates the emitted nested schema before calling the
+    server), and a decoded empty string is treated like any other decoded
+    scalar rather than being special-cased as "no value"."""
     adapter = MCPToolAdapter(
         mcp_tool=_google_analytics_run_report_mcp_tool(),
         connection={"transport": "stdio", "command": "python", "args": []},
@@ -2195,6 +2268,113 @@ def test_build_args_model_handles_multi_value_type_list():
 
     assert args_model(value="abc").value == "abc"
     assert args_model(value=123).value == 123
+
+
+def test_build_args_model_preserves_required_nullable_schema():
+    mcp_tool = SimpleNamespace(
+        name="required_nullable_tool",
+        description="Accept a required string or null",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "value": {
+                    "anyOf": [
+                        {"type": "string", "enum": ["a", "b"]},
+                        {"type": "null"},
+                    ],
+                    "description": "Required nullable value",
+                }
+            },
+            "required": ["value"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "stdio", "command": "python", "args": []},
+    )
+
+    args_model = adapter.args_type()
+
+    assert args_model(value=None).value is None
+    assert args_model(value="a").value == "a"
+
+    fixed = _fix_pydantic_schema_for_claude(args_model.model_json_schema())
+    assert fixed["properties"]["value"] == {
+        "description": "Required nullable value",
+        "enum": ["a", "b"],
+        "type": "string",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_preserves_explicit_null_for_required_nullable(
+    monkeypatch,
+):
+    adapter = _schema_adapter(
+        {
+            "value": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+            }
+        },
+        ["value"],
+    )
+    called: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"value": None})
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"value": None}
+
+
+@pytest.mark.asyncio
+async def test_run_json_async_drops_optional_and_unknown_explicit_nulls(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "required_value": {"type": "string"},
+            "optional_value": {"type": "string"},
+        },
+        ["required_value"],
+    )
+    called: dict[str, Any] = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "required_value": "required",
+            "optional_value": None,
+            "unknown": None,
+        }
+    )
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"required_value": "required"}
 
 
 @pytest.mark.asyncio
@@ -2701,6 +2881,91 @@ async def test_mcp_tool_call_proceeds_when_runtime_binding_target_is_undeclared(
 
     assert result["is_error"] is False
     assert captured["arguments"] == {"query": "active"}
+
+
+@pytest.mark.asyncio
+async def test_successful_mcp_call_runs_result_integrity_guard(monkeypatch):
+    adapter = MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="get_projects",
+            description="List projects",
+            inputSchema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        source_server="rocketlane",
+    )
+    checked_result = {
+        "content": [{"type": "text", "text": "integrity checked"}],
+        "is_error": False,
+    }
+    validate = AsyncMock(return_value=checked_result)
+    adapter._result_integrity.validate = validate
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"query": "active"})
+
+    validate.assert_awaited_once()
+    validated_args, remote_result = validate.await_args.args
+    assert validated_args == {"query": "active"}
+    assert remote_result["is_error"] is False
+    assert result == checked_result
+
+
+@pytest.mark.asyncio
+async def test_result_integrity_guard_exception_fails_closed(monkeypatch, caplog):
+    adapter = MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="get_projects",
+            description="List projects",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        source_server="rocketlane",
+    )
+    adapter._result_integrity.validate = AsyncMock(
+        side_effect=RuntimeError("integrity probe failed")
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert result["structured_content"] == {
+        "status": "error",
+        "reason": "the local integrity check could not complete",
+        "verified": False,
+    }
+    assert (
+        "MCP result integrity guard failed for server rocketlane tool get_projects"
+        in caplog.text
+    )
 
 
 def _resolver_retry_adapter(connection):
@@ -4522,8 +4787,9 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
         "bad_minimum": {"type": "number", "minimum": float("inf")},
         "bad_format": {"type": "string", "format": "not-a-known-format"},
         "bad_description": {"type": "string", "description": 123},
-        # Four keys this adapter never reads: they reach neither the emitted
-        # schema nor the field's type.
+        # Three keys this adapter never reads: they reach neither the emitted
+        # schema nor the field's type. ``const`` is converted to a single-value
+        # enum and therefore is intentionally retained.
         "unread_keys": {
             "type": "integer",
             "exclusiveMinimum": 1,
@@ -4545,7 +4811,7 @@ def test_rejected_metadata_is_reported_once_per_tool(caplog):
     ]
     assert len(lines) == 1
     assert lines[0] == (
-        "MCP tool reject_probe dropped 7 field schema metadata keys and 1 unreadable field schemas"
+        "MCP tool reject_probe dropped 6 field schema metadata keys and 1 unreadable field schemas"
     )
 
 
@@ -4613,6 +4879,7 @@ def test_enum_survives_when_a_non_finite_default_was_replaced():
     "declared_default,enum_expected",
     [
         ("metric", True),
+        ("imperial", True),
         (None, False),
         ("celsius", False),
     ],
@@ -4661,6 +4928,24 @@ def test_optional_field_metadata_is_nested_in_the_non_null_branch():
     assert field["default"] is None
     assert "description" not in field
     assert "enum" not in field
+
+
+def test_optional_union_description_survives_claude_schema_fix():
+    emitted = _emitted_schema(
+        {
+            "city": {
+                "anyOf": [{"type": "string"}, {"type": "null"}],
+                "description": "City name",
+            }
+        }
+    )
+
+    fixed = _fix_pydantic_schema_for_claude(emitted)
+
+    assert fixed["properties"]["city"] == {
+        "description": "City name",
+        "type": "string",
+    }
 
 
 @pytest.mark.parametrize("is_required", [True, False])
@@ -4770,36 +5055,554 @@ def test_nested_bool_and_number_enum_members_stay_apart(
     assert ("enum" in carrier) is enum_expected
 
 
-def test_nested_field_metadata_is_not_extracted():
-    """Only the tool's own top-level fields are read.
-
-    A nested object or an array item schema is flattened to a bare Python
-    type here, so metadata written inside one does not reach the model. This
-    pins the documented boundary rather than asserting it is desirable.
-    """
+def test_nested_object_and_array_schema_reaches_the_model():
+    """Nested MCP requirements survive the adapter boundary."""
     emitted = _emitted_schema(
         {
             "address": {
                 "type": "object",
                 "description": "Postal address.",
                 "properties": {
-                    "street": {"type": "string", "description": "STREET_DESC"}
+                    "street": {
+                        "type": "string",
+                        "description": "STREET_DESC",
+                        "enum": ["Main", "High"],
+                    }
                 },
+                "required": ["street"],
+                "additionalProperties": False,
             },
             "tags": {
                 "type": "array",
                 "description": "Labels.",
-                "items": {"type": "string", "description": "ITEM_DESC"},
+                "items": {
+                    "type": "string",
+                    "description": "ITEM_DESC",
+                    "enum": ["urgent", "normal"],
+                },
             },
         },
         ["address", "tags"],
     )
-    serialized = _compact_json(emitted)
+    address = emitted["properties"]["address"]
+    tags = emitted["properties"]["tags"]
 
-    assert emitted["properties"]["address"]["description"] == "Postal address."
-    assert emitted["properties"]["tags"]["description"] == "Labels."
-    assert "STREET_DESC" not in serialized
-    assert "ITEM_DESC" not in serialized
+    assert address["description"] == "Postal address."
+    assert address["required"] == ["street"]
+    assert address["additionalProperties"] is False
+    assert address["properties"]["street"] == {
+        "description": "STREET_DESC",
+        "enum": ["Main", "High"],
+        "type": "string",
+    }
+    assert tags["description"] == "Labels."
+    assert tags["items"] == {
+        "description": "ITEM_DESC",
+        "enum": ["urgent", "normal"],
+        "type": "string",
+    }
+
+
+def test_nested_mcp_schema_survives_claude_and_gemini_provider_passes():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+                "additionalProperties": False,
+            }
+        },
+        ["params"],
+    )
+
+    claude = _fix_pydantic_schema_for_claude(emitted)
+    gemini = _sanitize_schema_for_gemini(_flatten_json_schema(emitted))
+
+    for provider_schema in (claude, gemini):
+        params = provider_schema["properties"]["params"]
+        assert params["required"] == ["includeFields"]
+        assert params["properties"]["includeFields"]["items"]["enum"] == [
+            "customer",
+            "owner",
+            "dates",
+        ]
+
+
+def test_union_schema_is_gemini_compatible_and_const_discriminators_survive():
+    from google.genai import types
+
+    emitted = _emitted_schema(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "alpha"}},
+                        "required": ["kind"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            },
+            "bounded": {
+                "allOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "string", "maxLength": 32},
+                ]
+            },
+        },
+        ["choice", "bounded"],
+    )
+
+    choice = emitted["properties"]["choice"]
+    assert "oneOf" not in choice
+    assert "anyOf" in choice
+    assert [option["properties"]["kind"]["enum"] for option in choice["anyOf"]] == [
+        ["alpha"],
+        ["beta"],
+    ]
+    assert "allOf" not in emitted["properties"]["bounded"]
+
+    gemini = _sanitize_schema_for_gemini(_flatten_json_schema(emitted))
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="probe",
+                description="probe",
+                parameters=gemini,
+            )
+        ]
+    )
+
+
+def test_gemini_sanitizer_normalizes_nullable_and_non_string_schema_values():
+    emitted = _sanitize_schema_for_gemini(
+        {
+            "type": "object",
+            "properties": {
+                "nullable": {"type": ["string", "null"]},
+                "nullable_enum": {
+                    "type": "string",
+                    "enum": ["a", "b", None],
+                },
+                "numbers": {"type": "integer", "enum": [1, 2]},
+                "numeric_const": {"type": "integer", "const": 1},
+                "const": {"type": "string"},
+                "allOf": {"type": "string"},
+                "additionalProperties": {"type": "string"},
+            },
+        }
+    )
+
+    types_schema = emitted["properties"]["nullable"]
+    assert types_schema["type"] == "string"
+    assert types_schema["nullable"] is True
+    assert emitted["properties"]["nullable_enum"]["enum"] == ["a", "b"]
+    assert emitted["properties"]["nullable_enum"]["nullable"] is True
+    assert "enum" not in emitted["properties"]["numbers"]
+    assert "const" not in emitted["properties"]["numeric_const"]
+    assert set(emitted["properties"]) >= {
+        "const",
+        "allOf",
+        "additionalProperties",
+    }
+    from google.genai import types
+
+    types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="probe",
+                description="probe",
+                parameters=emitted,
+            )
+        ]
+    )
+
+
+def test_lossy_union_is_omitted_instead_of_narrowed_to_null():
+    emitted = mcp_adapter_module._nested_schema_for_emission(
+        {
+            "oneOf": [
+                {"$ref": "#/$defs/Model"},
+                {"type": "null"},
+            ]
+        },
+        is_required=False,
+    )
+
+    assert "oneOf" not in emitted
+    assert "anyOf" not in emitted
+
+
+def test_dropped_nested_properties_do_not_leave_a_closed_unsatisfiable_object():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "a": {"type": "string"},
+                    "dropped": {"$ref": "#/$defs/Missing"},
+                    "c": {"type": "integer"},
+                },
+                "required": ["a", "dropped"],
+                "additionalProperties": False,
+            }
+        },
+        ["params"],
+    )
+
+    params = emitted["properties"]["params"]
+    assert set(params["properties"]) == {"a", "dropped", "c"}
+    assert params["required"] == ["a", "dropped"]
+    assert params["additionalProperties"] is True
+
+
+def test_nested_budget_exhaustion_falls_back_to_later_top_level_metadata():
+    wide_object = {
+        "type": "object",
+        "properties": {
+            f"field_{index}": {"type": "string"}
+            for index in range(mcp_adapter_module._NESTED_SCHEMA_MAX_NODES - 1)
+        },
+    }
+    emitted = _emitted_schema(
+        {
+            "wide": wide_object,
+            "later": {
+                "type": "string",
+                "description": "later field",
+                "enum": ["a", "b"],
+            },
+        }
+    )
+
+    later = _metadata_carrier(emitted["properties"]["later"])
+    assert later["description"] == "later field"
+    assert later["enum"] == ["a", "b"]
+
+
+def test_nested_optional_properties_accept_null_for_legacy_server_behavior():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }
+        },
+        ["params"],
+    )
+
+    assert adapter._nested_argument_error({"params": {"limit": None}}) is None
+
+
+def test_nested_required_nullable_properties_and_items_accept_null():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "value": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    "values": {
+                        "type": "array",
+                        "items": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    },
+                    "openapi_nullable": {
+                        "type": "string",
+                        "nullable": True,
+                    },
+                },
+                "required": ["value", "values", "openapi_nullable"],
+            }
+        },
+        ["params"],
+    )
+
+    assert (
+        adapter._nested_argument_error(
+            {
+                "params": {
+                    "value": None,
+                    "values": ["a", None],
+                    "openapi_nullable": None,
+                }
+            }
+        )
+        is None
+    )
+
+
+def test_property_named_pattern_is_not_removed_from_local_validation():
+    adapter = _schema_adapter(
+        {
+            "filter": {
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}},
+                "required": ["pattern"],
+                "additionalProperties": False,
+            }
+        },
+        ["filter"],
+    )
+
+    assert adapter._nested_argument_error({"filter": {"pattern": "*.py"}}) is None
+
+
+def test_pattern_inside_object_enum_literal_is_not_removed():
+    adapter = _schema_adapter(
+        {"value": {"type": "object", "enum": [{"pattern": "*.py"}]}}
+    )
+
+    assert adapter._nested_argument_error({"value": {"pattern": "*.py"}}) is None
+
+
+def test_duplicate_nested_required_names_are_deduplicated():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"x": {"type": "string"}},
+                "required": ["x", "x"],
+            }
+        },
+        ["params"],
+    )
+
+    emitted = adapter.args_type().model_json_schema()
+    assert emitted["properties"]["params"]["required"] == ["x"]
+    assert adapter._args_validator is not None
+
+
+def test_nested_union_does_not_hide_object_siblings_from_claude():
+    emitted = _emitted_schema(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+                "oneOf": [{"type": "object"}, {"type": "null"}],
+            }
+        },
+        ["params"],
+    )
+
+    params = emitted["properties"]["params"]
+    assert params["anyOf"][1] == {"type": "null"}
+    assert params["anyOf"][0]["required"] == ["name"]
+    claude = _fix_pydantic_schema_for_claude(emitted)
+    assert claude["properties"]["params"]["required"] == ["name"]
+
+
+def test_discriminated_union_error_stays_at_union_boundary():
+    adapter = _schema_adapter(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "alpha"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["kind", "name"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            }
+        },
+        ["choice"],
+    )
+
+    error = adapter._nested_argument_error({"choice": {"kind": "alpha"}})
+
+    assert error is not None
+    assert error.validator == "anyOf"
+    assert list(error.path) == ["choice"]
+
+
+def test_optional_discriminated_union_error_stays_at_union_boundary():
+    adapter = _schema_adapter(
+        {
+            "choice": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"const": "alpha"},
+                            "name": {"type": "string"},
+                        },
+                        "required": ["kind", "name"],
+                    },
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"const": "beta"}},
+                        "required": ["kind"],
+                    },
+                ]
+            }
+        }
+    )
+
+    error = adapter._nested_argument_error({"choice": {"kind": "alpha"}})
+
+    assert error is not None
+    assert error.validator == "anyOf"
+    assert list(error.path) == ["choice"]
+
+
+def test_wrong_type_error_names_the_expected_type():
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+            }
+        },
+        ["params"],
+    )
+
+    error = adapter._nested_argument_error({"params": {"count": "many"}})
+
+    assert error is not None
+    result = adapter._invalid_arguments_result(error)
+    assert result["content"][0]["text"] == (
+        "Invalid MCP tool arguments at params.count: "
+        'the value has the wrong type (expected "integer"). '
+        "Check the tool schema and retry."
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_default_does_not_reject_omitted_argument(monkeypatch):
+    adapter = _schema_adapter({"limit": {"type": "integer", "default": "10"}})
+    called = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            called["arguments"] = arguments
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is False
+    assert called["arguments"] == {"limit": "10"}
+
+
+def test_nested_pattern_is_omitted_from_local_validation():
+    adapter = _schema_adapter(
+        {"params": {"type": "string", "pattern": "["}}, ["params"]
+    )
+
+    assert adapter._args_validator is not None
+    assert adapter._nested_argument_error({"params": "anything"}) is None
+
+
+@pytest.mark.asyncio
+async def test_nested_required_argument_is_rejected_before_mcp_execution(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+            }
+        },
+        ["params"],
+        tool_name="get_projects",
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"params": {}})
+
+    assert result == {
+        "content": [
+            {
+                "text": (
+                    "Invalid MCP tool arguments at params.includeFields: "
+                    "a required value is missing. Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_nested_enum_argument_is_rejected_before_mcp_execution(monkeypatch):
+    adapter = _schema_adapter(
+        {
+            "params": {
+                "type": "object",
+                "properties": {
+                    "includeFields": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": ["customer", "owner", "dates"],
+                        },
+                    }
+                },
+                "required": ["includeFields"],
+            }
+        },
+        ["params"],
+        tool_name="get_projects",
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(
+        {"params": {"includeFields": ["customerName"]}}
+    )
+
+    assert result == {
+        "content": [
+            {
+                "text": (
+                    "Invalid MCP tool arguments at params.includeFields.0: "
+                    'the value is outside the allowed enum ["customer","owner","dates"]. '
+                    "Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+    create_session_mock.assert_not_called()
 
 
 def test_an_unusable_numeric_bound_costs_only_its_own_key():
@@ -5629,125 +6432,11 @@ def _assert_load_warnings_are_safe(records: list[logging.LogRecord]) -> None:
         assert all(arg is None or type(arg) in (int, str) for arg in record.args)
 
 
-def _nested_group_with_outer_context() -> BaseException:
-    outer = ExceptionGroup("outer", [ExceptionGroup("tg", [_status_error(403)])])
-    outer.__context__ = RuntimeError("handled earlier")
-    return outer
+async def _load_with_failing_session(
+    monkeypatch, build, *, fail_in: str = "session"
+) -> tuple[Any, AsyncMock]:
+    """Load one stdio server where the ``fail_in`` step raises ``build()`` on every attempt."""
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("fail_in", "build", "error_type", "cause_type", "status_code"),
-    [
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [_status_error(403)]),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="group-403",
-        ),
-        pytest.param(
-            "session",
-            lambda: httpx.ConnectError("refused"),
-            "ConnectError",
-            "ConnectError",
-            None,
-            id="plain-connect-error",
-        ),
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [httpx.ConnectError("refused")]),
-            "ExceptionGroup",
-            "ConnectError",
-            None,
-            id="group-connect-error",
-        ),
-        pytest.param(
-            "session",
-            lambda: _nested_group_with_outer_context(),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="nested-group-ignores-outer-context",
-        ),
-        pytest.param(
-            "session",
-            lambda: ExceptionGroup("tg", [RuntimeError("first"), _status_error(403)]),
-            "ExceptionGroup",
-            "RuntimeError",
-            None,
-            id="first-member-wins",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=403),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            403,
-            id="non-httpx-status-code",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code="403"),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-str",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=True),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-bool",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=999),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-out-of-range",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=403.0),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            None,
-            id="status-code-float",
-        ),
-        pytest.param(
-            "session",
-            lambda: _RaisingStatusGetter("boom"),
-            "_RaisingStatusGetter",
-            "_RaisingStatusGetter",
-            None,
-            id="status-getter-raises",
-        ),
-        pytest.param(
-            "session",
-            lambda: _StatusCarrier(status_code=HTTPStatus.FORBIDDEN),
-            "_StatusCarrier",
-            "_StatusCarrier",
-            403,
-            id="http-status-enum",
-        ),
-        pytest.param(
-            "list_tools",
-            lambda: ExceptionGroup("tg", [_status_error(403)]),
-            "ExceptionGroup",
-            "HTTPStatusError",
-            403,
-            id="list-tools-403",
-        ),
-    ],
-)
-async def test_direct_load_failure_reports_cause_and_status(
-    monkeypatch, caplog, fail_in, build, error_type, cause_type, status_code
-):
     class FakeSession:
         async def initialize(self):
             return None
@@ -5761,21 +6450,111 @@ async def test_direct_load_failure_reports_cause_and_status(
     async def fake_load_tools(_session):
         raise build()
 
+    sleep = AsyncMock()
     monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
     monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_tools)
-    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
-    caplog.set_level("WARNING")
-
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", sleep)
     result = await load_mcp_tools_as_agent_tools(
         {"broken": {"transport": "stdio", "command": "python", "args": []}}
     )
+    return result, sleep
+
+
+def _backoff_sleeps(sleep: AsyncMock) -> int:
+    return len([call for call in sleep.await_args_list if call.args == (1,)])
+
+
+def _nested_group_with_outer_context() -> BaseException:
+    outer = ExceptionGroup("outer", [ExceptionGroup("tg", [_status_error(403)])])
+    outer.__context__ = RuntimeError("handled earlier")
+    return outer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("build", "error_type", "cause_type", "status_code"),
+    [
+        pytest.param(
+            lambda: httpx.ConnectError("refused"),
+            "ConnectError",
+            "ConnectError",
+            None,
+            id="plain-connect-error",
+        ),
+        pytest.param(
+            lambda: ExceptionGroup("tg", [httpx.ConnectError("refused")]),
+            "ExceptionGroup",
+            "ConnectError",
+            None,
+            id="group-connect-error",
+        ),
+        pytest.param(
+            lambda: ExceptionGroup("tg", [RuntimeError("first"), _status_error(403)]),
+            "ExceptionGroup",
+            "RuntimeError",
+            None,
+            id="first-member-wins",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=403),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            403,
+            id="non-httpx-status-code",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code="403"),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-str",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=True),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-bool",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=999),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-out-of-range",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=403.0),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            None,
+            id="status-code-float",
+        ),
+        pytest.param(
+            lambda: _RaisingStatusGetter("boom"),
+            "_RaisingStatusGetter",
+            "_RaisingStatusGetter",
+            None,
+            id="status-getter-raises",
+        ),
+        pytest.param(
+            lambda: _StatusCarrier(status_code=HTTPStatus.FORBIDDEN),
+            "_StatusCarrier",
+            "_StatusCarrier",
+            403,
+            id="http-status-enum",
+        ),
+    ],
+)
+async def test_direct_load_failure_reports_cause_and_status(
+    monkeypatch, caplog, build, error_type, cause_type, status_code
+):
+    caplog.set_level("WARNING")
+
+    result, _ = await _load_with_failing_session(monkeypatch, build)
 
     (failure,) = result.failures
-    assert failure.phase is (
-        MCPFailurePhase.SESSION_START
-        if fail_in == "session"
-        else MCPFailurePhase.LIST_TOOLS
-    )
+    assert failure.phase is MCPFailurePhase.SESSION_START
     assert failure.error_type == error_type
     assert failure.cause_type == cause_type
     assert failure.status_code == status_code
@@ -5934,16 +6713,16 @@ def _real_client_connection(transport: str, status_code: int) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("transport", "status_code", "phase"),
+    ("transport", "status_code", "handshake_phase", "rejected"),
     [
-        ("streamable_http", 401, MCPFailurePhase.INITIALIZE),
-        ("streamable_http", 403, MCPFailurePhase.INITIALIZE),
-        ("streamable_http", 503, MCPFailurePhase.INITIALIZE),
-        ("sse", 401, MCPFailurePhase.SESSION_START),
+        ("streamable_http", 401, MCPFailurePhase.INITIALIZE, True),
+        ("streamable_http", 403, MCPFailurePhase.INITIALIZE, True),
+        ("streamable_http", 503, MCPFailurePhase.INITIALIZE, False),
+        ("sse", 401, MCPFailurePhase.SESSION_START, True),
     ],
 )
 async def test_real_client_load_failure_shapes(
-    monkeypatch, caplog, transport, status_code, phase
+    monkeypatch, caplog, transport, status_code, handshake_phase, rejected
 ):
     # The backoff patch below replaces ``asyncio.sleep`` process-wide; anyio
     # binds that name when its asyncio backend is first imported.
@@ -5958,12 +6737,271 @@ async def test_real_client_load_failure_shapes(
     )
 
     (failure,) = result.failures
-    assert failure.phase is phase
+    assert failure.phase.value == (
+        "auth_rejected" if rejected else handshake_phase.value
+    )
     assert failure.error_type == "ExceptionGroup"
     assert failure.cause_type == "HTTPStatusError"
     assert failure.status_code == status_code
+    expected_attempts = 1 if rejected else 3
+    assert failure.attempts == expected_attempts
+    assert _backoff_sleeps(sleep) == expected_attempts - 1
+    records = _load_warnings(caplog)
+    assert len(records) == expected_attempts
+    assert f"during {handshake_phase.value}" in records[-1].getMessage()
+    _assert_load_warnings_are_safe(records)
+
+
+@pytest.mark.asyncio
+async def test_real_client_sse_rejected_message_post_is_retried(monkeypatch, caplog):
+    # The sse client logs a failed message POST and closes the session, so the
+    # 401 reaches the loader as an ``McpError`` with no HTTP status. That is
+    # not an ``httpx.HTTPStatusError``, so the load keeps retrying.
+    import anyio._backends._asyncio  # noqa: F401
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=b"event: endpoint\ndata: /messages/?session_id=x\n\n",
+            )
+        return httpx.Response(401)
+
+    def factory(headers=None, timeout=None, auth=None) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    sleep = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", sleep)
+    caplog.set_level("WARNING")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {
+            "srv": {
+                "transport": "sse",
+                "url": _SECRET_URL,
+                "headers": {"Authorization": "Bearer SECRET"},
+                "httpx_client_factory": factory,
+            }
+        }
+    )
+
+    (failure,) = result.failures
+    assert failure.phase is MCPFailurePhase.INITIALIZE
+    assert failure.cause_type == "McpError"
+    assert failure.status_code is None
     assert failure.attempts == 3
-    assert len([c for c in sleep.await_args_list if c.args == (1,)]) == 2
+    assert _backoff_sleeps(sleep) == 2
     records = _load_warnings(caplog)
     assert len(records) == 3
     _assert_load_warnings_are_safe(records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fail_in", "build", "status_code", "logged_phase"),
+    [
+        pytest.param(
+            "session",
+            lambda: ExceptionGroup("tg", [_status_error(401)]),
+            401,
+            "session_start",
+            id="group-401",
+        ),
+        pytest.param(
+            "session",
+            lambda: ExceptionGroup("tg", [_status_error(403)]),
+            403,
+            "session_start",
+            id="group-403",
+        ),
+        pytest.param(
+            "session",
+            _nested_group_with_outer_context,
+            403,
+            "session_start",
+            id="nested-group-ignores-outer-context",
+        ),
+        pytest.param(
+            "list_tools",
+            lambda: ExceptionGroup("tg", [_status_error(403)]),
+            403,
+            "list_tools",
+            id="list-tools-403",
+        ),
+    ],
+)
+async def test_direct_load_auth_rejection_is_not_retried(
+    monkeypatch, caplog, fail_in, build, status_code, logged_phase
+):
+    caplog.set_level("WARNING")
+
+    result, sleep = await _load_with_failing_session(
+        monkeypatch, build, fail_in=fail_in
+    )
+
+    (failure,) = result.failures
+    assert failure.phase.value == "auth_rejected"
+    assert failure.error_type == "ExceptionGroup"
+    assert failure.cause_type == "HTTPStatusError"
+    assert failure.status_code == status_code
+    assert failure.attempts == 1
+    assert _backoff_sleeps(sleep) == 0
+    (record,) = _load_warnings(caplog)
+    message = record.getMessage()
+    assert message.startswith("Giving up loading tools")
+    assert f"during {logged_phase} after 1 attempt(s)" in message
+    assert f"cause=HTTPStatusError status={status_code}" in message
+    _assert_load_warnings_are_safe([record])
+
+
+@pytest.mark.asyncio
+async def test_direct_load_stops_at_a_rejection_after_a_retryable_failure(
+    monkeypatch, caplog
+):
+    caplog.set_level("WARNING")
+    errors = iter(
+        [
+            ExceptionGroup("tg", [_status_error(503)]),
+            ExceptionGroup("tg", [_status_error(401)]),
+        ]
+    )
+
+    result, sleep = await _load_with_failing_session(monkeypatch, lambda: next(errors))
+
+    (failure,) = result.failures
+    assert failure.phase.value == "auth_rejected"
+    assert failure.status_code == 401
+    assert failure.attempts == 2
+    assert _backoff_sleeps(sleep) == 1
+    assert len(_load_warnings(caplog)) == 2
+
+
+def test_auth_rejected_phase_is_public():
+    assert MCPUnavailableSummary.from_values("x", "auth_rejected").reason == (
+        "auth_rejected"
+    )
+    assert mcp_adapter_module.mcp_load_failure_message(
+        MCPFailurePhase.AUTH_REJECTED
+    ) == ("MCP server refused the connection.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy", [MCPFailurePolicy.BEST_EFFORT, MCPFailurePolicy.STRICT]
+)
+async def test_auth_rejected_failure_reaches_summary_but_not_model(policy):
+    failure = MCPServerLoadFailure(
+        server_name="Rejected",
+        phase=MCPFailurePhase.AUTH_REJECTED,
+        error_type="ExceptionGroup",
+        attempts=1,
+        cause_type="HTTPStatusError",
+        status_code=403,
+    )
+    healthy = SimpleNamespace(name="healthy_tool", source_server="healthy")
+    unavailable = ToolFactory._unavailable_mcp_tools_from_load_failures(
+        (failure,), {"Rejected": {"id": 7}}
+    )
+    tools = [*unavailable, healthy]
+    summary = _build_mcp_load_summary(
+        [{"name": "Rejected"}, {"name": "healthy"}], tools
+    )
+    emitted: list[Any] = []
+
+    class _Config:
+        def get_mcp_failure_policy(self):
+            return policy
+
+        async def emit_mcp_load_summary(self, summary):
+            emitted.append(summary)
+
+    config = _Config()
+
+    if policy is MCPFailurePolicy.STRICT:
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await _finish_mcp_setup(config, summary, tools)
+        assert exc_info.value.summaries[0].reason == "auth_rejected"
+        assert str(exc_info.value) == (
+            "Required MCP servers are unavailable: auth_rejected (HTTP 403)."
+        )
+        assert "Rejected" not in str(exc_info.value)
+    else:
+        returned = await _finish_mcp_setup(config, summary, tools)
+        assert returned == [healthy]
+
+    (emitted_summary,) = emitted
+    (entry,) = emitted_summary.failures
+    assert (entry.reason, entry.status_code) == ("auth_rejected", 403)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "policy", [MCPFailurePolicy.BEST_EFFORT, MCPFailurePolicy.STRICT]
+)
+async def test_registry_path_hides_auth_rejected_placeholder_after_summary(
+    monkeypatch, policy
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    healthy = SimpleNamespace(name="healthy_tool", source_server="healthy")
+    load = AsyncMock(
+        return_value=mcp_adapter_module.MCPLoadResult(
+            tools=(healthy,),
+            loaded_servers=("healthy",),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="Rejected",
+                    phase=MCPFailurePhase.AUTH_REJECTED,
+                    error_type="ExceptionGroup",
+                    attempts=1,
+                    cause_type="HTTPStatusError",
+                    status_code=403,
+                ),
+            ),
+        )
+    )
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools_as_agent_tools", load)
+    emitted: list[Any] = []
+
+    class _Config:
+        async def get_mcp_server_configs(self):
+            return [
+                {
+                    "id": id_,
+                    "name": name,
+                    "transport": "sse",
+                    "config": {"url": f"https://example.invalid/{name}"},
+                }
+                for id_, name in ((1, "Rejected"), (2, "healthy"))
+            ]
+
+        def get_sandbox(self):
+            return None
+
+        def get_mcp_failure_policy(self):
+            return policy
+
+        async def emit_mcp_load_summary(self, summary):
+            emitted.append(summary)
+
+    if policy is MCPFailurePolicy.STRICT:
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await mcp_tools.create_mcp_tools(_Config())
+        assert exc_info.value.summaries[0].reason == "auth_rejected"
+        assert str(exc_info.value) == (
+            "Required MCP servers are unavailable: auth_rejected (HTTP 403)."
+        )
+    else:
+        tools = await mcp_tools.create_mcp_tools(_Config())
+        assert tools == [healthy]
+
+    (summary,) = emitted
+    (entry,) = summary.failures
+    assert (entry.server_name, entry.reason) == ("Rejected", "auth_rejected")
+    assert (entry.cause_type, entry.status_code) == ("HTTPStatusError", 403)

@@ -26,7 +26,7 @@ task_id = task_id_fixture
 async def host(engine, task_id, monkeypatch):
     factory = sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
-    monkeypatch.setattr(database, "get_session_local", lambda: factory)
+    monkeypatch.setattr(database, "_SessionLocal", factory)
     monkeypatch.setattr(transport, "get_runner_id", lambda: "worker")
     monkeypatch.setattr(runtime, "get_runner_id", lambda: "worker")
     # Every renewal is a SQLite write. When commits are slow (CI fsync), a

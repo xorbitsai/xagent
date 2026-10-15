@@ -126,7 +126,7 @@ async def test_prepare_channel_task_binds_owned_agent(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -162,7 +162,7 @@ async def test_trusted_direct_channel_path_creates_fresh_hidden_marked_tasks(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     task_ids: list[int] = []
     for message_text in ("first", "second"):
@@ -223,7 +223,7 @@ async def test_actor_marker_forces_new_channel_task_hidden(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -255,7 +255,7 @@ async def test_actor_task_persists_policy_identity(
     del mock_workspace_db
     engine, SessionLocal, _user_id, channel_id = _create_channel_session_local(tmp_path)
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -289,7 +289,7 @@ async def test_actor_interaction_reuses_exact_waiting_task(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -351,7 +351,7 @@ async def test_actor_interaction_resume_claim_keeps_run_and_checkpoint(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -412,7 +412,7 @@ async def test_abandoned_resume_claim_restores_the_waiting_state(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -446,7 +446,7 @@ async def test_abandoned_resume_claim_restores_the_waiting_state(
         )
     monkeypatch.undo()
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     # Nothing was injected; the claim is abandoned. Driven through the real
     # trigger -- heartbeat startup failing after the claim committed -- rather
@@ -499,7 +499,7 @@ async def test_abandoned_resume_of_a_non_waiting_task_fails(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     # An ordinary channel task, not actor-marked: DEFAULT mode refuses to
     # reuse an actor-marked row, so that is the shape this path can reach.
     seed = await prepare_channel_task(
@@ -554,7 +554,7 @@ async def test_abandoned_fresh_claim_still_fails(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     def _explode(_lease):
         raise RuntimeError("heartbeat could not start")
@@ -594,7 +594,7 @@ async def test_resume_claim_refuses_a_run_id_that_is_not_the_waiting_one(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -643,7 +643,7 @@ async def test_actor_interaction_rejects_live_waiting_lease(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(
         "xagent.web.services.task_lease_service.get_runner_id",
         lambda: "shared-runner",
@@ -697,7 +697,7 @@ async def test_actor_interaction_claim_rechecks_waiting_status(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -752,7 +752,7 @@ async def test_actor_interaction_claim_rechecks_task_lineage(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -815,7 +815,7 @@ async def test_actor_interaction_claim_rechecks_agent_visibility(
         db.commit()
         other_user_id = int(other_user.id)
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -870,7 +870,7 @@ async def test_actor_interaction_rejects_invalid_task_without_fallback(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -916,7 +916,7 @@ async def test_actor_interaction_requires_task_and_policy(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     with pytest.raises(ValueError, match="active task"):
         await prepare_channel_task(
@@ -975,7 +975,7 @@ async def test_actor_interaction_rejects_unavailable_agent_without_fallback(
     engine, SessionLocal, user_id, channel_id = _create_channel_session_local(tmp_path)
     agent_id = _add_agent(SessionLocal, user_id=user_id, name="Actor Agent")
     monkeypatch.setattr(channel_runtime, "get_session_local", lambda: SessionLocal)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     task_id = await _create_waiting_actor_task(
         SessionLocal,
         channel_id=channel_id,
@@ -1024,7 +1024,7 @@ async def test_prepare_channel_task_falls_back_when_agent_not_selectable(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -1063,7 +1063,7 @@ async def test_prepare_channel_task_rejects_workforce_manager_agent(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -1177,7 +1177,7 @@ async def test_prepare_channel_task_commits_creation_and_exact_claim_together(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -1609,7 +1609,7 @@ async def test_prepare_channel_task_evicts_existing_task_when_selection_stale(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     first = await prepare_channel_task(
         channel_id=channel_id,
@@ -1667,7 +1667,7 @@ async def test_prepare_channel_task_continues_task_when_selection_still_valid(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     first = await prepare_channel_task(
         channel_id=channel_id,
@@ -1856,7 +1856,7 @@ async def test_closing_a_running_claim_would_fail_the_task(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     prepared = await prepare_channel_task(
         channel_id=channel_id,
@@ -1950,7 +1950,7 @@ async def test_prepare_channel_task_resumes_claimed_legacy_task(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     # A task that predates the migration: owned by this channel, no sender stamp.
     with SessionLocal() as db:
@@ -1999,7 +1999,7 @@ async def test_prepare_channel_task_starts_new_task_when_binding_drifts(
         "xagent.web.services.channel_runtime.get_session_local",
         lambda: SessionLocal,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
 
     default_task = await prepare_channel_task(
         channel_id=channel_id,

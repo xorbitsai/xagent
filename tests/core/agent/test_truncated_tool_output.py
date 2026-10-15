@@ -310,10 +310,12 @@ async def test_partial_delivery_trace_records_finish_reason_and_protocol_code() 
             "parameters": {"type": "object", "properties": {}},
         },
     }
+    llm = ChatLLM([envelope])
+    llm.supports_forced_tool_choice = False
 
     args = await request_partial_delivery(
         context=react_context(),
-        llm=ChatLLM([envelope]),
+        llm=llm,
         runtime=runtime,
         messages=[{"role": "user", "content": "hand over"}],
         schema=schema,
@@ -322,6 +324,7 @@ async def test_partial_delivery_trace_records_finish_reason_and_protocol_code() 
     )
 
     assert args is None
+    assert llm.calls[0]["tool_choice"] == "auto"
     (end,) = tracer.llm_ends()
     assert end["finish_reason"] == "length"
     assert end["protocol_code"] == "malformed_tool_arguments"

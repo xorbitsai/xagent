@@ -363,6 +363,28 @@ def decision_tool_response(
     }
 
 
+def final_answer_tool_response(
+    answer: str, response_language: str = "English"
+) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call_final_answer",
+                "type": "function",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": json.dumps(
+                        {
+                            "response_language": response_language,
+                            "answer": answer,
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+
 def load_skill_tool_response(skill_name: str) -> dict[str, Any]:
     return {
         "tool_calls": [
@@ -1222,7 +1244,9 @@ async def test_auto_react_repetition_stays_in_single_react_trace() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_tool_response(
+                "可以基于已有搜索结果回答。", "Simplified Chinese"
+            ),
         ]
     )
     tracer = RecordingTracer()

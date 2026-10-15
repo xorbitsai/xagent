@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 
@@ -72,6 +73,63 @@ def local_execution_unless_selected(monkeypatch):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "false")
     monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
     monkeypatch.delenv("XAGENT_CHANNEL_INGRESS_ENABLED", raising=False)
+
+
+_DATABASE_MODULE = "xagent.web.models.database"
+_DATABASE_ACCESSORS = ("get_session_local", "get_optional_session_local", "get_engine")
+# ``get_db`` reads ``_SessionLocal`` too but is not checked yet: tests still
+# patch it directly, so adding it here waits on converting those tests.
+# A leaked binding stays leaked for the rest of the process; report it once,
+# against the test that leaked it, instead of failing every later test too.
+_reported_stale_database_accessors: set[str] = set()
+
+
+def _is_real_database_accessor(value: object, name: str) -> bool:
+    return (
+        inspect.isfunction(value)
+        and value.__module__ == _DATABASE_MODULE
+        and value.__qualname__ == name
+    )
+
+
+def _stale_database_accessors() -> list[str]:
+    """Loaded ``xagent`` modules holding a patched database accessor.
+
+    A module first imported while a test patches
+    ``xagent.web.models.database.get_session_local`` (or another accessor) binds
+    the replacement by name through ``from ..models.database import ...`` and
+    keeps it after monkeypatch restores the database module, so every later
+    test in the process silently uses the wrong database. Tests should patch
+    ``database._SessionLocal`` / ``database._engine`` instead.
+    """
+    return sorted(
+        f"{module_name}.{name}"
+        for module_name, module in list(sys.modules.items())
+        if module_name.startswith("xagent.") and module is not None
+        for name in _DATABASE_ACCESSORS
+        if name in vars(module)
+        and not _is_real_database_accessor(vars(module)[name], name)
+    )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    # Runs after every fixture (monkeypatch included) has been finalized, so
+    # anything still patched here outlives the test that patched it.
+    result = yield
+    stale = [
+        binding
+        for binding in _stale_database_accessors()
+        if binding not in _reported_stale_database_accessors
+    ]
+    if stale:
+        _reported_stale_database_accessors.update(stale)
+        raise AssertionError(
+            f"{item.nodeid} leaked patched database accessors into: "
+            f"{', '.join(stale)}. Patch xagent.web.models.database._SessionLocal "
+            "/ _engine instead of the accessors that read them."
+        )
+    return result
 
 
 def pytest_addoption(parser):
@@ -369,6 +427,44 @@ def isolate_task_keyed_process_state() -> Iterator[None]:
     _reset_task_keyed_process_state()
     yield
     _reset_task_keyed_process_state()
+
+
+@pytest.fixture(autouse=True, scope="function")
+def check_task_extension_registry_leaks() -> Iterator[None]:
+    """Fail the test that leaves the task-extension registry changed.
+
+    The registry in ``xagent.web.services.task_runtime`` is process-wide. A
+    provider left registered (e.g. by running the web app's startup without
+    its shutdown) makes every later test that consults
+    ``registered_task_extensions()`` take the provider branch, which then
+    fails far from the cause depending on xdist scheduling. The registry is
+    restored before failing so the leak cannot cascade.
+    """
+    task_runtime = sys.modules.get("xagent.web.services.task_runtime")
+    before = (
+        dict(task_runtime._task_runtime_extensions) if task_runtime is not None else {}
+    )
+    yield
+    task_runtime = sys.modules.get("xagent.web.services.task_runtime")
+    if task_runtime is None:
+        return
+    with task_runtime._task_runtime_extensions_lock:
+        after = dict(task_runtime._task_runtime_extensions)
+        if after == before:
+            return
+        task_runtime._task_runtime_extensions.clear()
+        task_runtime._task_runtime_extensions.update(before)
+    leaked = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    replaced = sorted(
+        name for name in set(after) & set(before) if after[name] is not before[name]
+    )
+    pytest.fail(
+        "Test changed the process-wide task extension registry without "
+        f"restoring it (leaked={leaked}, removed={removed}, replaced={replaced}); "
+        "unregister providers the test registers, or run the app shutdown.",
+        pytrace=False,
+    )
 
 
 @pytest.fixture(autouse=True, scope="function")

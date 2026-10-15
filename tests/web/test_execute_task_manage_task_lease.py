@@ -448,10 +448,7 @@ async def test_execute_task_quota_pool_timeout_stops_pre_run_checkouts(
 
     try:
         with (
-            patch(
-                "xagent.web.models.database.get_session_local",
-                return_value=factory,
-            ),
+            patch("xagent.web.models.database._SessionLocal", factory),
             patch(
                 "xagent.web.services.agent_service_manager.sync_workforce_run_status_for_task_id_isolated",
             ) as workforce_sync,
@@ -496,10 +493,7 @@ async def test_execute_task_workforce_pool_timeout_stops_tracker_checkout(
 
     try:
         with (
-            patch(
-                "xagent.web.models.database.get_session_local",
-                return_value=factory,
-            ),
+            patch("xagent.web.models.database._SessionLocal", factory),
             patch(
                 "xagent.web.services.agent_service_manager._load_task_run_gate_user_id_isolated",
                 return_value=None,
@@ -910,10 +904,7 @@ async def test_execute_task_preflight_pool_wait_does_not_block_event_loop(
         ticker_task = asyncio.create_task(ticker())
         try:
             with (
-                patch(
-                    "xagent.web.models.database.get_session_local",
-                    return_value=factory,
-                ),
+                patch("xagent.web.models.database._SessionLocal", factory),
                 patch.object(
                     manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
                 ),

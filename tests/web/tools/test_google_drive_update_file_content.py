@@ -2282,9 +2282,7 @@ async def test_edited_file_from_an_earlier_run_is_staged_for_the_update(
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
     get_unscoped_file_storage.cache_clear()
     monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: SessionLocal
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     edited = bytes(range(256)) * 64
     db = SessionLocal()
     try:

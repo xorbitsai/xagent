@@ -477,7 +477,7 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
         else:
             pytest.fail(f"trigger run did not reach FAILED: {final_state}")
 
-    safe_error = "Required MCP servers are unavailable."
+    safe_error = "Required MCP servers are unavailable: oauth_token_required."
     assert final_state is not None
     run_status, run_error, task_status, task_error, run_finished_at = final_state
     assert setup_calls == 1

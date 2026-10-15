@@ -102,6 +102,15 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
         "task_checkpoint_unreadable": "The task's saved progress could not be read.",
         "authentication_required": "Authentication is required to send this message.",
         "task_access_denied": "You do not have access to this task.",
+        "excel_workbook_access_denied": (
+            "The Excel workbook could not be opened or modified. Check that you "
+            "have edit permission or reconnect the Excel connector."
+        ),
+        "excel_site_not_found": (
+            "The Excel workbook or its SharePoint location could not be found. "
+            "Check the workbook path or reconnect the Excel connector."
+        ),
+        "excel_workbook_locked": "The Excel workbook is locked. Close it elsewhere and try again.",
         "invalid_message": "The message format is invalid.",
         "message_outcome_unknown": (
             "The message may or may not have been applied. Check the "

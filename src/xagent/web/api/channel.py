@@ -519,12 +519,10 @@ async def slack_oauth_callback(
     # The browser that completes this callback is NOT verified to be the one
     # that called /oauth/start: an attacker can send their own fresh
     # authorize_url to a victim, and the victim's consent then binds their
-    # workspace to the attacker's user_id (install CSRF). Closing that needs a
-    # browser binding, which a cookie cannot provide while CORS runs with
-    # allow_origins=["*"] -- the first /oauth/start response carries
-    # Access-Control-Allow-Origin: * so the browser refuses to store a
-    # Set-Cookie from it, breaking cross-origin installs outright. Tracked
-    # separately; the claim below only makes a state single-use.
+    # workspace to the attacker's user_id (install CSRF). Closing that needs an
+    # explicit binding between the initiating browser and this callback; the
+    # server-side state below is single-use but is not browser-bound. Tracked
+    # separately from this replay defense.
     #
     # Atomically claim the nonce so a replayed state is rejected after its
     # first presentation. The row's user_id must also match the state's, so a

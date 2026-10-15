@@ -61,10 +61,7 @@ async def test_trigger_dispatcher_delays_first_tick_by_startup_jitter(
     monkeypatch.setattr(
         "xagent.config.get_gmail_pubsub_project_id", lambda: "test-project"
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: FakeSession,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", FakeSession)
     monkeypatch.setattr(
         "xagent.web.services.gmail_triggers.scan_due_gmail_watch_renewals",
         fake_scan_due_gmail_watch_renewals,
@@ -120,10 +117,7 @@ async def test_trigger_dispatcher_skips_startup_delay_when_jitter_disabled(
     monkeypatch.setattr(
         app_module, "get_gmail_watch_enabled", lambda: False, raising=False
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: FakeSession,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", FakeSession)
     monkeypatch.setattr(
         "xagent.web.services.triggers.scan_due_scheduled_triggers",
         lambda _db: [],

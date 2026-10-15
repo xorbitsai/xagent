@@ -114,9 +114,7 @@ async def _replay(
     monkeypatch.setattr(
         "xagent.web.api.websocket.get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: SessionLocal
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     cache = {} if cache is None else cache
     monkeypatch.setattr(
         "xagent.web.api.websocket.cache_get", lambda *args: cache.get("value")

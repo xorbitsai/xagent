@@ -8,9 +8,10 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
 import xagent.web.api.mcp as mcp_module
@@ -44,6 +45,98 @@ from xagent.web.api.mcp import test_mcp_connection as run_mcp_connection_test
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.user import User
+
+
+@pytest.mark.asyncio
+async def test_connection_test_rejects_stdio_transport_before_loading():
+    with pytest.raises(HTTPException) as error:
+        await run_mcp_connection_test(
+            MCPConnectionTest(
+                name="local",
+                transport="stdio",
+                config={"command": "sh", "args": ["-c", "id"]},
+            )
+        )
+
+    assert error.value.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_connection_test_rejects_websocket_before_loading(monkeypatch):
+    loader = AsyncMock()
+    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", loader)
+
+    with pytest.raises(HTTPException) as error:
+        await run_mcp_connection_test(
+            MCPConnectionTest(
+                name="socket",
+                transport="websocket",
+                config={"url": "wss://mcp.example.test/socket"},
+            )
+        )
+
+    assert error.value.status_code == 400
+    loader.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_connection_test_uses_pinned_transport_and_follows_safe_redirects(
+    monkeypatch,
+):
+    safe_transport = AsyncMock()
+    transport_factory = MagicMock(return_value=safe_transport)
+
+    async def inspect_factory(connection: dict[str, Any]) -> MCPLoadResult:
+        client = connection["httpx_client_factory"](
+            headers={"X-Test": "yes"}, timeout=None, auth=None
+        )
+        try:
+            assert client._transport is safe_transport
+            assert client.follow_redirects is True
+            assert client.headers["X-Test"] == "yes"
+        finally:
+            await client.aclose()
+        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
+
+    monkeypatch.setattr(mcp_module, "SafeOAuthAsyncHTTPTransport", transport_factory)
+    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", inspect_factory)
+
+    response = await run_mcp_connection_test(
+        MCPConnectionTest(
+            name="remote",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test/mcp"},
+        )
+    )
+
+    assert response.success is False
+    transport_factory.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_connection_test_transport_cannot_be_overridden_by_config(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    async def fake_load(connection: dict[str, Any]) -> MCPLoadResult:
+        captured.update(connection)
+        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
+
+    monkeypatch.setattr(mcp_module, "_load_mcp_connection_test_tools", fake_load)
+
+    await run_mcp_connection_test(
+        MCPConnectionTest(
+            name="remote",
+            transport="SSE",
+            config={
+                "transport": "stdio",
+                "command": "sh",
+                "args": ["-c", "id"],
+            },
+        )
+    )
+
+    assert captured["transport"] == "sse"
+    assert captured["name"] == "remote"
 
 
 async def _wait_until(predicate: Callable[[], bool], *, timeout: float = 1.0) -> None:
@@ -162,8 +255,11 @@ async def test_connection_test_reports_successful_structured_load(monkeypatch):
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
-        MagicMock(),
+        MCPConnectionTest(
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
+        )
     )
 
     assert response.success is True
@@ -195,8 +291,11 @@ async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
-        MagicMock(),
+        MCPConnectionTest(
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
+        )
     )
 
     assert response.success is True
@@ -214,8 +313,15 @@ async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "attempts", "message"),
+    [
+        (MCPFailurePhase.INITIALIZE, 3, "MCP server initialization failed."),
+        (MCPFailurePhase.AUTH_REJECTED, 1, "MCP server refused the connection."),
+    ],
+)
 async def test_connection_test_reports_structured_load_failure_without_exception_text(
-    monkeypatch,
+    monkeypatch, phase, attempts, message
 ):
     async def load_tools(*args, **kwargs):
         return MCPLoadResult(
@@ -224,9 +330,9 @@ async def test_connection_test_reports_structured_load_failure_without_exception
             failures=(
                 MCPServerLoadFailure(
                     server_name="test",
-                    phase=MCPFailurePhase.INITIALIZE,
+                    phase=phase,
                     error_type="BearerSecretError",
-                    attempts=3,
+                    attempts=attempts,
                 ),
             ),
         )
@@ -237,15 +343,20 @@ async def test_connection_test_reports_structured_load_failure_without_exception
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
-        MagicMock(),
+        MCPConnectionTest(
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
+        )
     )
 
     assert response.success is False
-    assert response.message == "MCP server initialization failed."
+    assert response.message == message
     assert response.details == {
         "tool_count": 0,
-        "failures": [{"server_name": "test", "phase": "initialize", "attempts": 3}],
+        "failures": [
+            {"server_name": "test", "phase": phase.value, "attempts": attempts}
+        ],
     }
     assert "BearerSecretError" not in repr(response)
 
@@ -271,8 +382,11 @@ async def test_connection_test_reports_no_tools_as_failure(monkeypatch):
     )
 
     response = await run_mcp_connection_test(
-        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
-        MagicMock(),
+        MCPConnectionTest(
+            name="mail",
+            transport="streamable_http",
+            config={"url": "https://mcp.example.test"},
+        )
     )
 
     assert response.success is False
@@ -436,9 +550,10 @@ async def test_connection_test_deadline_matches_loader_timeout(
             start = time.monotonic()
             response = await run_mcp_connection_test(
                 MCPConnectionTest(
-                    name="mail", transport="stdio", config={"command": "python"}
-                ),
-                MagicMock(),
+                    name="mail",
+                    transport="streamable_http",
+                    config={"url": "https://mcp.example.test"},
+                )
             )
             elapsed = time.monotonic() - start
 
@@ -502,9 +617,10 @@ async def test_connection_test_real_loader_timeout_error_lines(monkeypatch, capl
         start = time.monotonic()
         response = await run_mcp_connection_test(
             MCPConnectionTest(
-                name="mail", transport="stdio", config={"command": "python"}
-            ),
-            MagicMock(),
+                name="mail",
+                transport="streamable_http",
+                config={"url": "https://mcp.example.test"},
+            )
         )
         elapsed = time.monotonic() - start
         await _wait_until(direct_load_cancelled.is_set)

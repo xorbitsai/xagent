@@ -127,6 +127,13 @@ on:
       - 'src/xagent/web/services/task_interaction_close.py'
       - 'tests/web/services/test_supersede_savepoint_postgresql.py'
       - 'tests/web/services/test_task_interaction_close_postgresql.py'
+      - 'tests/web/services/test_marker_residue_postgresql.py'
+      - 'tests/web/services/interaction_marker_shared.py'
+      - 'src/xagent/web/services/task_resume.py'
+      - 'src/xagent/web/api/websocket.py'
+      - 'src/xagent/web/services/agent_service_manager.py'
+      - 'src/xagent/web/models/agent.py'
+      - 'tests/web/services/task_lease_shared.py'
       - 'src/xagent/web/models/chat_message.py'
       - 'src/xagent/web/models/user.py'
       - 'src/xagent/web/models/user_oauth.py'
@@ -340,6 +347,13 @@ jobs:
             src/xagent/web/services/task_interaction_close.py
             tests/web/services/test_supersede_savepoint_postgresql.py
             tests/web/services/test_task_interaction_close_postgresql.py
+            tests/web/services/test_marker_residue_postgresql.py
+            tests/web/services/interaction_marker_shared.py
+            src/xagent/web/services/task_resume.py
+            src/xagent/web/api/websocket.py
+            src/xagent/web/services/agent_service_manager.py
+            src/xagent/web/models/agent.py
+            tests/web/services/task_lease_shared.py
             src/xagent/web/models/chat_message.py
             src/xagent/web/models/user.py
             src/xagent/web/models/user_oauth.py
@@ -612,6 +626,19 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      - name: Test task command claimable-kind index migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261014_task_command_claimable_kind_index.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test MCP OAuth lifecycle fencing (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
@@ -781,6 +808,19 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_task_interaction_close_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test interaction marker pairing on close and compensation paths (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/web/services/test_marker_residue_postgresql.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

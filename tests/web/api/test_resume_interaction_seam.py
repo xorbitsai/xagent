@@ -202,9 +202,7 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
 
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _session_factory
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
     _make_active_row(_session_factory, task_id=_seeded_task)
 
     snapshot = _snapshot(task_id=_seeded_task)
@@ -285,9 +283,7 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
 
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _session_factory
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
     _make_active_row(_session_factory, task_id=_seeded_task)
 
     snapshot = _snapshot(task_id=_seeded_task)
@@ -374,9 +370,7 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
 
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _session_factory
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
     _make_active_row(_session_factory, task_id=_seeded_task)
 
     db = _session_factory()
@@ -574,9 +568,7 @@ async def test_receipts_the_seam_cannot_verify_are_refused(
 
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _session_factory
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
     interaction_id = _make_active_row(_session_factory, task_id=_seeded_task)
 
     snapshot = _snapshot(task_id=_seeded_task)
@@ -662,9 +654,7 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
 
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _session_factory
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
     interaction_id = _make_active_row(_session_factory, task_id=_seeded_task)
 
     snapshot = _snapshot(task_id=_seeded_task)
@@ -763,9 +753,7 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
 
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _session_factory
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
     _make_active_row(_session_factory, task_id=_seeded_task, run_id="run-old")
 
     snapshot = _snapshot(task_id=_seeded_task, run_id=RUN_ID)

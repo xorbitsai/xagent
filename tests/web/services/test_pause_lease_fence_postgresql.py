@@ -17,9 +17,7 @@ import pytest
 from sqlalchemy import text, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from tests.shared.postgres_disposable import disposable_database_factory
-from xagent.web.models import database
-from xagent.web.models.database import Base
+from tests.shared.postgres_disposable import disposable_session_factory
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services import task_command_execution as commands
@@ -42,13 +40,7 @@ OWNER = TaskLease(task_id=0, runner_id="owner", run_id="live-run", attempt_id="a
 
 @pytest.fixture()
 def pg_sessions(monkeypatch) -> Iterator[sessionmaker[Session]]:
-    with disposable_database_factory("pause_lease_fence") as make_database:
-        engine = make_database("t")
-        Base.metadata.create_all(engine)
-        sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        # Production code resolves its Session factory and engine globally.
-        monkeypatch.setattr(database, "_engine", engine)
-        monkeypatch.setattr(database, "_SessionLocal", sessions)
+    with disposable_session_factory("pause_lease_fence", monkeypatch) as sessions:
         yield sessions
 
 

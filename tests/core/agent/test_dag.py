@@ -549,6 +549,7 @@ def test_completion_assessment_plan_withholds_execution_intent_fields() -> None:
         "status",
         "result",
         "error",
+        "failure_code",
     }
 
 

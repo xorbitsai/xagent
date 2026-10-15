@@ -342,8 +342,8 @@ class TestMultiTenantSearchIsolation:
     ):
         """Own-collection search succeeds; tenant-scoped results; cross-tenant search is 403."""
         users = {
-            "tenant1": {"username": "search_iso_user1", "password": "pass123"},
-            "tenant2": {"username": "search_iso_user2", "password": "pass123"},
+            "tenant1": {"username": "search_iso_user1", "password": "pass1234"},
+            "tenant2": {"username": "search_iso_user2", "password": "pass1234"},
         }
         user_tokens: Dict[str, str] = {}
         coll1 = "tenant1_iso_search_coll"
@@ -434,12 +434,12 @@ class TestMultiTenantAfterMigration:
         users = [
             {
                 "username": "migration_user1",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "user1@example.com",
             },
             {
                 "username": "migration_user2",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "user2@example.com",
             },
         ]
@@ -485,13 +485,13 @@ class TestMultiTenantAfterMigration:
             "/api/auth/register",
             json={
                 "username": "legacy_test_user",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "legacy@example.com",
             },
         )
         login_response = client.post(
             "/api/auth/login",
-            json={"username": "legacy_test_user", "password": "pass123"},
+            json={"username": "legacy_test_user", "password": "pass1234"},
         )
         assert login_response.status_code == 200, http_detail(login_response)
         user_token = login_response.json()["access_token"]
@@ -529,12 +529,12 @@ class TestMultiTenantAfterMigration:
         users = [
             {
                 "username": "schema_user1",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "schema1@example.com",
             },
             {
                 "username": "schema_user2",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "schema2@example.com",
             },
         ]
@@ -588,12 +588,12 @@ class TestMultiTenantDeleteIsolation:
         users = [
             {
                 "username": "delete_user1",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "delete1@example.com",
             },
             {
                 "username": "delete_user2",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "delete2@example.com",
             },
         ]
@@ -650,12 +650,12 @@ class TestMultiTenantDeleteIsolation:
         users = [
             {
                 "username": "doc_delete_user1",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "docdel1@example.com",
             },
             {
                 "username": "doc_delete_user2",
-                "password": "pass123",
+                "password": "pass1234",
                 "email": "docdel2@example.com",
             },
         ]

@@ -72,10 +72,7 @@ async def test_create_default_tools_prefers_out_of_tree_computer_runtime(
         )
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(
         ToolRegistry,
         "create_registered_tools",

@@ -27,7 +27,7 @@ instants from ``monitor_daily_window_shared``.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy.orm import Session
@@ -36,6 +36,7 @@ from xagent.web.api import monitor as monitor_module
 from xagent.web.api.monitor import get_dashboard_stats, get_monitoring_stats
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
+from xagent.web.services.task_execution_event_writer import append_fact_no_commit
 
 from .conftest import _direct_db_session
 from .monitor_daily_window_shared import (
@@ -126,6 +127,152 @@ async def test_stats_today_window_is_the_utc_day(_utc_plus_8_server: None) -> No
 
         assert stats["todayCalls"] == 2
         assert stats["activeModels"] == 1
+    finally:
+        db.close()
+
+
+async def test_active_models_include_utc_midnight_and_v2_events(
+    _utc_plus_8_server: None,
+) -> None:
+    """Count starts at the boundary, excluding historical-only models."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="legacy-models", updated_at=UTC_TODAY_LATE)
+        task.conversation_storage_version = 1
+        midnight = UTC_TODAY_EARLY.replace(minute=0)
+        for event_id, timestamp, name in [
+            ("at-midnight", midnight, "midnight-model"),
+            ("before-midnight", midnight - timedelta(microseconds=1), "late-model"),
+            ("historical", midnight - timedelta(days=2), "historical-model"),
+        ]:
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id=event_id,
+                    event_type="llm_call_start",
+                    timestamp=timestamp,
+                    data={"model_name": name},
+                )
+            )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 1
+        assert stats["todayCalls"] == 1
+
+        v2_task = _seed_task(db, admin, title="v2-models", updated_at=UTC_TODAY_LATE)
+        v2_task.conversation_storage_version = 2
+        append_fact_no_commit(
+            db,
+            task_id=v2_task.id,
+            kind="llm_call_start",
+            key="v2-start",
+            payload={
+                "protocol_event_id": "v2-start",
+                "data": {"model_name": "v2-model"},
+            },
+            occurred_at=UTC_TODAY_EARLY,
+        )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 2
+        assert stats["todayCalls"] == 2
+    finally:
+        db.close()
+
+
+async def test_active_models_count_empty_names_once(_utc_plus_8_server: None) -> None:
+    """Keep /stats' existing empty-string behavior, including deduplication."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="empty-models", updated_at=UTC_TODAY_LATE)
+        for index, name in enumerate(["named-model", "", ""]):
+            db.add(
+                TraceEvent(
+                    task_id=task.id,
+                    event_id=f"empty-name-{index}",
+                    event_type="llm_call_start",
+                    timestamp=UTC_TODAY_EARLY,
+                    data={"model_name": name},
+                )
+            )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 2
+        assert stats["todayCalls"] == 3
+    finally:
+        db.close()
+
+
+async def test_active_models_do_not_narrow_historical_durations(
+    _utc_plus_8_server: None,
+) -> None:
+    """Only model counts use today's window; durations still use all starts."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="paired-models", updated_at=UTC_TODAY_LATE)
+        for name, started_at, seconds in [
+            ("historical-model", UTC_YESTERDAY_LATE, 10),
+            ("today-model", UTC_TODAY_EARLY, 30),
+        ]:
+            for phase, timestamp in [
+                ("start", started_at),
+                ("end", started_at + timedelta(seconds=seconds)),
+            ]:
+                db.add(
+                    TraceEvent(
+                        task_id=task.id,
+                        event_id=f"{name}-{phase}",
+                        event_type=f"llm_call_{phase}",
+                        timestamp=timestamp,
+                        data={"model_name": name, "step_id": name, "attempt": 1},
+                    )
+                )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 1
+        # Restricting the shared starts to today would incorrectly return 30.
+        assert stats["avgResponseTime"] == 20.0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "pairing_data",
+    [
+        pytest.param({"attempt": 1}, id="missing-step-id"),
+        pytest.param({"step_id": "step-1"}, id="missing-attempt"),
+        pytest.param({"step_id": "step-1", "attempt": 1}, id="missing-end"),
+    ],
+)
+async def test_active_models_do_not_require_duration_pairing(
+    _utc_plus_8_server: None, pairing_data: dict[str, str | int]
+) -> None:
+    """An active model does not need a measurable completed call."""
+    db = _direct_db_session()
+    try:
+        admin = _seed_admin(db)
+        task = _seed_task(db, admin, title="unpaired-model", updated_at=UTC_TODAY_LATE)
+        db.add(
+            TraceEvent(
+                task_id=task.id,
+                event_id="unpaired-start",
+                event_type="llm_call_start",
+                timestamp=UTC_TODAY_EARLY,
+                data={"model_name": "unpaired-model", **pairing_data},
+            )
+        )
+        db.commit()
+
+        stats = await get_monitoring_stats(db=db, current_user=admin)
+        assert stats["activeModels"] == 1
+        assert stats["avgResponseTime"] is None
     finally:
         db.close()
 

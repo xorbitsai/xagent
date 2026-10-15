@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ...config import get_kb_milvus_cleanup_enabled
 from ..models.background_job import BackgroundJob
 from ..models.database import get_session_local, init_db
 from ..services.background_jobs import (
@@ -158,3 +159,33 @@ def scan_due_triggers() -> dict[str, Any]:
         }
     finally:
         db.close()
+
+
+@celery_app.task(
+    name="xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows",
+    # A lost purge is redone next interval; the global acks_late=True plus the
+    # 3600s visibility timeout would redeliver a long purge instead.
+    acks_late=False,
+)
+def purge_leftover_milvus_rows() -> dict[str, Any]:
+    """Celery Beat entrypoint for the periodic leftover Milvus row purge.
+
+    A failed purge raises so Celery records FAILURE; the next Beat tick runs it again.
+    """
+    if not get_kb_milvus_cleanup_enabled():
+        logger.info("Milvus cleanup disabled")
+        return {
+            "status": "disabled",
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+    logger.info("Milvus cleanup tick")
+    from ...core.tools.core.RAG_tools.kb.milvus_cleanup import (
+        purge_leftover_milvus_rows as purge,
+    )
+
+    deleted = purge()
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "processed_at": datetime.now(timezone.utc).isoformat(),
+    }

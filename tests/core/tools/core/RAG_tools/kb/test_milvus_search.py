@@ -562,6 +562,7 @@ PUNCTUATION_CORPUS = [
     "'%'",
     '"_"',
     "plain words here",
+    "全角逗号，与感叹号！！",
 ]
 PUNCTUATION_TERMS = [
     "%",
@@ -581,6 +582,8 @@ PUNCTUATION_TERMS = [
     '"',
     "'%",
     '"_',
+    "，",
+    "！！",
 ]
 
 

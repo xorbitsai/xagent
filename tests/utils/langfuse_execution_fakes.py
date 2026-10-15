@@ -272,7 +272,21 @@ class DeterministicSingleCallLLM(BaseLLM):
                     }
                 ],
             }
-        return {"type": "text", "content": self._final_answer}
+        return {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps(
+                            {
+                                "response_language": "English",
+                                "answer": self._final_answer,
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
 
     async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         del messages, kwargs
@@ -311,9 +325,21 @@ class DeterministicReActLLM(BaseLLM):
                     }
                 ],
             }
-        if self._call_count == 2:
-            return {"content": "The result is 4"}
-        return {"content": "The result is 4"}
+        return {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "final_answer",
+                        "arguments": json.dumps(
+                            {
+                                "response_language": "English",
+                                "answer": "The result is 4",
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
 
     async def stream_chat(self, messages: list[dict[str, str]], **kwargs: Any) -> Any:
         response = await self.chat(messages, **kwargs)

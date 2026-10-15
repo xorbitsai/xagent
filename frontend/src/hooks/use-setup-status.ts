@@ -16,6 +16,7 @@ interface SetupStatusState {
   initialized: boolean
   needsSetup: boolean
   registrationEnabled: boolean
+  passwordMinLength: number
 }
 
 export function useSetupStatus(
@@ -32,6 +33,7 @@ export function useSetupStatus(
     initialized: false,
     needsSetup: false,
     registrationEnabled: true,
+    passwordMinLength: 8,
   })
 
   useEffect(() => {
@@ -51,6 +53,12 @@ export function useSetupStatus(
         const needsSetup = Boolean(data.needs_setup)
         const initialized = Boolean(data.initialized)
         const registrationEnabled = Boolean(data.registration_enabled)
+        const configuredPasswordMinLength = Number(data.password_min_length)
+        const passwordMinLength =
+          Number.isInteger(configuredPasswordMinLength) &&
+          configuredPasswordMinLength > 0
+            ? configuredPasswordMinLength
+            : 8
 
         if (redirectToSetupIfNeeded && needsSetup) {
           window.location.href = "/setup"
@@ -73,6 +81,7 @@ export function useSetupStatus(
             initialized,
             needsSetup,
             registrationEnabled,
+            passwordMinLength,
           })
         }
       } catch {

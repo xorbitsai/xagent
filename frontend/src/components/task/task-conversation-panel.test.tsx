@@ -22,6 +22,7 @@ const appState = vi.hoisted(() => ({
   dagExecution: null,
   steps: [],
 }))
+const realChatMessage = vi.hoisted(() => ({ enabled: false }))
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const pauseTaskMock = vi.hoisted(() => vi.fn())
@@ -72,7 +73,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({ t: (key: string) => key, tDynamic: (key: string) => key }),
 }))
 
 vi.mock("@/contexts/file-access-context", () => ({
@@ -108,8 +109,11 @@ vi.mock("dagre", () => {
   }
 })
 
-vi.mock("@/components/chat/ChatMessage", () => ({
-  ChatMessage: ({
+vi.mock("@/components/chat/ChatMessage", async () => {
+  const actual = await vi.importActual<typeof import("@/components/chat/ChatMessage")>(
+    "@/components/chat/ChatMessage",
+  )
+  const MockChatMessage = ({
     content,
     interactionsActive,
     traceEvents,
@@ -172,8 +176,20 @@ vi.mock("@/components/chat/ChatMessage", () => ({
         </button>
       )}
     </div>
-  ),
-}))
+  )
+  // Tests that assert on the real trace rendering opt in through realChatMessage.
+  return {
+    ...actual,
+    ChatMessage: (props: React.ComponentProps<typeof actual.ChatMessage>) =>
+      realChatMessage.enabled ? <actual.ChatMessage {...props} /> : <MockChatMessage {...(props as React.ComponentProps<typeof MockChatMessage>)} />,
+  }
+})
+
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+vi.mock("@/components/file/docx-preview-renderer", () => ({ DocxPreviewRenderer: () => null }))
+vi.mock("@/components/file/excel-preview-renderer", () => ({ ExcelPreviewRenderer: () => null }))
+vi.mock("@/components/file/pptx-preview-renderer", () => ({ PptxPreviewRenderer: () => null }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
   ChatInput: (props: NonNullable<typeof chatInputProps.current>) => {
@@ -269,6 +285,7 @@ describe("TaskConversationPanel", () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    realChatMessage.enabled = false
     appState.messages = []
     appState.traceEvents = []
     appState.currentTask = null
@@ -1548,5 +1565,77 @@ describe("TaskConversationPanel", () => {
     for (const message of screen.getAllByTestId("chat-message")) {
       expect(message).toHaveAttribute("data-show-process-view", "true")
     }
+  })
+
+  describe("trace process rendering of paused and interrupted runs", () => {
+    const traceEvent = (
+      id: string,
+      type: string,
+      stepId: string,
+      timestamp: number,
+      data: Record<string, unknown> = {},
+    ) => ({ event_id: id, event_type: type, step_id: stepId, timestamp: String(timestamp), data })
+    const task = (status: string) => ({
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status,
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    })
+    const turnOne = { id: "u1", role: "user", content: "First", timestamp: "1000" }
+
+    beforeEach(() => {
+      realChatMessage.enabled = true
+    })
+
+    it("keeps a resumed run spinning after a pause in the same turn", () => {
+      appState.messages = [turnOne]
+      appState.traceEvents = [
+        traceEvent("a-start", "react_task_start", "react_a", 1100, { pattern: "ReActPattern" }),
+        traceEvent("a-tool", "tool_execution_start", "react_a", 1400, { tool_name: "web_search" }),
+        traceEvent("a-end", "react_task_end", "react_a", 1500, {
+          pattern: "ReActPattern",
+          status: "interrupted",
+        }),
+        traceEvent("b-start", "react_task_start", "react_b", 2000, { pattern: "ReActPattern" }),
+        traceEvent("b-tool", "tool_execution_start", "react_b", 2160, { tool_name: "web_search" }),
+      ]
+      appState.currentTask = task("running")
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      expect(container.querySelector(".animate-spin")).not.toBeNull()
+      expect(container.querySelector("svg[data-icon='interrupted']")).toBeNull()
+      expect(screen.queryByText("agent.layout.status.interrupted")).toBeNull()
+    })
+
+    it("renders a paused-and-abandoned DAG step as stopped in a closed turn", () => {
+      appState.messages = [
+        turnOne,
+        { id: "u2", role: "user", content: "Second", timestamp: "3000" },
+        { id: "r2", role: "assistant", content: "ok", timestamp: "3500", isResult: true },
+      ]
+      appState.traceEvents = [
+        traceEvent("d-start", "dag_execute_start", "root", 1100),
+        traceEvent("d1-s", "dag_step_start", "s1", 1200, { step_name: "Step one" }),
+        traceEvent("d1-e", "dag_step_end", "s1", 1300, { step_name: "Step one", result: "ok" }),
+        traceEvent("d2-s", "dag_step_start", "s2", 1400, { step_name: "Step two" }),
+        traceEvent("d2-tool", "tool_execution_start", "s2", 1450, { tool_name: "web_search" }),
+        traceEvent("d-end", "dag_execute_end", "root", 1500, { status: "interrupted" }),
+        traceEvent("c-start", "react_task_start", "react_c", 3100),
+        traceEvent("c-end", "react_task_end", "react_c", 3400, { status: "completed" }),
+      ]
+      appState.currentTask = task("completed")
+
+      const { container } = render(<TaskConversationPanel mode="page" />)
+
+      const stepTwo = screen.getByRole("button", { name: /Step two/ })
+      const icon = stepTwo.querySelector("svg[data-icon='interrupted']")
+      expect(icon).not.toBeNull()
+      expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
+      expect(stepTwo.querySelector(".animate-spin")).toBeNull()
+      expect(container.querySelector(".animate-spin")).toBeNull()
+    })
   })
 })

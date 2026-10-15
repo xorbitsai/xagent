@@ -2887,7 +2887,7 @@ def test_module_issues_zero_sa_text_calls() -> None:
 # ---------------------------------------------------------------------------
 # respond(): the answer-side entry point. respond() owns and retires its own
 # session (see its docstring), so every test below patches
-# ``xagent.web.models.database.get_session_local`` to hand back this file's
+# ``xagent.web.models.database._SessionLocal`` to hand back this file's
 # own file-backed SQLite session factory -- a bare ``:memory:`` database
 # cannot be shared across the separate connections respond()'s own session
 # and this test's setup/verification sessions each open.
@@ -2902,7 +2902,7 @@ from xagent.web.services.task_execution_controller import (  # noqa: E402
 
 @pytest.fixture
 def _respond_db(monkeypatch: pytest.MonkeyPatch, _session_factory):
-    monkeypatch.setattr(_database_module, "get_session_local", lambda: _session_factory)
+    monkeypatch.setattr(_database_module, "_SessionLocal", _session_factory)
     return _session_factory
 
 

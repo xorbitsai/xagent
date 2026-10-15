@@ -2,11 +2,12 @@ import React, { useRef } from "react"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { getApiUrl } from "@/lib/utils"
-import { Settings, Unlink, Plus, Users, UserMinus, Loader2 } from "lucide-react"
+import { Settings, Unlink, Plus, Users, UserMinus, Loader2, RefreshCw, AlertTriangle } from "lucide-react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { toast } from "@/components/ui/sonner"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
+import { needsReconnect } from "@/lib/mcp-connection-status"
 
 import type { AppIntegration } from "./types"
 import { GoogleDrivePickerButton } from "./google-drive-picker-button"
@@ -23,10 +24,12 @@ interface OfficialMcpSettingsDialogProps {
   isGloballyConnected?: boolean
   // Whether this viewer's Configure route would resolve — a backend fact
   // (list_mcp_apps.can_configure), passed in like isGloballyConnected rather
-  // than read off `app`, because the two call sites answer it differently: the
+  // than read off `app`, because the call sites answer it differently: the
   // connector picker reads the listing field, while the Tools page hands this
-  // dialog a hand-built entry that carries no listing fields at all. Omitted
-  // means "use the connection state", which is exactly the gate this replaced.
+  // dialog a hand-built entry that carries no listing fields at all. The agent
+  // builder's reconnect omits this prop and isGloballyConnected, so Configure
+  // stays hidden and the Connect button runs the login. Omitted means "use the
+  // connection state", which is exactly the gate this replaced.
   canConfigure?: boolean
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void
@@ -62,7 +65,8 @@ export function OfficialMcpSettingsDialog({
   const liveRef = useRef({ open, appId: app?.id })
   liveRef.current = { open, appId: app?.id }
 
-  // Only reached without onConnectStart (the Tools page): a provider hosted
+  // Only reached without onConnectStart (the Tools page and the agent
+  // builder's reconnect): a provider hosted
   // on the customer's own account needs the account label before the popup.
   const requestAppAccount = (appToConnect: AppIntegration, retry = false) => {
     if (!appToConnect.oauth_account_input) return
@@ -218,8 +222,9 @@ export function OfficialMcpSettingsDialog({
   // independent of connection state: a connector whose tokens arrive through a
   // deployment-installed resolver hook is never "connected" for its own
   // creator, yet its owner holds the association the edit routes require.
-  // The `??` fallback exists only for the caller that omits the prop entirely
-  // (the Tools page's hand-built entry) and reproduces the pre-field gate.
+  // The `??` fallback exists only for the callers that omit the prop entirely
+  // (the Tools page's hand-built entry and the agent builder's reconnect) and
+  // reproduces the pre-field gate.
   const configurable = Boolean(canConfigure ?? isGloballyConnected)
   const isKeyBased = app.auth_type === "api_key"
   // Keyless apps have no key and no editable config — once connected,
@@ -228,6 +233,11 @@ export function OfficialMcpSettingsDialog({
   // Team tool the viewer doesn't own: they can use it, but the backend
   // rejects edit/delete/unshare (403), so don't render those buttons.
   const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
+  // A builtin OAuth row whose grant needs a reconnect (#2931). Connect and
+  // Configure keep their own gates and both already re-run the app's login;
+  // only their label changes, so the action reads as what it does.
+  const reconnectNeeded = app.auth_type === "builtin_oauth" && needsReconnect(app)
+  const reconnectButtonContent = <><RefreshCw className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.reconnect')}</>
 
   return (
     <>
@@ -264,6 +274,13 @@ export function OfficialMcpSettingsDialog({
             </div>
           )}
 
+          {reconnectNeeded && (
+            <div role="status" className="mb-4 flex w-full items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-left text-sm text-amber-800">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{t('tools.mcp.dialog.reconnectNotice', { name: app.name })}</span>
+            </div>
+          )}
+
           {/* The ownership badge reports team-sharing status, which is not a
               credential fact, so it does not gate on isGloballyConnected.
               Number.isInteger(app.server_id) requires the entry to have a
@@ -297,7 +314,8 @@ export function OfficialMcpSettingsDialog({
           </p>
 
           <div className="flex flex-col items-center justify-center gap-3 w-full">
-            {isGloballyConnected && app.id === "google-drive" && app.picker_configured !== false && (
+            {/* The Picker authorizes with the grant's token, which a reconnect-needed grant no longer has. */}
+            {isGloballyConnected && !reconnectNeeded && app.id === "google-drive" && app.picker_configured !== false && (
               <GoogleDrivePickerButton
                 connectedAccount={app.connected_account}
                 // Radix's modal focus trap/pointer lock can interfere with
@@ -315,6 +333,8 @@ export function OfficialMcpSettingsDialog({
               >
                 {isConnecting ? (
                   <><Loader2 className="h-4 w-4 mr-2 animate-spin" /> {t('tools.mcp.dialog.connecting')}</>
+                ) : reconnectNeeded ? (
+                  reconnectButtonContent
                 ) : (
                   <><Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.connect')}</>
                 )}
@@ -341,8 +361,14 @@ export function OfficialMcpSettingsDialog({
                   }
                 }}
               >
-                <Settings className="h-4 w-4 mr-2" />
-                {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
+                {reconnectNeeded ? (
+                  reconnectButtonContent
+                ) : (
+                  <>
+                    <Settings className="h-4 w-4 mr-2" />
+                    {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
+                  </>
+                )}
               </Button>
             )}
             {/* "Make team" / "Make personal": only the owner (or a team admin,

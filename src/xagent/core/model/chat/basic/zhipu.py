@@ -3,7 +3,7 @@ import contextvars
 import json
 import logging
 import os
-import time
+import threading
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -15,12 +15,24 @@ except ImportError:
 
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..stream_deadline import await_before_deadline
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
 
 logger = logging.getLogger(__name__)
+
+
+def _close_stream_response(stream: Any) -> None:
+    """Close a zai stream's HTTP response from the producer thread, best effort."""
+    close = getattr(getattr(stream, "response", None), "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception as exc:  # best effort
+        logger.debug("Closing Zhipu stream response failed (%s)", type(exc).__name__)
 
 
 def _zhipu_stream_tool_calls(
@@ -439,15 +451,10 @@ class ZhipuLLM(BaseLLM):
 
         Raises:
             RuntimeError: If the API call fails
-            TimeoutError: If timeout thresholds are exceeded
+            LLMTimeoutError: First token or token interval deadline expired
         """
         self._ensure_client()
         assert self._client is not None
-
-        # Timeout tracking
-        first_token = True
-        last_token_time = None
-        start_time = time.time()
 
         # Accumulated content and tool calls
         current_content = ""
@@ -488,25 +495,60 @@ class ZhipuLLM(BaseLLM):
         if response_format:
             completion_params["response_format"] = response_format
 
+        # Set once the consumer stops waiting: a deadline expiring, an error,
+        # or the caller closing the stream (``aclose()`` or the async
+        # generator being finalized). The producer then stops reading and
+        # closes the response instead of draining the rest of the stream into
+        # a queue nobody reads. It only sees the signal before the request and
+        # between events: a producer already waiting for the next event keeps
+        # its executor thread until zai yields one or the read times out (300 s
+        # by default). SSE comment keepalives are dropped inside zai without
+        # reaching this check and reset the read timeout, so against a
+        # provider that sends them the wait is unbounded. Closing the response
+        # from the event loop cannot cut the read short, since httpcore's sync
+        # close does not shut the socket down (#3097).
+        stop_producer = threading.Event()
+
         try:
             # Create a queue to bridge the synchronous stream to async generator
-            queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+            queue: asyncio.Queue[Union[Dict[str, Any], Exception, None]] = (
+                asyncio.Queue()
+            )
 
             # Get the event loop in the main thread before spawning the worker thread
             loop = asyncio.get_event_loop()
+
+            def enqueue(item: Union[Dict[str, Any], Exception, None]) -> bool:
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, item)
+                except RuntimeError:
+                    # The loop is closed, so nobody is left to read the item.
+                    stop_producer.set()
+                    return False
+                return True
 
             def stream_producer() -> None:
                 """
                 Consume the synchronous Zhipu stream and put chunks into the queue.
                 This runs in a separate thread to avoid blocking the event loop.
                 """
+                stream = None
                 try:
                     if self._client is None:
                         raise RuntimeError("Zhipu client is not initialized")
+                    # The thread may start only after the consumer gave up,
+                    # for example when the executor is saturated: do not send
+                    # a request nobody will read.
+                    if stop_producer.is_set():
+                        return
 
                     stream = self._client.chat.completions.create(**completion_params)
+                    if stop_producer.is_set():
+                        return
 
                     for chunk in stream:
+                        if stop_producer.is_set():
+                            return
                         # Convert chunk to dict to avoid threading issues
                         chunk_dict: Dict[str, Any] = {}
 
@@ -580,22 +622,37 @@ class ZhipuLLM(BaseLLM):
                             chunk_dict["usage"] = usage_dict
 
                         # Put chunk in queue using the event loop from main thread
-                        loop.call_soon_threadsafe(queue.put_nowait, chunk_dict)
+                        # A closed loop means nobody reads further events.
+                        if not enqueue(chunk_dict):
+                            return
 
                     # Signal end of stream with sentinel value
-                    loop.call_soon_threadsafe(queue.put_nowait, None)
+                    enqueue(None)
 
-                except Exception:
+                except Exception as exc:
                     # Put exception in queue so it can be raised in the async context
-                    import sys
+                    enqueue(exc)
 
-                    exc_type, exc_value, _ = sys.exc_info()
-                    if exc_value is not None:
+                finally:
+                    # Idempotent: a fully read response is already closed, and
+                    # one abandoned or failed mid-stream is released here.
+                    if stream is not None:
+                        _close_stream_response(stream)
 
-                        def put_exception() -> None:
-                            queue.put_nowait(exc_value)  # type: ignore[arg-type]
-
-                        loop.call_soon_threadsafe(put_exception)
+            # Both limits are deadlines on the wait itself, not checks made
+            # when a chunk arrives: a check on arrival never runs for a stream
+            # that stays silent (#3058). The producer sends the request, so the
+            # first-token deadline also covers opening the stream.
+            first_token_timeout = self.timeout_config.first_token_timeout
+            first_token_deadline = loop.time() + first_token_timeout
+            first_token_message = (
+                f"First token timeout: no chunk within {first_token_timeout}s"
+            )
+            interval_timeout = self.timeout_config.token_interval_timeout
+            interval_message = (
+                f"Token interval timeout: no chunk within {interval_timeout}s "
+                "of the previous one"
+            )
 
             # Start the producer thread. The SDK runs there, so it gets the
             # caller's context (as asyncio.to_thread would give it): context
@@ -605,8 +662,20 @@ class ZhipuLLM(BaseLLM):
             )
 
             # Consume chunks from the queue as they arrive (true streaming)
+            first_chunk = True
             while True:
-                chunk_dict = await queue.get()
+                # The interval deadline starts when we begin waiting, so time
+                # the caller spends on the previous chunk is not counted as
+                # provider silence.
+                if first_chunk:
+                    deadline = first_token_deadline
+                    timeout_message = first_token_message
+                else:
+                    deadline = loop.time() + interval_timeout
+                    timeout_message = interval_message
+                chunk_dict = await await_before_deadline(
+                    queue.get(), deadline=deadline, timeout_message=timeout_message
+                )
 
                 # Check for end of stream sentinel
                 if chunk_dict is None:
@@ -615,28 +684,7 @@ class ZhipuLLM(BaseLLM):
                 # Check if an exception was put in the queue
                 if isinstance(chunk_dict, Exception):
                     raise chunk_dict
-                current_time = time.time()
-
-                # Check first token timeout
-                if first_token:
-                    elapsed = current_time - start_time
-                    if elapsed > self.timeout_config.first_token_timeout:
-                        raise LLMTimeoutError(
-                            f"First token timeout: {elapsed:.2f}s > "
-                            f"{self.timeout_config.first_token_timeout}s"
-                        )
-                    first_token = False
-
-                # Check token interval timeout
-                if last_token_time is not None:
-                    interval = current_time - last_token_time
-                    if interval > self.timeout_config.token_interval_timeout:
-                        raise LLMTimeoutError(
-                            f"Token interval timeout: {interval:.2f}s > "
-                            f"{self.timeout_config.token_interval_timeout}s"
-                        )
-
-                last_token_time = current_time
+                first_chunk = False
 
                 # Process the chunk data
                 if chunk_dict.get("choices"):
@@ -787,6 +835,9 @@ class ZhipuLLM(BaseLLM):
                 content=f"Zhipu streaming API error: {str(e)}",
                 raw=e,
             )
+
+        finally:
+            stop_producer.set()
 
     @property
     def supports_thinking_mode(self) -> bool:

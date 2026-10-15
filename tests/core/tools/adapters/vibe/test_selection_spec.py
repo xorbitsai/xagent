@@ -449,11 +449,38 @@ def test_required_mcp_error_message_does_not_expose_summary_values() -> None:
         ]
     )
 
-    assert str(error) == "Required MCP servers are unavailable."
+    assert str(error) == "Required MCP servers are unavailable: mcp_server_unavailable."
     assert "secret-like-server-name" not in str(error)
+    assert "hidden" not in str(error)
     assert error.summaries[0].reason == "mcp_server_unavailable"
     assert error.summaries[1].server_name == "MCP server"
     assert error.summaries[1].reason == "mcp_server_unavailable"
+
+
+def test_required_mcp_error_message_names_reason_and_status_only() -> None:
+    error = RequiredMCPUnavailableError(
+        [
+            MCPUnavailableSummary.from_values(
+                "secret-like-server-name",
+                "auth_rejected",
+                cause_type="HTTPStatusError",
+                status_code=403,
+            ),
+            MCPUnavailableSummary.from_values("other-server", "initialize"),
+            # Same reason and status as the first entry: named once.
+            MCPUnavailableSummary.from_values(
+                "third-server", "auth_rejected", status_code=403
+            ),
+        ]
+    )
+
+    assert str(error) == (
+        "Required MCP servers are unavailable: auth_rejected (HTTP 403), initialize."
+    )
+    assert "secret-like-server-name" not in str(error)
+    assert "HTTPStatusError" not in str(error)
+    assert error.summaries[0].status_code == 403
+    assert error.summaries[0].cause_type == "HTTPStatusError"
 
 
 @pytest.mark.parametrize(

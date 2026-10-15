@@ -40,6 +40,10 @@ from .services.local_browser_runtime import (
     register_local_browser_runtime,
     unregister_local_browser_runtime,
 )
+from .services.process_diagnostics import (
+    start_process_diagnostics,
+    stop_process_diagnostics,
+)
 from .services.task_auto_resume import run_task_auto_resume_loop
 from .services.task_command_execution import execute_durable_task_command
 from .services.task_command_transport import (
@@ -89,6 +93,7 @@ async def run_worker(
     auto_resume = None
     sandbox = None
     idle_sweep = None
+    diagnostics = None
     stop = stop if stop is not None else asyncio.Event()
     try:
         if initialize_host is not None:
@@ -131,34 +136,40 @@ async def run_worker(
             )
         )
         start_task_command_dispatcher(execute_durable_task_command)
+        diagnostics = start_process_diagnostics()
         logger.info("Shared task worker ready")
         await supervise_task_command_dispatcher(execute_durable_task_command, stop)
     finally:
-        # Stop every claim path first. Finalizers retain the bridge and runtime
-        # resources until execution and its heartbeats have drained.
-        await stop_task_command_dispatcher()
-        if auto_resume is not None:
-            auto_resume.cancel()
-            await asyncio.gather(auto_resume, return_exceptions=True)
-        if recovery is not None:
-            recovery.cancel()
-            await asyncio.gather(recovery, return_exceptions=True)
-        await close_task_coordinators()
-        await background_task_manager.shutdown()
-        await wait_for_heartbeat_manager_idle()
-        await stop_task_event_bridge()
-        if idle_sweep is not None:
-            idle_sweep.cancel()
-            await asyncio.gather(idle_sweep, return_exceptions=True)
-        shutdown_task_runtime_hook_executor()
-        unregister_local_browser_runtime()
+        # The diagnostics line keeps reporting while execution drains, and is
+        # stopped even when a shutdown step fails.
         try:
-            await shutdown_chrome_execution_session_pool()
-        except Exception:
-            logger.exception("Failed to drain Chrome execution sessions")
-        if sandbox is not None:
-            await sandbox.cleanup()
-        flush_langfuse()
+            # Stop every claim path first. Finalizers retain the bridge and
+            # runtime resources until execution and its heartbeats have drained.
+            await stop_task_command_dispatcher()
+            if auto_resume is not None:
+                auto_resume.cancel()
+                await asyncio.gather(auto_resume, return_exceptions=True)
+            if recovery is not None:
+                recovery.cancel()
+                await asyncio.gather(recovery, return_exceptions=True)
+            await close_task_coordinators()
+            await background_task_manager.shutdown()
+            await wait_for_heartbeat_manager_idle()
+            await stop_task_event_bridge()
+            if idle_sweep is not None:
+                idle_sweep.cancel()
+                await asyncio.gather(idle_sweep, return_exceptions=True)
+            shutdown_task_runtime_hook_executor()
+            unregister_local_browser_runtime()
+            try:
+                await shutdown_chrome_execution_session_pool()
+            except Exception:
+                logger.exception("Failed to drain Chrome execution sessions")
+            if sandbox is not None:
+                await sandbox.cleanup()
+            flush_langfuse()
+        finally:
+            await stop_process_diagnostics(diagnostics)
 
 
 async def _main() -> None:

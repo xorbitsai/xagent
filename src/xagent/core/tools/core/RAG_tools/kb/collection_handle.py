@@ -5524,6 +5524,20 @@ _MILVUS_QUERY_BATCH = 10_000
 _MILVUS_QUERY_WINDOW = 16_384
 _MILVUS_FALLBACK_PAGE = 1_000
 _MILVUS_NOT_LOADED = 101
+# The analyzer is fixed when a collection is created, so existing ones keep theirs.
+_MILVUS_ANALYZER_PARAMS = {
+    "tokenizer": "jieba",
+    "filter": [
+        "lowercase",
+        {
+            "type": "regex",
+            "expr": (
+                r"[0-9A-Za-z\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}"
+                r"\x{FF10}-\x{FF19}\x{FF21}-\x{FF3A}\x{FF41}-\x{FF5A}]"
+            ),
+        },
+    ],
+}
 
 
 def milvus_collection_name(model: str) -> str:
@@ -5566,7 +5580,7 @@ def ensure_milvus_collection(client: Any, model: str, dimension: int) -> str:
             types.VARCHAR,
             max_length=_MILVUS_TEXT_BYTES,
             enable_analyzer=True,
-            analyzer_params={"type": "chinese"},
+            analyzer_params=_MILVUS_ANALYZER_PARAMS,
         )
         schema.add_field("sparse", types.SPARSE_FLOAT_VECTOR)
         schema.add_field("dense", types.FLOAT_VECTOR, dim=dimension)

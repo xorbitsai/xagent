@@ -314,6 +314,7 @@ ENV XAGENT_ENCRYPTION_KEY_FILE=/run/xagent-secrets/encryption.key
 # explicitly; set this to false only when running the image as a non-root user
 # with a working Chromium sandbox.
 ENV XAGENT_BROWSER_ALLOW_UNSANDBOXED=true
+ENV XAGENT_JWT_SECRET_FILE=/run/xagent-secrets/jwt.secret
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

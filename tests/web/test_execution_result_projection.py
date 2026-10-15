@@ -2,7 +2,11 @@ import pytest
 
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.web.models.task import TaskStatus
-from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from xagent.web.services.client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    ClientErrorCode,
+    client_error_message,
+)
 from xagent.web.services.execution_result_projection import (
     EMPTY_CHANNEL_OUTPUT_FALLBACK,
     execution_result_diagnostic_error,
@@ -162,6 +166,46 @@ def test_project_empty_failure_has_no_diagnostic_and_uses_safe_display() -> None
     assert projection.transcript_content == "Task execution failed."
     assert projection.diagnostic_error is None
     assert projection.interactions == []
+
+
+def test_project_failed_result_maps_classified_tool_failure() -> None:
+    safe_error = client_error_message(ClientErrorCode.EXCEL_WORKBOOK_ACCESS_DENIED)
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "error": "truncated_tool_arguments",
+            "failure_code": "excel_workbook_access_denied",
+        }
+    )
+
+    assert projection.visible_text == safe_error
+    assert projection.transcript_content == CLIENT_SAFE_TASK_FAILURE
+
+
+def test_project_failed_result_rejects_unallowlisted_tool_failure() -> None:
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "failure_code": "arbitrary",
+        }
+    )
+
+    assert projection.visible_text == CLIENT_SAFE_TASK_FAILURE
+
+
+def test_project_failed_result_keeps_an_existing_error_code_over_tool_failure() -> None:
+    projection = project_execution_result_for_channel(
+        {
+            "success": False,
+            "status": "quota_exceeded",
+            "error_code": "quota_exceeded",
+            "failure_code": "excel_workbook_access_denied",
+        }
+    )
+
+    assert projection.visible_text == CLIENT_SAFE_TASK_FAILURE
 
 
 def test_project_failure_appends_task_id_to_visible_text_only() -> None:

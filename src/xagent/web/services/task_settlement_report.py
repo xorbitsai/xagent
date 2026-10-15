@@ -63,11 +63,15 @@ class SettlementReport:
     ``control_state`` is the committed V2 control identity, filled where a
     caller publishes it; it may be empty after a commit (a non-V2 row, or the
     managed path for a non-pause outcome). ``paused_for`` is the recorded
-    reason of a committed interruption pause, and is set only then.
+    reason of a committed interruption pause, and is set only then;
+    ``recovery`` is what that pause recorded for automatic recovery (``None``
+    when recording was skipped), announced after the commit as
+    ``task_recovery_update``.
     """
 
     control_state: dict[str, Any] = field(default_factory=dict)
     paused_for: InterruptionReason | None = None
+    recovery: RecordedInterruption | None = None
 
     @property
     def paused(self) -> bool:

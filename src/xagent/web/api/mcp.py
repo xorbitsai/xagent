@@ -5640,6 +5640,7 @@ async def get_mcp_server_logs(
 
 
 _TESTABLE_REMOTE_MCP_TRANSPORTS = frozenset({"sse", "streamable_http"})
+_MCP_CONNECTION_TEST_FOLLOW_REDIRECTS = True
 
 
 @mcp_router.post(
@@ -5687,7 +5688,7 @@ async def test_mcp_connection(
             # SafeOAuthAsyncHTTPTransport resolves and pins every redirected
             # request independently, so common /mcp -> /mcp/ redirects remain
             # usable without reopening redirect or DNS-rebinding SSRF.
-            follow_redirects=True,
+            follow_redirects=_MCP_CONNECTION_TEST_FOLLOW_REDIRECTS,
             transport=SafeOAuthAsyncHTTPTransport(),
         )
 

@@ -51,6 +51,7 @@ from ...core.runtime_performance import (
     observe_duration,
     observe_value,
 )
+from ...core.utils.api_key import verify_dummy
 from ...core.utils.security import host_matches_suffix
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
@@ -90,13 +91,12 @@ from ..oauth_provider_quirks import (
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.trigger_rate_limit import remote_ip_from_request
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     normalize_user_oauth_resource_owner_key,
     scoped_user_oauth_query,
 )
-from ..services.trigger_rate_limit import remote_ip_from_request
-from ...core.utils.api_key import verify_dummy
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
 logger = logging.getLogger(__name__)

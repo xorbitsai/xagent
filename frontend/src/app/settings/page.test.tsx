@@ -203,6 +203,7 @@ describe("SettingsPage auth profile synchronization", () => {
     const input = await screen.findByLabelText("settings.email.current")
     await waitFor(() => expect(input).not.toBeDisabled())
     fireEvent.change(input, { target: { value: "pending@example.com" } })
+    fireEvent.change(screen.getByLabelText("settings.password.current"), { target: { value: "current-password" } })
     fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
     await waitFor(() => expect(apiRequest).toHaveBeenCalledTimes(2))
     expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "old@example.com" } } } })

@@ -12,6 +12,13 @@ Example:
 
 Note: This tool uses SQLAlchemy's synchronous engine.
 Async drivers are not supported currently.
+
+For safety, connection URLs whose effective target cannot be proven distinct
+from the platform database are rejected. This includes opaque driver-side
+configuration such as ``service``/DSN files and SQLite URI mode; existing
+connections using those spellings must be rewritten with explicit targets.
+The URL check is a defense-in-depth measure, not a substitute for separate
+platform credentials or network isolation.
 """
 
 import csv
@@ -35,6 +42,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 PLATFORM_DATABASE_ERROR = "The platform database cannot be used by the SQL tool"
+SQLITE_URI_UNSUPPORTED_ERROR = "SQLite URI mode is not supported"
 _OPAQUE_TARGET_QUERY_KEYS = frozenset(
     {"service", "odbc_connect", "dsn", "read_default_file", "read_default_group"}
 )
@@ -200,7 +208,7 @@ def validate_external_database_url(candidate: str | URL) -> URL:
         # URI mode lets pysqlite reinterpret and percent-decode the path after
         # SQLAlchemy has validated it.  Reject it rather than trying to mirror
         # every SQLite URI spelling (including repeated/true-ish `uri` keys).
-        raise ValueError(PLATFORM_DATABASE_ERROR)
+        raise ValueError(SQLITE_URI_UNSUPPORTED_ERROR)
     configured_opaque_keys = _opaque_target_query_keys(parsed)
     if configured_opaque_keys:
         # Driver-side service/DSN/config files can replace the host/database

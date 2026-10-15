@@ -116,7 +116,7 @@ class TestGetConnectionUrl:
             "XAGENT_EXTERNAL_DB_TEST",
             candidate_template.format(path=platform_db, encoded_path=encoded_path),
         )
-        with pytest.raises(ValueError, match="platform database"):
+        with pytest.raises(ValueError, match="SQLite URI mode"):
             _get_connection_url("test")
 
     @pytest.mark.parametrize(

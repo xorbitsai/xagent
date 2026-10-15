@@ -12,7 +12,7 @@ from xagent.core.utils.encryption import (
 )
 
 revision: str = "20261014_encrypt_user_oauth_tokens"
-down_revision: Union[str, None] = "20261014_task_cmd_claimable_kind"
+down_revision: Union[str, None] = "20261015_sync_xero_mcp_app"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

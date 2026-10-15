@@ -1807,7 +1807,6 @@ async def _start_shared_task_runtime(app_instance: FastAPI) -> None:
 async def startup_event() -> None:
     global _migration_task
     from ..config import get_task_execution_role, validate_task_execution_host_config
-    from .auth_config import validate_auth_config
 
     validate_auth_config()
     validate_task_execution_host_config()

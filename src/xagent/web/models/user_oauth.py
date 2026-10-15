@@ -3,12 +3,17 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.types import TypeDecorator
 
-from ...core.utils.encryption import decrypt_value, encrypt_value
+from ...core.utils.encryption import decrypt_value_strict, encrypt_value
 from .database import Base
 
 
 class EncryptedOAuthToken(TypeDecorator[str]):
-    """Encrypt OAuth bearer/refresh tokens whenever they cross the DB boundary."""
+    """Encrypt OAuth tokens and fail closed if the configured key cannot open one.
+
+    Fernet output is intentionally non-deterministic, so callers must not add
+    value-equality filters for these columns. Empty strings and NULL remain
+    supported for presence checks and ``IS NULL`` predicates.
+    """
 
     impl = String
     cache_ok = True
@@ -17,7 +22,7 @@ class EncryptedOAuthToken(TypeDecorator[str]):
         return encrypt_value(value) if value else value
 
     def process_result_value(self, value: str | None, dialect: object) -> str | None:
-        return decrypt_value(value) if value else value
+        return decrypt_value_strict(value) if value else value
 
 
 USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512

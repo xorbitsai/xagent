@@ -3,6 +3,10 @@
 The ORM token type encrypts all future writes. This migration covers rows
 created before that type was introduced; ``encrypt_value`` is idempotent so a
 retry is safe after a partially completed deployment.
+
+This migration is intentionally irreversible: a downgrade leaves ciphertext
+in place because writing plaintext tokens back to the database would weaken
+the security guarantee. The ORM type continues to decrypt those rows.
 """
 
 from typing import Sequence, Union
@@ -36,23 +40,28 @@ def upgrade() -> None:
     selected_columns = [user_oauth.c.id, user_oauth.c.access_token]
     if "refresh_token" in columns:
         selected_columns.append(user_oauth.c.refresh_token)
-    result = connection.execute(sa.select(*selected_columns)).mappings()
+    result = connection.execute(sa.select(*selected_columns)).mappings().all()
     for row in result:
-        values: dict[str, str | None] = {
-            "access_token": encrypt_value(str(row["access_token"] or "")),
-        }
-        if "refresh_token" in columns:
-            values["refresh_token"] = (
-                encrypt_value(str(row["refresh_token"]))
-                if row["refresh_token"]
-                else None
-            )
-        connection.execute(
-            user_oauth.update().where(user_oauth.c.id == row["id"]).values(**values)
+        values: dict[str, str | None] = {}
+        access_token = row["access_token"]
+        encrypted_access_token = (
+            encrypt_value(access_token) if access_token else access_token
         )
+        if encrypted_access_token != access_token:
+            values["access_token"] = encrypted_access_token
+        if "refresh_token" in columns:
+            refresh_token = row["refresh_token"]
+            encrypted_refresh_token = (
+                encrypt_value(refresh_token) if refresh_token else refresh_token
+            )
+            if encrypted_refresh_token != refresh_token:
+                values["refresh_token"] = encrypted_refresh_token
+        if values:
+            connection.execute(
+                user_oauth.update().where(user_oauth.c.id == row["id"]).values(**values)
+            )
 
 
 def downgrade() -> None:
-    # Token ciphertext must never be written back as plaintext during a
-    # downgrade. The ORM remains able to decrypt rows from this migration.
+    """No-op: downgrading must not write OAuth tokens back as plaintext."""
     pass

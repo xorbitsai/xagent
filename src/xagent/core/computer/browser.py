@@ -175,12 +175,15 @@ class BrowserComputerEnvironment(ComputerEnvironment):
 
     async def _get_page(self, *, reject_recreated_session: bool) -> Any:
         workspace_dir = getattr(self.workspace, "workspace_dir", None)
+        workspace_roots = self._authorized_workspace_roots()
         session_kwargs: dict[str, Any] = {
             "headless": self.headless,
             "locale": self.locale,
         }
         if workspace_dir is not None:
             session_kwargs["workspace_root"] = str(workspace_dir)
+        if workspace_roots:
+            session_kwargs["workspace_roots"] = workspace_roots
         session = await self.manager.get_or_create(
             self._manager_session_id, **session_kwargs
         )
@@ -203,6 +206,17 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         if page.viewport_size != requested:
             await page.set_viewport_size(cast(Any, requested))
         return page
+
+    def _authorized_workspace_roots(self) -> tuple[str, ...]:
+        """Return trusted workspace roots for local browser navigation."""
+        roots: list[str] = []
+        workspace_dir = getattr(self.workspace, "workspace_dir", None)
+        if workspace_dir is not None:
+            roots.append(str(workspace_dir))
+        roots.extend(
+            str(path) for path in getattr(self.workspace, "allowed_external_dirs", ())
+        )
+        return tuple(dict.fromkeys(root for root in roots if root))
 
     async def _close(self) -> None:
         await self.manager.close(self._manager_session_id)
@@ -356,6 +370,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
                     workspace_root=(
                         str(workspace_dir) if workspace_dir is not None else None
                     ),
+                    workspace_roots=self._authorized_workspace_roots(),
                 )
             except (OSError, TypeError, ValueError) as exc:
                 raise ValueError(

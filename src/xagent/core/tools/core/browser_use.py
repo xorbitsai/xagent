@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, cast
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Sequence, cast
 from urllib.parse import unquote, urlsplit
 
 from ....config import (
@@ -65,24 +65,41 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
         return f"Error: {str(error)}\n\nTraceback:\n{tb_str}"
 
 
-def _workspace_file_path(url: str, workspace_root: str | None) -> Path | None:
-    """Return a workspace-contained file path, or ``None`` for unsafe URLs."""
-    if not workspace_root:
+def _workspace_file_path(
+    url: str,
+    workspace_root: str | None = None,
+    workspace_roots: Sequence[str] | None = None,
+) -> Path | None:
+    """Return a file contained by an authorized root, or ``None`` if unsafe."""
+    roots = [workspace_root] if workspace_root else []
+    roots.extend(workspace_roots or ())
+    if not roots:
         return None
     try:
         parsed = urlsplit(url)
         if parsed.scheme.lower() != "file" or parsed.netloc:
             return None
-        root = Path(workspace_root).expanduser().resolve()
         candidate = Path(unquote(parsed.path)).expanduser().resolve()
-        candidate.relative_to(root)
     except (OSError, ValueError):
         return None
-    return candidate if candidate.is_file() else None
+    if not candidate.is_file():
+        return None
+    for root_value in roots:
+        if not isinstance(root_value, str) or not root_value:
+            continue
+        try:
+            candidate.relative_to(Path(root_value).expanduser().resolve())
+        except (OSError, ValueError):
+            continue
+        return candidate
+    return None
 
 
 async def _validate_browser_target(
-    url: str, *, workspace_root: str | None = None
+    url: str,
+    *,
+    workspace_root: str | None = None,
+    workspace_roots: Sequence[str] | None = None,
 ) -> None:
     """Validate a browser target and every request made by its page."""
     try:
@@ -97,7 +114,12 @@ async def _validate_browser_target(
         # CDP guard and the browser-wide egress proxy.
         return
     if scheme == "file":
-        if _workspace_file_path(url, workspace_root) is None:
+        if (
+            _workspace_file_path(
+                url, workspace_root=workspace_root, workspace_roots=workspace_roots
+            )
+            is None
+        ):
             raise ValueError("Only workspace files are allowed")
         return
     if scheme not in {"http", "https"}:
@@ -345,6 +367,7 @@ class BrowserSession:
         headless: bool = True,
         locale: Optional[str] = None,
         workspace_root: str | None = None,
+        workspace_roots: Sequence[str] | None = None,
     ):
         """
         Initialize a browser session.
@@ -360,6 +383,14 @@ class BrowserSession:
         self.headless = headless
         self.locale = locale or get_browser_tool_default_locale()
         self.workspace_root = workspace_root
+        self.workspace_roots = tuple(
+            dict.fromkeys(
+                root
+                for root in ((workspace_root,) if workspace_root else ())
+                + tuple(workspace_roots or ())
+                if isinstance(root, str) and root
+            )
+        )
         # No caller ever supplies a per-request timezone (no tool schema
         # exposes it, and _with_default_session only injects locale) -- this
         # is deployment-configured only, unlike locale.
@@ -424,6 +455,7 @@ class BrowserSession:
                 await _validate_browser_target(
                     request_url,
                     workspace_root=self.workspace_root,
+                    workspace_roots=self.workspace_roots,
                 )
             except Exception:
                 # Fail closed if validation or DNS resolution fails. Leaving
@@ -762,6 +794,7 @@ class BrowserSessionManager:
         headless: bool = False,
         locale: Optional[str] = None,
         workspace_root: str | None = None,
+        workspace_roots: Sequence[str] | None = None,
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -793,6 +826,8 @@ class BrowserSessionManager:
                     )
                 if workspace_root and not existing.workspace_root:
                     existing.workspace_root = workspace_root
+                if workspace_roots and not existing.workspace_roots:
+                    existing.workspace_roots = tuple(workspace_roots)
                 existing._last_used = datetime.now()
                 return existing
 
@@ -806,6 +841,7 @@ class BrowserSessionManager:
                 headless,
                 locale=locale,
                 workspace_root=workspace_root,
+                workspace_roots=workspace_roots,
             )
             self._sessions[session_id] = new_session
             new_session._last_used = datetime.now()
@@ -924,10 +960,17 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "error": "Missing required parameters: session_id and url are required",
         }
     workspace_root = kwargs.get("_workspace_root")
+    workspace_roots = kwargs.get("_workspace_roots")
+    trusted_workspace_roots = (
+        tuple(root for root in workspace_roots if isinstance(root, str) and root)
+        if isinstance(workspace_roots, (list, tuple))
+        else None
+    )
     try:
         await _validate_browser_target(
             str(url),
             workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+            workspace_roots=trusted_workspace_roots,
         )
     except (TypeError, ValueError):
         return {
@@ -961,6 +1004,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         headless,
         locale=locale,
         workspace_root=workspace_root if isinstance(workspace_root, str) else None,
+        workspace_roots=trusted_workspace_roots,
     )
     page = await session.get_page()
 

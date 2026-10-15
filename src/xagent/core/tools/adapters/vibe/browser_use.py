@@ -397,12 +397,21 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         # Convert workspace-relative paths to file:// URLs
         url = args.get("url", "")
         # This is an internal trust boundary: callers may not choose the
-        # directory used to authorize file:// navigation. Always discard a
-        # model-supplied value, then inject the task workspace when one exists.
+        # directories used to authorize file:// navigation. Always discard
+        # model-supplied values, then inject the task workspace's authorized
+        # roots when one exists.
         args = dict(args)
         args.pop("_workspace_root", None)
+        args.pop("_workspace_roots", None)
         if self._workspace is not None:
             args["_workspace_root"] = str(self._workspace.workspace_dir)
+            args["_workspace_roots"] = [
+                str(self._workspace.workspace_dir),
+                *(
+                    str(path)
+                    for path in getattr(self._workspace, "allowed_external_dirs", ())
+                ),
+            ]
 
         # Debug logging
         import logging

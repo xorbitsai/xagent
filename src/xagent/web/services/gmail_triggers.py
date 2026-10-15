@@ -363,7 +363,7 @@ def scan_due_gmail_watch_renewals(
         .distinct()
         .subquery()
     )
-    rows = (
+    candidate_rows = (
         db.query(UserOAuth, GmailWatchState)
         .join(enabled_gmail_users, enabled_gmail_users.c.user_id == UserOAuth.user_id)
         .outerjoin(
@@ -393,7 +393,7 @@ def scan_due_gmail_watch_renewals(
     )
     rows = [
         (oauth_account, state)
-        for oauth_account, state in rows
+        for oauth_account, state in candidate_rows
         if oauth_account.access_token
     ][:batch_size]
 

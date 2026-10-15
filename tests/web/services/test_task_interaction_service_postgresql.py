@@ -585,7 +585,7 @@ def test_answer_fence_guest_entity_binding_matches_on_postgresql(db_session) -> 
 def _respond_pg(monkeypatch: pytest.MonkeyPatch, session_factory):
     import xagent.web.models.database as database_module
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
     return session_factory
 
 
@@ -834,7 +834,7 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
         pids["holder"] = db.scalar(sa.text("SELECT pg_backend_pid()"))
         return db
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: holder_session)
+    monkeypatch.setattr(database_module, "_SessionLocal", holder_session)
 
     def paused_fence_stmt(*args, **kwargs):
         # respond() has acquired the task lock. Keep it held until PostgreSQL
@@ -1291,8 +1291,8 @@ def test_respond_races_a_committed_duplicate_command_and_replays_on_matching_pay
 
     monkeypatch.setattr(
         database_module,
-        "get_session_local",
-        lambda: _pause_command_add_session_factory(
+        "_SessionLocal",
+        _pause_command_add_session_factory(
             _respond_pg, precheck_done=precheck_done, release_event=release_respond
         ),
     )
@@ -1385,8 +1385,8 @@ def test_respond_races_a_committed_duplicate_command_and_conflicts_on_mismatched
 
     monkeypatch.setattr(
         database_module,
-        "get_session_local",
-        lambda: _pause_command_add_session_factory(
+        "_SessionLocal",
+        _pause_command_add_session_factory(
             _respond_pg, precheck_done=precheck_done, release_event=release_respond
         ),
     )

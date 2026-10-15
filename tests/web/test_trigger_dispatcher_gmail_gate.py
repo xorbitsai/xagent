@@ -17,9 +17,6 @@ async def test_trigger_dispatcher_skips_gmail_scan_when_watch_disabled(
         def close(self) -> None:
             return None
 
-    def fake_get_session_local():
-        return FakeSession
-
     def fake_scan_due_gmail_watch_renewals(_db) -> int:
         return 0
 
@@ -41,8 +38,8 @@ async def test_trigger_dispatcher_skips_gmail_scan_when_watch_disabled(
     )
     monkeypatch.setattr(app_module.asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        fake_get_session_local,
+        "xagent.web.models.database._SessionLocal",
+        FakeSession,
     )
     monkeypatch.setattr(
         "xagent.web.services.gmail_triggers.scan_due_gmail_watch_renewals",
@@ -109,10 +106,7 @@ async def test_trigger_dispatcher_survives_scheduled_scan_error(
     monkeypatch.setattr(
         app_module, "get_gmail_watch_enabled", lambda: False, raising=False
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: FakeSession,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", FakeSession)
     monkeypatch.setattr(
         "xagent.web.services.triggers.scan_due_scheduled_triggers",
         flaky_scan,
@@ -173,10 +167,7 @@ async def test_trigger_dispatcher_throttles_preview_run_reap_tick(
     monkeypatch.setattr(
         app_module, "get_gmail_watch_enabled", lambda: False, raising=False
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: FakeSession,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", FakeSession)
     monkeypatch.setattr(
         "xagent.web.services.triggers.scan_due_scheduled_triggers",
         lambda _db: [],

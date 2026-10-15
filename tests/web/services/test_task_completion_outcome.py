@@ -213,7 +213,7 @@ async def test_channel_continuation_updates_outcome_and_rejects_late_result(
     from xagent.web.models.chat_message import TaskChatMessage
 
     factory = sessionmaker(engine)
-    monkeypatch.setattr(database, "get_session_local", lambda: factory)
+    monkeypatch.setattr(database, "_SessionLocal", factory)
     monkeypatch.setattr(snapshots, "get_session_local", lambda: factory)
     with factory() as db:
         db.get(Task, task_id).conversation_storage_version = storage_version

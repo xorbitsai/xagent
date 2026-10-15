@@ -24,6 +24,7 @@ from ...language import (
     request_context_output_language,
     serialize_pending_user_response,
 )
+from ...result import normalize_tool_failure_code
 from ..base import (
     RequiredToolCallError,
     append_user_message_preserving_turns,
@@ -89,6 +90,7 @@ class PlanStep:
     status: str = "pending"
     result: Any = None
     error: str | None = None
+    failure_code: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -102,6 +104,7 @@ class PlanStep:
             "status": self.status,
             "result": self.result,
             "error": self.error,
+            "failure_code": self.failure_code,
         }
 
     @classmethod
@@ -126,6 +129,7 @@ class PlanStep:
             status=str(data.get("status", "pending")),
             result=data.get("result"),
             error=data.get("error"),
+            failure_code=normalize_tool_failure_code(data.get("failure_code")),
         )
 
 

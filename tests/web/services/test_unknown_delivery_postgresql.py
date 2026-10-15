@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import text, update
 from sqlalchemy.orm import Session, sessionmaker
 
-from tests.shared.postgres_disposable import disposable_database_factory
+from tests.shared.postgres_disposable import disposable_session_factory
 from tests.web.api.test_durable_message_resume_contention import (
     _live_control_environment,
     _message_command,
@@ -37,9 +37,7 @@ from tests.web.api.test_recovered_delivery_outcome_unknown import (
     _settled_task,
     _user_rows,
 )
-from xagent.web.models import database
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution_controller as controller_module
@@ -80,13 +78,7 @@ _BLOCKED_SECONDS = 30
 
 @pytest.fixture()
 def pg_sessions(monkeypatch) -> Iterator[sessionmaker[Session]]:
-    with disposable_database_factory("unknown_delivery") as make_database:
-        engine = make_database("t")
-        Base.metadata.create_all(engine)
-        sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        # Production code resolves its Session factory and engine globally.
-        monkeypatch.setattr(database, "_engine", engine)
-        monkeypatch.setattr(database, "_SessionLocal", sessions)
+    with disposable_session_factory("unknown_delivery", monkeypatch) as sessions:
         yield sessions
 
 

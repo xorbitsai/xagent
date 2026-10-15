@@ -6,16 +6,37 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ...core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
+from ...core.agent.result import normalize_tool_failure_code
 from ..models.task import TaskStatus
 from .assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
 from .client_error_messages import (
     CLIENT_SAFE_TASK_FAILURE,
+    ClientErrorCode,
+    client_error_message,
     mask_provider_secrets,
     model_error_client_projection,
     with_task_reference,
 )
 
 EMPTY_CHANNEL_OUTPUT_FALLBACK = "Task completed, but no output was generated."
+_TOOL_FAILURE_CLIENT_CODES = {
+    "excel_workbook_access_denied": ClientErrorCode.EXCEL_WORKBOOK_ACCESS_DENIED,
+    "excel_site_not_found": ClientErrorCode.EXCEL_SITE_NOT_FOUND,
+    "excel_workbook_locked": ClientErrorCode.EXCEL_WORKBOOK_LOCKED,
+}
+
+
+def client_safe_failure_message(
+    result: Mapping[str, Any],
+) -> tuple[str, ClientErrorCode] | None:
+    """Map an allowlisted tool failure to a fixed client-facing message."""
+    failure_code = normalize_tool_failure_code(result.get("failure_code"))
+    if failure_code is None:
+        return None
+    client_code = _TOOL_FAILURE_CLIENT_CODES.get(failure_code)
+    if client_code is None:
+        return None
+    return client_error_message(client_code), client_code
 
 
 def interrupted_channel_result() -> dict[str, Any]:
@@ -84,15 +105,19 @@ class FailedResultPresentation:
 def present_failed_result(result: Mapping[str, Any]) -> FailedResultPresentation:
     """Decide how one failed result is shown to its owner and on the task stream.
 
-    A coded failure already on the result (the quota gate) takes precedence: its
-    fields pass through and no model failure is projected. Otherwise a recorded
-    model-provider failure is projected through ``model_error_client_projection``.
+    A coded failure already on the result (the quota gate or a classified tool
+    failure) takes precedence: its fields pass through and no model failure is
+    projected. Otherwise a recorded model-provider failure is projected through
+    ``model_error_client_projection``.
     """
     diagnostic_error = execution_result_diagnostic_error(result)
     existing_code = result.get("error_code")
+    safe_failure = (
+        None if existing_code is not None else client_safe_failure_message(result)
+    )
     projection = (
         model_error_client_projection(result.get("model_error"))
-        if existing_code is None
+        if existing_code is None and safe_failure is None
         else None
     )
     if projection is None:
@@ -105,6 +130,14 @@ def present_failed_result(result: Mapping[str, Any]) -> FailedResultPresentation
         # sentence for every task-stream surface.
         withheld = type(result.get("model_error")) is dict and existing_code is None
         error_details = result.get("error_details")
+        if safe_failure is not None:
+            safe_message, safe_code = safe_failure
+            return FailedResultPresentation(
+                diagnostic_error=diagnostic_error,
+                visible_text=safe_message,
+                error_code=safe_code.value,
+                error_details={"failure_code": result["failure_code"]},
+            )
         return FailedResultPresentation(
             diagnostic_error=diagnostic_error,
             visible_text=CLIENT_SAFE_TASK_FAILURE if withheld else None,
@@ -173,7 +206,15 @@ def project_execution_result_for_channel(
         interactions = []
     elif task_status == TaskStatus.FAILED:
         transcript_content = CLIENT_SAFE_TASK_FAILURE
-        base_text = with_task_reference(CLIENT_SAFE_TASK_FAILURE, task_id)
+        safe_failure = (
+            None
+            if result.get("error_code") is not None
+            else client_safe_failure_message(result)
+        )
+        base_text = with_task_reference(
+            safe_failure[0] if safe_failure is not None else CLIENT_SAFE_TASK_FAILURE,
+            task_id,
+        )
         interactions = []
     elif not base_text.strip() and not interactions:
         base_text = EMPTY_CHANNEL_OUTPUT_FALLBACK

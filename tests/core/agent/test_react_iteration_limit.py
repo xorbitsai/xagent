@@ -116,6 +116,54 @@ async def test_iteration_limit_preserves_file_links_and_outcome(outcome: str) ->
 
 
 @pytest.mark.asyncio
+async def test_auto_only_iteration_limit_accepts_plain_text_as_partial() -> None:
+    class AutoOnlyLLM(FakeLLM):
+        supports_forced_tool_choice = False
+
+    llm = AutoOnlyLLM(
+        [
+            tool_call("calculator", {"expression": "2+2"}, "work"),
+            {"content": "2+2 = 4; remaining work was not run."},
+        ]
+    )
+    context = ExecutionContext(execution_id="auto-only-iteration-limit")
+    context.add_user_message("Calculate 2+2 and then continue.")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[FakeTool()], llm=llm
+    )
+
+    assert result["success"] is True
+    assert result["completion_outcome"] == "partial"
+    assert result["termination_reason"] == "max_iterations"
+    assert "2+2 = 4" in result["output"]
+    assert llm.calls[-1]["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_auto_only_iteration_limit_rejects_truncated_plain_text() -> None:
+    class AutoOnlyLLM(FakeLLM):
+        supports_forced_tool_choice = False
+
+    llm = AutoOnlyLLM(
+        [
+            tool_call("calculator", {"expression": "2+2"}, "work"),
+            {"content": "2+2 = 4; remaining", "finish_reason": "length"},
+        ]
+    )
+    context = ExecutionContext(execution_id="truncated-auto-only-delivery")
+    context.add_user_message("Calculate 2+2 and then continue.")
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context, tools=[FakeTool()], llm=llm
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "max_iterations"
+    assert "output" not in result
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "response",
     [

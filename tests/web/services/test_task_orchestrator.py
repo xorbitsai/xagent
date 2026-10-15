@@ -1055,11 +1055,7 @@ def test_begin_turn_retires_failed_session_before_reconciliation(
         def close(self) -> None:
             events.append("close")
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: lambda: FailedSession(),
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", lambda: FailedSession())
     monkeypatch.setattr(
         task_orchestrator_module,
         "_claim_turn_no_commit",
@@ -1117,11 +1113,7 @@ def test_commit_reconciliation_accepts_a_late_visible_graph(
         created_sessions.append(session)
         return session
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
     monkeypatch.setattr(task_orchestrator_module.time, "sleep", MagicMock())
 
     assert (
@@ -1167,11 +1159,7 @@ def test_successful_commit_is_not_rejected_when_session_close_fails(
         def invalidate(self) -> None:
             events.append("invalidate")
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: lambda: CloseFailingSession(),
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", lambda: CloseFailingSession())
     monkeypatch.setattr(
         task_orchestrator_module,
         "_claim_turn_no_commit",
@@ -1230,11 +1218,7 @@ def test_reconciliation_read_failure_remains_commit_outcome_unknown(
             return FailedCommitSession()
         raise RuntimeError("reconciliation database unavailable")
 
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
     monkeypatch.setattr(
         task_orchestrator_module,
         "_claim_turn_no_commit",
@@ -2496,12 +2480,22 @@ async def test_schedule_bg_resolves_scope_off_loop_before_execution(
     assert resolver_threads and resolver_threads[0] != loop_thread
 
 
-@pytest.mark.parametrize("failure_point", ["missing_snapshot", "execute_error"])
+@pytest.mark.parametrize(
+    ("failure_point", "expect_flag"),
+    [
+        ("missing_snapshot", True),
+        ("execute_error", True),
+        ("success", False),
+        ("paused", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_schedule_bg_persists_setup_failures_off_loop(
+async def test_schedule_bg_settles_off_loop_and_registers_failure_flag(
     db_session,
     failure_point,
+    expect_flag,
 ) -> None:
+    from xagent.core.agent.interruption import InterruptionReason
     from xagent.web.services.task_execution import background_task_manager
 
     user = _create_user(db_session)
@@ -2516,13 +2510,18 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
     execute = AsyncMock(
         side_effect=(
             RuntimeError("simulated execute failure")
-            if failure_point == "execute_error"
+            if failure_point in ("execute_error", "paused")
             else None
         )
     )
 
-    def record_failure(*_args, **_kwargs) -> None:
+    def record_failure(*_args, **settle_kwargs) -> bool | None:
         marker_threads.append(get_ident())
+        if failure_point == "paused":
+            # The settlement reports the handled failure as a pause.
+            settle_kwargs["report"].paused_for = InterruptionReason.PERSISTENCE_FAILURE
+            return True
+        return None
 
     with (
         patch(
@@ -2551,7 +2550,11 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
             "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
             side_effect=record_failure,
         ),
-        patch.object(background_task_manager, "register_task"),
+        patch.object(background_task_manager, "register_task") as register,
+        patch(
+            "xagent.web.services.task_orchestrator.publish_settlement_pause",
+            new=AsyncMock(),
+        ) as publish_pause,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2565,8 +2568,16 @@ async def test_schedule_bg_persists_setup_failures_off_loop(
             force_fresh=False,
             context=None,
         )
+        (_, bg_task), kwargs = register.call_args
+        await bg_task
 
     assert marker_threads and marker_threads[0] != loop_thread
+    # The runner settles every outcome and returns normally; the registration's
+    # failure flag is what reports a handled failure to the per-process
+    # execution counts, and a pause is not a failure.
+    assert bg_task.exception() is None
+    assert kwargs["failure_flag"]() is expect_flag
+    assert publish_pause.await_count == int(failure_point == "paused")
 
 
 @pytest.mark.asyncio
@@ -2888,7 +2899,7 @@ async def test_schedule_bg_releases_lease_without_blocking_pool_checkout(
         task.run_id = "run-a"
         seed_db.commit()
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connection = engine.connect()
     ticker_stop = asyncio.Event()
     ticks = 0
@@ -3530,7 +3541,7 @@ async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
         run_id="run-a",
         attempt_id="test-attempt",
     )
-    public_message = "Required MCP servers are unavailable."
+    public_message = "Required MCP servers are unavailable: mcp_server_unavailable."
 
     with (
         patch(

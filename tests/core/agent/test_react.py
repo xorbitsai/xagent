@@ -76,6 +76,156 @@ class EmptyArgs(BaseModel):
     pass
 
 
+def test_latest_tool_failure_code_is_scoped_to_current_user_turn() -> None:
+    previous = SimpleNamespace(
+        role="tool",
+        metadata={
+            "raw_result": {"success": False, "failure_code": "excel_site_not_found"}
+        },
+    )
+    user = SimpleNamespace(role="user", metadata={})
+    current = SimpleNamespace(
+        role="tool",
+        metadata={
+            "raw_result": {
+                "success": False,
+                "failure_code": "excel_workbook_access_denied",
+            }
+        },
+    )
+    context = SimpleNamespace(messages=[previous, user, current])
+
+    assert (
+        ReActPattern._latest_tool_failure_code(context)
+        == "excel_workbook_access_denied"
+    )
+
+
+def test_latest_tool_failure_code_rejects_unallowlisted_code() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_rejects_non_string_code() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": 123},
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_stops_at_a_later_non_dict_result() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="tool", metadata={"raw_result": "completed"}),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_cross_a_failed_current_turn() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {"success": False, "failure_code": "arbitrary"}
+                },
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_drops_stale_failure_after_success() -> None:
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"status": "success"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
+def test_latest_tool_failure_code_does_not_reuse_older_code_after_uncoded_failure() -> (
+    None
+):
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(role="user", metadata={}),
+            SimpleNamespace(
+                role="tool",
+                metadata={
+                    "raw_result": {
+                        "success": False,
+                        "failure_code": "excel_site_not_found",
+                    }
+                },
+            ),
+            SimpleNamespace(
+                role="tool",
+                metadata={"raw_result": {"success": False, "error": "other failure"}},
+            ),
+        ]
+    )
+
+    assert ReActPattern._latest_tool_failure_code(context) is None
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -426,6 +576,28 @@ class FakeLLM:
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+def final_answer_response(
+    answer: str, response_language: str = "English"
+) -> dict[str, Any]:
+    return {
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_final",
+                "function": {
+                    "name": "final_answer",
+                    "arguments": json.dumps(
+                        {
+                            "response_language": response_language,
+                            "answer": answer,
+                        }
+                    ),
+                },
+            }
+        ],
+    }
 
 
 class FakeNamedLLM(FakeLLM):
@@ -1577,10 +1749,10 @@ async def test_react_retries_provider_tool_protocol_error_with_work_tools() -> N
     assert llm_end_events[1]["data"]["success"] is True
 
 
-def test_react_accepts_null_tool_calls_in_forced_final_response() -> None:
+def test_react_rejects_null_tool_calls_in_forced_final_response() -> None:
     pattern = ReActPattern()
 
-    assert not pattern._response_requires_tool_protocol_retry(
+    assert pattern._response_requires_tool_protocol_retry(
         {"content": "Done.", "tool_calls": None},
         force_final_answer=True,
     )
@@ -3174,7 +3346,7 @@ async def test_react_pattern_finalizes_with_completion_evidence() -> None:
                 ],
                 "done": False,
             },
-            {"content": "Created output/en_poster.html."},
+            final_answer_response("Created output/en_poster.html."),
         ]
     )
     pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
@@ -3248,7 +3420,7 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3353,7 +3525,7 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
                     }
                 ],
             },
-            "Both pending searches were executed.",
+            final_answer_response("Both pending searches were executed."),
         ]
     )
     pattern = ReActPattern(
@@ -3440,7 +3612,7 @@ async def test_react_pattern_uses_decision_after_cross_tool_attempts() -> None:
                     }
                 ],
             },
-            "已有跨工具结果，直接回答。",
+            final_answer_response("已有跨工具结果，直接回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3529,7 +3701,7 @@ async def test_react_pattern_uses_decision_after_tool_group_successes() -> None:
                     }
                 ],
             },
-            "AirPods 4 uses USB-C.",
+            final_answer_response("AirPods 4 uses USB-C."),
         ]
     )
     pattern = ReActPattern(
@@ -3609,7 +3781,7 @@ async def test_react_pattern_accepts_legacy_auto_reroute_kwarg() -> None:
                     }
                 ],
             },
-            "可以基于已有搜索结果回答。",
+            final_answer_response("可以基于已有搜索结果回答。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(
@@ -3830,7 +4002,7 @@ async def test_react_pattern_repeated_guard_can_fire_twice_in_single_run() -> No
                     }
                 ],
             },
-            "第三次搜索后信息足够。",
+            final_answer_response("第三次搜索后信息足够。", "Simplified Chinese"),
         ]
     )
     pattern = ReActPattern(

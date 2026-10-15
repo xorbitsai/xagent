@@ -80,12 +80,14 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
         ACTOR_STDIO_SHADOWED_REASON,
         NESTED_DELEGATION_NOT_APPROVABLE_REASON,
         "adapter_construction",
+        "auth_rejected",
         "authorization_required",
         "catalog_app_not_found",
         "config_load_failed",
         "initialize",
         "insufficient_scope",
         "invalid_config",
+        "invalid_configuration",
         "invalid_launch_config",
         "list_tools",
         "loader_failed",
@@ -184,6 +186,8 @@ def _normalize_mcp_unavailable_summaries(
             safe_summary = MCPUnavailableSummary.from_values(
                 summary.server_name,
                 summary.reason,
+                cause_type=summary.cause_type,
+                status_code=summary.status_code,
             )
         else:
             safe_summary = MCPUnavailableSummary.from_values(None, None)
@@ -215,12 +219,38 @@ class MCPConfigLoadError(RuntimeError):
         super().__init__("MCP server configurations could not be loaded.")
 
 
+_REQUIRED_MCP_UNAVAILABLE_PREFIX = "Required MCP servers are unavailable"
+
+
+def _required_mcp_unavailable_message(
+    summaries: tuple[MCPUnavailableSummary, ...],
+) -> str:
+    """Name each failure by its reason code and HTTP status, never by server.
+
+    The text is broadcast to every viewer of the task, so it carries only
+    allowlisted reason codes and validated integers. Server names stay in
+    ``summaries``.
+    """
+    details: list[str] = []
+    for summary in summaries:
+        detail = summary.reason
+        if summary.status_code is not None:
+            detail = f"{detail} (HTTP {summary.status_code})"
+        if detail not in details:
+            details.append(detail)
+    return f"{_REQUIRED_MCP_UNAVAILABLE_PREFIX}: {', '.join(details)}."
+
+
 class RequiredMCPUnavailableError(RuntimeError):
-    """A selected MCP dependency is unavailable under strict setup policy."""
+    """A selected MCP dependency is unavailable under strict setup policy.
+
+    ``str(error)`` names the reason code and HTTP status of each failure and
+    no server name; the per-server records are in ``summaries``.
+    """
 
     def __init__(self, summaries: Iterable[MCPUnavailableSummary]) -> None:
         self.summaries = _normalize_mcp_unavailable_summaries(summaries)
-        super().__init__("Required MCP servers are unavailable.")
+        super().__init__(_required_mcp_unavailable_message(self.summaries))
 
 
 def enforce_mcp_failure_policy(

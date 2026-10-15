@@ -9,7 +9,7 @@ from functools import lru_cache
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from ...config import DEV_FALLBACK_ENCRYPTION_KEY
+from ...config import DEV_FALLBACK_ENCRYPTION_KEY, get_environment
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 def _get_encryption_key() -> str:
     encryption_key = os.getenv("ENCRYPTION_KEY")
     if not encryption_key:
-        env = os.getenv("ENVIRONMENT", "development")
+        env = get_environment()
         if env != "development":
             raise ValueError(
                 "ENCRYPTION_KEY environment variable is not set in non-development environment"

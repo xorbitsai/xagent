@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import sys
 import threading
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -23,6 +25,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_database_shared import engine as engine_fixture
+from xagent.web.models import database
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
@@ -79,16 +82,41 @@ def _clean_signals():
     ops_signals.clear_degradation(ops_signals.TASK_AUTO_RESUME_UNAVAILABLE)
 
 
+# Captured at import, before any fixture patches ``database``.
+_REAL_DATABASE_ACCESSORS = {
+    "get_session_local": database.get_session_local,
+    "get_engine": database.get_engine,
+}
+
+
+def _stale_database_accessors() -> set[str]:
+    """Loaded modules whose imported database accessors are not the real ones."""
+    return {
+        f"{name}.{attr}"
+        for name, module in list(sys.modules.items())
+        if name.startswith("xagent.") and module is not None
+        for attr, real in _REAL_DATABASE_ACCESSORS.items()
+        if getattr(module, attr, real) is not real
+    }
+
+
 @pytest.fixture
-def factory(engine, monkeypatch) -> sessionmaker:
+def factory(engine, monkeypatch) -> Iterator[sessionmaker]:
     Base.metadata.create_all(engine)
     result = sessionmaker(engine, autoflush=False)
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: result)
+    # Patch the globals behind the accessors, never the accessors: a module
+    # first imported mid-test binds ``get_session_local`` by name and would
+    # keep this test's database after monkeypatch restores ``database``.
+    monkeypatch.setattr(database, "_SessionLocal", result)
     # Selects the PostgreSQL row-lock path or the SQLite CAS path.
-    monkeypatch.setattr("xagent.web.models.database.get_engine", lambda: engine)
+    monkeypatch.setattr(database, "_engine", engine)
     for name in _ENV:
         monkeypatch.delenv(name, raising=False)
-    return result
+    # Only flag what this test leaked; other files may still leak the old way.
+    stale_before = _stale_database_accessors()
+    yield result
+    leaked = sorted(_stale_database_accessors() - stale_before)
+    assert not leaked, f"modules bound a patched database accessor: {leaked}"
 
 
 @pytest.fixture

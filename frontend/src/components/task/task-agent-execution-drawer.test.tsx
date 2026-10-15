@@ -9,12 +9,27 @@ vi.mock("@/lib/api-wrapper", () => ({ apiRequest: request }))
 vi.mock("@/lib/utils", async (original) => ({
   ...await original<typeof import("@/lib/utils")>(), getApiUrl: () => "https://example.test",
 }))
-vi.mock("./agent-execution-panel", () => ({
-  sanitizeAgentExecutionTraceEvents: (events: unknown) => events || [],
-  AgentExecutionPanel: ({ detail, loading }: { detail: { output?: string } | null; loading: boolean }) => (
-    <div>{loading ? "Loading child" : detail?.output}</div>
-  ),
+const realPanel = vi.hoisted(() => ({ enabled: false }))
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }))
+vi.mock("@/contexts/app-context-chat", () => ({
+  useApp: () => ({ dispatch: vi.fn(), openFilePreview: vi.fn(), filesDisabled: false }),
 }))
+vi.mock("@/components/file/docx-preview-renderer", () => ({ DocxPreviewRenderer: () => null }))
+vi.mock("@/components/file/excel-preview-renderer", () => ({ ExcelPreviewRenderer: () => null }))
+vi.mock("@/components/file/pptx-preview-renderer", () => ({ PptxPreviewRenderer: () => null }))
+vi.mock("./agent-execution-panel", async () => {
+  const actual = await vi.importActual<typeof import("./agent-execution-panel")>("./agent-execution-panel")
+  return {
+    ...actual,
+    sanitizeAgentExecutionTraceEvents: (events: unknown) =>
+      realPanel.enabled ? actual.sanitizeAgentExecutionTraceEvents(events) : events || [],
+    // Tests that assert on the rendered trace opt in through realPanel.
+    AgentExecutionPanel: (props: React.ComponentProps<typeof actual.AgentExecutionPanel>) =>
+      realPanel.enabled ? <actual.AgentExecutionPanel {...props} /> : (
+        <div>{props.loading ? "Loading child" : (props.detail as { output?: string } | null)?.output}</div>
+      ),
+  }
+})
 const selection = { workerTaskId: "child/a", agentName: "Researcher", status: "running" as const }
 const response = (status: string, output: string) => ({ ok: true, json: async () => ({ status, output, trace_events: [] }) })
 const view = (taskId = 1, workerTaskId = selection.workerTaskId) => (
@@ -24,7 +39,7 @@ const view = (taskId = 1, workerTaskId = selection.workerTaskId) => (
 )
 
 beforeEach(() => { vi.useFakeTimers(); request.mockReset() })
-afterEach(() => { cleanup(); vi.useRealTimers() })
+afterEach(() => { cleanup(); vi.useRealTimers(); realPanel.enabled = false })
 
 describe("TaskAgentExecutionDrawer", () => {
   it("loads the selected authorized child scope and refreshes until terminal", async () => {
@@ -64,5 +79,31 @@ describe("TaskAgentExecutionDrawer", () => {
     expect(signal.aborted).toBe(true)
     await act(async () => { await vi.advanceTimersByTimeAsync(10000) })
     expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it("stops a worker's steps once the inspector reports it interrupted", async () => {
+    realPanel.enabled = true
+    request.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        status: "interrupted",
+        output: "",
+        trace_events: [
+          { event_id: "start", event_type: "react_task_start", step_id: "s1", timestamp: 1000, data: {} },
+          {
+            event_id: "tool",
+            event_type: "tool_execution_start",
+            step_id: "s1",
+            timestamp: 2000,
+            data: { tool_name: "web_search", tool_args: { query: "probe" } },
+          },
+        ],
+      }),
+    })
+    await act(async () => { render(view()) })
+
+    expect(document.body.querySelector(".animate-spin")).toBeNull()
+    expect(document.body.querySelector("svg[data-icon='interrupted']")).not.toBeNull()
+    expect(document.body.querySelector(".bg-amber-100")).toHaveTextContent("Interrupted")
   })
 })

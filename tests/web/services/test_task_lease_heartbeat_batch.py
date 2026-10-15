@@ -25,7 +25,7 @@ def scenario(engine, task_id, monkeypatch):
     if engine.dialect.name != "postgresql":
         pytest.skip("PostgreSQL row locking")
     factory = sessionmaker(engine)
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     with factory() as db:
         uid = db.get(Task, task_id).user_id
         ids = [task_id]
@@ -456,9 +456,7 @@ def test_preexecution_validation_waits_for_definitive_ownership(scenario, monkey
             return self
 
     validation_factory = sessionmaker(factory.kw["bind"], class_=ValidationSession)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: validation_factory
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", validation_factory)
     with factory() as blocker, ThreadPoolExecutor(1) as pool:
         blocker.execute(
             update(Task)

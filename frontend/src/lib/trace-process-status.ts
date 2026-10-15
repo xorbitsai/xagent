@@ -101,7 +101,14 @@ export const resolveTraceProcessStatus = ({
   if (explicit && isStoppedTraceProcessStatus(explicit)) {
     return explicit
   }
-  if (inferred && isStoppedTraceProcessStatus(inferred)) {
+  // An "interrupted" end event belongs to a run that a later resume may have
+  // replaced; it must not override a caller that says the task is running or
+  // pending.
+  if (
+    inferred &&
+    isStoppedTraceProcessStatus(inferred) &&
+    !(inferred === "interrupted" && (explicit === "running" || explicit === "pending"))
+  ) {
     return inferred
   }
   return explicit || inferred

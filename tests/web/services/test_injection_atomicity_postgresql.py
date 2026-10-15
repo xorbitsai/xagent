@@ -253,7 +253,7 @@ def leased_task(monkeypatch):
         engine = make_database("pause")
         Base.metadata.create_all(engine)
         sessions = sessionmaker(bind=engine)
-        monkeypatch.setattr(database, "get_session_local", lambda: sessions)
+        monkeypatch.setattr(database, "_SessionLocal", sessions)
         publish = AsyncMock()
         monkeypatch.setattr(task_events, "publish_task_event", publish)
         with sessions() as db:

@@ -394,6 +394,10 @@ class BoundaryLLM(BaseLLM):
         return self._inner.supports_json_object_response_format
 
     @property
+    def supports_forced_tool_choice(self) -> bool:
+        return self._inner.supports_forced_tool_choice
+
+    @property
     def supports_native_video_input(self) -> bool:
         return self._inner.supports_native_video_input
 

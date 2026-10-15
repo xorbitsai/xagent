@@ -366,7 +366,22 @@ async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answe
                     }
                 ]
             },
-            {"content": "done", "done": True},
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "done",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
         ]
     )
     tool = FakeTool()
@@ -1686,6 +1701,55 @@ def test_execution_adapter_promotes_model_error_keys_and_keeps_output_backfill()
     assert result["model_error"] == model_error
     assert result["output"] == aggregate
     assert result["error"] == aggregate
+
+
+def test_execution_adapter_propagates_allowlisted_tool_failure_code() -> None:
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "error": "truncated_tool_arguments",
+            "failure_code": "excel_workbook_access_denied",
+        },
+        execution_type="agent_react",
+        execution_id="client-safe-error-exec",
+    )
+
+    assert result["failure_code"] == "excel_workbook_access_denied"
+
+
+@pytest.mark.parametrize("status", ["error", "max_iterations", "model_error"])
+def test_execution_adapter_propagates_failure_code_on_any_failed_status(status):
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": status,
+            "error": "failed",
+            "failure_code": "excel_workbook_locked",
+        },
+        execution_type="agent_react",
+        execution_id="failure-code-status-exec",
+    )
+
+    assert result["failure_code"] == "excel_workbook_locked"
+
+
+@pytest.mark.parametrize("value", ["arbitrary", "x" * 501, 123, None])
+def test_execution_adapter_rejects_unallowlisted_tool_failure_code(
+    value: Any,
+) -> None:
+    result = _plain_react_adapter()._normalize_result(
+        result={
+            "success": False,
+            "status": "invalid_tool_protocol",
+            "error": "truncated_tool_arguments",
+            "failure_code": value,
+        },
+        execution_type="agent_react",
+        execution_id="invalid-client-safe-error-exec",
+    )
+
+    assert "failure_code" not in result
 
 
 @pytest.mark.parametrize(

@@ -172,7 +172,7 @@ async def test_composite_records_survive_unavailable_personal_database(
         b"---\ndescription: filesystem\n---\n# Filesystem writer\n"
     )
 
-    monkeypatch.setattr(database, "get_optional_session_local", lambda: None)
+    monkeypatch.setattr(database, "_SessionLocal", None)
     provider = CompositeSkillLibraryProvider(
         [
             FilesystemSkillLibraryProvider([tmp_path]),
@@ -205,8 +205,8 @@ async def test_composite_propagates_personal_database_failure_without_partial_re
 
     monkeypatch.setattr(
         database,
-        "get_optional_session_local",
-        lambda: _failing_session_factory,
+        "_SessionLocal",
+        _failing_session_factory,
     )
     provider = CompositeSkillLibraryProvider(
         [

@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task, TaskStatus
+from ..models.task_auto_recovery import TaskAutoRecoveryState
 from .assistant_history_safety import (
     ASSISTANT_RESPONSE_MESSAGE_TYPE,
     assistant_history_values_for_persistence,
@@ -35,7 +36,7 @@ from .task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
-from .task_settlement_report import SettlementReport
+from .task_settlement_report import RecordedInterruption, SettlementReport
 from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
@@ -71,9 +72,11 @@ def finalize_managed_task_lease_result(
     leave it off, their tasks are never eligible), a FAILED result that reports
     an interruption is decided as the other result paths decide it: a
     recoverable run rests PAUSED with no failure transcript, error or result,
-    and its channel result says it was interrupted (as lease recovery's does).
-    It needs ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` (off by default), as
-    on the other paths. A database connectivity failure while deciding raises
+    and its channel result says it was interrupted (as lease recovery's does),
+    unless the pause scheduled an automatic resume: then no channel result is
+    written and the channel waits for the resumed run's answer.
+    It follows ``settlement_pause_enabled``, as on the other paths. A
+    database connectivity failure while deciding raises
     ``InterruptionSettlementDeferred`` after rolling back, keeping the lease
     for TTL recovery; any other decision fault settles as before. Every
     decided interruption is recorded in ``task_auto_recovery``.
@@ -101,6 +104,7 @@ def finalize_managed_task_lease_result(
     from .task_orchestrator import invalidate_task_cache_best_effort
 
     run_error = error_message
+    recorded: RecordedInterruption | None = None
     try:
         interruption: InterruptionDecision | None = None
         if settle_interruption and status == TaskStatus.FAILED:
@@ -154,7 +158,7 @@ def finalize_managed_task_lease_result(
             # Projects the workforce run itself for a pause.
             if not paused:
                 sync_workforce_run_status(db, task, status)
-            apply_interruption_outcome_no_commit(
+            recorded = apply_interruption_outcome_no_commit(
                 db, task=task, decision=interruption, error=run_error
             )
         else:
@@ -201,11 +205,19 @@ def finalize_managed_task_lease_result(
             ):
                 db.rollback()
                 return False
+            stored: dict[str, Any] | None = channel_result
             if paused:
-                channel_result = interrupted_channel_result()
-            setattr(
-                command, "result", {**command.result, "channel_result": channel_result}
-            )
+                # A scheduled resume holds the reply: the reader decides from
+                # the recovery row (``_read_channel_result``), and the resumed
+                # run stores its answer here. Anything else is interrupted.
+                stored = (
+                    None
+                    if recorded is not None
+                    and recorded.state == TaskAutoRecoveryState.SCHEDULED.value
+                    else interrupted_channel_result()
+                )
+            if stored is not None:
+                setattr(command, "result", {**command.result, "channel_result": stored})
             if not paused:
                 # A pause keeps the previous output, as lease recovery does.
                 setattr(
@@ -226,6 +238,7 @@ def finalize_managed_task_lease_result(
         if report is not None:
             report.control_state = dict(paused_state)
             report.paused_for = interruption.reason
+            report.recovery = recorded
         logger.warning(
             "task_id=%s run_id=%s component=settlement paused interrupted "
             "channel run (reason=%s): %s",

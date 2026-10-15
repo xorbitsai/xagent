@@ -36,6 +36,7 @@ import psycopg2
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
+from sqlalchemy.orm import Session, sessionmaker
 
 
 def psycopg2_kwargs(base_url: str, dbname: str | None = None) -> dict[str, object]:
@@ -134,6 +135,31 @@ def disposable_database_factory(
                 "disposable databases left behind on the server; drop them "
                 "by hand: " + "; ".join(undropped)
             )
+
+
+@contextmanager
+def disposable_session_factory(
+    prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[sessionmaker[Session]]:
+    """Yield a Session factory on one disposable database that holds every
+    ORM table, installed as production code's global engine and Session
+    factory until ``monkeypatch`` undoes it.
+
+    For suites that drive production code which opens its own sessions
+    through ``xagent.web.models.database``. Skips the test the same way
+    ``disposable_database_factory`` does, and ``prefix`` is passed to it.
+    """
+    # Imported here so the suites that only need the factory above do not
+    # load the ORM models.
+    from xagent.web.models import database
+
+    with disposable_database_factory(prefix) as make_database:
+        engine = make_database("t")
+        database.Base.metadata.create_all(engine)
+        sessions = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        monkeypatch.setattr(database, "_engine", engine)
+        monkeypatch.setattr(database, "_SessionLocal", sessions)
+        yield sessions
 
 
 def load_migration_module(path: Path, name: str = "migration_under_test") -> ModuleType:

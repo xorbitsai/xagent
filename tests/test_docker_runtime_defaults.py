@@ -19,6 +19,7 @@ def test_backend_image_defaults_to_two_agent_workers_with_persistent_key_path():
         "ENV XAGENT_ENCRYPTION_KEY_FILE=/run/xagent-secrets/encryption.key"
         in dockerfile
     )
+    assert "ENV XAGENT_JWT_SECRET_FILE=/run/xagent-secrets/jwt.secret" in dockerfile
 
 
 def test_compose_shares_private_key_volume_across_xagent_services():
@@ -45,6 +46,9 @@ def _entrypoint_environment(install_root: Path) -> dict[str, str]:
     for name in (
         "DISPLAY",
         "ENCRYPTION_KEY",
+        "XAGENT_JWT_SECRET",
+        "XAGENT_JWT_SECRET_FILE",
+        "XAGENT_ENVIRONMENT",
         "XAGENT_ENCRYPTION_KEY_FILE",
         "XAGENT_TASK_EXECUTION_ROLE",
     ):
@@ -60,7 +64,8 @@ def _run_entrypoint(tmp_path: Path, environment: dict[str, str]):
             sys.executable,
             "-c",
             'import os; print(os.environ["ENCRYPTION_KEY"]); '
-            'print(os.environ.get("DISPLAY", ""))',
+            'print(os.environ.get("DISPLAY", "")); '
+            'print(os.environ.get("XAGENT_JWT_SECRET", ""))',
         ],
         cwd=REPOSITORY_ROOT,
         env=environment,
@@ -109,6 +114,48 @@ def test_entrypoint_explicit_key_takes_precedence(tmp_path):
     assert result.stdout.splitlines()[0] == explicit_key
     assert result.stderr == ""
     assert key_path.read_text(encoding="utf-8") == file_key
+
+
+def test_entrypoint_bootstraps_and_reuses_jwt_secret(tmp_path):
+    key_path = tmp_path / "jwt.secret"
+    environment = _entrypoint_environment(tmp_path)
+    environment.update(
+        {
+            "ENCRYPTION_KEY": Fernet.generate_key().decode(),
+            "XAGENT_ENVIRONMENT": "production",
+            "XAGENT_JWT_SECRET": "replace-with-a-long-random-secret",
+            "XAGENT_JWT_SECRET_FILE": str(key_path),
+        }
+    )
+
+    created = _run_entrypoint(tmp_path, environment)
+    reused = _run_entrypoint(tmp_path, environment)
+
+    created_secret = created.stdout.splitlines()[2]
+    assert len(created_secret) >= 32
+    assert reused.stdout.splitlines()[2] == created_secret
+    assert key_path.read_text(encoding="utf-8").strip() == created_secret
+    assert "generated a new one" in created.stderr
+    assert "reusing the existing secret" in reused.stderr
+
+
+def test_entrypoint_explicit_jwt_secret_takes_precedence(tmp_path):
+    key_path = tmp_path / "jwt.secret"
+    explicit_secret = "an-explicit-strong-jwt-secret-value"
+    environment = _entrypoint_environment(tmp_path)
+    environment.update(
+        {
+            "ENCRYPTION_KEY": Fernet.generate_key().decode(),
+            "XAGENT_ENVIRONMENT": "production",
+            "XAGENT_JWT_SECRET": explicit_secret,
+            "XAGENT_JWT_SECRET_FILE": str(key_path),
+        }
+    )
+
+    result = _run_entrypoint(tmp_path, environment)
+
+    assert result.stdout.splitlines()[2] == explicit_secret
+    assert not key_path.exists()
 
 
 def test_entrypoint_initializes_display_for_standalone_agent_worker(tmp_path):

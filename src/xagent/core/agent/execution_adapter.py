@@ -20,7 +20,7 @@ from .interruption import (
 )
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
-from .result import NO_OUTPUT_PLACEHOLDER
+from .result import NO_OUTPUT_PLACEHOLDER, normalize_tool_failure_code
 from .runner import AgentRunner, UserMessageInjectionOutcome
 from .tracing import TraceEventCallback
 
@@ -490,6 +490,9 @@ class AgentExecutionAdapter:
         model_error = result.get("model_error")
         if type(model_error) is dict:
             normalized["model_error"] = model_error
+        failure_code = normalize_tool_failure_code(result.get("failure_code"))
+        if failure_code is not None:
+            normalized["failure_code"] = failure_code
         if status == "waiting_for_user":
             message = str(result.get("message") or output or "")
             interactions = result.get("interactions")

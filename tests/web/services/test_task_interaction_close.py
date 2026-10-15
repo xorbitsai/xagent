@@ -576,7 +576,7 @@ def test_active_interaction_id_sync_reports_absence_without_a_session_factory(
     row", but as ``ActiveInteractionUnavailable`` and only after logging a
     warning this branch is specifically here to avoid."""
 
-    monkeypatch.setattr(database_module, "get_optional_session_local", lambda: None)
+    monkeypatch.setattr(database_module, "_SessionLocal", None)
 
     with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
         result = active_interaction_id_sync(1)
@@ -605,9 +605,7 @@ def test_active_interaction_id_sync_reports_unavailable_when_opening_a_session_f
     def _broken_session_local() -> None:
         raise RuntimeError("database file has been removed")
 
-    monkeypatch.setattr(
-        database_module, "get_optional_session_local", lambda: _broken_session_local
-    )
+    monkeypatch.setattr(database_module, "_SessionLocal", _broken_session_local)
 
     with caplog.at_level(logging.WARNING, logger=_CLOSE_MODULE_NAME):
         result = active_interaction_id_sync(1)
@@ -827,9 +825,7 @@ def test_close_keeps_the_marker_when_the_pre_injection_read_failed(
         raise sa.exc.OperationalError("SELECT 1", {}, Exception("database is locked"))
 
     with monkeypatch.context() as failing_read:
-        failing_read.setattr(
-            database_module, "get_optional_session_local", lambda: _broken_session_local
-        )
+        failing_read.setattr(database_module, "_SessionLocal", _broken_session_local)
         active_interaction_read = active_interaction_id_sync(task_id)
 
     assert active_interaction_read == ActiveInteractionUnavailable(

@@ -249,12 +249,14 @@ async def test_unstarted_tool_keeps_generic_persistence_failure(
 ):
     """No started attempt means no unknown effect: the tool never ran.
 
-    With interruption pauses switched off -- explicitly, or by the default
-    until automatic resume ships -- the run fails as it always has.
+    With interruption pauses switched off -- explicitly, or by default with
+    automatic resume off, which the unset switch follows -- the run fails as
+    it always has.
     """
 
     if pause_switch is None:
         monkeypatch.delenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", raising=False)
+        monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
     else:
         monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", pause_switch)
     factory, tid = canonical
@@ -276,13 +278,18 @@ async def test_unstarted_tool_keeps_generic_persistence_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pause_switch", ["true", None])
 async def test_unstarted_tool_persistence_failure_pauses_the_run(
-    canonical, monkeypatch
+    canonical, monkeypatch, pause_switch
 ):
-    """With the pause switch on the same failure pauses the run: it has a
-    checkpoint."""
+    """With the pause switch on -- explicitly, or by default with automatic
+    resume on -- the same failure pauses the run: it has a checkpoint."""
 
-    monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", "true")
+    if pause_switch is None:
+        monkeypatch.delenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", raising=False)
+        monkeypatch.delenv("XAGENT_TASK_AUTO_RESUME_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED", pause_switch)
     factory, tid = canonical
     with factory() as db:
         lease = acquire_task_lease(db, tid, new_run=True)

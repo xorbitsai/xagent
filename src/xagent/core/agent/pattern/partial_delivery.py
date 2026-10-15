@@ -6,6 +6,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 
+from ...model.chat.basic.base import compatible_tool_choice_for_llm
 from ...model.chat.tool_protocol import get_tool_protocol_error
 from ..runtime import (
     ExecutionInterrupted,
@@ -24,6 +25,7 @@ async def request_partial_delivery(
     schema: dict[str, Any],
     parse_response: Callable[[Any], dict[str, Any] | None],
     metadata: dict[str, Any],
+    parse_plain_text_response: Callable[[Any], dict[str, Any] | None] | None = None,
     timeout: float = 30.0,
 ) -> dict[str, Any] | None:
     """One buffered answer-only call. Never execute tools or repair/retry it.
@@ -41,16 +43,27 @@ async def request_partial_delivery(
             await runtime.on_llm_start(
                 context=context, messages=messages, tools=[schema], metadata=metadata
             )
+            forced_choice = {
+                "type": "function",
+                "function": {"name": "final_answer"},
+            }
             response = await runtime.run_llm_call(
                 call_llm,
                 messages=messages,
                 tools=[schema],
-                tool_choice={"type": "function", "function": {"name": "final_answer"}},
+                tool_choice=compatible_tool_choice_for_llm(call_llm, forced_choice),
                 # Kept small on purpose: the call must finish inside ``timeout``.
                 max_tokens=2048,
             )
         protocol_error = get_tool_protocol_error(response)
         args = parse_response(response) if protocol_error is None else None
+        if (
+            args is None
+            and protocol_error is None
+            and parse_plain_text_response is not None
+            and not getattr(call_llm, "supports_forced_tool_choice", True)
+        ):
+            args = parse_plain_text_response(response)
         if args is not None and not Draft202012Validator(
             schema["function"]["parameters"]
         ).is_valid(args):

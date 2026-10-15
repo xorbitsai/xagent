@@ -143,10 +143,7 @@ def test_isolated_acquire_closes_session_on_success() -> None:
     fake_lease = TaskLease(task_id=42, runner_id="runner-x")
 
     with (
-        patch(
-            "xagent.web.models.database.get_session_local",
-            return_value=fake_factory,
-        ),
+        patch("xagent.web.models.database._SessionLocal", fake_factory),
         patch(
             "xagent.web.services.task_lease_service.acquire_task_lease",
             return_value=fake_lease,
@@ -169,10 +166,7 @@ def test_isolated_acquire_closes_session_on_inner_exception() -> None:
     boom = RuntimeError("simulated DB connectivity failure")
 
     with (
-        patch(
-            "xagent.web.models.database.get_session_local",
-            return_value=fake_factory,
-        ),
+        patch("xagent.web.models.database._SessionLocal", fake_factory),
         patch(
             "xagent.web.services.task_lease_service.acquire_task_lease",
             side_effect=boom,

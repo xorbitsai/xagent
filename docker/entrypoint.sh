@@ -11,6 +11,17 @@ if [[ -z "${ENCRYPTION_KEY:-}" && -n "${XAGENT_ENCRYPTION_KEY_FILE:-}" ]]; then
   export ENCRYPTION_KEY
 fi
 
+# The checked-in example.env intentionally contains a recognizable placeholder.
+# The stock image replaces only that exact placeholder (or an unset value) with
+# a persistent secret shared by every service using the secrets volume. Other
+# weak explicit values still fail startup validation.
+if [[ -n "${XAGENT_JWT_SECRET_FILE:-}" \
+      && ( -z "${XAGENT_JWT_SECRET:-}" \
+           || "${XAGENT_JWT_SECRET}" == "replace-with-a-long-random-secret" ) ]]; then
+  XAGENT_JWT_SECRET="$(python -m xagent.web.jwt_secret_bootstrap "${XAGENT_JWT_SECRET_FILE}")"
+  export XAGENT_JWT_SECRET
+fi
+
 # Docker Compose uses this image for Celery worker and scheduler services too;
 # execute those overrides without an unnecessary Xvfb. A standalone Agent
 # worker can use browser automation, so its override continues through display

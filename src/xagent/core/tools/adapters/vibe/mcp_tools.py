@@ -276,10 +276,13 @@ async def _finish_mcp_setup(
     summary: MCPToolLoadSummary,
     tools: List[Any],
 ) -> List[Any]:
-    """Emit once before enforcing the caller-owned setup policy."""
+    """Emit once, enforce the caller-owned setup policy, then drop records
+    that are not offered to the model."""
+    from .mcp_adapter import model_visible_mcp_tools
+
     await _emit_mcp_load_summary(config, summary)
     enforce_mcp_failure_policy(config.get_mcp_failure_policy(), summary.failures)
-    return tools
+    return model_visible_mcp_tools(tools)
 
 
 @register_tool(categories={"mcp"}, selection_gate="mcp")

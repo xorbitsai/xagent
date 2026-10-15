@@ -52,9 +52,7 @@ async def test_create_default_tools_forwards_creator_and_declaration_to_web_tool
         return []
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: object()
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
     await create_default_tools(
@@ -92,9 +90,7 @@ async def test_create_default_tools_leaves_creator_and_declaration_unset_by_defa
         return []
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: object()
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
     await create_default_tools(

@@ -23,7 +23,7 @@ task_id = task_id_fixture
 @pytest.fixture
 def lease_database(engine, task_id, monkeypatch):
     factory = sessionmaker(engine)
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     monkeypatch.setattr(
         "xagent.web.services.trace_handlers.get_db", lambda: iter([factory()])
     )

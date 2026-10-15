@@ -67,9 +67,9 @@ engine = engine_fixture
 def factory(engine, monkeypatch) -> sessionmaker:
     Base.metadata.create_all(engine)
     result = sessionmaker(engine)
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: result)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", result)
     # Selects the PostgreSQL row-lock path or the SQLite CAS path.
-    monkeypatch.setattr("xagent.web.models.database.get_engine", lambda: engine)
+    monkeypatch.setattr("xagent.web.models.database._engine", engine)
     monkeypatch.setattr(
         task_lease_recovery, "invalidate_task_cache_best_effort", lambda _id: None
     )
@@ -1049,7 +1049,7 @@ def _trigger_run(factory: sessionmaker, run_id: int) -> TriggerRun:
 
 def _recorded(batch: Any) -> list[Any]:
     """What the batch's committed pauses recorded for automatic recovery."""
-    return [pause.recorded for pause in batch.paused if pause.recorded]
+    return [pause.report.recovery for pause in batch.paused if pause.report.recovery]
 
 
 def _notices(batch: Any) -> list[Any]:
@@ -1081,7 +1081,7 @@ def test_scheduled_resume_keeps_the_trigger_run_running(factory):
         report.control_state["run_id"],
         report.control_state["state_version"],
     ) == ("paused", task.run_id, task.state_version)
-    recorded = pause.recorded
+    recorded = report.recovery
     assert (recorded.task_id, recorded.state, recorded.attempt) == (
         ids[0],
         "scheduled",

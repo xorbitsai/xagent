@@ -16,6 +16,7 @@ from ...config import (
     get_background_job_visibility_timeout_seconds,
     get_celery_broker_url,
     get_celery_result_backend,
+    get_kb_milvus_cleanup_interval_seconds,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ def create_celery_app() -> Any:
     result_backend = get_celery_result_backend()
     visibility_timeout = get_background_job_visibility_timeout_seconds()
     sweep_interval = get_background_job_sweep_interval_seconds()
+    cleanup_interval = get_kb_milvus_cleanup_interval_seconds()
     app = Celery("xagent", broker=broker_url, backend=result_backend)
     app.conf.update(
         broker_connection_retry_on_startup=True,
@@ -46,11 +48,20 @@ def create_celery_app() -> Any:
             "xagent.web.jobs.trigger_tasks.scan_due_triggers": {
                 "queue": "triggers",
             },
+            "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows": {
+                "queue": "kb",
+            },
         },
         beat_schedule={
             "scan-due-triggers-and-stale-jobs": {
                 "task": "xagent.web.jobs.trigger_tasks.scan_due_triggers",
                 "schedule": float(sweep_interval),
+            },
+            "purge-leftover-milvus-rows": {
+                "task": "xagent.web.jobs.trigger_tasks.purge_leftover_milvus_rows",
+                "schedule": float(cleanup_interval),
+                # An unconsumed enqueue expires instead of piling up in Redis.
+                "options": {"expires": float(cleanup_interval)},
             },
         },
         task_serializer="json",

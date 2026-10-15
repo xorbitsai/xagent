@@ -119,6 +119,7 @@ MCP_UNAVAILABLE_REASONS = frozenset(
         "catalog_app_not_found",
         "config_load_failed",
         "insufficient_scope",
+        "invalid_configuration",
         "invalid_launch_config",
         "oauth_token_refresh_failed",
         "oauth_token_required",

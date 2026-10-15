@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import time
 import urllib.parse
 from inspect import isawaitable
@@ -88,6 +89,37 @@ logger = logging.getLogger(__name__)
 # through as a parameter there keeps this the only literal, so the two
 # layers of ``asyncio.wait_for`` around a listing call can never diverge.
 _CONNECTION_TEST_TIMEOUT_SECONDS = 60.0
+_CONNECTION_TEST_MAX_TOKENS = 16
+_BEDROCK_GPT_OSS_MODEL_RE = re.compile(
+    r"(?:^|[./])(?:[a-z0-9-]+\.)?openai\.gpt-oss-\d+b(?:[-:]|$)"
+)
+
+
+def _is_known_reasoning_model(model_name: str) -> bool:
+    model_name_lower = model_name.lower()
+    return (
+        model_name_lower.startswith(("o1", "o3", "gpt-5"))
+        or "-o1" in model_name_lower
+        or "-o3" in model_name_lower
+        or "-gpt-5" in model_name_lower
+        or "thinking" in model_name_lower
+        or "reasoner" in model_name_lower
+    )
+
+
+def _connection_test_chat_kwargs(
+    model_provider: str, model_name: str
+) -> dict[str, Any]:
+    """Return the output budget override for a cheap but useful LLM probe."""
+
+    provider = canonical_provider_name(model_provider)
+    is_bedrock_gpt_oss = provider == "bedrock" and bool(
+        _BEDROCK_GPT_OSS_MODEL_RE.search(model_name.lower())
+    )
+    if _is_known_reasoning_model(model_name) or is_bedrock_gpt_oss:
+        return {}
+    return {"max_tokens": _CONNECTION_TEST_MAX_TOKENS}
+
 
 # ---------------------------------------------------------------------------
 # Hook infrastructure for dynamic model sharing
@@ -873,15 +905,7 @@ async def test_model_connection(
         if request.category == "llm":
             # For some reasoning models (like o1, o3, claude reasoning variants), temperature might be deprecated
             # and max_tokens might be replaced by max_completion_tokens. We use a more minimal test strategy here.
-            model_name_lower = request.model_name.lower()
-            is_reasoning_model = (
-                model_name_lower.startswith(("o1", "o3", "gpt-5"))
-                or "-o1" in model_name_lower
-                or "-o3" in model_name_lower
-                or "-gpt-5" in model_name_lower
-                or "thinking" in model_name_lower
-                or "reasoner" in model_name_lower
-            )
+            is_reasoning_model = _is_known_reasoning_model(request.model_name)
             is_deepseek_model = provider == "deepseek"
 
             connection_api_key = request.api_key
@@ -921,19 +945,11 @@ async def test_model_connection(
             config = ChatModelConfig(**config_kwargs)
             llm = create_base_llm(config)
 
-            # Test chat connection with a small but non-trivial token budget.
-            # ``max_tokens=1`` is unsafe for reasoning models that aren't
-            # caught by the name-based heuristic above (e.g. qwen3-thinking
-            # variants advertised as ``qwen3.x_*``): they would consume the
-            # single token in ``reasoning_content`` and return an empty
-            # ``content``, which providers report as an invalid response.
-            # 16 tokens is still cheap and gives reasoning models room to
-            # produce at least the start of an answer.
-            chat_kwargs: dict[str, Any] = {"max_tokens": 16}
-
-            # Claude models and OpenAI o1/o3 handle max_tokens differently or deprecate temperature
-            if is_reasoning_model:
-                chat_kwargs = {}  # let the adapter handle defaults
+            # Keep ordinary probes cheap. Reasoning models use the adapter or
+            # saved configuration's default because their reasoning and final
+            # answer share the output budget; a tiny explicit cap can expire
+            # before any user-visible text is produced.
+            chat_kwargs = _connection_test_chat_kwargs(provider, request.model_name)
             if is_deepseek_model:
                 chat_kwargs["thinking"] = {"type": "disabled"}
 
@@ -1300,13 +1316,14 @@ async def test_models(
                 )
                 continue
 
-            # Test with a simple message. Use a small but non-trivial token
-            # budget so that reasoning models (e.g. qwen3-thinking,
-            # deepseek-r1) have room to produce at least the start of an
-            # answer instead of getting truncated mid-thought, which would
-            # otherwise surface as "Invalid response" from the provider.
+            # Test with a simple message. Keep ordinary probes cheap while
+            # allowing reasoning models to use their configured/default output
+            # budget so the probe reaches a final answer.
             test_messages = [{"role": "user", "content": test_message}]
-            await llm.chat(test_messages, max_tokens=16)
+            chat_kwargs = _connection_test_chat_kwargs(
+                cast(str, model.model_provider), cast(str, model.model_name)
+            )
+            await llm.chat(test_messages, **chat_kwargs)
             response_time = time.time() - start_time
 
             test_results.append(

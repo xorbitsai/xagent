@@ -1316,7 +1316,7 @@ async def test_dispatch_claim_pool_wait_does_not_block_event_loop(
         session_threads.append(get_ident())
         return SessionLocal()
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
 
     held_connection = engine.connect()
     loop_thread = get_ident()
@@ -1381,7 +1381,7 @@ async def test_command_handler_pool_timeout_does_not_checkout_again(
         )
         task_id = int(task.id)
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connections = []
     checkout_probe = ExitStack()
 
@@ -1531,7 +1531,7 @@ async def test_real_final_disposition_pool_timeout_stays_off_event_loop(
             payload={"type": "pause_task"},
         )
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     held_connections = []
     checkout_probe = ExitStack()
 
@@ -3166,7 +3166,7 @@ async def test_dispatcher_worker_recovers_from_a_lock_timeout_and_claims_once_re
             payload={"type": "pause_task"},
         )
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(task_command_transport_module, "DISPATCHER_IDLE_SECONDS", 0.01)
     monkeypatch.setattr(
         task_command_transport_module, "_dispatcher_wakeup", asyncio.Event()
@@ -3593,3 +3593,189 @@ async def test_supervise_task_command_dispatcher(
         if foreign_loop is not None:
             foreign.cancel()
             foreign_loop.close()
+
+
+@pytest.fixture()
+def shared_dispatch_db(db_session, monkeypatch):
+    """Shared execution enabled, with tasks that any runner may claim from."""
+
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_command_transport_module, "get_runner_id", lambda: "me")
+    return db_session
+
+
+def _unowned_task(db, user_id: int, title: str) -> Task:
+    task = Task(
+        user_id=user_id,
+        title=title,
+        description=title,
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+        run_id=None,
+        runner_id=None,
+        lease_expires_at=None,
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def _insert_command(db, task_id: int, kind: TaskCommandKind, identity: str) -> int:
+    row = TaskExecutionCommand(
+        task_id=task_id, command_id=identity, kind=kind.value, payload={}
+    )
+    db.add(row)
+    db.commit()
+    return int(row.id)
+
+
+def _claim_candidate() -> tuple[int, int, TaskCommandKind] | None:
+    return task_command_transport_module._find_command_candidate(None)
+
+
+def test_reply_first_claim_order_prefers_a_newer_reply_over_an_older_start(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    second_task = _unowned_task(db, int(user.id), "second")
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    older_start = _insert_command(
+        db, int(first_task.id), TaskCommandKind.START, "start-a"
+    )
+    newer_reply = _insert_command(
+        db, int(second_task.id), TaskCommandKind.RESUME_INPUT, "reply-b"
+    )
+    assert older_start < newer_reply
+
+    assert _claim_candidate() == (
+        newer_reply,
+        int(second_task.id),
+        TaskCommandKind.RESUME_INPUT,
+    )
+
+
+def test_reply_first_claim_order_keeps_a_tasks_start_ahead_of_its_own_reply(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, task = _create_running_task(db)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    start = _insert_command(db, int(task.id), TaskCommandKind.START, "start-same")
+    _insert_command(db, int(task.id), TaskCommandKind.RESUME_INPUT, "reply-same")
+
+    assert _claim_candidate() == (start, int(task.id), TaskCommandKind.START)
+
+
+@pytest.mark.parametrize(
+    "kind", [TaskCommandKind.START, TaskCommandKind.RESUME_INPUT], ids=lambda k: k.value
+)
+def test_reply_first_claim_order_takes_the_older_of_two_commands_of_one_kind(
+    shared_dispatch_db, kind: TaskCommandKind
+) -> None:
+    db = shared_dispatch_db
+    user, first_task = _create_running_task(db)
+    first_task.runner_id = None
+    first_task.lease_expires_at = None
+    db.commit()
+    second_task = _unowned_task(db, int(user.id), "second")
+    older = _insert_command(db, int(first_task.id), kind, f"{kind.value}-1")
+    _insert_command(db, int(second_task.id), kind, f"{kind.value}-2")
+
+    assert _claim_candidate() == (older, int(first_task.id), kind)
+
+
+@pytest.mark.parametrize(
+    "kind", [TaskCommandKind.CANCEL, TaskCommandKind.PAUSE], ids=lambda k: k.value
+)
+def test_reply_first_claim_order_puts_a_reply_ahead_of_an_older_control_command(
+    shared_dispatch_db, kind: TaskCommandKind
+) -> None:
+    db = shared_dispatch_db
+    user, control_task = _create_running_task(db)
+    control_task.runner_id = None
+    control_task.lease_expires_at = None
+    db.commit()
+    reply_task = _unowned_task(db, int(user.id), "reply")
+    older_control = _insert_command(
+        db, int(control_task.id), kind, f"{kind.value}-older"
+    )
+    newer_reply = _insert_command(
+        db, int(reply_task.id), TaskCommandKind.RESUME_INPUT, "reply-newer"
+    )
+    assert older_control < newer_reply
+
+    assert _claim_candidate() == (
+        newer_reply,
+        int(reply_task.id),
+        TaskCommandKind.RESUME_INPUT,
+    )
+
+
+def test_reply_first_claim_order_falls_back_past_a_reply_on_a_busy_task(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, start_task = _create_running_task(db)
+    start_task.runner_id = None
+    start_task.lease_expires_at = None
+    db.commit()
+    busy_task = _unowned_task(db, int(user.id), "busy")
+    start = _insert_command(db, int(start_task.id), TaskCommandKind.START, "start")
+    _insert_command(db, int(busy_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+
+    assert task_command_transport_module._find_command_candidate(
+        None, (int(busy_task.id),)
+    ) == (start, int(start_task.id), TaskCommandKind.START)
+
+
+def test_reply_first_claim_order_falls_back_past_a_reply_under_an_expired_foreign_owner(
+    shared_dispatch_db,
+) -> None:
+    db = shared_dispatch_db
+    user, foreign_task = _create_running_task(db)
+    foreign_task.runner_id = "someone-else"
+    foreign_task.lease_expires_at = datetime.utcnow() - timedelta(minutes=1)
+    db.commit()
+    start_task = _unowned_task(db, int(user.id), "start")
+    start = _insert_command(db, int(start_task.id), TaskCommandKind.START, "start")
+    _insert_command(db, int(foreign_task.id), TaskCommandKind.RESUME_INPUT, "reply")
+
+    assert _claim_candidate() == (start, int(start_task.id), TaskCommandKind.START)
+
+
+def test_find_command_candidate_with_an_explicit_id_skips_the_reply_lookup(
+    shared_dispatch_db,
+) -> None:
+    from sqlalchemy import event
+
+    db = shared_dispatch_db
+    user, task = _create_running_task(db)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db.commit()
+    reply = _insert_command(
+        db, int(task.id), TaskCommandKind.RESUME_INPUT, "reply-explicit"
+    )
+    parameters: list[tuple[object, ...]] = []
+
+    def record(_conn, _cursor, statement, params, *_args) -> None:
+        if statement.lstrip().upper().startswith("SELECT"):
+            parameters.append(tuple(params))
+
+    engine = get_engine()
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        found = task_command_transport_module._find_command_candidate(reply)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert found == (reply, int(task.id), TaskCommandKind.RESUME_INPUT)
+    # One statement, and the reply-only kind filter is not among its values.
+    assert len(parameters) == 1
+    assert TaskCommandKind.RESUME_INPUT.value not in parameters[0]

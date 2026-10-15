@@ -21,7 +21,7 @@ export function SetupPage() {
   const [confirmPassword, setConfirmPassword] = useState("")
   const [error, setError] = useState("")
   const [isLoading, setIsLoading] = useState(false)
-  const { isLoading: isChecking } = useSetupStatus({
+  const { isLoading: isChecking, passwordMinLength } = useSetupStatus({
     redirectToLoginIfInitialized: true,
   })
 
@@ -37,8 +37,8 @@ export function SetupPage() {
       setError(t("setup.errors.invalidEmail"))
       return
     }
-    if (password.length < 6) {
-      setError(t("setup.errors.passwordTooShort"))
+    if (password.length < passwordMinLength) {
+      setError(t("setup.errors.passwordTooShort", { min: passwordMinLength }))
       return
     }
     if (password !== confirmPassword) {
@@ -153,6 +153,7 @@ export function SetupPage() {
                     <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                     <Input
                       type="password"
+                      minLength={passwordMinLength}
                       value={password}
                       onChange={(e) => setPassword(e.target.value)}
                       placeholder={t("setup.form.password")}
@@ -170,6 +171,7 @@ export function SetupPage() {
                     <Lock className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
                     <Input
                       type="password"
+                      minLength={passwordMinLength}
                       value={confirmPassword}
                       onChange={(e) => setConfirmPassword(e.target.value)}
                       placeholder={t("setup.form.confirmPassword")}

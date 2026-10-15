@@ -118,7 +118,7 @@ async def test_to2_default_mode_ready_behavior_is_unchanged_zero_queries(
     monkeypatch,
 ):
     _set_policy(monkeypatch, mode="legacy")
-    monkeypatch.setattr(database_module, "get_session_local", _PoisonSessionLocal())
+    monkeypatch.setattr(database_module, "_SessionLocal", _PoisonSessionLocal())
     app_module.app.state.file_storage_startup_sync_task = None
     app_module.app.state.file_storage_startup_sync_error = None
 
@@ -139,7 +139,7 @@ async def test_to3_native_mode_table_absent_returns_503_without_table_name(
         bind=engine, tables=tables_excluding_interaction_requests()
     )
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     response = await app_module.readiness_check()
 
@@ -164,7 +164,7 @@ async def test_to4_native_mode_table_present_returns_200_and_clears_degradation(
     engine = create_engine(f"sqlite:///{tmp_path / 'with_table.db'}")
     Base.metadata.create_all(bind=engine)
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     response = await app_module.readiness_check()
 
@@ -182,7 +182,7 @@ async def test_to4b_latch_positive_means_zero_queries_on_next_probe(
     engine = create_engine(f"sqlite:///{tmp_path / 'with_table.db'}")
     Base.metadata.create_all(bind=engine)
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     first = await app_module.readiness_check()
     assert first.status_code == 200
@@ -190,7 +190,7 @@ async def test_to4b_latch_positive_means_zero_queries_on_next_probe(
 
     # Second probe: swap in a poison session-factory. If the latch were not
     # honored, this would raise instead of returning 200.
-    monkeypatch.setattr(database_module, "get_session_local", _PoisonSessionLocal())
+    monkeypatch.setattr(database_module, "_SessionLocal", _PoisonSessionLocal())
     second = await app_module.readiness_check()
     assert second.status_code == 200
 
@@ -205,7 +205,7 @@ async def test_to4c_latch_negative_rechecks_every_probe(monkeypatch, tmp_path):
         bind=engine, tables=tables_excluding_interaction_requests()
     )
     session_local = sessionmaker(bind=engine)
-    monkeypatch.setattr(database_module, "get_session_local", lambda: session_local)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
 
     first = await app_module.readiness_check()
     assert first.status_code == 503

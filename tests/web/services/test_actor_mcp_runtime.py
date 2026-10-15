@@ -476,9 +476,7 @@ async def test_create_default_tools_registers_production_adapter_only_for_actor_
         return []
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: object()
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
     for policy in (None, _policy()):

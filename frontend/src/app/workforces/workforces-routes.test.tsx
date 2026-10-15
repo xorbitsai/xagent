@@ -82,10 +82,19 @@ vi.mock("@/contexts/app-context-chat", () => ({
     setTaskId: setTaskIdMock,
     closeFilePreview: closeFilePreviewMock,
     dispatch: dispatchMock,
+    openFilePreview: vi.fn(),
     getFileDownloadUrl: (fileId: string) => `/api/files/${fileId}/download`,
     state: workforceAppState,
   }),
   isTerminalTaskStatus: (status: string | null | undefined) => status === "completed" || status === "failed",
+}))
+
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ user: { id: "1", is_admin: false } }),
+}))
+
+vi.mock("@/components/config-dialog", () => ({
+  ConfigDialog: ({ trigger }: { trigger: unknown }) => trigger,
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
@@ -936,16 +945,17 @@ describe("workforce route entry points", () => {
 
     expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
 
-    const textarea = screen.getByPlaceholderText("workforces.run.placeholder")
-    fireEvent.change(textarea, { target: { value: " Draft launch plan " } })
+    const textarea = screen.getByRole("textbox")
+    textarea.innerHTML = " Draft launch plan "
+    fireEvent.input(textarea)
 
     // Wait for the submit button to become enabled after state update
     await waitFor(() => {
-      const submitBtn = container.querySelector("textarea + button:not([disabled])")
+      const submitBtn = container.querySelector('form button[type="submit"]:not([disabled])')
       expect(submitBtn).not.toBeNull()
     })
 
-    const submitBtn = container.querySelector("textarea + button:not([disabled])")
+    const submitBtn = container.querySelector('form button[type="submit"]:not([disabled])')
     fireEvent.click(submitBtn!)
 
     await waitFor(() => {
@@ -981,14 +991,15 @@ describe("workforce route entry points", () => {
 
     const { container } = render(<WorkforceRunPage />)
 
-    const textarea = await screen.findByPlaceholderText("workforces.run.placeholder")
-    fireEvent.change(textarea, { target: { value: "Draft launch plan" } })
+    const textarea = await screen.findByRole("textbox")
+    textarea.innerHTML = "Draft launch plan"
+    fireEvent.input(textarea)
 
     await waitFor(() => {
-      const submitBtn = container.querySelector("textarea + button:not([disabled])")
+      const submitBtn = container.querySelector('form button[type="submit"]:not([disabled])')
       expect(submitBtn).not.toBeNull()
     })
-    fireEvent.click(container.querySelector("textarea + button:not([disabled])")!)
+    fireEvent.click(container.querySelector('form button[type="submit"]:not([disabled])')!)
 
     expect(await screen.findByTestId("task-conversation-panel")).toBeInTheDocument()
 

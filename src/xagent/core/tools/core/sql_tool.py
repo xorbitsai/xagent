@@ -12,25 +12,240 @@ Example:
 
 Note: This tool uses SQLAlchemy's synchronous engine.
 Async drivers are not supported currently.
+
+For safety, connection URLs whose effective target cannot be proven distinct
+from the platform database are rejected. This includes opaque driver-side
+configuration such as ``service``/DSN files and SQLite URI mode; existing
+connections using those spellings must be rewritten with explicit targets.
+The URL check is a defense-in-depth measure, not a substitute for separate
+platform credentials or network isolation.
 """
 
 import csv
 import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
+from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, Field
-from sqlalchemy import URL, create_engine, text
-from sqlalchemy.engine import CursorResult, Row, make_url
+from sqlalchemy import URL, create_engine, event, text
+from sqlalchemy.engine import CursorResult, Engine, Row, make_url
 
+from ....config import get_database_url
 from ...file_ref import build_workspace_file_ref
 
 if TYPE_CHECKING:
     from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
+PLATFORM_DATABASE_ERROR = "The platform database cannot be used by the SQL tool"
+SQLITE_URI_UNSUPPORTED_ERROR = "SQLite URI mode is not supported"
+_OPAQUE_TARGET_QUERY_KEYS = frozenset(
+    {"service", "odbc_connect", "dsn", "read_default_file", "read_default_group"}
+)
+
+
+def _canonical_backend(url: URL) -> str:
+    backend = url.get_backend_name().lower()
+    return "mysql" if backend == "mariadb" else backend
+
+
+def _query_values(url: URL, name: str) -> tuple[str, ...]:
+    for key, values in url.normalized_query.items():
+        if key.lower() == name:
+            return tuple(str(value) for value in values)
+    return ()
+
+
+def _opaque_target_query_keys(url: URL) -> list[str]:
+    return sorted(key for key in _OPAQUE_TARGET_QUERY_KEYS if _query_values(url, key))
+
+
+def _sqlite_database_path(url: URL) -> str:
+    database = unquote(url.database or ":memory:")
+    uri_mode = any(
+        value.strip().lower() in {"1", "on", "true", "yes"}
+        for value in _query_values(url, "uri")
+    )
+    if uri_mode and database.lower().startswith("file:"):
+        parsed_file = urlsplit(database)
+        if parsed_file.netloc.lower() in {"", "localhost"}:
+            database = unquote(parsed_file.path)
+        else:
+            database = f"//{parsed_file.netloc}{unquote(parsed_file.path)}"
+    if database != ":memory:":
+        database = str(Path(database).expanduser().resolve())
+    return database
+
+
+def _effective_connect_args(url: URL) -> dict[str, Any]:
+    """Return SQLAlchemy's parsed driver arguments without opening a connection."""
+    _args, connect_args = url.get_dialect()().create_connect_args(url)
+    return dict(connect_args)
+
+
+def _split_hosts(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = (value,)
+    hosts: list[str] = []
+    for item in values:
+        if item is None:
+            continue
+        hosts.extend(str(item).split(","))
+    return [host.rstrip(".").strip().lower() for host in hosts if host.strip()]
+
+
+def _database_identity(url: URL) -> tuple[str, tuple[str, ...], int | None, str]:
+    """Return the driver's effective target, ignoring credentials.
+
+    ``URL.host`` is not sufficient here: SQLAlchemy drivers apply query
+    overrides, default ports, multi-host syntax, and PostgreSQL's omitted
+    database default before opening the socket.  Ask the dialect to perform
+    that parsing, but never connect while checking the identity.
+    """
+    backend = _canonical_backend(url)
+    if backend == "sqlite":
+        return backend, ("",), None, _sqlite_database_path(url)
+    opaque_keys = _opaque_target_query_keys(url)
+    if opaque_keys:
+        raise ValueError(
+            "Opaque database target configuration is not allowed: "
+            + ", ".join(opaque_keys)
+        )
+
+    default_ports = {"postgresql": 5432, "mysql": 3306, "mssql": 1433}
+    for key in ("host", "hostaddr"):
+        if any("," in value for value in _query_values(url, key)):
+            raise ValueError(f"Database URL contains multiple '{key}' targets")
+    connect_args = _effective_connect_args(url)
+    # libpq treats hostaddr as the actual destination when both host and
+    # hostaddr are present. Compare that effective destination, rather than
+    # allowing a public host name to hide a platform hostaddr override.
+    raw_hosts = _split_hosts(connect_args.get("hostaddr"))
+    if not raw_hosts:
+        raw_hosts = _split_hosts(connect_args.get("host"))
+    if not raw_hosts and url.host:
+        raw_hosts.extend(_split_hosts(url.host))
+    unix_socket = connect_args.get("unix_socket")
+    if unix_socket:
+        raw_hosts = [f"unix:{Path(str(unix_socket)).expanduser().resolve()}"]
+    elif raw_hosts and raw_hosts[0].startswith("/"):
+        raw_hosts = [f"unix:{Path(host).expanduser().resolve()}" for host in raw_hosts]
+    hosts = tuple(sorted(set(raw_hosts or [""])))
+
+    raw_port = connect_args.get("port")
+    if raw_port is None:
+        port = url.port or default_ports.get(backend)
+    else:
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Database URL contains an invalid port") from exc
+    database = str(
+        connect_args.get("dbname")
+        or connect_args.get("database")
+        or url.database
+        or (connect_args.get("user") if backend == "postgresql" else "")
+        or ""
+    ).lstrip("/")
+    return backend, hosts, port, database
+
+
+def is_platform_database_url(candidate: str | URL) -> bool:
+    """Whether a candidate URL points at the application's own database."""
+    try:
+        candidate_url = make_url(candidate)
+        platform_raw = get_database_url()
+        if not platform_raw:
+            return False
+        platform_url = make_url(platform_raw)
+        candidate_identity = _database_identity(candidate_url)
+        platform_identity = _database_identity(platform_url)
+        if candidate_identity[0] != platform_identity[0]:
+            return False
+        if candidate_identity[0] == "sqlite":
+            candidate_path = candidate_identity[3]
+            platform_path = platform_identity[3]
+            if candidate_path == platform_path:
+                return True
+            if candidate_path == ":memory:" or platform_path == ":memory:":
+                return False
+            try:
+                return os.path.samefile(candidate_path, platform_path)
+            except (FileNotFoundError, OSError):
+                return False
+
+        # A MySQL account can qualify table names across schemas, so sharing
+        # the same server is sufficient to make the platform target unsafe.
+        hosts_overlap = bool(set(candidate_identity[1]) & set(platform_identity[1]))
+        # A connection to the platform server is unsafe even when it names a
+        # different database: the deployment credentials may be allowed to
+        # create/drop databases or use server-side links. Database names are
+        # therefore not an isolation boundary for the SQL tool.
+        return hosts_overlap and candidate_identity[2] == platform_identity[2]
+    except Exception:
+        # This helper protects a security boundary. A malformed platform URL
+        # or ambiguous target parameter must disable external SQL rather than
+        # silently turning the protection off.
+        return True
+
+
+def validate_external_database_url(candidate: str | URL) -> URL:
+    """Parse and reject connection spellings that can target the platform DB."""
+    try:
+        parsed = make_url(candidate)
+    except Exception as exc:
+        raise ValueError("Invalid SQLAlchemy connection URL") from exc
+    if _canonical_backend(parsed) == "sqlite" and (
+        _query_values(parsed, "uri")
+        or (parsed.database or "").strip().lower().startswith("file:")
+    ):
+        # URI mode lets pysqlite reinterpret and percent-decode the path after
+        # SQLAlchemy has validated it.  Reject it rather than trying to mirror
+        # every SQLite URI spelling (including repeated/true-ish `uri` keys).
+        raise ValueError(SQLITE_URI_UNSUPPORTED_ERROR)
+    configured_opaque_keys = _opaque_target_query_keys(parsed)
+    if configured_opaque_keys:
+        # Driver-side service/DSN/config files can replace the host/database
+        # without exposing their values in the URL, so their effective target
+        # cannot be proven distinct from the platform database here.
+        raise ValueError(
+            "Opaque database target configuration is not allowed: "
+            + ", ".join(configured_opaque_keys)
+        )
+    try:
+        _database_identity(parsed)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Unable to determine the database target") from exc
+    if is_platform_database_url(parsed):
+        raise ValueError(PLATFORM_DATABASE_ERROR)
+    return parsed
+
+
+def _install_sqlite_authorizer(dbapi_connection: Any, _connection_record: Any) -> None:
+    """Deny SQLite ATTACH exactly, without rejecting identifiers or strings."""
+
+    def authorize(
+        action_code: int,
+        _parameter_one: str | None,
+        _parameter_two: str | None,
+        _database_name: str | None,
+        _trigger_or_view: str | None,
+    ) -> int:
+        return (
+            sqlite3.SQLITE_DENY
+            if action_code == sqlite3.SQLITE_ATTACH
+            else sqlite3.SQLITE_OK
+        )
+
+    dbapi_connection.set_authorizer(authorize)
 
 
 class SQLQueryArgs(BaseModel):
@@ -75,8 +290,11 @@ def _get_connection_url(
     if not url:
         raise ValueError(f"Database connection '{connection_name}' not found.")
 
-    # Validate URL format using SQLAlchemy
-    return make_url(url)
+    # Never allow the SQL tool to reuse the platform's own database. This
+    # catches equivalent URL/driver spellings and effective target overrides;
+    # real isolation still requires distinct credentials or network policy,
+    # because DNS/container aliases cannot be proven equivalent from strings.
+    return validate_external_database_url(url)
 
 
 def get_database_type(
@@ -134,6 +352,8 @@ def execute_sql_query(
     url = _get_connection_url(connection_name, connection_url)
     stmt = text(query)
     engine = create_engine(url)
+    if _canonical_backend(url) == "sqlite" and isinstance(engine, Engine):
+        event.listen(engine, "connect", _install_sqlite_authorizer)
 
     try:
         with engine.connect() as conn:

@@ -597,7 +597,7 @@ async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
     monkeypatch.setattr(
         command_execution_service, "get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     prepare_turn = command_execution_service._prepare_task_message_sync
     monkeypatch.setattr(websocket_api, "manager", local_manager)
     monkeypatch.setattr(
@@ -707,7 +707,7 @@ async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
     monkeypatch.setattr(
         command_execution_service, "get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     prepare_turn = command_execution_service._prepare_task_message_sync
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
@@ -837,7 +837,7 @@ async def test_missing_task_create_commits_claim_message_file_and_prelease_toget
     monkeypatch.setattr(
         command_execution_service, "get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
         "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
@@ -924,7 +924,7 @@ async def test_missing_task_file_bind_race_rolls_back_the_whole_create(
     monkeypatch.setattr(
         command_execution_service, "get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
         task_orchestrator,
@@ -1011,7 +1011,7 @@ async def test_missing_task_send_failure_leaves_only_ttl_owned_running_claim(
     monkeypatch.setattr(
         command_execution_service, "get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
         "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
@@ -1096,7 +1096,7 @@ async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
     monkeypatch.setattr(
         command_execution_service, "get_session_local", lambda: SessionLocal
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(
         command_execution_service,
         "_prepare_task_message_sync",

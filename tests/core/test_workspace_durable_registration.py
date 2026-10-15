@@ -57,9 +57,7 @@ def test_inline_delivery_rejects_registration_without_durable_task_owner(
     from xagent.core.inline_file_delivery import InlineFileDelivery
 
     engine, SessionLocal, db = constrained_workspace_db
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: SessionLocal
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr("xagent.core.storage.manager.create_db_session", SessionLocal)
     workspace = TaskWorkspace(id="web_task_9999", base_dir=str(tmp_path))
     delivery = InlineFileDelivery(workspace)
@@ -108,9 +106,7 @@ async def test_inline_delivery_uses_task_owned_durable_file_registration(
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "false")
     get_unscoped_file_storage.cache_clear()
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: SessionLocal
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     monkeypatch.setattr(
         "xagent.web.services.uploaded_file_store.get_session_local",
         lambda: SessionLocal,
@@ -1339,7 +1335,7 @@ def test_concurrent_registration_of_one_path_uses_one_workspace_owner(
 
     from xagent.web.models import database as database_module
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     get_unscoped_file_storage.cache_clear()

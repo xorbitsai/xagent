@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from collections.abc import Iterator
@@ -155,7 +156,19 @@ def test_the_collection_refuses_rows_without_kb_id_text_or_vector(
 
     assert [n for n in ("kb_id", "text", "dense") if fields[n].get("nullable")] == []
     assert fields["kb_id"].get("is_partition_key") is True
-    assert fields["text"]["params"]["analyzer_params"] == '{"type":"chinese"}'
+    assert json.loads(fields["text"]["params"]["analyzer_params"]) == {
+        "tokenizer": "jieba",
+        "filter": [
+            "lowercase",
+            {
+                "type": "regex",
+                "expr": (
+                    r"[0-9A-Za-z\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}"
+                    r"\x{FF10}-\x{FF19}\x{FF21}-\x{FF3A}\x{FF41}-\x{FF5A}]"
+                ),
+            },
+        ],
+    }
     (bm25,) = client.describe_collection(name)["functions"]
     assert (bm25["input_field_names"], bm25["output_field_names"]) == (
         ["text"],

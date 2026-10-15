@@ -957,9 +957,26 @@ def test_builtin_registry_remote_mcp_apps_launch_config() -> None:
     # Atlassian's current endpoint is /v2/mcp; the legacy /v1/sse endpoint is
     # unsupported after 2026-06-30 and must not be what the catalog points at.
     assert rows_by_app_id["atlassian"]["transport"] == "streamable_http"
+    # Its metadata advertises more scopes than one request can carry, so the
+    # catalog pins a subset. It is the permission set users consent to, so it
+    # is pinned literally here like every other row; changing it after release
+    # also needs a new migration (see 20261013_atlassian_mcp_scope). Atlassian
+    # grants only the scopes of the products a site has, so a grant must
+    # include just the basic identity scopes (required_scope).
     assert rows_by_app_id["atlassian"]["launch_config"] == {
         "url": "https://mcp.atlassian.com/v2/mcp",
-        "auth": {"type": "mcp_oauth"},
+        "auth": {
+            "type": "mcp_oauth",
+            "scope": (
+                "email offline_access read:account "
+                "read:bitbucket:agent-interface read:confluence:agent-interface "
+                "read:jira:agent-interface read:me "
+                "search:confluence:agent-interface search:jira:agent-interface "
+                "search:rovo:agent-interface write:bitbucket:agent-interface "
+                "write:confluence:agent-interface write:jira:agent-interface"
+            ),
+            "required_scope": "email offline_access read:account read:me",
+        },
         "builtin_provenance": {
             "registry": "xagent",
             "app_id": "atlassian",

@@ -1154,6 +1154,7 @@ class TestSurface:
             supports_thinking_mode = True  # type: ignore[assignment]
             supports_json_schema_response_format = True
             supports_json_object_response_format = True
+            supports_forced_tool_choice = False
             supports_native_video_input = True
             supports_native_video_with_images = True
             supports_native_video_time_range = True
@@ -1167,6 +1168,7 @@ class TestSurface:
         assert llm.supports_thinking_mode is True
         assert llm.supports_json_schema_response_format is True
         assert llm.supports_json_object_response_format is True
+        assert llm.supports_forced_tool_choice is False
         assert llm.supports_native_video_input is True
         assert llm.supports_native_video_with_images is True
         assert llm.supports_native_video_time_range is True

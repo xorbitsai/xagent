@@ -730,9 +730,7 @@ def test_cli_run_imports_end_to_end(
     user_id = int(user.id)
     # Point the CLI at the already-initialized test database.
     monkeypatch.setattr("xagent.web.models.database.init_db", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: lambda: db_session
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", lambda: db_session)
     args = argparse.Namespace(
         source="hermes",
         source_dir=hermes_home,

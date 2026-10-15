@@ -49,6 +49,7 @@ TASK_EVENT_CHANNEL_PREFIX = "XAGENT_TASK_EVENT_CHANNEL_PREFIX"
 ENCRYPTION_KEY = "ENCRYPTION_KEY"
 # Public development fallback; runtime credential storage must reject it.
 DEV_FALLBACK_ENCRYPTION_KEY = "RQMpe38gK3m0szjpSmTNw_sP3Y54r6hDc6JewBoPKXc="
+INSECURE_SECRET_PLACEHOLDER = "your-secret-key-change-in-production"
 TASK_REPLY_WAIT_TIMEOUT_SECONDS = "XAGENT_TASK_REPLY_WAIT_TIMEOUT_SECONDS"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
@@ -206,6 +207,8 @@ BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
 BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
 BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
 BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_INTERVAL_SECONDS = "XAGENT_KB_MILVUS_CLEANUP_INTERVAL_SECONDS"
+KB_MILVUS_CLEANUP_ENABLED = "XAGENT_KB_MILVUS_CLEANUP_ENABLED"
 TASKLESS_UPLOAD_TTL_SECONDS = "XAGENT_TASKLESS_UPLOAD_TTL_SECONDS"
 ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS = "XAGENT_ORPHAN_UPLOAD_SWEEP_INTERVAL_SECONDS"
 TASK_CLEANUP_RETRY_INTERVAL_SECONDS = "XAGENT_TASK_CLEANUP_RETRY_INTERVAL_SECONDS"
@@ -275,6 +278,10 @@ GOOGLE_OIDC_CLIENT_ID = "XAGENT_GOOGLE_OIDC_CLIENT_ID"
 GOOGLE_OIDC_CLIENT_SECRET = "XAGENT_GOOGLE_OIDC_CLIENT_SECRET"
 GOOGLE_OIDC_REDIRECT_URI = "XAGENT_GOOGLE_OIDC_REDIRECT_URI"
 FRONTEND_URL = "XAGENT_FRONTEND_URL"
+CORS_ORIGINS = "XAGENT_CORS_ORIGINS"
+XAGENT_ENVIRONMENT = "XAGENT_ENVIRONMENT"
+ENVIRONMENT = "ENVIRONMENT"
+REQUIRE_SECURE_SECRETS = "XAGENT_REQUIRE_SECURE_SECRETS"
 OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
@@ -517,16 +524,25 @@ def _get_strict_bool_env(env_var: str, default: bool) -> bool:
 def get_task_infra_failure_pause_enabled() -> bool:
     """Whether eligible tasks pause (instead of failing) on infrastructure failures.
 
-    Off by default until automatic resume ships: a paused run that nothing
-    resumes is worse than a terminal failure for unattended (e.g. scheduled)
-    tasks. Lease-expiry recovery pauses regardless, as it always has.
+    Unset (or blank or invalid), it follows
+    :func:`get_task_auto_resume_enabled`: a paused run that nothing resumes
+    is worse than a terminal failure for unattended (e.g. scheduled) tasks,
+    so pausing is the default only while automatic resume is on. Channel
+    tasks are the exception automatic resume does not schedule yet: they
+    pause, their channel gets the "interrupted" reply, and the next channel
+    message starts a new turn from the pause, as after a lease expiry. Set it
+    explicitly to pause for a manual resume with automatic resume off, or to
+    fail as before with it on. Lease-expiry recovery pauses regardless, as it
+    always has.
 
     Priority:
         1. XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED environment variable
-        2. False
+        2. get_task_auto_resume_enabled()
     """
 
-    return _get_strict_bool_env(TASK_INFRA_FAILURE_PAUSE_ENABLED, False)
+    return _get_strict_bool_env(
+        TASK_INFRA_FAILURE_PAUSE_ENABLED, get_task_auto_resume_enabled()
+    )
 
 
 def get_task_auto_resume_enabled() -> bool:
@@ -1459,6 +1475,20 @@ def get_background_job_sweep_interval_seconds() -> int:
     )
 
 
+def get_kb_milvus_cleanup_interval_seconds() -> int:
+    """Return how often the leftover Milvus rows of a Milvus deployment are purged."""
+    return _get_positive_int_env(
+        KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
+        3600,
+        minimum=300,
+    )
+
+
+def get_kb_milvus_cleanup_enabled() -> bool:
+    """Return whether the scheduled leftover Milvus row purge runs at all."""
+    return _get_bool_env(KB_MILVUS_CLEANUP_ENABLED, True)
+
+
 def get_taskless_upload_ttl_seconds() -> int:
     """Age after which an unbound task-less public upload is GC-eligible (#973).
 
@@ -2117,6 +2147,37 @@ def get_frontend_url() -> str:
     return "http://localhost:3000"
 
 
+def get_cors_origins() -> list[str]:
+    """Return the explicit browser origins allowed to call the API."""
+    configured = os.getenv(CORS_ORIGINS)
+    if configured and configured.strip():
+        origins = [
+            origin.strip().rstrip("/")
+            for origin in configured.split(",")
+            if origin.strip()
+        ]
+        if "*" in origins:
+            raise ValueError(
+                "XAGENT_CORS_ORIGINS cannot contain '*' when credentials are enabled"
+            )
+        return origins
+    return [get_frontend_url()]
+
+
+def get_environment() -> str:
+    """Return the normalized deployment environment name."""
+    for setting in (XAGENT_ENVIRONMENT, ENVIRONMENT):
+        value = os.getenv(setting)
+        if value and value.strip():
+            return value.strip().lower()
+    return "development"
+
+
+def get_require_secure_secrets() -> bool:
+    """Whether development should also enforce production secret checks."""
+    return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
+
+
 def get_oidc_login_ttl_seconds() -> int:
     """Return the short-lived OIDC login transaction TTL."""
     return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)
@@ -2132,7 +2193,7 @@ def get_session_secret() -> str:
     value = os.getenv(SESSION_SECRET)
     if value and value.strip():
         return value.strip()
-    return os.getenv("XAGENT_JWT_SECRET", "your-secret-key-change-in-production")
+    return os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
 
 
 def get_web_dir() -> Path:

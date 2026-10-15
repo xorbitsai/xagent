@@ -49,8 +49,8 @@ def owned_model_session(monkeypatch):
     mock_db = MagicMock()
     session_factory = MagicMock(return_value=mock_db)
     monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        MagicMock(return_value=session_factory),
+        "xagent.web.models.database._SessionLocal",
+        session_factory,
     )
     return mock_db, session_factory
 
@@ -827,10 +827,7 @@ class TestModelService:
         shared_query.limit.return_value.all.return_value = []
         session_factory = MagicMock(return_value=mock_db)
 
-        with patch(
-            "xagent.web.models.database.get_session_local",
-            return_value=session_factory,
-        ):
+        with patch("xagent.web.models.database._SessionLocal", session_factory):
             result = get_default(user_id=None)
 
         assert result is None
@@ -860,10 +857,7 @@ class TestModelService:
         filter_query.return_value.limit.return_value.all.return_value = []
         session_factory = MagicMock(return_value=mock_db)
 
-        with patch(
-            "xagent.web.models.database.get_session_local",
-            return_value=session_factory,
-        ):
+        with patch("xagent.web.models.database._SessionLocal", session_factory):
             get_default(user_id=None)
 
         # The is_active column itself is passed as a filter condition, so look
@@ -1064,7 +1058,7 @@ class TestModelService:
             raise RuntimeError("session factory failed")
 
         monkeypatch.setattr(
-            "xagent.web.models.database.get_session_local",
+            "xagent.web.models.database._SessionLocal",
             fail_session_factory,
         )
 

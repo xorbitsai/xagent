@@ -16,6 +16,7 @@ import {
   Check,
   Shield,
   MessageSquare,
+  CircleSlash,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
@@ -141,7 +142,7 @@ interface StepAction {
   id: string;
   type: 'llm' | 'tool' | 'info' | 'error';
   title: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'completed' | 'failed' | 'interrupted';
   timestamp: number;
   data: {
     model?: string;
@@ -185,17 +186,18 @@ function formatActionContent(value: unknown, filesDisabled = false): string {
 // DAGNode.data: this status is derived locally from the trace event stream
 // itself (dag_step_start/dag_step_end/etc.), not read off StepExecution, and
 // mixes in whole-TASK states ("paused", "waiting_for_user") that the other
-// three don't carry at the step level. No trace event currently distinguishes
-// a step being "interrupted" or "clarification_invalidated" from plain
-// "running" the way StepExecution's own field does, so this view can't
-// represent those two states without new derivation logic to detect them from
-// the event stream - a step in either state renders here as "running" rather
-// than reporting an unknown/wrong status.
+// three don't carry at the step level. A step only becomes "interrupted"
+// through the process-level status in processTraceEvents' final settling
+// pass. A per-step "interrupted" status is ignored: a react_task_end whose
+// data.status is "interrupted" still marks its step "completed". No trace
+// event distinguishes a step being "clarification_invalidated" from plain
+// "running", so a step in that state renders here as "running" rather than
+// reporting an unknown/wrong status.
 interface ProcessedStep {
   stepId: string;
   stepName: string;
   description: string;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'waiting_for_user';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'waiting_for_user' | 'interrupted';
   tools: Array<{ function: { name: string } }>;
   reasoning?: string;
   code: string;
@@ -928,6 +930,15 @@ export function processTraceEvents(
             action.status = 'completed';
           });
         }
+
+        if (taskStatus === 'interrupted') {
+          if (step.status === 'pending' || step.status === 'running') {
+            step.status = 'interrupted';
+          }
+          runningActions.forEach((action) => {
+            action.status = 'interrupted';
+          });
+        }
       });
     }
 
@@ -1347,7 +1358,11 @@ function StepActionItem({
 
     if (displayAction.status === 'running') {
       setIsExpanded(true);
-    } else if (displayAction.status === 'completed' || displayAction.status === 'failed') {
+    } else if (
+      displayAction.status === 'completed' ||
+      displayAction.status === 'failed' ||
+      displayAction.status === 'interrupted'
+    ) {
       setIsExpanded(false);
     }
   }, [displayAction.status, userToggled]);
@@ -1676,6 +1691,7 @@ function StepItem({
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
   const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
+  const isInterrupted = step.status === 'interrupted';
   const [isExpanded, setIsExpanded] = useState(() => defaultExpanded || !isCompleted);
   const wasCompletedRef = useRef(isCompleted);
   const rawTitle = filesDisabled
@@ -1702,6 +1718,15 @@ function StepItem({
         <Info className="w-5 h-5 text-red-500 mt-0.5" />
       ) : isPaused ? (
         <Info className="w-5 h-5 text-yellow-500 mt-0.5" />
+      ) : isInterrupted ? (
+        <>
+          <CircleSlash
+            data-icon="interrupted"
+            className="w-5 h-5 text-muted-foreground mt-0.5"
+            aria-hidden="true"
+          />
+          <span className="sr-only">{t('agent.layout.status.interrupted')}</span>
+        </>
       ) : (
         <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
       )}

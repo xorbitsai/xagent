@@ -44,12 +44,15 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # expected shape (e.g. an HTML gateway error page) must not be forwarded to the
 # LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
-# Xero returns at most 100 records per page for every paged endpoint.
+# Keep interactive list responses modest even though the Accounting API now
+# accepts up to 1000 records per page. Full-ledger scans use the larger value so
+# they consume fewer calls and are less likely to hit the scan safety limit.
 XERO_MAX_PAGE_SIZE = 100
+XERO_BULK_PAGE_SIZE = 1000
 DEFAULT_PAGE_SIZE = 20
-# list_overdue_invoices walks the whole list. 50 pages x 100 invoices is far
-# beyond any real overdue ledger; hitting it is reported, never silent.
-OVERDUE_MAX_PAGES = 50
+# Full-ledger tools fail rather than publishing partial values as totals if this
+# bound is reached. 50 pages x 1000 invoices covers a 50,000-invoice ledger.
+OPEN_INVOICE_MAX_PAGES = 50
 OVERDUE_DEFAULT_LIMIT = 50
 OVERDUE_MAX_LIMIT = 200
 OVERDUE_TOP_CONTACTS = 25
@@ -955,20 +958,21 @@ def _collect_open_invoices(
     contact_ids: list[str] | None,
     *,
     min_days_overdue: int | None,
-) -> tuple[list[dict[str, Any]], bool]:
+) -> list[dict[str, Any]]:
     """Read every Authorised invoice of ``invoice_type`` that still has an
     amount due, across all pages.
 
     With ``min_days_overdue`` only invoices at least that many days past due
     are kept; with None every open invoice is kept (including not-yet-due ones,
-    whose ``days_overdue`` is zero or negative). Returns the invoice views and
-    whether the whole list was read.
+    whose ``days_overdue`` is zero or negative). A successful return is always
+    complete; reaching the safety bound raises rather than exposing partial
+    values as totals.
     """
     params: dict[str, Any] = {
         "where": f'Type=="{invoice_type}"',
         "Statuses": "AUTHORISED",
         "order": "DueDate",
-        "pageSize": XERO_MAX_PAGE_SIZE,
+        "pageSize": XERO_BULK_PAGE_SIZE,
     }
     narrowed_where: str | None = None
     if min_days_overdue is not None:
@@ -984,7 +988,6 @@ def _collect_open_invoices(
         params["ContactIDs"] = ",".join(_guid_list(contact_ids, "contactIds"))
 
     found: list[dict[str, Any]] = []
-    complete = True
     page = 1
     while True:
         try:
@@ -1019,15 +1022,18 @@ def _collect_open_invoices(
         finished = (
             page >= int(page_count)
             if page_count is not None
-            else len(records) < XERO_MAX_PAGE_SIZE
+            else len(records) < XERO_BULK_PAGE_SIZE
         )
         if finished:
             break
-        if page >= OVERDUE_MAX_PAGES:
-            complete = False
-            break
+        if page >= OPEN_INVOICE_MAX_PAGES:
+            raise RuntimeError(
+                "Xero invoice scan reached the safety limit of "
+                f"{OPEN_INVOICE_MAX_PAGES} pages before the end of the list; "
+                "narrow the request with contactIds or a stricter date range"
+            )
         page += 1
-    return found, complete
+    return found
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -1064,7 +1070,7 @@ def list_overdue_invoices(
     min_days = max(1, int(minDaysOverdue))
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), OVERDUE_MAX_LIMIT))
-    overdue, complete = _collect_open_invoices(
+    overdue = _collect_open_invoices(
         as_of, type, contactIds, min_days_overdue=min_days
     )
 
@@ -1133,7 +1139,7 @@ def list_overdue_invoices(
             "aging_buckets": aging,
             "by_contact": by_contact,
             "by_contact_complete": len(ranked) <= OVERDUE_TOP_CONTACTS,
-            "complete": complete,
+            "complete": True,
             "skip": skip,
             "returned": len(shown),
             "has_more": has_more,
@@ -1143,11 +1149,6 @@ def list_overdue_invoices(
             payload["next_skip"] = next_skip
         if truncated:
             payload["truncated"] = True
-        if not complete:
-            payload["note"] = (
-                f"Stopped after {OVERDUE_MAX_PAGES} pages; narrow with contactIds "
-                "or minDaysOverdue to read the rest."
-            )
         return payload
 
     return _fit_list(build, window)
@@ -1200,7 +1201,7 @@ def list_receivables_ageing(
     as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _today()
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), RECEIVABLES_MAX_LIMIT))
-    invoices, complete = _collect_open_invoices(
+    invoices = _collect_open_invoices(
         as_of, type, contactIds, min_days_overdue=None
     )
 
@@ -1274,7 +1275,7 @@ def list_receivables_ageing(
             "total_invoice_count": len(invoices),
             "total_rows": len(rendered_rows),
             "totals_by_currency": totals_by_currency,
-            "complete": complete,
+            "complete": True,
             "skip": skip,
             "returned": len(shown),
             "has_more": has_more,
@@ -1284,11 +1285,6 @@ def list_receivables_ageing(
             payload["next_skip"] = next_skip
         if truncated:
             payload["truncated"] = True
-        if not complete:
-            payload["note"] = (
-                f"Stopped after {OVERDUE_MAX_PAGES} pages; narrow with contactIds "
-                "to read the rest."
-            )
         return payload
 
     return _fit_list(build, window)

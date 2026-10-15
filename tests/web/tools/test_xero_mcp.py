@@ -338,7 +338,7 @@ def _overdue_pages(pages: list[list[dict[str, Any]]]) -> Callable[..., MockRespo
             {
                 "pagination": {
                     "page": page,
-                    "pageSize": 100,
+                    "pageSize": xero.XERO_BULK_PAGE_SIZE,
                     "pageCount": len(pages),
                     "itemCount": sum(len(p) for p in pages),
                 },
@@ -381,7 +381,7 @@ def test_overdue_query_asks_xero_for_authorised_invoices_due_before_the_date(
     assert params["where"] == 'Type=="ACCREC" AND DueDate<DateTime(2026,10,13)'
     assert params["Statuses"] == "AUTHORISED"
     assert params["order"] == "DueDate"
-    assert params["pageSize"] == 100
+    assert params["pageSize"] == xero.XERO_BULK_PAGE_SIZE
 
 
 def test_overdue_min_days_moves_the_cutoff(fake: FakeXero) -> None:
@@ -529,18 +529,15 @@ def test_overdue_trims_a_window_that_does_not_fit_and_still_resumes(
     assert result["total_count"] == 60
 
 
-def test_overdue_reports_when_it_stops_early(
+def test_overdue_fails_instead_of_reporting_partial_totals(
     fake: FakeXero, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(xero, "OVERDUE_MAX_PAGES", 2)
+    monkeypatch.setattr(xero, "OPEN_INVOICE_MAX_PAGES", 2)
     pages = [[_invoice(f"INV-{p}", "2026-09-01", 10)] for p in range(5)]
     fake.responder = _overdue_pages(pages)
 
-    result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
-
-    assert result["complete"] is False
-    assert result["total_count"] == 2
-    assert "Stopped after 2 pages" in result["note"]
+    with pytest.raises(RuntimeError, match="safety limit of 2 pages"):
+        xero.list_overdue_invoices(asOfDate="2026-10-13")
 
 
 def test_overdue_without_page_metadata_stops_on_a_short_page(fake: FakeXero) -> None:

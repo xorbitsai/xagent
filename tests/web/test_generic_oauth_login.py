@@ -51,6 +51,10 @@ XERO_APP_SCOPES = [
     "accounting.payments",
     "accounting.banktransactions",
     "accounting.manualjournals",
+    "accounting.reports.aged.read",
+    "accounting.reports.profitandloss.read",
+    "accounting.reports.balancesheet.read",
+    "accounting.reports.trialbalance.read",
     "offline_access",
 ]
 

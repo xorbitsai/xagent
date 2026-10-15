@@ -14436,6 +14436,22 @@ def test_react_repeated_guard_does_not_mark_identical_page_arguments() -> None:
     assert "paginated" not in metadata
 
 
+def test_react_repeated_guard_marks_cursor_added_after_first_page() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
+    _record_completed_calls(
+        pattern,
+        [
+            ("list_invoices", {"status": "open"}),
+            ("list_invoices", {"status": "open", "cursor": "next-page"}),
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+
+
 def test_react_work_attempt_guard_marks_pagination_after_failed_page() -> None:
     pattern = ReActPattern(
         repeated_tool_decision_after_consecutive_tool_calls=4,
@@ -14465,6 +14481,27 @@ def test_react_work_attempt_guard_marks_pagination_after_failed_page() -> None:
     assert metadata is not None
     assert metadata["trigger"] == "work_tool_attempts"
     assert metadata["paginated"] is True
+
+
+def test_react_work_attempt_guard_ignores_other_tools_pagination() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=4,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    _record_completed_calls(
+        pattern,
+        [
+            ("list_invoices", {"page": 1}),
+            ("list_invoices", {"page": 2}),
+            ("send_reminder", {"invoice_id": "inv-1"}),
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "send_reminder"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "work_tool_attempts"
+    assert "paginated" not in metadata
 
 
 def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:

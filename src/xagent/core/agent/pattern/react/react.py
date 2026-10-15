@@ -586,6 +586,7 @@ def _records_advance_pagination(records: list[ToolCallRecord]) -> bool:
     """
 
     signatures: list[dict[str, Any]] = []
+    has_pagination_argument = False
     for record in records:
         args = record.args
         if not isinstance(args, dict):
@@ -593,10 +594,12 @@ def _records_advance_pagination(records: list[ToolCallRecord]) -> bool:
         signature = {
             name: args[name] for name in PAGINATION_ARGUMENT_NAMES if name in args
         }
-        if signature:
-            signatures.append(signature)
-    return len(signatures) >= 2 and any(
-        signature != signatures[0] for signature in signatures[1:]
+        has_pagination_argument = has_pagination_argument or bool(signature)
+        signatures.append(signature)
+    return (
+        has_pagination_argument
+        and len(signatures) >= 2
+        and any(signature != signatures[0] for signature in signatures[1:])
     )
 
 
@@ -5597,7 +5600,13 @@ class ReActPattern(AgentPattern):
             "consecutive_tool_calls": work_tool_count,
             "threshold": work_tool_threshold,
         }
-        if _records_advance_pagination(work_tool_records):
+        tool_group = self._tool_decision_group_for_name(tool_name)
+        same_group_work_records = [
+            record
+            for record in work_tool_records
+            if self._tool_decision_group_for_name(record.tool_name) == tool_group
+        ]
+        if _records_advance_pagination(same_group_work_records):
             metadata["paginated"] = True
         return metadata
 

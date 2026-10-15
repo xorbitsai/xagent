@@ -276,6 +276,7 @@ class _BrowserEgressProxy:
             logical_url = target
         parsed = urlsplit(logical_url)
         scheme = parsed.scheme.lower()
+        websocket = scheme == "ws"
         if scheme == "ws":
             scheme = "http"
         elif scheme == "wss":
@@ -298,8 +299,11 @@ class _BrowserEgressProxy:
             saw_host = False
             chunked = headers.get("transfer-encoding", "").lower() == "chunked"
             for name, value in headers.items():
-                if name in {"proxy-connection", "connection", "expect"} or (
-                    chunked and name == "content-length"
+                if (
+                    name == "proxy-connection"
+                    or name == "expect"
+                    or (not websocket and name == "connection")
+                    or (chunked and name == "content-length")
                 ):
                     continue
                 if name == "host":
@@ -308,7 +312,8 @@ class _BrowserEgressProxy:
                 output_headers.append(f"{name}: {value}")
             if not saw_host:
                 output_headers.append(f"Host: {parsed.netloc}")
-            output_headers.append("Connection: close")
+            if not websocket:
+                output_headers.append("Connection: close")
             request = (
                 f"{method} {path} {version}\r\n"
                 + "\r\n".join(output_headers)
@@ -316,10 +321,15 @@ class _BrowserEgressProxy:
             ).encode("latin-1")
             remote_writer.write(request + body)
             await remote_writer.drain()
-            # Do not bridge client_reader here.  Once this request has been
-            # sent, any additional bytes on Chromium's keep-alive socket must
-            # never reach this origin's upstream connection.
-            await self._relay_response(remote_reader, writer)
+            if websocket:
+                # A WebSocket stays on this one validated origin after the
+                # HTTP upgrade, so it needs the normal bidirectional bridge.
+                await self._bridge(reader, writer, remote_reader, remote_writer)
+            else:
+                # Do not bridge client_reader here. Once this request has been
+                # sent, any additional bytes on Chromium's keep-alive socket
+                # must never reach this origin's upstream connection.
+                await self._relay_response(remote_reader, writer)
         finally:
             remote_writer.close()
             try:

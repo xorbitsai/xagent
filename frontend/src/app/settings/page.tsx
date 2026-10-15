@@ -25,6 +25,7 @@ export default function SettingsPage() {
   const { user, session } = useAuth()
   const { t, locale, setLocale } = useI18n()
   const [email, setEmail] = useState(user?.email || "")
+  const [emailCurrentPassword, setEmailCurrentPassword] = useState("")
   const [isProfileLoading, setIsProfileLoading] = useState(true)
   const [isSavingEmail, setIsSavingEmail] = useState(false)
   const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -155,9 +156,21 @@ export default function SettingsPage() {
               />
             </div>
 
+            <div className="space-y-2">
+              <Label htmlFor="email-current-password">{t("settings.password.current")}</Label>
+              <Input
+                id="email-current-password"
+                type="password"
+                value={emailCurrentPassword}
+                onChange={(e) => setEmailCurrentPassword(e.target.value)}
+                placeholder={t("settings.password.current_placeholder")}
+                disabled={isProfileLoading || isSavingEmail}
+              />
+            </div>
+
             <Button
               onClick={handleEmailUpdate}
-              disabled={isProfileLoading || isSavingEmail || !email.trim()}
+              disabled={isProfileLoading || isSavingEmail || !email.trim() || !emailCurrentPassword}
               className="w-full"
             >
               {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
@@ -304,6 +317,7 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({
           email,
+          current_password: emailCurrentPassword,
         })
       })
 
@@ -314,6 +328,7 @@ export default function SettingsPage() {
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
+          setEmailCurrentPassword('')
           setEmailMessage({ type: 'success', text: t("settings.email.success") })
         } else if (updated.status === "advanced") {
           applyCanonicalEmail()

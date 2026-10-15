@@ -95,6 +95,8 @@ from ..services.user_oauth import (
     normalize_user_oauth_resource_owner_key,
     scoped_user_oauth_query,
 )
+from ..services.trigger_rate_limit import remote_ip_from_request
+from ...core.utils.api_key import verify_dummy
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
 logger = logging.getLogger(__name__)
@@ -118,27 +120,39 @@ _used_ordinary_oauth_states: dict[str, float] = {}
 
 
 def _login_attempt_key(request: Request | None, identifier: str) -> str:
-    client_host = request.client.host if request and request.client else "unknown"
+    client_host = remote_ip_from_request(request) if request else "unknown"
     normalized = identifier.strip().lower()
     return hashlib.sha256(f"{client_host}\0{normalized}".encode()).hexdigest()
+
+
+def _prune_login_failures(key: str, current: float) -> deque[float]:
+    attempts = _login_failures.get(key)
+    if attempts is None:
+        return deque()
+    while attempts and current - attempts[0] >= _LOGIN_FAILURE_WINDOW_SECONDS:
+        attempts.popleft()
+    return attempts
 
 
 def _login_is_blocked(key: str, now: float | None = None) -> bool:
     current = time.monotonic() if now is None else now
     with _login_failure_lock:
-        attempts = _login_failures[key]
-        while attempts and current - attempts[0] >= _LOGIN_FAILURE_WINDOW_SECONDS:
-            attempts.popleft()
+        attempts = _prune_login_failures(key, current)
+        if not attempts:
+            _login_failures.pop(key, None)
         return len(attempts) >= _LOGIN_FAILURE_LIMIT
 
 
-def _record_login_failure(key: str, now: float | None = None) -> None:
+def _reserve_login_attempt(key: str, now: float | None = None) -> bool:
+    """Atomically admit one attempt, preventing concurrent burst bypasses."""
     current = time.monotonic() if now is None else now
     with _login_failure_lock:
-        attempts = _login_failures[key]
-        while attempts and current - attempts[0] >= _LOGIN_FAILURE_WINDOW_SECONDS:
-            attempts.popleft()
+        attempts = _prune_login_failures(key, current)
+        if len(attempts) >= _LOGIN_FAILURE_LIMIT:
+            return False
+        _login_failures[key] = attempts
         attempts.append(current)
+        return True
 
 
 def _clear_login_failures(key: str) -> None:
@@ -1925,6 +1939,9 @@ def get_user_by_login_identifier(db: Session, identifier: str) -> Optional[User]
 def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[str, Any]:
     """Build detached response data before commit can expire ORM attributes."""
     if user is None:
+        # Keep unknown-user failures on the same bcrypt timing floor as a
+        # wrong password for an existing account.
+        verify_dummy()
         raise HTTPException(status_code=401, detail="Incorrect username or password")
     with observe_duration("xagent.auth.login.password_verify.duration"):
         valid = verify_password(request.password, str(user.password_hash))
@@ -1982,7 +1999,7 @@ async def login(
     started_at = time.perf_counter()
     outcome = "error"
     attempt_key = _login_attempt_key(http_request, request.username)
-    if _login_is_blocked(attempt_key):
+    if not _reserve_login_attempt(attempt_key):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many failed login attempts. Try again later.",
@@ -1997,7 +2014,6 @@ async def login(
         return response
     except HTTPException:
         outcome = "rejected"
-        _record_login_failure(attempt_key)
         raise
     except Exception:
         # SQL errors may contain bound refresh tokens. Never expose them to clients.
@@ -3724,17 +3740,18 @@ def _generic_oauth_login(
     full_auth_url = f"{auth_url}{separator}{urlencode(params)}"
     response = RedirectResponse(full_auth_url)
     if browser_state_nonce is not None:
+        from urllib.parse import urlsplit
+
         response.set_cookie(
             _ORDINARY_OAUTH_STATE_COOKIE,
             browser_state_nonce,
             max_age=600,
             httponly=True,
-            secure=(
-                os.getenv("XAGENT_ENVIRONMENT")
-                or os.getenv("ENVIRONMENT")
-                or "development"
-            ).lower()
-            in {"prod", "production", "stage", "staging"},
+            # Match the callback URL's transport, rather than an environment
+            # label. Development can run behind HTTPS and production can be
+            # reached over HTTP during local health checks; the cookie must
+            # follow the browser-visible OAuth origin.
+            secure=urlsplit(redirect_uri).scheme.lower() == "https",
             samesite="lax",
         )
     return response

@@ -480,8 +480,9 @@ class BrowserSession:
                     response_headers[key] = f"{response_headers[key]}, {value}"
                 else:
                     response_headers[key] = value
-            for response_url, set_cookie_headers in redirect_history:
-                await self._apply_response_cookies(response_url, set_cookie_headers)
+            if is_navigation_request:
+                for response_url, set_cookie_headers in redirect_history:
+                    await self._apply_response_cookies(response_url, set_cookie_headers)
             final_response_url = str(
                 getattr(getattr(response, "request", None), "url", "") or request_url
             )

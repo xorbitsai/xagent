@@ -180,6 +180,17 @@ describe("auth cache lineage", () => {
     await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })
     expect(current().cache).toMatchObject({ token: "new", user: { email: "profile@example.com" }, credentialRevision: 1, profileRevision: 1 })
   })
+  it("preserves the password capability marker during a profile update", async () => {
+    const oidcUser = { ...user, has_password: false }
+    const captured = await created({ user: oidcUser, access_token: "old", refresh_token: "refresh" })
+
+    await updateAuthSessionUser(captured, { ...oidcUser, email: "oidc@example.com" })
+
+    expect(current().cache.user).toMatchObject({
+      email: "oidc@example.com",
+      has_password: false,
+    })
+  })
   it("preserves credential advance when profile updates afterwards", async () => {
     const captured = await created({ user, access_token: "old", refresh_token: "refresh" })
     await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })

@@ -560,7 +560,21 @@ export async function updateAuthSessionUser(captured: AuthSessionSnapshot, next:
     if (cache.user.id !== user.id || cache.profileRevision !== captured.profileRevision) return { status: "advanced" as const, projection: comparison.projection! }
     const revision = nextRevision(cache.profileRevision)
     if (revision === null) return { status: "invalid" as const }
-    const updated = { ...cache, user: { ...cache.user, username: user.username, email: user.email, is_admin: user.is_admin }, profileRevision: revision }
+    const updated = {
+      ...cache,
+      user: {
+        ...cache.user,
+        username: user.username,
+        email: user.email,
+        is_admin: user.is_admin,
+        // Keep the password-capability marker in the canonical cache.  OIDC
+        // users have no local password, and dropping this field here makes
+        // the settings page require a password they cannot provide after a
+        // /me profile refresh.
+        has_password: user.has_password ?? cache.user.has_password,
+      },
+      profileRevision: revision,
+    }
     persist(storage, updated, markAuthUpdated); return { status: "updated" as const, projection: projectionFromCache(updated) }
   })
   return result.status === "completed" ? result.value : unavailable(result.reason)

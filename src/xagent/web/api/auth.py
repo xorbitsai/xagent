@@ -111,6 +111,7 @@ _ACTOR_OAUTH_FLOW_TTL = timedelta(minutes=10)
 _ACTOR_OAUTH_COOKIE_PREFIX = "xagent_actor_oauth_"
 _ACTOR_OWNER_CLAIM_VERSION = 1
 _ORDINARY_OAUTH_STATE_COOKIE = "xagent_oauth_state"
+_ORDINARY_OAUTH_STATE_COOKIE_PREFIX = f"{_ORDINARY_OAUTH_STATE_COOKIE}_"
 _LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 _LOGIN_FAILURE_LIMIT = 5
 _login_failure_lock = threading.Lock()
@@ -2685,6 +2686,11 @@ def _actor_oauth_cookie_name(nonce: str) -> str:
     return f"{_ACTOR_OAUTH_COOKIE_PREFIX}{nonce[:24]}"
 
 
+def _ordinary_oauth_cookie_name(nonce_digest: str) -> str:
+    """Return a distinct browser-binding cookie name for one OAuth state."""
+    return f"{_ORDINARY_OAUTH_STATE_COOKIE_PREFIX}{nonce_digest[:24]}"
+
+
 def is_actor_oauth_cookie_header(value: str) -> bool:
     """Accept only a non-empty Set-Cookie header for an actor OAuth flow."""
     name, separator, rest = value.partition("=")
@@ -3571,6 +3577,7 @@ def _generic_oauth_login(
     browser_state_nonce = (
         secrets.token_urlsafe(32) if actor_flow_nonce is None else None
     )
+    browser_nonce_hash: str | None = None
     state_payload = {
         "type": "oauth_state",
         "user_id": user_id,
@@ -3579,9 +3586,10 @@ def _generic_oauth_login(
         "redirect": redirect,
     }
     if browser_state_nonce is not None:
-        state_payload["browser_nonce_hash"] = hashlib.sha256(
+        browser_nonce_hash = hashlib.sha256(
             browser_state_nonce.encode("ascii")
         ).hexdigest()
+        state_payload["browser_nonce_hash"] = browser_nonce_hash
     if bound_account is not None:
         state_payload["oauth_account"] = bound_account
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
@@ -3780,8 +3788,9 @@ def _generic_oauth_login(
     if browser_state_nonce is not None:
         from urllib.parse import urlsplit
 
+        assert browser_nonce_hash is not None
         response.set_cookie(
-            _ORDINARY_OAUTH_STATE_COOKIE,
+            _ordinary_oauth_cookie_name(browser_nonce_hash),
             browser_state_nonce,
             max_age=600,
             httponly=True,
@@ -4004,7 +4013,9 @@ def generic_oauth_callback(
 
     browser_nonce_hash = payload.get("browser_nonce_hash")
     if browser_nonce_hash:
-        browser_nonce = request.cookies.get(_ORDINARY_OAUTH_STATE_COOKIE)
+        browser_nonce = request.cookies.get(
+            _ordinary_oauth_cookie_name(str(browser_nonce_hash))
+        )
         if not browser_nonce or not secrets.compare_digest(
             str(browser_nonce_hash),
             hashlib.sha256(browser_nonce.encode("ascii", "ignore")).hexdigest(),

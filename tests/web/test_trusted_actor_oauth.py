@@ -136,6 +136,18 @@ def _flow_cookie(response) -> tuple[str, str, SimpleCookie]:
     return matches[0][0], matches[0][1], parsed
 
 
+def _ordinary_flow_cookie(response) -> tuple[str, str, SimpleCookie]:
+    parsed = SimpleCookie()
+    parsed.load(response.headers["set-cookie"])
+    matches = [
+        (name, morsel.value)
+        for name, morsel in parsed.items()
+        if name.startswith(auth_api._ORDINARY_OAUTH_STATE_COOKIE_PREFIX)
+    ]
+    assert len(matches) == 1
+    return matches[0][0], matches[0][1], parsed
+
+
 def _request(state: str, *, cookie: tuple[str, str] | None = None, code: str = "code"):
     return SimpleNamespace(
         query_params={"state": state, "code": code},
@@ -698,9 +710,7 @@ def test_ordinary_oauth_flow_binds_state_to_cookie_and_provisions(
     assert payload is not None
     assert "resource_owner_key" not in payload
     assert "actor_flow_nonce" not in payload
-    ordinary_cookie = SimpleCookie()
-    ordinary_cookie.load(start.headers["set-cookie"])
-    assert "xagent_oauth_state" in ordinary_cookie
+    cookie_name, cookie_value, _ordinary_cookie = _ordinary_flow_cookie(start)
     _mock_exchange(monkeypatch)
     side_effects = Mock()
     monkeypatch.setattr(auth_api, "_run_post_commit_oauth_side_effects", side_effects)
@@ -709,10 +719,7 @@ def test_ordinary_oauth_flow_binds_state_to_cookie_and_provisions(
         "custom",
         _request(
             _state(start),
-            cookie=(
-                "xagent_oauth_state",
-                ordinary_cookie["xagent_oauth_state"].value,
-            ),
+            cookie=(cookie_name, cookie_value),
         ),
         db,
         _provider(),
@@ -721,3 +728,34 @@ def test_ordinary_oauth_flow_binds_state_to_cookie_and_provisions(
     assert response.status_code == 200
     assert db.query(UserOAuth).one().resource_owner_key is None
     side_effects.assert_called_once_with(db, user_id=user.id, connector_key="calendar")
+
+
+def test_concurrent_ordinary_oauth_flows_use_independent_browser_cookies(
+    oauth_db, monkeypatch
+) -> None:
+    db, user = oauth_db
+    _catalog_link(db, user)
+    token = create_access_token(
+        data={"sub": user.username, "type": "access"},
+        expires_delta=timedelta(minutes=5),
+    )
+
+    first = generic_oauth_login(
+        "custom", token=token, app_id="calendar", db=db, db_provider=_provider()
+    )
+    second = generic_oauth_login(
+        "custom", token=token, app_id="calendar", db=db, db_provider=_provider()
+    )
+    first_name, first_value, _ = _ordinary_flow_cookie(first)
+    second_name, second_value, _ = _ordinary_flow_cookie(second)
+    assert first_name != second_name
+
+    _mock_exchange(monkeypatch)
+    for response, cookie in (
+        (first, (first_name, first_value)),
+        (second, (second_name, second_value)),
+    ):
+        callback = generic_oauth_callback(
+            "custom", _request(_state(response), cookie=cookie), db, _provider()
+        )
+        assert callback.status_code == 200

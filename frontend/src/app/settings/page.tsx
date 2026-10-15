@@ -353,7 +353,7 @@ export default function SettingsPage() {
 
   async function syncCachedUser(
     capturedSession: typeof session,
-    nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean },
+    nextUser: { id: string; username: string; email?: string | null; is_admin?: boolean; has_password?: boolean },
   ) {
     return updateAuthSessionUser(capturedSession, nextUser)
   }

@@ -71,4 +71,10 @@ def test_oauth_state_cookie_follows_redirect_transport(monkeypatch) -> None:
     )
     cookie = SimpleCookie()
     cookie.load(response.headers["set-cookie"])
-    assert cookie["xagent_oauth_state"]["secure"]
+    names = [
+        name
+        for name in cookie
+        if name.startswith(auth_api._ORDINARY_OAUTH_STATE_COOKIE_PREFIX)
+    ]
+    assert len(names) == 1
+    assert cookie[names[0]]["secure"]

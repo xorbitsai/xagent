@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -157,6 +158,7 @@ class FakeManager:
         session_id: str,
         headless: bool,
         locale: str | None = None,
+        workspace_root: str | None = None,
     ) -> FakeSession:
         self.calls.append((session_id, headless, locale))
         return self.session
@@ -166,11 +168,19 @@ class FakeManager:
 
 
 @pytest.fixture
-def browser_environment() -> tuple[
+def browser_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[
     BrowserComputerEnvironment,
     FakePage,
     FakeObservationStore,
 ]:
+    # The fake page does not perform real DNS resolution; the production
+    # browser path validates every navigation target before calling goto().
+    monkeypatch.setattr(
+        "xagent.core.computer.browser._validate_browser_target",
+        AsyncMock(return_value=None),
+    )
     page = FakePage()
     store = FakeObservationStore()
     environment = BrowserComputerEnvironment(

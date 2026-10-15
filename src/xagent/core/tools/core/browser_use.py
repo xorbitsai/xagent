@@ -94,7 +94,10 @@ async def _validate_browser_target(
         return
     if scheme not in {"http", "https"}:
         raise ValueError("Only HTTP(S) URLs are allowed")
-    await validate_public_http_url(url)
+    try:
+        await validate_public_http_url(url)
+    except OSError as exc:
+        raise ValueError("Browser target could not be resolved") from exc
 
 
 class BrowserSession:
@@ -129,9 +132,74 @@ class BrowserSession:
         self._context: Optional[BrowserContext] = None
         self._page: Optional[Page] = None
         self._playwright: Any = None
+        self._cdp_sessions: list[Any] = []
+        self._cdp_tasks: set[asyncio.Task[Any]] = set()
+        self._guarded_pages: set[int] = set()
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
+
+    async def _guard_page_requests(self, page: Page) -> None:
+        """Validate every Chromium request, including redirect hops.
+
+        Playwright's route API invokes a handler only for the first request in
+        a redirect chain. The Chromium Fetch domain emits a pause for each
+        hop, so using it here keeps Chromium's cookie and redirect semantics
+        while applying the URL policy to subresources and redirects.
+        """
+        page_key = id(page)
+        if page_key in self._guarded_pages or self._context is None:
+            return
+        self._guarded_pages.add(page_key)
+        try:
+            cdp = await self._context.new_cdp_session(page)
+        except Exception:
+            self._guarded_pages.discard(page_key)
+            raise
+
+        async def handle_paused(params: dict[str, Any]) -> None:
+            request_id = params.get("requestId")
+            request = params.get("request") or {}
+            request_url = request.get("url", "")
+            try:
+                await _validate_browser_target(
+                    request_url,
+                    workspace_root=self.workspace_root,
+                )
+            except Exception:
+                # Fail closed if validation or DNS resolution fails. Leaving
+                # a paused request unresolved would stall the whole page.
+                await cdp.send(
+                    "Fetch.failRequest",
+                    {"requestId": request_id, "errorReason": "BlockedByClient"},
+                )
+                return
+            await cdp.send("Fetch.continueRequest", {"requestId": request_id})
+
+        def on_paused(params: dict[str, Any]) -> None:
+            task = asyncio.create_task(handle_paused(params))
+            self._cdp_tasks.add(task)
+            task.add_done_callback(self._cdp_tasks.discard)
+
+        cdp.on("Fetch.requestPaused", on_paused)
+        try:
+            await cdp.send(
+                "Fetch.enable",
+                {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+            )
+        except Exception:
+            self._guarded_pages.discard(page_key)
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+            raise
+        self._cdp_sessions.append(cdp)
+
+    def _schedule_page_guard(self, page: Page) -> None:
+        task = asyncio.create_task(self._guard_page_requests(page))
+        self._cdp_tasks.add(task)
+        task.add_done_callback(self._cdp_tasks.discard)
 
     async def _ensure_initialized(self) -> None:
         """Lazy initialization: create browser on first use."""
@@ -151,15 +219,23 @@ class BrowserSession:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1920,1080",
+                # Prevent browser-managed transports from bypassing the
+                # request guard. Browser tasks do not require WebRTC/QUIC.
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                "--disable-quic",
             ]
             allow_unsandboxed = get_browser_allow_unsandboxed()
             if allow_unsandboxed:
                 browser_args.append("--no-sandbox")
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                args=browser_args,
-                chromium_sandbox=not allow_unsandboxed,
-            )
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    args=browser_args,
+                    chromium_sandbox=not allow_unsandboxed,
+                )
+            except Exception:
+                await self.close()
+                raise
 
             # Create context with realistic settings. locale comes from the
             # caller (ultimately the requesting user/task's own language);
@@ -167,28 +243,29 @@ class BrowserSession:
             # the deployment default -- previously hardcoded to
             # zh-CN/Asia/Shanghai, which forced every automated session to
             # request Chinese-localized pages regardless of who asked.
-            self._context = await self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale=self.locale,
-                timezone_id=self.timezone_id,
-            )
+            try:
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    locale=self.locale,
+                    timezone_id=self.timezone_id,
+                    # Service workers can own requests without going through
+                    # Playwright routing. Browser security checks must see every
+                    # page request, so keep them disabled for this context.
+                    service_workers="block",
+                )
+            except Exception:
+                await self.close()
+                raise
 
-            self._page = await self._context.new_page()
-
-            async def guard_route(route: Any) -> None:
-                try:
-                    await _validate_browser_target(
-                        route.request.url,
-                        workspace_root=self.workspace_root,
-                    )
-                except (TypeError, ValueError):
-                    await route.abort()
-                    return
-                await route.continue_()
-
-            await self._page.route("**/*", guard_route)
+            try:
+                self._context.on("page", self._schedule_page_guard)
+                self._page = await self._context.new_page()
+                await self._guard_page_requests(self._page)
+            except Exception:
+                await self.close()
+                raise
 
             # Languages mirror the context's own locale instead of a fixed
             # list, so the spoofed navigator.languages stays consistent with
@@ -230,8 +307,21 @@ class BrowserSession:
                 Object.defineProperty(navigator, 'languages', {
                     get: () => __XAGENT_LANGUAGES__
                 });
+
+                // These APIs can open sockets outside page request routing.
+                // Browser tasks do not need them, so keep them unavailable.
+                Object.defineProperty(globalThis, 'SharedWorker', {
+                    value: undefined,
+                    configurable: false,
+                    writable: false
+                });
+                Object.defineProperty(globalThis, 'RTCPeerConnection', {
+                    value: undefined,
+                    configurable: false,
+                    writable: false
+                });
             """.replace("__XAGENT_LANGUAGES__", spoofed_languages)
-            await self._page.add_init_script(init_script)
+            await self._context.add_init_script(init_script)
 
             self._initialized = True
 
@@ -248,6 +338,22 @@ class BrowserSession:
 
     async def close(self) -> None:
         """Close the browser and cleanup resources."""
+        for task in list(self._cdp_tasks):
+            if not task.done():
+                task.cancel()
+        self._cdp_tasks.clear()
+        for cdp in self._cdp_sessions:
+            try:
+                await cdp.send("Fetch.disable")
+            except Exception:
+                pass
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+        self._cdp_sessions.clear()
+        self._guarded_pages.clear()
+
         try:
             # Close page first
             if self._page:

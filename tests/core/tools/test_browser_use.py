@@ -5,7 +5,8 @@ These tests use mocking to avoid requiring actual browser installation.
 Run with: pytest tests/core/tools/test_browser_use.py
 """
 
-from unittest.mock import patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -42,7 +43,13 @@ class TestBrowserNavigate:
         """Test that navigate fails gracefully without Playwright."""
         import asyncio
 
-        with patch("xagent.core.tools.core.browser_use.PLAYWRIGHT_AVAILABLE", False):
+        with (
+            patch("xagent.core.tools.core.browser_use.PLAYWRIGHT_AVAILABLE", False),
+            patch(
+                "xagent.core.tools.core.browser_use.validate_public_http_url",
+                new=AsyncMock(return_value=["93.184.216.34"]),
+            ),
+        ):
             result = asyncio.run(
                 browser_use.browser_navigate(
                     session_id="test-session", url="https://example.com"
@@ -92,6 +99,58 @@ class TestBrowserNavigate:
 
         assert "Only public network URLs are allowed" not in allowed["error"]
         assert blocked["error"] == "Only public network URLs are allowed"
+
+
+class TestBrowserRequestGuard:
+    @pytest.mark.asyncio
+    async def test_fetch_guard_blocks_private_redirect_hops(self):
+        session = browser_use.BrowserSession("guard")
+        context = MagicMock()
+        cdp = MagicMock()
+        cdp.send = AsyncMock()
+        context.new_cdp_session = AsyncMock(return_value=cdp)
+        session._context = context
+
+        await session._guard_page_requests(MagicMock())
+        paused_handler = cdp.on.call_args.args[1]
+        paused_handler(
+            {
+                "requestId": "redirect-hop",
+                "request": {"url": "http://127.0.0.1/metadata"},
+            }
+        )
+        await asyncio.gather(*list(session._cdp_tasks))
+
+        cdp.send.assert_any_await(
+            "Fetch.failRequest",
+            {"requestId": "redirect-hop", "errorReason": "BlockedByClient"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_fetch_guard_continues_public_requests(self, monkeypatch):
+        session = browser_use.BrowserSession("guard")
+        context = MagicMock()
+        cdp = MagicMock()
+        cdp.send = AsyncMock()
+        context.new_cdp_session = AsyncMock(return_value=cdp)
+        session._context = context
+        monkeypatch.setattr(
+            browser_use,
+            "validate_public_http_url",
+            AsyncMock(return_value=["203.0.113.10"]),
+        )
+
+        await session._guard_page_requests(MagicMock())
+        paused_handler = cdp.on.call_args.args[1]
+        paused_handler(
+            {
+                "requestId": "public-hop",
+                "request": {"url": "https://public.example/"},
+            }
+        )
+        await asyncio.gather(*list(session._cdp_tasks))
+
+        cdp.send.assert_any_await("Fetch.continueRequest", {"requestId": "public-hop"})
 
 
 class TestBrowserClick:

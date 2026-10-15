@@ -1009,7 +1009,16 @@ def _collect_open_invoices(
         for record in records:
             amount_due = Decimal(str(record.get("AmountDue") or 0))
             due = _doc_date(record, "DueDate")
-            if record.get("Type") != invoice_type or amount_due <= 0 or not due:
+            # The request asks Xero for Authorised invoices, but enforce the
+            # same contract locally as well.  A stale or non-conforming API
+            # response must never let a Paid invoice into an overdue/follow-up
+            # list merely because it still carries a non-zero AmountDue.
+            if (
+                record.get("Type") != invoice_type
+                or record.get("Status") != "AUTHORISED"
+                or amount_due <= 0
+                or not due
+            ):
                 continue
             days = (as_of - date.fromisoformat(due[:10])).days
             if min_days_overdue is not None and days < min_days_overdue:

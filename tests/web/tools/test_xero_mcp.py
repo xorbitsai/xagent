@@ -399,6 +399,9 @@ def test_overdue_drops_invoices_that_are_not_actually_overdue(fake: FakeXero) ->
                 _invoice("INV-OLD", "2026-09-01", 100),
                 _invoice("INV-TODAY", "2026-10-13", 50),
                 _invoice("INV-SETTLED", "2026-09-01", 0),
+                # Defend locally even if Xero ignores Statuses=AUTHORISED or
+                # returns a stale Paid row with an inconsistent amount due.
+                _invoice("INV-PAID", "2026-09-01", 75, status="PAID"),
             ]
         ]
     )
@@ -603,6 +606,14 @@ def test_ageing_has_one_named_row_per_contact_with_every_bucket(
                 _invoice("INV-5", "2026-10-05", 5, contact="Beta", contact_id="b"),
                 _invoice("INV-6", "2026-10-05", 0, contact="Beta", contact_id="b"),
                 _invoice(
+                    "INV-PAID",
+                    "2026-09-01",
+                    999,
+                    contact="Beta",
+                    contact_id="b",
+                    status="PAID",
+                ),
+                _invoice(
                     "INV-7",
                     "2026-09-01",
                     7,
@@ -764,6 +775,15 @@ def test_aged_receivables_maps_parameters(fake: FakeXero) -> None:
         "fromDate": "2026-01-01",
         "toDate": "2026-10-01",
     }
+
+
+def test_aged_receivables_rejects_placeholder_contact_before_request(
+    fake: FakeXero,
+) -> None:
+    with pytest.raises(ValueError, match="contactId must be a Xero GUID"):
+        xero.list_aged_receivables_by_contact(contactId="PLACEHOLDER")
+
+    assert fake.calls == []
 
 
 # --------------------------------------------------------------------------- #

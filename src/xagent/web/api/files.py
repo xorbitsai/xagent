@@ -326,9 +326,10 @@ async def _inline_preview_response(
             # See the invariant note in the SVG branch above. User markup is
             # always downloaded instead of being interpreted as a same-origin
             # document, including ticket-authenticated previews.
-            "Content-Disposition": _content_disposition_header(
-                "attachment" if is_active_content_type(media_type) else "inline",
-                filename,
+            "Content-Disposition": (
+                _content_disposition_header("attachment", filename)
+                if is_active_content_type(media_type)
+                else "inline"
             ),
             "X-Content-Type-Options": "nosniff",
         },

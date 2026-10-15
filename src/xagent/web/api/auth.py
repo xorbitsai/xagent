@@ -2713,7 +2713,7 @@ def generic_oauth_login(
     db_provider: Optional[Any] = None,
     account: Optional[str] = None,
 ) -> Any:
-    """Start the ordinary public OAuth flow without actor claims or cookies."""
+    """Start ordinary OAuth with a per-state browser-binding cookie."""
     return _generic_oauth_login(
         provider,
         token=token,

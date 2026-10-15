@@ -2926,6 +2926,48 @@ async def test_successful_mcp_call_runs_result_integrity_guard(monkeypatch):
     assert result == checked_result
 
 
+@pytest.mark.asyncio
+async def test_result_integrity_guard_exception_fails_closed(monkeypatch, caplog):
+    adapter = MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="get_projects",
+            description="List projects",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        source_server="rocketlane",
+    )
+    adapter._result_integrity.validate = AsyncMock(
+        side_effect=RuntimeError("integrity probe failed")
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert result["structured_content"] == {
+        "status": "error",
+        "reason": "the local integrity check could not complete",
+        "verified": False,
+    }
+    assert (
+        "MCP result integrity guard failed for server rocketlane tool get_projects"
+        in caplog.text
+    )
+
+
 def _resolver_retry_adapter(connection):
     return MCPToolAdapter(
         mcp_tool=SimpleNamespace(

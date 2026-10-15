@@ -3006,7 +3006,21 @@ class MCPToolAdapter(AbstractBaseTool):
                         result = await self._run_upload_staging_operation(
                             self._register_workspace_download_result, result
                         )
-                    result = await self._result_integrity.validate(tool_args, result)
+                    try:
+                        result = await self._result_integrity.validate(
+                            tool_args, result
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP result integrity guard failed for server %s "
+                            "tool %s (%s)",
+                            self.source_server,
+                            self.mcp_tool.name,
+                            type(exc).__name__,
+                        )
+                        result = self._result_integrity.failure_result(
+                            "the local integrity check could not complete"
+                        )
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
                     return _replace_staged_upload_paths(result, staged_upload_sources)

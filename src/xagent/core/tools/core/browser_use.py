@@ -72,6 +72,7 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
 
 _BROWSER_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 _BROWSER_REQUEST_DEADLINE_SECONDS = 30.0
+_BROWSER_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 logger = logging.getLogger(__name__)
 
 
@@ -333,6 +334,7 @@ class BrowserSession:
                 await route.continue_()
                 return
             assert self._http_client is not None
+            is_navigation_request = bool(route.request.is_navigation_request())
             request_headers = await route.request.all_headers()
             # Playwright may omit cookies from ``all_headers`` for a request
             # that was initiated by a worker or by a redirect.  Reconstruct
@@ -368,8 +370,62 @@ class BrowserSession:
                 headers=request_headers,
                 content=route.request.post_data_buffer,
             )
+            redirect_history: list[tuple[str, list[str]]] = []
+            response: httpx.Response
             async with asyncio.timeout(max(0.0, deadline - loop.time())):
-                response = await self._http_client.send(request, stream=True)
+                # Playwright invokes a route handler only for the first hop
+                # in a redirect chain. Let HTTPX follow redirects for
+                # subresources so its transport validates and pins every
+                # hop. Navigation redirects are handled below with a fresh
+                # browser navigation instead, preserving the final origin.
+                current_request = request
+                redirect_url: str | None = None
+                for _ in range(21):
+                    response = await self._http_client.send(
+                        current_request,
+                        stream=True,
+                        follow_redirects=False,
+                    )
+                    if (
+                        response.status_code not in _BROWSER_REDIRECT_STATUS_CODES
+                        or not response.headers.get("location")
+                    ):
+                        break
+                    next_request = response.next_request
+                    if next_request is None:
+                        await response.aclose()
+                        raise ValueError("Browser redirect could not be replayed")
+                    redirect_url = str(next_request.url)
+                    try:
+                        await _validate_browser_target(
+                            redirect_url,
+                            allowed_file_roots=self.allowed_file_roots,
+                            allowed_files=self.allowed_files,
+                        )
+                    except Exception:
+                        await response.aclose()
+                        raise
+                    if redirect_url == str(current_request.url):
+                        await response.aclose()
+                        raise ValueError("Browser redirect loop detected")
+                    redirect_history.append(
+                        (
+                            str(current_request.url),
+                            response.headers.get_list("set-cookie"),
+                        )
+                    )
+                    if is_navigation_request:
+                        if next_request.method != "GET":
+                            await response.aclose()
+                            raise ValueError(
+                                "Redirected browser navigations must use GET"
+                            )
+                        break
+                    await response.aclose()
+                    current_request = next_request
+                else:
+                    raise ValueError("Browser redirect limit exceeded")
+
                 try:
                     chunks: list[bytes] = []
                     content_size = 0
@@ -394,14 +450,31 @@ class BrowserSession:
                     response_headers[key] = f"{response_headers[key]}, {value}"
                 else:
                     response_headers[key] = value
-            for redirect_response in (*response.history, response):
-                response_url = str(
-                    getattr(getattr(redirect_response, "request", None), "url", "")
-                    or request_url
+            for response_url, set_cookie_headers in redirect_history:
+                await self._apply_response_cookies(response_url, set_cookie_headers)
+            final_response_url = str(
+                getattr(getattr(response, "request", None), "url", "") or request_url
+            )
+            await self._apply_response_cookies(
+                final_response_url, response.headers.get_list("set-cookie")
+            )
+            if is_navigation_request and redirect_url is not None:
+                # A fulfilled 3xx is followed by Chromium without invoking
+                # the route handler again. Return a same-origin document that
+                # starts a fresh navigation, so the redirect target is a new
+                # routed request and receives the same egress checks.
+                redirect_document = (
+                    '<!doctype html><meta charset="utf-8">'
+                    "<script>location.replace("
+                    f"{json.dumps(redirect_url)}"
+                    ");</script>"
                 )
-                await self._apply_response_cookies(
-                    response_url, redirect_response.headers.get_list("set-cookie")
+                await route.fulfill(
+                    status=200,
+                    headers={"content-type": "text/html; charset=utf-8"},
+                    body=redirect_document.encode(),
                 )
+                return
             # Chromium's Cookie header was forwarded explicitly above. Never
             # let httpx replay upstream Set-Cookie values on another request.
             self._http_client.cookies.clear()

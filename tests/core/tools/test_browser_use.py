@@ -404,6 +404,7 @@ class TestBrowserSession:
         route = MagicMock()
         route.request.url = "https://public.example/page"
         route.request.method = "GET"
+        route.request.is_navigation_request = lambda: False
         route.request.post_data_buffer = None
         route.request.all_headers = AsyncMock(
             return_value={"accept-encoding": "br, gzip", "host": "public.example"}
@@ -443,6 +444,147 @@ class TestBrowserSession:
         route = MagicMock()
         route.request.url = "https://public.example/large"
         route.request.method = "GET"
+        route.request.is_navigation_request = lambda: False
+        route.request.post_data_buffer = None
+        route.request.all_headers = AsyncMock(return_value={})
+        route.fulfill = AsyncMock()
+        route.abort = AsyncMock()
+
+        try:
+            await session._guard_route(route)
+        finally:
+            await session._http_client.aclose()
+
+        route.fulfill.assert_not_awaited()
+        route.abort.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_route_follows_subresource_redirects_inside_httpx(
+        self, monkeypatch
+    ):
+        captured: list[str] = []
+
+        async def respond(request: httpx.Request) -> httpx.Response:
+            captured.append(str(request.url))
+            if request.url.path == "/start":
+                return httpx.Response(
+                    302,
+                    request=request,
+                    headers={"location": "https://public.example/final"},
+                )
+            return httpx.Response(
+                200, request=request, stream=httpx.ByteStream(b"final")
+            )
+
+        async def allow_public_target(_url: str) -> list[str]:
+            return ["203.0.113.10"]
+
+        monkeypatch.setattr(
+            browser_use, "validate_public_http_url", allow_public_target
+        )
+        session = browser_use.BrowserSession("guard-redirect")
+        session._http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), follow_redirects=False
+        )
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+        session._context.cookies = AsyncMock(return_value=[])
+        route = MagicMock()
+        route.request.url = "https://public.example/start"
+        route.request.method = "GET"
+        route.request.is_navigation_request = lambda: False
+        route.request.post_data_buffer = None
+        route.request.all_headers = AsyncMock(return_value={})
+        route.fulfill = AsyncMock()
+        route.abort = AsyncMock()
+
+        try:
+            await session._guard_route(route)
+        finally:
+            await session._http_client.aclose()
+
+        assert captured == [
+            "https://public.example/start",
+            "https://public.example/final",
+        ]
+        assert route.abort.await_count == 0
+        assert route.fulfill.await_args.kwargs["status"] == 200
+        assert route.fulfill.await_args.kwargs["body"] == b"final"
+
+    @pytest.mark.asyncio
+    async def test_guard_route_restarts_navigation_redirect_through_route(
+        self, monkeypatch
+    ):
+        async def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "https://public.example/final"},
+                stream=httpx.ByteStream(b""),
+            )
+
+        async def allow_public_target(_url: str) -> list[str]:
+            return ["203.0.113.10"]
+
+        monkeypatch.setattr(
+            browser_use, "validate_public_http_url", allow_public_target
+        )
+        session = browser_use.BrowserSession("guard-navigation-redirect")
+        session._http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), follow_redirects=False
+        )
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+        session._context.cookies = AsyncMock(return_value=[])
+        route = MagicMock()
+        route.request.url = "https://public.example/start"
+        route.request.method = "GET"
+        route.request.is_navigation_request = lambda: True
+        route.request.post_data_buffer = None
+        route.request.all_headers = AsyncMock(return_value={})
+        route.fulfill = AsyncMock()
+        route.abort = AsyncMock()
+
+        try:
+            await session._guard_route(route)
+        finally:
+            await session._http_client.aclose()
+
+        fulfill = route.fulfill.await_args.kwargs
+        assert fulfill["status"] == 200
+        assert b"https://public.example/final" in fulfill["body"]
+        route.abort.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_navigation", [False, True])
+    async def test_guard_route_aborts_redirect_to_private_target(
+        self, monkeypatch, is_navigation
+    ):
+        async def respond(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                302,
+                request=request,
+                headers={"location": "http://169.254.169.254/latest/meta-data/"},
+                stream=httpx.ByteStream(b""),
+            )
+
+        async def reject_private_target(_url: str) -> list[str]:
+            raise ValueError("private network target")
+
+        monkeypatch.setattr(
+            browser_use, "validate_public_http_url", reject_private_target
+        )
+        session = browser_use.BrowserSession("guard-private-redirect")
+        session._http_client = httpx.AsyncClient(
+            transport=httpx.MockTransport(respond), follow_redirects=False
+        )
+        session._context = MagicMock()
+        session._context.add_cookies = AsyncMock()
+        session._context.cookies = AsyncMock(return_value=[])
+        route = MagicMock()
+        route.request.url = "https://public.example/start"
+        route.request.method = "GET"
+        route.request.is_navigation_request = lambda: is_navigation
         route.request.post_data_buffer = None
         route.request.all_headers = AsyncMock(return_value={})
         route.fulfill = AsyncMock()

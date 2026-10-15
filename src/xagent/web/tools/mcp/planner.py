@@ -607,6 +607,30 @@ def _build_assignments(user_ids: list[str] | None) -> dict[str, Any] | None:
     }
 
 
+def _list_plans_page(default_path: str, next_link: str | None) -> str:
+    path = _resolve_list_path(default_path, next_link)
+    result = _graph_request("GET", path)
+    tenant_id = _tenant_id_from_auth_token()
+    if tenant_id is None:
+        logger.warning(
+            "Planner web URLs unavailable: the token has no usable tenant id; "
+            "there is no shareable link, so open plans from Planner or Teams"
+        )
+    plans = result.get("value", [])
+    if not isinstance(plans, list):
+        raise RuntimeError("Planner returned a non-list value collection")
+    plans = [
+        _with_plan_web_url(plan, tenant_id) if isinstance(plan, dict) else plan
+        for plan in plans
+    ]
+    return _bounded_list_response(
+        "plans",
+        plans,
+        next_link=result.get("@odata.nextLink"),
+        retry_next_link=next_link,
+    )
+
+
 @mcp.tool()
 def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
     """List the Planner plans owned by a Microsoft 365 group.
@@ -624,28 +648,8 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
     next_link is optional -- pass the next_link value from a previous
     response to fetch the next page instead of the first."""
     try:
-        path = _resolve_list_path(
+        return _list_plans_page(
             f"/groups/{url_path_id(group_id, 'group_id')}/planner/plans", next_link
-        )
-        result = _graph_request("GET", path)
-        tenant_id = _tenant_id_from_auth_token()
-        if tenant_id is None:
-            logger.warning(
-                "Planner web URLs unavailable: the token has no usable tenant id; "
-                "there is no shareable link, so open plans from Planner or Teams"
-            )
-        plans = result.get("value", [])
-        if not isinstance(plans, list):
-            raise RuntimeError("Planner returned a non-list value collection")
-        plans = [
-            _with_plan_web_url(plan, tenant_id) if isinstance(plan, dict) else plan
-            for plan in plans
-        ]
-        return _bounded_list_response(
-            "plans",
-            plans,
-            next_link=result.get("@odata.nextLink"),
-            retry_next_link=next_link,
         )
     except Exception as e:
         logger.error("Error listing Planner plans for group %s: %s", group_id, e)
@@ -654,7 +658,7 @@ def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
 
 @mcp.tool()
 def planner_list_my_plans(next_link: str | None = None) -> str:
-    """List every Planner plan accessible to the signed-in user.
+    """List Planner plans shared with the user (Graph ``/me/planner/plans``).
 
     Use this tool for requests such as "what plans do I have?". It does not
     require a Microsoft 365 group id. ``planner_list_my_tasks`` is not a
@@ -670,27 +674,7 @@ def planner_list_my_plans(next_link: str | None = None) -> str:
     response to fetch the next page instead of the first.
     """
     try:
-        path = _resolve_list_path("/me/planner/plans", next_link)
-        result = _graph_request("GET", path)
-        tenant_id = _tenant_id_from_auth_token()
-        if tenant_id is None:
-            logger.warning(
-                "Planner web URLs unavailable: the token has no usable tenant id; "
-                "there is no shareable link, so open plans from Planner or Teams"
-            )
-        plans = result.get("value", [])
-        if not isinstance(plans, list):
-            raise RuntimeError("Planner returned a non-list value collection")
-        plans = [
-            _with_plan_web_url(plan, tenant_id) if isinstance(plan, dict) else plan
-            for plan in plans
-        ]
-        return _bounded_list_response(
-            "plans",
-            plans,
-            next_link=result.get("@odata.nextLink"),
-            retry_next_link=next_link,
-        )
+        return _list_plans_page("/me/planner/plans", next_link)
     except Exception as e:
         logger.error("Error listing the signed-in user's Planner plans: %s", e)
         return _error(str(e))

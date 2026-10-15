@@ -433,14 +433,21 @@ def test_list_plans_fetches_next_page(monkeypatch):
     assert mock_request.call_args.kwargs["url"] == next_link
 
 
-def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        pytest.param("planner_list_plans", ("group-1",), id="group-plans"),
+        pytest.param("planner_list_my_plans", (), id="shared-plans"),
+    ],
+)
+def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch, tool_name, args):
     monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
     mock_request = Mock(
         return_value=MockResponse({"value": [{"title": "No id"}, {"id": "plan-1"}]})
     )
     monkeypatch.setattr(planner.requests, "request", mock_request)
 
-    result = json.loads(planner.planner_list_plans("group-1"))
+    result = json.loads(getattr(planner, tool_name)(*args))
 
     assert result["status"] == "success"
     assert result["plans"] == [
@@ -449,7 +456,14 @@ def test_list_plans_preserves_null_web_url_and_missing_id(monkeypatch):
     ]
 
 
-def test_list_plans_decodes_tenant_once(monkeypatch):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        pytest.param("planner_list_plans", ("group-1",), id="group-plans"),
+        pytest.param("planner_list_my_plans", (), id="shared-plans"),
+    ],
+)
+def test_list_plans_decodes_tenant_once(monkeypatch, tool_name, args):
     tenant_id = Mock(return_value=TENANT_ID)
     monkeypatch.setattr(planner, "_tenant_id_from_auth_token", tenant_id)
     monkeypatch.setattr(
@@ -460,13 +474,20 @@ def test_list_plans_decodes_tenant_once(monkeypatch):
         ),
     )
 
-    result = json.loads(planner.planner_list_plans("group-1"))
+    result = json.loads(getattr(planner, tool_name)(*args))
 
     assert result["status"] == "success"
     tenant_id.assert_called_once_with()
 
 
-def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog):
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        pytest.param("planner_list_plans", ("group-1",), id="group-plans"),
+        pytest.param("planner_list_my_plans", (), id="shared-plans"),
+    ],
+)
+def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog, tool_name, args):
     monkeypatch.setenv("AUTH_TOKEN", "opaque-token")
     monkeypatch.setattr(
         planner.requests,
@@ -477,7 +498,7 @@ def test_list_plans_logs_missing_tenant_once(monkeypatch, caplog):
     )
 
     with caplog.at_level("WARNING", logger="planner-mcp"):
-        result = json.loads(planner.planner_list_plans("group-1"))
+        result = json.loads(getattr(planner, tool_name)(*args))
 
     assert result["status"] == "success"
     assert (

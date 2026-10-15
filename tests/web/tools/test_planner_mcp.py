@@ -499,6 +499,84 @@ def test_list_plans_rejects_forged_next_link(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_list_my_plans_success(monkeypatch):
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/plans?%24skip=50"
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [
+                    {
+                        "id": "plan-1",
+                        "title": "Launch",
+                        "owner": "group-1",
+                        "createdDateTime": "2026-10-15T00:00:00Z",
+                    }
+                ],
+                "@odata.nextLink": next_link,
+            }
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_my_plans())
+
+    assert result == {
+        "status": "success",
+        "plans": [
+            {
+                "web_url": (
+                    "https://planner.cloud.microsoft/webui/plan/plan-1/view/board?"
+                    f"tid={TENANT_ID}"
+                ),
+                "id": "plan-1",
+                "title": "Launch",
+                "owner": "group-1",
+                "createdDateTime": "2026-10-15T00:00:00Z",
+            }
+        ],
+        "next_link": next_link,
+        "truncated": False,
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/me/planner/plans")
+
+
+def test_list_my_plans_fetches_next_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse({"value": [{"id": "plan-2"}]}))
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/plans?%24skip=50"
+
+    result = json.loads(planner.planner_list_my_plans(next_link=next_link))
+
+    assert result["status"] == "success"
+    assert result["plans"][0]["id"] == "plan-2"
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_my_plans_rejects_other_graph_collection(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/planner/tasks?%24skip=50"
+
+    result = json.loads(planner.planner_list_my_plans(next_link=next_link))
+
+    assert result["status"] == "error"
+    assert "next_link" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_my_plans_rejects_non_list_collection(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(return_value=MockResponse({"value": {"id": "plan-1"}})),
+    )
+
+    result = json.loads(planner.planner_list_my_plans())
+
+    assert result["status"] == "error"
+    assert "non-list" in result["message"]
+
+
 def test_create_plan_builds_container_url(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse({"id": "plan-1", "title": "New plan"})

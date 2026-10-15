@@ -329,11 +329,14 @@ class PublicNetworkAsyncHTTPTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         original_url = request.url
         original_host = request.headers.get("Host")
+        # A proxy controls the TCP hop, but it must not become an implicit
+        # allowlist for browser targets. Validate every URL (including each
+        # redirect followed by httpx) before handing it to the proxy.
+        await validate_public_http_url(str(original_url))
         if self._proxy_url is not None:
-            # A trusted egress proxy performs the actual DNS lookup and TCP
-            # connection. The explicit opt-in represented by proxy_url means
-            # it is responsible for enforcing the same private-range policy;
-            # rewriting the CONNECT target to an IP would also break TLS SNI.
+            # The explicit proxy opt-in controls the egress route; the target
+            # policy was still checked above. Rewriting the CONNECT target to
+            # an IP would break TLS SNI and proxy routing.
             parsed = urlsplit(str(original_url))
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("Only HTTP(S) URLs with a hostname are allowed")

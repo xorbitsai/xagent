@@ -209,6 +209,9 @@ class BrowserSession:
                 "--disable-blink-features=AutomationControlled",
                 "--disable-infobars",
                 "--window-size=1920,1080",
+                # Prevent browser-managed UDP/WebRTC paths from bypassing the
+                # context route and the pinned HTTP transport.
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             ]
             allow_unsandboxed = get_browser_allow_unsandboxed()
             if allow_unsandboxed:
@@ -236,7 +239,7 @@ class BrowserSession:
 
             self._http_client = httpx.AsyncClient(
                 transport=PublicNetworkAsyncHTTPTransport(proxy_url=proxy_url),
-                follow_redirects=False,
+                follow_redirects=True,
                 timeout=httpx.Timeout(30.0),
                 cookies=CookieJar(policy=_NoStoreCookiePolicy()),
             )
@@ -288,6 +291,20 @@ class BrowserSession:
                 Object.defineProperty(navigator, 'languages', {
                     get: () => __XAGENT_LANGUAGES__
                 });
+
+                // Shared workers and peer connections can open sockets that
+                // Playwright's page routing cannot observe. Browser tasks do
+                // not need either capability, so keep them unavailable.
+                Object.defineProperty(globalThis, 'SharedWorker', {
+                    value: undefined,
+                    configurable: false,
+                    writable: false
+                });
+                Object.defineProperty(globalThis, 'RTCPeerConnection', {
+                    value: undefined,
+                    configurable: false,
+                    writable: false
+                });
             """.replace("__XAGENT_LANGUAGES__", spoofed_languages)
             await self._page.add_init_script(init_script)
 
@@ -314,6 +331,21 @@ class BrowserSession:
                 return
             assert self._http_client is not None
             request_headers = await route.request.all_headers()
+            # Playwright may omit cookies from ``all_headers`` for a request
+            # that was initiated by a worker or by a redirect.  Reconstruct
+            # the browser's cookie header from the isolated context so the
+            # upstream request has the same authenticated state as Chromium.
+            if self._context is not None and not any(
+                header.lower() == "cookie" for header in request_headers
+            ):
+                browser_cookies = await self._context.cookies([request_url])
+                if browser_cookies:
+                    request_headers["cookie"] = "; ".join(
+                        f"{cookie['name']}={cookie['value']}"
+                        for cookie in browser_cookies
+                        if cookie.get("name") is not None
+                        and cookie.get("value") is not None
+                    )
             for header in (
                 "accept-encoding",
                 "connection",
@@ -359,9 +391,14 @@ class BrowserSession:
                     response_headers[key] = f"{response_headers[key]}, {value}"
                 else:
                     response_headers[key] = value
-            await self._apply_response_cookies(
-                request_url, response.headers.get_list("set-cookie")
-            )
+            for redirect_response in (*response.history, response):
+                response_url = str(
+                    getattr(getattr(redirect_response, "request", None), "url", "")
+                    or request_url
+                )
+                await self._apply_response_cookies(
+                    response_url, redirect_response.headers.get_list("set-cookie")
+                )
             # Chromium's Cookie header was forwarded explicitly above. Never
             # let httpx replay upstream Set-Cookie values on another request.
             self._http_client.cookies.clear()
@@ -550,10 +587,16 @@ class BrowserSessionManager:
                         f"{existing.locale!r}; requested locale {locale!r} ignored "
                         "(a session's locale is frozen at creation)"
                     )
-                # A session id can be supplied by a model. Replace grants on
-                # every call so a previous call cannot authorize a later one.
-                existing.allowed_file_roots = tuple(allowed_file_roots)
-                existing.allowed_files = tuple(allowed_files)
+                # Keep grants for the lifetime of a session. Navigation is
+                # often followed by click/screenshot/PDF calls that do not
+                # carry the workspace arguments again; replacing them would
+                # abort legitimate file subresources after the first tool.
+                existing.allowed_file_roots = tuple(
+                    dict.fromkeys((*existing.allowed_file_roots, *allowed_file_roots))
+                )
+                existing.allowed_files = tuple(
+                    dict.fromkeys((*existing.allowed_files, *allowed_files))
+                )
                 existing._last_used = datetime.now()
                 return existing
 
@@ -724,15 +767,29 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "error": "Playwright is not installed or browsers not downloaded. Install with: pip install playwright. Then download browsers: playwright install chromium",
         }
 
-    manager = get_browser_manager()
-    session = await manager.get_or_create(
-        session_id,
-        headless,
-        locale=locale,
-        allowed_file_roots=allowed_file_roots,
-        allowed_files=allowed_files,
-    )
-    page = await session.get_page()
+    try:
+        manager = get_browser_manager()
+        session = await manager.get_or_create(
+            session_id,
+            headless,
+            locale=locale,
+            allowed_file_roots=allowed_file_roots,
+            allowed_files=allowed_files,
+        )
+        page = await session.get_page()
+    except Exception as exc:
+        logger.warning(
+            "[browser_navigate] Failed to initialize browser session (%s)",
+            type(exc).__name__,
+        )
+        return {
+            "success": False,
+            "session_id": session_id,
+            "url": url,
+            "title": "",
+            "message": "",
+            "error": str(exc) or "Browser session initialization failed",
+        }
 
     try:
         # Log navigation attempt for debugging

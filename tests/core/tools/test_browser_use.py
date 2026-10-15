@@ -397,6 +397,7 @@ class TestBrowserSession:
         )
         session._context = MagicMock()
         session._context.add_cookies = AsyncMock()
+        session._context.cookies = AsyncMock(return_value=[])
         route = MagicMock()
         route.request.url = "https://public.example/page"
         route.request.method = "GET"
@@ -435,6 +436,7 @@ class TestBrowserSession:
         session._http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
         session._context = MagicMock()
         session._context.add_cookies = AsyncMock()
+        session._context.cookies = AsyncMock(return_value=[])
         route = MagicMock()
         route.request.url = "https://public.example/large"
         route.request.method = "GET"

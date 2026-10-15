@@ -134,15 +134,17 @@ class TestPublicNetworkAsyncHTTPTransport:
         assert str(request.url) == "https://public.example/path"
 
     @pytest.mark.asyncio
-    async def test_trusted_proxy_preserves_hostname_without_local_resolution(
+    async def test_trusted_proxy_validates_target_and_preserves_hostname(
         self, monkeypatch
     ) -> None:
         inner = _RecordingTransport()
+        validated: list[str] = []
 
-        async def fail_if_resolved(_url: str) -> list[str]:
-            raise AssertionError("trusted proxy should perform target DNS")
+        async def validate_target(url: str) -> list[str]:
+            validated.append(url)
+            return ["203.0.113.8"]
 
-        monkeypatch.setattr(security, "validate_public_http_url", fail_if_resolved)
+        monkeypatch.setattr(security, "validate_public_http_url", validate_target)
         monkeypatch.setattr(security.httpx, "AsyncHTTPTransport", lambda **_: inner)
         transport = security.PublicNetworkAsyncHTTPTransport(
             proxy_url="http://proxy.example:8080"
@@ -153,3 +155,4 @@ class TestPublicNetworkAsyncHTTPTransport:
 
         assert response.status_code == 200
         assert inner.urls == ["https://public.example/path"]
+        assert validated == ["https://public.example/path"]

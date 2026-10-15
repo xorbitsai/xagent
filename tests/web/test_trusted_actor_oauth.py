@@ -683,7 +683,7 @@ def test_actor_callback_rejects_unreadable_owner_claim_before_exchange(
     post.assert_not_called()
 
 
-def test_ordinary_oauth_flow_keeps_cookie_free_state_and_provisioning(
+def test_ordinary_oauth_flow_binds_state_to_cookie_and_provisions(
     oauth_db, monkeypatch
 ) -> None:
     db, user = oauth_db
@@ -698,13 +698,24 @@ def test_ordinary_oauth_flow_keeps_cookie_free_state_and_provisioning(
     assert payload is not None
     assert "resource_owner_key" not in payload
     assert "actor_flow_nonce" not in payload
-    assert "set-cookie" not in start.headers
+    ordinary_cookie = SimpleCookie()
+    ordinary_cookie.load(start.headers["set-cookie"])
+    assert "xagent_oauth_state" in ordinary_cookie
     _mock_exchange(monkeypatch)
     side_effects = Mock()
     monkeypatch.setattr(auth_api, "_run_post_commit_oauth_side_effects", side_effects)
 
     response = generic_oauth_callback(
-        "custom", _request(_state(start)), db, _provider()
+        "custom",
+        _request(
+            _state(start),
+            cookie=(
+                "xagent_oauth_state",
+                ordinary_cookie["xagent_oauth_state"].value,
+            ),
+        ),
+        db,
+        _provider(),
     )
 
     assert response.status_code == 200

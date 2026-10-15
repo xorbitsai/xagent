@@ -567,8 +567,16 @@ def _mock_provider_http(monkeypatch, token_data: dict | None = None):
     return post, get
 
 
-def _callback(db: Session, state: str, provider: str = FAKE_PROVIDER):
-    request = SimpleNamespace(query_params={"state": state, "code": "code"}, cookies={})
+def _callback(
+    db: Session,
+    state: str,
+    provider: str = FAKE_PROVIDER,
+    cookies: dict[str, str] | None = None,
+):
+    request = SimpleNamespace(
+        query_params={"state": state, "code": "code"},
+        cookies=cookies or {},
+    )
     return auth_api.generic_oauth_callback(
         provider, request, db=db, db_provider=_db_provider(provider)
     )
@@ -601,11 +609,13 @@ def test_callback_exchanges_the_code_on_the_account_bound_at_login(
 ):
     db, user = oauth_db
     post, get = _mock_provider_http(monkeypatch)
-    state = parse_qs(
-        urlparse(_login(db, user, account="acme").headers["location"]).query
-    )["state"][0]
+    start = _login(db, user, account="acme")
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    cookie = SimpleCookie()
+    cookie.load(start.headers["set-cookie"])
+    cookies = {name: morsel.value for name, morsel in cookie.items()}
 
-    response = _callback(db, state)
+    response = _callback(db, state, cookies=cookies)
 
     assert response.status_code == 200
     assert post.call_args.args[0] == "https://acme.acmedesk.example/oauth/token"
@@ -704,9 +714,15 @@ def test_callback_with_a_nested_userinfo_identity_persists_no_grant(
     assert _grant(db, user) is None
 
 
-def _login_state(db: Session, user: User, account: str) -> str:
-    location = _login(db, user, account=account).headers["location"]
-    return parse_qs(urlparse(location).query)["state"][0]
+def _login_state(db: Session, user: User, account: str) -> tuple[str, dict[str, str]]:
+    response = _login(db, user, account=account)
+    location = response.headers["location"]
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    return (
+        parse_qs(urlparse(location).query)["state"][0],
+        {name: morsel.value for name, morsel in cookie.items()},
+    )
 
 
 def test_callback_ignores_an_account_in_the_callback_query_string(
@@ -714,14 +730,15 @@ def test_callback_ignores_an_account_in_the_callback_query_string(
 ):
     db, user = oauth_db
     post, _get = _mock_provider_http(monkeypatch)
+    state, cookies = _login_state(db, user, "acme")
     request = SimpleNamespace(
         query_params={
-            "state": _login_state(db, user, "acme"),
+            "state": state,
             "code": "code",
             "oauth_account": "evil",
             "account": "evil",
         },
-        cookies={},
+        cookies=cookies,
     )
 
     response = auth_api.generic_oauth_callback(
@@ -738,14 +755,15 @@ def test_callback_rejects_a_state_whose_account_was_tampered_with(
 ):
     db, user = oauth_db
     post, _get = _mock_provider_http(monkeypatch)
-    header, body, signature = _login_state(db, user, "acme").split(".")
+    state, cookies = _login_state(db, user, "acme")
+    header, body, signature = state.split(".")
     claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
     claims["oauth_account"] = "evil"
     forged_body = (
         base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     )
 
-    response = _callback(db, f"{header}.{forged_body}.{signature}")
+    response = _callback(db, f"{header}.{forged_body}.{signature}", cookies=cookies)
 
     assert response.status_code == 400
     post.assert_not_called()
@@ -757,12 +775,14 @@ def test_reconnecting_to_another_account_replaces_account_and_tokens_together(
 ):
     db, user = oauth_db
     _mock_provider_http(monkeypatch)
-    assert _callback(db, _login_state(db, user, "acme")).status_code == 200
+    state, cookies = _login_state(db, user, "acme")
+    assert _callback(db, state, cookies=cookies).status_code == 200
     _mock_provider_http(
         monkeypatch, {"access_token": "beta-access", "refresh_token": "beta-refresh"}
     )
 
-    assert _callback(db, _login_state(db, user, "beta")).status_code == 200
+    state, cookies = _login_state(db, user, "beta")
+    assert _callback(db, state, cookies=cookies).status_code == 200
 
     grants = db.query(UserOAuth).filter(UserOAuth.user_id == user.id).all()
     assert [(g.instance_url, g.access_token, g.refresh_token) for g in grants] == [

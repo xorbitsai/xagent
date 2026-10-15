@@ -7,6 +7,7 @@ import asyncio
 import socket
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
@@ -169,9 +170,15 @@ def _login(db, user, account: str):
     )
 
 
-def _login_state(db, user, account: str = "acme") -> str:
-    location = _login(db, user, account).headers["location"]
-    return parse_qs(urlparse(location).query)["state"][0]
+def _login_state(db, user, account: str = "acme") -> tuple[str, dict[str, str]]:
+    response = _login(db, user, account)
+    location = response.headers["location"]
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    return (
+        parse_qs(urlparse(location).query)["state"][0],
+        {name: morsel.value for name, morsel in cookie.items()},
+    )
 
 
 def _mock_provider_http(monkeypatch, userinfo: dict):
@@ -193,8 +200,11 @@ def _mock_provider_http(monkeypatch, userinfo: dict):
     return post, get
 
 
-def _callback(db, state: str):
-    request = SimpleNamespace(query_params={"state": state, "code": "code"}, cookies={})
+def _callback(db, state: str, cookies: dict[str, str] | None = None):
+    request = SimpleNamespace(
+        query_params={"state": state, "code": "code"},
+        cookies=cookies or {},
+    )
     return auth_api.generic_oauth_callback(
         "zendesk", request, db=db, db_provider=_db_provider(db)
     )
@@ -247,7 +257,8 @@ def test_callback_persists_the_identity_nested_under_user(zendesk_db, monkeypatc
         monkeypatch, {"user": {"id": 123456, "email": "agent@acme.example"}}
     )
 
-    response = _callback(db, _login_state(db, user))
+    state, cookies = _login_state(db, user)
+    response = _callback(db, state, cookies)
 
     assert response.status_code == 200
     assert post.call_args.args[0] == "https://acme.zendesk.com/oauth/tokens"
@@ -268,7 +279,8 @@ def test_code_exchange_requests_the_maximum_token_lifetimes(zendesk_db, monkeypa
         monkeypatch, {"user": {"id": 1, "email": "agent@acme.example"}}
     )
 
-    _callback(db, _login_state(db, user))
+    state, cookies = _login_state(db, user)
+    _callback(db, state, cookies)
 
     sent = post.call_args.kwargs["data"]
     assert sent["grant_type"] == "authorization_code"
@@ -290,7 +302,8 @@ def test_callback_without_a_nested_user_id_persists_no_grant(
     db, user = zendesk_db
     _mock_provider_http(monkeypatch, userinfo)
 
-    response = _callback(db, _login_state(db, user))
+    state, cookies = _login_state(db, user)
+    response = _callback(db, state, cookies)
 
     assert response.status_code == 400
     assert _grant(db, user) is None

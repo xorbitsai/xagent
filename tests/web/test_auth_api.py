@@ -17,7 +17,12 @@ from sqlalchemy.orm import sessionmaker
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.auth_database import auth_db_override
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
+from xagent.web.api.auth import (
+    RefreshTokenResponse,
+    auth_router,
+    hash_password,
+    verify_password,
+)
 from xagent.web.models import database as database_module
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.database import Base, configure_db, get_db, get_engine
@@ -1387,7 +1392,10 @@ class TestAuthAPI:
         )
         response = client.patch(
             "/api/auth/email",
-            json={"email": "updated@example.com"},
+            json={
+                "email": "updated@example.com",
+                "current_password": test_user_data["password"],
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
@@ -1420,7 +1428,7 @@ class TestAuthAPI:
         token = login_and_get_token("seconduser", "password123")
         response = client.patch(
             "/api/auth/email",
-            json={"email": "first@example.com"},
+            json={"email": "first@example.com", "current_password": "password123"},
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200
@@ -1624,7 +1632,8 @@ class TestAuthAPI:
         )
         assert user is not None
         assert user.password_hash != test_user_data["password"]  # Should be hashed
-        assert len(str(user.password_hash)) == 64
+        assert str(user.password_hash).startswith("$2b$")
+        assert verify_password(test_user_data["password"], str(user.password_hash))
 
         db.close()
 
@@ -1928,7 +1937,10 @@ class TestAuthAPI:
         token = login_and_get_token("updater", "password123")
         conflict_response = client.patch(
             "/api/auth/email",
-            json={"email": "legacy@example.com"},
+            json={
+                "email": "legacy@example.com",
+                "current_password": "password123",
+            },
             headers={"Authorization": f"Bearer {token}"},
         )
         assert conflict_response.status_code == 200

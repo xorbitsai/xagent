@@ -378,6 +378,42 @@ class TestBrowserSession:
         context.add_init_script.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_initialization_failure_cleans_up_partial_browser(self, monkeypatch):
+        context = MagicMock()
+        context.route = AsyncMock(side_effect=RuntimeError("route setup failed"))
+        context.close = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+        chromium = MagicMock()
+        chromium.launch = AsyncMock(return_value=browser)
+        playwright = MagicMock(chromium=chromium)
+        playwright.stop = AsyncMock()
+        starter = MagicMock()
+        starter.start = AsyncMock(return_value=playwright)
+
+        monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+        monkeypatch.setattr(browser_use, "async_playwright", lambda: starter)
+        monkeypatch.setattr(browser_use, "get_trusted_proxy_url", lambda: None)
+        monkeypatch.setattr(
+            browser_use,
+            "PublicNetworkAsyncHTTPTransport",
+            lambda **_kwargs: httpx.MockTransport(lambda _request: httpx.Response(200)),
+        )
+
+        session = browser_use.BrowserSession("cleanup-on-init-failure")
+        with pytest.raises(RuntimeError, match="route setup failed"):
+            await session._ensure_initialized()
+
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+        playwright.stop.assert_awaited_once()
+        assert session._initialized is False
+        assert session._browser is None
+        assert session._context is None
+        assert session._http_client is None
+
+    @pytest.mark.asyncio
     async def test_guard_route_preserves_encoded_body_and_multiple_cookies(self):
         captured: list[httpx.Request] = []
 

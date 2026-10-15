@@ -212,14 +212,18 @@ class BrowserSession:
                 # context route and the pinned HTTP transport.
                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
             ]
-            allow_unsandboxed = get_browser_allow_unsandboxed()
-            if allow_unsandboxed:
-                browser_args.append("--no-sandbox")
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless,
-                args=browser_args,
-                chromium_sandbox=not allow_unsandboxed,
-            )
+            try:
+                allow_unsandboxed = get_browser_allow_unsandboxed()
+                if allow_unsandboxed:
+                    browser_args.append("--no-sandbox")
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless,
+                    args=browser_args,
+                    chromium_sandbox=not allow_unsandboxed,
+                )
+            except Exception:
+                await self.close()
+                raise
 
             # Create context with realistic settings. locale comes from the
             # caller (ultimately the requesting user/task's own language);
@@ -227,90 +231,102 @@ class BrowserSession:
             # the deployment default -- previously hardcoded to
             # zh-CN/Asia/Shanghai, which forced every automated session to
             # request Chinese-localized pages regardless of who asked.
-            self._context = await self._browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                locale=self.locale,
-                timezone_id=self.timezone_id,
-                service_workers="block",
-            )
+            try:
+                self._context = await self._browser.new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    locale=self.locale,
+                    timezone_id=self.timezone_id,
+                    service_workers="block",
+                )
+            except Exception:
+                await self.close()
+                raise
 
-            self._http_client = httpx.AsyncClient(
-                transport=PublicNetworkAsyncHTTPTransport(proxy_url=proxy_url),
-                # Let Chromium follow redirects through the context route. If
-                # httpx follows them here, the final response is fulfilled for
-                # the original Playwright request and keeps the wrong origin.
-                follow_redirects=False,
-                timeout=httpx.Timeout(30.0),
-                cookies=CookieJar(policy=_NoStoreCookiePolicy()),
-            )
+            try:
+                self._http_client = httpx.AsyncClient(
+                    transport=PublicNetworkAsyncHTTPTransport(proxy_url=proxy_url),
+                    # Let Chromium follow redirects through the context route. If
+                    # httpx follows them here, the final response is fulfilled for
+                    # the original Playwright request and keeps the wrong origin.
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(30.0),
+                    cookies=CookieJar(policy=_NoStoreCookiePolicy()),
+                )
+            except Exception:
+                await self.close()
+                raise
 
-            await self._context.route("**/*", self._guard_route)
-            await self._context.route_web_socket(
-                "**/*", lambda websocket: websocket.close(code=1008)
-            )
+            try:
+                await self._context.route("**/*", self._guard_route)
+                await self._context.route_web_socket(
+                    "**/*", lambda websocket: websocket.close(code=1008)
+                )
 
-            self._page = await self._context.new_page()
+                self._page = await self._context.new_page()
 
-            # Languages mirror the context's own locale instead of a fixed
-            # list, so the spoofed navigator.languages stays consistent with
-            # what the locale/Accept-Language header already imply. Built via
-            # plain string substitution (not an f-string) since the rest of
-            # this script is full of literal JS braces that an f-string would
-            # require escaping.
-            base_language = self.locale.split("-")[0]
-            spoofed_languages = json.dumps(
-                list(dict.fromkeys([self.locale, base_language, "en-US", "en"]))
-            )
+                # Languages mirror the context's own locale instead of a fixed
+                # list, so the spoofed navigator.languages stays consistent with
+                # what the locale/Accept-Language header already imply. Built via
+                # plain string substitution (not an f-string) since the rest of
+                # this script is full of literal JS braces that an f-string would
+                # require escaping.
+                base_language = self.locale.split("-")[0]
+                spoofed_languages = json.dumps(
+                    list(dict.fromkeys([self.locale, base_language, "en-US", "en"]))
+                )
 
-            # Inject script to hide webdriver property
-            init_script = """
-                // Override webdriver detection
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                });
+                # Inject script to hide webdriver property
+                init_script = """
+                    // Override webdriver detection
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
 
-                // Add chrome property
-                window.chrome = {
-                    runtime: {}
-                };
+                    // Add chrome property
+                    window.chrome = {
+                        runtime: {}
+                    };
 
-                // Override permissions
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
+                    // Override permissions
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters.name === 'notifications' ?
+                            Promise.resolve({ state: Notification.permission }) :
+                            originalQuery(parameters)
+                    );
 
-                // Override plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5]
-                });
+                    // Override plugins
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
 
-                // Override languages
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => __XAGENT_LANGUAGES__
-                });
+                    // Override languages
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => __XAGENT_LANGUAGES__
+                    });
 
-                // Shared workers and peer connections can open sockets that
-                // Playwright's page routing cannot observe. Browser tasks do
-                // not need either capability, so keep them unavailable.
-                Object.defineProperty(globalThis, 'SharedWorker', {
-                    value: undefined,
-                    configurable: false,
-                    writable: false
-                });
-                Object.defineProperty(globalThis, 'RTCPeerConnection', {
-                    value: undefined,
-                    configurable: false,
-                    writable: false
-                });
-            """.replace("__XAGENT_LANGUAGES__", spoofed_languages)
-            # Context-level scripts also cover popup pages created with
-            # window.open(), not only the initial page.
-            await self._context.add_init_script(init_script)
+                    // Shared workers and peer connections can open sockets that
+                    // Playwright's page routing cannot observe. Browser tasks do
+                    // not need either capability, so keep them unavailable.
+                    Object.defineProperty(globalThis, 'SharedWorker', {
+                        value: undefined,
+                        configurable: false,
+                        writable: false
+                    });
+                    Object.defineProperty(globalThis, 'RTCPeerConnection', {
+                        value: undefined,
+                        configurable: false,
+                        writable: false
+                    });
+                """.replace("__XAGENT_LANGUAGES__", spoofed_languages)
+                # Context-level scripts also cover popup pages created with
+                # window.open(), not only the initial page.
+                await self._context.add_init_script(init_script)
+            except Exception:
+                await self.close()
+                raise
 
             self._initialized = True
 
@@ -421,6 +437,20 @@ class BrowserSession:
                                 "Redirected browser navigations must use GET"
                             )
                         break
+                    await self._apply_response_cookies(
+                        str(current_request.url),
+                        response.headers.get_list("set-cookie"),
+                    )
+                    if self._context is not None:
+                        next_request.headers.pop("cookie", None)
+                        browser_cookies = await self._context.cookies([redirect_url])
+                        if browser_cookies:
+                            next_request.headers["cookie"] = "; ".join(
+                                f"{cookie['name']}={cookie['value']}"
+                                for cookie in browser_cookies
+                                if cookie.get("name") is not None
+                                and cookie.get("value") is not None
+                            )
                     await response.aclose()
                     current_request = next_request
                 else:
@@ -463,10 +493,16 @@ class BrowserSession:
                 # the route handler again. Return a same-origin document that
                 # starts a fresh navigation, so the redirect target is a new
                 # routed request and receives the same egress checks.
+                redirect_target = (
+                    json.dumps(redirect_url)
+                    .replace("<", "\\u003c")
+                    .replace(">", "\\u003e")
+                    .replace("&", "\\u0026")
+                )
                 redirect_document = (
                     '<!doctype html><meta charset="utf-8">'
                     "<script>location.replace("
-                    f"{json.dumps(redirect_url)}"
+                    f"{redirect_target}"
                     ");</script>"
                 )
                 await route.fulfill(

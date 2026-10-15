@@ -119,6 +119,12 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 ENV NODE_PATH="/opt/xagent/frontend/node_modules"
+# This image intentionally runs the backend as root for its existing Docker
+# sandbox and mounted-volume integrations. Chromium cannot initialize its
+# namespace sandbox as root, so make the compatibility opt-in explicit rather
+# than silently passing --no-sandbox. Prefer a non-root deployment and unset
+# this variable when the runtime can use Chromium's sandbox.
+ENV XAGENT_BROWSER_ALLOW_UNSANDBOXED=true
 
 WORKDIR /opt/xagent
 
@@ -198,15 +204,11 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /
 # image. A build ARG is the actual release gate for the image; deployments
 # that never intend to enable this connector can pass
 # --build-arg INSTALL_CHROME=false to drop the image size and the
-# /opt/google/chrome/chrome binary + npx cache. That flag does NOT remove
-# all root/--no-sandbox browser exposure from the image: Playwright Chromium
-# is installed unconditionally in a separate stage below and is already
-# launched with --no-sandbox as root by the pre-existing browser_use tool,
-# independent of this connector and this flag. Also note the container has
-# no USER directive anywhere (root throughout, pre-existing and out of scope
-# here) -- see the follow-up issue tracking both that (scoped to cover the
-# generic custom-MCP-server path too, not just this connector's visibility
-# toggle) and the security review needed before unhiding.
+# /opt/google/chrome/chrome binary + npx cache. Playwright Chromium is
+# installed unconditionally in a separate stage below. The published backend
+# image still runs as root, so the runtime opts into unsandboxed Chromium for
+# compatibility; deployments that can run the backend as a non-root user
+# should unset XAGENT_BROWSER_ALLOW_UNSANDBOXED and use Chromium's sandbox.
 ARG INSTALL_CHROME=true
 # Distinct from the Playwright Chromium below, which chrome-devtools-mcp does
 # not detect. Its default "stable" channel resolution checks exactly

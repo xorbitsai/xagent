@@ -377,3 +377,33 @@ class TestBrowserSession:
             assert session.session_id == "test-session"
             assert session.headless is True
             assert session._initialized is False
+
+    @pytest.mark.asyncio
+    async def test_session_uses_sandbox_unless_explicitly_allowed(self, monkeypatch):
+        monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+        playwright = MagicMock()
+        browser = MagicMock()
+        context = MagicMock()
+        page = MagicMock()
+        cdp = MagicMock()
+
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+        browser.new_context = AsyncMock(return_value=context)
+        context.new_page = AsyncMock(return_value=page)
+        context.new_cdp_session = AsyncMock(return_value=cdp)
+        context.add_init_script = AsyncMock()
+        cdp.send = AsyncMock()
+        cdp.detach = AsyncMock()
+        playwright_api = MagicMock()
+        playwright_api.start = AsyncMock(return_value=playwright)
+        monkeypatch.setattr(browser_use, "async_playwright", lambda: playwright_api)
+
+        session = browser_use.BrowserSession("sandbox-test", headless=True)
+        monkeypatch.setattr(browser_use, "get_browser_allow_unsandboxed", lambda: False)
+        await session.get_page()
+
+        launch_kwargs = playwright.chromium.launch.await_args.kwargs
+        assert launch_kwargs["chromium_sandbox"] is True
+        assert "--no-sandbox" not in launch_kwargs["args"]
+
+        await session.close()

@@ -5,6 +5,7 @@ import inspect
 import pytest
 
 from xagent.core.tools.adapters.vibe.browser_use import (
+    BrowserNavigateTool,
     BrowserScreenshotTool,
     BrowserTaskSessionMixin,
     create_browser_tools,
@@ -87,6 +88,34 @@ def test_browser_task_session_mixin_keeps_explicit_session() -> None:
 
     assert args["session_id"] == "custom-session"
     assert "_xagent_step_id" not in args
+
+
+@pytest.mark.asyncio
+async def test_browser_navigate_discards_model_supplied_workspace_root(monkeypatch):
+    captured = {}
+
+    async def fake_browser_navigate(**kwargs):
+        captured.update(kwargs)
+        return {
+            "success": True,
+            "session_id": kwargs.get("session_id", ""),
+            "url": kwargs["url"],
+            "message": "ok",
+        }
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.browser_use.browser_navigate",
+        fake_browser_navigate,
+    )
+
+    tool = BrowserNavigateTool(task_id="task-412")
+    result = await tool.run_json_async(
+        {"url": "https://example.com", "_workspace_root": "/"}
+    )
+
+    assert result["success"] is True
+    assert captured["session_id"] == "task-412"
+    assert "_workspace_root" not in captured
 
 
 @pytest.mark.asyncio

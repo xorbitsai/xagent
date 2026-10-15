@@ -409,10 +409,13 @@ def test_overdue_query_asks_xero_for_authorised_invoices_due_before_the_date(
     _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
 
     params = fake.calls[-1]["params"]
-    assert params["where"] == 'Type=="ACCREC" AND DueDate<DateTime(2026,10,13)'
+    assert params["where"] == (
+        'Type=="ACCREC" AND Date<=DateTime(2026,10,13) AND DueDate<DateTime(2026,10,13)'
+    )
     assert params["Statuses"] == "AUTHORISED"
-    assert params["order"] == "DueDate"
+    assert "order" not in params
     assert params["pageSize"] == xero.XERO_BULK_PAGE_SIZE
+    assert params["summaryOnly"] == "true"
 
 
 def test_overdue_min_days_moves_the_cutoff(fake: FakeXero) -> None:
@@ -462,33 +465,16 @@ def test_overdue_deduplicates_invoice_ids_across_pages(fake: FakeXero) -> None:
     assert [invoice["invoice_number"] for invoice in result["invoices"]] == ["INV-1"]
 
 
-def test_overdue_falls_back_when_xero_rejects_the_due_date_filter(
-    fake: FakeXero,
-) -> None:
-    pages = [
-        [
-            _invoice("INV-OLD", "2026-09-01", 100),
-            _invoice("INV-NOT-DUE", "2026-11-01", 100),
-        ]
-    ]
-    respond = _overdue_pages(pages)
+def test_overdue_does_not_retry_a_bad_request_without_filters(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse(
+        {"Message": "Invalid filter"}, status_code=400
+    )
 
-    def reject_due_date(call: dict[str, Any]) -> MockResponse:
-        if "DueDate" in (call["params"].get("where") or ""):
-            return MockResponse({"Message": "Invalid filter"}, status_code=400)
-        return respond(call)
+    with pytest.raises(xero.XeroAPIError, match="Invalid filter") as error:
+        xero.list_overdue_invoices(asOfDate="2026-10-13")
 
-    fake.responder = reject_due_date
-
-    result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
-
-    wheres = [call["params"]["where"] for call in fake.calls if "params" in call]
-    assert wheres == [
-        'Type=="ACCREC" AND DueDate<DateTime(2026,10,13)',
-        'Type=="ACCREC"',
-    ]
-    # Without the server-side clause, the not-yet-due invoice is dropped locally.
-    assert [inv["invoice_number"] for inv in result["invoices"]] == ["INV-OLD"]
+    assert error.value.status_code == 400
+    assert len([call for call in fake.calls if "params" in call]) == 1
 
 
 def test_overdue_does_not_swallow_other_errors(fake: FakeXero) -> None:
@@ -712,7 +698,7 @@ def test_ageing_reads_every_page_and_does_not_narrow_by_due_date(
 
     sent = [call["params"] for call in fake.calls if "params" in call]
     assert [params["page"] for params in sent] == [1, 2, 3]
-    assert sent[0]["where"] == 'Type=="ACCREC"'
+    assert sent[0]["where"] == ('Type=="ACCREC" AND Date<=DateTime(2026,10,13)')
     assert sent[0]["Statuses"] == "AUTHORISED"
     assert result["total_invoice_count"] == 3
     assert result["totals_by_currency"]["AUD"]["buckets"]["Current"] == "30.00"
@@ -779,7 +765,9 @@ def test_ageing_supports_payables(fake: FakeXero) -> None:
 
     assert result["invoice_type"] == "ACCPAY"
     assert result["total_invoice_count"] == 1
-    assert fake.calls[-1]["params"]["where"] == 'Type=="ACCPAY"'
+    assert fake.calls[-1]["params"]["where"] == (
+        'Type=="ACCPAY" AND Date<=DateTime(2026,10,13)'
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -802,6 +790,20 @@ def test_organisation_today_uses_xero_accounting_timezone(
     )
 
     assert xero._organisation_today() == date(2026, 10, 14)
+
+
+@pytest.mark.parametrize(
+    ("xero_zone", "iana_zone"),
+    [
+        ("AUSCENTRALSTANDARDTIME", "Australia/Darwin"),
+        ("CENAUSTRALIASTANDARDTIME", "Australia/Adelaide"),
+        ("EAUSTRALIASTANDARDTIME", "Australia/Brisbane"),
+        ("WAUSTRALIASTANDARDTIME", "Australia/Perth"),
+        ("CHATHAMISLANDSSTANDARDTIME", "Pacific/Chatham"),
+    ],
+)
+def test_xero_au_nz_timezone_mapping(xero_zone: str, iana_zone: str) -> None:
+    assert xero._XERO_TIME_ZONES[xero_zone] == iana_zone
 
 
 def test_xero_date_formats() -> None:
@@ -1057,9 +1059,10 @@ def test_create_payment_returns_created_payment(fake: FakeXero) -> None:
     )
 
     assert result["payment"]["payment_id"] == "payment-1"
-    put = fake.calls[-1]
-    assert put["path"] == "Payments"
-    assert put["json"]["Amount"] == 125
+    post = fake.calls[-1]
+    assert post["method"] == "POST"
+    assert post["path"] == "Payments"
+    assert post["json"]["Amount"] == 125
 
 
 def test_manual_journal_must_balance(fake: FakeXero) -> None:

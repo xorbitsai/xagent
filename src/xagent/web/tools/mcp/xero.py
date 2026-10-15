@@ -36,8 +36,8 @@ mcp = FastMCP("xero-mcp")
 # * ``list_overdue_invoices`` reads *every* overdue invoice server-side.
 # * A failed call raises, which FastMCP turns into ``isError``. The upstream
 #   package returned the failure as ordinary text, so it counted as a success.
-# * A 401/403 names the OAuth scope the tool needs instead of the upstream
-#   package's "unexpected error occurred while communicating with Xero".
+# * Authentication failures retain Xero's detail; a 403 also names the OAuth
+#   scope the tool needs instead of returning an unexplained generic error.
 XERO_API_BASE = "https://api.xero.com/api.xro/2.0/"
 XERO_CONNECTIONS_URL = "https://api.xero.com/connections"
 DEFAULT_TIMEOUT_SECONDS = 30
@@ -89,10 +89,15 @@ _connection_cache: dict[str, str] = {}
 
 _XERO_TIME_ZONES = {
     "AUSEASTERNSTANDARDTIME": "Australia/Sydney",
-    "AUSCENTRALSTANDARDTIME": "Australia/Adelaide",
-    "W.AUSTRALIASTANDARDTIME": "Australia/Perth",
+    "AUSCENTRALSTANDARDTIME": "Australia/Darwin",
+    "AUSCENTRALWSTANDARDTIME": "Australia/Eucla",
+    "CENAUSTRALIASTANDARDTIME": "Australia/Adelaide",
+    "EAUSTRALIASTANDARDTIME": "Australia/Brisbane",
+    "WAUSTRALIASTANDARDTIME": "Australia/Perth",
+    "LORDHOWESTANDARDTIME": "Australia/Lord_Howe",
     "TASMANIASTANDARDTIME": "Australia/Hobart",
     "NEWZEALANDSTANDARDTIME": "Pacific/Auckland",
+    "CHATHAMISLANDSSTANDARDTIME": "Pacific/Chatham",
     "UTC": "UTC",
 }
 
@@ -882,7 +887,7 @@ def _organisation_today() -> date:
             return _today()
     try:
         return datetime.now(ZoneInfo(zone_name)).date()
-    except ZoneInfoNotFoundError:
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
         logger.warning("Unknown Xero organisation time zone %r", zone_name)
         return _today()
 
@@ -1024,21 +1029,15 @@ def _collect_open_invoices(
     values as totals.
     """
     params: dict[str, Any] = {
-        "where": f'Type=="{invoice_type}"',
+        "where": (f'Type=="{invoice_type}" AND Date<={_where_date(as_of)}'),
         "Statuses": "AUTHORISED",
-        "order": "DueDate",
         "pageSize": XERO_BULK_PAGE_SIZE,
+        "summaryOnly": "true",
     }
-    narrowed_where: str | None = None
     if min_days_overdue is not None:
         # DueDate <= asOf - n  <=>  DueDate < asOf - n + 1 day
         cutoff = as_of - timedelta(days=min_days_overdue - 1)
-        # The DueDate clause only saves Xero from sending invoices that are not
-        # due yet; every invoice is re-checked below. Xero's documentation
-        # shows no DueDate example for ``where``, so a 400 retries once without
-        # the clause.
-        narrowed_where = f"{params['where']} AND DueDate<{_where_date(cutoff)}"
-        params["where"] = narrowed_where
+        params["where"] += f" AND DueDate<{_where_date(cutoff)}"
     if contact_ids:
         params["ContactIDs"] = ",".join(_guid_list(contact_ids, "contactIds"))
 
@@ -1046,21 +1045,9 @@ def _collect_open_invoices(
     seen_invoice_ids: set[str] = set()
     page = 1
     while True:
-        try:
-            data = _request(
-                "GET", "Invoices", scope="invoices", params={**params, "page": page}
-            )
-        except XeroAPIError as error:
-            if (
-                narrowed_where is not None
-                and page == 1
-                and params["where"] == narrowed_where
-                and error.status_code == 400
-            ):
-                logger.warning("Xero rejected the DueDate filter; retrying without it")
-                params["where"] = f'Type=="{invoice_type}"'
-                continue
-            raise
+        data = _request(
+            "GET", "Invoices", scope="invoices", params={**params, "page": page}
+        )
         records = data.get("Invoices") or []
         for record in records:
             amount_due = Decimal(str(record.get("AmountDue") or 0))
@@ -1205,7 +1192,7 @@ def list_overdue_invoices(
         )
         for entry in ranked
     ]
-    aging = {
+    ageing = {
         name: {
             "count": bucket["count"],
             "amount_due_by_currency": _money_totals(bucket["totals"]),
@@ -1226,7 +1213,7 @@ def list_overdue_invoices(
             "excludes": OPEN_INVOICE_EXCLUDES,
             "total_count": len(overdue),
             "total_amount_due_by_currency": _money_totals(totals),
-            "ageing_buckets": aging,
+            "ageing_buckets": ageing,
             "by_contact": by_contact,
             "by_contact_complete": len(ranked) == len(contacts),
             "complete": True,
@@ -1746,8 +1733,9 @@ def list_aged_receivables_by_contact(
 ) -> str:
     """
     Xero's aged receivables report for one contact up to a report date. For
-    every contact at once use list_receivables_ageing (the same buckets, built
-    from the invoices), or list_overdue_invoices for the overdue invoices.
+    every contact at once use list_receivables_ageing, whose gross invoice
+    balances use the same bucket boundaries but exclude credits, overpayments
+    and prepayments. Use list_overdue_invoices for the overdue invoice rows.
 
     reportDate: YYYY-MM-DD (default: end of the current month).
     invoicesFromDate / invoicesToDate: YYYY-MM-DD window for the invoices.
@@ -2082,7 +2070,7 @@ def create_payment(
     }
     if reference:
         body["Reference"] = reference
-    data = _request("PUT", "Payments", scope="payments", json_data=body)
+    data = _request("POST", "Payments", scope="payments", json_data=body)
     record = _first(data, "Payments")
     return _success(payment=_payment_view(record))
 

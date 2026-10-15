@@ -6930,6 +6930,7 @@ def _mcp_tool_adapter(tool_name: str, name_prefix: str = "mcp_Xero_") -> MCPTool
         ),
         connection={"transport": "stdio", "command": "python", "args": []},
         name_prefix=name_prefix,
+        source_server="xero",
     )
 
 
@@ -6954,7 +6955,8 @@ def test_mcp_tool_adapter_decision_group_is_the_tool_name():
 )
 def test_normalized_mcp_call_result_flags_plain_text_error(text):
     result = _normalized_mcp_call_result(
-        CallToolResult(content=[TextContent(type="text", text=text)])
+        CallToolResult(content=[TextContent(type="text", text=text)]),
+        detect_legacy_plain_text_error=True,
     )
 
     assert result["is_error"] is True
@@ -6977,6 +6979,16 @@ def test_normalized_mcp_call_result_flags_plain_text_error(text):
 )
 def test_normalized_mcp_call_result_keeps_ordinary_text_successful(content):
     result = _normalized_mcp_call_result(CallToolResult(content=content))
+
+    assert result["is_error"] is False
+
+
+def test_normalized_mcp_call_result_does_not_apply_xero_compat_globally():
+    result = _normalized_mcp_call_result(
+        CallToolResult(
+            content=[TextContent(type="text", text="Error listing invoices: boom")]
+        )
+    )
 
     assert result["is_error"] is False
 

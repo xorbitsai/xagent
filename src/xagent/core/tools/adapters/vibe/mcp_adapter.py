@@ -1752,7 +1752,10 @@ def _is_plain_text_error_result(content: list[dict[str, Any]]) -> bool:
 
 
 def _normalized_mcp_call_result(
-    value: Any, *, validate_wire: bool = False
+    value: Any,
+    *,
+    validate_wire: bool = False,
+    detect_legacy_plain_text_error: bool = False,
 ) -> dict[str, Any]:
     """Validate a wire result and render the stable agent-facing shape."""
 
@@ -1785,7 +1788,10 @@ def _normalized_mcp_call_result(
         "content": content,
         "structured_content": other_fields.get("structuredContent"),
         "is_error": bool(other_fields.get("isError"))
-        or _is_plain_text_error_result(content),
+        or (
+            detect_legacy_plain_text_error
+            and _is_plain_text_error_result(content)
+        ),
     }
 
 
@@ -1906,6 +1912,13 @@ class MCPToolAdapter(AbstractBaseTool):
         self._workspace_download_field = workspace_download_field
         self._is_excel_tool = (
             self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
+        )
+        # The retired third-party Xero server returned failures as a successful,
+        # single-line ``Error <operation>: <cause>`` payload. Keep that narrow
+        # compatibility only for Xero: applying the heuristic to every MCP
+        # server misclassifies legitimate output such as an error-budget metric.
+        self._detect_legacy_plain_text_error = (
+            str(source_server or "").casefold() == "xero"
         )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
@@ -3120,7 +3133,12 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            normalized = _normalized_mcp_call_result(result)
+            normalized = _normalized_mcp_call_result(
+                result,
+                detect_legacy_plain_text_error=(
+                    self._detect_legacy_plain_text_error
+                ),
+            )
             if self._is_excel_tool:
                 failure_code = _excel_failure_code(normalized)
                 if failure_code is not None:
@@ -3392,7 +3410,13 @@ class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
             tool_args,
         )
         try:
-            return _normalized_mcp_call_result(result, validate_wire=True)
+            return _normalized_mcp_call_result(
+                result,
+                validate_wire=True,
+                detect_legacy_plain_text_error=(
+                    self._detect_legacy_plain_text_error
+                ),
+            )
         except ChromeSessionContractError:
             await self._chrome_pool.close_shielded(self._chrome_scope)
             raise

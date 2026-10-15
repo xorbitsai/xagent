@@ -199,6 +199,9 @@ PAGINATION_ARGUMENT_NAMES = frozenset(
         "nextPageToken",
         "cursor",
         "offset",
+        "skip",
+        "next_skip",
+        "nextSkip",
         "start_at",
         "startAt",
     }
@@ -5637,7 +5640,7 @@ class ReActPattern(AgentPattern):
         )
         pagination_clause = (
             " The consecutive calls were paging through a list: their arguments "
-            "carry a page, cursor, or offset. A page that came back full, or "
+            "carry a page, cursor, offset, or skip. A page that came back full, or "
             "results with no total or last-page marker, mean more pages may "
             f"exist, so choose {REACT_DECISION_TOOL_CALL} to fetch the next page "
             "unless the latest user request only asks for a sample or the "

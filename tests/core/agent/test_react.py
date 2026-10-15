@@ -14368,6 +14368,29 @@ def test_react_repeated_guard_marks_paged_runs() -> None:
     assert "more pages may exist" in prompt
 
 
+@pytest.mark.parametrize("argument", ["skip", "next_skip", "nextSkip"])
+def test_react_repeated_guard_marks_skip_paged_runs(argument: str) -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    _record_completed_calls(
+        pattern,
+        [
+            ("mcp_Xero_list_overdue_invoices", {argument: skip})
+            for skip in (0, 50, 100, 150)
+        ],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata(
+        {"name": "mcp_Xero_list_overdue_invoices"}
+    )
+
+    assert metadata is not None
+    assert metadata["paginated"] is True
+    prompt = pattern._messages_for_repeated_tool_decision(
+        ExecutionContext(), metadata
+    )[-1]["content"]
+    assert "offset, or skip" in prompt
+
+
 def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:
     pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=2)
     _record_completed_calls(

@@ -131,6 +131,24 @@ class TestBrowserRequestGuard:
         )
 
     @pytest.mark.asyncio
+    async def test_egress_proxy_rejects_unvalidated_connect(self, monkeypatch):
+        proxy = browser_use._BrowserEgressProxy()
+        client_reader = MagicMock()
+        client_writer = MagicMock()
+        client_writer.drain = AsyncMock()
+        validate = AsyncMock(side_effect=ValueError("private target"))
+        open_connection = AsyncMock()
+        monkeypatch.setattr(browser_use, "validate_public_http_url", validate)
+        monkeypatch.setattr(browser_use.asyncio, "open_connection", open_connection)
+
+        with pytest.raises(ValueError, match="private target"):
+            await proxy._handle_connect(
+                client_reader, client_writer, "internal.example:443"
+            )
+
+        open_connection.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_concurrent_page_guards_share_one_installation(self):
         session = browser_use.BrowserSession("guard")
         context = MagicMock()
@@ -173,6 +191,25 @@ class TestBrowserRequestGuard:
         assert not session._guarded_pages
         assert not session._page_guard_futures
         cdp.detach.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_popup_guard_failure_closes_popup(self):
+        session = browser_use.BrowserSession("guard")
+        context = MagicMock()
+        cdp = MagicMock()
+        cdp.send = AsyncMock(side_effect=RuntimeError("Fetch unavailable"))
+        cdp.detach = AsyncMock()
+        context.new_cdp_session = AsyncMock(return_value=cdp)
+        session._context = context
+        page = MagicMock()
+        page.close = AsyncMock()
+
+        session._schedule_page_guard(page)
+        guard_task = next(iter(session._cdp_tasks))
+        await asyncio.gather(guard_task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        page.close.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_fetch_guard_blocks_private_redirect_hops(self):

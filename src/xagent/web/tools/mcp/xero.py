@@ -1070,9 +1070,7 @@ def list_overdue_invoices(
     min_days = max(1, int(minDaysOverdue))
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), OVERDUE_MAX_LIMIT))
-    overdue = _collect_open_invoices(
-        as_of, type, contactIds, min_days_overdue=min_days
-    )
+    overdue = _collect_open_invoices(as_of, type, contactIds, min_days_overdue=min_days)
 
     overdue.sort(key=lambda view: (view["due_date"], view.get("invoice_number", "")))
     totals: dict[str, Decimal] = {}
@@ -1201,9 +1199,7 @@ def list_receivables_ageing(
     as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _today()
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), RECEIVABLES_MAX_LIMIT))
-    invoices = _collect_open_invoices(
-        as_of, type, contactIds, min_days_overdue=None
-    )
+    invoices = _collect_open_invoices(as_of, type, contactIds, min_days_overdue=None)
 
     def empty_buckets() -> dict[str, Decimal]:
         return {name: Decimal(0) for name in RECEIVABLE_BUCKETS}

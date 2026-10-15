@@ -20,33 +20,35 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     connection = op.get_bind()
+    inspector = sa.inspect(connection)
+    if "user_oauth" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("user_oauth")}
+    if not {"id", "access_token"}.issubset(columns):
+        return
+
     user_oauth = sa.table(
         "user_oauth",
         sa.column("id", sa.Integer),
         sa.column("access_token", sa.String),
         sa.column("refresh_token", sa.String),
     )
-    rows = list(
-        connection.execute(
-            sa.select(
-                user_oauth.c.id,
-                user_oauth.c.access_token,
-                user_oauth.c.refresh_token,
+    selected_columns = [user_oauth.c.id, user_oauth.c.access_token]
+    if "refresh_token" in columns:
+        selected_columns.append(user_oauth.c.refresh_token)
+    result = connection.execute(sa.select(*selected_columns)).mappings()
+    for row in result:
+        values: dict[str, str | None] = {
+            "access_token": encrypt_value(str(row["access_token"] or "")),
+        }
+        if "refresh_token" in columns:
+            values["refresh_token"] = (
+                encrypt_value(str(row["refresh_token"]))
+                if row["refresh_token"]
+                else None
             )
-        ).mappings()
-    )
-    for row in rows:
         connection.execute(
-            user_oauth.update()
-            .where(user_oauth.c.id == row["id"])
-            .values(
-                access_token=encrypt_value(str(row["access_token"] or "")),
-                refresh_token=(
-                    encrypt_value(str(row["refresh_token"]))
-                    if row["refresh_token"]
-                    else None
-                ),
-            )
+            user_oauth.update().where(user_oauth.c.id == row["id"]).values(**values)
         )
 
 

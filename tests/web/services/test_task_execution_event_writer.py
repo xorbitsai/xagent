@@ -49,7 +49,7 @@ def canonical(engine, task_id, monkeypatch):
         task = db.get(Task, task_id)
         task.conversation_storage_version = 2
         db.commit()
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     monkeypatch.setattr(
         "xagent.web.services.trace_handlers.get_db", lambda: iter([factory()])
     )

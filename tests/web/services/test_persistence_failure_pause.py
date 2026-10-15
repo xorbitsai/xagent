@@ -131,7 +131,7 @@ NO_OUTPUTS = _PreparedTaskFileOutputs((), (), ())
 
 @pytest.fixture(autouse=True)
 def _pause_switch_on(monkeypatch):
-    # Off by default until automatic resume ships; these tests exercise it on.
+    # Unset, the switch follows automatic resume; these tests exercise it on.
     monkeypatch.setenv(PAUSE_SWITCH, "true")
 
 
@@ -448,7 +448,11 @@ def test_report_stays_empty_when_the_lease_no_longer_owns_the_run(canonical):
     assert report == SettlementReport()
 
 
-def test_report_stays_empty_when_the_fenced_pause_write_misses(canonical, monkeypatch):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_report_stays_empty_when_the_fenced_pause_write_misses(
+    canonical, monkeypatch, auto_resume
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, tid = canonical
     lease = _start_run(factory, tid)
     _checkpoint(factory, tid, lease.run_id)
@@ -467,7 +471,11 @@ def test_report_stays_empty_when_the_fenced_pause_write_misses(canonical, monkey
     assert report == SettlementReport()
 
 
-def test_report_stays_empty_when_the_pause_commit_fails(canonical, monkeypatch):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_report_stays_empty_when_the_pause_commit_fails(
+    canonical, monkeypatch, auto_resume
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, tid = canonical
     lease = _start_run(factory, tid)
     _checkpoint(factory, tid, lease.run_id)
@@ -964,10 +972,19 @@ def _projection(factory, ids: dict[str, Any], lease: TaskLease) -> dict[str, Any
 
 
 async def _schedule_failing_turn(
-    factory, ids: dict[str, Any], lease: TaskLease, error: BaseException
+    factory,
+    ids: dict[str, Any],
+    lease: TaskLease,
+    error: BaseException,
+    *,
+    events: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Run one scheduled turn whose execution raises ``error``."""
-    events: list[dict[str, Any]] = []
+    """Run one scheduled turn whose execution raises ``error``.
+
+    ``events``, when given, receives every published frame.
+    """
+    if events is None:
+        events = []
 
     async def publish(event, _task_id):
         events.append(event)
@@ -1029,10 +1046,12 @@ def _expire_and_recover(factory, ids: dict[str, Any]) -> TaskStatus | None:
 
 
 @pytest.mark.asyncio
-async def test_pause_projects_like_lease_recovery(canonical):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+async def test_pause_projects_like_lease_recovery(canonical, monkeypatch, auto_resume):
     """S2's pause leaves every projection as a lease-expiry pause does,
     except the TriggerRun message, which names an interruption."""
 
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     paused, recovered = _projected_task(factory), _projected_task(factory)
     paused_lease = _prepare_run(factory, paused)
@@ -1045,15 +1064,12 @@ async def test_pause_projects_like_lease_recovery(canonical):
 
     left = _projection(factory, paused, paused_lease)
     right = _projection(factory, recovered, recovered_lease)
-    assert left.pop("trigger_run") == (
-        TriggerRunStatus.FAILED.value,
-        TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
-        True,
-    )
-    assert right.pop("trigger_run") == (
-        TriggerRunStatus.FAILED.value,
-        TASK_LEASE_PAUSED_TRIGGER_ERROR,
-        True,
+    _assert_recovers_like_lease_recovery(
+        factory,
+        paused,
+        recovered,
+        (left.pop("trigger_run"), right.pop("trigger_run")),
+        auto_resume=auto_resume,
     )
     assert TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR != TASK_LEASE_PAUSED_TRIGGER_ERROR
     assert left == right
@@ -1062,9 +1078,11 @@ async def test_pause_projects_like_lease_recovery(canonical):
     assert left["workforce_run"] == ("paused", True)
     # The run may have consumed the message: "do not resend", never failed.
     assert left["delivery"] == ["dispatched"]
-    assert frames == ["task_paused"]
+    assert frames == ["task_paused"] + (
+        ["task_recovery_update"] if auto_resume == "true" else []
+    )
     _task, row, _events = _state(factory, paused["task"])
-    assert (row.reason, row.state) == ("persistence_failure", "manual")
+    assert row.reason == "persistence_failure"
 
 
 @pytest.mark.asyncio
@@ -1136,10 +1154,15 @@ async def test_ineligible_task_settles_exactly_as_before(canonical, monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
 @pytest.mark.parametrize("failure", ["python", "database", "marker"])
 async def test_recording_failure_does_not_change_the_pause(
-    canonical, monkeypatch, failure
+    canonical, monkeypatch, failure, auto_resume
 ):
+    """A failed recording settles the pause as a recorded ``manual`` one
+    would: the TriggerRun fails with the interruption message and nothing
+    announces a resume. Only a recorded, scheduled resume differs."""
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     recorded, unrecorded = _projected_task(factory), _projected_task(factory)
     recorded_lease = _prepare_run(factory, recorded)
@@ -1154,17 +1177,32 @@ async def test_recording_failure_does_not_change_the_pause(
             factory, unrecorded, unrecorded_lease, _persistence_error()
         )
 
-    assert _projection(factory, recorded, recorded_lease) == _projection(
-        factory, unrecorded, unrecorded_lease
+    left = _projection(factory, recorded, recorded_lease)
+    right = _projection(factory, unrecorded, unrecorded_lease)
+    assert right["trigger_run"] == (
+        TriggerRunStatus.FAILED.value,
+        TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
+        True,
     )
-    assert recorded_frames == unrecorded_frames == ["task_paused"]
+    assert unrecorded_frames == ["task_paused"]
+    if auto_resume == "true":
+        assert left.pop("trigger_run") == (TriggerRunStatus.RUNNING.value, None, False)
+        right.pop("trigger_run")
+        assert recorded_frames == ["task_paused", "task_recovery_update"]
+    else:
+        assert recorded_frames == ["task_paused"]
+    assert left == right
     assert _state(factory, unrecorded["task"])[1:] == (None, [])
 
 
-def test_resume_requested_run_pauses_like_lease_recovery(canonical):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_resume_requested_run_pauses_like_lease_recovery(
+    canonical, monkeypatch, auto_resume
+):
     """A RUNNING row already RESUME_REQUESTED is paused (control ``paused``)
     by an interruption, exactly as lease-expiry recovery pauses it."""
 
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     settled, recovered = _projected_task(factory), _projected_task(factory)
     settled_lease = _prepare_run(factory, settled)
@@ -1182,13 +1220,62 @@ def test_resume_requested_run_pauses_like_lease_recovery(canonical):
 
     left = _projection(factory, settled, settled_lease)
     right = _projection(factory, recovered, recovered_lease)
+    _assert_recovers_like_lease_recovery(
+        factory,
+        settled,
+        recovered,
+        (left.pop("trigger_run"), right.pop("trigger_run")),
+        auto_resume=auto_resume,
+    )
     for side in (left, right):
-        side.pop("trigger_run")  # Messages differ by design.
         side.pop("delivery")  # Reconciled by the scheduler, not by settle.
     assert left == right
     assert (left["status"], left["control_state"]) == (TaskStatus.PAUSED, "paused")
     _task, row, _events = _state(factory, settled["task"])
     assert row.reason == "persistence_failure"
+
+
+def _assert_recovers_like_lease_recovery(
+    factory,
+    settled: dict[str, Any],
+    recovered: dict[str, Any],
+    triggers: tuple[tuple[Any, ...], tuple[Any, ...]],
+    *,
+    auto_resume: str,
+    settled_error: str = TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
+) -> None:
+    """Settlement records and projects a pause as lease recovery does.
+
+    With automatic resume on both schedule it and keep the TriggerRun
+    RUNNING; with it off both leave it to the user and fail the TriggerRun,
+    each with its own message.
+    """
+    left_trigger, right_trigger = triggers
+    if auto_resume == "true":
+        assert (
+            left_trigger
+            == right_trigger
+            == (
+                TriggerRunStatus.RUNNING.value,
+                None,
+                False,
+            )
+        )
+        expected = "scheduled"
+    else:
+        assert left_trigger == (TriggerRunStatus.FAILED.value, settled_error, True)
+        assert right_trigger == (
+            TriggerRunStatus.FAILED.value,
+            TASK_LEASE_PAUSED_TRIGGER_ERROR,
+            True,
+        )
+        expected = "manual"
+    _left_task, left_row, left_events = _state(factory, settled["task"])
+    _right_task, right_row, right_events = _state(factory, recovered["task"])
+    assert left_row.state == right_row.state == expected
+    assert [(e.event, e.attempt) for e in left_events] == [
+        (e.event, e.attempt) for e in right_events
+    ]
 
 
 def _finalize_and_release(factory, ids, lease, result) -> Any:
@@ -1248,10 +1335,12 @@ def test_result_switch_off_settles_exactly_as_before(canonical, monkeypatch):
     assert (row.reason, row.state) == ("persistence_failure", "disabled")
 
 
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
 @pytest.mark.parametrize("failure", ["python", "database", "marker"])
 def test_result_recording_failure_does_not_change_the_pause(
-    canonical, monkeypatch, failure
+    canonical, monkeypatch, failure, auto_resume
 ):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     recorded, unrecorded = _projected_task(factory), _projected_task(factory)
     recorded_lease = _prepare_run(factory, recorded)
@@ -1268,10 +1357,23 @@ def test_result_recording_failure_does_not_change_the_pause(
 
     assert left.report.paused_for is not None
     assert right.report.paused_for is not None
+    assert right.report.recovery is None
     left_projection = _projection(factory, recorded, recorded_lease)
-    assert left_projection == _projection(factory, unrecorded, unrecorded_lease)
+    right_projection = _projection(factory, unrecorded, unrecorded_lease)
+    assert right_projection["trigger_run"] == (
+        TriggerRunStatus.FAILED.value,
+        TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
+        True,
+    )
+    if auto_resume == "true":
+        assert left_projection.pop("trigger_run") == (
+            TriggerRunStatus.RUNNING.value,
+            None,
+            False,
+        )
+        right_projection.pop("trigger_run")
+    assert left_projection == right_projection
     assert left_projection["status"] == TaskStatus.PAUSED
-    assert left_projection["trigger_run"][1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
     assert _state(factory, unrecorded["task"])[1:] == (None, [])
 
 
@@ -1333,7 +1435,11 @@ RESULT_PATHS = pytest.mark.parametrize("path", ["result", "resumed_result"])
 
 
 @RESULT_PATHS
-def test_result_pause_projects_like_lease_recovery(canonical, path):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_result_pause_projects_like_lease_recovery(
+    canonical, monkeypatch, path, auto_resume
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     paused, recovered = _projected_task(factory), _projected_task(factory)
     paused_lease = _prepare_run(factory, paused)
@@ -1344,15 +1450,20 @@ def test_result_pause_projects_like_lease_recovery(canonical, path):
 
     left = _projection(factory, paused, paused_lease)
     right = _projection(factory, recovered, recovered_lease)
-    assert left.pop("trigger_run")[1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
-    assert right.pop("trigger_run")[1] == TASK_LEASE_PAUSED_TRIGGER_ERROR
+    _assert_recovers_like_lease_recovery(
+        factory,
+        paused,
+        recovered,
+        (left.pop("trigger_run"), right.pop("trigger_run")),
+        auto_resume=auto_resume,
+    )
     # Only lease recovery reconciles orphaned delivery rows.
     left.pop("delivery")
     right.pop("delivery")
     assert left == right
     assert left["settled"] == [PAUSED_FACT]
     _task, row, _events = _state(factory, paused["task"])
-    assert (row.reason, row.state) == ("persistence_failure", "manual")
+    assert row.reason == "persistence_failure"
 
 
 @RESULT_PATHS
@@ -1627,47 +1738,232 @@ async def test_explicit_cancel_is_not_settled_as_an_interruption():
 # --------------------------------------------- scheduled automatic resume
 
 
+def _recovery_updates(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [event for event in events if event.get("type") == "task_recovery_update"]
+
+
 @pytest.mark.asyncio
-async def test_exception_pause_schedules_a_resume_and_keeps_the_trigger_running(
+async def test_exception_pause_schedules_a_resume_and_announces_it(
     canonical, monkeypatch
 ):
-    """S2 with automatic resume on: the shared recording schedules the
-    resume, so the TriggerRun stays RUNNING for the resumed run to settle.
-    Settlement announces its pause; the scheduled resume is announced by the
-    sweeper once it dispatches it."""
+    """S2: the pause records ``scheduled``, keeps the TriggerRun RUNNING and,
+    after the commit, announces the pause and then the scheduled resume."""
     monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
+    events: list[dict[str, Any]] = []
 
-    frames = await _schedule_failing_turn(factory, ids, lease, _persistence_error())
+    frames = await _schedule_failing_turn(
+        factory, ids, lease, _persistence_error(), events=events
+    )
 
-    assert frames == ["task_paused"]
+    assert frames == ["task_paused", "task_recovery_update"]
     projection = _projection(factory, ids, lease)
     assert projection["status"] == TaskStatus.PAUSED
     assert projection["trigger_run"] == (TriggerRunStatus.RUNNING.value, None, False)
     assert projection["workforce_run"] == ("paused", True)
-    _task, row, recorded = _state(factory, ids["task"])
+    task, row, recorded = _state(factory, ids["task"])
     assert (row.reason, row.state) == ("persistence_failure", "scheduled")
-    assert row.next_attempt_at is not None
-    assert [(event.event, event.attempt) for event in recorded] == [
-        ("interrupted", None),
-        ("scheduled", 1),
-    ]
+    assert [event.event for event in recorded] == ["interrupted", "scheduled"]
+    (update,) = _recovery_updates(events)
+    assert (update["task_id"], update["run_id"], update["state_version"]) == (
+        ids["task"],
+        lease.run_id,
+        task.state_version,
+    )
+    assert update["auto_resume"]["status"] == "scheduled"
+    assert update["auto_resume"]["reason"] == "persistence_failure"
+    assert update["auto_resume"]["attempt"] == 1
 
 
 @RESULT_PATHS
-def test_result_pause_schedules_a_resume_and_keeps_the_trigger_running(
-    canonical, monkeypatch, path
-):
+def test_result_pause_reports_the_scheduled_resume(canonical, monkeypatch, path):
+    """S1 and S3 carry the recorded resume in the report they announce."""
     monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     factory, _tid = canonical
     ids = _projected_task(factory)
     lease = _prepare_run(factory, ids)
 
-    _settle_result(path, factory, ids, lease, PERSISTENCE_RESULT)
+    if path == "result":
+        report = _finalize_and_release(
+            factory, ids, lease, dict(PERSISTENCE_RESULT)
+        ).report
+    else:
+        report = _finalize_resumed(ids, lease, PERSISTENCE_RESULT)["report"]
 
-    _task, row, _events = _state(factory, ids["task"])
+    task, row, _events = _state(factory, ids["task"])
+    assert report.paused_for is InterruptionReason.PERSISTENCE_FAILURE
+    assert report.recovery is not None
+    assert (report.recovery.state, report.recovery.task_id) == (
+        "scheduled",
+        ids["task"],
+    )
+    assert report.recovery.paused_state_version == task.state_version
+    assert report.recovery.next_attempt_at is not None
     assert row.state == "scheduled"
     projection = _projection(factory, ids, lease)
     assert projection["trigger_run"] == (TriggerRunStatus.RUNNING.value, None, False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "detail", "expected"),
+    [
+        (
+            "scheduled",
+            None,
+            [("task_paused", None), ("task_recovery_update", "scheduled")],
+        ),
+        (
+            "exhausted",
+            None,
+            [("task_paused", None), ("task_recovery_update", "stopped")],
+        ),
+        ("manual", "auto_resume_disabled", [("task_paused", None)]),
+        ("manual", "channel_hold_pending", [("task_paused", None)]),
+        ("ineligible", "ineligible:source_sdk", [("task_paused", None)]),
+    ],
+)
+async def test_pause_broadcast_announces_only_a_planned_resume(state, detail, expected):
+    from datetime import datetime, timezone
+
+    from xagent.web.services.task_settlement_report import RecordedInterruption
+
+    recovery = RecordedInterruption(
+        task_id=7,
+        run_id="run-7",
+        reason="persistence_failure",
+        state=state,
+        state_detail=detail,
+        paused_state_version=4,
+        next_attempt_at=(
+            datetime(2026, 10, 10, 8, 0, 12, tzinfo=timezone.utc)
+            if state == "scheduled"
+            else None
+        ),
+        attempt=1,
+    )
+    with patch(
+        "xagent.web.services.task_events.publish_task_event", new=AsyncMock()
+    ) as published:
+        await publish_settlement_pause(
+            7,
+            SettlementReport(
+                control_state={"status": "paused"},
+                paused_for=InterruptionReason.PERSISTENCE_FAILURE,
+                recovery=recovery,
+            ),
+        )
+
+    events = [call.args[0] for call in published.await_args_list]
+    assert [
+        (event["type"], event.get("auto_resume", {}).get("status")) for event in events
+    ] == expected
+
+
+@pytest.mark.asyncio
+async def test_pause_broadcast_failure_still_announces_the_resume():
+    from xagent.web.services.task_settlement_report import RecordedInterruption
+
+    sent: list[str] = []
+
+    async def flaky(event: dict[str, Any], _task_id: int) -> None:
+        sent.append(event["type"])
+        if event["type"] == "task_paused":
+            raise RuntimeError("socket gone")
+
+    recovery = RecordedInterruption(
+        task_id=7,
+        run_id="run-7",
+        reason="lease_expired",
+        state="scheduled",
+        state_detail=None,
+        paused_state_version=4,
+        next_attempt_at=None,
+        attempt=1,
+    )
+    with patch("xagent.web.services.task_events.publish_task_event", flaky):
+        await publish_settlement_pause(
+            7,
+            SettlementReport(
+                paused_for=InterruptionReason.PERSISTENCE_FAILURE, recovery=recovery
+            ),
+        )
+
+    assert sent == ["task_paused", "task_recovery_update"]
+
+
+@pytest.mark.asyncio
+async def test_new_run_result_pause_announces_its_resume_through_the_runner(
+    canonical, monkeypatch
+):
+    """S1 end to end through ``execute_task_background``'s own publish
+    point: the committed pause, then the scheduled resume."""
+    from xagent.web.services import task_execution as task_execution_service
+
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids, checkpoint=False)
+    monkeypatch.setattr(
+        "xagent.web.services.task_setup_snapshot.get_session_local", lambda: factory
+    )
+    from xagent.web.services.task_setup_snapshot import load_task_setup_snapshot_sync
+
+    # Loaded before the run writes its checkpoint, as the scheduler does.
+    snapshot = load_task_setup_snapshot_sync(ids["task"], ids["user"])
+    _checkpoint(factory, ids["task"], lease.run_id)
+    published: list[dict[str, Any]] = []
+
+    async def publish(event: dict[str, Any], _task_id: int) -> None:
+        published.append(event)
+
+    class Manager:
+        def __getattr__(self, _name: str) -> Any:
+            return MagicMock()
+
+        async def wait_for_previous(self, _task_id: int) -> None:
+            return None
+
+    class AgentService(MagicMock):
+        pass
+
+    class AgentManager:
+        async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            return AgentService()
+
+        async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            return dict(PERSISTENCE_RESULT)
+
+    monkeypatch.setattr(task_execution_service, "background_task_manager", Manager())
+    monkeypatch.setattr("xagent.web.services.task_events.publish_task_event", publish)
+    monkeypatch.setattr(
+        "xagent.web.services.task_event_display.publish_task_result", publish
+    )
+
+    await task_execution_service.execute_task_background(
+        task_id=ids["task"],
+        user_message="2+2",
+        context={"turn_id": ids["turn_id"]},
+        agent_manager=AgentManager(),
+        task_owner_user_id=ids["user"],
+        llm_user_message="2+2",
+        task_setup_snapshot=snapshot,
+        expected_run_id=lease.run_id,
+        task_lease=lease,
+        resolved_execution_scope=None,
+    )
+
+    types = [event.get("type") for event in published]
+    assert "task_paused" in types and "task_recovery_update" in types, types
+    assert types.index("task_paused") < types.index("task_recovery_update")
+    update = published[types.index("task_recovery_update")]
+    task, row, _events = _state(factory, ids["task"])
+    assert row.state == "scheduled"
+    assert (update["task_id"], update["run_id"], update["state_version"]) == (
+        ids["task"],
+        lease.run_id,
+        task.state_version,
+    )
+    assert update["auto_resume"]["status"] == "scheduled"

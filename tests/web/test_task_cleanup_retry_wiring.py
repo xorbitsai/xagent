@@ -38,8 +38,8 @@ async def test_the_starter_runs_the_driver_and_shutdown_stops_it(
 
     monkeypatch.setattr(
         database_module,
-        "get_session_local",
-        lambda: sessionmaker(bind=sa.create_engine("sqlite://")),
+        "_SessionLocal",
+        sessionmaker(bind=sa.create_engine("sqlite://")),
     )
     app = FastAPI()
     app.state.task_cleanup_retry_allowed_in_tests = True

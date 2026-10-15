@@ -38,6 +38,7 @@ import shutil
 import time
 import uuid
 import weakref
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -108,7 +109,7 @@ from .task_lease_service import (
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
 )
-from .task_settlement_report import SettlementReport
+from .task_settlement_report import RecordedInterruption, SettlementReport
 
 if TYPE_CHECKING:
     from .task_setup_snapshot import TaskSetupSnapshot
@@ -150,6 +151,7 @@ from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
     present_failed_result,
+    project_execution_result_for_channel,
 )
 from .file_reference_output_service import (
     reconcile_assistant_file_references,
@@ -1997,8 +1999,8 @@ def _apply_result_interruption(
     task: Task,
     decision: InterruptionDecision,
     result: dict[str, Any],
-) -> None:
-    apply_interruption_outcome_no_commit(
+) -> RecordedInterruption | None:
+    return apply_interruption_outcome_no_commit(
         db,
         task=task,
         decision=decision,
@@ -2124,6 +2126,7 @@ def _finalize_task_execution_result_isolated(
         # its files.
         control_commit_pending = False
         interruption_pause_reason: InterruptionReason | None = None
+        interruption_recovery: RecordedInterruption | None = None
         final_control_snapshot: TaskControlSnapshot | None = None
         final_task_status = pre_run_status.value
         # Set only when this transaction settles the result as FAILED.
@@ -2234,7 +2237,7 @@ def _finalize_task_execution_result_isolated(
                         status=TaskStatus.PAUSED,
                         expected_run_id=expected_run_id,
                     )
-                    _apply_result_interruption(
+                    interruption_recovery = _apply_result_interruption(
                         finalize_db, task_updated, interruption, result
                     )
                     interruption_pause_reason = interruption.reason
@@ -2397,6 +2400,7 @@ def _finalize_task_execution_result_isolated(
                     else {}
                 ),
                 paused_for=interruption_pause_reason,
+                recovery=interruption_recovery,
             ),
             error_code=(
                 presentation.error_code
@@ -3109,6 +3113,7 @@ def _finalize_resumed_task(
 
         interruption: InterruptionDecision | None = None
         pause_reason: InterruptionReason | None = None
+        pause_recovery: RecordedInterruption | None = None
         if result.get("injection_outcome_unknown") and (
             success or status in {"waiting_for_user", "interrupted"}
         ):
@@ -3188,9 +3193,10 @@ def _finalize_resumed_task(
             # Projects the workforce run itself for a pause.
             if not interruption.pause:
                 sync_workforce_run_status(db, task, final_task_status)
-            _apply_result_interruption(db, task, interruption, result)
+            recorded = _apply_result_interruption(db, task, interruption, result)
             if interruption.pause:
                 pause_reason = interruption.reason
+                pause_recovery = recorded
         else:
             sync_workforce_run_status(db, task, final_task_status)
         if final_task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
@@ -3212,6 +3218,47 @@ def _finalize_resumed_task(
             task,
             interruption_pause_result() if pause_reason is not None else result,
         )
+        if task.channel_id is not None and final_task_status in {
+            TaskStatus.COMPLETED,
+            TaskStatus.FAILED,
+            TaskStatus.WAITING_FOR_USER,
+        }:
+            # A channel turn whose run paused and resumed: its START stores
+            # the answer the leaf would have (first writer wins), so a channel
+            # still waiting for it gets the leaf's projection, questions and
+            # coded failure text included.
+            from .shared_channel_execution import (
+                channel_durable_result,
+                stamp_channel_result_no_commit,
+            )
+
+            # Best effort: a failed stamp never undoes the settlement; the
+            # channel then falls back to the task row. The stamp only assigns
+            # the START's result, so it is flushed (and the savepoint
+            # released) inside the ``try``: a failing UPDATE is caught too.
+            stamp = db.begin_nested()
+            try:
+                stamp_channel_result_no_commit(
+                    db,
+                    task_id=task_id,
+                    run_id=task_lease.run_id,
+                    channel_result=channel_durable_result(
+                        result,
+                        project_execution_result_for_channel(result),
+                        # The text this transaction stored, file links
+                        # rewritten.
+                        transcript=output if success and output.strip() else None,
+                    ),
+                )
+                db.flush()
+                stamp.commit()
+            except Exception:
+                stamp.rollback()
+                logger.exception(
+                    "Storing the channel result of resumed task %s failed; "
+                    "its channel reads the task row instead",
+                    task_id,
+                )
         # A lost acknowledgement here is not reconciled yet: the lease is
         # released in this transaction, so only the result fact's witness
         # (returned above) can prove the commit. That belongs with the
@@ -3222,7 +3269,9 @@ def _finalize_resumed_task(
         finalized["final_status"] = final_task_status.value
         # Filled only now that the commit succeeded.
         finalized["report"] = SettlementReport(
-            control_state=control_snapshot.as_dict(), paused_for=pause_reason
+            control_state=control_snapshot.as_dict(),
+            paused_for=pause_reason,
+            recovery=pause_recovery,
         )
         return finalized
     finally:
@@ -4675,6 +4724,18 @@ class BackgroundTaskManager:
         self._explicitly_cancelled: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
+        # Every execution task this process started, by identity: one object
+        # counts once as started and once as finished however many times it
+        # is registered. Live members are the in-flight executions.
+        self._counted_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
+        # Window counts for the per-process diagnostics line. Written by
+        # registration and by done callbacks, zeroed by ``drain_window_counts``
+        # and when ``start_accepting`` opens a new lifespan. ``shutdown`` keeps
+        # them so cancellations during shutdown are still reported.
+        self._window_started = 0
+        self._window_finished_ok = 0
+        self._window_finished_failed = 0
+        self._window_finished_cancelled = 0
 
     def start_accepting(self) -> None:
         """Reopen admission for a new application lifespan."""
@@ -4693,6 +4754,7 @@ class BackgroundTaskManager:
         # so an idle manager must not retain the previous lifespan's lock.
         self._shutdown_lock = asyncio.Lock()
         self._shutting_down = False
+        self.drain_window_counts()
 
     async def wait_for_previous(self, task_id: int) -> None:
         """Wait for previous background task of this task to complete"""
@@ -4713,8 +4775,23 @@ class BackgroundTaskManager:
                         f"Previous background task {task_id} ended with error: {e}"
                     )
 
-    def register_task(self, task_id: int, task: asyncio.Task) -> None:
-        """Register new background task"""
+    def register_task(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        *,
+        failure_flag: Callable[[], bool] | None = None,
+    ) -> None:
+        """Register new background task and count it as a started execution.
+
+        ``failure_flag`` reports a failure the task handled itself and then
+        returned from normally; it is read once, when the task finishes, and
+        must be a cheap read of state the task already holds. Without it only
+        an exception escaping the task counts as a failure. The manager logs
+        that exception exactly once, with its traceback, and asyncio adds no
+        second report; a path that also awaits the handle may log it again
+        there.
+        """
         if self._shutting_down:
             task.cancel()
             raise RuntimeError("Background task manager is shutting down")
@@ -4731,6 +4808,7 @@ class BackgroundTaskManager:
         task.add_done_callback(
             lambda finished: self.cleanup_task(task_id, expected_task=finished)
         )
+        self._count_execution_start(task_id, task, failure_flag)
         logger.info(f"Registered background task for task {task_id}")
 
     def resume_admission_state(
@@ -4850,6 +4928,13 @@ class BackgroundTaskManager:
         self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
+        """Make a resume coordinator the task's execution and count it as started.
+
+        It is counted without a failure flag: only an exception escaping the
+        coordinator counts as failed, and that exception is logged as for
+        ``register_task``.
+        """
+
         if self._shutting_down:
             raise RuntimeError("Background task manager is shutting down")
         existing = self.resume_tasks.get(task_id)
@@ -4858,7 +4943,95 @@ class BackgroundTaskManager:
                 f"Task {task_id} resume coordinator is not registered or no longer current"
             )
         self.running_tasks[task_id] = task
+        self._count_execution_start(task_id, task, None)
         logger.info("Promoted resume coordinator for task %s", task_id)
+
+    def _count_execution_start(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        failure_flag: Callable[[], bool] | None,
+    ) -> None:
+        if task in self._counted_tasks:
+            return
+        self._counted_tasks.add(task)
+        self._window_started += 1
+        task.add_done_callback(
+            lambda finished: self._count_execution_finish(
+                task_id, finished, failure_flag
+            )
+        )
+
+    def _count_execution_finish(
+        self,
+        task_id: int,
+        task: asyncio.Task,
+        failure_flag: Callable[[], bool] | None,
+    ) -> None:
+        # Deliberately independent of ``cleanup_task`` and ``_shutting_down``:
+        # tasks cancelled by ``shutdown`` are still counted.
+        if task.cancelled():
+            self._window_finished_cancelled += 1
+            return
+        exc = task.exception()
+        if exc is not None:
+            # Reading the exception marks it retrieved, which silences
+            # asyncio's "Task exception was never retrieved" report for a
+            # handle nobody awaits. Report it here instead; this callback is
+            # attached once per task object, so it is reported once.
+            logger.error(
+                "Background execution for task %s raised", task_id, exc_info=exc
+            )
+        failed = exc is not None
+        if not failed and failure_flag is not None:
+            try:
+                failed = bool(failure_flag())
+            except Exception:
+                logger.exception("Execution failure flag raised; counting as failed")
+                failed = True
+        if failed:
+            self._window_finished_failed += 1
+        else:
+            self._window_finished_ok += 1
+
+    def inflight_counts(self) -> tuple[int, int]:
+        """Return (executions in flight, resume coordinators not yet executing).
+
+        The two numbers are disjoint: a promoted coordinator is an execution.
+        Counts objects, not task ids, so an older execution still finishing
+        after its task id was registered again is included.
+        """
+
+        inflight = sum(1 for task in list(self._counted_tasks) if not task.done())
+        resuming = sum(
+            1
+            for task in list(self.resume_tasks.values())
+            if not task.done() and task not in self._counted_tasks
+        )
+        return inflight, resuming
+
+    def drain_window_counts(self) -> tuple[int, int, int, int]:
+        """Return and zero (started, finished ok, failed, cancelled) since the last drain.
+
+        "failed" means the task raised, or reported through its failure flag
+        that it handled a failure. "ok" is every other non-cancelled finish,
+        which includes runs that paused, lost their lease, or whose agent
+        reported an unsuccessful result without raising. A resume coordinator
+        is counted without a failure flag, so a resume run that handles its
+        own failure and returns normally counts as "ok".
+        """
+
+        counts = (
+            self._window_started,
+            self._window_finished_ok,
+            self._window_finished_failed,
+            self._window_finished_cancelled,
+        )
+        self._window_started = 0
+        self._window_finished_ok = 0
+        self._window_finished_failed = 0
+        self._window_finished_cancelled = 0
+        return counts
 
     def cleanup_task(
         self,

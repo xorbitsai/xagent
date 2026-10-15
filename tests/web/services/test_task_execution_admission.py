@@ -45,7 +45,7 @@ async def host(engine, monkeypatch):
     monkeypatch.setattr(runtime, "_registry", registry)
     from xagent.web.models import database
 
-    monkeypatch.setattr(database, "get_session_local", lambda: sessions)
+    monkeypatch.setattr(database, "_SessionLocal", sessions)
     with sessions() as db:
         user = User(username="owner", password_hash="unused")
         db.add(user)
@@ -474,7 +474,7 @@ def _dispatch_process(url, barrier, release, results):
         engine, busy_timeout_ms=int(DB_PROGRESS_TIMEOUT * 1000)
     )
     sessions = sessionmaker(engine, expire_on_commit=False)
-    database.get_session_local = lambda: sessions
+    database._SessionLocal = sessions
     worker = f"process-{os.getpid()}"
     transport.get_runner_id = lambda: worker
 

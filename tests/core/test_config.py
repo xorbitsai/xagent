@@ -26,6 +26,7 @@ from xagent.config import (
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
+    CORS_ORIGINS,
     DATABASE_URL,
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
@@ -58,6 +59,8 @@ from xagent.config import (
     HOT_PATH_CACHE_TTL_SECONDS,
     HOT_PATH_TASK_CACHE_TTL_SECONDS,
     KB_COLLECTIONS_TIMEOUT_SECONDS,
+    KB_MILVUS_CLEANUP_ENABLED,
+    KB_MILVUS_CLEANUP_INTERVAL_SECONDS,
     KB_SEARCH_TIMEOUT_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
@@ -135,6 +138,7 @@ from xagent.config import (
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
+    get_cors_origins,
     get_database_url,
     get_db_max_overflow,
     get_db_pool_size,
@@ -169,6 +173,8 @@ from xagent.config import (
     get_hot_path_cache_ttl_seconds,
     get_hot_path_task_cache_ttl_seconds,
     get_kb_collections_timeout_seconds,
+    get_kb_milvus_cleanup_enabled,
+    get_kb_milvus_cleanup_interval_seconds,
     get_kb_search_timeout_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
@@ -558,6 +564,31 @@ class TestAuthEmailConfig:
         assert get_slack_app_token() is None
         assert get_slack_oauth_redirect_uri() is None
 
+    def test_cors_origins_default_to_frontend_url(self, monkeypatch):
+        monkeypatch.delenv(CORS_ORIGINS, raising=False)
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", " https://app.example.com/ ")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_parse_explicit_list(self, monkeypatch):
+        monkeypatch.setenv(
+            CORS_ORIGINS,
+            " https://app.example.com/ , https://admin.example.com ",
+        )
+        assert get_cors_origins() == [
+            "https://app.example.com",
+            "https://admin.example.com",
+        ]
+
+    def test_cors_origins_treat_blank_as_unset(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "")
+        monkeypatch.setenv("XAGENT_FRONTEND_URL", "https://app.example.com")
+        assert get_cors_origins() == ["https://app.example.com"]
+
+    def test_cors_origins_reject_wildcard_with_credentials(self, monkeypatch):
+        monkeypatch.setenv(CORS_ORIGINS, "*")
+        with pytest.raises(ValueError, match=r"cannot contain '\*'"):
+            get_cors_origins()
+
     def test_slack_oauth_config_uses_explicit_values(self, monkeypatch):
         monkeypatch.setenv(SLACK_CLIENT_ID, " client-id ")
         monkeypatch.setenv(SLACK_CLIENT_SECRET, " client-secret ")
@@ -826,6 +857,33 @@ class TestCeleryBackgroundJobConfig:
         assert get_background_job_max_retries() == 3
         assert get_background_job_stale_seconds() == 7200
         assert get_background_job_sweep_interval_seconds() == 300
+
+    def test_kb_milvus_cleanup_interval_default(self, monkeypatch):
+        monkeypatch.delenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, raising=False)
+        assert get_kb_milvus_cleanup_interval_seconds() == 3600
+
+    def test_kb_milvus_cleanup_interval_env_override(self, monkeypatch):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, "600")
+        assert get_kb_milvus_cleanup_interval_seconds() == 600
+
+    def test_kb_milvus_cleanup_interval_below_minimum_falls_back_to_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_INTERVAL_SECONDS, "299")
+        assert get_kb_milvus_cleanup_interval_seconds() == 3600
+
+    def test_kb_milvus_cleanup_enabled_defaults_to_true(self, monkeypatch):
+        monkeypatch.delenv(KB_MILVUS_CLEANUP_ENABLED, raising=False)
+        assert get_kb_milvus_cleanup_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE", " false "])
+    def test_kb_milvus_cleanup_enabled_false_values(self, monkeypatch, value):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_ENABLED, value)
+        assert get_kb_milvus_cleanup_enabled() is False
+
+    def test_kb_milvus_cleanup_enabled_true_value(self, monkeypatch):
+        monkeypatch.setenv(KB_MILVUS_CLEANUP_ENABLED, "true")
+        assert get_kb_milvus_cleanup_enabled() is True
 
     def test_trigger_dispatcher_tuning(self, monkeypatch):
         monkeypatch.delenv(TRIGGER_DISPATCHER_ENABLED, raising=False)
@@ -3798,7 +3856,7 @@ _AUTO_RESUME_INT_SETTINGS = [
 ]
 
 _AUTO_RESUME_BOOL_SETTINGS = [
-    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", False),
+    ("TASK_INFRA_FAILURE_PAUSE_ENABLED", "get_task_infra_failure_pause_enabled", True),
     ("TASK_AUTO_RESUME_ENABLED", "get_task_auto_resume_enabled", True),
 ]
 
@@ -3833,6 +3891,7 @@ class TestTaskAutoRecoveryConfig:
         assert env_var == f"XAGENT_{const}"
         read = getattr(config, getter)
 
+        monkeypatch.delenv(config.TASK_AUTO_RESUME_ENABLED, raising=False)
         monkeypatch.delenv(env_var, raising=False)
         assert read() is default
 
@@ -3856,6 +3915,27 @@ class TestTaskAutoRecoveryConfig:
             with caplog.at_level(logging.WARNING, logger="xagent.config"):
                 assert read() is default
             assert env_var in caplog.text
+
+    @pytest.mark.parametrize("auto_resume", [True, False])
+    def test_infra_failure_pause_follows_auto_resume_unless_set(
+        self, monkeypatch, auto_resume
+    ):
+        monkeypatch.setenv(config.TASK_AUTO_RESUME_ENABLED, str(auto_resume).lower())
+        read = config.get_task_infra_failure_pause_enabled
+
+        for unset in (None, "", "maybe"):
+            if unset is None:
+                monkeypatch.delenv(
+                    config.TASK_INFRA_FAILURE_PAUSE_ENABLED, raising=False
+                )
+            else:
+                monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, unset)
+            assert read() is auto_resume
+
+        monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, "true")
+        assert read() is True
+        monkeypatch.setenv(config.TASK_INFRA_FAILURE_PAUSE_ENABLED, "false")
+        assert read() is False
 
     def test_example_env_documents_every_setting(self):
         example = (Path(config.__file__).parents[2] / "example.env").read_text()
@@ -3905,3 +3985,27 @@ def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
     monkeypatch.setenv("XAGENT_EXECUTION_BUDGET_MAX_TOKENS", "100")
     with pytest.raises(ValueError, match="must not exceed"):
         get_execution_budget_defaults()
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", " development ", "DEVELOPMENT"])
+def test_environment_defaults_and_normalizes_development(monkeypatch, value):
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    if value is None:
+        monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_ENVIRONMENT", value)
+
+    assert config.get_environment() == "development"
+
+
+def test_legacy_environment_alias_is_normalized(monkeypatch):
+    monkeypatch.delenv("XAGENT_ENVIRONMENT", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", " Production ")
+
+    assert config.get_environment() == "production"
+
+
+def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "  ")
+    monkeypatch.setenv("ENVIRONMENT", " production ")
+    assert config.get_environment() == "production"

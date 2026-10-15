@@ -11,7 +11,7 @@ import logging
 import math
 import os
 import re
-from collections.abc import Coroutine, Iterator
+from collections.abc import Coroutine, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
@@ -33,6 +33,8 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
+import jsonschema.exceptions as jsonschema_exceptions  # type: ignore[import-untyped]
+from jsonschema import Draft202012Validator
 from mcp.types import CallToolResult
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, ValidationError, create_model
@@ -68,6 +70,7 @@ from .connector_runtime import (
     runtime_bindings_from_config,
 )
 from .mcp_approval_gate import gate_mcp_tools
+from .mcp_result_integrity import MCPResultIntegrityGuard
 from .sandboxed_tool.chrome_session import (
     ChromeDaemonLaunchSpec,
     ChromeExecutionScope,
@@ -87,7 +90,13 @@ _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
 
 
 class MCPFailurePhase(str, Enum):
-    """Public-safe phase where an MCP server failed to load."""
+    """Public-safe phase where an MCP server failed to load.
+
+    ``AUTH_REJECTED`` is recorded instead of the handshake phase when the
+    transport raised an ``httpx.HTTPStatusError`` with status 401 or 403:
+    the server, or whatever answers in front of it, refused the request
+    outright.
+    """
 
     SESSION_START = "session_start"
     INITIALIZE = "initialize"
@@ -96,6 +105,7 @@ class MCPFailurePhase(str, Enum):
     SANDBOX_LIST_TOOLS = "sandbox_list_tools"
     SANDBOX_TOOL_WRAP = "sandbox_tool_wrap"
     NO_TOOLS_RETURNED = "no_tools_returned"
+    AUTH_REJECTED = "auth_rejected"
 
 
 _DEFAULT_UNAVAILABLE_MCP_MESSAGE = "MCP server credentials are unavailable."
@@ -109,7 +119,14 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
     MCPFailurePhase.SANDBOX_LIST_TOOLS: "MCP server tools could not be loaded.",
     MCPFailurePhase.SANDBOX_TOOL_WRAP: ("Some MCP server tools could not be prepared."),
     MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
+    MCPFailurePhase.AUTH_REJECTED: "MCP server refused the connection.",
 }
+# HTTP statuses that end a load's retries. A 401 means the credentials were
+# not accepted, and every attempt of a load sends the same credentials, so a
+# retry cannot change that answer. A 403 can also come from a firewall or a
+# rate limit in front of the server and may clear later; it is still treated
+# as final, trading a retry for not repeating a request the server refused.
+_AUTH_REJECTED_HTTP_STATUSES = frozenset({401, 403})
 
 
 def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
@@ -576,15 +593,14 @@ def _is_non_negative_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-# Every field-schema key this adapter reads: the eight it carries into the
-# emitted schema, the four `_json_schema_to_python_type` resolves a type from,
-# and `default`. A key outside this set reaches neither the emitted schema nor
-# the field's type, so it is dropped -- `items`, `const`, `multipleOf`,
-# `exclusiveMinimum` and `title` among them -- and is counted as such.
+# Every field-schema key this adapter reads for metadata, structure, or type
+# conversion. A key outside this set reaches neither the emitted schema nor
+# the field's type, so it is dropped and counted as such.
 _READ_FIELD_SCHEMA_KEYS = frozenset(
     {
         "description",
         "enum",
+        "const",
         "pattern",
         "format",
         "minLength",
@@ -596,6 +612,13 @@ _READ_FIELD_SCHEMA_KEYS = frozenset(
         "anyOf",
         "oneOf",
         "allOf",
+        "properties",
+        "required",
+        "items",
+        "additionalProperties",
+        "patternProperties",
+        "propertyNames",
+        "nullable",
     }
 )
 # Numeric field-schema keys carried through, in the order they are emitted,
@@ -667,6 +690,8 @@ def _field_metadata_candidates(
 
     if "enum" in field_schema:
         raw_enum = field_schema["enum"]
+        raw_const = field_schema.get("const")
+        has_const = "const" in field_schema
         # An over-long enum is dropped whole rather than shortened: a clipped
         # list still reads as the complete set of legal values, so it would
         # tell the model that a value the server accepts is illegal.
@@ -689,11 +714,34 @@ def _field_metadata_candidates(
             and _is_json_serializable(raw_enum)
             and len(_compact_json(raw_enum)) <= _FIELD_TEXT_MAX_CHARS
             and (
+                not has_const
+                or (
+                    _is_json_serializable(raw_const)
+                    and len(_compact_json(raw_const)) <= _FIELD_TEXT_MAX_CHARS
+                    and any(_json_equal(raw_const, member) for member in raw_enum)
+                )
+            )
+            and (
                 not default_is_authored
-                or any(_json_equal(emitted_default, member) for member in raw_enum)
+                or (has_const and _json_equal(emitted_default, raw_const))
+                or (
+                    not has_const
+                    and any(_json_equal(emitted_default, member) for member in raw_enum)
+                )
             )
         ):
-            candidates.append(("enum", list(raw_enum)))
+            candidates.append(("enum", [raw_const] if has_const else list(raw_enum)))
+        else:
+            rejected += 1
+
+    if "const" in field_schema and "enum" not in field_schema:
+        raw_const = field_schema["const"]
+        if (
+            _is_json_serializable(raw_const)
+            and len(_compact_json(raw_const)) <= _FIELD_TEXT_MAX_CHARS
+            and (not default_is_authored or _json_equal(emitted_default, raw_const))
+        ):
+            candidates.append(("enum", [raw_const]))
         else:
             rejected += 1
 
@@ -830,6 +878,302 @@ def _tool_field_metadata(
         metadata[field_name] = _FieldMetadata(emitted_default, description, extra)
 
     return _ToolFieldMetadata(metadata, rejected_keys, unreadable_fields)
+
+
+_JSON_SCHEMA_TYPES = frozenset(
+    {"array", "boolean", "integer", "null", "number", "object", "string"}
+)
+_NESTED_SCHEMA_MAX_DEPTH = 16
+_NESTED_SCHEMA_MAX_NODES = 1024
+
+
+def _schema_type_for_emission(value: Any) -> str | list[str] | None:
+    """Return a provider-safe JSON Schema type declaration, if readable."""
+    if isinstance(value, str):
+        return value if value in _JSON_SCHEMA_TYPES else None
+    if not isinstance(value, list) or not value:
+        return None
+    types: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item not in _JSON_SCHEMA_TYPES:
+            return None
+        if item not in types:
+            types.append(item)
+    return types or None
+
+
+def _schema_allows_null(schema: Any) -> bool:
+    if not isinstance(schema, Mapping):
+        return False
+    if schema.get("nullable") is True:
+        return True
+    schema_type = schema.get("type")
+    if schema_type == "null":
+        return True
+    if isinstance(schema_type, list) and "null" in schema_type:
+        return True
+    for union_key in ("anyOf", "oneOf"):
+        options = schema.get(union_key)
+        if isinstance(options, list) and any(
+            _schema_allows_null(option) for option in options
+        ):
+            return True
+    return False
+
+
+def _schema_is_null_option(schema: Any) -> bool:
+    """Return whether a union option is exactly the JSON null type."""
+    if not isinstance(schema, Mapping):
+        return False
+    schema_type = schema.get("type")
+    return schema_type == "null" or schema_type == ["null"]
+
+
+def _is_optional_union_options(options: Any) -> bool:
+    """Return whether options contain one concrete branch and one null branch."""
+    return (
+        isinstance(options, list)
+        and len(options) == 2
+        and sum(_schema_is_null_option(option) for option in options) == 1
+    )
+
+
+def _remove_schema_keyword(schema: Any, keyword: str) -> Any:
+    """Remove a validator keyword without treating property names as keywords."""
+    if isinstance(schema, Mapping):
+        schema_maps = {"properties", "patternProperties", "$defs", "definitions"}
+        schema_lists = {"prefixItems", "anyOf", "oneOf", "allOf"}
+        schema_values = {
+            "additionalProperties",
+            "contains",
+            "else",
+            "if",
+            "items",
+            "not",
+            "propertyNames",
+            "then",
+            "unevaluatedItems",
+            "unevaluatedProperties",
+        }
+        cleaned: dict[str, Any] = {}
+        for key, value in schema.items():
+            if key == keyword:
+                continue
+            if key in schema_maps:
+                if isinstance(value, Mapping):
+                    cleaned[key] = {
+                        name: _remove_schema_keyword(child, keyword)
+                        for name, child in value.items()
+                    }
+                else:
+                    cleaned[key] = value
+            elif key in schema_lists and isinstance(value, list):
+                cleaned[key] = [
+                    _remove_schema_keyword(child, keyword) for child in value
+                ]
+            elif key in schema_values and isinstance(value, Mapping):
+                cleaned[key] = _remove_schema_keyword(value, keyword)
+            else:
+                # enum/default/examples and other literal values are data,
+                # not schema nodes; do not rewrite object members inside them.
+                cleaned[key] = value
+        return cleaned
+    return schema
+
+
+def _nested_schema_for_emission(
+    schema: Any,
+    *,
+    is_required: bool,
+    flatten_nullable_union: bool = False,
+    depth: int = 0,
+    _node_budget: list[int] | None = None,
+) -> dict[str, Any]:
+    """Build the bounded nested schema exposed to the model and validator.
+
+    MCP input schemas are remote-controlled.  Preserve the structural subset
+    needed to describe nested argument objects and arrays, but run every
+    model-facing string, enum, numeric bound, and recursive child through the
+    same guards as a top-level field.  Unsupported or malformed fragments are
+    dropped locally instead of being copied verbatim into every LLM request.
+    """
+    if _node_budget is None:
+        _node_budget = [0]
+    if (
+        not isinstance(schema, Mapping)
+        or depth >= _NESTED_SCHEMA_MAX_DEPTH
+        or _node_budget[0] >= _NESTED_SCHEMA_MAX_NODES
+    ):
+        return {}
+    _node_budget[0] += 1
+
+    emitted: dict[str, Any] = {}
+    schema_type = _schema_type_for_emission(schema.get("type"))
+    if schema_type is not None:
+        emitted["type"] = schema_type
+
+    if is_required:
+        emitted_default: Any = None
+        default_is_authored = False
+    else:
+        emitted_default, default_is_authored = _emitted_default(schema)
+    candidates, _ = _field_metadata_candidates(
+        schema,
+        emitted_default=emitted_default,
+        default_is_authored=default_is_authored,
+    )
+    for key, value in candidates:
+        emitted[key] = value
+
+    union_options: list[dict[str, Any]] = []
+    union_is_lossless = True
+    union_keys = [
+        union_key
+        for union_key in ("anyOf", "oneOf")
+        if isinstance(schema.get(union_key), list) and schema[union_key]
+    ]
+    merged_optional_union = False
+    if flatten_nullable_union and len(union_keys) == 1:
+        raw_options = schema[union_keys[0]]
+        if (
+            isinstance(raw_options, list)
+            and len(raw_options) == 2
+            and all(isinstance(option, Mapping) for option in raw_options)
+        ):
+            non_null_options = [
+                option for option in raw_options if not _schema_is_null_option(option)
+            ]
+            if len(non_null_options) == 1:
+                emitted_option = _nested_schema_for_emission(
+                    non_null_options[0],
+                    is_required=True,
+                    depth=depth + 1,
+                    _node_budget=_node_budget,
+                )
+                if emitted_option:
+                    # The top-level Pydantic annotation supplies the nullable
+                    # wrapper. Flattening only at that boundary keeps outer
+                    # metadata on Claude's retained branch without dropping
+                    # null from nested required properties or array items.
+                    emitted_option.update(emitted)
+                    emitted = emitted_option
+                    merged_optional_union = True
+
+    if not merged_optional_union:
+        for union_key in union_keys:
+            raw_options = schema[union_key]
+            if not isinstance(raw_options, list):
+                union_is_lossless = False
+                continue
+            if not all(isinstance(option, Mapping) for option in raw_options):
+                union_is_lossless = False
+                continue
+            for option in raw_options:
+                emitted_option = _nested_schema_for_emission(
+                    option,
+                    is_required=True,
+                    depth=depth + 1,
+                    _node_budget=_node_budget,
+                )
+                if not emitted_option:
+                    union_is_lossless = False
+                else:
+                    union_options.append(emitted_option)
+    raw_properties = schema.get("properties")
+    if union_options and union_is_lossless and not isinstance(raw_properties, Mapping):
+        # Gemini accepts anyOf but rejects oneOf. A lossy union is omitted
+        # instead of being narrowed to the surviving branches. Claude treats
+        # a union beside object siblings as the whole schema, so leave that
+        # shape broad rather than dropping its properties and required names.
+        emitted["anyOf"] = union_options
+
+    raw_property_names: list[str] = []
+    properties_complete = True
+    if isinstance(raw_properties, Mapping):
+        raw_property_names = [name for name in raw_properties if isinstance(name, str)]
+        properties_complete = len(raw_property_names) == len(raw_properties)
+        raw_required = schema.get("required")
+        required_order: list[str] = []
+        if isinstance(raw_required, list):
+            seen_required: set[str] = set()
+            for name in raw_required:
+                if (
+                    isinstance(name, str)
+                    and name in raw_properties
+                    and name not in seen_required
+                ):
+                    required_order.append(name)
+                    seen_required.add(name)
+        required_names = set(required_order)
+        properties: dict[str, Any] = {}
+        for name, child_schema in raw_properties.items():
+            if not isinstance(name, str):
+                continue
+            child = _nested_schema_for_emission(
+                child_schema,
+                is_required=name in required_names,
+                depth=depth + 1,
+                _node_budget=_node_budget,
+            )
+            if child:
+                if name not in required_names and not _schema_allows_null(child):
+                    child = {"anyOf": [child, {"type": "null"}]}
+                properties[name] = child
+            elif name in required_names:
+                # Preserve the required key when a remote $ref, opaque Any,
+                # or exhausted budget leaves no readable child schema. An
+                # unconstrained placeholder is safer than silently relaxing
+                # the server's required contract.
+                properties[name] = {}
+                properties_complete = False
+            else:
+                properties_complete = False
+        emitted["properties"] = properties
+        required = [name for name in required_order if name in properties]
+        if required:
+            emitted["required"] = required
+        if "type" not in emitted:
+            emitted["type"] = "object"
+
+    raw_items = schema.get("items")
+    if isinstance(raw_items, Mapping):
+        items = _nested_schema_for_emission(
+            raw_items,
+            is_required=True,
+            depth=depth + 1,
+            _node_budget=_node_budget,
+        )
+        if items:
+            emitted["items"] = items
+            if "type" not in emitted:
+                emitted["type"] = "array"
+
+    additional_properties = schema.get("additionalProperties")
+    additional_properties_safe = properties_complete and not (
+        "patternProperties" in schema or "propertyNames" in schema
+    )
+    if isinstance(additional_properties, bool) and (
+        additional_properties or additional_properties_safe
+    ):
+        emitted["additionalProperties"] = additional_properties
+    elif isinstance(additional_properties, Mapping):
+        nested_additional = _nested_schema_for_emission(
+            additional_properties,
+            is_required=True,
+            depth=depth + 1,
+            _node_budget=_node_budget,
+        )
+        if nested_additional and additional_properties_safe:
+            emitted["additionalProperties"] = nested_additional
+
+    if (
+        schema.get("nullable") is True
+        and not flatten_nullable_union
+        and not _schema_allows_null(emitted)
+    ):
+        return {"anyOf": [emitted, {"type": "null"}]}
+
+    return emitted
 
 
 def _bounded_exception_nodes(
@@ -1424,6 +1768,28 @@ def _normalized_mcp_call_result(
     }
 
 
+def _excel_failure_code(result: Mapping[str, Any]) -> str | None:
+    """Carry the Excel connector's allowlisted failure code to the runtime."""
+    from ....agent.result import EXCEL_FAILURE_CODES, normalize_tool_failure_code
+
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict) or not isinstance(item.get("text"), str):
+            continue
+        try:
+            payload = json.loads(item["text"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        code = normalize_tool_failure_code(payload.get("failure_code"))
+        if code in EXCEL_FAILURE_CODES:
+            return code
+    return None
+
+
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
     from .selection_spec import normalize_mcp_server_name
 
@@ -1517,6 +1883,9 @@ class MCPToolAdapter(AbstractBaseTool):
         self._durable_upload_fields = durable_upload_fields
         self._durable_upload_own_file_id = durable_upload_own_file_id
         self._workspace_download_field = workspace_download_field
+        self._is_excel_tool = (
+            self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
+        )
         self.concurrency_safe = _mcp_tool_is_concurrency_safe(
             self.mcp_tool.name,
             concurrency_safe=concurrency_safe,
@@ -1531,7 +1900,12 @@ class MCPToolAdapter(AbstractBaseTool):
 
         # Build models from MCP tool schema
         self._args_type = self._build_args_model()
+        self._args_validator = self._build_args_validator()
         self._return_type = self._build_return_model()
+        self._result_integrity = MCPResultIntegrityGuard(
+            source_server=self.source_server,
+            tool_name=self.mcp_tool.name,
+        )
 
     @property
     def name(self) -> str:
@@ -1694,14 +2068,11 @@ class MCPToolAdapter(AbstractBaseTool):
 
         Field-level metadata the connector author wrote (description, enum,
         pattern, format and the length/range bounds) is carried through to the
-        emitted schema as presentation only: it goes in as
-        ``json_schema_extra``, which never becomes a Pydantic validator, so
-        argument validation behaves exactly as it would without it.
-
-        Only the tool's own top-level fields are read. A nested ``object`` or
-        an ``array`` item schema is already flattened to a bare Python type
-        here, so metadata a connector wrote on a nested sub-field or on an
-        array's items is not extracted and does not reach the model.
+        emitted schema through ``json_schema_extra``. Nested object properties,
+        required names and array items are recursively carried through the same
+        bounded sanitizer. ``_build_args_validator`` then validates the parsed
+        arguments against the adapter-visible schema before a remote call;
+        provider-specific schema rewrites may be less restrictive.
 
         The metadata is attached to the field's annotation rather than placed
         beside the field. For an optional field Pydantic emits an ``anyOf``
@@ -1710,7 +2081,7 @@ class MCPToolAdapter(AbstractBaseTool):
         beside the wrapper would be dropped there, which is exactly the shape
         the fix is for.
 
-        A field's default is the one exception, and it is not presentation: a
+        Defaults also affect execution rather than only presentation: a
         non-finite default is replaced by ``None``, so such a field is omitted
         from the arguments sent to the server instead of carrying a value no
         provider client can serialize.
@@ -1732,9 +2103,14 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Extract properties and required fields
             properties = schema.get("properties", {})
-            required = schema.get("required", [])
+            raw_required = schema.get("required", [])
+            required = (
+                {name for name in raw_required if isinstance(name, str)}
+                if isinstance(raw_required, list)
+                else set()
+            )
 
-            if not properties:
+            if not isinstance(properties, Mapping) or not properties:
                 return EmptyArgsModel
 
             # Build field definitions for create_model
@@ -1744,6 +2120,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 properties, required, runtime_bound_args
             )
             metadata = tool_metadata.fields
+            nested_node_budget = [0]
 
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
@@ -1752,8 +2129,29 @@ class MCPToolAdapter(AbstractBaseTool):
                 # every field reaching here has a record.
                 field_metadata = metadata[field_name]
                 annotation: Any = self._json_schema_to_python_type(field_schema)
+                field_allows_null = _schema_allows_null(field_schema)
+                emitted_fragment = _nested_schema_for_emission(
+                    field_schema,
+                    is_required=field_name in required,
+                    flatten_nullable_union=True,
+                    _node_budget=nested_node_budget,
+                )
+                if not emitted_fragment and field_metadata.extra:
+                    # A shared nested budget may be exhausted by an earlier
+                    # field. Keep this field's independent scalar metadata
+                    # instead of silently making the output order-dependent.
+                    emitted_fragment = dict(field_metadata.extra)
+                description = emitted_fragment.pop(
+                    "description", field_metadata.description
+                )
+                # Pydantic emits the annotation's type itself. Retaining the
+                # connector's identical scalar type is harmless, but dropping
+                # it avoids allowing malformed remote input to override the
+                # Python type selected above. Object/array structure stays in
+                # the fragment via properties/required/items.
+                emitted_fragment.pop("type", None)
 
-                if field_metadata.description is not None or field_metadata.extra:
+                if description is not None or emitted_fragment:
                     # Carried on the annotation so it lands inside the
                     # non-null branch of the `anyOf` an optional field gets.
                     # A field with nothing to say is left alone, so its
@@ -1761,13 +2159,19 @@ class MCPToolAdapter(AbstractBaseTool):
                     annotation = Annotated[
                         annotation,
                         Field(
-                            description=field_metadata.description,
-                            json_schema_extra=field_metadata.extra or None,
+                            description=description,
+                            json_schema_extra=emitted_fragment or None,
                         ),
                     ]
 
                 # Check if field is required
                 if field_name in required:
+                    # Required controls key presence, not whether the value
+                    # may be null. Wrap after attaching metadata so Pydantic
+                    # puts that metadata inside the non-null branch Claude
+                    # retains when simplifying Optional[T].
+                    if field_allows_null and annotation is not Any:
+                        annotation = self._build_union_type([annotation, type(None)])
                     fields[field_name] = (annotation, ...)
                 else:
                     # Optional field with default
@@ -1798,6 +2202,169 @@ class MCPToolAdapter(AbstractBaseTool):
             )
 
             return EmptyArgsModel
+
+    def _build_args_validator(self) -> Any | None:
+        """Compile the adapter-visible argument schema for local checks.
+
+        A malformed remote schema must not make the whole connector unload.
+        ``_build_args_model`` already drops unsupported fragments; if the
+        remaining Pydantic schema is still invalid, preserve the historical
+        Pydantic-only validation path and log only the exception class.
+        """
+        try:
+            schema = self._args_type.model_json_schema()
+            # Regexes supplied by an MCP server are model-facing hints, not a
+            # safe event-loop validator. In particular, Python's backtracking
+            # engine can be blocked by a pathological pattern, and ECMA-only
+            # patterns can make the entire schema invalid. Keep the pattern in
+            # the provider schema but omit it from local pre-call checks.
+            schema = _remove_schema_keyword(schema, "pattern")
+            Draft202012Validator.check_schema(schema)
+            return Draft202012Validator(schema)
+        except (jsonschema_exceptions.SchemaError, TypeError, ValueError) as exc:
+            logger.warning(
+                "MCP tool %s argument schema could not be compiled for nested "
+                "validation: %s",
+                self.mcp_tool.name,
+                type(exc).__name__,
+            )
+            return None
+
+    def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
+        if self._args_validator is None:
+            return None
+        errors = list(self._args_validator.iter_errors(dict(args)))
+        for candidate in errors:
+            if candidate.validator not in {"anyOf", "oneOf"}:
+                continue
+            options = (
+                candidate.schema.get(candidate.validator)
+                if isinstance(candidate.schema, Mapping)
+                else None
+            )
+            if _is_optional_union_options(options):
+                for nested_candidate in candidate.context:
+                    nested_options = (
+                        nested_candidate.schema.get(nested_candidate.validator)
+                        if nested_candidate.validator in {"anyOf", "oneOf"}
+                        and isinstance(nested_candidate.schema, Mapping)
+                        else None
+                    )
+                    if nested_candidate.validator in {
+                        "anyOf",
+                        "oneOf",
+                    } and not _is_optional_union_options(nested_options):
+                        # Keep the outer Optional[T] boundary so its absolute
+                        # field path is retained, rather than selecting an
+                        # enum/required failure from an unrelated T branch.
+                        return candidate
+                continue
+            # For a discriminated union, best_match may select a misleading
+            # enum/required error from the wrong branch.
+            return candidate
+
+        error = jsonschema_exceptions.best_match(errors)
+        if error is not None and error.validator in {"anyOf", "oneOf"}:
+            options = (
+                error.schema.get(error.validator)
+                if isinstance(error.schema, Mapping)
+                else None
+            )
+            if _is_optional_union_options(options):
+                for nested_candidate in error.context:
+                    if nested_candidate.validator not in {"anyOf", "oneOf"}:
+                        continue
+                    nested_options = (
+                        nested_candidate.schema.get(nested_candidate.validator)
+                        if isinstance(nested_candidate.schema, Mapping)
+                        else None
+                    )
+                    if not _is_optional_union_options(nested_options):
+                        # The outer union only represents Optional[T]. Keep a
+                        # multi-branch T error at its boundary instead of
+                        # descending into an unrelated discriminated branch.
+                        return error
+                nested = jsonschema_exceptions.best_match(error.context)
+                if nested is not None:
+                    error = nested
+        return error
+
+    @staticmethod
+    def _invalid_arguments_result(error: Any) -> dict[str, Any]:
+        path = [str(part) for part in error.absolute_path]
+        if error.validator == "required" and isinstance(error.instance, Mapping):
+            required = error.validator_value
+            if isinstance(required, list):
+                missing = next(
+                    (
+                        name
+                        for name in required
+                        if isinstance(name, str) and name not in error.instance
+                    ),
+                    None,
+                )
+                if missing is not None:
+                    path.append(missing)
+        location = ".".join(path) or "arguments"
+        if error.validator == "required":
+            reason = "a required value is missing"
+        elif error.validator == "enum":
+            allowed = _compact_json(error.validator_value)
+            if len(allowed) > 160:
+                allowed = allowed[:157] + "..."
+            reason = f"the value is outside the allowed enum {allowed}"
+        elif error.validator == "type":
+            expected = _compact_json(error.validator_value)
+            if len(expected) > 160:
+                expected = expected[:157] + "..."
+            reason = f"the value has the wrong type (expected {expected})"
+        elif error.validator in {
+            "minimum",
+            "maximum",
+            "exclusiveMinimum",
+            "exclusiveMaximum",
+            "minLength",
+            "maxLength",
+        }:
+            reason = (
+                f"the {error.validator} constraint "
+                f"({_compact_json(error.validator_value)}) was not satisfied"
+            )
+        elif error.validator == "additionalProperties":
+            allowed_names: set[str] = set()
+            if isinstance(error.schema, Mapping):
+                properties = error.schema.get("properties")
+                if isinstance(properties, Mapping):
+                    allowed_names.update(properties)
+            unexpected = sorted(
+                str(name)
+                for name in (
+                    error.instance if isinstance(error.instance, Mapping) else {}
+                )
+                if name not in allowed_names
+            )
+            if unexpected:
+                unexpected_text = ", ".join(unexpected)
+                if len(unexpected_text) > 160:
+                    unexpected_text = unexpected_text[:157] + "..."
+                reason = f"an unsupported field was supplied: {unexpected_text}"
+            else:
+                reason = "an unsupported field was supplied"
+        elif error.validator in {"anyOf", "oneOf"}:
+            reason = "the value does not match any allowed variant"
+        else:
+            reason = f"the {error.validator or 'schema'} constraint was not satisfied"
+        return {
+            "content": [
+                {
+                    "text": (
+                        f"Invalid MCP tool arguments at {location}: {reason}. "
+                        "Check the tool schema and retry."
+                    )
+                }
+            ],
+            "is_error": True,
+        }
 
     def _build_return_model(self) -> Type[BaseModel]:
         """Build return model for MCP tool output."""
@@ -2329,8 +2896,31 @@ class MCPToolAdapter(AbstractBaseTool):
                     normalized_args.pop(field_name, None)
             self._validate_strict_integer_args(normalized_args)
             parsed_args = self._args_type(**normalized_args)
+            supplied_argument_names = set(normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
-            tool_args.update(self._runtime_tool_arguments())
+            input_schema = self.mcp_tool.inputSchema
+            raw_required = (
+                input_schema.get("required", [])
+                if isinstance(input_schema, Mapping)
+                else []
+            )
+            required_names = (
+                {name for name in raw_required if isinstance(name, str)}
+                if isinstance(raw_required, list)
+                else set()
+            )
+            input_properties = self._input_schema_properties()
+            # ``exclude_none`` preserves the historical behavior for
+            # optional fields. Restore null only when the server explicitly
+            # requires the key and its schema allows null; never reintroduce
+            # ignored/unknown keys.
+            for name in supplied_argument_names & required_names:
+                if normalized_args.get(name) is None and _schema_allows_null(
+                    input_properties.get(name)
+                ):
+                    tool_args[name] = None
+            runtime_arguments = self._runtime_tool_arguments()
+            tool_args.update(runtime_arguments)
             # Snapshot before the call, and attach in this shared layer so
             # subclass calls and authorization retries retain the same evidence.
             bound_args = self._runtime_tool_arguments(
@@ -2349,6 +2939,28 @@ class MCPToolAdapter(AbstractBaseTool):
                     own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
+
+            # Pydantic inserts declared defaults before this point. Validate
+            # only values supplied by the model. Runtime-bound fields are
+            # intentionally absent from the args model, so validating them
+            # here would report them as unexpected properties. This also
+            # prevents a connector's self-contradictory default from rejecting
+            # an otherwise valid call that omitted the field.
+            validation_args = {
+                name: value
+                for name, value in tool_args.items()
+                if name in supplied_argument_names
+            }
+            argument_error = self._nested_argument_error(validation_args)
+            if argument_error is not None:
+                await self._discard_external_upload_args(staged_uploads)
+                result = self._invalid_arguments_result(argument_error)
+                logger.warning(
+                    "MCP tool %s rejected supplied arguments locally: %s",
+                    self.mcp_tool.name,
+                    result["content"][0]["text"],
+                )
+                return result
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",
@@ -2393,6 +3005,21 @@ class MCPToolAdapter(AbstractBaseTool):
                     ):
                         result = await self._run_upload_staging_operation(
                             self._register_workspace_download_result, result
+                        )
+                    try:
+                        result = await self._result_integrity.validate(
+                            tool_args, result
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "MCP result integrity guard failed for server %s "
+                            "tool %s (%s)",
+                            self.source_server,
+                            self.mcp_tool.name,
+                            type(exc).__name__,
+                        )
+                        result = self._result_integrity.failure_result(
+                            "the local integrity check could not complete"
                         )
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
@@ -2488,7 +3115,14 @@ class MCPToolAdapter(AbstractBaseTool):
                 meta=dict(tool_meta) or None,
             )
 
-            return _normalized_mcp_call_result(result)
+            normalized = _normalized_mcp_call_result(result)
+            if self._is_excel_tool:
+                failure_code = _excel_failure_code(normalized)
+                if failure_code is not None:
+                    normalized["failure_code"] = failure_code
+                    normalized["success"] = False
+                    normalized["is_error"] = True
+            return normalized
 
     async def _retry_after_authorization_failure(
         self,
@@ -2804,7 +3438,9 @@ class UnavailableMCPTool(AbstractBaseTool):
     ``unavailable_server`` is the raw configured name, shown to anyone who can
     see the trace, including anonymous share viewers (#1041).
     ``cause_type`` and ``status_code`` are kept for the setup summary only and
-    are not part of the result.
+    are not part of the result. A record whose reason is ``auth_rejected`` is
+    kept only for the setup summary and the failure policy;
+    ``model_visible_mcp_tools`` removes it before the list reaches an agent.
     """
 
     read_only = True
@@ -2913,6 +3549,23 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     def return_value_as_string(self, value: Any) -> str:
         return _mcp_return_value_as_string(value)
+
+
+def model_visible_mcp_tools(tools: Iterable[Any]) -> list[Any]:
+    """Drop the record of a server that refused the load (``auth_rejected``).
+
+    The model cannot act on a refused connection, so that record is kept only
+    for the setup summary and the failure policy. Call this only after both
+    have read the full list: the record is how they learn about the failure.
+    """
+    return [
+        tool
+        for tool in tools
+        if not (
+            isinstance(tool, UnavailableMCPTool)
+            and tool.unavailability_reason == MCPFailurePhase.AUTH_REJECTED.value
+        )
+    ]
 
 
 def _build_mcp_tool_adapter(
@@ -3284,11 +3937,14 @@ async def _load_direct_mcp_tools(
         recorder.instrument(connection) if recorder is not None else connection
     )
 
+    loaded = False
+    attempts = 0
     for attempt in range(max_attempts):
         if recorder is not None:
             # Also outside the try-block, so it ends the load instead of being
             # retried: an abandoned load must not open another session.
             recorder.raise_if_sealed()
+        attempts = attempt + 1
         current_phase = MCPFailurePhase.SESSION_START
         try:
             async with create_session(session_connection) as session:
@@ -3297,6 +3953,7 @@ async def _load_direct_mcp_tools(
                 # Use the shared loader to keep pagination behavior consistent.
                 current_phase = MCPFailurePhase.LIST_TOOLS
                 mcp_tools = await load_mcp_tools(session)
+            loaded = True
             break
         except Exception as e:
             failure_phase = current_phase
@@ -3304,7 +3961,15 @@ async def _load_direct_mcp_tools(
             cause = _load_failure_cause(e)
             cause_type = type(cause).__name__
             status_code = _exception_http_status(cause)
-            if attempt < max_attempts - 1:
+            # Only a transport-level HTTP error counts: a status attribute on
+            # any other exception type is logged but does not end the retries.
+            rejected = (
+                isinstance(cause, httpx.HTTPStatusError)
+                and status_code in _AUTH_REJECTED_HTTP_STATUSES
+            )
+            if rejected:
+                failure_phase = MCPFailurePhase.AUTH_REJECTED
+            if not rejected and attempt < max_attempts - 1:
                 logger.warning(
                     "Attempt %d failed to load tools from MCP server %s during %s "
                     "(%s; cause=%s status=%s); retrying",
@@ -3316,30 +3981,31 @@ async def _load_direct_mcp_tools(
                     status_code,
                 )
                 await asyncio.sleep(1)
-            else:
-                logger.warning(
-                    "Giving up loading tools from MCP server %s during %s after "
-                    "%d attempt(s) (%s; cause=%s status=%s)",
-                    server_name,
-                    current_phase.value,
-                    attempt + 1,
-                    error_type,
-                    cause_type,
-                    status_code,
-                )
-                # The traceback stays at DEBUG: an exception message or a
-                # traceback can carry secrets from the connection (e.g. an
-                # oauth-authenticated request's URL or headers), so the
-                # WARNING above carries only class names and an integer HTTP
-                # status. Opt-in: set XAGENT_LOG_LEVEL=DEBUG (or run with
-                # --debug) to capture the traceback when reproducing a failure.
-                logger.debug(
-                    "Exhausted retries loading tools from MCP server %s during %s",
-                    server_name,
-                    current_phase.value,
-                    exc_info=True,
-                )
-    else:
+                continue
+            logger.warning(
+                "Giving up loading tools from MCP server %s during %s after "
+                "%d attempt(s) (%s; cause=%s status=%s)",
+                server_name,
+                current_phase.value,
+                attempts,
+                error_type,
+                cause_type,
+                status_code,
+            )
+            # The traceback stays at DEBUG: an exception message or a
+            # traceback can carry secrets from the connection (e.g. an
+            # oauth-authenticated request's URL or headers), so the
+            # WARNING above carries only class names and an integer HTTP
+            # status. Opt-in: set XAGENT_LOG_LEVEL=DEBUG (or run with
+            # --debug) to capture the traceback when reproducing a failure.
+            logger.debug(
+                "Exhausted retries loading tools from MCP server %s during %s",
+                server_name,
+                current_phase.value,
+                exc_info=True,
+            )
+            break
+    if not loaded:
         return MCPLoadResult(
             tools=(),
             loaded_servers=(),
@@ -3348,7 +4014,7 @@ async def _load_direct_mcp_tools(
                     server_name=server_name,
                     phase=failure_phase,
                     error_type=error_type,
-                    attempts=max_attempts,
+                    attempts=attempts,
                     cause_type=cause_type,
                     status_code=status_code,
                 ),

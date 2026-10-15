@@ -183,7 +183,7 @@ async def test_v1_compaction_keeps_legacy_path(engine, task_id, monkeypatch):
 
     factory = sessionmaker(engine)
     monkeypatch.setenv("XAGENT_ASYNC_TRACE_DB_ENABLED", "false")
-    monkeypatch.setattr("xagent.web.models.database.get_session_local", lambda: factory)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", factory)
     monkeypatch.setattr(
         "xagent.web.services.trace_handlers.get_db", lambda: iter([factory()])
     )

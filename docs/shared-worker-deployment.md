@@ -46,6 +46,27 @@ The count must be a positive integer and cannot be combined with `--reload`,
 do not run this CLI launcher; use the existing separate web/worker deployment
 when managing processes externally.
 
+## Runtime diagnostics line
+
+Every app process (`combined` or `web` role) and every worker logs one INFO line
+per minute, including minutes with no work:
+
+```
+runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 loop_lag_max_ms=12.3 loop_lag_samples=0
+```
+
+Read the lines per `pid`. A pid that keeps logging `inflight=0` is alive and
+idle. If a pid that was logging is missing for two consecutive minutes, that
+process has exited or its event loop is blocked; with the launcher above, an
+unexpected child exit also stops the other children, so check whether the whole
+group stopped. A `window_s` well above 60 means the event loop was blocked when
+the line was due. In shared mode the `web` process only accepts work, so its
+line shows liveness and `loop_lag_*` only, with `inflight=0`. `inflight` counts
+unfinished executions in that process and differs from the
+`xagent.agent_tasks.running` gauge, which also counts finished executions that
+are still registered. The line is not logged when `XAGENT_LOG_LEVEL` is above
+`INFO`.
+
 ## Configuration and upgrade
 
 1. Stop old application processes before upgrading the database. Back up the

@@ -7,6 +7,18 @@ from typing import Any, AsyncIterator, List
 from ..types import ChunkType, StreamChunk
 
 
+def compatible_tool_choice_for_llm(
+    llm: Any, tool_choice: str | dict[str, Any] | None
+) -> str | dict[str, Any] | None:
+    """Return the strongest tool choice supported by an arbitrary LLM object."""
+
+    if getattr(llm, "supports_forced_tool_choice", True):
+        return tool_choice
+    if tool_choice is None or tool_choice in ("auto", "none"):
+        return tool_choice
+    return "auto"
+
+
 class BaseLLM(ABC):
     """
     Abstract base class for Large Language Models (LLMs) with ability-based support.
@@ -33,7 +45,10 @@ class BaseLLM(ABC):
     def abilities(self) -> List[str]:
         """
         Get the list of abilities supported by this LLM implementation.
-        Possible abilities: ["chat", "vision", "video", "thinking_mode", "tool_calling"]
+        Possible abilities: ["chat", "vision", "video", "thinking_mode",
+        "tool_calling", "auto_tool_choice_only"]. The last ability marks opaque
+        model identifiers whose provider accepts automatic but not forced tool
+        choice.
 
         Returns:
             List[str]: List of supported abilities
@@ -81,6 +96,24 @@ class BaseLLM(ABC):
         Defaults to True to preserve existing structured-output routing.
         """
         return True
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        """Whether the model accepts a request that requires a tool call.
+
+        Tool calling and forced tool selection are separate capabilities: a
+        model can accept tool schemas with ``tool_choice=auto`` while rejecting
+        ``required`` or a named tool. Most providers support both, so the
+        default preserves their existing behavior. Wrappers that do not use
+        the generic retry delegator must explicitly forward this property.
+        """
+        return True
+
+    def compatible_tool_choice(
+        self, tool_choice: str | dict[str, Any] | None
+    ) -> str | dict[str, Any] | None:
+        """Return the strongest tool choice this model can accept."""
+        return compatible_tool_choice_for_llm(self, tool_choice)
 
     @property
     def supports_native_video_input(self) -> bool:

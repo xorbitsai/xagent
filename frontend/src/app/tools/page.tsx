@@ -39,6 +39,8 @@ import { getApiUrl, cn } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
+import { NeedsReconnectBadge } from "@/components/mcp/needs-reconnect-badge"
+import { needsReconnect, type McpConnectionStatus } from "@/lib/mcp-connection-status"
 import { sanitizeConnectorStatusEntry } from "@/lib/team-sharing-sanitizers"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
@@ -94,6 +96,7 @@ export interface MCPServer {
   connected_account?: string
   app_id?: string
   provider?: string
+  connection_status?: McpConnectionStatus | null
   user_env?: Record<string, string>
   can_edit_global?: boolean
   runtime_input_schema?: Record<string, any> | null
@@ -187,8 +190,8 @@ function ToolsPageContent() {
   const { getAppIcon, apps: catalogApps } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
-  // F8: strip all three mcp_oauth redirect params in both effects below, not
-  // just the one each effect owns. The two backend redirects are mutually
+  // F8: strip every mcp_oauth redirect param in both effects below, not just
+  // the one each effect owns. The two backend redirects are mutually
   // exclusive today (never both present at once), but if that ever changed,
   // one effect's router.replace could otherwise undo the other's cleanup and
   // cause a duplicate-toast loop.
@@ -196,6 +199,7 @@ function ToolsPageContent() {
     const next = new URLSearchParams(params.toString())
     next.delete("mcp_oauth_error")
     next.delete("mcp_oauth_error_message")
+    next.delete("mcp_oauth_provider_error")
     next.delete(MCP_OAUTH_SUCCESS_PARAM)
     const nextQuery = next.toString()
     router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
@@ -616,6 +620,8 @@ function ToolsPageContent() {
         is_connected: true,
         provider: provider,
         connected_account: server.connected_account,
+        // The settings dialog names its login action Reconnect from this.
+        connection_status: server.connection_status,
         is_custom: false,
         // This reconstruction path is only reached for oauth servers (gated
         // above); set auth_type explicitly so the settings dialog's isKeyBased
@@ -1056,6 +1062,7 @@ function ToolsPageContent() {
                 {t('tools.mcp.sharing.needsConfig')}
               </span>
             )}
+            {needsReconnect(server) && <NeedsReconnectBadge />}
           </div>
         </div>
         <div className="mb-1 truncate text-[9.5px] font-bold uppercase tracking-[0.07em] text-muted-foreground">

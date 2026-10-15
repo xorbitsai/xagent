@@ -124,6 +124,45 @@ describe("TraceEventRenderer", () => {
     assertStepOutcomes()
   })
 
+  describe("interrupted process", () => {
+    const events = [
+      { event_id: "start", event_type: "react_task_start", step_id: "s1", timestamp: 1000, data: {} },
+      {
+        event_id: "tool",
+        event_type: "tool_execution_start",
+        step_id: "s1",
+        timestamp: 2000,
+        data: { tool_name: "web_search", tool_args: { query: "interrupted-probe" } },
+      },
+    ]
+
+    it("renders an interrupted process as a distinct, named, non-error state", () => {
+      const { container } = render(<TraceEventRenderer events={events} taskStatus="interrupted" />)
+
+      expect(container.querySelector(".animate-spin")).toBeNull()
+      expect(container.querySelector(".text-red-500")).toBeNull()
+      expect(screen.queryByText("traceEventRenderer.unknownError")).toBeNull()
+
+      const step = screen.getByRole("button", { name: /agent\.layout\.status\.interrupted/ })
+      const icon = step.querySelector("svg[data-icon='interrupted']")
+      expect(icon).not.toBeNull()
+      // CircleSlash draws a diagonal bar; the Info glyph used for failed and
+      // paused steps draws a vertical stem instead.
+      expect(icon?.querySelector("line[x1='9'][y1='15'][x2='15'][y2='9']")).not.toBeNull()
+      expect(icon?.querySelector("path[d='M12 16v-4']")).toBeNull()
+    })
+
+    it("collapses an action once its process becomes interrupted", async () => {
+      const { rerender } = render(<TraceEventRenderer events={events} taskStatus="running" />)
+      expect(screen.getByText("traceEventRenderer.searchQuery")).toBeInTheDocument()
+
+      rerender(<TraceEventRenderer events={events} taskStatus="interrupted" />)
+      await waitFor(() => {
+        expect(screen.queryByText("traceEventRenderer.searchQuery")).toBeNull()
+      })
+    })
+  })
+
   it("ignores null, primitive, and malformed trace event entries", () => {
     expect(() => render(
       <TraceEventRenderer

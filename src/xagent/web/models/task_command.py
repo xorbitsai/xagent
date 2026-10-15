@@ -10,10 +10,15 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.sql import func
 
 from .database import Base
+
+# Rows a dispatcher can still claim. Settled commands leave the partial index,
+# so it stays small however large the command history grows.
+_CLAIMABLE_STATUS_CLAUSE = text("status IN ('pending', 'processing')")
 
 
 class TaskExecutionCommand(Base):  # type: ignore
@@ -24,6 +29,15 @@ class TaskExecutionCommand(Base):  # type: ignore
         UniqueConstraint("task_id", "command_id", name="uq_task_command_identity"),
         Index("ix_task_commands_status_created", "status", "created_at"),
         Index("ix_task_commands_task_order", "task_id", "id"),
+        # Serves the dispatcher's reply-first candidate lookup, which filters
+        # claimable commands by kind and takes the oldest id.
+        Index(
+            "ix_task_commands_claimable_kind",
+            "kind",
+            "id",
+            sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
+            postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
+        ),
     )
 
     id = Column(Integer, primary_key=True)

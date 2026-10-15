@@ -36,7 +36,7 @@ from .task_orchestrator import (
     publish_settlement_pause,
     sync_trigger_run_status,
 )
-from .task_settlement_report import RecordedInterruption, SettlementReport
+from .task_settlement_report import SettlementReport
 from .workforce_runtime import sync_workforce_run_status
 
 logger = logging.getLogger(__name__)
@@ -57,13 +57,12 @@ TaskLeaseRecoveryCursor = tuple[datetime, int]
 
 @dataclass(frozen=True)
 class LeaseRecoveryPause:
-    """A committed PAUSED recovery to announce, as settlement announces its
-    pauses: ``report`` as ``task_paused``, then what ``recorded`` planned
-    for automatic recovery as ``task_recovery_update``."""
+    """A committed PAUSED recovery to announce as settlement announces its
+    pauses (``publish_settlement_pause``): ``task_paused``, then what
+    ``report.recovery`` planned for automatic recovery."""
 
     task_id: int
     report: SettlementReport
-    recorded: RecordedInterruption | None
 
 
 @dataclass(frozen=True)
@@ -397,8 +396,8 @@ def stage_task_lease_recovery_no_commit(
             report=SettlementReport(
                 control_state=task_control_snapshot(task).as_dict(),
                 paused_for=lease_expiry_interruption_reason(candidate, verdict),
+                recovery=recorded,
             ),
-            recorded=recorded,
         ),
     )
 
@@ -652,16 +651,12 @@ async def recover_expired_task_leases_until_cutoff(
     # past it. At either finer grain the signal could never stay set.
     clear_degradation(CHECKPOINT_LEGACY_POINTER_AMBIGUOUS)
     clear_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE)
-    from .task_auto_resume import publish_recovery_notices, recorded_notice
 
     async def announce(pauses: tuple[LeaseRecoveryPause, ...]) -> None:
         # Committed pauses are announced as settlement announces its own:
         # ``task_paused``, then any automatic-resume notice. Best effort.
         for pause in pauses:
             await publish_settlement_pause(pause.task_id, pause.report)
-            notice = recorded_notice(pause.recorded)
-            if notice is not None:
-                await publish_recovery_notices((notice,))
 
     recovered = 0
     cursor: TaskLeaseRecoveryCursor | None = None

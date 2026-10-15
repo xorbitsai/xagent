@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as DatabaseTimeoutError
 from sqlalchemy.orm import Session
 
 from ...config import get_task_reply_wait_timeout_seconds
+from ...core.agent.result import normalize_tool_failure_code
 from ...core.agent.trace import (
     TraceAction,
     TraceCategory,
@@ -48,7 +49,10 @@ from .db_runtime import (
     cancel_and_drain_async_task,
     run_db_io_cancellation_safe,
 )
-from .execution_result_projection import interrupted_channel_result
+from .execution_result_projection import (
+    ChannelExecutionProjection,
+    interrupted_channel_result,
+)
 from .task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
@@ -56,7 +60,7 @@ from .task_command_transport import (
     stage_task_command,
 )
 from .task_event_bridge import get_task_event_bridge
-from .task_lease_service import TaskLease, TaskLeaseLostError
+from .task_lease_service import TaskLease, TaskLeaseLostError, utc_now
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnPayload,
@@ -410,6 +414,13 @@ def accept_channel_turn_no_commit(
         )
     ):
         raise TaskTurnError("busy")
+    from .task_auto_resume import supersede_pending_auto_resume_no_commit
+
+    # A turn accepted while the run waits for an automatic resume replaces
+    # it; the START is staged at the version that moved. No notice is
+    # published: web clients learn the new version when this START's run
+    # broadcasts.
+    supersede_pending_auto_resume_no_commit(db, task, now=utc_now())
     db.refresh(task)
     files = (
         db.query(UploadedFile)
@@ -525,8 +536,16 @@ def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:
         ):
             return None
         # Crash recovery or a control command can settle without reaching the
-        # execution leaf. Its persisted state still terminates this exact wait.
+        # execution leaf. Its persisted state still terminates this exact wait,
+        # unless an automatic resume of this run is still due or starting: the
+        # resumed run then stores the answer on this START.
         if task.status == TaskStatus.PAUSED:
+            from .task_auto_resume import channel_reply_waits_for_auto_resume
+
+            if channel_reply_waits_for_auto_resume(
+                db, task_id=int(task.id), run_id=run_id, now=utc_now()
+            ):
+                return None
             return interrupted_channel_result()
         return {
             "success": task.status == TaskStatus.COMPLETED,
@@ -536,6 +555,68 @@ def _read_channel_result(command_id: int, run_id: str) -> dict[str, Any] | None:
             if task.status == TaskStatus.COMPLETED
             else None,
         }
+
+
+def channel_durable_result(
+    result: dict[str, Any],
+    projection: ChannelExecutionProjection,
+    *,
+    transcript: str | None = None,
+) -> dict[str, Any]:
+    """The ``channel_result`` stored on a channel START for ``result``.
+
+    ``transcript`` replaces the projected transcript text when the caller
+    stored a different one (a resumed run rewrites file links).
+    """
+    content = projection.transcript_content if transcript is None else transcript
+    durable: dict[str, Any] = {
+        "success": projection.task_status != TaskStatus.FAILED,
+        "status": str(result.get("status") or projection.task_status.value),
+        "output": content,
+        "completion_outcome": projection.completion_outcome,
+        "chat_response": {"message": content, "interactions": projection.interactions},
+    }
+    failure_code = normalize_tool_failure_code(result.get("failure_code"))
+    if failure_code is not None:
+        durable["failure_code"] = failure_code
+    return durable
+
+
+def stamp_channel_result_no_commit(
+    db: Session, *, task_id: int, run_id: str, channel_result: dict[str, Any]
+) -> bool:
+    """Give ``run_id``'s channel START the answer a later segment of the run
+    produced; no commit.
+
+    First writer wins: a ``channel_result`` already stored (the leaf's own,
+    or "interrupted" for a pause that was not held) is never replaced. The
+    caller holds the task row lock; the lock order is the START hand-off's
+    and the leaf's, ``tasks`` then ``task_execution_commands``. Returns
+    whether it wrote.
+    """
+    command = db.execute(
+        select(TaskExecutionCommand)
+        .where(
+            TaskExecutionCommand.task_id == task_id,
+            TaskExecutionCommand.kind == TaskCommandKind.START.value,
+            TaskExecutionCommand.target_run_id == run_id,
+            TaskExecutionCommand.status == "completed",
+        )
+        .order_by(TaskExecutionCommand.id)
+        .limit(1)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if (
+        command is None
+        or not isinstance(command.payload, dict)
+        or command.payload.get("channel") is None
+    ):
+        return False
+    current = dict(command.result or {})
+    if "channel_result" in current:
+        return False
+    command.result = {**current, "channel_result": channel_result}
+    return True
 
 
 class ChannelProgressForwarder(TraceHandler):
@@ -742,16 +823,7 @@ async def execute_channel_background(
         # queued progress as an opportunity to deliver the final reply early.
         await forwarder.close(drain=True)
         projection = project_execution_result_for_channel(result)
-        durable_result = {
-            "success": projection.task_status != TaskStatus.FAILED,
-            "status": str(result.get("status") or projection.task_status.value),
-            "output": projection.transcript_content,
-            "completion_outcome": projection.completion_outcome,
-            "chat_response": {
-                "message": projection.transcript_content,
-                "interactions": projection.interactions,
-            },
-        }
+        durable_result = channel_durable_result(result, projection)
 
         report = SettlementReport()
 
@@ -769,7 +841,8 @@ async def execute_channel_background(
                     execution_result=result,
                     completion=(command.id, durable_result),
                     # An interrupted run may rest PAUSED instead; its channel
-                    # then reads "interrupted", as after lease recovery.
+                    # then reads "interrupted", as after lease recovery, or
+                    # waits for the automatic resume the pause scheduled.
                     settle_interruption=True,
                     report=report,
                 )
@@ -777,7 +850,8 @@ async def execute_channel_background(
         if not await run_db_io_cancellation_safe(finalize):
             raise TaskLeaseLostError("Channel result no longer owns its execution")
         if report.paused:
-            # The channel has its "interrupted" reply; a web viewer of the
+            # The channel has its "interrupted" reply, or waits for the
+            # automatic resume the pause scheduled; a web viewer of the
             # task learns of the committed pause here. Best effort, as on
             # the other settlement paths: a failed broadcast is only logged.
             from .task_orchestrator import publish_settlement_pause

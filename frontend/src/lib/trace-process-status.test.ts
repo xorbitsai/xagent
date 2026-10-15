@@ -129,4 +129,39 @@ describe("trace process status", () => {
       })
     ).toBe("failed")
   })
+
+  describe("an inferred interrupted end event", () => {
+    const interruptedRun = [
+      { event_type: "react_task_start", data: {} },
+      { event_type: "llm_call_start", data: {} },
+      { event_type: "react_task_end", data: { status: "interrupted" } },
+      { event_type: "react_task_start", data: {} },
+      { event_type: "tool_execution_start", data: {} },
+    ]
+
+    it.each(["running", "pending"])(
+      "keeps an explicit %s status over it",
+      (processStatus) => {
+        expect(
+          resolveTraceProcessStatus({ processStatus, traceEvents: interruptedRun })
+        ).toBe(processStatus)
+      }
+    )
+
+    it("is used when no status is given", () => {
+      expect(resolveTraceProcessStatus({ traceEvents: interruptedRun })).toBe("interrupted")
+    })
+
+    it.each([
+      ["failed", [{ event_type: "agent_error", data: {} }]],
+      ["completed", [{ event_type: "react_task_end", data: {} }]],
+      ["paused", [{ event_type: "react_task_end", data: { status: "paused" } }]],
+      [
+        "waiting_for_user",
+        [{ event_type: "react_task_end", data: { status: "waiting_for_user" } }],
+      ],
+    ])("still lets an inferred %s status override an explicit running status", (inferred, traceEvents) => {
+      expect(resolveTraceProcessStatus({ processStatus: "running", traceEvents })).toBe(inferred)
+    })
+  })
 })

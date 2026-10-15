@@ -38,6 +38,54 @@ ZOOM_MEETING_WRITE_DESCRIPTION = (
     "recordings and transcripts."
 )
 
+# The scopes the remote Atlassian connector requests. Atlassian's
+# protected-resource metadata lists 38 scopes (1023 characters once
+# normalized) and its 401 challenge carries no scope, so requesting all of
+# them exceeds MCP_OAUTH_SCOPE_MAX_LENGTH and the connect fails before the
+# authorization page opens. This subset covers Jira and Confluence read,
+# write and search, Bitbucket read and write, Rovo search, and the basic
+# identity scopes; it leaves out delete/manage and the other products.
+# A change here reaches the shared server row when someone next connects
+# (_ensure_catalog_mcp_oauth_server syncs its auth to the catalog); until
+# then the actor projection rejects that row. A migration that updates the
+# row's auth in place, like 20261013_atlassian_mcp_scope, closes that gap.
+# Existing users must authorize again to get scopes their grant lacks.
+ATLASSIAN_MCP_OAUTH_SCOPES: tuple[str, ...] = (
+    "email",
+    "offline_access",
+    "read:account",
+    "read:me",
+    "read:jira:agent-interface",
+    "write:jira:agent-interface",
+    "search:jira:agent-interface",
+    "read:confluence:agent-interface",
+    "write:confluence:agent-interface",
+    "search:confluence:agent-interface",
+    "read:bitbucket:agent-interface",
+    "write:bitbucket:agent-interface",
+    "search:rovo:agent-interface",
+)
+# Stored in the canonical form normalize_mcp_oauth_scope produces (sorted,
+# space-separated), so the catalog value, the server row and the persisted
+# flow scope are the same string.
+ATLASSIAN_MCP_OAUTH_SCOPE = " ".join(sorted(ATLASSIAN_MCP_OAUTH_SCOPES))
+# The part of that request a grant must include to count as usable (when the
+# connector is listed as connected, at runtime and after a token refresh):
+# the basic identity scopes and offline_access for refresh. Atlassian grants
+# product scopes only for the products the consenting account's site has
+# (a site without Bitbucket gets no Bitbucket scopes), so requiring the whole
+# request would leave such accounts unable to connect. The shared server row
+# picks up a change to this value the same way as a change to the scope.
+ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES: tuple[str, ...] = (
+    "email",
+    "offline_access",
+    "read:account",
+    "read:me",
+)
+ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE = " ".join(
+    sorted(ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES)
+)
+
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
     sa.column("provider_name", sa.String),
@@ -1124,9 +1172,17 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # separate "jira" row (our own local Jira tool launched behind
             # Atlassian 3LO, transport "oauth"); both are visible in the
             # connector picker because they expose different tool sets.
+            # auth.scope overrides the discovered scopes_supported, which is
+            # too long to request (see ATLASSIAN_MCP_OAUTH_SCOPES);
+            # auth.required_scope is the part of it a grant must include (see
+            # ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPES).
             "launch_config": {
                 "url": "https://mcp.atlassian.com/v2/mcp",
-                "auth": {"type": "mcp_oauth"},
+                "auth": {
+                    "type": "mcp_oauth",
+                    "scope": ATLASSIAN_MCP_OAUTH_SCOPE,
+                    "required_scope": ATLASSIAN_MCP_OAUTH_REQUIRED_SCOPE,
+                },
                 # Stable ownership marker used by the seed migration
                 # (whatsapp/shopify pattern): a pre-existing operator row
                 # under this app_id is neither adopted on upgrade nor

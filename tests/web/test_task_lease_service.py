@@ -334,7 +334,7 @@ def test_refresh_batch_uses_one_pool_checkout(
             )
         seed_db.commit()
 
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     checkouts = 0
 
     def record_checkout(*_args) -> None:
@@ -524,7 +524,7 @@ async def test_lease_heartbeat_keeps_loop_responsive_during_pool_checkout(
         constrained_get_db,
         raising=False,
     )
-    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     monkeypatch.setattr(
         task_lease_service,
         "get_task_lease_heartbeat_seconds",

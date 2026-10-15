@@ -396,10 +396,7 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     async def create_tools(config):
         return ["prepared-tool"]
 
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", session_factory)
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
@@ -483,10 +480,7 @@ async def test_create_default_tools_preserves_legacy_positional_owner(
     async def create_tools(_config):
         return []
 
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
@@ -525,10 +519,7 @@ async def test_create_default_tools_skips_runtime_workspace_without_providers(
         raise AssertionError("runtime build must not run without providers")
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
     monkeypatch.setattr(ToolFactory, "create_workspace", unexpected_workspace)
     monkeypatch.setattr(agent_runtime_service, "build_task_runtime", unexpected_runtime)
@@ -585,10 +576,7 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
         )
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
     monkeypatch.setattr(
         ToolFactory,
@@ -679,10 +667,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
         )
 
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: object(),
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
     monkeypatch.setattr(
         ToolRegistry,
         "create_registered_tools",
@@ -738,10 +723,7 @@ async def test_create_default_tools_prefetches_excluded_agent_policy_once(monkey
         "xagent.web.tools.config._load_tool_factory_runtime_snapshot",
         load_runtime_snapshot,
     )
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local",
-        lambda: session_factory,
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", session_factory)
     monkeypatch.setattr(ToolFactory, "_create_all_tools_prepared", create_tools)
 
     tools, _ = await create_default_tools(

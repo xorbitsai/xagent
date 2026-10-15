@@ -19,6 +19,7 @@ import { Select } from "@/components/ui/select"
 import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
 import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 import { ExecutionBudgetSettings } from "@/components/settings/execution-budget"
+import { useSetupStatus } from "@/hooks/use-setup-status"
 
 export default function SettingsPage() {
   const { user, session } = useAuth()
@@ -32,6 +33,7 @@ export default function SettingsPage() {
   const [confirmPassword, setConfirmPassword] = useState("")
   const [isChangingPassword, setIsChangingPassword] = useState(false)
   const [passwordMessage, setPasswordMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
+  const { passwordMinLength } = useSetupStatus()
 
   useEffect(() => {
     let isMounted = true
@@ -198,6 +200,7 @@ export default function SettingsPage() {
               <Input
                 id="new-password"
                 type="password"
+                minLength={passwordMinLength}
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
                 placeholder={t("settings.password.new_placeholder")}
@@ -209,6 +212,7 @@ export default function SettingsPage() {
               <Input
                 id="confirm-password"
                 type="password"
+                minLength={passwordMinLength}
                 value={confirmPassword}
                 onChange={(e) => setConfirmPassword(e.target.value)}
                 placeholder={t("settings.password.confirm_placeholder")}
@@ -240,8 +244,13 @@ export default function SettingsPage() {
       return
     }
 
-    if (newPassword.length < 6) {
-      setPasswordMessage({ type: 'error', text: t("settings.password.errors.too_short") })
+    if (newPassword.length < passwordMinLength) {
+      setPasswordMessage({
+        type: 'error',
+        text: t("settings.password.errors.too_short", {
+          min: passwordMinLength,
+        }),
+      })
       return
     }
 

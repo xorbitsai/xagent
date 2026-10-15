@@ -1364,6 +1364,7 @@ class TestModelAPI:
             def converse(self, **request: Any) -> dict[str, Any]:
                 assert request["modelId"] == "amazon.nova-lite-v1:0"
                 assert request["messages"][-1]["content"] == [{"text": "Hello"}]
+                assert request["inferenceConfig"]["maxTokens"] == 16
                 return {
                     "output": {
                         "message": {
@@ -3367,18 +3368,25 @@ class TestModelAPI:
         )
 
     @pytest.mark.parametrize(
-        ("model_name", "temperature", "expected_default_temperature"),
+        (
+            "model_provider",
+            "model_name",
+            "temperature",
+            "expected_default_temperature",
+        ),
         [
-            ("openai/gpt-5.6-sol", None, None),
-            ("gpt-4o", 0.0, 0.0),
-            ("o1", 0.5, None),
-            ("gpt-4o", 0.5, 0.5),
+            ("openai", "openai/gpt-5.6-sol", None, None),
+            ("openai", "gpt-4o", 0.0, 0.0),
+            ("openai", "o1", 0.5, None),
+            ("openai", "gpt-4o", 0.5, 0.5),
+            ("bedrock", "openai.gpt-oss-120b-1:0", 0.5, 0.5),
         ],
         ids=[
             "unset_temperature_is_never_invented",
             "explicit_zero_is_not_swallowed",
             "reasoning_model_still_rejects_explicit_temperature",
             "non_reasoning_model_forwards_explicit_temperature",
+            "gpt_oss_budget_handling_does_not_change_temperature",
         ],
     )
     def test_test_connection_llm_default_temperature_matches_request(
@@ -3386,6 +3394,7 @@ class TestModelAPI:
         test_db,
         regular_user,
         regular_headers,
+        model_provider,
         model_name,
         temperature,
         expected_default_temperature,
@@ -3405,12 +3414,15 @@ class TestModelAPI:
             return FakeLLM()
 
         payload = {
-            "model_provider": "openai",
+            "model_provider": model_provider,
             "model_name": model_name,
             "api_key": "test-api-key",
-            "base_url": "https://api.openai.com/v1",
             "category": "llm",
         }
+        if model_provider == "openai":
+            payload["base_url"] = "https://api.openai.com/v1"
+        else:
+            payload["bedrock_region"] = "us-east-1"
         if temperature is not None:
             payload["temperature"] = temperature
 
@@ -3428,14 +3440,27 @@ class TestModelAPI:
         assert captured["default_temperature"] == expected_default_temperature
 
     @pytest.mark.parametrize(
-        ("model_name", "expected_chat_kwargs"),
+        ("model_provider", "model_name", "expected_chat_kwargs"),
         [
-            ("o1", {}),
-            ("gpt-4o", {"max_tokens": 16}),
+            ("openai", "o1", {}),
+            ("openai", "gpt-4o", {"max_tokens": 16}),
+            ("bedrock", "openai.gpt-oss-20b-1:0", {}),
+            ("bedrock", "us.openai.gpt-oss-120b-1:0", {}),
+            (
+                "bedrock",
+                "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
+                "us.openai.gpt-oss-120b-1:0",
+                {},
+            ),
+            ("openai", "openai.gpt-oss-120b-1:0", {"max_tokens": 16}),
         ],
         ids=[
             "reasoning_model_lets_adapter_pick_max_tokens",
             "non_reasoning_model_still_caps_max_tokens_at_16",
+            "bedrock_gpt_oss_20b_uses_adapter_budget",
+            "bedrock_regional_gpt_oss_120b_uses_adapter_budget",
+            "bedrock_profile_gpt_oss_120b_uses_adapter_budget",
+            "gpt_oss_name_does_not_change_other_providers",
         ],
     )
     def test_test_connection_llm_max_tokens_matches_reasoning_heuristic(
@@ -3443,15 +3468,27 @@ class TestModelAPI:
         test_db,
         regular_user,
         regular_headers,
+        model_provider,
         model_name,
         expected_chat_kwargs,
     ):
-        """max_tokens handling is unrelated to the temperature fix and must
-        stay pinned to the existing reasoning-model heuristic."""
+        """Probe budgets must stay cheap except where reasoning needs the
+        adapter's usable default."""
         mock_llm = Mock()
         mock_llm.chat = AsyncMock(
             return_value={"type": "text", "content": "ok", "raw": {}}
         )
+
+        payload = {
+            "model_provider": model_provider,
+            "model_name": model_name,
+            "api_key": "test-api-key",
+            "category": "llm",
+        }
+        if model_provider == "openai":
+            payload["base_url"] = "https://api.openai.com/v1"
+        else:
+            payload["bedrock_region"] = "us-east-1"
 
         with patch(
             "xagent.core.model.chat.basic.adapter.create_base_llm",
@@ -3459,13 +3496,7 @@ class TestModelAPI:
         ):
             response = client.post(
                 "/api/models/test-connection",
-                json={
-                    "model_provider": "openai",
-                    "model_name": model_name,
-                    "api_key": "test-api-key",
-                    "base_url": "https://api.openai.com/v1",
-                    "category": "llm",
-                },
+                json=payload,
                 headers=regular_headers,
             )
 
@@ -3473,3 +3504,142 @@ class TestModelAPI:
         mock_llm.chat.assert_awaited_once_with(
             [{"role": "user", "content": "Hello"}], **expected_chat_kwargs
         )
+
+    def test_bedrock_gpt_oss_native_probe_uses_adapter_default_budget(
+        self, test_db, regular_user, regular_headers
+    ):
+        class SyntheticBedrockClient:
+            def converse(self, **request: Any) -> dict[str, Any]:
+                assert request["modelId"] == "us.openai.gpt-oss-120b-1:0"
+                assert request["inferenceConfig"]["maxTokens"] == 4096
+                return {
+                    "output": {
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"text": "Hello from GPT-OSS"}],
+                        }
+                    },
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 32},
+                }
+
+        with patch.object(
+            BedrockLLM,
+            "_build_client",
+            return_value=SyntheticBedrockClient(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "us.openai.gpt-oss-120b-1:0",
+                    "api_key": "test-api-key",
+                    "bedrock_region": "us-east-1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+
+    def test_bedrock_gpt_oss_probe_reaches_reasoning_and_final_text(
+        self, test_db, regular_user, regular_headers
+    ):
+        observed = {}
+
+        class BudgetSensitiveReasoningLLM:
+            async def chat(self, messages, **kwargs):
+                observed["messages"] = messages
+                observed["kwargs"] = kwargs
+                effective_budget = kwargs.get("max_tokens", 4096)
+                if effective_budget <= 16:
+                    raise RuntimeError("reasoning-only response exhausted the budget")
+                response = {
+                    "reasoning_content": "The greeting is straightforward.",
+                    "content": "Hello!",
+                }
+                assert response["reasoning_content"]
+                assert response["content"]
+                return response
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=BudgetSensitiveReasoningLLM(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "bedrock",
+                    "model_name": "us.openai.gpt-oss-120b-1:0",
+                    "api_key": "test-api-key",
+                    "bedrock_region": "us-east-1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "passed"
+        assert observed == {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "kwargs": {},
+        }
+
+    def test_saved_model_probes_share_reasoning_budget_policy(
+        self, test_db, regular_user, regular_headers, sample_model_data
+    ):
+        ordinary = client.post(
+            "/api/models/", json=sample_model_data, headers=regular_headers
+        )
+        known_reasoning = client.post(
+            "/api/models/",
+            json={
+                **sample_model_data,
+                "model_id": "saved-o1",
+                "model_name": "o1",
+            },
+            headers=regular_headers,
+        )
+        gpt_oss = client.post(
+            "/api/models/",
+            json={
+                "model_id": "saved-bedrock-gpt-oss",
+                "category": "llm",
+                "model_provider": "bedrock",
+                "model_name": "eu.openai.gpt-oss-20b-1:0",
+                "api_key": "test-api-key",
+                "bedrock_region": "eu-west-1",
+                "abilities": ["chat"],
+            },
+            headers=regular_headers,
+        )
+        assert ordinary.status_code == 200
+        assert known_reasoning.status_code == 200
+        assert gpt_oss.status_code == 200
+
+        llms = {
+            "test-openai-model": AsyncMock(),
+            "saved-o1": AsyncMock(),
+            "saved-bedrock-gpt-oss": AsyncMock(),
+        }
+        for llm in llms.values():
+            llm.chat.return_value = {"content": "ok"}
+
+        with patch.object(
+            model_module.CoreStorage,
+            "get_llm_by_id",
+            side_effect=lambda model_id: llms[model_id],
+        ):
+            response = client.post(
+                "/api/models/test",
+                json={"model_ids": list(llms)},
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert {item["status"] for item in response.json()} == {"passed"}
+        message = [{"role": "user", "content": "Test message - are you working?"}]
+        llms["test-openai-model"].chat.assert_awaited_once_with(message, max_tokens=16)
+        llms["saved-o1"].chat.assert_awaited_once_with(message)
+        llms["saved-bedrock-gpt-oss"].chat.assert_awaited_once_with(message)

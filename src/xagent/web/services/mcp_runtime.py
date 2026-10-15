@@ -11,7 +11,9 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ConnectorRuntimeError,
 )
 from .mcp_oauth import (
+    MCPOAuthDiscoveryError,
     MCPOAuthRuntimeError,
+    mcp_oauth_required_scope,
     redact_oauth_url_for_diagnostics,
     resolve_mcp_oauth_runtime_auth,
 )
@@ -529,7 +531,7 @@ async def build_mcp_runtime_connection(
                 message=exc.message,
                 resource_owner_key=str(resource_owner_key),
                 resource=selection.get("resource") or auth_config.get("resource"),
-                scope=selection.get("scope") or auth_config.get("scope"),
+                scope=selection.get("scope") or _diagnostic_required_scope(auth_config),
                 issuer=selection.get("issuer") or auth_config.get("issuer"),
             ),
         )
@@ -539,6 +541,18 @@ async def build_mcp_runtime_connection(
     )
     connection.pop("auth", None)
     return MCPRuntimeConnectionBuild(connection=connection)
+
+
+def _diagnostic_required_scope(auth_config: dict[str, Any]) -> Any:
+    """The configured scope a grant had to cover, for a runtime diagnostic.
+
+    A configuration whose required scope is invalid fails with its own code;
+    its diagnostic falls back to the requested scope.
+    """
+    try:
+        return mcp_oauth_required_scope(auth_config)
+    except MCPOAuthDiscoveryError:
+        return auth_config.get("scope")
 
 
 def connection_to_transport_config(connection: dict[str, Any]) -> dict[str, Any]:

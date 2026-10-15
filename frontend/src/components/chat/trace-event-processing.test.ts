@@ -117,6 +117,114 @@ describe("processTraceEvents DAG step outcomes", () => {
   })
 })
 
+// Every status in the final settling pass crossed with every step shape that
+// can reach it. A step only holds pending/running/completed/failed before that
+// pass, and a pending step never carries a name, so "unfinished" means running.
+describe("processTraceEvents settling of stopped processes", () => {
+  type Shape = "running" | "running+action" | "completed" | "completed+action" | "failed" | "failed+action"
+  type Settled = {
+    step: string
+    actions: Array<[status: string, error: string | undefined]>
+  }
+
+  const stepEnd = (data: Record<string, unknown>) => ev("dag_step_end", data)
+  const shapeEvents: Record<Shape, ReturnType<typeof ev>[]> = {
+    running: [stepStart],
+    "running+action": [stepStart, ev("llm_call_start", { model_name: "m" })],
+    completed: [stepStart, stepEnd({ status: "completed" })],
+    "completed+action": [
+      stepStart,
+      stepEnd({ status: "completed" }),
+      ev("llm_call_start", { model_name: "m" }),
+    ],
+    failed: [stepStart, stepEnd({ status: "failed", error: "boom" })],
+    "failed+action": [
+      stepStart,
+      stepEnd({ status: "failed", error: "boom" }),
+      ev("llm_call_start", { model_name: "m" }),
+    ],
+  }
+
+  const unknownError = "traceEventRenderer.unknownError"
+  const reported: Settled["actions"][number] = ["failed", "boom"]
+  // Known existing behaviour, pinned as it is today: a running action stays
+  // spinning under a step that has already settled, under "completed" when the
+  // step failed and under "paused" or "waiting_for_user" when the step completed
+  // or failed. A later fix that settles these actions should update the
+  // `spinning` entries in those rows; that change is not a regression.
+  const spinning: Settled["actions"][number] = ["running", undefined]
+
+  const expectations: Record<string, Record<Shape, Settled>> = {
+    interrupted: {
+      running: { step: "interrupted", actions: [] },
+      "running+action": { step: "interrupted", actions: [["interrupted", undefined]] },
+      completed: { step: "completed", actions: [] },
+      "completed+action": { step: "completed", actions: [["interrupted", undefined]] },
+      failed: { step: "failed", actions: [reported] },
+      "failed+action": { step: "failed", actions: [reported, ["interrupted", undefined]] },
+    },
+    failed: {
+      running: { step: "failed", actions: [] },
+      "running+action": { step: "failed", actions: [["failed", unknownError]] },
+      completed: { step: "completed", actions: [] },
+      "completed+action": { step: "failed", actions: [["failed", unknownError]] },
+      failed: { step: "failed", actions: [reported] },
+      "failed+action": { step: "failed", actions: [reported, ["failed", unknownError]] },
+    },
+    completed: {
+      running: { step: "completed", actions: [] },
+      "running+action": { step: "completed", actions: [["completed", undefined]] },
+      completed: { step: "completed", actions: [] },
+      "completed+action": { step: "completed", actions: [["completed", undefined]] },
+      failed: { step: "failed", actions: [reported] },
+      "failed+action": { step: "failed", actions: [reported, spinning] },
+    },
+    paused: {
+      running: { step: "paused", actions: [] },
+      "running+action": { step: "paused", actions: [["completed", undefined]] },
+      completed: { step: "completed", actions: [] },
+      "completed+action": { step: "completed", actions: [spinning] },
+      failed: { step: "failed", actions: [reported] },
+      "failed+action": { step: "failed", actions: [reported, spinning] },
+    },
+    waiting_for_user: {
+      running: { step: "waiting_for_user", actions: [] },
+      "running+action": { step: "waiting_for_user", actions: [["completed", undefined]] },
+      completed: { step: "completed", actions: [] },
+      "completed+action": { step: "completed", actions: [spinning] },
+      failed: { step: "failed", actions: [reported] },
+      "failed+action": { step: "failed", actions: [reported, spinning] },
+    },
+    // Not stopped statuses: the settling pass must leave the step untouched.
+    running: {
+      running: { step: "running", actions: [] },
+      "running+action": { step: "running", actions: [spinning] },
+      completed: { step: "completed", actions: [] },
+      "completed+action": { step: "completed", actions: [spinning] },
+      failed: { step: "failed", actions: [reported] },
+      "failed+action": { step: "failed", actions: [reported, spinning] },
+    },
+  }
+
+  const cases = Object.entries(expectations).flatMap(([status, byShape]) =>
+    (Object.keys(byShape) as Shape[]).map((shape) => [status, shape, byShape[shape]] as const),
+  )
+
+  it.each(cases)("settles a %s process with a %s step", (status, shape, expected) => {
+    const [step] = processTraceEvents(shapeEvents[shape] as never, t, status)
+    expect({
+      step: step.status,
+      actions: step.actions.map((action) => [action.status, action.data.error]),
+    }).toEqual(expected)
+  })
+
+  it("settles nothing when the process status is absent", () => {
+    const [step] = processTraceEvents(shapeEvents["running+action"] as never, t)
+    expect(step.status).toBe("running")
+    expect(step.actions.map((action) => action.status)).toEqual(["running"])
+  })
+})
+
 describe("processTraceEvents tool_call_id attribution", () => {
   it("normalizes malformed trace data before nested access", () => {
     const malformedEvents = [

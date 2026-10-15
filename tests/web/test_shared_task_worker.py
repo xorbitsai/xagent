@@ -251,3 +251,99 @@ async def test_memory_admission_failure_never_aborts_the_worker_boot(monkeypatch
 
     assert admissions == [1]
     assert "accept" in order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shutdown_step_fails", [False, True])
+async def test_worker_runs_process_diagnostics_until_stop(
+    monkeypatch, shutdown_step_fails
+):
+    """The per-process diagnostics line runs while the worker serves and drains."""
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "worker")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://localhost:6379/0")
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    order = []
+    for name in (
+        "configure_db",
+        "validate_worker_schema",
+        "validate_interaction_rollout_at_startup",
+        "register_local_browser_runtime",
+        "register_execution_scope_snapshot_loader",
+        "initialize_langfuse",
+        "shutdown_task_runtime_hook_executor",
+        "unregister_local_browser_runtime",
+        "flush_langfuse",
+        "admit_memory_storage_at_startup",
+    ):
+        monkeypatch.setattr(worker, name, Mock())
+    monkeypatch.setattr(
+        worker,
+        "background_task_manager",
+        SimpleNamespace(
+            start_accepting=lambda: None,
+            shutdown=AsyncMock(side_effect=lambda: order.append("drain")),
+        ),
+    )
+    monkeypatch.setattr(worker, "close_task_coordinators", AsyncMock())
+    monkeypatch.setattr(
+        worker, "create_skill_manager", lambda: SimpleNamespace(initialize=AsyncMock())
+    )
+    monkeypatch.setattr(
+        worker,
+        "create_template_manager",
+        lambda: SimpleNamespace(initialize=AsyncMock()),
+    )
+    monkeypatch.setattr(worker, "get_sandbox_manager", lambda: None)
+    monkeypatch.setattr(worker, "start_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "stop_task_event_bridge", AsyncMock())
+    monkeypatch.setattr(worker, "wait_for_heartbeat_manager_idle", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_lease_recovery_loop", AsyncMock())
+    monkeypatch.setattr(worker, "run_task_auto_resume_loop", AsyncMock())
+    monkeypatch.setattr(
+        worker,
+        "start_task_command_dispatcher",
+        lambda executor: order.append("dispatch"),
+    )
+
+    async def stop_claims():
+        order.append("stop_claims")
+        if shutdown_step_fails:
+            raise ConnectionError("claim shutdown failed")
+
+    monkeypatch.setattr(worker, "stop_task_command_dispatcher", stop_claims)
+    diagnostics = SimpleNamespace(name="diagnostics")
+    seen = {}
+
+    def start_diagnostics():
+        order.append("diagnostics_start")
+        return diagnostics
+
+    async def stop_diagnostics(task):
+        seen["stopped"] = task
+        order.append("diagnostics_stop")
+
+    monkeypatch.setattr(worker, "start_process_diagnostics", start_diagnostics)
+    monkeypatch.setattr(worker, "stop_process_diagnostics", stop_diagnostics)
+
+    async def supervise(executor, stop_event):
+        assert "diagnostics_start" in order
+        assert "diagnostics_stop" not in order
+        order.append("supervise")
+
+    monkeypatch.setattr(worker, "supervise_task_command_dispatcher", supervise)
+
+    stop = asyncio.Event()
+    stop.set()
+    if shutdown_step_fails:
+        with pytest.raises(ConnectionError):
+            await worker.run_worker(stop=stop)
+        assert order[-1] == "diagnostics_stop"
+    else:
+        await worker.run_worker(stop=stop)
+        assert order.index("drain") < order.index("diagnostics_stop")
+        assert order[-1] == "diagnostics_stop"
+    assert order.index("dispatch") < order.index("diagnostics_start")
+    assert seen["stopped"] is diagnostics

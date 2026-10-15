@@ -7,14 +7,18 @@ import sqlite3
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from sqlalchemy.exc import DatabaseError
 
 from xagent.core.tools.core.sql_tool import (
     _get_connection_url,
     _row_to_dict,
     execute_sql_query,
     get_database_type,
+    is_platform_database_url,
+    validate_external_database_url,
 )
 from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
+from xagent.web.services.tool_credentials import set_sql_connection
 
 
 class TestGetConnectionUrl:
@@ -48,6 +52,166 @@ class TestGetConnectionUrl:
         with pytest.raises(ValueError, match="not found"):
             _get_connection_url("test")
 
+    def test_rejects_platform_database_with_equivalent_sqlite_path(
+        self, monkeypatch, tmp_path
+    ):
+        platform_db = tmp_path / "platform.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{platform_db}")
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", f"sqlite:///{platform_db}")
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
+
+    def test_rejects_platform_database_with_driver_and_credential_variants(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@DB.Example/app")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST",
+            "postgresql+psycopg://other:secret@db.example:5432/app",
+        )
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
+
+    def test_allows_distinct_platform_database(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db.example/app")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST", "postgresql://other@other.example/other"
+        )
+        assert _get_connection_url("test").database == "other"
+
+    def test_rejects_other_database_on_platform_server(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db.example/app")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST", "postgresql://other@db.example/other"
+        )
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
+
+    def test_default_platform_sqlite_database_is_compared(self, monkeypatch):
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.setattr(
+            "xagent.config.get_default_sqlite_db_path", lambda: "/tmp/xagent.db"
+        )
+        assert is_platform_database_url("sqlite:////tmp/xagent.db")
+
+    @pytest.mark.parametrize(
+        "candidate_template",
+        [
+            "sqlite:///file:{path}?uri=on",
+            "sqlite:///file:{path}?uri=t",
+            "sqlite:///file:{path}?uri=y",
+            "sqlite:///file:{encoded_path}?uri=true",
+            "sqlite:///file://localhost{path}?uri=yes",
+            "sqlite:///file:{path}?uri=false&uri=true",
+            "sqlite:///file:{path}?uri=0&uri=0",
+        ],
+    )
+    def test_rejects_platform_sqlite_file_uri(
+        self, monkeypatch, tmp_path, candidate_template
+    ):
+        platform_db = tmp_path / "platform.db"
+        monkeypatch.setenv("DATABASE_URL", f"sqlite:///{platform_db}")
+        encoded_path = str(platform_db).replace("/", "%2F")
+        monkeypatch.setenv(
+            "XAGENT_EXTERNAL_DB_TEST",
+            candidate_template.format(path=platform_db, encoded_path=encoded_path),
+        )
+        with pytest.raises(ValueError, match="SQLite URI mode"):
+            _get_connection_url("test")
+
+    @pytest.mark.parametrize(
+        ("platform", "candidate"),
+        [
+            (
+                "postgresql://platform@postgres/xagent",
+                "postgresql://other@public.example/xagent?host=postgres",
+            ),
+            (
+                "postgresql://platform@127.0.0.1/xagent",
+                "postgresql://other@public.example/xagent?hostaddr=127.0.0.1",
+            ),
+            (
+                "postgresql://platform@public.example:5433/xagent",
+                "postgresql://other@public.example/xagent?port=5433",
+            ),
+            (
+                "postgresql://platform@public.example/xagent",
+                "postgresql://other@public.example/other?dbname=xagent",
+            ),
+            (
+                "mysql://platform@public.example/xagent",
+                "mysql+pymysql://other@public.example/other?database=xagent",
+            ),
+            (
+                "postgresql://platform@/xagent?host=/var/run/postgresql",
+                "postgresql://other@public.example/xagent?host=/var/run/postgresql",
+            ),
+        ],
+    )
+    def test_rejects_effective_network_target_overrides(
+        self, monkeypatch, platform, candidate
+    ):
+        monkeypatch.setenv("DATABASE_URL", platform)
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", candidate)
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
+
+    def test_allows_legitimate_external_unix_socket(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres/xagent")
+        candidate = "postgresql://other@/analytics?host=/cloudsql/customer-project"
+        assert validate_external_database_url(candidate).database == "analytics"
+
+    @pytest.mark.parametrize(
+        ("candidate", "key"),
+        [
+            ("postgresql://other@public/other?service=platform", "service"),
+            ("mssql+pyodbc://other@public/other?odbc_connect=opaque", "odbc_connect"),
+            (
+                "mysql+pymysql://other@public/other?read_default_file=/tmp/db.cnf",
+                "read_default_file",
+            ),
+        ],
+    )
+    def test_rejects_opaque_driver_target_configuration(
+        self, monkeypatch, candidate, key
+    ):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres/xagent")
+        with pytest.raises(ValueError, match=key):
+            validate_external_database_url(candidate)
+
+    def test_rejects_multi_host_failover_target(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres/xagent")
+        with pytest.raises(ValueError, match="multiple 'host' targets"):
+            validate_external_database_url(
+                "postgresql://other@public/xagent?host=postgres,public"
+            )
+
+    @pytest.mark.parametrize(
+        "candidate",
+        [
+            "postgresql://other@postgres,public/xagent",
+            "postgresql://xagent:xagent_password@postgres:5432",
+        ],
+    )
+    def test_rejects_driver_effective_postgres_target_spellings(
+        self, monkeypatch, candidate
+    ):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@postgres:5432/xagent")
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", candidate)
+        with pytest.raises(ValueError, match="platform database"):
+            _get_connection_url("test")
+
+    def test_mariadb_and_mysql_are_same_backend(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "mysql+pymysql://platform@db/xagent")
+        assert is_platform_database_url("mariadb+pymysql://other@DB:3306/xagent")
+
+    def test_invalid_platform_url_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db:notaport/xagent")
+        with pytest.raises(ValueError, match="platform database"):
+            validate_external_database_url(
+                "postgresql://other@public.example/analytics"
+            )
+
 
 class TestGetDatabaseType:
     """Test database type detection."""
@@ -75,6 +239,21 @@ class TestGetDatabaseType:
         monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///test.db")
         with pytest.raises(ValueError, match="not found"):
             get_database_type("missing")
+
+
+def test_saved_sql_connection_rejects_platform_database(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://platform@db.example/app")
+    db = MagicMock()
+
+    with pytest.raises(ValueError, match="platform database"):
+        set_sql_connection(
+            db,
+            user_id=1,
+            name="platform",
+            connection_url="postgresql+psycopg://other@DB.EXAMPLE:5432/app",
+        )
+
+    db.commit.assert_not_called()
 
 
 class TestRowToDict:
@@ -107,6 +286,18 @@ class TestExecuteSqlQuery:
         # The function raises ValueError when connection not found
         with pytest.raises(ValueError, match="not found"):
             execute_sql_query("missing", "SELECT 1")
+
+    def test_sqlite_attach_is_rejected_by_authorizer(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")
+        attached = tmp_path / "other.db"
+        with pytest.raises(DatabaseError, match="not authorized"):
+            execute_sql_query("test", f"ATTACH DATABASE '{attached}' AS other")
+
+    def test_sqlite_attach_word_in_string_or_identifier_is_allowed(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")
+        result = execute_sql_query("test", "SELECT 'attach' AS \"attach\"")
+        assert result["success"] is True
+        assert result["rows"] == [{"attach": "attach"}]
 
     @patch("xagent.core.tools.core.sql_tool.create_engine")
     def test_execute_sql_query_basic_select(self, mock_create_engine, monkeypatch):

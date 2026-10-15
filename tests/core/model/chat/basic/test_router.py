@@ -101,6 +101,16 @@ class _ThinkingChatLLM(_ScriptedChatLLM):
         return True
 
 
+class _AutoOnlyToolChoiceLLM(_ScriptedChatLLM):
+    @property
+    def abilities(self) -> list[str]:
+        return ["chat", "vision", "tool_calling"]
+
+    @property
+    def supports_forced_tool_choice(self) -> bool:
+        return False
+
+
 @pytest.mark.asyncio
 async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     monkeypatch,
@@ -134,6 +144,38 @@ async def test_prepare_for_call_reuses_route_and_exposes_profile_context_window(
     assert prepared.context_window == 1_048_576
     assert await prepared.chat([{"role": "user", "content": "continue"}]) == "ok"
     assert selected == ["make a podcast"]
+
+
+@pytest.mark.asyncio
+async def test_router_normalizes_tool_choice_after_resolving_model(monkeypatch):
+    downstream = _AutoOnlyToolChoiceLLM([])
+    router = RouterLLM(
+        downstream_resolver=lambda _model_id: downstream,
+        candidate_models=("auto-only",),
+    )
+
+    async def select_model(_prompt: str, **_kwargs: Any) -> str:
+        return "auto-only"
+
+    monkeypatch.setattr(router, "_select_model", select_model)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(router, "_profile_input_modalities", lambda _model_id: ())
+    messages = [{"role": "user", "content": "hi"}]
+
+    await router.chat(messages, tools=[], tool_choice="required")
+    await router.vision_chat(messages, tools=[], tool_choice="required")
+    async for _ in router.stream_chat(messages, tools=[], tool_choice="required"):
+        pass
+
+    assert downstream.tool_choices == ["auto", "auto", "auto"]
+
+    prepared = await router.prepare_for_call(messages)
+    await prepared.chat(messages, tools=[], tool_choice="required")
+    await prepared.vision_chat(messages, tools=[], tool_choice="required")
+    async for _ in prepared.stream_chat(messages, tools=[], tool_choice="required"):
+        pass
+
+    assert downstream.tool_choices[-3:] == ["auto", "auto", "auto"]
 
 
 @pytest.mark.asyncio

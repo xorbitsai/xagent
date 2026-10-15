@@ -15,8 +15,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.responses import Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from ..config import (
     get_agent_runtime,
@@ -100,6 +102,7 @@ from .api.v1.errors import V1ApiError, V1ErrorCode, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
+from .auth_config import validate_auth_config
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -142,6 +145,55 @@ setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 logger = logging.getLogger(__name__)
 
 __all__ = ["app"]
+
+
+class PublicWidgetCORSMiddleware:
+    """Allow credential-free widget calls from customer embedding origins."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not str(scope.get("path", "")).startswith(
+            "/api/widget/"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        request_headers = Headers(scope=scope)
+        origin = request_headers.get("origin")
+        if not origin:
+            await self.app(scope, receive, send)
+            return
+
+        if scope.get("method") == "OPTIONS" and request_headers.get(
+            "access-control-request-method"
+        ):
+            response = Response(
+                status_code=200,
+                headers={
+                    "Access-Control-Allow-Origin": origin,
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": request_headers.get(
+                        "access-control-request-headers", ""
+                    ),
+                    "Access-Control-Max-Age": "600",
+                    "Vary": "Origin",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_widget_response(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                response_headers = MutableHeaders(scope=message)
+                response_headers["Access-Control-Allow-Origin"] = origin
+                if "access-control-allow-credentials" in response_headers:
+                    del response_headers["access-control-allow-credentials"]
+                response_headers.add_vary_header("Origin")
+            await send(message)
+
+        await self.app(scope, receive, send_widget_response)
 
 
 @contextmanager
@@ -1479,6 +1531,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(PublicWidgetCORSMiddleware)
 app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site="lax")
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
@@ -1643,6 +1696,25 @@ async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
     app_instance.state.runtime_performance_task = None
     await stop_event_loop_lag_monitor(task)
     await asyncio.to_thread(shutdown_runtime_performance_telemetry)
+
+
+def start_app_process_diagnostics(app_instance: FastAPI) -> None:
+    """Start this process's diagnostics line once per app lifespan; never raises."""
+
+    from .services.process_diagnostics import start_process_diagnostics
+
+    existing = getattr(app_instance.state, "process_diagnostics_task", None)
+    if existing is not None and not existing.done():
+        return
+    app_instance.state.process_diagnostics_task = start_process_diagnostics()
+
+
+async def stop_app_process_diagnostics(app_instance: FastAPI) -> None:
+    from .services.process_diagnostics import stop_process_diagnostics
+
+    task = getattr(app_instance.state, "process_diagnostics_task", None)
+    app_instance.state.process_diagnostics_task = None
+    await stop_process_diagnostics(task)
 
 
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
@@ -2255,6 +2327,7 @@ async def startup_event() -> None:
     if auto_migrate:
         start_temp_file_cleanup_task(app)
     start_runtime_performance_monitor(app)
+    start_app_process_diagnostics(app)
 
 
 @app.on_event("shutdown")
@@ -2371,23 +2444,28 @@ async def shutdown_event() -> None:
     from .services.task_execution import background_task_manager
     from .services.task_lease_service import wait_for_heartbeat_manager_idle
 
-    await close_task_coordinators()
-    await background_task_manager.shutdown()
-    await wait_for_heartbeat_manager_idle()
-    if get_shared_task_execution_enabled():
-        from .api.websocket import manager
-        from .services.task_event_bridge import stop_task_event_bridge
+    # The diagnostics line keeps reporting while execution drains, and is
+    # stopped even when a shutdown step below fails.
+    try:
+        await close_task_coordinators()
+        await background_task_manager.shutdown()
+        await wait_for_heartbeat_manager_idle()
+        if get_shared_task_execution_enabled():
+            from .api.websocket import manager
+            from .services.task_event_bridge import stop_task_event_bridge
 
-        await manager.stop_stream_reconciliation()
-        await stop_task_event_bridge()
+            await manager.stop_stream_reconciliation()
+            await stop_task_event_bridge()
 
-    from .services.trace_database import close_trace_database_runtime
+        from .services.trace_database import close_trace_database_runtime
 
-    await close_trace_database_runtime()
+        await close_trace_database_runtime()
 
-    # Export task-finalization metrics and post-drain gauges before stopping
-    # telemetry. Exporter shutdown must not delay cancellation of live tasks.
-    await stop_runtime_performance_monitor(app)
+        # Export task-finalization metrics and post-drain gauges before stopping
+        # telemetry. Exporter shutdown must not delay cancellation of live tasks.
+        await stop_runtime_performance_monitor(app)
+    finally:
+        await stop_app_process_diagnostics(app)
 
     from .services.task_runtime import shutdown_task_runtime_hook_executor
 

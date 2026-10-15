@@ -1,3 +1,4 @@
+import type { McpConnectionStatus } from "@/lib/mcp-connection-status"
 import type { OAuthAccountInput } from "@/lib/oauth-account"
 
 // Shared shape for a connector catalog entry / connected MCP app. Kept in one
@@ -15,6 +16,9 @@ export interface AppIntegration {
   server_id?: number
   transport?: string
   connected_account?: string
+  // Persisted grant state of a builtin OAuth server row, carried over from
+  // GET /api/mcp/servers. The /api/mcp/apps catalog does not send it.
+  connection_status?: McpConnectionStatus | null
   // Whether the deployment has configured the browser-facing Google Picker
   // key. The connector still works for files created by Xagent when false;
   // only the existing-file authorization button is hidden.

@@ -281,13 +281,26 @@ async def cancel_a2a_task(
     from .task_execution import background_task_manager
 
     cancel_outcome = await background_task_manager.cancel_task(task.id)
-    finalized = await run_db_io_cancellation_safe(
-        lambda: _finalize_a2a_cancel_sync(
+
+    def finalize() -> A2ATaskSnapshot:
+        return _finalize_a2a_cancel_sync(
             task_id=task_id,
             agent_id=agent_id,
             expected_run_id=expected_run_id,
             expected_state_version=expected_state_version,
             local_cancel_requested=cancel_outcome.requested,
         )
-    )
-    return finalized
+
+    try:
+        return await run_db_io_cancellation_safe(finalize)
+    except StaleTaskRunError:
+        if not cancel_outcome.requested:
+            raise
+        # ``cancel_task`` only waits a bounded time for the cancelled
+        # execution to drain. Its finalizer can still be settling the run and
+        # commit between this command's read and its conditional UPDATE. Every
+        # stale result is re-checked once rather than only that UPDATE miss:
+        # each one is raised before any write or after a rollback, and the
+        # second attempt applies the same exact checks. A settled local cancel
+        # now matches; any other change to the target is still rejected.
+        return await run_db_io_cancellation_safe(finalize)

@@ -481,6 +481,31 @@ describe("AgentBuilder template entry with lists still loading", () => {
     await waitFor(() => expect(configStepComplete()).toBe(true))
     expect(isHighlighted(mcpSection())).toBe(false)
   })
+
+  it("holds the configure step for a required connector that needs a reconnect (#2931)", async () => {
+    installApi({
+      mcp: json([{ name: "foo", description: "Foo", connection_status: "needs_reconnect" }]),
+      template: json(templateResponse({ connections: ["foo"] })),
+    })
+    render(<AgentBuilder />)
+
+    await waitFor(() => expect(screen.getByText("tools.mcp.needsReconnect")).toBeInTheDocument())
+    await waitFor(() => expect(modelSelect().value).toBe(String(MODEL_ID)))
+    expect(isHighlighted(mcpSection())).toBe(true)
+    expect(configStepComplete()).toBe(false)
+  })
+
+  it("completes the configure step for a required connector that is connected", async () => {
+    installApi({
+      mcp: json([{ name: "foo", description: "Foo", connection_status: "connected" }]),
+      template: json(templateResponse({ connections: ["foo"] })),
+    })
+    render(<AgentBuilder />)
+
+    await waitFor(() => expect(configStepComplete()).toBe(true))
+    expect(screen.queryByText("tools.mcp.needsReconnect")).toBeNull()
+    expect(isHighlighted(mcpSection())).toBe(false)
+  })
 })
 
 describe("AgentBuilder edit-mode seed with independent lists", () => {

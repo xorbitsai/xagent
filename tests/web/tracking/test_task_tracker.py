@@ -72,7 +72,7 @@ def _run_tracker_ownership_race(
     from xagent.web.tracking import task_tracker as tracker_module
 
     engine, session_factory = _create_tracker_concurrency_db(tmp_path, filename)
-    monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database, "_SessionLocal", session_factory)
     fence_ready = threading.Event()
     takeover_done = threading.Event()
     pause_lock = threading.Lock()
@@ -204,7 +204,7 @@ async def _assert_tracker_operation_keeps_loop_responsive_under_pool_pressure(
     from xagent.web.tracking import task_tracker as tracker_module
 
     engine, session_factory = _create_tracker_pool_db(tmp_path, filename)
-    monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database, "_SessionLocal", session_factory)
     tracker = TaskTracker(task_id=123, update_interval_seconds=60)
     operation_task = None
     ticker_task = None
@@ -297,7 +297,7 @@ class TestTaskTracker:
         session.query.return_value.filter.return_value.update.side_effect = (
             apply_atomic_update
         )
-        monkeypatch.setattr(database, "get_session_local", lambda: lambda: session)
+        monkeypatch.setattr(database, "_SessionLocal", lambda: session)
 
         return session
 
@@ -533,7 +533,7 @@ class TestTaskTracker:
             )
             db.commit()
 
-        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+        monkeypatch.setattr(database, "_SessionLocal", session_factory)
         usage_hook_calls: list[int] = []
         quota_hooks.set_usage_record_hook(
             lambda _db, _user_id, _details, _actions: usage_hook_calls.append(1)
@@ -604,7 +604,7 @@ class TestTaskTracker:
                 )
             db.commit()
 
-        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+        monkeypatch.setattr(database, "_SessionLocal", session_factory)
         usage_hook_calls: list[int] = []
         quota_hooks.set_usage_record_hook(
             lambda _db, _user_id, _details, _actions: usage_hook_calls.append(1)
@@ -754,7 +754,7 @@ class TestTaskTracker:
             )
             db.commit()
 
-        monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+        monkeypatch.setattr(database, "_SessionLocal", session_factory)
 
         def pool_pressured_usage_hook(db, *_args):
             # The fenced counter commit has returned its connection. Occupy that
@@ -825,7 +825,7 @@ class TestTaskTracker:
             sessions.append(session)
             return session
 
-        monkeypatch.setattr(database, "get_session_local", lambda: create_session)
+        monkeypatch.setattr(database, "_SessionLocal", create_session)
 
         def progress_hook(db, user_id, delta_details, delta_actions):
             hook_threads.append(threading.get_ident())
@@ -1415,7 +1415,7 @@ class TestTaskTrackerManager:
         mock_task.status = TaskStatus.RUNNING
 
         session.query.return_value.filter.return_value.first.return_value = mock_task
-        monkeypatch.setattr(database, "get_session_local", lambda: lambda: session)
+        monkeypatch.setattr(database, "_SessionLocal", lambda: session)
 
         return session
 
@@ -1550,7 +1550,7 @@ class TestTaskTrackerIntegration:
         mock_task.token_usage_details = None
 
         session.query.return_value.filter.return_value.first.return_value = mock_task
-        monkeypatch.setattr(database, "get_session_local", lambda: lambda: session)
+        monkeypatch.setattr(database, "_SessionLocal", lambda: session)
 
         return session
 

@@ -40,6 +40,7 @@ pytest's automatic startup skips.
 | `test_shared_channels.py` | Slack, Feishu, and Telegram callbacks through real SharedChannelTurn execution and forwarded traces; Telegram attachment download, worker transformation, and returned bytes; queued pause and channel deactivation before worker consumption. |
 | `test_shared_happy_paths.py` | Agent public chat/reply/follow-up and file transfer; A2A blocking/context continuation; all execution modes and auto branches; combined host; legacy webhook. |
 | `test_shared_gmail.py` | Agent and workforce Gmail callback through actual signature verification, mail ingestion, and worker completion. |
+| `test_shared_auto_resume.py` | Automatic resume after SIGKILL: a killed worker's or combined host's run is recovered, scheduled, dispatched by the sweeper and finished by a replacement host on the same run; a run killed while PAUSE_REQUESTED, a user message while the resume is scheduled, and the switch turned off each leave it to the user; a later tick of the same scheduled trigger supersedes the killed tick, whose TriggerRun fails, while the later tick completes. |
 | `test_shared_network_recovery.py` | A controllable TCP link interrupts only the test hosts' Redis connections. An in-flight task still persists its result, an unaccepted START leaves no task behind, and clients recover after reconnection. |
 
 In `test_shared_channels.py`, the bot callbacks and their event bridge run in

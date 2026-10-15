@@ -1148,6 +1148,8 @@ class ToolFactory:
             MCPUnavailableSummary.from_values(
                 tool.server_name,
                 tool.unavailability_reason,
+                cause_type=tool.unavailability_cause_type,
+                status_code=tool.unavailability_status_code,
             )
             for tool in tools
             if isinstance(tool, UnavailableMCPTool)
@@ -1401,7 +1403,10 @@ class ToolFactory:
                 load_user_env_overrides,
                 load_user_env_sources,
             )
-            from .mcp_adapter import load_mcp_tools_as_agent_tools
+            from .mcp_adapter import (
+                load_mcp_tools_as_agent_tools,
+                model_visible_mcp_tools,
+            )
 
             query = db.query(MCPServer)
             if user_id:
@@ -1520,7 +1525,7 @@ class ToolFactory:
                 mcp_failure_policy,
                 cls._mcp_unavailable_summaries(unavailable_tools),
             )
-            return unavailable_tools + list(load_result.tools)
+            return model_visible_mcp_tools(unavailable_tools + list(load_result.tools))
         except ConnectorRuntimeError:
             raise
         except RequiredMCPUnavailableError:

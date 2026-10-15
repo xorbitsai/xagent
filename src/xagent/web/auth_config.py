@@ -1,27 +1,50 @@
 import os
 
-_INSECURE_JWT_SECRET = "your-secret-key-change-in-production"
-JWT_SECRET_KEY = os.getenv("XAGENT_JWT_SECRET", _INSECURE_JWT_SECRET)
+from ..config import (
+    INSECURE_SECRET_PLACEHOLDER,
+    get_environment,
+    get_require_secure_secrets,
+    get_session_secret,
+)
+
+MIN_SECRET_LENGTH = 32
+
+_INSECURE_JWT_SECRET_VALUES = {
+    INSECURE_SECRET_PLACEHOLDER,
+    "change-me",
+    "secret",
+    "replace-with-a-long-random-secret",
+    "change-me-to-a-random-session-secret",
+}
+JWT_SECRET_KEY = os.getenv("XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER)
 JWT_ALGORITHM = os.getenv("XAGENT_JWT_ALGORITHM", "HS256")
+
+
+def _is_insecure_secret(value: str) -> bool:
+    normalized = value.strip().lower()
+    return (
+        len(normalized) < MIN_SECRET_LENGTH or normalized in _INSECURE_JWT_SECRET_VALUES
+    )
 
 
 def validate_auth_config() -> None:
     """Fail production startup when the JWT signing secret is not configured."""
-    environment = (
-        (os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development")
-        .strip()
-        .lower()
-    )
-    requires_secure_secret = environment in {"prod", "production", "stage", "staging"}
-    requires_secure_secret = requires_secure_secret or os.getenv(
-        "XAGENT_REQUIRE_SECURE_SECRETS", ""
-    ).strip().lower() in {"1", "true", "yes", "on"}
-    if requires_secure_secret and (
-        not JWT_SECRET_KEY or JWT_SECRET_KEY == _INSECURE_JWT_SECRET
-    ):
+    environment = get_environment()
+    requires_secure_secret = environment != "development"
+    requires_secure_secret = requires_secure_secret or get_require_secure_secrets()
+    # Read the environment again here rather than trusting the import-time JWT
+    # constant. Startup validation must catch a missing deployment setting even
+    # when another test or an embedding process imported this module earlier.
+    configured_secret = os.getenv(
+        "XAGENT_JWT_SECRET", INSECURE_SECRET_PLACEHOLDER
+    ).strip()
+    if requires_secure_secret and _is_insecure_secret(configured_secret):
+        raise RuntimeError("XAGENT_JWT_SECRET must be set to a unique deployment value")
+    session_secret = get_session_secret().strip()
+    if requires_secure_secret and _is_insecure_secret(session_secret):
         raise RuntimeError(
-            "XAGENT_JWT_SECRET must be set to a unique value before starting "
-            f"the {environment} environment"
+            "XAGENT_SESSION_SECRET or XAGENT_JWT_SECRET must provide a unique "
+            "session signing value"
         )
 
 

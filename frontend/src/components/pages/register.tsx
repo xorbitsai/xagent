@@ -39,7 +39,7 @@ export function RegisterPage() {
     confirmPassword: ""
   })
 
-  const { isLoading: isStatusLoading } = useSetupStatus({
+  const { isLoading: isStatusLoading, passwordMinLength } = useSetupStatus({
     redirectToSetupIfNeeded: true,
     redirectToLoginIfRegistrationClosed: true,
   })
@@ -61,8 +61,10 @@ export function RegisterPage() {
     }
 
     // Verify password length
-    if (formData.password.length < 6) {
-      setError(t("register.alerts.password_too_short"))
+    if (formData.password.length < passwordMinLength) {
+      setError(
+        t("register.alerts.password_too_short", { min: passwordMinLength })
+      )
       return
     }
 
@@ -215,6 +217,7 @@ export function RegisterPage() {
               <Lock className="pointer-events-none absolute left-4 top-1/2 h-4 w-4 -translate-y-1/2 text-[#A0A9B8]" />
               <Input
                 type={showPassword ? "text" : "password"}
+                minLength={passwordMinLength}
                 name="password"
                 value={formData.password}
                 onChange={handleInputChange}

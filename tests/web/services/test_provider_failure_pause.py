@@ -2,8 +2,9 @@
 unusable output, rests PAUSED instead of FAILED.
 
 ``llm_unavailable`` follows ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` like
-``persistence_failure``; ``model_output_invalid`` is recorded but never paused
-for until the automatic-resume executor ships. Both reach settlement as an
+``persistence_failure``; ``model_output_invalid`` also needs automatic resume
+on and a task kind it schedules, since only a resume resamples the model.
+Both reach settlement as an
 unsuccessful result, so the result paths carry them: a new run's
 (``_finalize_task_execution_result_isolated``), a resumed run's
 (``_finalize_resumed_task``) and the shared channel leaf's
@@ -40,6 +41,7 @@ from tests.web.services.test_persistence_failure_pause import (
     PERSISTENCE_RESULT,
     _assert_no_failure_in_model_context,
     _assert_paused,
+    _assert_recovers_like_lease_recovery,
     _assistant_lines,
     _break_decision,
     _checkpoint,
@@ -101,6 +103,7 @@ from xagent.web.models.database import get_session_local
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_auto_recovery import TaskAutoRecovery
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.trigger import TriggerRunStatus
 
 # Imported here, not lazily: a module first imported while ``canonical``
 # patches ``database.get_session_local`` would keep that patched factory.
@@ -131,6 +134,10 @@ from xagent.web.services.task_auto_recovery import (
     settlement_interruption_for_result,
     settlement_pause_enabled,
 )
+from xagent.web.services.task_auto_resume import (
+    TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
+    auto_resume_command_id,
+)
 from xagent.web.services.task_execution import (
     _acquire_resume_task_lease,
     _settle_resumed_task_lease,
@@ -139,7 +146,6 @@ from xagent.web.services.task_execution_context_service import (
     TaskExecutionRecoverySnapshot,
 )
 from xagent.web.services.task_execution_event_writer import append_fact_no_commit
-from xagent.web.services.task_lease_recovery import TASK_LEASE_PAUSED_TRIGGER_ERROR
 from xagent.web.services.task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     CheckpointRecoveryResolution,
@@ -151,7 +157,10 @@ from xagent.web.services.task_orchestrator import (
     TaskTurnPayload,
     settle_task_lease_isolated,
 )
-from xagent.web.services.task_settlement_report import SettlementReport
+from xagent.web.services.task_settlement_report import (
+    RecordedInterruption,
+    SettlementReport,
+)
 
 canonical = canonical_fixture
 engine = engine_fixture
@@ -166,8 +175,9 @@ PAUSED_FACT = {"status": "paused", "result": {"error": None}}
 
 @pytest.fixture(autouse=True)
 def _switch_defaults(monkeypatch):
-    # The infra switch is off by default until automatic resume ships; these
-    # tests exercise it on (``infra_default`` cases pin the default).
+    # Unset, the infra switch follows automatic resume, which these suites
+    # mostly turn off; they exercise it on (``infra_default`` cases pin the
+    # default).
     monkeypatch.setenv(PAUSE_SWITCH, "true")
 
 
@@ -311,23 +321,20 @@ def _settle_new_run(factory, tid: int, lease: TaskLease, result: dict[str, Any])
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", ["react", "auto"])
-@pytest.mark.parametrize("gate", ["today", "executor"])
+@pytest.mark.parametrize("auto_resume", ["false", "true"])
 async def test_invalid_tool_protocol_resume_samples_the_model_again(
-    canonical, monkeypatch, tmp_path, wrapped, gate
+    canonical, monkeypatch, tmp_path, wrapped, auto_resume
 ):
     """The run gives up on the tool protocol after a tool call.
 
-    ``today``: settlement never pauses for it yet; the run fails as before
-    and the row records why. ``executor``: with the deferral lifted, as the
-    automatic-resume executor will lift it, the run pauses, and resuming it
-    continues from its checkpoint with a NEW model call -- it does not replay
-    the cached failure (Auto caches the child's result in its
-    ``auto_after_child`` checkpoint) and does not re-run the tool."""
+    Automatic resume off: nothing would resample the model, so the run fails
+    as before and the row records why. On: the run pauses with a resume
+    scheduled, and resuming it continues from its checkpoint with a NEW model
+    call -- it does not replay the cached failure (Auto caches the child's
+    result in its ``auto_after_child`` checkpoint) and does not re-run the
+    tool."""
 
-    if gate == "executor":
-        monkeypatch.setattr(
-            task_auto_recovery, "SETTLEMENT_PAUSE_DEFERRED_REASONS", frozenset()
-        )
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, tid = canonical
     lease = _start_run(factory, tid)
     tool = FakeTool()
@@ -365,7 +372,7 @@ async def test_invalid_tool_protocol_resume_samples_the_model_again(
 
     finalized = _settle_new_run(factory, tid, lease, result)
 
-    if gate == "today":
+    if auto_resume == "false":
         assert finalized.report.paused_for is None
         task, row, events = _state(factory, tid)
         assert task.status == TaskStatus.FAILED
@@ -376,7 +383,12 @@ async def test_invalid_tool_protocol_resume_samples_the_model_again(
         ]
         return
     assert finalized.report.paused_for is InterruptionReason.MODEL_OUTPUT_INVALID
-    _assert_paused(factory, tid, lease, reason="model_output_invalid")
+    task, row, events = _state(factory, tid)
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert task.error_message is None
+    assert (row.reason, row.state) == ("model_output_invalid", "scheduled")
+    assert row.paused_state_version == task.state_version
+    assert [e.event for e in events] == ["interrupted", "scheduled"]
     assert _settled_facts(factory, tid) == [PAUSED_FACT]
     assert _assistant_lines(factory, tid) == []
     _assert_no_failure_in_model_context(factory, tid)
@@ -586,22 +598,30 @@ def test_settlement_acts_on_provider_and_model_output_failures():
     )
 
 
+ALL_REASONS = {"persistence_failure", "llm_unavailable", "model", "user_pause"}
+
+
 @pytest.mark.parametrize(
-    ("infra", "enabled"),
+    ("infra", "auto_resume", "enabled"),
     [
-        ("true", {"persistence_failure", "llm_unavailable", "user_pause"}),
-        ("false", set()),
-        (None, set()),
+        ("true", "true", ALL_REASONS),
+        ("true", "false", ALL_REASONS - {"model"}),
+        ("false", "true", set()),
+        ("false", "false", set()),
+        (None, "true", ALL_REASONS),
+        (None, "false", set()),
     ],
-    ids=["on", "off", "default"],
+    ids=["on-on", "on-off", "off-on", "off-off", "default-on", "default-off"],
 )
-def test_settlement_switches_per_reason(monkeypatch, infra, enabled):
-    """model_output_invalid never pauses until the executor ships, and the
-    switch defaults off."""
+def test_settlement_switches_per_reason(monkeypatch, infra, auto_resume, enabled):
+    """The infra switch follows automatic resume when unset, and
+    model_output_invalid pauses only when an automatic resume will resample
+    it."""
     if infra is None:
         monkeypatch.delenv(PAUSE_SWITCH)
     else:
         monkeypatch.setenv(PAUSE_SWITCH, infra)
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     names = {
         "persistence_failure": InterruptionReason.PERSISTENCE_FAILURE,
         "llm_unavailable": InterruptionReason.LLM_UNAVAILABLE,
@@ -623,7 +643,8 @@ _PATH_REASONS = [
     for reason in RESULTS
     if path == "channel" or reason != "persistence_failure"
 ]
-# The reasons settlement pauses for today.
+# The reasons settlement pauses for whether or not automatic resume is on;
+# model_output_invalid has its own cases.
 _PAUSE_PATH_REASONS = [
     case for case in _PATH_REASONS if case[1] != "model_output_invalid"
 ]
@@ -730,6 +751,11 @@ def test_channel_pause_fills_the_report_after_the_commit(canonical):
     assert report.paused_for is InterruptionReason.LLM_UNAVAILABLE
     assert report.control_state["status"] == "paused"
     assert report.control_state["run_id"] == lease.run_id
+    # Channel tasks are not scheduled yet, so nothing announces this; pin
+    # the snapshot for when the channel hold lands.
+    with factory() as db:
+        row = db.get(TaskAutoRecovery, ids["task"])
+        assert report.recovery == RecordedInterruption.from_row(row)
 
 
 def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):
@@ -755,7 +781,11 @@ def test_channel_pause_leaves_the_report_empty_when_the_commit_fails(canonical):
 
 
 @PAUSE_CASES
-def test_pause_projects_like_lease_recovery(canonical, path, reason):
+@pytest.mark.parametrize("auto_resume", ["true", "false"])
+def test_pause_projects_like_lease_recovery(
+    canonical, monkeypatch, path, reason, auto_resume
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, auto_resume)
     factory, _tid = canonical
     paused, recovered = _projected_task(factory), _projected_task(factory)
     paused_lease = _prepare_run(factory, paused)
@@ -768,9 +798,18 @@ def test_pause_projects_like_lease_recovery(canonical, path, reason):
     right = _full_projection(factory, recovered, recovered_lease)
     if path == "channel":
         # Lease recovery leaves no channel result; a reader derives this one.
-        assert left.pop("channel_result") == interrupted_channel_result()
-    assert left.pop("trigger_run")[1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
-    assert right.pop("trigger_run")[1] == TASK_LEASE_PAUSED_TRIGGER_ERROR
+        # A scheduled resume (this task's kind is scheduled; a channel task's
+        # is not yet) leaves none either: the channel waits for the resume.
+        assert left.pop("channel_result") == (
+            None if auto_resume == "true" else interrupted_channel_result()
+        )
+    _assert_recovers_like_lease_recovery(
+        factory,
+        paused,
+        recovered,
+        (left.pop("trigger_run"), right.pop("trigger_run")),
+        auto_resume=auto_resume,
+    )
     # Only lease recovery reconciles orphaned delivery rows.
     left.pop("delivery")
     right.pop("delivery")
@@ -780,12 +819,12 @@ def test_pause_projects_like_lease_recovery(canonical, path, reason):
     assert left["assistant"] == []
     assert left["settled"] == [PAUSED_FACT]
     task, row, events = _state(factory, paused["task"])
-    assert (row.reason, row.state) == (reason, "manual")
+    assert row.reason == reason
     assert row.paused_state_version == task.state_version
     assert row.last_error == RESULTS[reason]["error"]
-    assert [(e.event, e.detail["task_status"]) for e in events] == [
+    assert [(e.event, e.detail.get("task_status")) for e in events] == [
         ("interrupted", "paused")
-    ]
+    ] + ([("scheduled", None)] if auto_resume == "true" else [])
     _assert_no_failure_in_model_context(factory, paused["task"])
 
 
@@ -810,7 +849,8 @@ def _switch_case(m: pytest.MonkeyPatch, case: str) -> str:
 def test_unpaused_runs_settle_exactly_as_before(
     canonical, monkeypatch, path, reason, case
 ):
-    """The switch is off (or unset: it defaults off), or the task is
+    """The switch is off (or unset, following automatic resume, which this
+    suite turns off), or the task is
     ineligible: the same FAILED settlement as without an interruption, plus a
     ``disabled`` (or ``ineligible``) row."""
 
@@ -840,11 +880,14 @@ def test_unpaused_runs_settle_exactly_as_before(
 @pytest.mark.parametrize(
     "case", ["infra_on", "infra_off", "infra_default", "pause_requested", "ineligible"]
 )
-def test_model_output_invalid_never_pauses_yet(canonical, monkeypatch, path, case):
-    """Until the automatic-resume executor ships, unusable model output
-    settles exactly as without an interruption whatever the switch, the
-    checkpoint or the control state say; the row records it as ``manual``
-    (no switch would help), or ``ineligible``."""
+def test_model_output_invalid_fails_without_auto_resume(
+    canonical, monkeypatch, path, case
+):
+    """With automatic resume off nothing would resample the model, so
+    unusable model output settles exactly as without an interruption whatever
+    the infra switch, the checkpoint or the control state say; the row
+    records it as ``manual`` (the infra switch would not help), or
+    ``ineligible``."""
 
     if case == "infra_off":
         monkeypatch.setenv(PAUSE_SWITCH, "false")
@@ -872,6 +915,104 @@ def test_model_output_invalid_never_pauses_yet(canonical, monkeypatch, path, cas
     expected = "ineligible" if case == "ineligible" else "manual"
     assert (row.reason, row.state) == ("model_output_invalid", expected)
     assert [e.detail["task_status"] for e in events] == ["failed"]
+
+
+@pytest.mark.parametrize("path", _PATHS)
+@pytest.mark.parametrize("infra", ["default", "off"])
+def test_model_output_invalid_pauses_for_an_automatic_resume(
+    canonical, monkeypatch, path, infra
+):
+    """With automatic resume on, unusable model output pauses an eligible run
+    and schedules the resume that samples the model again -- unless the
+    infra switch is explicitly off, which settles it as before (``disabled``:
+    turning the switch on would pause it)."""
+
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    if infra == "default":
+        monkeypatch.delenv(PAUSE_SWITCH)
+    else:
+        monkeypatch.setenv(PAUSE_SWITCH, "false")
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    _settle_result(path, factory, ids, lease, MODEL_RESULT)
+
+    if infra == "off":
+        baseline = _projected_task(factory)
+        baseline_lease = _prepare_run(factory, baseline)
+        with monkeypatch.context() as m:
+            _without_result_interruption(m)
+            _settle_result(path, factory, baseline, baseline_lease, MODEL_RESULT)
+        projection = _full_projection(factory, ids, lease)
+        assert projection == _full_projection(factory, baseline, baseline_lease)
+        assert projection["status"] == TaskStatus.FAILED
+        _task, row, _events = _state(factory, ids["task"])
+        assert (row.reason, row.state) == ("model_output_invalid", "disabled")
+        return
+    task, row, events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert task.error_message is None
+    assert (row.reason, row.state) == ("model_output_invalid", "scheduled")
+    assert row.paused_state_version == task.state_version
+    assert row.next_attempt_at is not None
+    assert [e.event for e in events] == ["interrupted", "scheduled"]
+    projection = _full_projection(factory, ids, lease)
+    assert projection["settled"] == [PAUSED_FACT]
+    assert projection["assistant"] == []
+    # The scheduled resume keeps the TriggerRun RUNNING.
+    assert projection["trigger_run"][0] == "running"
+
+
+def test_model_output_invalid_out_of_resumes_stays_paused(canonical, monkeypatch):
+    """An automatically resumed run that keeps producing unusable output
+    without progress stops at the policy's limit: ``exhausted``, and the task
+    stays PAUSED for its user, like any reason that runs out of resumes."""
+
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    monkeypatch.delenv(PAUSE_SWITCH)
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+    _settle_result("resumed_result", factory, ids, lease, MODEL_RESULT)
+    # The sweeper dispatched the last resume the policy allows: two without
+    # progress, through its own RESUME command, which nobody followed.
+    with factory() as db:
+        row = db.get(TaskAutoRecovery, ids["task"])
+        assert row.state == "scheduled" and row.progress_marker is not None
+        command_id = auto_resume_command_id(
+            int(row.paused_state_version), 2, lease.run_id
+        )
+        db.add(
+            TaskExecutionCommand(
+                task_id=ids["task"],
+                command_id=command_id,
+                kind="resume",
+                payload={},
+                target_run_id=lease.run_id,
+                status="completed",
+            )
+        )
+        row.state = "dispatched"
+        row.no_progress_resumes = 2
+        row.total_resumes = 2
+        row.last_command_id = command_id
+        db.commit()
+    resume_lease = _acquire_resume_task_lease(ids["task"], ids["user"], lease.run_id)
+    assert resume_lease is not None and resume_lease.run_id == lease.run_id
+
+    _settle_result("resumed_result", factory, ids, resume_lease, MODEL_RESULT)
+
+    task, row, events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert task.error_message is None
+    assert (row.reason, row.state) == ("model_output_invalid", "exhausted")
+    assert row.next_attempt_at is None
+    assert [e.event for e in events][-2:] == ["interrupted", "exhausted"]
+    assert _projection(factory, ids, resume_lease)["trigger_run"][:2] == (
+        TriggerRunStatus.FAILED.value,
+        TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
+    )
 
 
 @PAUSE_CASES
@@ -1075,7 +1216,31 @@ async def test_raised_provider_failure_pauses_on_the_exception_path(
 
 
 @pytest.mark.asyncio
+async def test_raised_model_output_failure_pauses_for_an_automatic_resume(
+    canonical, monkeypatch
+):
+    """With automatic resume on, the exception path decides unusable model
+    output as the result paths do: paused, with a resume scheduled."""
+
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids)
+
+    frames = await _schedule_failing_turn(
+        factory, ids, lease, LLMEmptyContentError("empty response")
+    )
+
+    assert frames == ["task_paused", "task_recovery_update"]
+    task, row, _events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert (row.reason, row.state) == ("model_output_invalid", "scheduled")
+
+
+@pytest.mark.asyncio
 async def test_raised_model_output_failure_fails_as_before(canonical, monkeypatch):
+    """Automatic resume off (this suite's default): nothing would resample
+    the model, so the run fails exactly as before."""
     factory, _tid = canonical
     gated, baseline = _projected_task(factory), _projected_task(factory)
     gated_lease = _prepare_run(factory, gated)
@@ -1342,11 +1507,15 @@ def _leaf_failed_channel_result(result: dict[str, Any]) -> dict[str, Any]:
 async def test_shared_channel_turn_that_does_not_pause_fails_as_before(
     selected, monkeypatch, reason, switch
 ):
-    """Switch off, or a reason settlement does not pause for yet: the channel
-    command, its result and the task output are what the leaf has always
-    written for a FAILED result."""
+    """Switch off, or unusable model output on a channel task (automatic
+    resume does not schedule channel tasks yet, so nothing would resample
+    it, even with automatic resume on): the channel command, its result and
+    the task output are what the leaf has always written for a FAILED
+    result."""
 
     monkeypatch.setenv(PAUSE_SWITCH, switch)
+    if reason == "model_output_invalid":
+        monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
     published = _capture_task_events(monkeypatch)
 
     command = await _run_shared_channel_turn(selected, monkeypatch, RESULTS[reason])

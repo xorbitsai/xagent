@@ -18,7 +18,7 @@ import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, handleIconLoadError } from "./
 import { useOAuthAccountStep } from "@/components/mcp/oauth-account-dialog";
 import type { OAuthAccountInput } from "@/lib/oauth-account";
 
-// The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
+// The builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
 // locales like every other connector name in the app. Falling back to
 // capitalize() below still runs for any provider missing here, but gets the
@@ -36,6 +36,12 @@ export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   github: "GitHub",
   linear: "Linear",
   jira: "Jira",
+  zendesk: "Zendesk",
+  salesforce: "Salesforce",
+  deputy: "Deputy",
+  xero: "Xero",
+  myob: "MYOB",
+  "employment-hero": "Employment Hero",
 };
 
 // connectingKeys/connectingKeysRef below hold both of these kinds of key in

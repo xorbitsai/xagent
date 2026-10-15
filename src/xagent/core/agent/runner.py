@@ -61,7 +61,11 @@ from .interruption import (
     interruption_reason_value,
 )
 from .language import reset_output_language_to_request_context
-from .result import extract_assistant_message, set_assistant_message
+from .result import (
+    extract_assistant_message,
+    normalize_tool_failure_code,
+    set_assistant_message,
+)
 from .runtime import (
     THRESHOLD_WARNING_KEY_PREFIX,
     ExecutionInterrupted,
@@ -785,6 +789,16 @@ class AgentRunner:
                 "execution_id": execution_id,
                 "context": context,
             }
+            failure_codes = {
+                normalize_tool_failure_code(
+                    entry.get("result", {}).get("failure_code")
+                    if isinstance(entry.get("result"), dict)
+                    else None
+                )
+                for entry in pattern_errors
+            }
+            if len(failure_codes) == 1 and None not in failure_codes:
+                result["failure_code"] = next(iter(failure_codes))
             # Only an interruption every pattern agrees on describes the run;
             # a mix means at least one pattern failed for a terminal reason.
             reasons = {entry.get(INTERRUPTION_REASON_KEY) for entry in pattern_errors}

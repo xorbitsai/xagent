@@ -51,9 +51,7 @@ def db_session(tmp_path, monkeypatch):
     )
     Base.metadata.create_all(engine)
     SessionLocal = sessionmaker(bind=engine)
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_session_local", lambda: SessionLocal
-    )
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", SessionLocal)
     db = SessionLocal()
     try:
         yield db

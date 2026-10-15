@@ -905,9 +905,7 @@ async def test_unavailable_lease_read_is_visible_until_next_clean_sweep(
     from xagent.web.services.task_lease_service import utc_now
 
     factory, tid = canonical
-    monkeypatch.setattr(
-        "xagent.web.models.database.get_engine", lambda: factory.kw["bind"]
-    )
+    monkeypatch.setattr("xagent.web.models.database._engine", factory.kw["bind"])
     with factory() as db:
         task = db.get(Task, tid)
         task.status = TaskStatus.RUNNING

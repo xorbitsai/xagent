@@ -46,7 +46,7 @@ async def test_personal_provider_skips_unavailable_database_with_warning(
 ) -> None:
     from xagent.web.models import database
 
-    monkeypatch.setattr(database, "get_optional_session_local", lambda: None)
+    monkeypatch.setattr(database, "_SessionLocal", None)
 
     records = await XagentPersonalDbSkillProvider().list_records(
         SkillScopeContext(user_id=7)
@@ -122,7 +122,7 @@ async def test_personal_provider_owns_and_closes_its_database_session(
 
     from xagent.web.models import database
 
-    monkeypatch.setattr(database, "get_optional_session_local", lambda: session_factory)
+    monkeypatch.setattr(database, "_SessionLocal", session_factory)
 
     records = await XagentPersonalDbSkillProvider().list_records(
         SkillScopeContext(user_id=7)
@@ -184,8 +184,8 @@ async def test_personal_provider_returns_postgresql_pool_connection(
 
             monkeypatch.setattr(
                 database,
-                "get_optional_session_local",
-                lambda: session_factory,
+                "_SessionLocal",
+                session_factory,
             )
 
             records = await XagentPersonalDbSkillProvider().list_records(
@@ -247,7 +247,7 @@ async def test_personal_provider_drains_owned_db_work_before_cancellation(
         "xagent.skills.personal_db._load_personal_skill_records_sync",
         _blocking_load,
     )
-    monkeypatch.setattr(database, "get_optional_session_local", lambda: object())
+    monkeypatch.setattr(database, "_SessionLocal", object())
 
     task = asyncio.create_task(
         XagentPersonalDbSkillProvider().list_records(SkillScopeContext(user_id=7))

@@ -71,8 +71,8 @@ async def test_a_configured_period_starts_the_loop(
     monkeypatch.setenv("XAGENT_CONVERSATION_RETENTION_DAYS", "365")
     monkeypatch.setattr(
         database_module,
-        "get_session_local",
-        lambda: sessionmaker(bind=sa.create_engine("sqlite://")),
+        "_SessionLocal",
+        sessionmaker(bind=sa.create_engine("sqlite://")),
     )
     app = FastAPI()
     app.state.retention_purge_allowed_in_tests = True

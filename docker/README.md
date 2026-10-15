@@ -654,7 +654,24 @@ POSTGRES_IMAGE_TAG="17-bookworm"
 
 # Security
 ENCRYPTION_KEY="your-encryption-key"
+XAGENT_JWT_SECRET="a-unique-random-secret"
 ```
+
+The stock backend image persists generated encryption and JWT signing keys in
+the shared `xagent_secrets` volume. An explicit `ENCRYPTION_KEY` or strong
+`XAGENT_JWT_SECRET` always takes precedence. On the first upgrade to an image
+with JWT bootstrap support, deployments that still use the exact
+`replace-with-a-long-random-secret` example value receive a generated persistent
+secret; deployments with an existing strong value keep it unchanged.
+Any browser session or password-reset token previously signed with the example
+placeholder is intentionally invalid after that first startup, so users must
+sign in again.
+
+This release also replaces wildcard credentialed CORS for private API routes
+with `XAGENT_CORS_ORIGINS` (default: `XAGENT_FRONTEND_URL`). Before upgrading,
+list every other trusted browser origin that calls non-widget APIs as a
+comma-separated value. Public `/api/widget/` embedding remains origin-agnostic
+and credential-free.
 
 ### Volumes
 
@@ -662,6 +679,7 @@ Data persists in Docker volumes:
 
 - `postgres_data` - PostgreSQL database
 - `xagent_data` - User data (~/.xagent/)
+- `xagent_secrets` - Generated encryption and JWT signing keys
 - `xagent_uploads` - Uploaded files
 
 ### Backup

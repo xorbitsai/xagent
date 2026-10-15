@@ -1520,6 +1520,36 @@ class TestAuthAPI:
         )
         db.close()
 
+    def test_register_enforces_configured_password_minimum(self, test_db, monkeypatch):
+        monkeypatch.setattr(auth_api, "PASSWORD_MIN_LENGTH", 8)
+        setup_first_admin()
+
+        too_short = client.post(
+            "/api/auth/register",
+            json={
+                "username": "short-password-user",
+                "email": "short-password@example.com",
+                "password": "1234567",
+            },
+        )
+        exact_minimum = client.post(
+            "/api/auth/register",
+            json={
+                "username": "minimum-password-user",
+                "email": "minimum-password@example.com",
+                "password": "12345678",
+            },
+        )
+
+        assert too_short.status_code == 200
+        assert too_short.json() == {
+            "success": False,
+            "message": "Password must be at least 8 characters",
+            "user": None,
+        }
+        assert exact_minimum.status_code == 200
+        assert exact_minimum.json()["success"] is True
+
     def test_register_duplicate_username(self, test_db, test_user_data):
         """Test registration with duplicate username"""
         setup_first_admin()
@@ -1654,6 +1684,7 @@ class TestAuthAPI:
         assert status_before.status_code == 200
         data_before = status_before.json()
         assert data_before["needs_setup"] is True
+        assert data_before["password_min_length"] == auth_api.PASSWORD_MIN_LENGTH
 
         setup_first_admin()
 
@@ -1670,12 +1701,13 @@ class TestAuthAPI:
             json={
                 "username": "root2",
                 "email": "root2@example.com",
-                "password": "root234",
+                "password": "root2345",
             },
         )
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is False
+        assert data["message"] == "Setup already completed"
 
     def test_forgot_password_and_reset_password(
         self, test_db, test_user_data, monkeypatch

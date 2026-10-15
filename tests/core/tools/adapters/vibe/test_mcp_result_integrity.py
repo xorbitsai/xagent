@@ -21,7 +21,7 @@ def _result(projects, *, has_more=False, next_page_token=None):
 
 @pytest.mark.asyncio
 async def test_rocketlane_project_filter_removes_unrelated_records():
-    guard = MCPResultIntegrityGuard("Rocketlane", "get_projects")
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
 
     checked = await guard.validate(
         {"params": {"projectName": "Versatile"}},
@@ -39,7 +39,77 @@ async def test_rocketlane_project_filter_removes_unrelated_records():
     assert checked["structured_content"]["projects"] == [
         {"projectId": "p1", "projectName": "Versatile Resource Centre"}
     ]
+    assert checked["structured_content"]["pagination"] == {"hasMore": False}
     assert "Orbital Medical" not in checked["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_empty_project_result_is_a_valid_no_match():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+    original = _result([])
+
+    checked = await guard.validate(
+        {"params": {"projectName": "Does not exist"}}, original
+    )
+
+    assert checked is original
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_prefers_named_project_list_over_nested_identity_lists():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+    original = _result(
+        [
+            {
+                "projectId": "p1",
+                "projectName": "Versatile migration",
+                "phases": [
+                    {"id": f"phase-{index}", "name": f"Phase {index}"}
+                    for index in range(5)
+                ],
+            }
+        ]
+    )
+
+    checked = await guard.validate({"params": {"projectName": "Versatile"}}, original)
+
+    assert checked is original
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_no_match_on_incomplete_page_keeps_pagination():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+
+    checked = await guard.validate(
+        {"params": {"projectName": "Versatile"}},
+        _result(
+            [{"projectId": "p2", "projectName": "Orbital Medical"}],
+            has_more=True,
+            next_page_token="page-2",
+        ),
+    )
+
+    assert checked["is_error"] is False
+    assert checked["structured_content"]["projects"] == []
+    assert checked["structured_content"]["pagination"] == {
+        "hasMore": True,
+        "nextPageToken": "page-2",
+    }
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_short_record_name_does_not_reverse_match_query():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+
+    checked = await guard.validate(
+        {"params": {"projectName": "Phone migration"}},
+        _result([{"projectId": "p1", "projectName": "One"}]),
+    )
+
+    assert checked["is_error"] is True
+    assert checked["structured_content"]["reason"] == (
+        "the requested project/customer filter was ignored"
+    )
 
 
 @pytest.mark.asyncio
@@ -71,6 +141,38 @@ async def test_rocketlane_customer_filter_reads_nested_customer_name():
 
 
 @pytest.mark.asyncio
+async def test_rocketlane_combines_project_and_customer_filters():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+
+    checked = await guard.validate(
+        {
+            "params": {
+                "projectName": "Warehouse",
+                "customerName": "B Free",
+            }
+        },
+        _result(
+            [
+                {
+                    "projectId": "p1",
+                    "projectName": "Warehouse launch",
+                    "customer": {"name": "Bfree"},
+                },
+                {
+                    "projectId": "p2",
+                    "projectName": "Warehouse expansion",
+                    "customer": {"name": "Another Co"},
+                },
+            ]
+        ),
+    )
+
+    assert [
+        project["projectId"] for project in checked["structured_content"]["projects"]
+    ] == ["p1"]
+
+
+@pytest.mark.asyncio
 async def test_rocketlane_ignored_filter_is_a_failure():
     guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
 
@@ -86,6 +188,24 @@ async def test_rocketlane_ignored_filter_is_a_failure():
         "verified": False,
     }
     assert "Do not use these records as evidence" in checked["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_unreadable_filtered_result_is_a_failure():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+
+    checked = await guard.validate(
+        {"params": {"projectName": "Versatile"}},
+        {
+            "content": [{"type": "text", "text": '{"status":"ok"}'}],
+            "is_error": False,
+        },
+    )
+
+    assert checked["is_error"] is True
+    assert checked["structured_content"]["reason"] == (
+        "project records were not readable"
+    )
 
 
 @pytest.mark.asyncio
@@ -118,6 +238,25 @@ async def test_rocketlane_repeated_page_is_a_failure():
 
 
 @pytest.mark.asyncio
+async def test_rocketlane_same_page_token_can_be_refetched():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+    args = {"params": {"pageToken": "page-2"}}
+    projects = [{"projectId": "p2", "projectName": "Two"}]
+
+    first = await guard.validate(
+        args,
+        _result(projects, has_more=True, next_page_token="page-3"),
+    )
+    retried = await guard.validate(
+        args,
+        _result(projects, has_more=True, next_page_token="page-3"),
+    )
+
+    assert first["is_error"] is False
+    assert retried["is_error"] is False
+
+
+@pytest.mark.asyncio
 async def test_rocketlane_non_advancing_page_token_is_a_failure():
     guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
 
@@ -134,6 +273,84 @@ async def test_rocketlane_non_advancing_page_token_is_a_failure():
     assert checked["structured_content"]["reason"] == (
         "the pagination token did not advance"
     )
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_failed_page_is_not_recorded_as_seen():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+    projects = [{"projectId": "p3", "projectName": "Three"}]
+
+    failed = await guard.validate(
+        {"params": {"pageToken": "page-2"}},
+        _result(projects, has_more=True, next_page_token="page-2"),
+    )
+    valid = await guard.validate(
+        {"params": {"pageToken": "page-3"}},
+        _result(projects, has_more=True, next_page_token="page-4"),
+    )
+
+    assert failed["is_error"] is True
+    assert valid["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_has_more_without_next_token_is_a_failure():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+
+    checked = await guard.validate(
+        {},
+        _result(
+            [{"projectId": "p1", "projectName": "One"}],
+            has_more=True,
+        ),
+    )
+
+    assert checked["is_error"] is True
+    assert checked["structured_content"]["reason"] == (
+        "hasMore was true without a next page token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_all_matching_records_pass_through_unchanged():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+    original = _result(
+        [{"projectId": "p1", "projectName": "Versatile Resource Centre"}]
+    )
+
+    checked = await guard.validate({"params": {"projectName": "Versatile"}}, original)
+
+    assert checked is original
+
+
+@pytest.mark.asyncio
+async def test_rocketlane_error_result_passes_through_unchanged():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_projects")
+    original = {"content": [{"type": "text", "text": "failed"}], "is_error": True}
+
+    checked = await guard.validate({"params": {"projectName": "Versatile"}}, original)
+
+    assert checked is original
+
+
+@pytest.mark.asyncio
+async def test_other_rocketlane_tools_are_unchanged():
+    guard = MCPResultIntegrityGuard("rocketlane", "get_tasks")
+    original = _result([{"projectId": "p2", "projectName": "Orbital Medical"}])
+
+    checked = await guard.validate({"params": {"projectName": "Versatile"}}, original)
+
+    assert checked is original
+
+
+@pytest.mark.asyncio
+async def test_similarly_named_custom_server_is_unchanged():
+    guard = MCPResultIntegrityGuard("rocket_lane", "get_projects")
+    original = _result([{"projectId": "p2", "projectName": "Orbital Medical"}])
+
+    checked = await guard.validate({"params": {"projectName": "Versatile"}}, original)
+
+    assert checked is original
 
 
 @pytest.mark.asyncio

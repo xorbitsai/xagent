@@ -2883,6 +2883,49 @@ async def test_mcp_tool_call_proceeds_when_runtime_binding_target_is_undeclared(
     assert captured["arguments"] == {"query": "active"}
 
 
+@pytest.mark.asyncio
+async def test_successful_mcp_call_runs_result_integrity_guard(monkeypatch):
+    adapter = MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="get_projects",
+            description="List projects",
+            inputSchema={
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+            },
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        source_server="rocketlane",
+    )
+    checked_result = {
+        "content": [{"type": "text", "text": "integrity checked"}],
+        "is_error": False,
+    }
+    validate = AsyncMock(return_value=checked_result)
+    adapter._result_integrity.validate = validate
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter.run_json_async({"query": "active"})
+
+    validate.assert_awaited_once()
+    validated_args, remote_result = validate.await_args.args
+    assert validated_args == {"query": "active"}
+    assert remote_result["is_error"] is False
+    assert result == checked_result
+
+
 def _resolver_retry_adapter(connection):
     return MCPToolAdapter(
         mcp_tool=SimpleNamespace(

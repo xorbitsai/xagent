@@ -8,12 +8,13 @@ filters or pagination cursors.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import re
+from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
+
+from .....builtin_identity import canonicalize_builtin_identity
 
 _ROCKETLANE_SERVER = "rocketlane"
 _ROCKETLANE_PROJECT_TOOL = "get_projects"
@@ -21,12 +22,16 @@ _PAGE_TOKEN_KEYS = frozenset({"cursor", "nextpagetoken", "pagetoken"})
 _PROJECT_ID_KEYS = frozenset({"id", "projectid"})
 _PROJECT_NAME_KEYS = frozenset({"name", "projectname"})
 _CUSTOMER_NAME_KEYS = frozenset({"companyname", "customercompany", "customername"})
+_NESTED_CUSTOMER_NAME_KEYS = frozenset({"name", "companyname", "customername"})
+_PROJECT_LIST_KEY_PRIORITY = {"projects": 0, "data": 1, "items": 2}
+_PAGINATION_KEYS = frozenset({"pagination"})
+_HAS_MORE_KEYS = frozenset({"hasmore"})
 _MAX_WALK_DEPTH = 10
 _MAX_WALK_NODES = 20_000
 
 
 def _key(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    return _search_text(value)
 
 
 def _search_text(value: Any) -> str:
@@ -38,7 +43,7 @@ def _search_text(value: Any) -> str:
 def _matches(query: str, candidate: str) -> bool:
     wanted = _search_text(query)
     actual = _search_text(candidate)
-    return bool(wanted and actual and (wanted in actual or actual in wanted))
+    return bool(wanted and actual and wanted in actual)
 
 
 def _walk(value: Any) -> Iterator[Any]:
@@ -54,6 +59,24 @@ def _walk(value: Any) -> Iterator[Any]:
             pending.extend((item, depth + 1) for item in current.values())
         elif isinstance(current, list):
             pending.extend((item, depth + 1) for item in current)
+
+
+def _walk_locations(value: Any) -> Iterator[tuple[Any, int, str | None]]:
+    """Walk breadth-first while retaining the normalized parent key."""
+    pending: deque[tuple[Any, int, str | None]] = deque([(value, 0, None)])
+    visited = 0
+    while pending and visited < _MAX_WALK_NODES:
+        current, depth, parent_key = pending.popleft()
+        visited += 1
+        yield current, depth, parent_key
+        if depth >= _MAX_WALK_DEPTH:
+            continue
+        if isinstance(current, Mapping):
+            pending.extend(
+                (item, depth + 1, _key(name)) for name, item in current.items()
+            )
+        elif isinstance(current, list):
+            pending.extend((item, depth + 1, None) for item in current)
 
 
 def _json_value(value: Any) -> Any | None:
@@ -121,12 +144,7 @@ def _customer_values(record: Mapping[str, Any]) -> list[str]:
         if isinstance(value, (str, int)) and str(value).strip():
             values.append(str(value).strip())
         elif isinstance(value, Mapping):
-            values.extend(
-                _direct_values(
-                    value,
-                    frozenset({"name", "companyname", "customername"}),
-                )
-            )
+            values.extend(_direct_values(value, _NESTED_CUSTOMER_NAME_KEYS))
     return values
 
 
@@ -138,29 +156,42 @@ def _project_identity(record: Mapping[str, Any]) -> str | None:
     return f"name:{_search_text(names[0])}" if names else None
 
 
-def _project_records(payloads: list[Any]) -> list[Mapping[str, Any]]:
-    candidates: list[list[Mapping[str, Any]]] = []
-    for payload in payloads:
-        for current in _walk(payload):
-            if not isinstance(current, list) or not current:
+def _project_records(payloads: list[Any]) -> list[Mapping[str, Any]] | None:
+    """Return the most likely project list, preserving an explicit empty list."""
+    named_candidates: list[tuple[int, int, int, list[Mapping[str, Any]]]] = []
+    fallback_candidates: list[tuple[int, int, int, int, list[Mapping[str, Any]]]] = []
+    for payload_index, payload in enumerate(payloads):
+        for current, depth, parent_key in _walk_locations(payload):
+            if not isinstance(current, list):
                 continue
             records = [item for item in current if isinstance(item, Mapping)]
-            if not records:
-                continue
             identities = sum(
                 _project_identity(record) is not None for record in records
             )
+            if parent_key in _PROJECT_LIST_KEY_PRIORITY and (not current or identities):
+                named_candidates.append(
+                    (
+                        _PROJECT_LIST_KEY_PRIORITY[parent_key],
+                        depth,
+                        payload_index,
+                        records,
+                    )
+                )
             if identities:
-                candidates.append(records)
-    if not candidates:
-        return []
-    return max(
-        candidates,
-        key=lambda records: (
-            sum(_project_identity(record) is not None for record in records),
-            len(records),
-        ),
-    )
+                # Prefer the shallowest qualifying list before using record
+                # count, so a project's nested phases/members cannot displace
+                # the outer project collection.
+                fallback_candidates.append(
+                    (depth, -identities, -len(records), payload_index, records)
+                )
+    if named_candidates:
+        return min(
+            named_candidates,
+            key=lambda candidate: (candidate[1], candidate[0], candidate[2]),
+        )[3]
+    if fallback_candidates:
+        return min(fallback_candidates, key=lambda candidate: candidate[:4])[4]
+    return None
 
 
 def _first_named_value(value: Any, names: frozenset[str]) -> Any | None:
@@ -210,6 +241,11 @@ def _project_fingerprint(records: list[Mapping[str, Any]]) -> tuple[str, ...]:
     )
 
 
+def _pagination(payloads: list[Any]) -> dict[str, Any] | None:
+    value = _first_named_value(payloads, _PAGINATION_KEYS)
+    return dict(value) if isinstance(value, Mapping) else None
+
+
 def _integrity_failure(reason: str) -> dict[str, Any]:
     return {
         "content": [
@@ -236,6 +272,7 @@ def _locally_filtered_result(
     *,
     project_name: str | None,
     customer_name: str | None,
+    pagination: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     payload = {
         "status": "success",
@@ -252,6 +289,8 @@ def _locally_filtered_result(
             "upstream filter was complete."
         ),
     }
+    if pagination is not None:
+        payload["pagination"] = dict(pagination)
     return {
         "content": [
             {
@@ -270,14 +309,19 @@ class MCPResultIntegrityGuard:
 
     source_server: str | None
     tool_name: str
-    _seen_pages: dict[str, set[tuple[str, ...]]] = field(default_factory=dict)
-    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _seen_pages: dict[str, dict[str | None, tuple[str, ...]]] = field(
+        default_factory=dict
+    )
 
     @property
     def enabled(self) -> bool:
-        return _key(self.source_server or "") == _ROCKETLANE_SERVER and _key(
-            self.tool_name
-        ) == _key(_ROCKETLANE_PROJECT_TOOL)
+        # Use the same collision-safe built-in identity normalization as the
+        # connector registries. In particular, a custom "Rocket-Lane" server
+        # remains ``rocket_lane`` after the adapter's source normalization and
+        # cannot accidentally enroll in this connector-specific guard.
+        return canonicalize_builtin_identity(self.source_server) == (
+            _ROCKETLANE_SERVER
+        ) and _key(self.tool_name) == _key(_ROCKETLANE_PROJECT_TOOL)
 
     async def validate(
         self,
@@ -287,37 +331,29 @@ class MCPResultIntegrityGuard:
         if not self.enabled or result.get("is_error") is True:
             return result
 
-        project_name = _argument_value(args, "projectName", "project_name")
-        customer_name = _argument_value(
-            args,
-            "customerName",
-            "customer_name",
-            "companyName",
-            "company_name",
-        )
+        project_name = _argument_value(args, "projectName")
+        customer_name = _argument_value(args, "customerName", "companyName")
         requested_page_token = _argument_value(
-            args, "pageToken", "page_token", "nextPageToken", "cursor"
+            args, "pageToken", "nextPageToken", "cursor"
         )
         payloads = _result_payloads(result)
         records = _project_records(payloads)
-        if not records:
+        if records is None:
             if project_name or customer_name or requested_page_token:
                 return _integrity_failure("project records were not readable")
             return result
 
         fingerprint = _project_fingerprint(records)
         signature = _query_signature(args)
-        async with self._lock:
-            seen = self._seen_pages.setdefault(signature, set())
-            if requested_page_token and fingerprint and fingerprint in seen:
-                return _integrity_failure(
-                    "a later page repeated the same project records"
-                )
-            if fingerprint:
-                seen.add(fingerprint)
+        seen = self._seen_pages.setdefault(signature, {})
+        if fingerprint and any(
+            token != requested_page_token and seen_fingerprint == fingerprint
+            for token, seen_fingerprint in seen.items()
+        ):
+            return _integrity_failure("a later page repeated the same project records")
 
         response_token = _first_named_value(payloads, _PAGE_TOKEN_KEYS)
-        has_more = _first_named_value(payloads, frozenset({"hasmore"}))
+        has_more = _first_named_value(payloads, _HAS_MORE_KEYS)
         if (
             requested_page_token
             and response_token is not None
@@ -328,30 +364,37 @@ class MCPResultIntegrityGuard:
         if has_more is True and response_token in (None, ""):
             return _integrity_failure("hasMore was true without a next page token")
 
-        if not project_name and not customer_name:
-            return result
+        checked_result = result
 
-        def matches_filters(record: Mapping[str, Any]) -> bool:
-            if project_name and not any(
-                _matches(project_name, value)
-                for value in _project_values(record, _PROJECT_NAME_KEYS)
-            ):
-                return False
-            if customer_name and not any(
-                _matches(customer_name, value) for value in _customer_values(record)
-            ):
-                return False
-            return True
+        if project_name or customer_name:
 
-        matched = [record for record in records if matches_filters(record)]
-        if not matched:
-            return _integrity_failure(
-                "the requested project/customer filter was ignored"
-            )
-        if len(matched) != len(records):
-            return _locally_filtered_result(
-                matched,
-                project_name=project_name,
-                customer_name=customer_name,
-            )
-        return result
+            def matches_filters(record: Mapping[str, Any]) -> bool:
+                if project_name and not any(
+                    _matches(project_name, value)
+                    for value in _project_values(record, _PROJECT_NAME_KEYS)
+                ):
+                    return False
+                if customer_name and not any(
+                    _matches(customer_name, value) for value in _customer_values(record)
+                ):
+                    return False
+                return True
+
+            matched = [record for record in records if matches_filters(record)]
+            if records and not matched and has_more is not True:
+                return _integrity_failure(
+                    "the requested project/customer filter was ignored"
+                )
+            if len(matched) != len(records):
+                checked_result = _locally_filtered_result(
+                    matched,
+                    project_name=project_name,
+                    customer_name=customer_name,
+                    pagination=_pagination(payloads),
+                )
+
+        # Record only verified pages. Re-fetching the same token is allowed;
+        # only a different token returning an already-seen page is suspect.
+        if fingerprint:
+            seen[requested_page_token] = fingerprint
+        return checked_result

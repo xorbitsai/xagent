@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from xagent.core.utils.encryption import get_cipher
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
-from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.models.user_oauth import UserOAuth, is_undecryptable_oauth_token
 
 
 @pytest.fixture(autouse=True)
@@ -49,6 +49,15 @@ def test_user_oauth_tokens_round_trip_encrypted_and_presence_filters(monkeypatch
             ]
         )
         session.commit()
+        session.execute(
+            text(
+                "INSERT INTO user_oauth "
+                "(user_id, provider, provider_user_id, access_token, refresh_token) "
+                "VALUES (:user_id, 'legacy', 'legacy', 'legacy-access', 'legacy-refresh')"
+            ),
+            {"user_id": user.id},
+        )
+        session.commit()
 
         encrypted = session.execute(
             text(
@@ -72,6 +81,9 @@ def test_user_oauth_tokens_round_trip_encrypted_and_presence_filters(monkeypatch
             .provider
             == "test-empty"
         )
+        legacy = session.query(UserOAuth).filter_by(provider="legacy").one()
+        assert legacy.access_token == "legacy-access"
+        assert legacy.refresh_token == "legacy-refresh"
 
 
 def test_wrong_key_marks_tokens_for_reauthorization_without_rewriting(
@@ -115,6 +127,12 @@ def test_wrong_key_marks_tokens_for_reauthorization_without_rewriting(
         row = session.query(UserOAuth).filter_by(provider="test").one()
         assert row.access_token == ""
         assert row.refresh_token == ""
+        assert is_undecryptable_oauth_token(row.access_token)
+        assert is_undecryptable_oauth_token(row.refresh_token)
+        # Loading a row under the wrong key must not cause a later flush to
+        # replace the recoverable ciphertext with the reconnect marker.
+        row.scope = "unchanged-ciphertext"
+        session.commit()
         raw_after = tuple(
             session.execute(
                 text(

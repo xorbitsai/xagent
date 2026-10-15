@@ -884,6 +884,22 @@ async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
     """Check if token is expired (or close to expiring) and refresh if needed."""
+    from ..models.user_oauth import is_undecryptable_oauth_token
+
+    # A ciphertext that cannot be opened with the configured key is exposed by
+    # the ORM as an empty reconnect marker.  Handle it before the expiry check
+    # so rows without ``expires_at`` cannot be treated as usable credentials.
+    if is_undecryptable_oauth_token(
+        getattr(oauth_account, "access_token", None)
+    ) or is_undecryptable_oauth_token(getattr(oauth_account, "refresh_token", None)):
+        logger.warning(
+            "Cannot refresh %s OAuth credentials for user %s: "
+            "stored token was encrypted with a rotated key; reconnect required",
+            provider_name,
+            oauth_account.user_id,
+        )
+        return False
+
     if not oauth_account.expires_at:
         return True  # Assume valid if no expiration is set
 

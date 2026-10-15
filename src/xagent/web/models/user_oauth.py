@@ -15,12 +15,26 @@ from .database import Base
 logger = logging.getLogger(__name__)
 
 
+class UndecryptableOAuthToken(str):
+    """Empty token marker for ciphertext that needs user reauthorization."""
+
+    requires_reconnect = True
+
+
+def is_undecryptable_oauth_token(value: object) -> bool:
+    """Return whether an ORM token value was unreadable under the current key."""
+    return isinstance(value, UndecryptableOAuthToken)
+
+
 class EncryptedOAuthToken(TypeDecorator[str]):
     """Encrypt OAuth tokens and fail closed if the configured key cannot open one.
 
     Fernet output is intentionally non-deterministic, so callers must not add
-    value-equality filters for these columns. Empty strings and NULL remain
-    supported for presence checks and ``IS NULL`` predicates.
+    value-equality filters for token contents. Empty strings and NULL remain
+    supported for presence checks and ``IS NULL`` predicates. A token encrypted
+    under a rotated key is exposed as an empty reconnect marker in Python, but
+    SQL filters still see its ciphertext; query consumers must inspect the
+    loaded value before attempting refresh or renewal.
     """
 
     impl = String
@@ -43,7 +57,7 @@ class EncryptedOAuthToken(TypeDecorator[str]):
                 "Unable to decrypt a stored UserOAuth token; "
                 "connection requires reauthorization"
             )
-            return ""
+            return UndecryptableOAuthToken("")
 
 
 USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512

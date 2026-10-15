@@ -218,11 +218,11 @@ def _matching_gmail_reconnect_tombstone(
         )
         .filter(
             UserOAuth.provider == connector_key,
-            UserOAuth.access_token == "",
         )
         .order_by(UserOAuth.id.desc())
         .all()
     )
+    candidates = [candidate for candidate in candidates if not candidate.access_token]
     normalized_provider_user_id = str(provider_user_id) if provider_user_id else None
     if normalized_provider_user_id is not None:
         for candidate in candidates:
@@ -3139,16 +3139,15 @@ def has_other_builtin_oauth_reference(
     """
     if not provider_user_id:
         return False
-    return (
+    candidates = (
         db.query(UserOAuth)
         .filter(
             UserOAuth.provider == provider,
             UserOAuth.provider_user_id == provider_user_id,
-            UserOAuth.access_token != "",
         )
-        .first()
-        is not None
+        .all()
     )
+    return any(candidate.access_token for candidate in candidates)
 
 
 def revoke_resolved_github_oauth_grant(revocation: BuiltinOAuthRevocation) -> None:

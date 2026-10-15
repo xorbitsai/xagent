@@ -194,34 +194,32 @@ def _legacy_mailbox_account_id(
     subscription leak forever.
     """
     live_matches = (
-        db.query(UserOAuth.id)
+        db.query(UserOAuth)
         .filter(
             UserOAuth.user_id == int(trigger.user_id),
             ordinary_gmail_clause(),
-            UserOAuth.access_token != "",
             func.lower(UserOAuth.email) == mailbox,
         )
         .order_by(UserOAuth.id)
-        .limit(2)
         .all()
     )
+    live_matches = [account for account in live_matches if account.access_token]
     if len(live_matches) == 1:
-        return int(live_matches[0][0])
+        return int(live_matches[0].id)
     if live_matches:
         return None
 
     all_matches = (
-        db.query(UserOAuth.id)
+        db.query(UserOAuth)
         .filter(
             UserOAuth.user_id == int(trigger.user_id),
             ordinary_gmail_clause(),
             func.lower(UserOAuth.email) == mailbox,
         )
         .order_by(UserOAuth.id)
-        .limit(2)
         .all()
     )
-    return int(all_matches[0][0]) if len(all_matches) == 1 else None
+    return int(all_matches[0].id) if len(all_matches) == 1 else None
 
 
 def _bearer_token(context: CallbackRequestContext) -> str | None:

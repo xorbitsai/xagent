@@ -1397,13 +1397,12 @@ def _provisioning_account(
         )
         .filter(
             UserOAuth.provider == GMAIL_OAUTH_PROVIDER,
-            UserOAuth.access_token != "",
             func.lower(UserOAuth.email) == mailbox,
         )
         .order_by(UserOAuth.id)
-        .limit(2)
         .all()
     )
+    matches = [account for account in matches if account.access_token]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -1626,8 +1625,9 @@ def _reconcile_gmail_trigger_batch(
         filters.append(GmailWatchState.oauth_account_id.in_(account_ids))
     if emails:
         filters.append(func.lower(GmailWatchState.email).in_(emails))
-    states = (
-        db.query(GmailWatchState)
+    state_rows = (
+        db.query(UserOAuth, GmailWatchState)
+        .select_from(GmailWatchState)
         .join(
             UserOAuth,
             and_(
@@ -1637,16 +1637,18 @@ def _reconcile_gmail_trigger_batch(
         )
         .filter(
             ordinary_gmail_clause(),
-            or_(
-                UserOAuth.access_token != "",
-                GmailWatchState.status == TriggerProvisioningStatus.FAILED.value,
-            ),
             or_(*filters),
         )
         .all()
         if filters
         else []
     )
+    states = [
+        state
+        for oauth_account, state in state_rows
+        if oauth_account.access_token
+        or state.status == TriggerProvisioningStatus.FAILED.value
+    ]
 
     states_by_account_id = {int(state.oauth_account_id): state for state in states}
     states_by_key = {
@@ -1672,10 +1674,10 @@ def _reconcile_gmail_trigger_batch(
                 .filter(
                     UserOAuth.id.in_(unresolved_bound_account_ids),
                     ordinary_gmail_clause(),
-                    UserOAuth.access_token != "",
                 )
                 .all()
             )
+            if account.access_token
         }
 
     updated = 0

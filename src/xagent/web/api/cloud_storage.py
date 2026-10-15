@@ -718,9 +718,11 @@ async def list_connected_accounts(
     if provider:
         query = query.filter(UserOAuth.provider == provider)
 
-    query = query.filter(UserOAuth.access_token != "")
-
-    accounts = query.all()
+    # A token encrypted with a rotated key is exposed by the ORM as an empty
+    # reconnect marker, while SQL still sees its ciphertext.  Keep this
+    # presence check in Python so unreadable credentials are not advertised as
+    # connected accounts.
+    accounts = [account for account in query.all() if account.access_token]
 
     return [
         {

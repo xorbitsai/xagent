@@ -72,6 +72,7 @@ def _format_error_with_traceback(error: Exception, context: str = "") -> str:
 
 _BROWSER_RESPONSE_MAX_BYTES = 16 * 1024 * 1024
 _BROWSER_REQUEST_DEADLINE_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 class _NoStoreCookiePolicy(DefaultCookiePolicy):
@@ -79,9 +80,6 @@ class _NoStoreCookiePolicy(DefaultCookiePolicy):
 
     def set_ok(self, cookie: Any, request: Any) -> bool:
         return False
-
-
-logger = logging.getLogger(__name__)
 
 
 def _sanitize_browser_url(value: str) -> str:
@@ -793,9 +791,6 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
 
     try:
         # Log navigation attempt for debugging
-        import logging
-
-        logger = logging.getLogger(__name__)
         logger.info(
             f"[browser_navigate] Navigating to {url} (headless={headless}, wait_until={wait_until})"
         )
@@ -827,10 +822,8 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             ),
         }
     except Exception as e:
-        import logging
         import traceback
 
-        logger = logging.getLogger(__name__)
         logger.error(f"[browser_navigate] Failed to navigate to {url}: {str(e)}")
         logger.error(f"[browser_navigate] Traceback: {traceback.format_exc()}")
 

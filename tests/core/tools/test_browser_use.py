@@ -96,6 +96,7 @@ class TestBrowserNavigate:
                     session_id="test-session",
                     url=html_path.as_uri(),
                     _workspace_root=str(tmp_path),
+                    _workspace_auth=browser_use._BROWSER_WORKSPACE_AUTH,
                 )
             )
             allowed_external = asyncio.run(
@@ -103,6 +104,7 @@ class TestBrowserNavigate:
                     session_id="test-session",
                     url=external_path.as_uri(),
                     _workspace_roots=[str(tmp_path), str(external_root)],
+                    _workspace_auth=browser_use._BROWSER_WORKSPACE_AUTH,
                 )
             )
             allowed_exact = asyncio.run(
@@ -110,6 +112,7 @@ class TestBrowserNavigate:
                     session_id="test-session",
                     url=materialized_path.as_uri(),
                     _workspace_file_paths=[str(materialized_path)],
+                    _workspace_auth=browser_use._BROWSER_WORKSPACE_AUTH,
                 )
             )
             blocked = asyncio.run(
@@ -118,11 +121,19 @@ class TestBrowserNavigate:
                     url=html_path.as_uri(),
                 )
             )
+            spoofed = asyncio.run(
+                browser_use.browser_navigate(
+                    session_id="test-session",
+                    url=html_path.as_uri(),
+                    _workspace_root="/",
+                )
+            )
 
         assert "Only public network URLs are allowed" not in allowed["error"]
         assert "Browser target is not allowed" not in allowed_external["error"]
         assert "Browser target is not allowed" not in allowed_exact["error"]
         assert blocked["error"] == "Browser target is not allowed"
+        assert spoofed["error"] == "Browser target is not allowed"
 
 
 class TestBrowserRequestGuard:

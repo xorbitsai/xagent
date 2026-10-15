@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from ....file_ref import build_workspace_file_ref
 from ....tools.core.browser_use import (
+    _BROWSER_WORKSPACE_AUTH,
     browser_click,
     browser_close,
     browser_evaluate,
@@ -404,7 +405,9 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         args.pop("_workspace_root", None)
         args.pop("_workspace_roots", None)
         args.pop("_workspace_file_paths", None)
+        args.pop("_workspace_auth", None)
         if self._workspace is not None:
+            args["_workspace_auth"] = _BROWSER_WORKSPACE_AUTH
             args["_workspace_root"] = str(self._workspace.workspace_dir)
             args["_workspace_roots"] = [
                 str(self._workspace.workspace_dir),

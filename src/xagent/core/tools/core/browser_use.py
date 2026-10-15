@@ -148,6 +148,7 @@ _PROXY_HEADER_LIMIT = 64 * 1024
 _PROXY_CONNECT_TIMEOUT = 10.0
 _PROXY_RESPONSE_TIMEOUT = 10.0
 _PROXY_MAX_REQUEST_BODY = 64 * 1024 * 1024
+_BROWSER_WORKSPACE_AUTH = object()
 
 _HTTP_FETCH_PATTERNS = [
     {"urlPattern": "http://*", "requestStage": "Request"},
@@ -1207,9 +1208,10 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "message": "",
             "error": "Missing required parameters: session_id and url are required",
         }
-    workspace_root = kwargs.get("_workspace_root")
-    workspace_roots = kwargs.get("_workspace_roots")
-    workspace_file_paths = kwargs.get("_workspace_file_paths")
+    trusted_call = kwargs.get("_workspace_auth") is _BROWSER_WORKSPACE_AUTH
+    workspace_root = kwargs.get("_workspace_root") if trusted_call else None
+    workspace_roots = kwargs.get("_workspace_roots") if trusted_call else None
+    workspace_file_paths = kwargs.get("_workspace_file_paths") if trusted_call else None
     trusted_workspace_roots = (
         tuple(root for root in workspace_roots if isinstance(root, str) and root)
         if isinstance(workspace_roots, (list, tuple))

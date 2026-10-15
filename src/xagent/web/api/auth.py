@@ -1481,7 +1481,7 @@ class UserProfileResponse(BaseModel):
 
 class UpdateEmailRequest(BaseModel):
     email: str
-    current_password: str
+    current_password: Optional[str] = None
 
 
 class UpdateEmailResponse(BaseModel):
@@ -1633,6 +1633,16 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password_material, bcrypt.gensalt()).decode("ascii")
 
 
+async def hash_password_async(password: str) -> str:
+    """Run bcrypt hashing off the FastAPI event loop."""
+    return await asyncio.to_thread(hash_password, password)
+
+
+async def verify_password_async(password: str, password_hash: str) -> bool:
+    """Run bcrypt verification off the FastAPI event loop."""
+    return await asyncio.to_thread(verify_password, password, password_hash)
+
+
 def verify_password(password: str, password_hash: str) -> bool:
     """Verify bcrypt passwords and transparently support legacy SHA-256 rows."""
     if password_hash.startswith(("$2a$", "$2b$", "$2y$")):
@@ -1647,7 +1657,11 @@ def verify_password(password: str, password_hash: str) -> bool:
     # Legacy rows were stored as a bare SHA-256 digest. Keep this fallback
     # only for migration; successful authentication is upgraded immediately.
     legacy_digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
-    return secrets.compare_digest(legacy_digest, password_hash)
+    valid = secrets.compare_digest(legacy_digest, password_hash)
+    if not valid:
+        # Keep legacy and unusable-password failures on the bcrypt timing floor.
+        verify_dummy()
+    return valid
 
 
 def needs_password_rehash(password_hash: str) -> bool:
@@ -1776,7 +1790,7 @@ async def setup_admin(
         user = User(
             username=request.username,
             email=email,
-            password_hash=hash_password(request.password),
+            password_hash=await hash_password_async(request.password),
             is_admin=True,
         )
         db.add(user)
@@ -1845,13 +1859,21 @@ async def update_register_switch(
     )
 
 
-def create_user(db: Session, username: str, email: str, password: str) -> User:
+def create_user(
+    db: Session,
+    username: str,
+    email: str,
+    password: str,
+    *,
+    password_hash: str | None = None,
+) -> User:
     """Create a new user without default model configurations.
 
     Users will use admin defaults via dynamic fallback logic until they set their own.
     No pre-creation of UserModel or UserDefaultModel records.
     """
-    password_hash = hash_password(password)
+    if password_hash is None:
+        password_hash = hash_password(password)
     user = User(username=username, email=email, password_hash=password_hash)
     db.add(user)
     db.flush()  # Get the user ID without committing
@@ -1919,6 +1941,7 @@ def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[st
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
+        "has_password": not str(user.password_hash).startswith("!"),
         "preferences": _normalized_preferences(user),
     }
     if include_login_time:
@@ -2085,7 +2108,13 @@ async def register(
             return RegisterResponse(success=False, message="Email already exists")
 
         # Create new user with inherited defaults
-        user = create_user(db, request.username, email, request.password)
+        user = create_user(
+            db,
+            request.username,
+            email,
+            request.password,
+            password_hash=await hash_password_async(request.password),
+        )
 
         return RegisterResponse(
             success=True,
@@ -2197,7 +2226,7 @@ async def reset_password(
                 success=False, message="Reset token has expired"
             )
 
-    setattr(user, "password_hash", hash_password(request.new_password))
+    setattr(user, "password_hash", await hash_password_async(request.new_password))
     setattr(user, "password_reset_token_hash", None)
     setattr(user, "password_reset_expires_at", None)
     setattr(user, "refresh_token", None)
@@ -2219,7 +2248,9 @@ async def change_password(
     """Change user password endpoint"""
     try:
         # Verify current password
-        if not verify_password(request.current_password, str(user.password_hash)):
+        if not await verify_password_async(
+            request.current_password, str(user.password_hash)
+        ):
             return ChangePasswordResponse(
                 success=False, message="Current password is incorrect"
             )
@@ -2232,7 +2263,7 @@ async def change_password(
             )
 
         # Update password
-        setattr(user, "password_hash", hash_password(request.new_password))
+        setattr(user, "password_hash", await hash_password_async(request.new_password))
         # A password change invalidates every currently issued refresh
         # session. Access tokens remain short-lived and will expire normally.
         setattr(user, "refresh_token", None)
@@ -2272,7 +2303,14 @@ async def update_current_user_email(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdateEmailResponse:
-    if not verify_password(request.current_password, str(user.password_hash)):
+    has_password = not str(user.password_hash).startswith("!")
+    if has_password and not request.current_password:
+        return UpdateEmailResponse(
+            success=False, message="Current password is required"
+        )
+    if has_password and not await verify_password_async(
+        request.current_password or "", str(user.password_hash)
+    ):
         return UpdateEmailResponse(
             success=False, message="Current password is incorrect"
         )

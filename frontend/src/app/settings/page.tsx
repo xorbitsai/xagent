@@ -35,6 +35,7 @@ export default function SettingsPage() {
   const [isChangingPassword, setIsChangingPassword] = useState(false)
   const [passwordMessage, setPasswordMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
   const { passwordMinLength } = useSetupStatus()
+  const hasPassword = user?.has_password !== false
 
   useEffect(() => {
     let isMounted = true
@@ -156,21 +157,23 @@ export default function SettingsPage() {
               />
             </div>
 
-            <div className="space-y-2">
-              <Label htmlFor="email-current-password">{t("settings.password.current")}</Label>
-              <Input
-                id="email-current-password"
-                type="password"
-                value={emailCurrentPassword}
-                onChange={(e) => setEmailCurrentPassword(e.target.value)}
-                placeholder={t("settings.password.current_placeholder")}
-                disabled={isProfileLoading || isSavingEmail}
-              />
-            </div>
+            {hasPassword && (
+              <div className="space-y-2">
+                <Label htmlFor="email-current-password">{t("settings.password.current")}</Label>
+                <Input
+                  id="email-current-password"
+                  type="password"
+                  value={emailCurrentPassword}
+                  onChange={(e) => setEmailCurrentPassword(e.target.value)}
+                  placeholder={t("settings.password.current_placeholder")}
+                  disabled={isProfileLoading || isSavingEmail}
+                />
+              </div>
+            )}
 
             <Button
               onClick={handleEmailUpdate}
-              disabled={isProfileLoading || isSavingEmail || !email.trim() || !emailCurrentPassword}
+              disabled={isProfileLoading || isSavingEmail || !email.trim() || (hasPassword && !emailCurrentPassword)}
               className="w-full"
             >
               {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
@@ -317,7 +320,7 @@ export default function SettingsPage() {
         },
         body: JSON.stringify({
           email,
-          current_password: emailCurrentPassword,
+          ...(hasPassword ? { current_password: emailCurrentPassword } : {}),
         })
       })
 

@@ -1403,6 +1403,33 @@ class TestAuthAPI:
         assert data["success"] is True
         assert data["user"]["email"] == "updated@example.com"
 
+    def test_oidc_user_email_update_does_not_require_local_password(self, test_db):
+        db = TestingSessionLocal()
+        try:
+            user = User(
+                username="oidc-user",
+                email="oidc@example.com",
+                password_hash="!oidc-google",
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            result = asyncio.run(
+                auth_api.update_current_user_email(
+                    request=auth_api.UpdateEmailRequest(email="new@example.com"),
+                    db=db,
+                    user=user,
+                )
+            )
+
+            assert result.success is True
+            assert result.user is not None
+            assert result.user["email"] == "new@example.com"
+            assert result.user["has_password"] is False
+        finally:
+            db.close()
+
     def test_update_current_user_email_rejects_duplicate(self, test_db):
         setup_first_admin()
         response = client.post(

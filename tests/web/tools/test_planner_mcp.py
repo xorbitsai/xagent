@@ -303,6 +303,30 @@ def test_bounded_plan_list_compact_projection_keeps_null_web_url(monkeypatch):
     assert all(plan["web_url"] is None for plan in result["plans"])
 
 
+def test_bounded_group_list_compact_projection_keeps_display_name(monkeypatch):
+    monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: 550)
+    groups = [
+        {
+            "id": f"group-{index}",
+            "displayName": f"Team {index}",
+            "description": "x" * 256,
+            "largeFutureField": "y" * 256,
+        }
+        for index in range(5)
+    ]
+
+    response = planner._bounded_list_response(
+        "groups", groups, next_link=None, retry_next_link=None
+    )
+    result = json.loads(response)
+
+    assert result["projection"] == "identity_and_label"
+    assert result["groups"][0] == {
+        "id": "group-0",
+        "displayName": "Team 0",
+    }
+
+
 @pytest.mark.parametrize("configured_limit", [18, 0, -1])
 def test_bounded_envelopes_remain_valid_below_minimum(monkeypatch, configured_limit):
     monkeypatch.setattr(planner, "get_tool_max_output_length", lambda: configured_limit)
@@ -391,6 +415,91 @@ def test_resolve_list_path_accepts_percent_encoding_case_difference():
 # ---------------------------------------------------------------------------
 # plans
 # ---------------------------------------------------------------------------
+
+
+def test_list_my_groups_success(monkeypatch):
+    next_link = f"{planner.GRAPH_BASE_URL}/me/joinedTeams?%24skiptoken=next"
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "value": [
+                    {
+                        "id": "group-1",
+                        "displayName": "Product",
+                        "description": "Product team",
+                    }
+                ],
+                "@odata.nextLink": next_link,
+            }
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_my_groups())
+
+    assert result == {
+        "status": "success",
+        "groups": [
+            {
+                "id": "group-1",
+                "displayName": "Product",
+                "description": "Product team",
+            }
+        ],
+        "next_link": next_link,
+        "truncated": False,
+    }
+    assert mock_request.call_args.kwargs["url"].endswith("/me/joinedTeams")
+
+
+def test_list_my_groups_fetches_next_page(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"value": [{"id": "group-2", "displayName": "Sales"}]}
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/joinedTeams?%24skiptoken=next"
+
+    result = json.loads(planner.planner_list_my_groups(next_link=next_link))
+
+    assert result["status"] == "success"
+    assert result["groups"][0]["id"] == "group-2"
+    assert mock_request.call_args.kwargs["url"] == next_link
+
+
+def test_list_my_groups_rejects_other_graph_collection(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+    next_link = f"{planner.GRAPH_BASE_URL}/me/memberOf?%24skiptoken=next"
+
+    result = json.loads(planner.planner_list_my_groups(next_link=next_link))
+
+    assert result["status"] == "error"
+    assert "next_link" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_my_groups_missing_scope_asks_for_reconnect(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges to complete the operation.",
+                }
+            },
+            status_code=403,
+            url=f"{planner.GRAPH_BASE_URL}/me/joinedTeams",
+        )
+    )
+    monkeypatch.setattr(planner.requests, "request", mock_request)
+
+    result = json.loads(planner.planner_list_my_groups())
+
+    assert result["status"] == "error"
+    assert "Reconnect the Planner connector" in result["message"]
+    assert "Team.ReadBasic.All" in result["message"]
 
 
 def test_list_plans_success(monkeypatch):

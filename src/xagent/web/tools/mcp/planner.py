@@ -250,6 +250,7 @@ def _created_object(result: Any, resource_name: str) -> dict[str, Any]:
 
 _LIST_PROJECTION_FIELDS: dict[str, tuple[str, ...]] = {
     "plans": ("web_url", "id", "title", "owner", "createdDateTime"),
+    "groups": ("id", "displayName", "description"),
     "buckets": ("id", "name", "planId", "orderHint"),
     "tasks": (
         "id",
@@ -326,7 +327,10 @@ def _bounded_list_response(
     if len(response) <= max_output_length:
         return response
 
-    label_field = "name" if list_field == "buckets" else "title"
+    label_field = {
+        "buckets": "name",
+        "groups": "displayName",
+    }.get(list_field, "title")
     compact: list[Any] = []
     for item in projected:
         if not isinstance(item, dict):
@@ -632,6 +636,42 @@ def _list_plans_page(default_path: str, next_link: str | None) -> str:
 
 
 @mcp.tool()
+def planner_list_my_groups(next_link: str | None = None) -> str:
+    """List Teams-backed Microsoft 365 groups the signed-in user has joined.
+
+    Call this before ``planner_create_plan`` when the user has not supplied a
+    verified Microsoft 365 group id. Use only an id returned by this tool for
+    the create call; never substitute a user id, SharePoint site or drive id,
+    or a SharePoint drive owner's id. If several groups are returned, ask the
+    user which group should own the plan.
+
+    next_link is optional -- pass the next_link value from a previous
+    response to fetch the next page instead of the first.
+    """
+    try:
+        path = _resolve_list_path("/me/joinedTeams", next_link)
+        result = _graph_request("GET", path)
+        return _bounded_list_response(
+            "groups",
+            result.get("value", []),
+            next_link=result.get("@odata.nextLink"),
+            retry_next_link=next_link,
+        )
+    except _GraphRequestError as e:
+        logger.error("Error listing the signed-in user's joined teams: %s", e)
+        if e.status_code == 403:
+            return _error(
+                "Planner cannot list the signed-in user's Microsoft 365 groups. "
+                "Reconnect the Planner connector to grant Team.ReadBasic.All; "
+                "your Microsoft 365 administrator may need to approve it."
+            )
+        return _error(str(e))
+    except Exception as e:
+        logger.error("Error listing the signed-in user's joined teams: %s", e)
+        return _error(str(e))
+
+
+@mcp.tool()
 def planner_list_plans(group_id: str, next_link: str | None = None) -> str:
     """List the Planner plans owned by a Microsoft 365 group.
 
@@ -709,6 +749,12 @@ def planner_get_plan(plan_id: str) -> str:
 @mcp.tool()
 def planner_create_plan(group_id: str, title: str) -> str:
     """Create a new Planner plan owned by a Microsoft 365 group.
+
+    When a verified group id was not supplied by the user, call
+    ``planner_list_my_groups`` first and use an id it returns. Never guess or
+    reuse a user id, SharePoint site or drive id, or SharePoint drive-owner id
+    as ``group_id``. If several groups are available, ask the user which one
+    should own the plan before creating it.
 
     The returned plan's ``web_url`` is the browser-safe link to share with
     users. Never substitute the plan's Graph ``container.url`` for it. If

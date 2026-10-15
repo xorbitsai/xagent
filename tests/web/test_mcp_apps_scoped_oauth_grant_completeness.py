@@ -91,6 +91,7 @@ def test_whatsapp_scopes_actually_exceed_the_meta_providers_default_scopes():
 def test_planner_scopes_exceed_the_microsoft_providers_default_scopes():
     assert _app_scopes_beyond_provider_defaults("planner") == {
         "Tasks.ReadWrite",
+        "Team.ReadBasic.All",
         "offline_access",
     }
 

@@ -196,8 +196,45 @@ class TestBrowserRequestGuard:
         assert cdp.send.await_count == 1
         cdp.send.assert_awaited_once_with(
             "Fetch.enable",
-            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+            {"patterns": browser_use._HTTP_FETCH_PATTERNS},
         )
+
+    @pytest.mark.asyncio
+    async def test_context_route_blocks_unauthorized_file_requests(self, tmp_path):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        outside = tmp_path.parent / "outside.html"
+        outside.write_text("<html></html>", encoding="utf-8")
+        route = MagicMock()
+        route.request.url = outside.as_uri()
+        route.abort = AsyncMock()
+        route.fallback = AsyncMock()
+
+        await session._guard_context_route(route)
+
+        route.abort.assert_awaited_once_with("blockedbyclient")
+        route.fallback.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_context_route_allows_authorized_file_and_falls_back_for_http(
+        self, tmp_path
+    ):
+        session = browser_use.BrowserSession("guard", workspace_root=str(tmp_path))
+        local_file = tmp_path / "page.html"
+        local_file.write_text("<html></html>", encoding="utf-8")
+
+        local_route = MagicMock()
+        local_route.request.url = local_file.as_uri()
+        local_route.abort = AsyncMock()
+        local_route.fallback = AsyncMock()
+        await session._guard_context_route(local_route)
+        local_route.fallback.assert_awaited_once_with()
+        local_route.abort.assert_not_awaited()
+
+        http_route = MagicMock()
+        http_route.request.url = "https://example.com/"
+        http_route.fallback = AsyncMock()
+        await session._guard_context_route(http_route)
+        http_route.fallback.assert_awaited_once_with()
 
     @pytest.mark.asyncio
     async def test_page_guard_failure_is_propagated(self):
@@ -533,6 +570,7 @@ class TestBrowserSession:
         playwright.chromium.launch = AsyncMock(return_value=browser)
         browser.new_context = AsyncMock(return_value=context)
         context.new_page = AsyncMock(return_value=page)
+        context.route = AsyncMock()
         context.new_cdp_session = AsyncMock(return_value=cdp)
         context.add_init_script = AsyncMock()
         cdp.send = AsyncMock()
@@ -550,7 +588,9 @@ class TestBrowserSession:
         assert "--no-sandbox" not in launch_kwargs["args"]
         assert launch_kwargs["proxy"] == {
             "server": "http://127.0.0.1:43123",
-            "bypass": "",
+            "bypass": "<-loopback>",
         }
+        context.route.assert_awaited_once()
+        assert context.route.await_args.args[0] == "**/*"
 
         await session.close()

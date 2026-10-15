@@ -146,6 +146,13 @@ async def _validate_browser_target(
 _PROXY_HEADER_LIMIT = 64 * 1024
 _PROXY_CONNECT_TIMEOUT = 10.0
 
+_HTTP_FETCH_PATTERNS = [
+    {"urlPattern": "http://*", "requestStage": "Request"},
+    {"urlPattern": "https://*", "requestStage": "Request"},
+    {"urlPattern": "ws://*", "requestStage": "Request"},
+    {"urlPattern": "wss://*", "requestStage": "Request"},
+]
+
 
 class _BrowserEgressProxy:
     """Small loopback proxy that pins each connection to validated DNS IPs.
@@ -431,12 +438,14 @@ class BrowserSession:
         self._initialized = False
 
     async def _guard_page_requests(self, page: Page) -> None:
-        """Validate every Chromium request, including redirect hops.
+        """Validate network requests, including HTTP redirect hops.
 
         Playwright's route API invokes a handler only for the first request in
-        a redirect chain. The Chromium Fetch domain emits a pause for each
+        a redirect chain. The Chromium Fetch domain emits a pause for each HTTP
         hop, so using it here keeps Chromium's cookie and redirect semantics
-        while applying the URL policy to subresources and redirects.
+        while applying the URL policy to network subresources and redirects.
+        Local-file requests are gated by the context route installed before
+        the first page exists.
         """
         page_key = id(page)
         if self._context is None:
@@ -510,7 +519,7 @@ class BrowserSession:
         try:
             await cdp.send(
                 "Fetch.enable",
-                {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+                {"patterns": _HTTP_FETCH_PATTERNS},
             )
         except BaseException as exc:
             self._guarded_pages.discard(page_key)
@@ -563,6 +572,38 @@ class BrowserSession:
         page.on("close", forget_page)
         if not ready.done():
             ready.set_result(None)
+
+    async def _guard_context_route(self, route: Any) -> None:
+        """Gate local-file requests before popup or frame navigation starts.
+
+        A page-level CDP session is installed asynchronously after Chromium
+        creates a popup target.  BrowserContext routing is registered before
+        the first page exists, so it also covers a popup's first request and
+        requests from out-of-process iframes.  HTTP(S)/WebSocket traffic is
+        intentionally left to the browser-wide pinned egress proxy and the
+        CDP redirect guard; this route is the synchronous local-file boundary
+        that the proxy cannot enforce.
+        """
+        request_url = route.request.url
+        try:
+            scheme = urlsplit(request_url).scheme.lower()
+        except ValueError:
+            scheme = ""
+        if scheme != "file":
+            await route.fallback()
+            return
+        try:
+            await _validate_browser_target(
+                request_url,
+                workspace_root=self.workspace_root,
+                workspace_roots=self.workspace_roots,
+                workspace_file_paths=self.workspace_file_paths,
+            )
+        except Exception:
+            logger.info("Blocked browser local-file request: %s", request_url)
+            await route.abort("blockedbyclient")
+            return
+        await route.fallback()
 
     def _schedule_page_guard(self, page: Page) -> None:
         task = asyncio.create_task(self._guard_page_requests(page))
@@ -623,7 +664,10 @@ class BrowserSession:
                     headless=self.headless,
                     args=browser_args,
                     chromium_sandbox=not allow_unsandboxed,
-                    proxy={"server": proxy_server, "bypass": ""},
+                    # Chromium otherwise has an implicit loopback bypass on
+                    # some versions.  Make the proxy boundary explicit so
+                    # loopback/private destinations cannot skip validation.
+                    proxy={"server": proxy_server, "bypass": "<-loopback>"},
                 )
             except Exception:
                 await self.close()
@@ -652,6 +696,7 @@ class BrowserSession:
                 raise
 
             try:
+                await self._context.route("**/*", self._guard_context_route)
                 self._context.on("page", self._schedule_page_guard)
                 self._page = await self._context.new_page()
                 await self._guard_page_requests(self._page)

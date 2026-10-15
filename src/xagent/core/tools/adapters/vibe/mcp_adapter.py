@@ -1730,7 +1730,7 @@ def _mcp_return_value_as_string(value: Any) -> str:
         return str(value)
 
 
-# Some MCP servers (e.g. the Xero server) report a failed call as one line of
+# The third-party Xero server can report a failed call as one line of
 # ordinary text, ``Error <doing something>: <cause>``, without setting
 # ``isError``. Left alone, such a result counts as a success for the agent's
 # repeated-tool accounting.
@@ -1910,8 +1910,8 @@ class MCPToolAdapter(AbstractBaseTool):
         self._is_excel_tool = (
             self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
         )
-        # The retired third-party Xero server returned failures as a successful,
-        # single-line ``Error <operation>: <cause>`` payload. Keep that narrow
+        # The third-party Xero server can return failures as a successful,
+        # single-line ``Error <operation>: <cause>`` payload. Keep this narrow
         # compatibility only for Xero: applying the heuristic to every MCP
         # server misclassifies legitimate output such as an error-budget metric.
         self._detect_legacy_plain_text_error = (

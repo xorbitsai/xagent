@@ -6923,7 +6923,11 @@ async def test_registry_path_hides_auth_rejected_placeholder_after_summary(
     assert (entry.cause_type, entry.status_code) == ("HTTPStatusError", 403)
 
 
-def _mcp_tool_adapter(tool_name: str, name_prefix: str = "mcp_Xero_") -> MCPToolAdapter:
+def _mcp_tool_adapter(
+    tool_name: str,
+    name_prefix: str = "mcp_Xero_",
+    source_server: str = "xero",
+) -> MCPToolAdapter:
     return MCPToolAdapter(
         mcp_tool=SimpleNamespace(
             name=tool_name,
@@ -6932,7 +6936,7 @@ def _mcp_tool_adapter(tool_name: str, name_prefix: str = "mcp_Xero_") -> MCPTool
         ),
         connection={"transport": "stdio", "command": "python", "args": []},
         name_prefix=name_prefix,
-        source_server="xero",
+        source_server=source_server,
     )
 
 
@@ -6945,6 +6949,16 @@ def test_mcp_tool_adapter_decision_group_is_the_tool_name():
     assert invoices.decision_group == "mcp_Xero_list_invoices"
     assert contacts.decision_group == "mcp_Xero_list_contacts"
     assert invoices.metadata.decision_group != contacts.metadata.decision_group
+
+
+def test_plain_text_error_compat_is_enabled_only_for_xero():
+    xero = _mcp_tool_adapter("list_invoices")
+    stripe = _mcp_tool_adapter(
+        "list_invoices", name_prefix="mcp_Stripe_", source_server="stripe"
+    )
+
+    assert xero._detect_legacy_plain_text_error is True
+    assert stripe._detect_legacy_plain_text_error is False
 
 
 @pytest.mark.parametrize(
@@ -6980,7 +6994,10 @@ def test_normalized_mcp_call_result_flags_plain_text_error(text):
     ],
 )
 def test_normalized_mcp_call_result_keeps_ordinary_text_successful(content):
-    result = _normalized_mcp_call_result(CallToolResult(content=content))
+    result = _normalized_mcp_call_result(
+        CallToolResult(content=content),
+        detect_legacy_plain_text_error=True,
+    )
 
     assert result["is_error"] is False
 
@@ -6993,6 +7010,30 @@ def test_normalized_mcp_call_result_does_not_apply_xero_compat_globally():
     )
 
     assert result["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_xero_plain_text_error_flows_through_execute_as_failed(monkeypatch):
+    adapter = _mcp_tool_adapter("list_invoices")
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return CallToolResult(
+                content=[TextContent(type="text", text="Error listing invoices: boom")]
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", _fake_create_session)
+
+    result = await adapter._execute_mcp_call(adapter.connection, {}, {})
+
+    assert result["is_error"] is True
 
 
 def test_normalized_mcp_call_result_preserves_server_reported_error():

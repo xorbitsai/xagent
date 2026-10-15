@@ -14325,12 +14325,30 @@ def _record_completed_calls(
         pattern.tool_call_id_index[record.tool_call_id] = record.invocation_id
 
 
+def _react_mcp_tool_adapter(tool_name: str):
+    from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
+
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name=tool_name,
+            description=tool_name,
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection={"transport": "stdio", "command": "python", "args": []},
+        name_prefix="mcp_Xero_",
+        source_server="xero",
+    )
+
+
 def test_react_repeated_guard_counts_each_decision_group_separately() -> None:
     pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
-    pattern._tool_decision_groups_by_name = {
-        "mcp_Xero_list_invoices": "mcp_Xero_list_invoices",
-        "mcp_Xero_list_aged_receivables": "mcp_Xero_list_aged_receivables",
-    }
+    tools = [
+        _react_mcp_tool_adapter("list_invoices"),
+        _react_mcp_tool_adapter("list_aged_receivables"),
+    ]
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        tools
+    )
     _record_completed_calls(
         pattern,
         [
@@ -14368,15 +14386,26 @@ def test_react_repeated_guard_marks_paged_runs() -> None:
     assert "more pages may exist" in prompt
 
 
-@pytest.mark.parametrize("argument", ["skip", "next_skip", "nextSkip"])
-def test_react_repeated_guard_marks_skip_paged_runs(argument: str) -> None:
+@pytest.mark.parametrize(
+    ("argument", "values"),
+    [
+        ("page", (1, 2, 3, 4)),
+        ("cursor", ("a", "b", "c", "d")),
+        ("offset", (0, 50, 100, 150)),
+        ("page_token", ("a", "b", "c", "d")),
+        ("skip", (0, 50, 100, 150)),
+        ("next_skip", (0, 50, 100, 150)),
+        ("starting_after", ("a", "b", "c", "d")),
+        ("page_index", (0, 1, 2, 3)),
+    ],
+)
+def test_react_repeated_guard_marks_advancing_paged_runs(
+    argument: str, values: tuple[Any, ...]
+) -> None:
     pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
     _record_completed_calls(
         pattern,
-        [
-            ("mcp_Xero_list_overdue_invoices", {argument: skip})
-            for skip in (0, 50, 100, 150)
-        ],
+        [("mcp_Xero_list_overdue_invoices", {argument: value}) for value in values],
     )
 
     metadata = pattern._repeated_tool_call_metadata(
@@ -14389,6 +14418,50 @@ def test_react_repeated_guard_marks_skip_paged_runs(argument: str) -> None:
         -1
     ]["content"]
     assert "offset, or skip" in prompt
+
+
+def test_react_repeated_guard_does_not_mark_identical_page_arguments() -> None:
+    pattern = ReActPattern(repeated_tool_decision_after_consecutive_tool_calls=4)
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": 1}) for _ in range(4)],
+    )
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert "paginated" not in metadata
+
+
+def test_react_work_attempt_guard_marks_pagination_after_failed_page() -> None:
+    pattern = ReActPattern(
+        repeated_tool_decision_after_consecutive_tool_calls=4,
+        repeated_tool_decision_after_consecutive_work_tool_calls=3,
+    )
+    _record_completed_calls(
+        pattern,
+        [("list_invoices", {"page": 1}), ("list_invoices", {"page": 2})],
+    )
+    failed = ToolCallRecord(
+        tool_call_id="call_failed",
+        invocation_id="inv_failed",
+        tool_name="list_invoices",
+        args={"page": 3},
+        args_hash="hash_failed",
+        status="failed",
+        result={
+            "content": [{"text": "Error listing invoices: boom"}],
+            "is_error": True,
+        },
+    )
+    pattern.tool_ledger[failed.invocation_id] = failed
+    pattern.tool_call_id_index[failed.tool_call_id] = failed.invocation_id
+
+    metadata = pattern._repeated_tool_call_metadata({"name": "list_invoices"})
+
+    assert metadata is not None
+    assert metadata["trigger"] == "work_tool_attempts"
+    assert metadata["paginated"] is True
 
 
 def test_react_repeated_guard_leaves_unpaged_runs_unmarked() -> None:

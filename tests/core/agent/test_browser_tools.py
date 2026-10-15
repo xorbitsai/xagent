@@ -161,6 +161,7 @@ async def test_browser_navigate_injects_authorized_external_roots(
         str(workspace.workspace_dir),
         str(external_root.resolve()),
     ]
+    assert captured["_workspace_file_paths"] == [str(external_file.resolve())]
 
 
 @pytest.mark.asyncio

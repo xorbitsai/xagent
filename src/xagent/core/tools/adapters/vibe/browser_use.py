@@ -403,6 +403,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
         args = dict(args)
         args.pop("_workspace_root", None)
         args.pop("_workspace_roots", None)
+        args.pop("_workspace_file_paths", None)
         if self._workspace is not None:
             args["_workspace_root"] = str(self._workspace.workspace_dir)
             args["_workspace_roots"] = [
@@ -451,6 +452,7 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
 
                 if resolved_path.exists():
                     args["url"] = resolved_path.as_uri()
+                    args["_workspace_file_paths"] = [str(resolved_path)]
                     logger.info(
                         f"[BrowserNavigateTool] Converted to file:// URL: {args['url']}"
                     )

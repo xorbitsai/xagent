@@ -69,11 +69,12 @@ def _workspace_file_path(
     url: str,
     workspace_root: str | None = None,
     workspace_roots: Sequence[str] | None = None,
+    workspace_file_paths: Sequence[str] | None = None,
 ) -> Path | None:
     """Return a file contained by an authorized root, or ``None`` if unsafe."""
     roots = [workspace_root] if workspace_root else []
     roots.extend(workspace_roots or ())
-    if not roots:
+    if not roots and not workspace_file_paths:
         return None
     try:
         parsed = urlsplit(url)
@@ -84,6 +85,14 @@ def _workspace_file_path(
         return None
     if not candidate.is_file():
         return None
+    for file_path in workspace_file_paths or ():
+        if not isinstance(file_path, str) or not file_path:
+            continue
+        try:
+            if candidate == Path(file_path).expanduser().resolve():
+                return candidate
+        except (OSError, ValueError):
+            continue
     for root_value in roots:
         if not isinstance(root_value, str) or not root_value:
             continue
@@ -100,6 +109,7 @@ async def _validate_browser_target(
     *,
     workspace_root: str | None = None,
     workspace_roots: Sequence[str] | None = None,
+    workspace_file_paths: Sequence[str] | None = None,
 ) -> None:
     """Validate a browser target and every request made by its page."""
     try:
@@ -116,7 +126,10 @@ async def _validate_browser_target(
     if scheme == "file":
         if (
             _workspace_file_path(
-                url, workspace_root=workspace_root, workspace_roots=workspace_roots
+                url,
+                workspace_root=workspace_root,
+                workspace_roots=workspace_roots,
+                workspace_file_paths=workspace_file_paths,
             )
             is None
         ):
@@ -368,6 +381,7 @@ class BrowserSession:
         locale: Optional[str] = None,
         workspace_root: str | None = None,
         workspace_roots: Sequence[str] | None = None,
+        workspace_file_paths: Sequence[str] | None = None,
     ):
         """
         Initialize a browser session.
@@ -389,6 +403,13 @@ class BrowserSession:
                 for root in ((workspace_root,) if workspace_root else ())
                 + tuple(workspace_roots or ())
                 if isinstance(root, str) and root
+            )
+        )
+        self.workspace_file_paths = tuple(
+            dict.fromkeys(
+                file_path
+                for file_path in (workspace_file_paths or ())
+                if isinstance(file_path, str) and file_path
             )
         )
         # No caller ever supplies a per-request timezone (no tool schema
@@ -456,6 +477,7 @@ class BrowserSession:
                     request_url,
                     workspace_root=self.workspace_root,
                     workspace_roots=self.workspace_roots,
+                    workspace_file_paths=self.workspace_file_paths,
                 )
             except Exception:
                 # Fail closed if validation or DNS resolution fails. Leaving
@@ -795,6 +817,7 @@ class BrowserSessionManager:
         locale: Optional[str] = None,
         workspace_root: str | None = None,
         workspace_roots: Sequence[str] | None = None,
+        workspace_file_paths: Sequence[str] | None = None,
     ) -> BrowserSession:
         """
         Get or create a browser session (async-safe).
@@ -828,6 +851,12 @@ class BrowserSessionManager:
                     existing.workspace_root = workspace_root
                 if workspace_roots and not existing.workspace_roots:
                     existing.workspace_roots = tuple(workspace_roots)
+                if workspace_file_paths:
+                    existing.workspace_file_paths = tuple(
+                        dict.fromkeys(
+                            (*existing.workspace_file_paths, *workspace_file_paths)
+                        )
+                    )
                 existing._last_used = datetime.now()
                 return existing
 
@@ -842,6 +871,7 @@ class BrowserSessionManager:
                 locale=locale,
                 workspace_root=workspace_root,
                 workspace_roots=workspace_roots,
+                workspace_file_paths=workspace_file_paths,
             )
             self._sessions[session_id] = new_session
             new_session._last_used = datetime.now()
@@ -961,9 +991,15 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         }
     workspace_root = kwargs.get("_workspace_root")
     workspace_roots = kwargs.get("_workspace_roots")
+    workspace_file_paths = kwargs.get("_workspace_file_paths")
     trusted_workspace_roots = (
         tuple(root for root in workspace_roots if isinstance(root, str) and root)
         if isinstance(workspace_roots, (list, tuple))
+        else None
+    )
+    trusted_workspace_file_paths = (
+        tuple(path for path in workspace_file_paths if isinstance(path, str) and path)
+        if isinstance(workspace_file_paths, (list, tuple))
         else None
     )
     try:
@@ -971,6 +1007,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             str(url),
             workspace_root=workspace_root if isinstance(workspace_root, str) else None,
             workspace_roots=trusted_workspace_roots,
+            workspace_file_paths=trusted_workspace_file_paths,
         )
     except (TypeError, ValueError):
         return {
@@ -1005,6 +1042,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
         locale=locale,
         workspace_root=workspace_root if isinstance(workspace_root, str) else None,
         workspace_roots=trusted_workspace_roots,
+        workspace_file_paths=trusted_workspace_file_paths,
     )
     page = await session.get_page()
 

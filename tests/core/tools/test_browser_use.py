@@ -85,6 +85,10 @@ class TestBrowserNavigate:
         external_root.mkdir()
         external_path = external_root / "uploaded.html"
         external_path.write_text("<html><body>uploaded</body></html>", encoding="utf-8")
+        materialized_path = tmp_path / "materialized.html"
+        materialized_path.write_text(
+            "<html><body>materialized</body></html>", encoding="utf-8"
+        )
 
         with patch("xagent.core.tools.core.browser_use.PLAYWRIGHT_AVAILABLE", False):
             allowed = asyncio.run(
@@ -101,6 +105,13 @@ class TestBrowserNavigate:
                     _workspace_roots=[str(tmp_path), str(external_root)],
                 )
             )
+            allowed_exact = asyncio.run(
+                browser_use.browser_navigate(
+                    session_id="test-session",
+                    url=materialized_path.as_uri(),
+                    _workspace_file_paths=[str(materialized_path)],
+                )
+            )
             blocked = asyncio.run(
                 browser_use.browser_navigate(
                     session_id="test-session",
@@ -110,6 +121,7 @@ class TestBrowserNavigate:
 
         assert "Only public network URLs are allowed" not in allowed["error"]
         assert "Browser target is not allowed" not in allowed_external["error"]
+        assert "Browser target is not allowed" not in allowed_exact["error"]
         assert blocked["error"] == "Browser target is not allowed"
 
 

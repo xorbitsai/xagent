@@ -237,7 +237,10 @@ class BrowserSession:
 
             self._http_client = httpx.AsyncClient(
                 transport=PublicNetworkAsyncHTTPTransport(proxy_url=proxy_url),
-                follow_redirects=True,
+                # Let Chromium follow redirects through the context route. If
+                # httpx follows them here, the final response is fulfilled for
+                # the original Playwright request and keeps the wrong origin.
+                follow_redirects=False,
                 timeout=httpx.Timeout(30.0),
                 cookies=CookieJar(policy=_NoStoreCookiePolicy()),
             )
@@ -304,7 +307,9 @@ class BrowserSession:
                     writable: false
                 });
             """.replace("__XAGENT_LANGUAGES__", spoofed_languages)
-            await self._page.add_init_script(init_script)
+            # Context-level scripts also cover popup pages created with
+            # window.open(), not only the initial page.
+            await self._context.add_init_script(init_script)
 
             self._initialized = True
 

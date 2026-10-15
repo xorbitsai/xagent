@@ -339,8 +339,8 @@ class TestBrowserSession:
         context = MagicMock()
         context.route = AsyncMock()
         context.route_web_socket = AsyncMock()
+        context.add_init_script = AsyncMock()
         page = MagicMock()
-        page.add_init_script = AsyncMock()
         context.new_page = AsyncMock(return_value=page)
         browser = MagicMock()
         browser.new_context = AsyncMock(return_value=context)
@@ -366,6 +366,8 @@ class TestBrowserSession:
         session = browser_use.BrowserSession("security-flags")
         try:
             await session._ensure_initialized()
+            assert session._http_client is not None
+            assert session._http_client.follow_redirects is False
         finally:
             await session.close()
 
@@ -373,6 +375,7 @@ class TestBrowserSession:
         assert launch_kwargs["chromium_sandbox"] is expected_sandbox
         assert ("--no-sandbox" in launch_kwargs["args"]) is expected_no_sandbox
         context.route_web_socket.assert_awaited_once()
+        context.add_init_script.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_guard_route_preserves_encoded_body_and_multiple_cookies(self):

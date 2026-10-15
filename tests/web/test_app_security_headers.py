@@ -11,7 +11,16 @@ from xagent.web.app import _blocked_upload_extension, _security_header_values
 
 @pytest.mark.parametrize(
     "filename",
-    ["page.html", "page.HTML", "page.xhtml", "page.xht", "style.xsl", "feed.rdf"],
+    [
+        "page.html",
+        "page.HTML",
+        "page.xhtml",
+        "page.xht",
+        "style.xsl",
+        "feed.rdf",
+        "page.html.gz",
+        "page.mathml",
+    ],
 )
 def test_active_upload_document_extensions_are_blocked(filename: str) -> None:
     assert _blocked_upload_extension(filename)
@@ -41,6 +50,14 @@ def test_security_headers_harden_api_and_regular_pages() -> None:
     assert "Content-Security-Policy" not in page
 
 
+def test_security_headers_only_exempt_file_preview_routes() -> None:
+    agent_preview = _security_header_values("/api/agents/preview")
+    workforce_preview = _security_header_values("/api/workforces/preview/runs")
+
+    assert agent_preview["X-Frame-Options"] == "DENY"
+    assert workforce_preview["X-Frame-Options"] == "DENY"
+
+
 def test_public_html_preview_is_downloaded_instead_of_executed(tmp_path: Path) -> None:
     html = tmp_path / "report.html"
     html.write_text("<script>alert(1)</script>", encoding="utf-8")
@@ -54,4 +71,6 @@ def test_public_html_preview_is_downloaded_instead_of_executed(tmp_path: Path) -
         )
     )
 
-    assert response.headers["content-disposition"] == "attachment"
+    content_disposition = response.headers["content-disposition"]
+    assert content_disposition.startswith("attachment;")
+    assert 'filename="report.html"' in content_disposition

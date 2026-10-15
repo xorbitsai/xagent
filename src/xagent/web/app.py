@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import random
 import threading
@@ -104,6 +105,7 @@ from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
 from .auth_config import validate_auth_config
+from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
@@ -1532,7 +1534,7 @@ def _security_header_values(path: str) -> dict[str, str]:
     is_widget_page = path == "/widget" or path.startswith("/widget/")
     is_upload = path == "/uploads" or path.startswith("/uploads/")
     is_api = path == "/api" or path.startswith("/api/")
-    is_preview = "preview" in path.split("/")
+    is_preview = path.startswith(("/api/files/preview/", "/api/files/public/preview/"))
     headers = {
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "strict-origin-when-cross-origin",
@@ -1582,13 +1584,14 @@ _BLOCKED_UPLOAD_EXTENSIONS = frozenset(
 
 
 def _blocked_upload_extension(path: str) -> bool:
+    media_type, _encoding = mimetypes.guess_type(path)
+    if is_active_content_type(media_type):
+        return True
     return PurePosixPath(path).suffix.lower() in _BLOCKED_UPLOAD_EXTENSIONS
 
 
 class SafeUploadsStaticFiles(StaticFiles):
     """Serve only non-active content from the legacy public uploads mount."""
-
-    _BLOCKED_EXTENSIONS = _BLOCKED_UPLOAD_EXTENSIONS
 
     async def get_response(self, path: str, scope: Scope) -> Any:
         if _blocked_upload_extension(path):

@@ -60,6 +60,7 @@ from ..config import (
     get_upload_path,
     is_allowed_file,
 )
+from ..content_security import is_active_content_type
 from ..jwt_validation import has_matching_temporal_claim_conversion_failure
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task
@@ -189,7 +190,7 @@ def _inline_download_disposition(media_type: str) -> str:
 def _preview_can_redirect(path: Path, media_type: str) -> bool:
     if path.suffix.lower() in {".pptx", ".ppt"}:
         return False
-    return media_type not in {"text/html", "application/xhtml+xml", "image/svg+xml"}
+    return not is_active_content_type(media_type)
 
 
 def _svg_png_cache_path(svg_path: Path, file_id: Optional[str] = None) -> Path:
@@ -322,15 +323,12 @@ async def _inline_preview_response(
         media_type=media_type,
         headers={
             **(extra_headers or {}),
-            # See the invariant note in the SVG branch above.
-            # Public previews must not turn a user-uploaded HTML document
-            # into a same-origin page. Authenticated in-app previews retain
-            # their inline behavior for the artifact viewer.
-            "Content-Disposition": (
-                "attachment"
-                if public_validation
-                and media_type in {"text/html", "application/xhtml+xml"}
-                else "inline"
+            # See the invariant note in the SVG branch above. User markup is
+            # always downloaded instead of being interpreted as a same-origin
+            # document, including ticket-authenticated previews.
+            "Content-Disposition": _content_disposition_header(
+                "attachment" if is_active_content_type(media_type) else "inline",
+                filename,
             ),
             "X-Content-Type-Options": "nosniff",
         },

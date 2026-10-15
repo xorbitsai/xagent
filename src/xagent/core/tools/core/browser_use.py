@@ -11,7 +11,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, cast
 from urllib.parse import unquote, urlsplit
 
 from ....config import (
@@ -939,7 +939,10 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "error": "Browser target is not allowed",
         }
     headless = kwargs.get("headless", False)
-    wait_until = kwargs.get("wait_until", "networkidle")
+    wait_until = cast(
+        Literal["commit", "domcontentloaded", "load", "networkidle"],
+        kwargs.get("wait_until", "networkidle"),
+    )
     locale = kwargs.get("locale")
 
     if not PLAYWRIGHT_AVAILABLE:
@@ -962,7 +965,9 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
     page = await session.get_page()
 
     try:
-        wait_until_local = (
+        wait_until_local: Literal[
+            "commit", "domcontentloaded", "load", "networkidle"
+        ] = (
             "domcontentloaded"
             if url.startswith("file://") and wait_until == "networkidle"
             else wait_until

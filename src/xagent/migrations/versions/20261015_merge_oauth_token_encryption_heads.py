@@ -2,7 +2,6 @@
 
 from typing import Sequence, Union
 
-
 revision: str = "20261015_merge_oauth_token_encryption_heads"
 down_revision: Union[str, Sequence[str], None] = (
     "20261014_encrypt_user_oauth_tokens",

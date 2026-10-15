@@ -1,10 +1,18 @@
+import logging
+
 from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.types import TypeDecorator
 
-from ...core.utils.encryption import decrypt_value_strict, encrypt_value
+from ...core.utils.encryption import (
+    EncryptionDecodeError,
+    decrypt_value_strict,
+    encrypt_value,
+)
 from .database import Base
+
+logger = logging.getLogger(__name__)
 
 
 class EncryptedOAuthToken(TypeDecorator[str]):
@@ -22,7 +30,20 @@ class EncryptedOAuthToken(TypeDecorator[str]):
         return encrypt_value(value) if value else value
 
     def process_result_value(self, value: str | None, dialect: object) -> str | None:
-        return decrypt_value_strict(value) if value else value
+        if not value:
+            return value
+        try:
+            return decrypt_value_strict(value)
+        except EncryptionDecodeError:
+            # A rotated/missing key must not make every UserOAuth query fail.
+            # Returning an empty credential marks this connection for
+            # reauthorization while leaving the ciphertext untouched so it
+            # can still be recovered with the original key.
+            logger.warning(
+                "Unable to decrypt a stored UserOAuth token; "
+                "connection requires reauthorization"
+            )
+            return ""
 
 
 USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512

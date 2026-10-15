@@ -6,7 +6,8 @@ retry is safe after a partially completed deployment.
 
 This migration is intentionally irreversible: a downgrade leaves ciphertext
 in place because writing plaintext tokens back to the database would weaken
-the security guarantee. The ORM type continues to decrypt those rows.
+the security guarantee. A rollback therefore requires code that understands
+encrypted values; otherwise affected connections must be reconnected.
 """
 
 from typing import Sequence, Union
@@ -63,5 +64,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """No-op: downgrading must not write OAuth tokens back as plaintext."""
+    """Leave ciphertext in place; downgrading must not write plaintext tokens."""
     pass

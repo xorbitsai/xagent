@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from cryptography.fernet import Fernet
@@ -27,9 +28,15 @@ def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
 
+@pytest.fixture(autouse=True)
+def _clear_cipher_cache():
+    get_cipher.cache_clear()
+    yield
+    get_cipher.cache_clear()
+
+
 def test_upgrade_encrypts_legacy_tokens_and_is_idempotent(tmp_path, monkeypatch):
     monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
-    get_cipher.cache_clear()
     engine = create_engine(f"sqlite:///{tmp_path / 'oauth.db'}")
     migration = _load_migration()
     with engine.begin() as connection:

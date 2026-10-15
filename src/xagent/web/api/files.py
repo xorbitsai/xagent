@@ -323,7 +323,15 @@ async def _inline_preview_response(
         headers={
             **(extra_headers or {}),
             # See the invariant note in the SVG branch above.
-            "Content-Disposition": "inline",
+            # Public previews must not turn a user-uploaded HTML document
+            # into a same-origin page. Authenticated in-app previews retain
+            # their inline behavior for the artifact viewer.
+            "Content-Disposition": (
+                "attachment"
+                if public_validation
+                and media_type in {"text/html", "application/xhtml+xml"}
+                else "inline"
+            ),
             "X-Content-Type-Options": "nosniff",
         },
     )

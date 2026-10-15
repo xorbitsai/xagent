@@ -25,6 +25,7 @@ from ..config import (
     get_background_job_sweep_interval_seconds,
     get_cors_origins,
     get_external_upload_dirs,
+    get_environment,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
@@ -237,17 +238,7 @@ get_external_upload_dirs()
 
 
 # FastAPI app creation here
-_runtime_environment = (
-    (os.getenv("XAGENT_ENVIRONMENT") or os.getenv("ENVIRONMENT") or "development")
-    .strip()
-    .lower()
-)
-_is_production_environment = _runtime_environment in {
-    "prod",
-    "production",
-    "stage",
-    "staging",
-}
+_is_production_environment = get_environment() != "development"
 app = FastAPI(
     title="xagent",
     description="The Agent Operating System",
@@ -1536,20 +1527,35 @@ app.add_middleware(SessionMiddleware, secret_key=get_session_secret(), same_site
 app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
 
+def _security_header_values(path: str) -> dict[str, str]:
+    """Return headers appropriate for an API, preview, upload, or SPA path."""
+    is_widget_page = path == "/widget" or path.startswith("/widget/")
+    is_upload = path == "/uploads" or path.startswith("/uploads/")
+    is_api = path == "/api" or path.startswith("/api/")
+    is_preview = "preview" in path.split("/")
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "strict-origin-when-cross-origin",
+    }
+    if is_api or is_upload:
+        frame_ancestors = "'self'" if is_upload or is_preview else "'none'"
+        headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; object-src 'none'; "
+            f"frame-ancestors {frame_ancestors}; img-src 'self' data: blob: https:; "
+            "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:"
+        )
+    if not is_widget_page and not is_upload and not is_preview:
+        headers["X-Frame-Options"] = "DENY"
+    return headers
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next: Any) -> Any:
-    """Add browser hardening headers to API and uploaded-file responses."""
+    """Add browser hardening headers without breaking the SPA or previews."""
     response = await call_next(request)
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; base-uri 'self'; object-src 'none'; "
-        "frame-ancestors 'none'; img-src 'self' data: blob: https:; "
-        "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:",
-    )
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault("X-Frame-Options", "DENY")
+    for name, value in _security_header_values(request.url.path).items():
+        response.headers.setdefault(name, value)
     return response
 
 
@@ -1557,13 +1563,35 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 # For static files
+_BLOCKED_UPLOAD_EXTENSIONS = frozenset(
+    {
+        ".html",
+        ".htm",
+        ".xhtml",
+        ".xht",
+        ".xsl",
+        ".xslt",
+        ".svg",
+        ".svgz",
+        ".xml",
+        ".rdf",
+        ".atom",
+        ".rss",
+    }
+)
+
+
+def _blocked_upload_extension(path: str) -> bool:
+    return PurePosixPath(path).suffix.lower() in _BLOCKED_UPLOAD_EXTENSIONS
+
+
 class SafeUploadsStaticFiles(StaticFiles):
     """Serve only non-active content from the legacy public uploads mount."""
 
-    _BLOCKED_EXTENSIONS = frozenset({".html", ".htm", ".svg", ".svgz", ".xml"})
+    _BLOCKED_EXTENSIONS = _BLOCKED_UPLOAD_EXTENSIONS
 
     async def get_response(self, path: str, scope: Scope) -> Any:
-        if PurePosixPath(path).suffix.lower() in self._BLOCKED_EXTENSIONS:
+        if _blocked_upload_extension(path):
             return PlainTextResponse("Not found", status_code=404)
         return await super().get_response(path, scope)
 

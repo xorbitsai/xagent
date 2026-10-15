@@ -1573,6 +1573,7 @@ _BLOCKED_UPLOAD_EXTENSIONS = frozenset(
         ".xht",
         ".xsl",
         ".xslt",
+        ".mathml",
         ".svg",
         ".svgz",
         ".xml",

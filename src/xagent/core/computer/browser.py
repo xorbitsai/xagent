@@ -461,8 +461,10 @@ class BrowserComputerEnvironment(ComputerEnvironment):
     def _resolve_navigation_url(raw_url: str) -> str:
         url = raw_url.strip()
         parsed = urlsplit(url)
+        if parsed.scheme == "file" and not parsed.netloc:
+            return url
         if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-            raise ValueError("navigate URL must use absolute HTTP or HTTPS")
+            raise ValueError("navigate URL must use absolute HTTP(S) or file URL")
         return url
 
     @staticmethod

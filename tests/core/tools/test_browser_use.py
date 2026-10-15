@@ -74,7 +74,7 @@ class TestBrowserNavigate:
                 result = asyncio.run(
                     browser_use.browser_navigate(session_id="test-session", url=url)
                 )
-                assert result["error"] == "Only public network URLs are allowed"
+                assert result["error"] == "Browser target is not allowed"
 
     def test_navigate_allows_workspace_file_only(self, tmp_path):
         import asyncio
@@ -98,10 +98,82 @@ class TestBrowserNavigate:
             )
 
         assert "Only public network URLs are allowed" not in allowed["error"]
-        assert blocked["error"] == "Only public network URLs are allowed"
+        assert blocked["error"] == "Browser target is not allowed"
 
 
 class TestBrowserRequestGuard:
+    @pytest.mark.asyncio
+    async def test_egress_proxy_connects_to_validated_ip(self, monkeypatch):
+        proxy = browser_use._BrowserEgressProxy()
+        client_reader = MagicMock()
+        client_reader.read = AsyncMock(return_value=b"")
+        client_writer = MagicMock()
+        client_writer.drain = AsyncMock()
+        remote_reader = MagicMock()
+        remote_reader.read = AsyncMock(return_value=b"")
+        remote_writer = MagicMock()
+        remote_writer.drain = AsyncMock()
+        remote_writer.wait_closed = AsyncMock()
+
+        monkeypatch.setattr(
+            browser_use,
+            "validate_public_http_url",
+            AsyncMock(return_value=["203.0.113.10"]),
+        )
+        open_connection = AsyncMock(return_value=(remote_reader, remote_writer))
+        monkeypatch.setattr(browser_use.asyncio, "open_connection", open_connection)
+
+        await proxy._handle_connect(client_reader, client_writer, "example.com:443")
+
+        open_connection.assert_awaited_once_with("203.0.113.10", 443)
+        client_writer.write.assert_called_once_with(
+            b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrent_page_guards_share_one_installation(self):
+        session = browser_use.BrowserSession("guard")
+        context = MagicMock()
+        cdp = MagicMock()
+        cdp.send = AsyncMock()
+        page = MagicMock()
+
+        async def create_session(_page):
+            await asyncio.sleep(0)
+            return cdp
+
+        context.new_cdp_session = create_session
+        session._context = context
+
+        await asyncio.gather(
+            session._guard_page_requests(page),
+            session._guard_page_requests(page),
+        )
+
+        assert cdp.on.call_count == 1
+        assert cdp.send.await_count == 1
+        cdp.send.assert_awaited_once_with(
+            "Fetch.enable",
+            {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+        )
+
+    @pytest.mark.asyncio
+    async def test_page_guard_failure_is_propagated(self):
+        session = browser_use.BrowserSession("guard")
+        context = MagicMock()
+        cdp = MagicMock()
+        cdp.send = AsyncMock(side_effect=RuntimeError("Fetch unavailable"))
+        cdp.detach = AsyncMock()
+        context.new_cdp_session = AsyncMock(return_value=cdp)
+        session._context = context
+
+        with pytest.raises(RuntimeError, match="Fetch unavailable"):
+            await session._guard_page_requests(MagicMock())
+
+        assert not session._guarded_pages
+        assert not session._page_guard_futures
+        cdp.detach.assert_awaited_once()
+
     @pytest.mark.asyncio
     async def test_fetch_guard_blocks_private_redirect_hops(self):
         session = browser_use.BrowserSession("guard")
@@ -381,6 +453,16 @@ class TestBrowserSession:
     @pytest.mark.asyncio
     async def test_session_uses_sandbox_unless_explicitly_allowed(self, monkeypatch):
         monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
+        monkeypatch.setattr(
+            browser_use._BrowserEgressProxy,
+            "start",
+            AsyncMock(return_value="http://127.0.0.1:43123"),
+        )
+        monkeypatch.setattr(
+            browser_use._BrowserEgressProxy,
+            "close",
+            AsyncMock(),
+        )
         playwright = MagicMock()
         browser = MagicMock()
         context = MagicMock()
@@ -405,5 +487,9 @@ class TestBrowserSession:
         launch_kwargs = playwright.chromium.launch.await_args.kwargs
         assert launch_kwargs["chromium_sandbox"] is True
         assert "--no-sandbox" not in launch_kwargs["args"]
+        assert launch_kwargs["proxy"] == {
+            "server": "http://127.0.0.1:43123",
+            "bypass": "",
+        }
 
         await session.close()

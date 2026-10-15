@@ -8,6 +8,7 @@ automatically cleaned up after a timeout period.
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -19,6 +20,8 @@ from ....config import (
     get_browser_tool_default_timezone,
 )
 from ...utils.security import validate_public_http_url
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from playwright.async_api import Browser, BrowserContext, Page, async_playwright
@@ -88,6 +91,11 @@ async def _validate_browser_target(
         raise ValueError("Malformed browser URL") from exc
 
     scheme = parsed.scheme.lower()
+    if scheme in {"about", "data", "blob"}:
+        # These URLs do not perform a network connection by themselves. Any
+        # HTTP(S) fetches initiated by their document still pass through the
+        # CDP guard and the browser-wide egress proxy.
+        return
     if scheme == "file":
         if _workspace_file_path(url, workspace_root) is None:
             raise ValueError("Only workspace files are allowed")
@@ -98,6 +106,234 @@ async def _validate_browser_target(
         await validate_public_http_url(url)
     except OSError as exc:
         raise ValueError("Browser target could not be resolved") from exc
+
+
+_PROXY_HEADER_LIMIT = 64 * 1024
+_PROXY_CONNECT_TIMEOUT = 10.0
+
+
+class _BrowserEgressProxy:
+    """Small loopback proxy that pins each connection to validated DNS IPs.
+
+    Chromium resolves hosts independently of Python.  A browser-wide CONNECT
+    proxy closes that TOCTOU gap: the proxy validates the hostname, connects
+    directly to one of the validated public IPs, and then tunnels the original
+    TLS/WebSocket handshake without changing its Host header or SNI.
+    """
+
+    def __init__(self) -> None:
+        self._server: asyncio.AbstractServer | None = None
+        self._client_tasks: set[asyncio.Task[Any]] = set()
+
+    async def start(self) -> str:
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            host="127.0.0.1",
+            port=0,
+            limit=_PROXY_HEADER_LIMIT,
+        )
+        socket = self._server.sockets[0]
+        port = socket.getsockname()[1]
+        return f"http://127.0.0.1:{port}"
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
+        tasks = list(self._client_tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._client_tasks.clear()
+
+    async def _handle_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
+        try:
+            header = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"), _PROXY_CONNECT_TIMEOUT
+            )
+            method, target, version, headers = self._parse_request(header)
+            if method.upper() == "CONNECT":
+                await self._handle_connect(reader, writer, target)
+            else:
+                await self._handle_forward(
+                    reader, writer, method, target, version, headers
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Browser egress proxy rejected request: %s", exc)
+            await self._send_error(writer, 502, "Bad Gateway")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            if task is not None:
+                self._client_tasks.discard(task)
+
+    @staticmethod
+    def _parse_request(
+        header: bytes,
+    ) -> tuple[str, str, str, dict[str, str]]:
+        lines = header[:-4].split(b"\r\n")
+        method, target, version = lines[0].decode("latin-1").split(" ", 2)
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            name, value = line.decode("latin-1").split(":", 1)
+            headers[name.lower().strip()] = value.strip()
+        return method, target, version, headers
+
+    async def _handle_connect(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        target: str,
+    ) -> None:
+        parsed = urlsplit(f"//{target}")
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.hostname is None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("invalid CONNECT authority")
+        port = parsed.port or 443
+        resolved = await validate_public_http_url(f"https://{target}")
+        remote_reader, remote_writer = await self._open_validated(resolved, port)
+        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        await writer.drain()
+        await self._bridge(reader, writer, remote_reader, remote_writer)
+
+    async def _handle_forward(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        method: str,
+        target: str,
+        version: str,
+        headers: dict[str, str],
+    ) -> None:
+        if target.startswith("/"):
+            host = headers.get("host")
+            if not host:
+                raise ValueError("origin-form request has no Host header")
+            logical_url = f"http://{host}{target}"
+        else:
+            logical_url = target
+        parsed = urlsplit(logical_url)
+        scheme = parsed.scheme.lower()
+        if scheme == "ws":
+            scheme = "http"
+        elif scheme == "wss":
+            scheme = "https"
+        if scheme not in {"http", "https"} or parsed.hostname is None:
+            raise ValueError("proxy only accepts HTTP(S) targets")
+        if scheme == "https":
+            raise ValueError("HTTPS requests must use CONNECT")
+        port = parsed.port or 80
+        resolved = await validate_public_http_url(
+            parsed._replace(scheme=scheme).geturl()
+        )
+        remote_reader, remote_writer = await self._open_validated(resolved, port)
+
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        output_headers = []
+        saw_host = False
+        for name, value in headers.items():
+            if name in {"proxy-connection", "connection"}:
+                continue
+            if name == "host":
+                value = parsed.netloc
+                saw_host = True
+            output_headers.append(f"{name}: {value}")
+        if not saw_host:
+            output_headers.append(f"Host: {parsed.netloc}")
+        output_headers.append("Connection: close")
+        request = (
+            f"{method} {path} {version}\r\n" + "\r\n".join(output_headers) + "\r\n\r\n"
+        ).encode("latin-1")
+        remote_writer.write(request)
+        await remote_writer.drain()
+        await self._bridge(reader, writer, remote_reader, remote_writer)
+
+    @staticmethod
+    async def _open_validated(
+        addresses: list[str], port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        last_error: OSError | None = None
+        for address in addresses:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.open_connection(address, port), _PROXY_CONNECT_TIMEOUT
+                )
+            except (OSError, asyncio.TimeoutError) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OSError("validated host did not provide any addresses")
+
+    @staticmethod
+    async def _send_error(
+        writer: asyncio.StreamWriter, status: int, reason: str
+    ) -> None:
+        if writer.is_closing():
+            return
+        writer.write(
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Connection: close\r\n"
+            "Content-Length: 0\r\n\r\n".encode("ascii")
+        )
+        try:
+            await writer.drain()
+        except Exception:
+            pass
+
+    @staticmethod
+    async def _bridge(
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        remote_reader: asyncio.StreamReader,
+        remote_writer: asyncio.StreamWriter,
+    ) -> None:
+        async def copy_stream(
+            source: asyncio.StreamReader, destination: asyncio.StreamWriter
+        ) -> None:
+            try:
+                while data := await source.read(64 * 1024):
+                    destination.write(data)
+                    await destination.drain()
+            except (ConnectionError, asyncio.IncompleteReadError):
+                pass
+
+        tasks = {
+            asyncio.create_task(copy_stream(client_reader, remote_writer)),
+            asyncio.create_task(copy_stream(remote_reader, client_writer)),
+        }
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            remote_writer.close()
+            try:
+                await remote_writer.wait_closed()
+            except Exception:
+                pass
 
 
 class BrowserSession:
@@ -135,6 +371,9 @@ class BrowserSession:
         self._cdp_sessions: list[Any] = []
         self._cdp_tasks: set[asyncio.Task[Any]] = set()
         self._guarded_pages: set[int] = set()
+        self._page_guard_futures: dict[int, asyncio.Future[None]] = {}
+        self._cdp_sessions_by_page: dict[int, Any] = {}
+        self._egress_proxy: _BrowserEgressProxy | None = None
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
@@ -148,13 +387,33 @@ class BrowserSession:
         while applying the URL policy to subresources and redirects.
         """
         page_key = id(page)
-        if page_key in self._guarded_pages or self._context is None:
+        if self._context is None:
             return
+        existing = self._page_guard_futures.get(page_key)
+        if existing is not None:
+            await asyncio.shield(existing)
+            return
+        if page_key in self._guarded_pages:
+            return
+        loop = asyncio.get_running_loop()
+        ready = loop.create_future()
+        ready.add_done_callback(
+            lambda future: (
+                future.exception() if not future.cancelled() and future.done() else None
+            )
+        )
+        self._page_guard_futures[page_key] = ready
         self._guarded_pages.add(page_key)
+        cdp = None
         try:
             cdp = await self._context.new_cdp_session(page)
-        except Exception:
+        except BaseException as exc:
             self._guarded_pages.discard(page_key)
+            self._page_guard_futures.pop(page_key, None)
+            if isinstance(exc, asyncio.CancelledError):
+                ready.cancel()
+            elif not ready.done():
+                ready.set_exception(exc)
             raise
 
         async def handle_paused(params: dict[str, Any]) -> None:
@@ -179,7 +438,19 @@ class BrowserSession:
         def on_paused(params: dict[str, Any]) -> None:
             task = asyncio.create_task(handle_paused(params))
             self._cdp_tasks.add(task)
-            task.add_done_callback(self._cdp_tasks.discard)
+
+            def finish_request(completed: asyncio.Task[Any]) -> None:
+                self._cdp_tasks.discard(completed)
+                if completed.cancelled():
+                    return
+                error = completed.exception()
+                if error is not None:
+                    logger.debug(
+                        "Browser CDP request guard failed",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+
+            task.add_done_callback(finish_request)
 
         cdp.on("Fetch.requestPaused", on_paused)
         try:
@@ -187,19 +458,83 @@ class BrowserSession:
                 "Fetch.enable",
                 {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
             )
-        except Exception:
+        except BaseException as exc:
             self._guarded_pages.discard(page_key)
+            self._page_guard_futures.pop(page_key, None)
             try:
                 await cdp.detach()
             except Exception:
                 pass
+            if isinstance(exc, asyncio.CancelledError):
+                ready.cancel()
+            elif not ready.done():
+                ready.set_exception(exc)
             raise
         self._cdp_sessions.append(cdp)
+        self._cdp_sessions_by_page[page_key] = cdp
+
+        def forget_page(*_args: Any) -> None:
+            self._guarded_pages.discard(page_key)
+            ready = self._page_guard_futures.pop(page_key, None)
+            if ready is not None and not ready.done():
+                ready.cancel()
+            page_cdp = self._cdp_sessions_by_page.pop(page_key, None)
+            if page_cdp is None:
+                return
+            try:
+                self._cdp_sessions.remove(page_cdp)
+            except ValueError:
+                pass
+
+            async def detach_page_cdp() -> None:
+                try:
+                    await page_cdp.send("Fetch.disable")
+                except Exception:
+                    pass
+                try:
+                    await page_cdp.detach()
+                except Exception:
+                    pass
+
+            cleanup = asyncio.create_task(detach_page_cdp())
+            self._cdp_tasks.add(cleanup)
+
+            def finish_cleanup(done: asyncio.Task[Any]) -> None:
+                self._cdp_tasks.discard(done)
+                if not done.cancelled():
+                    done.exception()
+
+            cleanup.add_done_callback(finish_cleanup)
+
+        page.on("close", forget_page)
+        if not ready.done():
+            ready.set_result(None)
 
     def _schedule_page_guard(self, page: Page) -> None:
         task = asyncio.create_task(self._guard_page_requests(page))
         self._cdp_tasks.add(task)
-        task.add_done_callback(self._cdp_tasks.discard)
+
+        def finish(completed: asyncio.Task[Any]) -> None:
+            self._cdp_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "Failed to guard popup page requests",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+                close_task = asyncio.create_task(page.close())
+                self._cdp_tasks.add(close_task)
+
+                def finish_close(done: asyncio.Task[Any]) -> None:
+                    self._cdp_tasks.discard(done)
+                    if not done.cancelled():
+                        done.exception()
+
+                close_task.add_done_callback(finish_close)
+
+        task.add_done_callback(finish)
 
     async def _ensure_initialized(self) -> None:
         """Lazy initialization: create browser on first use."""
@@ -228,10 +563,13 @@ class BrowserSession:
             if allow_unsandboxed:
                 browser_args.append("--no-sandbox")
             try:
+                self._egress_proxy = _BrowserEgressProxy()
+                proxy_server = await self._egress_proxy.start()
                 self._browser = await self._playwright.chromium.launch(
                     headless=self.headless,
                     args=browser_args,
                     chromium_sandbox=not allow_unsandboxed,
+                    proxy={"server": proxy_server, "bypass": ""},
                 )
             except Exception:
                 await self.close()
@@ -338,9 +676,12 @@ class BrowserSession:
 
     async def close(self) -> None:
         """Close the browser and cleanup resources."""
-        for task in list(self._cdp_tasks):
-            if not task.done():
-                task.cancel()
+        while self._cdp_tasks:
+            tasks = list(self._cdp_tasks)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._cdp_tasks.clear()
         for cdp in self._cdp_sessions:
             try:
@@ -352,7 +693,9 @@ class BrowserSession:
             except Exception:
                 pass
         self._cdp_sessions.clear()
+        self._cdp_sessions_by_page.clear()
         self._guarded_pages.clear()
+        self._page_guard_futures.clear()
 
         try:
             # Close page first
@@ -385,6 +728,13 @@ class BrowserSession:
                 self._playwright = None
         except Exception:
             pass  # Ignore playwright stop errors
+
+        if self._egress_proxy is not None:
+            try:
+                await self._egress_proxy.close()
+            except Exception:
+                pass
+            self._egress_proxy = None
 
         self._initialized = False
 
@@ -586,7 +936,7 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
             "url": url,
             "title": "",
             "message": "",
-            "error": "Only public network URLs are allowed",
+            "error": "Browser target is not allowed",
         }
     headless = kwargs.get("headless", False)
     wait_until = kwargs.get("wait_until", "networkidle")
@@ -612,7 +962,11 @@ async def browser_navigate(**kwargs: Any) -> Dict[str, Any]:
     page = await session.get_page()
 
     try:
-        wait_until_local = wait_until
+        wait_until_local = (
+            "domcontentloaded"
+            if url.startswith("file://") and wait_until == "networkidle"
+            else wait_until
+        )
 
         # Log navigation attempt for debugging
         import logging

@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 import pytest
@@ -68,6 +68,7 @@ def _invoice(
     due: str,
     amount_due: float,
     *,
+    issued: str = "2026-08-01",
     contact: str = "Acme",
     contact_id: str = CONTACT_ID,
     currency: str = "AUD",
@@ -79,7 +80,7 @@ def _invoice(
         "Type": "ACCREC",
         "Status": status,
         "Contact": {"ContactID": contact_id, "Name": contact},
-        "DateString": "2026-08-01T00:00:00",
+        "DateString": f"{issued}T00:00:00",
         "DueDateString": f"{due}T00:00:00",
         "CurrencyCode": currency,
         "Total": amount_due,
@@ -122,16 +123,26 @@ def test_tenant_is_looked_up_once_and_sent_on_every_call(fake: FakeXero) -> None
     assert api_calls[0]["headers"]["Authorization"] == "Bearer token"
 
 
-def test_explicit_tenant_id_skips_the_connections_lookup(
-    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("connections", "message"),
+    [([], "No Xero organisation"), ([{}], "without a tenant id")],
+)
+def test_tenant_lookup_rejects_unusable_connections(
+    fake: FakeXero,
+    monkeypatch: pytest.MonkeyPatch,
+    connections: list[dict[str, Any]],
+    message: str,
 ) -> None:
-    monkeypatch.setenv("XERO_TENANT_ID", "pinned")
-    fake.responder = lambda call: MockResponse({"Accounts": []})
+    def get(url: str, **kwargs: Any) -> MockResponse:
+        fake.calls.append({"method": "GET", "url": url, "path": "connections"})
+        return MockResponse(connections)
 
-    xero.list_accounts()
+    monkeypatch.setattr(xero.requests, "get", get)
 
-    assert [call["path"] for call in fake.calls] == ["Accounts"]
-    assert fake.calls[0]["headers"]["xero-tenant-id"] == "pinned"
+    with pytest.raises(RuntimeError, match=message):
+        xero.list_accounts()
+
+    assert [call["path"] for call in fake.calls] == ["connections"]
 
 
 # --------------------------------------------------------------------------- #
@@ -139,18 +150,33 @@ def test_explicit_tenant_id_skips_the_connections_lookup(
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("status", [401, 403])
-def test_denied_request_names_the_missing_scope(fake: FakeXero, status: int) -> None:
+def test_unauthorized_request_reports_expired_connection_not_scope(
+    fake: FakeXero,
+) -> None:
     fake.responder = lambda call: MockResponse(
-        {"Title": "Forbidden"}, status_code=status
+        {"Title": "Token expired"}, status_code=401
     )
 
     with pytest.raises(RuntimeError) as error:
         xero.list_aged_receivables_by_contact(contactId=CONTACT_ID)
 
     message = str(error.value)
-    assert f"status {status}" in message
+    assert "status 401" in message
+    assert "Token expired" in message
+    assert "scope" not in message
+    assert "reconnect" in message.lower()
+
+
+def test_forbidden_request_names_the_missing_scope(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse({"Title": "Forbidden"}, status_code=403)
+
+    with pytest.raises(RuntimeError) as error:
+        xero.list_aged_receivables_by_contact(contactId=CONTACT_ID)
+
+    message = str(error.value)
+    assert "status 403" in message
     assert "accounting.reports.aged.read" in message
+    assert "Forbidden" in message
     assert "reconnect" in message.lower()
 
 
@@ -296,15 +322,20 @@ def test_list_payments_where_clause_is_validated_and_built(fake: FakeXero) -> No
         xero.list_payments(reference='x" OR 1==1')
 
 
-def test_unpaged_list_falls_back_to_full_page_heuristic(fake: FakeXero) -> None:
+def test_quotes_use_xero_pagination_metadata(fake: FakeXero) -> None:
     fake.responder = lambda call: MockResponse(
-        {"Quotes": [{"QuoteID": str(i)} for i in range(100)]}
+        {
+            "pagination": {"page": 1, "pageSize": 20, "pageCount": 3, "itemCount": 45},
+            "Quotes": [{"QuoteID": str(i)} for i in range(20)],
+        }
     )
 
     result = _call_tool("list_quotes", page=1)
 
+    assert result["total_count"] == 45
     assert result["has_more"] is True
     assert result["next_page"] == 2
+    assert fake.calls[-1]["params"]["pageSize"] == 20
 
 
 def test_oversized_page_is_trimmed_and_flagged(
@@ -402,6 +433,12 @@ def test_overdue_drops_invoices_that_are_not_actually_overdue(fake: FakeXero) ->
                 # Defend locally even if Xero ignores Statuses=AUTHORISED or
                 # returns a stale Paid row with an inconsistent amount due.
                 _invoice("INV-PAID", "2026-09-01", 75, status="PAID"),
+                _invoice(
+                    "INV-ISSUED-LATER",
+                    "2026-09-01",
+                    80,
+                    issued="2026-10-14",
+                ),
             ]
         ]
     )
@@ -410,6 +447,19 @@ def test_overdue_drops_invoices_that_are_not_actually_overdue(fake: FakeXero) ->
 
     assert [inv["invoice_number"] for inv in result["invoices"]] == ["INV-OLD"]
     assert result["invoices"][0]["days_overdue"] == 42
+    assert result["balance_basis"] == "current_open_invoice_state"
+    assert result["historical_payments_reversed"] is False
+    assert result["excludes"] == ["credit_notes", "overpayments", "prepayments"]
+
+
+def test_overdue_deduplicates_invoice_ids_across_pages(fake: FakeXero) -> None:
+    repeated = _invoice("INV-1", "2026-09-01", 100)
+    fake.responder = _overdue_pages([[repeated], [repeated]])
+
+    result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
+
+    assert result["total_count"] == 1
+    assert [invoice["invoice_number"] for invoice in result["invoices"]] == ["INV-1"]
 
 
 def test_overdue_falls_back_when_xero_rejects_the_due_date_filter(
@@ -481,14 +531,15 @@ def test_overdue_sorts_oldest_first_and_summarises(fake: FakeXero) -> None:
         "INV-B",
     ]
     assert result["total_amount_due_by_currency"] == {"AUD": "550.00", "USD": "25.00"}
-    assert result["aging_buckets"]["90+"]["count"] == 1
-    assert result["aging_buckets"]["31-60"]["count"] == 1
-    assert result["aging_buckets"]["1-30"]["count"] == 2
-    assert result["aging_buckets"]["61-90"]["count"] == 0
+    assert result["ageing_buckets"]["90+"]["count"] == 1
+    assert result["ageing_buckets"]["31-60"]["count"] == 1
+    assert result["ageing_buckets"]["1-30"]["count"] == 2
+    assert result["ageing_buckets"]["61-90"]["count"] == 0
     top = result["by_contact"][0]
     assert top["contact_name"] == "Acme"
+    assert top["currency"] == "AUD"
     assert top["invoice_count"] == 2
-    assert top["amount_due_by_currency"] == {"AUD": "350.00"}
+    assert top["amount_due"] == "350.00"
     assert top["oldest_due_date"] == "2026-06-01T00:00:00"
 
 
@@ -543,21 +594,19 @@ def test_overdue_fails_instead_of_reporting_partial_totals(
         xero.list_overdue_invoices(asOfDate="2026-10-13")
 
 
-def test_overdue_without_page_metadata_stops_on_a_short_page(fake: FakeXero) -> None:
+def test_overdue_without_page_metadata_fails_closed(fake: FakeXero) -> None:
     fake.responder = lambda call: MockResponse(
         {"Invoices": [_invoice("INV-1", "2026-09-01", 10)]}
     )
 
-    result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
-
-    assert result["total_count"] == 1
-    assert len(fake.calls) == 2  # connections + one page
+    with pytest.raises(RuntimeError, match="no pagination metadata"):
+        xero.list_overdue_invoices(asOfDate="2026-10-13")
 
 
 def test_overdue_defaults_to_today(
     fake: FakeXero, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(xero, "_today", lambda: date(2026, 10, 13))
+    monkeypatch.setattr(xero, "_organisation_today", lambda: date(2026, 10, 13))
     fake.responder = _overdue_pages([[]])
 
     result = _call_tool("list_overdue_invoices")
@@ -593,7 +642,7 @@ def test_receivable_bucket_edges(days: int, bucket: str) -> None:
     assert xero._receivable_bucket(days) == bucket
 
 
-def test_ageing_has_one_named_row_per_contact_with_every_bucket(
+def test_ageing_has_one_named_row_per_contact_and_currency_with_every_bucket(
     fake: FakeXero,
 ) -> None:
     fake.responder = _overdue_pages(
@@ -633,8 +682,8 @@ def test_ageing_has_one_named_row_per_contact_with_every_bucket(
     assert [(row["contact_name"], row["currency"]) for row in rows] == [
         ("Heebie", "AUD"),
         ("Acme", "AUD"),
-        ("Acme", "USD"),
         ("Beta", "AUD"),
+        ("Acme", "USD"),
     ]
     heebie = rows[0]
     assert heebie["buckets"]["76+"] == "1617.00"
@@ -645,7 +694,7 @@ def test_ageing_has_one_named_row_per_contact_with_every_bucket(
     assert acme_aud["buckets"]["Current"] == "140.00"
     assert acme_aud["buckets"]["1-15"] == "10.00"
     assert acme_aud["invoice_count"] == 3
-    assert rows[3]["total_due"] == "5.00"
+    assert rows[2]["total_due"] == "5.00"
     aud = result["totals_by_currency"]["AUD"]
     assert aud["total_due"] == "1772.00"
     assert aud["buckets"]["Current"] == "140.00"
@@ -690,6 +739,37 @@ def test_ageing_rows_window_resumes_with_next_skip(fake: FakeXero) -> None:
     assert first["totals_by_currency"] == second["totals_by_currency"]
 
 
+def test_ageing_trims_rows_and_preserves_resume_cursor(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "get_tool_max_output_length", lambda: 3500)
+    invoices = [
+        _invoice(f"INV-{i:03d}", "2026-09-01", 10, contact=f"C{i}", contact_id=f"c{i}")
+        for i in range(60)
+    ]
+    fake.responder = _overdue_pages([invoices])
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13", limit=60)
+
+    assert result["truncated"] is True
+    assert result["returned"] < 60
+    assert result["has_more"] is True
+    assert result["next_skip"] == result["returned"]
+    assert result["total_rows"] == 60
+
+
+def test_ageing_fails_instead_of_reporting_partial_totals(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "OPEN_INVOICE_MAX_PAGES", 2)
+    fake.responder = _overdue_pages(
+        [[_invoice(f"INV-{page}", "2026-09-01", 10)] for page in range(5)]
+    )
+
+    with pytest.raises(RuntimeError, match="safety limit of 2 pages"):
+        xero.list_receivables_ageing(asOfDate="2026-10-13")
+
+
 def test_ageing_supports_payables(fake: FakeXero) -> None:
     bill = _invoice("BILL-1", "2026-09-01", 50)
     bill["Type"] = "ACCPAY"
@@ -705,6 +785,23 @@ def test_ageing_supports_payables(fake: FakeXero) -> None:
 # --------------------------------------------------------------------------- #
 # Dates and reports
 # --------------------------------------------------------------------------- #
+
+
+def test_organisation_today_uses_xero_accounting_timezone(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            moment = datetime(2026, 10, 13, 13, 30, tzinfo=timezone.utc)
+            return moment.astimezone(tz) if tz else moment.replace(tzinfo=None)
+
+    monkeypatch.setattr(xero, "datetime", FixedDateTime)
+    fake.responder = lambda call: MockResponse(
+        {"Organisations": [{"Timezone": "NEWZEALANDSTANDARDTIME"}]}
+    )
+
+    assert xero._organisation_today() == date(2026, 10, 14)
 
 
 def test_xero_date_formats() -> None:
@@ -933,6 +1030,38 @@ def test_create_payment_requires_a_positive_amount(fake: FakeXero) -> None:
     assert fake.calls == []
 
 
+def test_create_payment_returns_created_payment(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse(
+        {
+            "Payments": [
+                {
+                    "PaymentID": "payment-1",
+                    "Invoice": {"InvoiceID": INVOICE_ID, "InvoiceNumber": "INV-1"},
+                    "Account": {"AccountID": CONTACT_ID, "Code": "090"},
+                    "Amount": 125,
+                    "DateString": "2026-10-13T00:00:00",
+                    "Reference": "STRIPE-1",
+                }
+            ]
+        }
+    )
+
+    result = json.loads(
+        xero.create_payment(
+            invoiceId=INVOICE_ID,
+            accountId=CONTACT_ID,
+            amount=125,
+            date="2026-10-13",
+            reference="STRIPE-1",
+        )
+    )
+
+    assert result["payment"]["payment_id"] == "payment-1"
+    put = fake.calls[-1]
+    assert put["path"] == "Payments"
+    assert put["json"]["Amount"] == 125
+
+
 def test_manual_journal_must_balance(fake: FakeXero) -> None:
     lines = [
         xero.ManualJournalLine(lineAmount=100, accountCode="200"),
@@ -1020,7 +1149,7 @@ def test_ids_cannot_escape_their_url_segment(fake: FakeXero) -> None:
 # --------------------------------------------------------------------------- #
 
 # The accounting tools the third-party @xeroapi/xero-mcp-server exposed, which
-# Toby's prompts and memories refer to by name.
+# Existing prompts and memories refer to these tools by name.
 PRESERVED_TOOLS = {
     "create_bank_transaction",
     "create_contact",

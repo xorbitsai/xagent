@@ -5,6 +5,7 @@ import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -12,7 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from ....config import get_tool_max_output_length
-from .utils import setup_proxy_env, url_path_id
+from .utils import clamp_limit, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("xero-mcp")
@@ -56,6 +57,7 @@ OPEN_INVOICE_MAX_PAGES = 50
 OVERDUE_DEFAULT_LIMIT = 50
 OVERDUE_MAX_LIMIT = 200
 OVERDUE_TOP_CONTACTS = 25
+OPEN_INVOICE_EXCLUDES = ["credit_notes", "overpayments", "prepayments"]
 DEFAULT_INVOICE_TERMS_DAYS = 30
 DEFAULT_QUOTE_VALID_DAYS = 7
 
@@ -84,6 +86,21 @@ _GUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12
 _MS_DATE_PATTERN = re.compile(r"/Date\((-?\d+)(?:[+-]\d{4})?\)/")
 
 _connection_cache: dict[str, str] = {}
+
+_XERO_TIME_ZONES = {
+    "AUSEASTERNSTANDARDTIME": "Australia/Sydney",
+    "AUSCENTRALSTANDARDTIME": "Australia/Adelaide",
+    "W.AUSTRALIASTANDARDTIME": "Australia/Perth",
+    "TASMANIASTANDARDTIME": "Australia/Hobart",
+    "NEWZEALANDSTANDARDTIME": "Pacific/Auckland",
+    "UTC": "UTC",
+}
+
+
+class XeroAPIError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class Tracking(BaseModel):
@@ -174,7 +191,7 @@ def _page_number(page: int) -> int:
 
 
 def _page_size(page_size: int) -> int:
-    return max(1, min(int(page_size), XERO_MAX_PAGE_SIZE))
+    return clamp_limit(page_size, max_limit=XERO_MAX_PAGE_SIZE)
 
 
 # --------------------------------------------------------------------------- #
@@ -190,9 +207,6 @@ def _access_token() -> str:
 
 
 def _tenant_id() -> str:
-    explicit = os.environ.get("XERO_TENANT_ID")
-    if explicit:
-        return explicit
     cached = _connection_cache.get("tenant_id")
     if cached:
         return cached
@@ -259,25 +273,40 @@ def _raise_for_status(response: requests.Response, *, scope: str | None) -> None
     if response.status_code < 400:
         return
     status = response.status_code
-    if status in (401, 403):
-        hint = (
-            f" The tool needs the OAuth scope {SCOPE_HINTS[scope]}; if it was "
-            "added after Xero was connected, reconnect Xero to grant it."
-            if scope in SCOPE_HINTS
-            else " Reconnect Xero if the connection has expired."
-        )
-        raise RuntimeError(f"Xero denied the request (status {status}).{hint}")
-    if status == 429:
-        retry = response.headers.get("Retry-After")
-        wait = f" Retry after {retry} seconds." if retry else ""
-        raise RuntimeError(f"Xero rate limit reached (status 429).{wait}")
     detail = _error_detail(response)
     if detail is None:
         detail = response.text.strip()
     if detail and len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
         detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    detail_text = f" Details: {detail}" if detail else ""
+    if status == 401:
+        raise XeroAPIError(
+            "Xero rejected the access token (status 401). Reconnect Xero if "
+            f"the connection has expired.{detail_text}",
+            status_code=status,
+        )
+    if status == 403:
+        hint = (
+            f" The tool needs the OAuth scope {SCOPE_HINTS[scope]}; if it was "
+            "added after Xero was connected, reconnect Xero to grant it."
+            if scope in SCOPE_HINTS
+            else " Check that this Xero user can access the connected organisation."
+        )
+        raise XeroAPIError(
+            f"Xero denied the request (status 403).{hint}{detail_text}",
+            status_code=status,
+        )
+    if status == 429:
+        retry = response.headers.get("Retry-After")
+        wait = f" Retry after {retry} seconds." if retry else ""
+        raise XeroAPIError(
+            f"Xero rate limit reached (status 429).{wait}", status_code=status
+        )
     message = f"Xero API error (status {status})"
-    raise RuntimeError(f"{message}: {detail}" if detail else message)
+    raise XeroAPIError(
+        f"{message}: {detail}" if detail else message,
+        status_code=status,
+    )
 
 
 def _request(
@@ -652,13 +681,12 @@ def _paged_response(
     return _fit_list(build, items)
 
 
-def _unpaged_response(list_field: str, items: list[Any], **extra: Any) -> str:
+def _unpaged_response(list_field: str, items: list[Any]) -> str:
     def build(shown: list[Any], truncated: bool) -> dict[str, Any]:
         payload: dict[str, Any] = {
             list_field: shown,
             "total_count": len(items),
             "returned": len(shown),
-            **extra,
         }
         if truncated:
             payload["truncated"] = True
@@ -832,6 +860,33 @@ def _today() -> date:
     return datetime.now(timezone.utc).date()
 
 
+def _organisation_today() -> date:
+    """Return today in the connected organisation's accounting time zone.
+
+    Xero exposes Windows-style zone identifiers for AU/NZ organisations. If
+    the organisation lookup or zone mapping fails, retain the previous UTC
+    behaviour rather than preventing an otherwise valid invoice read.
+    """
+
+    zone_name = _connection_cache.get("time_zone")
+    if not zone_name:
+        try:
+            data = _request("GET", "Organisation", scope="settings")
+            record = _first(data, "Organisations")
+            raw_zone = str(record.get("Timezone") or "").strip()
+            zone_name = _XERO_TIME_ZONES.get(raw_zone.upper(), raw_zone)
+            if zone_name:
+                _connection_cache["time_zone"] = zone_name
+        except Exception:
+            logger.warning("Could not resolve the Xero organisation time zone")
+            return _today()
+    try:
+        return datetime.now(ZoneInfo(zone_name)).date()
+    except ZoneInfoNotFoundError:
+        logger.warning("Unknown Xero organisation time zone %r", zone_name)
+        return _today()
+
+
 def _get_one(path: str, key: str, *, scope: str) -> dict[str, Any]:
     return _first(_request("GET", path, scope=scope), key)
 
@@ -988,18 +1043,19 @@ def _collect_open_invoices(
         params["ContactIDs"] = ",".join(_guid_list(contact_ids, "contactIds"))
 
     found: list[dict[str, Any]] = []
+    seen_invoice_ids: set[str] = set()
     page = 1
     while True:
         try:
             data = _request(
                 "GET", "Invoices", scope="invoices", params={**params, "page": page}
             )
-        except RuntimeError as error:
+        except XeroAPIError as error:
             if (
                 narrowed_where is not None
                 and page == 1
                 and params["where"] == narrowed_where
-                and "status 400" in str(error)
+                and error.status_code == 400
             ):
                 logger.warning("Xero rejected the DueDate filter; retrying without it")
                 params["where"] = f'Type=="{invoice_type}"'
@@ -1009,6 +1065,7 @@ def _collect_open_invoices(
         for record in records:
             amount_due = Decimal(str(record.get("AmountDue") or 0))
             due = _doc_date(record, "DueDate")
+            issued = _doc_date(record, "Date")
             # The request asks Xero for Authorised invoices, but enforce the
             # same contract locally as well.  A stale or non-conforming API
             # response must never let a Paid invoice into an overdue/follow-up
@@ -1018,8 +1075,18 @@ def _collect_open_invoices(
                 or record.get("Status") != "AUTHORISED"
                 or amount_due <= 0
                 or not due
+                or not issued
+                or date.fromisoformat(issued[:10]) > as_of
             ):
                 continue
+            identity = str(
+                record.get("InvoiceID")
+                or record.get("InvoiceNumber")
+                or f"{record.get('Contact')}:{issued}:{due}:{amount_due}"
+            )
+            if identity in seen_invoice_ids:
+                continue
+            seen_invoice_ids.add(identity)
             days = (as_of - date.fromisoformat(due[:10])).days
             if min_days_overdue is not None and days < min_days_overdue:
                 continue
@@ -1028,11 +1095,12 @@ def _collect_open_invoices(
             found.append(view)
         pagination = data.get("pagination") or {}
         page_count = pagination.get("pageCount")
-        finished = (
-            page >= int(page_count)
-            if page_count is not None
-            else len(records) < XERO_BULK_PAGE_SIZE
-        )
+        if page_count is None:
+            raise RuntimeError(
+                "Xero invoice scan returned no pagination metadata; refusing "
+                "to report partial ledger totals as complete"
+            )
+        finished = page >= int(page_count)
         if finished:
             break
         if page >= OPEN_INVOICE_MAX_PAGES:
@@ -1055,27 +1123,33 @@ def list_overdue_invoices(
     limit: int = OVERDUE_DEFAULT_LIMIT,
 ) -> str:
     """
-    List ALL overdue invoices in Xero in one call, oldest due date first.
+    List ALL currently open overdue invoices in Xero, oldest due date first.
 
     Overdue means an Authorised invoice with an amount still due whose due date
     is before asOfDate. Paid, draft, voided and not-yet-due invoices are never
     returned, and this tool reads every page from Xero itself, so there is no
     need to call list_invoices page by page.
 
-    The result always carries the complete picture in total_count,
-    total_amount_due_by_currency, aging_buckets (1-30, 31-60, 61-90, 90+ days)
+    The result always carries the complete open-invoice picture in total_count,
+    total_amount_due_by_currency, ageing_buckets (1-30, 31-60, 61-90, 90+ days)
     and by_contact (largest balances first), even when only part of the invoice
     list fits in one response. When has_more is true, call again with next_skip
-    to read the remaining invoices.
+    to read the remaining invoices. Each window re-scans the open ledger, so
+    prefer the largest practical limit (up to 200) to conserve Xero's tenant
+    request quota.
 
-    asOfDate: YYYY-MM-DD the organisation's local "today" (default: today in
-        UTC). Pass it explicitly near midnight or across time zones.
+    Historical limitation: a past asOfDate excludes invoices issued later, but
+    payments, credits and allocations made after that date are not rolled back.
+    Credit notes, overpayments and prepayments are not netted into these gross
+    open-invoice totals; the response declares these exclusions explicitly.
+
+    asOfDate: YYYY-MM-DD (default: today in the Xero organisation's time zone).
     contactIds: only these contacts (from list_contacts).
     type: ACCREC for customer invoices (default), ACCPAY for bills you owe.
     minDaysOverdue: only invoices at least this many days past due (default 1).
     skip, limit: window into the invoice list (limit 1-200, default 50).
     """
-    as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _today()
+    as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _organisation_today()
     min_days = max(1, int(minDaysOverdue))
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), OVERDUE_MAX_LIMIT))
@@ -1086,7 +1160,7 @@ def list_overdue_invoices(
     buckets: dict[str, dict[str, Any]] = {
         name: {"count": 0, "totals": {}} for name in ("1-30", "31-60", "61-90", "90+")
     }
-    contacts: dict[str, dict[str, Any]] = {}
+    contacts: dict[tuple[str, str], dict[str, Any]] = {}
     for view in overdue:
         currency = view.get("currency") or "UNKNOWN"
         amount = Decimal(str(view.get("amount_due") or 0))
@@ -1095,35 +1169,41 @@ def list_overdue_invoices(
         bucket["count"] += 1
         bucket["totals"][currency] = bucket["totals"].get(currency, Decimal(0)) + amount
         contact = view.get("contact") or {}
-        key = contact.get("id") or contact.get("name") or "unknown"
+        key = (contact.get("id") or contact.get("name") or "unknown", currency)
         entry = contacts.setdefault(
             key,
             {
                 "contact_id": contact.get("id"),
                 "contact_name": contact.get("name"),
+                "currency": currency,
                 "invoice_count": 0,
-                "totals": {},
+                "amount_due": Decimal(0),
                 "oldest_due_date": view["due_date"],
             },
         )
         entry["invoice_count"] += 1
-        entry["totals"][currency] = entry["totals"].get(currency, Decimal(0)) + amount
+        entry["amount_due"] += amount
 
-    ranked = sorted(
-        contacts.values(),
-        key=lambda entry: -sum(entry["totals"].values(), Decimal(0)),
-    )
+    ranked: list[dict[str, Any]] = []
+    for currency in sorted({entry["currency"] for entry in contacts.values()}):
+        ranked.extend(
+            sorted(
+                (entry for entry in contacts.values() if entry["currency"] == currency),
+                key=lambda entry: (-entry["amount_due"], entry["contact_name"] or ""),
+            )[:OVERDUE_TOP_CONTACTS]
+        )
     by_contact = [
         _compact(
             {
                 "contact_id": entry["contact_id"],
                 "contact_name": entry["contact_name"],
+                "currency": entry["currency"],
                 "invoice_count": entry["invoice_count"],
-                "amount_due_by_currency": _money_totals(entry["totals"]),
+                "amount_due": f"{entry['amount_due']:.2f}",
                 "oldest_due_date": entry["oldest_due_date"],
             }
         )
-        for entry in ranked[:OVERDUE_TOP_CONTACTS]
+        for entry in ranked
     ]
     aging = {
         name: {
@@ -1141,11 +1221,14 @@ def list_overdue_invoices(
             "as_of_date": as_of.isoformat(),
             "invoice_type": type,
             "min_days_overdue": min_days,
+            "balance_basis": "current_open_invoice_state",
+            "historical_payments_reversed": False,
+            "excludes": OPEN_INVOICE_EXCLUDES,
             "total_count": len(overdue),
             "total_amount_due_by_currency": _money_totals(totals),
-            "aging_buckets": aging,
+            "ageing_buckets": aging,
             "by_contact": by_contact,
-            "by_contact_complete": len(ranked) <= OVERDUE_TOP_CONTACTS,
+            "by_contact_complete": len(ranked) == len(contacts),
             "complete": True,
             "skip": skip,
             "returned": len(shown),
@@ -1185,27 +1268,35 @@ def list_receivables_ageing(
     limit: int = RECEIVABLES_DEFAULT_LIMIT,
 ) -> str:
     """
-    Aged receivables summary for ALL contacts in one call: one row per contact
-    with the amount still due in each bucket (Current, 1-15, 16-30, 31-45,
-    46-60, 61-75, 76+ days overdue) and a total, largest balance first. Every
+    Gross open-invoice ageing for ALL contacts in one call: one row per
+    contact and currency with the amount still due in each bucket (Current,
+    1-15, 16-30, 31-45, 46-60, 61-75, 76+ days overdue) and a total. Rows are
+    grouped by currency and largest balance first within each currency; every
     row carries the contact's name.
 
-    Built from the open invoices themselves, so it does not depend on Xero's
+    Built from open invoices, so it does not depend on Xero's
     aged-receivables report. Current means not yet due (due today or later).
     Only Authorised invoices with an amount still due count; paid, draft and
-    voided invoices are excluded. This tool reads every page from Xero itself.
+    voided invoices are excluded. Credit notes, overpayments and prepayments
+    are not netted, so this gross balance may not reconcile to Xero's native
+    aged-receivables report. This tool reads every page from Xero itself.
 
     The result always carries the complete picture in totals_by_currency,
     even when only part of the rows fit in one response. When has_more is true,
-    call again with next_skip to read the remaining rows.
+    call again with next_skip to read the remaining rows. Each window re-scans
+    the open ledger, so prefer the largest practical limit (up to 500).
 
-    asOfDate: YYYY-MM-DD the organisation's local "today" (default: today in
-        UTC).
+    Historical limitation: a past asOfDate excludes invoices issued later, but
+    payments, credits and allocations made after that date are not rolled back.
+
+    asOfDate: YYYY-MM-DD (default: today in the Xero organisation's time zone).
     contactIds: only these contacts (from list_contacts).
-    type: ACCREC for customer invoices (default), ACCPAY for bills you owe.
+    type: ACCREC for receivables (default), ACCPAY for payables. Both use Xero's
+        Current/1-15/16-30/31-45/46-60/61-75/76+ report-style bucket scheme;
+        list_overdue_invoices uses operational 1-30/31-60/61-90/90+ buckets.
     skip, limit: window into the contact rows (limit 1-500, default 100).
     """
-    as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _today()
+    as_of = _iso_date(asOfDate, "asOfDate") if asOfDate else _organisation_today()
     skip = max(0, int(skip))
     limit = max(1, min(int(limit), RECEIVABLES_MAX_LIMIT))
     invoices = _collect_open_invoices(as_of, type, contactIds, min_days_overdue=None)
@@ -1243,6 +1334,7 @@ def list_receivables_ageing(
     ordered = sorted(
         rows.values(),
         key=lambda row: (
+            row["currency"],
             -sum(row["buckets"].values(), Decimal(0)),
             row["contact_name"] or "",
         ),
@@ -1276,6 +1368,9 @@ def list_receivables_ageing(
         payload: dict[str, Any] = {
             "as_of_date": as_of.isoformat(),
             "invoice_type": type,
+            "balance_basis": "current_open_invoice_state",
+            "historical_payments_reversed": False,
+            "excludes": OPEN_INVOICE_EXCLUDES,
             "bucket_names": list(RECEIVABLE_BUCKETS),
             "total_invoice_count": len(invoices),
             "total_rows": len(rendered_rows),
@@ -1435,6 +1530,7 @@ def list_quotes(
     page: int = 1,
     contactId: str | None = None,
     quoteNumber: str | None = None,
+    page_size: int = DEFAULT_PAGE_SIZE,
 ) -> str:
     """
     List quotes in Xero (up to 100 per page, newest first). If has_more is true
@@ -1442,25 +1538,23 @@ def list_quotes(
 
     contactId: only quotes for this contact.
     quoteNumber: only this quote number.
+    page_size: quotes per page, 1-100 (default 20).
     """
-    page = _page_number(page)
-    params: dict[str, Any] = {"page": page, "order": "UpdatedDateUTC DESC"}
+    params: dict[str, Any] = {"order": "UpdatedDateUTC DESC"}
     if contactId:
         params["ContactID"] = _guid(contactId, "contactId")
     if quoteNumber:
         params["QuoteNumber"] = _where_text(quoteNumber, "quoteNumber")
-    data = _request("GET", "Quotes", scope="invoices", params=params)
-    records = data.get("Quotes") or []
-    has_more = len(records) >= XERO_MAX_PAGE_SIZE
-    payload: dict[str, Any] = {
-        "quotes": [_quote_view(record) for record in records],
-        "page": page,
-        "returned": len(records),
-        "has_more": has_more,
-    }
-    if has_more:
-        payload["next_page"] = page + 1
-    return _success(**payload)
+    return _list_paged(
+        "Quotes",
+        "Quotes",
+        "quotes",
+        _quote_view,
+        scope="invoices",
+        page=page,
+        page_size=page_size,
+        params=params,
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)

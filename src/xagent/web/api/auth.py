@@ -114,8 +114,11 @@ _ORDINARY_OAUTH_STATE_COOKIE = "xagent_oauth_state"
 _ORDINARY_OAUTH_STATE_COOKIE_PREFIX = f"{_ORDINARY_OAUTH_STATE_COOKIE}_"
 _LOGIN_FAILURE_WINDOW_SECONDS = 15 * 60
 _LOGIN_FAILURE_LIMIT = 5
+_LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS = 60
+_LOGIN_FAILURE_MAX_KEYS = 10_000
 _login_failure_lock = threading.Lock()
 _login_failures: dict[str, deque[float]] = defaultdict(deque)
+_login_failure_last_sweep = 0.0
 _oauth_state_lock = threading.Lock()
 _used_ordinary_oauth_states: dict[str, float] = {}
 
@@ -135,6 +138,33 @@ def _prune_login_failures(key: str, current: float) -> deque[float]:
     return attempts
 
 
+def _sweep_login_failures(current: float) -> None:
+    """Bound the in-process login limiter's memory footprint.
+
+    Login identifiers are attacker-controlled, so pruning only the key being
+    attempted would let a stream of unique usernames grow the dictionary
+    indefinitely. Sweep expired buckets periodically and evict the oldest
+    remaining buckets if a hard cap is reached.
+    """
+    global _login_failure_last_sweep
+    if (
+        current - _login_failure_last_sweep < _LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS
+        and len(_login_failures) <= _LOGIN_FAILURE_MAX_KEYS
+    ):
+        return
+    for key, attempts in list(_login_failures.items()):
+        if not _prune_login_failures(key, current):
+            _login_failures.pop(key, None)
+    if len(_login_failures) > _LOGIN_FAILURE_MAX_KEYS:
+        oldest = sorted(
+            _login_failures,
+            key=lambda key: _login_failures[key][-1] if _login_failures[key] else 0,
+        )
+        for key in oldest[: len(_login_failures) - _LOGIN_FAILURE_MAX_KEYS]:
+            _login_failures.pop(key, None)
+    _login_failure_last_sweep = current
+
+
 def _login_is_blocked(key: str, now: float | None = None) -> bool:
     current = time.monotonic() if now is None else now
     with _login_failure_lock:
@@ -148,6 +178,7 @@ def _reserve_login_attempt(key: str, now: float | None = None) -> bool:
     """Atomically admit one attempt, preventing concurrent burst bypasses."""
     current = time.monotonic() if now is None else now
     with _login_failure_lock:
+        _sweep_login_failures(current)
         attempts = _prune_login_failures(key, current)
         if len(attempts) >= _LOGIN_FAILURE_LIMIT:
             return False
@@ -1583,6 +1614,12 @@ class RefreshTokenRequest(BaseModel):
     refresh_token: str
 
 
+class LogoutRequest(BaseModel):
+    """Optional refresh token for revoking exactly the session being logged out."""
+
+    refresh_token: Optional[str] = None
+
+
 class RefreshTokenResponse(BaseModel):
     """Refresh token response model"""
 
@@ -2629,10 +2666,20 @@ async def refresh_token(
 
 @auth_router.post("/logout")
 async def logout(
+    request: Optional[LogoutRequest] = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """Revoke the user's rotating refresh session at logout."""
+    # A stale tab must not revoke a newer session that replaced its refresh
+    # token. Omitting the body preserves the endpoint's legacy revoke-all
+    # behavior for API clients that only send the access token.
+    if (
+        request is not None
+        and request.refresh_token is not None
+        and request.refresh_token != getattr(user, "refresh_token", None)
+    ):
+        return {"success": True, "message": "Logged out successfully"}
     setattr(user, "refresh_token", None)
     setattr(user, "refresh_token_expires_at", None)
     db.commit()

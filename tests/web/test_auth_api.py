@@ -1403,6 +1403,34 @@ class TestAuthAPI:
         assert data["success"] is True
         assert data["user"]["email"] == "updated@example.com"
 
+    def test_logout_revokes_the_refresh_token_supplied_by_the_client(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        assert client.post("/api/auth/register", json=test_user_data).status_code == 200
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["username"],
+                "password": test_user_data["password"],
+            },
+        )
+        assert login.status_code == 200
+        tokens = login.json()
+
+        response = client.post(
+            "/api/auth/logout",
+            json={"refresh_token": tokens["refresh_token"]},
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["success"] is True
+        refresh = client.post(
+            "/api/auth/refresh", json={"refresh_token": tokens["refresh_token"]}
+        )
+        assert refresh.status_code == 401
+
     def test_oidc_user_email_update_does_not_require_local_password(self, test_db):
         db = TestingSessionLocal()
         try:

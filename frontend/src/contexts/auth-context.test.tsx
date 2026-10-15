@@ -496,6 +496,27 @@ describe("AuthProvider storage synchronization", () => {
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
   })
 
+  it("revokes the server refresh session before clearing local auth", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    const fetchMock = vi.fn(async (..._args: unknown[]) => new Response(null, { status: 200 }))
+    vi.stubGlobal("fetch", fetchMock)
+    render(<AuthProvider><AuthLogoutProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("logout-token")).toHaveTextContent("access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Logout" }))
+
+    await waitFor(() => expect(screen.getByTestId("logout-result")).toHaveTextContent("true"))
+    const logoutCalls = fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/api/auth/logout"))
+    expect(logoutCalls).toHaveLength(1)
+    expect(logoutCalls[0][1]).toMatchObject({
+      method: "POST",
+      headers: {
+        Authorization: "Bearer access",
+      },
+      body: JSON.stringify({ refresh_token: "refresh" }),
+    })
+  })
+
   it("clears the Provider projection even when the login-intent barrier cannot be replaced or removed", async () => {
     writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
     const originalSetItem = localStorage.setItem.bind(localStorage)

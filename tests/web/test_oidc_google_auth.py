@@ -188,7 +188,9 @@ def test_google_oidc_login_creates_user_when_registration_enabled(
     data = response.json()
     assert data["success"] is True
     assert data["user"]["username"] == "person@example.com"
+    assert data["user"]["email"] == "person@example.com"
     assert data["user"]["is_admin"] is False
+    assert data["user"]["has_password"] is False
     assert data["access_token"]
     assert data["refresh_token"]
 

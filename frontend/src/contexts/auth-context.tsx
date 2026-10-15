@@ -119,12 +119,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
   const logout = useCallback(async () => {
     ++operationRef.current
+    const captured = currentProjection()?.snapshot ?? projection?.snapshot
+    if (captured?.accessToken) {
+      try {
+        // Use the captured access token directly. Passing this through
+        // apiRequest could refresh the session after a 401, then retry logout
+        // with a new access token but the old refresh token in the body.
+        await fetch(`${getApiUrl()}/api/auth/logout`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${captured.accessToken}`,
+          },
+          body: JSON.stringify({ refresh_token: captured.refreshToken }),
+        })
+      } catch {
+        // Local logout must still proceed when the server is unavailable.
+      }
+    }
     const result = await clearStoredAuth()
     if (result.credentialsCleared && mountedRef.current) setProjection(null)
     if (result.status !== "cleared") return false
     window.location.href = "/login"
     return true
-  }, [])
+  }, [projection])
   const checkAuth = useCallback(async () => {
     const captured = projection?.snapshot
     const beforeInspection = inspectAuthSession()

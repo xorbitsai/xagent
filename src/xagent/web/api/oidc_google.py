@@ -229,6 +229,8 @@ def _get_or_create_google_user(db: Session, claims: dict[str, Any]) -> User:
         user = db.query(User).filter(User.id == identity.user_id).first()
         if user is None:
             raise ValueError("linked_user_not_found")
+        if not user.email:
+            setattr(user, "email", email)
         setattr(identity, "email", email)
         setattr(identity, "email_verified", email_verified)
         setattr(identity, "display_name", claims.get("name"))
@@ -243,6 +245,7 @@ def _get_or_create_google_user(db: Session, claims: dict[str, Any]) -> User:
 
     user = User(
         username=_unique_google_username(db, email, provider_subject),
+        email=email,
         password_hash=OIDC_UNUSABLE_PASSWORD_HASH,
         is_admin=False,
     )
@@ -300,7 +303,9 @@ def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
         "user": {
             "id": user.id,
             "username": user.username,
+            "email": user.email,
             "is_admin": user.is_admin,
+            "has_password": not str(user.password_hash).startswith("!"),
             "loginTime": _utcnow().timestamp(),
         },
         "access_token": access_token,

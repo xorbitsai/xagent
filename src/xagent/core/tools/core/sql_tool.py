@@ -196,7 +196,10 @@ def is_platform_database_url(candidate: str | URL) -> bool:
 
 def validate_external_database_url(candidate: str | URL) -> URL:
     """Parse and reject connection spellings that can target the platform DB."""
-    parsed = make_url(candidate)
+    try:
+        parsed = make_url(candidate)
+    except Exception as exc:
+        raise ValueError("Invalid SQLAlchemy connection URL") from exc
     if _canonical_backend(parsed) == "sqlite" and (
         _query_values(parsed, "uri")
         or (parsed.database or "").strip().lower().startswith("file:")
@@ -214,7 +217,12 @@ def validate_external_database_url(candidate: str | URL) -> URL:
             "Opaque database target configuration is not allowed: "
             + ", ".join(configured_opaque_keys)
         )
-    _database_identity(parsed)
+    try:
+        _database_identity(parsed)
+    except ValueError:
+        raise
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise ValueError("Unable to determine the database target") from exc
     if is_platform_database_url(parsed):
         raise ValueError(PLATFORM_DATABASE_ERROR)
     return parsed

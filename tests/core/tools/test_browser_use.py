@@ -183,8 +183,8 @@ class TestBrowserRequestGuard:
         client_writer = MagicMock()
         client_writer.drain = AsyncMock()
         remote_reader = MagicMock()
-        remote_reader.read = AsyncMock(
-            side_effect=[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", b""]
+        remote_reader.readuntil = AsyncMock(
+            return_value=b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
         )
         remote_writer = MagicMock()
         remote_writer.drain = AsyncMock()
@@ -215,6 +215,9 @@ class TestBrowserRequestGuard:
         request = remote_writer.write.call_args.args[0]
         assert request.endswith(b"\r\n\r\nabc")
         assert b"Connection: close\r\n" in request
+        response = client_writer.write.call_args.args[0]
+        assert b"Connection: close\r\n" in response
+        assert b"Connection: keep-alive" not in response
         client_reader.read.assert_not_awaited()
         remote_writer.wait_closed.assert_awaited_once_with()
 
@@ -681,6 +684,6 @@ class TestBrowserSession:
             "bypass": "<-loopback>",
         }
         context.route.assert_awaited_once()
-        assert context.route.await_args.args[0] == "**/*"
+        assert context.route.await_args.args[0].pattern == r"^file:"
 
         await session.close()

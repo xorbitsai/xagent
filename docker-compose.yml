@@ -40,6 +40,10 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - BACKEND_PORT=8000
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      # The published image runs this service as root for its existing volume
+      # layout. Keep the compatibility opt-in explicit here; non-root
+      # deployments should set this to false and use Chromium's sandbox.
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
       - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
       - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
       - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}
@@ -94,6 +98,7 @@ services:
       - DATABASE_URL=postgresql://xagent:${POSTGRES_PASSWORD:-xagent_password}@postgres:5432/xagent
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-xagent_password}
       - XAGENT_UPLOADS_DIR=/root/.xagent/uploads
+      - XAGENT_BROWSER_ALLOW_UNSANDBOXED=${XAGENT_BROWSER_ALLOW_UNSANDBOXED:-true}
       - XAGENT_MAX_UPLOAD_SIZE=${XAGENT_MAX_UPLOAD_SIZE:-100M}
       - XAGENT_ARTIFACT_VALIDATION_MAX_BYTES=${XAGENT_ARTIFACT_VALIDATION_MAX_BYTES:-32M}
       - XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS=${XAGENT_ARTIFACT_VALIDATION_TIMEOUT_SECONDS:-8}

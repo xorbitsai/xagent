@@ -119,12 +119,12 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 ENV NODE_PATH="/opt/xagent/frontend/node_modules"
-# This image intentionally runs the backend as root for its existing Docker
-# sandbox and mounted-volume integrations. Chromium cannot initialize its
-# namespace sandbox as root, so make the compatibility opt-in explicit rather
-# than silently passing --no-sandbox. Prefer a non-root deployment and unset
-# this variable when the runtime can use Chromium's sandbox.
-ENV XAGENT_BROWSER_ALLOW_UNSANDBOXED=true
+# Chromium sandboxing stays enabled by default. The published Compose
+# deployment runs this image as root for its existing mounted-volume
+# integrations, so docker-compose.yml opts into the compatibility flag
+# explicitly. Direct deployments should run as a non-root user; only set
+# XAGENT_BROWSER_ALLOW_UNSANDBOXED=true when that is not possible.
+ENV XAGENT_BROWSER_ALLOW_UNSANDBOXED=false
 
 WORKDIR /opt/xagent
 
@@ -206,9 +206,8 @@ RUN curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /
 # --build-arg INSTALL_CHROME=false to drop the image size and the
 # /opt/google/chrome/chrome binary + npx cache. Playwright Chromium is
 # installed unconditionally in a separate stage below. The published backend
-# image still runs as root, so the runtime opts into unsandboxed Chromium for
-# compatibility; deployments that can run the backend as a non-root user
-# should unset XAGENT_BROWSER_ALLOW_UNSANDBOXED and use Chromium's sandbox.
+# image still runs as root. The Compose deployment supplies the explicit
+# compatibility opt-in; direct non-root deployments keep Chromium sandboxed.
 ARG INSTALL_CHROME=true
 # Distinct from the Playwright Chromium below, which chrome-devtools-mcp does
 # not detect. Its default "stable" channel resolution checks exactly

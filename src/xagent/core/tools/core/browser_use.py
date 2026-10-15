@@ -9,6 +9,7 @@ automatically cleaned up after a timeout period.
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Sequence, cast
@@ -145,6 +146,7 @@ async def _validate_browser_target(
 
 _PROXY_HEADER_LIMIT = 64 * 1024
 _PROXY_CONNECT_TIMEOUT = 10.0
+_PROXY_RESPONSE_TIMEOUT = 10.0
 _PROXY_MAX_REQUEST_BODY = 64 * 1024 * 1024
 
 _HTTP_FETCH_PATTERNS = [
@@ -180,10 +182,6 @@ class _BrowserEgressProxy:
         return f"http://127.0.0.1:{port}"
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
         tasks = list(self._client_tasks)
         for task in tasks:
             if not task.done():
@@ -191,6 +189,10 @@ class _BrowserEgressProxy:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._client_tasks.clear()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -254,9 +256,17 @@ class _BrowserEgressProxy:
         port = parsed.port or 443
         resolved = await validate_public_http_url(f"https://{target}")
         remote_reader, remote_writer = await self._open_validated(resolved, port)
-        writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await writer.drain()
-        await self._bridge(reader, writer, remote_reader, remote_writer)
+        try:
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+            await self._bridge(reader, writer, remote_reader, remote_writer)
+        finally:
+            if not remote_writer.is_closing():
+                remote_writer.close()
+            try:
+                await remote_writer.wait_closed()
+            except Exception:
+                pass
 
     async def _handle_forward(
         self,
@@ -395,11 +405,81 @@ class _BrowserEgressProxy:
     async def _relay_response(
         remote_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
     ) -> None:
-        try:
-            while data := await remote_reader.read(64 * 1024):
+        header = await asyncio.wait_for(
+            remote_reader.readuntil(b"\r\n\r\n"), _PROXY_RESPONSE_TIMEOUT
+        )
+        lines = header[:-4].split(b"\r\n")
+        response_headers: list[bytes] = []
+        content_length: int | None = None
+        chunked = False
+        for line in lines[1:]:
+            name, _, value = line.partition(b":")
+            normalized_name = name.lower().strip()
+            if normalized_name in {b"connection", b"proxy-connection", b"keep-alive"}:
+                continue
+            if normalized_name == b"content-length":
+                try:
+                    content_length = int(value.strip())
+                except ValueError as exc:
+                    raise ValueError("invalid upstream Content-Length") from exc
+                if content_length < 0:
+                    raise ValueError("invalid upstream Content-Length")
+            elif normalized_name == b"transfer-encoding":
+                chunked = value.strip().lower() == b"chunked"
+            response_headers.append(line)
+        response_headers.append(b"Connection: close")
+        client_writer.write(b"\r\n".join([lines[0], *response_headers, b"", b""]))
+        await client_writer.drain()
+
+        if content_length is not None:
+            remaining = content_length
+            while remaining:
+                data = await asyncio.wait_for(
+                    remote_reader.read(min(64 * 1024, remaining)),
+                    _PROXY_RESPONSE_TIMEOUT,
+                )
+                if not data:
+                    break
                 client_writer.write(data)
                 await client_writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError):
+                remaining -= len(data)
+            return
+
+        if chunked:
+            while True:
+                size_line = await asyncio.wait_for(
+                    remote_reader.readuntil(b"\r\n"), _PROXY_RESPONSE_TIMEOUT
+                )
+                client_writer.write(size_line)
+                await client_writer.drain()
+                try:
+                    chunk_size = int(size_line[:-2].split(b";", 1)[0].strip(), 16)
+                except ValueError as exc:
+                    raise ValueError("invalid upstream chunked response") from exc
+                chunk = await asyncio.wait_for(
+                    remote_reader.readexactly(chunk_size + 2),
+                    _PROXY_RESPONSE_TIMEOUT,
+                )
+                client_writer.write(chunk)
+                await client_writer.drain()
+                if chunk_size == 0:
+                    while True:
+                        trailer = await asyncio.wait_for(
+                            remote_reader.readuntil(b"\r\n"),
+                            _PROXY_RESPONSE_TIMEOUT,
+                        )
+                        client_writer.write(trailer)
+                        await client_writer.drain()
+                        if trailer == b"\r\n":
+                            return
+
+        try:
+            while data := await asyncio.wait_for(
+                remote_reader.read(64 * 1024), _PROXY_RESPONSE_TIMEOUT
+            ):
+                client_writer.write(data)
+                await client_writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError):
             pass
 
     @staticmethod
@@ -787,7 +867,9 @@ class BrowserSession:
                 raise
 
             try:
-                await self._context.route("**/*", self._guard_context_route)
+                await self._context.route(
+                    re.compile(r"^file:"), self._guard_context_route
+                )
                 self._context.on("page", self._schedule_page_guard)
                 self._page = await self._context.new_page()
                 await self._guard_page_requests(self._page)

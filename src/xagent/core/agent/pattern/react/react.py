@@ -5798,9 +5798,6 @@ class ReActPattern(AgentPattern):
             records.append(record)
         return records
 
-    def _consecutive_successful_tool_group_count(self, tool_group: str) -> int:
-        return len(self._consecutive_successful_tool_group_records(tool_group))
-
     def _consecutive_work_tool_call_count(self) -> int:
         return len(self._consecutive_work_tool_records())
 

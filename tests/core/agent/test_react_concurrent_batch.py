@@ -453,7 +453,7 @@ def test_reorder_moves_ids_reused_from_an_earlier_step_to_the_tail() -> None:
         tool_call["invocation_id"] for tool_call in batch
     ]
     group = pattern._tool_decision_group_for_name("web_search")
-    assert pattern._consecutive_successful_tool_group_count(group) == 2
+    assert len(pattern._consecutive_successful_tool_group_records(group)) == 2
 
 
 async def test_concurrent_batch_keeps_ledger_in_input_order() -> None:
@@ -498,7 +498,7 @@ async def test_concurrent_batch_updates_consecutive_group_count() -> None:
 
     await pattern._run_concurrent_batch(batch, tools, FakeRuntime(), context)
 
-    assert pattern._consecutive_successful_tool_group_count(group) == 3
+    assert len(pattern._consecutive_successful_tool_group_records(group)) == 3
 
 
 async def test_mcp_error_result_stops_consecutive_successful_group_count() -> None:
@@ -514,7 +514,7 @@ async def test_mcp_error_result_stops_consecutive_successful_group_count() -> No
         result={"content": [{"text": "failed"}], "is_error": True},
     )
 
-    assert pattern._consecutive_successful_tool_group_count(group) == 0
+    assert len(pattern._consecutive_successful_tool_group_records(group)) == 0
 
 
 async def test_concurrent_batch_with_failure_counts_work_calls() -> None:

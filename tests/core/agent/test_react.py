@@ -10041,7 +10041,10 @@ async def test_resumed_settlement_replaces_original_tool_result_after_rebuild() 
     )
     assert record.result == {"success": True, "post_urn": "urn:li:share:123"}
     assert (
-        restored_pattern._consecutive_successful_tool_group_count("approval_gate") == 1
+        len(
+            restored_pattern._consecutive_successful_tool_group_records("approval_gate")
+        )
+        == 1
     )
     assert restored_pattern._consecutive_work_tool_call_count() == 1
     projected_messages = [
@@ -10417,7 +10420,7 @@ async def test_non_successful_settlement_fails_the_original_tool_call(
     assert pattern.force_final_answer_next is guarded
     assert pattern.settlement_final_answer_fence is guarded
     assert pattern.settlement_fence_turn_id == ("approval-turn" if guarded else None)
-    assert pattern._consecutive_successful_tool_group_count("approval_gate") == 0
+    assert len(pattern._consecutive_successful_tool_group_records("approval_gate")) == 0
     assert pattern._consecutive_work_tool_call_count() == 1
     assert _settlement_trace_events(tracer, "call-1") == [
         "action_start_tool",

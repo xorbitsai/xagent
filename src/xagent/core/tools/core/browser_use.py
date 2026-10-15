@@ -145,6 +145,7 @@ async def _validate_browser_target(
 
 _PROXY_HEADER_LIMIT = 64 * 1024
 _PROXY_CONNECT_TIMEOUT = 10.0
+_PROXY_MAX_REQUEST_BODY = 64 * 1024 * 1024
 
 _HTTP_FETCH_PATTERNS = [
     {"urlPattern": "http://*", "requestStage": "Request"},
@@ -287,29 +288,109 @@ class _BrowserEgressProxy:
         resolved = await validate_public_http_url(
             parsed._replace(scheme=scheme).geturl()
         )
+        body = await self._read_forward_body(reader, headers)
         remote_reader, remote_writer = await self._open_validated(resolved, port)
+        try:
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            output_headers = []
+            saw_host = False
+            chunked = headers.get("transfer-encoding", "").lower() == "chunked"
+            for name, value in headers.items():
+                if name in {"proxy-connection", "connection", "expect"} or (
+                    chunked and name == "content-length"
+                ):
+                    continue
+                if name == "host":
+                    value = parsed.netloc
+                    saw_host = True
+                output_headers.append(f"{name}: {value}")
+            if not saw_host:
+                output_headers.append(f"Host: {parsed.netloc}")
+            output_headers.append("Connection: close")
+            request = (
+                f"{method} {path} {version}\r\n"
+                + "\r\n".join(output_headers)
+                + "\r\n\r\n"
+            ).encode("latin-1")
+            remote_writer.write(request + body)
+            await remote_writer.drain()
+            # Do not bridge client_reader here.  Once this request has been
+            # sent, any additional bytes on Chromium's keep-alive socket must
+            # never reach this origin's upstream connection.
+            await self._relay_response(remote_reader, writer)
+        finally:
+            remote_writer.close()
+            try:
+                await remote_writer.wait_closed()
+            except Exception:
+                pass
 
-        path = parsed.path or "/"
-        if parsed.query:
-            path = f"{path}?{parsed.query}"
-        output_headers = []
-        saw_host = False
-        for name, value in headers.items():
-            if name in {"proxy-connection", "connection"}:
-                continue
-            if name == "host":
-                value = parsed.netloc
-                saw_host = True
-            output_headers.append(f"{name}: {value}")
-        if not saw_host:
-            output_headers.append(f"Host: {parsed.netloc}")
-        output_headers.append("Connection: close")
-        request = (
-            f"{method} {path} {version}\r\n" + "\r\n".join(output_headers) + "\r\n\r\n"
-        ).encode("latin-1")
-        remote_writer.write(request)
-        await remote_writer.drain()
-        await self._bridge(reader, writer, remote_reader, remote_writer)
+    @staticmethod
+    async def _read_forward_body(
+        reader: asyncio.StreamReader, headers: dict[str, str]
+    ) -> bytes:
+        """Read exactly one bounded HTTP request body before opening upstream."""
+        transfer_encoding = headers.get("transfer-encoding", "").lower()
+        if transfer_encoding not in {"", "identity", "chunked"}:
+            raise ValueError("unsupported proxy request transfer encoding")
+        if transfer_encoding == "chunked":
+            body = bytearray()
+            total = 0
+            while True:
+                size_line = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n"), _PROXY_CONNECT_TIMEOUT
+                )
+                try:
+                    size_text = size_line[:-2].split(b";", 1)[0].strip()
+                    chunk_size = int(size_text, 16)
+                except ValueError as exc:
+                    raise ValueError("invalid chunked proxy request body") from exc
+                body.extend(size_line)
+                if chunk_size == 0:
+                    while True:
+                        trailer = await asyncio.wait_for(
+                            reader.readuntil(b"\r\n"), _PROXY_CONNECT_TIMEOUT
+                        )
+                        body.extend(trailer)
+                        if trailer == b"\r\n":
+                            return bytes(body)
+                total += chunk_size
+                if total > _PROXY_MAX_REQUEST_BODY:
+                    raise ValueError("proxy request body is too large")
+                chunk = await asyncio.wait_for(
+                    reader.readexactly(chunk_size + 2), _PROXY_CONNECT_TIMEOUT
+                )
+                if not chunk.endswith(b"\r\n"):
+                    raise ValueError("invalid chunked proxy request body")
+                body.extend(chunk)
+        raw_length = headers.get("content-length", "0")
+        try:
+            content_length = int(raw_length)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if content_length < 0 or content_length > _PROXY_MAX_REQUEST_BODY:
+            raise ValueError("proxy request body is too large")
+        if content_length == 0:
+            return b""
+        try:
+            return await asyncio.wait_for(
+                reader.readexactly(content_length), _PROXY_CONNECT_TIMEOUT
+            )
+        except asyncio.IncompleteReadError as exc:
+            raise ValueError("proxy request body ended early") from exc
+
+    @staticmethod
+    async def _relay_response(
+        remote_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
+    ) -> None:
+        try:
+            while data := await remote_reader.read(64 * 1024):
+                client_writer.write(data)
+                await client_writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
 
     @staticmethod
     async def _open_validated(

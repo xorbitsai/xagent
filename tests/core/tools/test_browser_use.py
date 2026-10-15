@@ -173,6 +173,52 @@ class TestBrowserRequestGuard:
         open_connection.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_http_forward_is_one_shot_per_client_request(self, monkeypatch):
+        proxy = browser_use._BrowserEgressProxy()
+        client_reader = MagicMock()
+        client_reader.readexactly = AsyncMock(return_value=b"abc")
+        client_reader.read = AsyncMock(
+            side_effect=AssertionError("pipelined client bytes were forwarded")
+        )
+        client_writer = MagicMock()
+        client_writer.drain = AsyncMock()
+        remote_reader = MagicMock()
+        remote_reader.read = AsyncMock(
+            side_effect=[b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", b""]
+        )
+        remote_writer = MagicMock()
+        remote_writer.drain = AsyncMock()
+        remote_writer.wait_closed = AsyncMock()
+
+        monkeypatch.setattr(
+            browser_use,
+            "validate_public_http_url",
+            AsyncMock(return_value=["203.0.113.10"]),
+        )
+        open_connection = AsyncMock(return_value=(remote_reader, remote_writer))
+        monkeypatch.setattr(proxy, "_open_validated", open_connection)
+
+        await proxy._handle_forward(
+            client_reader,
+            client_writer,
+            "POST",
+            "http://example.com/upload",
+            "HTTP/1.1",
+            {
+                "host": "example.com",
+                "content-length": "3",
+                "connection": "keep-alive",
+            },
+        )
+
+        open_connection.assert_awaited_once_with(["203.0.113.10"], 80)
+        request = remote_writer.write.call_args.args[0]
+        assert request.endswith(b"\r\n\r\nabc")
+        assert b"Connection: close\r\n" in request
+        client_reader.read.assert_not_awaited()
+        remote_writer.wait_closed.assert_awaited_once_with()
+
+    @pytest.mark.asyncio
     async def test_concurrent_page_guards_share_one_installation(self):
         session = browser_use.BrowserSession("guard")
         context = MagicMock()

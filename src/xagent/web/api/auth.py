@@ -201,10 +201,10 @@ def _clear_login_failures(key: str) -> None:
 def _password_recovery_attempt_key(
     request: Request | None, namespace: str, value: str
 ) -> str:
-    client_host = remote_ip_from_request(request) if request else "unknown"
-    return hashlib.sha256(
-        f"password-recovery\0{namespace}\0{client_host}\0{value}".encode()
-    ).hexdigest()
+    if namespace == "ip":
+        client_host = remote_ip_from_request(request) if request else "unknown"
+        value = client_host or "unknown"
+    return hashlib.sha256(f"password-recovery\0{namespace}\0{value}".encode()).hexdigest()
 
 
 def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bool:

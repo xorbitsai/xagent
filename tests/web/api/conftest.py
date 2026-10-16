@@ -2,8 +2,8 @@
 
 Each test file gets:
 
-  - An autouse ``_test_db`` fixture that lays a fresh SQLite schema
-    before each test and drops it after.
+  - An opt-in ``_test_db`` fixture that copies a fresh SQLite database
+    before each test and drops its schema after.
   - A module-level ``client`` (TestClient) wired up against the routers
     every test file needs: auth, agents, v1.
   - Auth helpers (``_setup_admin`` / ``_login`` / ``_admin_headers`` /
@@ -23,7 +23,10 @@ import asyncio
 import logging
 import os
 import shutil
+import sqlite3
 import tempfile
+from contextlib import closing
+from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
@@ -193,13 +196,40 @@ def _reset_trigger_rate_limiter() -> Iterator[None]:
     yield
 
 
-@pytest.fixture
-def _test_db() -> Iterator[None]:
-    """Per-test SQLite DB so tables come up empty for every test.
+@pytest.fixture(scope="session")
+def _test_db_template(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Build the ordinary API database once per worker, including seeded rows.
 
-    Mirrors the pattern from ``test_agents_kb_tool_validation.py``:
-    temp sqlite file, ``init_db`` lays out the schema, drop all on
-    teardown.
+    Startup, migration, or custom seed tests use their own ``init_db`` fixtures.
+    The session owns only the snapshot; live engines remain test-scoped.
+    """
+    from xagent.web.models import database
+
+    template_dir = tmp_path_factory.mktemp("api-db-template")
+    source_path = template_dir / "source.db"
+    template_path = template_dir / "template.db"
+    previous = database._SessionLocal, database._engine
+    try:
+        database.init_db(db_url=f"sqlite:///{source_path}")
+        # SQLite backup includes committed WAL contents without retaining a
+        # connection to the file copied into individual tests.
+        with closing(sqlite3.connect(source_path)) as source:
+            with closing(sqlite3.connect(template_path)) as template:
+                source.backup(template)
+    finally:
+        engine = database._engine
+        database._SessionLocal, database._engine = previous
+        if engine is not None and engine is not previous[1]:
+            engine.dispose()
+    return template_path
+
+
+@pytest.fixture
+def _test_db(_test_db_template: Path) -> Iterator[None]:
+    """Give each ordinary API test its own fresh SQLite file and engine.
+
+    Copy the initialized schema and seed data, bind a test-scoped engine,
+    and preserve the existing schema cleanup on teardown.
 
     Not ``autouse=True`` -- some sibling test files
     (``test_tools_api.py``) define their own DB fixture and would
@@ -211,12 +241,13 @@ def _test_db() -> Iterator[None]:
         def _db(self, _test_db):
             pass
     """
-    from xagent.web.models.database import init_db
+    from xagent.web.models.database import configure_db
 
     temp_dir = tempfile.mkdtemp()
     temp_db_path = os.path.join(temp_dir, "test.db")
+    shutil.copyfile(_test_db_template, temp_db_path)
     db_url = f"sqlite:///{temp_db_path}"
-    init_db(db_url=db_url)
+    configure_db(db_url=db_url)
 
     yield
 

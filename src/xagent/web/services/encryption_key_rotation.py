@@ -19,8 +19,9 @@ from ...config import (
     requires_secure_secrets,
 )
 from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
-from ...core.utils.encryption import _looks_like_fernet_token
+from ...core.utils.encryption import _get_encryption_key, _looks_like_fernet_token
 from ..models.database import get_engine
+from ..models.user_channel import CHANNEL_SECRET_FIELDS
 from .tool_credentials import _build_fernet_key
 
 logger = logging.getLogger(__name__)
@@ -51,7 +52,7 @@ _REQUIRED_CIPHERTEXT = {
 # Match the writers, not the shape of unrelated JSON strings. These columns
 # contain plaintext metadata next to explicitly encrypted top-level fields.
 _JSON_SECRET_FIELDS = {
-    ("user_channels", "config"): ("bot_token", "app_secret", "app_token"),
+    ("user_channels", "config"): CHANNEL_SECRET_FIELDS,
     ("mcp_servers", "auth"): SENSITIVE_AUTH_FIELDS,
     ("trigger_runs", "payload_snapshot"): ("encrypted_payload",),
 }
@@ -136,6 +137,18 @@ def transform_credential_value(
     return transform_token(value)
 
 
+def tool_credential_items(value: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield the tool credential paths shared by admission and offline rotation."""
+    if not isinstance(value, dict):
+        return
+    for group in ("credentials", "sql_connections"):
+        fields = value.get(group)
+        if isinstance(fields, dict):
+            for field, item in fields.items():
+                if isinstance(item, dict) and isinstance(item.get("ciphertext"), str):
+                    yield f"{group}.{field!r}", item
+
+
 def validate_stored_encryption_keys(engine: Engine | None = None) -> None:
     """Refuse deployed admission rather than silently losing old credentials."""
     if not requires_secure_secrets():
@@ -173,22 +186,13 @@ def validate_stored_encryption_keys(engine: Engine | None = None) -> None:
         for table, row_id, column, value in credential_rows(
             connection, {"tool_configs": ("config",), "user_tool_configs": ("config",)}
         ):
-            if not isinstance(value, dict):
-                continue
-            for group in ("credentials", "sql_connections"):
-                fields = value.get(group)
-                if not isinstance(fields, dict):
-                    continue
-                for field, item in fields.items():
-                    if isinstance(item, dict) and isinstance(
-                        item.get("ciphertext"), str
-                    ):
-                        try:
-                            tool.decrypt(item["ciphertext"].encode())
-                        except (InvalidToken, ValueError):
-                            raise RuntimeError(
-                                f"Unreadable tool credential: {table.name} row {row_id} field {group}.{field!r}; see docs/tool-credential-key-upgrade.md"
-                            ) from None
+            for field, item in tool_credential_items(value):
+                try:
+                    tool.decrypt(item["ciphertext"].encode())
+                except (InvalidToken, ValueError):
+                    raise RuntimeError(
+                        f"Unreadable tool credential: {table.name} row {row_id} field {field}; see docs/tool-credential-key-upgrade.md"
+                    ) from None
     if recoverable_failures > 5:
         logger.warning(
             "%s additional unreadable recoverable credential fields; "
@@ -224,6 +228,15 @@ def rotate_encryption_key(connection: Connection, old: Fernet, new: Fernet) -> i
             if table.name == "global_memory_embedding_authority":
                 from .global_memory_embedding_authority import _credential_verifier
 
+                # The verifier derives from the configured master key, not the
+                # passed Fernet object. Refuse a mismatched caller atomically.
+                try:
+                    Fernet(_get_encryption_key().encode()).decrypt(rotated.encode())
+                except (InvalidToken, ValueError):
+                    raise RuntimeError(
+                        "Rotation destination must match configured ENCRYPTION_KEY "
+                        "for the global authority; migration rolled back"
+                    ) from None
                 values["credential_verifier"] = _credential_verifier(
                     new.decrypt(rotated.encode()).decode()
                 )

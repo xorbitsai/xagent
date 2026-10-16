@@ -10,6 +10,8 @@ from sqlalchemy.sql import func
 from ...config import DEV_FALLBACK_ENCRYPTION_KEY
 from .database import Base
 
+CHANNEL_SECRET_FIELDS = ("bot_token", "app_secret", "app_token")
+
 # Dev-only fallback so local setups work without configuration. Production
 # deployments must set ENCRYPTION_KEY; has_production_channel_encryption_key()
 # gates features (such as Slack workspace OAuth) that persist third-party
@@ -61,7 +63,7 @@ class UserChannel(Base):  # type: ignore[no-any-unimported]
         config_copy = copy.deepcopy(raw_config)
 
         # Decrypt sensitive fields
-        for field in ("bot_token", "app_secret", "app_token"):
+        for field in CHANNEL_SECRET_FIELDS:
             if not config_copy.get(field):
                 continue
             try:
@@ -82,7 +84,7 @@ class UserChannel(Base):  # type: ignore[no-any-unimported]
         config_copy = copy.deepcopy(value)
 
         # Encrypt sensitive fields
-        for field in ("bot_token", "app_secret", "app_token"):
+        for field in CHANNEL_SECRET_FIELDS:
             if not config_copy.get(field):
                 continue
             try:

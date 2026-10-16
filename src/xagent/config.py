@@ -2248,7 +2248,7 @@ def validate_private_encryption_key(key: str | None) -> None:
         raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
     try:
         Fernet(key.encode("ascii"))
-    except (ValueError, UnicodeError) as exc:
+    except ValueError as exc:
         raise RuntimeError("ENCRYPTION_KEY must provide a valid Fernet key") from exc
     # Fernet accepts standard Base64, extra padding and embedded whitespace.
     # All equivalent encodings of the published key are equally public.

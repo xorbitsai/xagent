@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig
 
 ToolFieldSpec = dict[str, Any]
+logger = logging.getLogger(__name__)
 
 # Hook signature: (db: Session, user: Any) -> dict[str, {"enabled": bool|None}]
 # Returns per-user overrides for tool enable/disable.
@@ -393,7 +395,14 @@ def resolve_sql_connection(db: Session, user_id: int | None, name: str) -> str |
         if isinstance(sql_connections, dict):
             item = sql_connections.get(normalized_name)
             if isinstance(item, dict) and isinstance(item.get("ciphertext"), str):
-                decrypted = _decrypt(item["ciphertext"])
+                try:
+                    decrypted = _decrypt(item["ciphertext"])
+                except ToolCredentialUnreadableError:
+                    logger.warning(
+                        "Skipping unreadable stored SQL connection %s; no environment fallback",
+                        normalized_name,
+                    )
+                    return None
                 if decrypted:
                     return decrypted
 
@@ -428,9 +437,18 @@ def get_sql_connection_map(db: Session, user_id: int | None) -> dict[str, str]:
                     continue
                 ciphertext = item.get("ciphertext")
                 if isinstance(ciphertext, str):
-                    decrypted = _decrypt(ciphertext)
+                    name = _sanitize_sql_connection_name(raw_name)
+                    try:
+                        decrypted = _decrypt(ciphertext)
+                    except ToolCredentialUnreadableError:
+                        result.pop(name, None)
+                        logger.warning(
+                            "Skipping unreadable stored SQL connection %s; no environment fallback",
+                            name,
+                        )
+                        continue
                     if decrypted:
-                        result[_sanitize_sql_connection_name(raw_name)] = decrypted
+                        result[name] = decrypted
 
     return result
 

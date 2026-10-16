@@ -340,6 +340,7 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
 
 def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
+    global _engine, _SessionLocal
     # Import all models to ensure they are registered with Base.metadata
     from ..services.encryption_key_rotation import validate_stored_encryption_keys
     from . import (  # noqa: F401
@@ -382,11 +383,23 @@ def init_db(db_url: str | None = None) -> None:
     from .sandbox import SandboxInfo, SandboxSnapshot  # noqa: F401
 
     validate_encryption_config()
-    configure_db(db_url)
-    # Bind the requested database before inspecting raw ciphertext, but never
-    # migrate/seed it (or admit runtime work) while old credentials are unreadable.
-    validate_stored_encryption_keys()
-    builtin_mcp_mismatches = _initialize_database_schema(get_engine())
+    try:
+        configure_db(db_url)
+        # Never migrate/seed or admit runtime work with unreadable credentials.
+        validate_stored_encryption_keys()
+        builtin_mcp_mismatches = _initialize_database_schema(get_engine())
+    except BaseException:
+        # Lazy workers use an unbound factory to detect that init_db must retry.
+        # A failed admission/schema upgrade must not leave a usable factory.
+        failed_engine = _engine
+        _engine = None
+        _SessionLocal = None
+        if failed_engine is not None:
+            try:
+                failed_engine.dispose()
+            except Exception:
+                logger.warning("Failed to dispose rejected database engine")
+        raise
 
     for mismatch in builtin_mcp_mismatches:
         logger.warning(

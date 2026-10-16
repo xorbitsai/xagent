@@ -31,6 +31,7 @@ from xagent.web import (
     worker_pool,
 )
 from xagent.web.models.trigger import AgentTrigger
+from xagent.web.models.user_channel import CHANNEL_SECRET_FIELDS
 from xagent.web.services import encryption_key_rotation as rotation
 from xagent.web.services.tool_credentials import _build_fernet_key, _decrypt
 from xagent.web.services.trigger_providers.base import CallbackRequestContext
@@ -290,10 +291,7 @@ def test_token_shaped_plaintext_is_never_scanned_or_rotated(
 
 @pytest.mark.parametrize(
     "table_name,column,field",
-    [
-        ("user_channels", "config", field)
-        for field in ("bot_token", "app_secret", "app_token")
-    ]
+    [("user_channels", "config", field) for field in CHANNEL_SECRET_FIELDS]
     + [("mcp_servers", "auth", field) for field in SENSITIVE_AUTH_FIELDS]
     + [("trigger_runs", "payload_snapshot", "encrypted_payload")],
 )
@@ -444,13 +442,18 @@ def test_standalone_worker_refuses_unreadable_storage_before_runtime(monkeypatch
     runtime.assert_not_called()
 
 
-def test_global_authority_verifier_rotates_with_master(database):
+@pytest.mark.parametrize("matching_destination", [True, False])
+def test_global_authority_verifier_rotates_with_master(database, matching_destination):
     from xagent.web.services.global_memory_embedding_authority import (
         _credential_verifier,
     )
 
     old = Fernet(DEV_FALLBACK_ENCRYPTION_KEY.encode())
-    new = Fernet(os.environ["ENCRYPTION_KEY"].encode())
+    new = Fernet(
+        os.environ["ENCRYPTION_KEY"].encode()
+        if matching_destination
+        else Fernet.generate_key()
+    )
     table = Table(
         "global_memory_embedding_authority",
         MetaData(),
@@ -459,15 +462,34 @@ def test_global_authority_verifier_rotates_with_master(database):
         Column("credential_verifier", String),
     )
     table.create(database)
+    ciphertext = old.encrypt(b"embedding-secret").decode()
+    model = Table(
+        "models",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("_api_key_encrypted", Text),
+    )
+    model.create(database)
     with database.begin() as conn:
+        conn.execute(model.insert().values(id=1, _api_key_encrypted=ciphertext))
         conn.execute(
             table.insert().values(
                 authority_key="global",
-                api_key_encrypted=old.encrypt(b"embedding-secret").decode(),
+                api_key_encrypted=ciphertext,
                 credential_verifier="old-verifier",
             )
         )
-        assert rotation.rotate_encryption_key(conn, old, new) == 1
+    if not matching_destination:
+        with pytest.raises(RuntimeError, match="must match configured ENCRYPTION_KEY"):
+            with database.begin() as conn:
+                rotation.rotate_encryption_key(conn, old, new)
+        with database.connect() as conn:
+            assert conn.scalar(select(table.c.api_key_encrypted)) == ciphertext
+            assert conn.scalar(select(table.c.credential_verifier)) == "old-verifier"
+            assert conn.scalar(select(model.c._api_key_encrypted)) == ciphertext
+        return
+    with database.begin() as conn:
+        assert rotation.rotate_encryption_key(conn, old, new) == 2
         assert conn.scalar(select(table.c.credential_verifier)) == _credential_verifier(
             "embedding-secret"
         )
@@ -490,8 +512,9 @@ def test_celery_disposes_pre_fork_database_pool_on_storage_failure(monkeypatch):
     engine.dispose.assert_called_once()
 
 
+@pytest.mark.parametrize("failed_stage", [None, "credential", "schema"])
 def test_celery_admission_preserves_lazy_child_database_initialization(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, failed_stage
 ):
     from xagent.web.jobs import celery_app, tasks
     from xagent.web.models import database as db_module
@@ -506,6 +529,21 @@ def test_celery_admission_preserves_lazy_child_database_initialization(
     assert db_module._engine is None
     assert db_module._SessionLocal is None
     try:
+        if failed_stage:
+            module, name = (
+                (rotation, "validate_stored_encryption_keys")
+                if failed_stage == "credential"
+                else (db_module, "_initialize_database_schema")
+            )
+            with monkeypatch.context() as failure:
+                failure.setattr(
+                    module, name, Mock(side_effect=RuntimeError("rejected"))
+                )
+                for _ in range(2):
+                    with pytest.raises(RuntimeError, match="rejected"):
+                        tasks._open_worker_session()
+                    assert db_module._engine is None
+                    assert db_module._SessionLocal is None
         with tasks._open_worker_session() as session:
             assert "background_jobs" in inspect(session.get_bind()).get_table_names()
     finally:
@@ -739,9 +777,11 @@ def test_web_initializes_engine_before_guard_and_checks_before_migrations(
         if unreadable:
             schema.assert_not_called()
             admission.assert_not_called()
+            assert db_module._engine is None
+            assert db_module._SessionLocal is None
         else:
             schema.assert_called_once_with(db_module.get_engine())
-        with db_module.get_engine().connect() as conn:
+        with seed_engine.connect() as conn:
             assert conn.scalar(select(table.c._api_key_encrypted)) == ciphertext
     finally:
         if db_module._engine is not None:

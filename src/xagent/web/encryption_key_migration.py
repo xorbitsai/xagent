@@ -27,7 +27,7 @@ def main() -> None:
         raise SystemExit(str(exc)) from None
     try:
         old, new = Fernet(source.encode()), Fernet(destination.encode())
-    except (ValueError, UnicodeError):
+    except ValueError:
         raise SystemExit("Source and destination must be valid Fernet keys") from None
     try:
         configure_db()

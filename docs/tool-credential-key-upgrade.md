@@ -8,9 +8,16 @@ it already meets the requirement: whitespace is part of historical derivation.
 Web, standalone workers, combined launchers and Celery worker/beat validate
 encryption at startup. Database initialization binds the configured database,
 then checks persisted ciphertext before any schema migration or seeding;
-workers also check before accepting work. An unreadable durable credential
-(model/channel/MCP/tool or global authority) aborts startup with a table/row/field
-location and this guide, never a silent environment/default fallback.
+workers also check before accepting work. An unreadable durable credential in
+`models`, `user_channels`, `oauth_providers`, `mcp_servers`, `user_mcpservers`,
+`actor_mcp_server_connections`, `custom_apis`, `mcp_oauth_clients`,
+`mcp_oauth_grants`, `agent_triggers` (`secret_encrypted`),
+`global_memory_embedding_authority`, `tool_configs` or `user_tool_configs`
+aborts startup with a table/row/field location and this guide, never a silent
+environment/default fallback. Failed database initialization clears its engine
+and session factory so subsequent lazy worker tasks must retry admission.
+At runtime, an unreadable stored SQL connection is skipped individually without
+substituting its same-name environment connection; other connections remain usable.
 Unreadable `user_oauth` tokens and transient `mcp_oauth_flow_states`,
 `task_runtime_secrets` and `trigger_runs` values instead warn so account
 reauthorization and administrator recovery remain available. Their ciphertext

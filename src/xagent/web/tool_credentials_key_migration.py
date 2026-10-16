@@ -14,7 +14,7 @@ from ..config import (
     validate_tool_credentials_key,
 )
 from .models.database import configure_db, get_session_local
-from .services.encryption_key_rotation import credential_rows
+from .services.encryption_key_rotation import credential_rows, tool_credential_items
 from .services.tool_credentials import _build_fernet_key
 
 
@@ -46,36 +46,28 @@ def migrate_tool_credentials(db: Session, old_key: str) -> int:
             if not isinstance(payload, dict):
                 continue
             changed = False
-            for group in ("credentials", "sql_connections"):
-                fields = payload.get(group)
-                if not isinstance(fields, dict):
+            for field, item in tool_credential_items(payload):
+                location = f"{table.name} row {row_id} field {field}"
+                try:
+                    encoded = item["ciphertext"].encode()
+                except UnicodeError:
+                    raise RuntimeError(
+                        f"Unreadable {location}; migration rolled back"
+                    ) from None
+                try:
+                    new.decrypt(encoded)
                     continue
-                for field_name, item in fields.items():
-                    if not isinstance(item, dict) or not isinstance(
-                        item.get("ciphertext"), str
-                    ):
-                        continue
-                    location = f"{table.name} row {row_id} field {group}.{field_name!r}"
-                    try:
-                        encoded = item["ciphertext"].encode()
-                    except UnicodeError:
-                        raise RuntimeError(
-                            f"Unreadable {location}; migration rolled back"
-                        ) from None
-                    try:
-                        new.decrypt(encoded)
-                        continue
-                    except InvalidToken:
-                        pass
-                    try:
-                        plaintext = old.decrypt(encoded)
-                    except InvalidToken:
-                        raise RuntimeError(
-                            f"Unreadable {location}; migration rolled back"
-                        ) from None
-                    item["ciphertext"] = new.encrypt(plaintext).decode()
-                    changed = True
-                    count += 1
+                except InvalidToken:
+                    pass
+                try:
+                    plaintext = old.decrypt(encoded)
+                except InvalidToken:
+                    raise RuntimeError(
+                        f"Unreadable {location}; migration rolled back"
+                    ) from None
+                item["ciphertext"] = new.encrypt(plaintext).decode()
+                changed = True
+                count += 1
             if changed:
                 primary = next(iter(table.primary_key.columns))
                 connection.execute(

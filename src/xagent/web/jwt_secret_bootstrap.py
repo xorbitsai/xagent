@@ -13,11 +13,10 @@ from pathlib import Path
 from ..config import KNOWN_INSECURE_SECRETS
 
 _MIN_SECRET_LENGTH = 32
-_KNOWN_WEAK_SECRETS = KNOWN_INSECURE_SECRETS
 
 
 def _validate_secret(secret: str, path: Path, label: str = "JWT secret") -> None:
-    if len(secret) < _MIN_SECRET_LENGTH or secret.lower() in _KNOWN_WEAK_SECRETS:
+    if len(secret) < _MIN_SECRET_LENGTH or secret.lower() in KNOWN_INSECURE_SECRETS:
         raise ValueError(f"{label} file is weak or too short: {path}")
 
 

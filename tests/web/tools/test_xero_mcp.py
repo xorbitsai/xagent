@@ -290,6 +290,85 @@ def test_list_invoices_includes_lines_only_for_named_invoices(fake: FakeXero) ->
     assert named["invoices"][0]["line_items"][0]["description"] == "Widget"
 
 
+def test_list_invoices_exposes_expected_and_planned_payment_dates(
+    fake: FakeXero,
+) -> None:
+    receivable = _invoice("INV-AR", "2026-10-20", 10)
+    receivable["ExpectedPaymentDate"] = "/Date(1792454400000+0000)/"
+    payable = _invoice("INV-AP", "2026-10-21", 20)
+    payable["Type"] = "ACCPAY"
+    payable["PlannedPaymentDate"] = "2026-10-22T00:00:00"
+    fake.responder = lambda call: MockResponse({"Invoices": [receivable, payable]})
+
+    result = _call_tool("list_invoices")
+
+    assert result["invoices"][0]["expected_payment_date"] == "2026-10-20T00:00:00Z"
+    assert result["invoices"][1]["planned_payment_date"] == "2026-10-22T00:00:00"
+    assert "planned_payment_date" not in result["invoices"][0]
+    assert "expected_payment_date" not in result["invoices"][1]
+
+
+def test_list_invoice_history_returns_xero_notes_oldest_first(fake: FakeXero) -> None:
+    fake.responder = lambda call: MockResponse(
+        {
+            "HistoryRecords": [
+                {
+                    "Details": "Customer promised payment on Friday",
+                    "Changes": "Note",
+                    "User": "Hannah Example",
+                    "DateUTC": "/Date(1792458000000+0000)/",
+                },
+                {
+                    "Details": "Invoice authorised",
+                    "Changes": "Approved",
+                    "User": "Toby Example",
+                    "DateUTCString": "2026-10-19T23:00:00Z",
+                },
+            ]
+        }
+    )
+
+    result = _call_tool("list_invoice_history", invoiceId=INVOICE_ID)
+
+    assert result == {
+        "status": "success",
+        "history": [
+            {
+                "details": "Invoice authorised",
+                "changes": "Approved",
+                "user": "Toby Example",
+                "date_utc": "2026-10-19T23:00:00Z",
+            },
+            {
+                "details": "Customer promised payment on Friday",
+                "changes": "Note",
+                "user": "Hannah Example",
+                "date_utc": "2026-10-20T01:00:00Z",
+            },
+        ],
+        "total_count": 2,
+        "complete": True,
+        "skip": 0,
+        "returned": 2,
+        "has_more": False,
+    }
+    assert fake.calls[-1]["path"] == f"Invoices/{INVOICE_ID}/History"
+    assert fake.calls[-1]["method"] == "GET"
+
+    first = _call_tool("list_invoice_history", invoiceId=INVOICE_ID, limit=1)
+    assert first["returned"] == 1
+    assert first["has_more"] is True
+    assert first["next_skip"] == 1
+    assert first["history"][0]["details"] == "Invoice authorised"
+
+
+def test_list_invoice_history_rejects_unsafe_invoice_id(fake: FakeXero) -> None:
+    with pytest.raises(ValueError, match="invoiceId"):
+        xero.list_invoice_history(invoiceId="../Contacts")
+
+    assert fake.calls == []
+
+
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
@@ -1438,6 +1517,7 @@ def _registered_tools() -> dict[str, Any]:
 def test_every_preserved_tool_is_registered_plus_the_new_ones() -> None:
     assert set(_registered_tools()) == PRESERVED_TOOLS | {
         "list_paid_invoices",
+        "list_invoice_history",
         "list_overdue_invoices",
         "list_receivables_ageing",
     }

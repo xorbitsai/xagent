@@ -21,7 +21,14 @@ def _cipher(raw: str) -> Fernet:
 
 def migrate_tool_credentials(db: Session, old_key: str) -> int:
     """Own one all-or-nothing transaction. Stop writers and back up first."""
-    old, new = _cipher(old_key), _cipher(get_tool_credentials_encryption_key())
+    destination = get_tool_credentials_encryption_key()
+    # This offline tool must never downgrade data to a development fallback,
+    # even when an operator forgot to select the production environment.
+    if len(destination.strip()) < 32:
+        raise RuntimeError(
+            "Configure a private 32+ character destination tool key before migration"
+        )
+    old, new = _cipher(old_key), _cipher(destination)
     count = 0
     with db.begin():
         for model in (ToolConfig, UserToolConfig):

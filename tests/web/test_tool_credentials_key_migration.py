@@ -1,5 +1,6 @@
 import base64
 import hashlib
+from unittest.mock import Mock
 
 import pytest
 from cryptography.fernet import Fernet
@@ -13,6 +14,19 @@ from xagent.web.tool_credentials_key_migration import migrate_tool_credentials
 
 def cipher(raw):
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest()))
+
+
+@pytest.mark.parametrize("destination", ["", "short-key", "xagent-dev-key"])
+def test_migration_refuses_weak_destination_even_in_development(
+    monkeypatch, destination
+):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "development")
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", destination)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    db = Mock()
+    with pytest.raises(RuntimeError, match="32\\+ character destination"):
+        migrate_tool_credentials(db, "old-key")
+    db.begin.assert_not_called()
 
 
 @pytest.mark.parametrize("old_key", ["xagent-dev-key", "short-key"])

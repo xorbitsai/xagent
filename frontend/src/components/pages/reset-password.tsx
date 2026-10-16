@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import Link from "next/link"
 import { ArrowRight, Loader2, Eye, EyeOff, Lock, Workflow, Database, UserCheck } from "lucide-react"
 import { Button } from "@/components/ui/button"
@@ -17,6 +17,7 @@ export function ResetPasswordPage() {
   const branding = getBrandingFromEnv()
   const { t } = useI18n()
   const [token, setToken] = useState("")
+  const tokenRead = useRef(false)
   const [password, setPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
   const [showPassword, setShowPassword] = useState(false)
@@ -27,6 +28,8 @@ export function ResetPasswordPage() {
   const { passwordMinLength } = useSetupStatus()
 
   useEffect(() => {
+    if (tokenRead.current) return
+    tokenRead.current = true
     const fragment = window.location.hash.replace(/^#/, "")
     const fragmentParams = new URLSearchParams(fragment)
     setToken(fragmentParams.get("token") || "")

@@ -322,6 +322,105 @@ def test_list_payments_where_clause_is_validated_and_built(fake: FakeXero) -> No
         xero.list_payments(reference='x" OR 1==1')
 
 
+def _paid_invoice(number: str, paid_on: str, *, total: float = 10) -> dict[str, Any]:
+    record = _invoice(
+        number,
+        "2026-10-01",
+        0,
+        issued="2026-09-01",
+        status="PAID",
+    )
+    record["FullyPaidOnDate"] = f"{paid_on}T00:00:00"
+    record["Total"] = total
+    record["AmountPaid"] = total
+    return record
+
+
+def _paid_pages(pages: list[list[dict[str, Any]]]) -> Callable[..., MockResponse]:
+    def respond(call: dict[str, Any]) -> MockResponse:
+        page = call["params"]["page"]
+        return MockResponse(
+            {
+                "pagination": {
+                    "page": page,
+                    "pageSize": xero.XERO_BULK_PAGE_SIZE,
+                    "pageCount": len(pages),
+                    "itemCount": sum(len(items) for items in pages),
+                },
+                "Invoices": pages[page - 1],
+            }
+        )
+
+    return respond
+
+
+def test_list_paid_invoices_reads_later_pages_after_mixed_dates(
+    fake: FakeXero,
+) -> None:
+    # Production regression: the first page contained ten 13 Oct settlements;
+    # the next page mixed five more with other dates. Updated ordering is not a
+    # valid boundary for FullyPaidOnDate.
+    first = [_paid_invoice(f"INV-{number}", "2026-10-13") for number in range(1, 11)]
+    second = [
+        *[_paid_invoice(f"INV-{number}", "2026-10-13") for number in range(11, 16)],
+        _paid_invoice("INV-OLDER", "2026-10-12"),
+    ]
+    fake.responder = _paid_pages([first, second])
+
+    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
+
+    assert result["complete"] is True
+    assert result["date_basis"] == "FullyPaidOnDate"
+    assert result["total_count"] == 15
+    assert result["returned"] == 15
+    assert result["has_more"] is False
+    assert {row["invoice_number"] for row in result["invoices"]} == {
+        f"INV-{number}" for number in range(1, 16)
+    }
+    assert result["total_invoice_amount_by_currency"] == {"AUD": "150.00"}
+    api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
+    assert [call["params"]["page"] for call in api_calls] == [1, 2]
+    assert api_calls[0]["params"]["Statuses"] == "PAID"
+    assert api_calls[0]["params"]["where"] == 'Type=="ACCREC"'
+
+
+def test_list_paid_invoices_rejects_partial_scan_without_pagination(
+    fake: FakeXero,
+) -> None:
+    fake.responder = lambda call: MockResponse(
+        {"Invoices": [_paid_invoice("INV-1", "2026-10-13")]}
+    )
+
+    with pytest.raises(
+        RuntimeError, match="refusing to report a partial settlement-date list"
+    ):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_partial_scan_at_safety_limit(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "PAID_INVOICE_MAX_PAGES", 1)
+    fake.responder = _paid_pages(
+        [
+            [_paid_invoice("INV-1", "2026-10-13")],
+            [_paid_invoice("INV-2", "2026-10-13")],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="paid-invoice scan reached the safety"):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_invalid_date_before_calling_xero(
+    fake: FakeXero,
+) -> None:
+    with pytest.raises(ValueError, match="paidOnDate must be YYYY-MM-DD"):
+        xero.list_paid_invoices(paidOnDate="13/10/2026")
+
+    assert fake.calls == []
+
+
 def test_quotes_use_xero_pagination_metadata(fake: FakeXero) -> None:
     fake.responder = lambda call: MockResponse(
         {
@@ -1201,6 +1300,7 @@ def _registered_tools() -> dict[str, Any]:
 
 def test_every_preserved_tool_is_registered_plus_the_new_ones() -> None:
     assert set(_registered_tools()) == PRESERVED_TOOLS | {
+        "list_paid_invoices",
         "list_overdue_invoices",
         "list_receivables_ageing",
     }

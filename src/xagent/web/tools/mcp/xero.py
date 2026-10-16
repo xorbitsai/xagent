@@ -34,6 +34,9 @@ mcp = FastMCP("xero-mcp")
 #   The upstream package fixed the page size at 10 and returned only
 #   "Found N invoices", so an agent could not tell whether it had read a list.
 # * ``list_overdue_invoices`` reads *every* overdue invoice server-side.
+# * ``list_paid_invoices`` reads *every* paid invoice server-side before
+#   selecting the requested settlement date.  UpdatedDateUTC order is not a
+#   valid boundary for FullyPaidOnDate.
 # * A failed call raises, which FastMCP turns into ``isError``. The upstream
 #   package returned the failure as ordinary text, so it counted as a success.
 # * Authentication failures retain Xero's detail; a 403 also names the OAuth
@@ -54,8 +57,11 @@ DEFAULT_PAGE_SIZE = 20
 # Full-ledger tools fail rather than publishing partial values as totals if this
 # bound is reached. 50 pages x 1000 invoices covers a 50,000-invoice ledger.
 OPEN_INVOICE_MAX_PAGES = 50
+PAID_INVOICE_MAX_PAGES = 50
 OVERDUE_DEFAULT_LIMIT = 50
 OVERDUE_MAX_LIMIT = 200
+PAID_INVOICE_DEFAULT_LIMIT = 100
+PAID_INVOICE_MAX_LIMIT = 200
 OVERDUE_TOP_CONTACTS = 25
 OPEN_INVOICE_EXCLUDES = ["credit_notes", "overpayments", "prepayments"]
 DEFAULT_INVOICE_TERMS_DAYS = 30
@@ -996,6 +1002,138 @@ def list_invoices(
         page_size=page_size,
         params=params,
     )
+
+
+def _collect_paid_invoices(
+    paid_on: date,
+    invoice_type: str,
+    contact_ids: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Read the complete paid-invoice ledger and select one settlement date.
+
+    Xero orders the generic invoice list by update time, not by
+    ``FullyPaidOnDate``.  A page containing another payment date therefore
+    cannot be used as an end marker.  Keep paging until Xero's own pagination
+    metadata says the PAID list is complete, then filter locally.
+    """
+    params: dict[str, Any] = {
+        "where": f'Type=="{invoice_type}"',
+        "Statuses": "PAID",
+        "pageSize": XERO_BULK_PAGE_SIZE,
+        "summaryOnly": "true",
+    }
+    if contact_ids:
+        params["ContactIDs"] = ",".join(_guid_list(contact_ids, "contactIds"))
+
+    found: list[dict[str, Any]] = []
+    seen_invoice_ids: set[str] = set()
+    page = 1
+    while True:
+        data = _request(
+            "GET", "Invoices", scope="invoices", params={**params, "page": page}
+        )
+        records = data.get("Invoices") or []
+        for record in records:
+            fully_paid_on = _xero_date(record.get("FullyPaidOnDate"))
+            if (
+                record.get("Type") != invoice_type
+                or record.get("Status") != "PAID"
+                or not fully_paid_on
+                or date.fromisoformat(fully_paid_on[:10]) != paid_on
+            ):
+                continue
+            identity = str(
+                record.get("InvoiceID")
+                or record.get("InvoiceNumber")
+                or f"{record.get('Contact')}:{fully_paid_on}:{record.get('Total')}"
+            )
+            if identity in seen_invoice_ids:
+                continue
+            seen_invoice_ids.add(identity)
+            found.append(_invoice_view(record))
+
+        pagination = data.get("pagination") or {}
+        page_count = pagination.get("pageCount")
+        if page_count is None:
+            raise RuntimeError(
+                "Xero paid-invoice scan returned no pagination metadata; refusing "
+                "to report a partial settlement-date list as complete"
+            )
+        if page >= int(page_count):
+            break
+        if page >= PAID_INVOICE_MAX_PAGES:
+            raise RuntimeError(
+                "Xero paid-invoice scan reached the safety limit of "
+                f"{PAID_INVOICE_MAX_PAGES} pages before the end of the list; "
+                "narrow the request with contactIds"
+            )
+        page += 1
+    return found
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_paid_invoices(
+    paidOnDate: str,
+    contactIds: list[str] | None = None,
+    type: Literal["ACCREC", "ACCPAY"] = "ACCREC",
+    skip: int = 0,
+    limit: int = PAID_INVOICE_DEFAULT_LIMIT,
+) -> str:
+    """
+    List ALL invoices fully paid on one date, regardless of update ordering.
+
+    Use this tool for requests such as "customer invoices settled on 13 Oct".
+    It scans every PAID invoice page inside the connector and filters by
+    FullyPaidOnDate. Do not infer settlement-date completeness from
+    list_invoices: that list is ordered by UpdatedDateUTC, so matching dates can
+    occur on later pages after other dates.
+
+    This reports invoices that became fully settled on the requested date. It
+    is not a list of every payment received that day; partial payments belong
+    in list_payments.
+
+    paidOnDate: settlement date in YYYY-MM-DD format.
+    contactIds: optionally restrict to these contacts (from list_contacts).
+    type: ACCREC for customer invoices (default), ACCPAY for bills you paid.
+    skip, limit: window into the complete result (limit 1-200, default 100).
+    """
+    paid_on = _iso_date(paidOnDate, "paidOnDate")
+    skip = max(0, int(skip))
+    limit = max(1, min(int(limit), PAID_INVOICE_MAX_LIMIT))
+    paid = _collect_paid_invoices(paid_on, type, contactIds)
+    paid.sort(
+        key=lambda view: (view.get("invoice_number", ""), view.get("invoice_id", ""))
+    )
+
+    totals: dict[str, Decimal] = {}
+    for view in paid:
+        currency = view.get("currency") or "UNKNOWN"
+        amount = Decimal(str(view.get("total") or 0))
+        totals[currency] = totals.get(currency, Decimal(0)) + amount
+    window = paid[skip : skip + limit]
+
+    def build(shown: list[Any], truncated: bool) -> dict[str, Any]:
+        next_skip = skip + len(shown)
+        has_more = next_skip < len(paid)
+        payload: dict[str, Any] = {
+            "paid_on_date": paid_on.isoformat(),
+            "invoice_type": type,
+            "date_basis": "FullyPaidOnDate",
+            "total_count": len(paid),
+            "total_invoice_amount_by_currency": _money_totals(totals),
+            "complete": True,
+            "skip": skip,
+            "returned": len(shown),
+            "has_more": has_more,
+            "invoices": shown,
+        }
+        if has_more:
+            payload["next_skip"] = next_skip
+        if truncated:
+            payload["truncated"] = True
+        return payload
+
+    return _fit_list(build, window)
 
 
 def _money_totals(totals: dict[str, Decimal]) -> dict[str, str]:

@@ -1594,7 +1594,13 @@ def _blocked_upload_extension(path: str) -> bool:
 
 def _is_public_upload_path(path: str) -> bool:
     """Only agent logos are safe to expose through the legacy static mount."""
-    return path.startswith(_PUBLIC_UPLOAD_PREFIX) and path != _PUBLIC_UPLOAD_PREFIX
+    parts = path.split("/")
+    return (
+        len(parts) == 2
+        and path.startswith(_PUBLIC_UPLOAD_PREFIX)
+        and parts[1] not in {"", ".", ".."}
+        and "\\" not in path
+    )
 
 
 class SafeUploadsStaticFiles(StaticFiles):

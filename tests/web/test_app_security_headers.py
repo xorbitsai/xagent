@@ -39,6 +39,8 @@ def test_public_upload_mount_only_allows_agent_logos() -> None:
     assert not _is_public_upload_path("agent_logos/")
     assert not _is_public_upload_path("user_1/private/report.pdf")
     assert not _is_public_upload_path("../user_1/private/report.pdf")
+    assert not _is_public_upload_path("agent_logos/../user_1/report.pdf")
+    assert not _is_public_upload_path("agent_logos/..")
 
 
 def test_security_headers_keep_widget_and_preview_embeddable() -> None:

@@ -847,9 +847,7 @@ class _LegacyPreviewRegistrationError(RuntimeError):
     """A legacy preview path cannot be registered for a public redirect."""
 
 
-def _register_legacy_preview_isolated(
-    legacy_path: str, requesting_user_id: int | None = None
-) -> str:
+def _register_legacy_preview_isolated(legacy_path: str, requesting_user_id: int) -> str:
     """Register one legacy local preview without overlapping DB and file I/O.
 
     Owner discovery and the final insert each own a short Session. Durable
@@ -871,6 +869,8 @@ def _register_legacy_preview_isolated(
             .first()
         )
         if existing is not None:
+            if int(existing.user_id) != requesting_user_id:
+                raise _LegacyPreviewRegistrationError("Legacy preview target not found")
             return str(existing.file_id)
 
         owner_info = _infer_owner_from_relative_path(lookup_db, relative_path)
@@ -879,7 +879,7 @@ def _register_legacy_preview_isolated(
                 "Cannot infer owner for legacy preview path"
             )
         owner_user_id, task_id = owner_info
-        if requesting_user_id is not None and owner_user_id != requesting_user_id:
+        if owner_user_id != requesting_user_id:
             raise _LegacyPreviewRegistrationError(
                 "Legacy preview path belongs to another user"
             )
@@ -937,6 +937,10 @@ def _register_legacy_preview_isolated(
                 .first()
             )
             if current is not None:
+                if int(current.user_id) != requesting_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview target not found"
+                    )
                 return str(current.file_id)
 
             if task_id is not None:
@@ -976,6 +980,10 @@ def _register_legacy_preview_isolated(
                 )
                 if winner is None:
                     raise
+                if int(winner.user_id) != requesting_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview target not found"
+                    )
                 return str(winner.file_id)
             metadata_committed = True
             return applied.snapshot.file_id
@@ -1003,6 +1011,7 @@ async def redirect_legacy_preview(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Any:
+    requesting_user_id = int(user.id)
     if not release_db_connection_if_clean(db):
         raise RuntimeError(
             "Cannot register a legacy preview while the request database "
@@ -1010,7 +1019,7 @@ async def redirect_legacy_preview(
         )
     try:
         file_id = await run_db_io_cancellation_safe(
-            lambda: _register_legacy_preview_isolated(legacy_path, int(user.id))
+            lambda: _register_legacy_preview_isolated(legacy_path, requesting_user_id)
         )
     except _LegacyPreviewRegistrationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

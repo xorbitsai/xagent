@@ -4,6 +4,11 @@ import { describe, expect, it } from "vitest"
 import { MarkdownDescription } from "./markdown-description"
 
 describe("untrusted connector descriptions", () => {
+  it("renders no element for an empty description", () => {
+    const { container } = render(<MarkdownDescription content="" />)
+    expect(container.firstChild).toBeNull()
+  })
+
   it("renders formatting as React elements", () => {
     const { container } = render(<MarkdownDescription content="**Trusted-looking** and `code`" />)
     expect(container.querySelector("strong")?.textContent).toBe("Trusted-looking")

@@ -1,7 +1,7 @@
 """Raw-column key readability checks and offline Fernet rotation.
 
 Reflection deliberately bypasses ORM encryption decorators and property setters.
-The catalog is restricted to credential-bearing columns, never arbitrary text.
+The catalog is restricted to credential-bearing paths, never arbitrary JSON text.
 """
 
 import os
@@ -17,6 +17,7 @@ from ...config import (
     get_tool_credentials_encryption_key,
     requires_secure_secrets,
 )
+from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import _looks_like_fernet_token
 from ..models.database import get_engine
 from .tool_credentials import _build_fernet_key
@@ -43,6 +44,21 @@ _REQUIRED_CIPHERTEXT = {
     ("task_runtime_secrets", "ciphertext"),
     ("global_memory_embedding_authority", "api_key_encrypted"),
 }
+# Match the writers, not the shape of unrelated JSON strings. These columns
+# contain plaintext metadata next to explicitly encrypted top-level fields.
+_JSON_SECRET_FIELDS = {
+    ("user_channels", "config"): ("bot_token", "app_secret", "app_token"),
+    ("mcp_servers", "auth"): SENSITIVE_AUTH_FIELDS,
+    ("trigger_runs", "payload_snapshot"): ("encrypted_payload",),
+}
+# encrypt_env_dict and actor MCP credential storage encrypt direct string
+# values only. Nested objects/lists are not ciphertext-bearing paths.
+_ENV_COLUMNS = {
+    ("mcp_servers", "env"),
+    ("user_mcpservers", "env"),
+    ("actor_mcp_server_connections", "encrypted_env"),
+    ("custom_apis", "env"),
+}
 
 
 def credential_rows(
@@ -64,20 +80,32 @@ def credential_rows(
                 yield table, row[primary[0].name], column.name, row[column.name]
 
 
-def transform_tokens(
-    value: Any, transform: Callable[[str], str], *, required: bool = False
+def transform_credential_value(
+    table_name: str, column: str, value: Any, transform: Callable[[str], str]
 ) -> Any:
-    if isinstance(value, dict):
-        return {key: transform_tokens(item, transform) for key, item in value.items()}
-    if isinstance(value, list):
-        return [transform_tokens(item, transform) for item in value]
-    if (
-        isinstance(value, str)
-        and value
-        and (required or _looks_like_fernet_token(value))
-    ):
-        return transform(value)
-    return value
+    """Apply crypto only to paths encrypted by the corresponding writer."""
+    identity = (table_name, column)
+
+    def transform_token(item: Any) -> Any:
+        if (
+            isinstance(item, str)
+            and item
+            and (identity in _REQUIRED_CIPHERTEXT or _looks_like_fernet_token(item))
+        ):
+            return transform(item)
+        return item
+
+    if identity in _ENV_COLUMNS or identity in _JSON_SECRET_FIELDS:
+        if not isinstance(value, dict):
+            return value
+        fields = (
+            value.keys() if identity in _ENV_COLUMNS else _JSON_SECRET_FIELDS[identity]
+        )
+        return {
+            key: transform_token(item) if key in fields else item
+            for key, item in value.items()
+        }
+    return transform_token(value)
 
 
 def validate_stored_encryption_keys() -> None:
@@ -86,16 +114,17 @@ def validate_stored_encryption_keys() -> None:
         return
     master = Fernet(os.environ[ENCRYPTION_KEY].encode())
     tool = Fernet(_build_fernet_key(get_tool_credentials_encryption_key()))
+
+    def validate_token(token: str) -> str:
+        master.decrypt(token.encode())
+        return token
+
     with get_engine().connect() as connection:
         for table, row_id, column, value in credential_rows(
             connection, ENCRYPTED_COLUMNS
         ):
             try:
-                transform_tokens(
-                    value,
-                    lambda token: (master.decrypt(token.encode()), token)[1],
-                    required=(table.name, column) in _REQUIRED_CIPHERTEXT,
-                )
+                transform_credential_value(table.name, column, value, validate_token)
             except (InvalidToken, ValueError):
                 raise RuntimeError(
                     f"Unreadable encrypted credential: {table.name} row {row_id} field {column}; see docs/tool-credential-key-upgrade.md"
@@ -142,9 +171,7 @@ def rotate_encryption_key(connection: Connection, old: Fernet, new: Fernet) -> i
             count += 1
             return new.encrypt(plaintext).decode()
 
-        rotated = transform_tokens(
-            value, rotate, required=(table.name, column) in _REQUIRED_CIPHERTEXT
-        )
+        rotated = transform_credential_value(table.name, column, value, rotate)
         if rotated != value:
             values = {column: rotated}
             if table.name == "global_memory_embedding_authority":

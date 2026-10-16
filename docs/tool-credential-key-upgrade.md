@@ -51,6 +51,11 @@ standard-Base64 alphabet variants, extra padding and embedded whitespace.
 `ENCRYPTION_KEY`. It reads raw columns (bypassing ORM encryption hooks), rotates
 recognized encrypted values in one transaction and rolls back on any unreadable
 entry. Already migrated fields are skipped; unrelated plaintext/JSON is preserved.
+Both startup checks and rotation follow the writers' exact encrypted JSON paths:
+`trigger_runs.payload_snapshot.encrypted_payload`, the three channel token fields,
+MCP sensitive auth fields, and direct string values in encrypted environment maps.
+Webhook event metadata and other plaintext fields are never treated as ciphertext,
+even when their values have a Fernet-like shape or decrypt with an old key.
 It covers the core model, channel, OAuth provider/account, MCP/custom API, trigger,
 runtime-secret and global embedding-authority columns. The global authority's
 key-derived verifier is recomputed. Verify memory admission after restart too.

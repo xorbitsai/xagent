@@ -1,5 +1,8 @@
 import asyncio
+import base64
+import json
 import os
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -19,14 +22,23 @@ from sqlalchemy import (
 from sqlalchemy.exc import OperationalError
 
 from xagent.config import DEV_FALLBACK_ENCRYPTION_KEY
+from xagent.core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
+from xagent.core.utils.encryption import get_cipher
 from xagent.web import (
     encryption_key_migration,
     tool_credentials_key_migration,
     worker,
     worker_pool,
 )
+from xagent.web.models.trigger import AgentTrigger
 from xagent.web.services import encryption_key_rotation as rotation
 from xagent.web.services.tool_credentials import _build_fernet_key, _decrypt
+from xagent.web.services.trigger_providers.base import CallbackRequestContext
+from xagent.web.services.trigger_providers.webhook import (
+    WebhookProvider,
+    sign_webhook_payload,
+)
+from xagent.web.services.triggers import _payload_snapshot
 
 
 @pytest.fixture
@@ -175,26 +187,222 @@ def test_rotation_rolls_back_every_field_if_one_is_unreadable(database):
         )
 
 
-@pytest.mark.parametrize("column", ["env", "auth"])
-def test_nested_mcp_fields_rotate_without_touching_plaintext(database, column):
-    old, new = Fernet(Fernet.generate_key()), Fernet(Fernet.generate_key())
+@pytest.mark.parametrize(
+    "table_name,column",
+    [
+        ("mcp_servers", "env"),
+        ("user_mcpservers", "env"),
+        ("actor_mcp_server_connections", "encrypted_env"),
+        ("custom_apis", "env"),
+    ],
+)
+def test_env_rotation_matches_flat_writer_contract(database, table_name, column):
+    old = Fernet(Fernet.generate_key())
+    new = Fernet(os.environ["ENCRYPTION_KEY"].encode())
     table = Table(
-        "mcp_servers",
+        table_name,
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column(column, JSON),
+    )
+    table.create(database)
+    unrelated = Fernet(Fernet.generate_key()).encrypt(b"not-a-stored-secret").decode()
+    payload = {
+        "API_KEY": old.encrypt(b"secret").decode(),
+        "PLAIN": "legacy-plaintext",
+        "EMPTY": "",
+        "nested": {"API_KEY": unrelated},
+        "list": [unrelated],
+        "number": 7,
+        "none": None,
+    }
+    with database.begin() as conn:
+        conn.execute(table.insert().values(id=1, **{column: payload}))
+    with pytest.raises(RuntimeError, match=f"{table_name} row 1 field {column}"):
+        rotation.validate_stored_encryption_keys()
+    with database.begin() as conn:
+        assert rotation.rotate_encryption_key(conn, old, new) == 1
+        values = conn.scalar(select(table.c[column]))
+        assert new.decrypt(values.pop("API_KEY").encode()) == b"secret"
+        assert values == {
+            key: value for key, value in payload.items() if key != "API_KEY"
+        }
+        assert rotation.rotate_encryption_key(conn, old, new) == 0
+    rotation.validate_stored_encryption_keys()
+
+
+@pytest.mark.parametrize("token_kind", ["shaped", "foreign_key", "source_key"])
+@pytest.mark.parametrize(
+    "table_name,column",
+    [
+        ("trigger_runs", "payload_snapshot"),
+        ("user_channels", "config"),
+        ("mcp_servers", "auth"),
+    ],
+)
+def test_token_shaped_plaintext_is_never_scanned_or_rotated(
+    database, table_name, column, token_kind
+):
+    old = Fernet(Fernet.generate_key())
+    new = Fernet(os.environ["ENCRYPTION_KEY"].encode())
+    token = {
+        "shaped": base64.urlsafe_b64encode(b"\x80" + b"\0" * 72).decode(),
+        "foreign_key": Fernet(Fernet.generate_key()).encrypt(b"plaintext-id").decode(),
+        "source_key": old.encrypt(b"plaintext-id").decode(),
+    }[token_kind]
+    payloads = {
+        "trigger_runs": {
+            "metadata": {
+                "source_event_id": token,
+                "event_type": token,
+                "resource_id": token,
+            },
+            "payload_sha256": token,
+        },
+        "user_channels": {"channel_id": token},
+        "mcp_servers": {"type": token, "api_key_name": token},
+    }
+    # Even familiar secret field names are not encrypted when nested below an
+    # unrelated key; the real writers only encrypt explicitly declared paths.
+    payload = {
+        **payloads[table_name],
+        "nested": {
+            "encrypted_payload": token,
+            "bot_token": token,
+            "access_token": token,
+        },
+        "items": [token],
+    }
+    table = Table(
+        table_name,
         MetaData(),
         Column("id", Integer, primary_key=True),
         Column(column, JSON),
     )
     table.create(database)
     with database.begin() as conn:
-        conn.execute(
-            table.insert().values(
-                id=1, **{column: {"nested": [old.encrypt(b"secret").decode(), "plain"]}}
-            )
-        )
+        conn.execute(table.insert().values(id=1, **{column: payload}))
+    rotation.validate_stored_encryption_keys()
+    with database.begin() as conn:
+        assert rotation.rotate_encryption_key(conn, old, new) == 0
+        assert conn.scalar(select(table.c[column])) == payload
+
+
+@pytest.mark.parametrize(
+    "table_name,column,field",
+    [
+        ("user_channels", "config", field)
+        for field in ("bot_token", "app_secret", "app_token")
+    ]
+    + [("mcp_servers", "auth", field) for field in SENSITIVE_AUTH_FIELDS]
+    + [("trigger_runs", "payload_snapshot", "encrypted_payload")],
+)
+@pytest.mark.parametrize("readable_source", [True, False])
+def test_exact_json_secret_paths_still_fail_closed_and_rotate(
+    database, table_name, column, field, readable_source
+):
+    old = Fernet(Fernet.generate_key())
+    new = Fernet(os.environ["ENCRYPTION_KEY"].encode())
+    source = old if readable_source else Fernet(Fernet.generate_key())
+    token = source.encrypt(b"secret-value").decode()
+    payload = {field: token, "nested": {field: token}, "items": [token]}
+    table = Table(
+        table_name,
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column(column, JSON),
+    )
+    table.create(database)
+    with database.begin() as conn:
+        conn.execute(table.insert().values(id=1, **{column: payload}))
+    with pytest.raises(RuntimeError, match=f"{table_name} row 1 field {column}"):
+        rotation.validate_stored_encryption_keys()
+    if not readable_source:
+        with pytest.raises(RuntimeError, match="migration rolled back"):
+            with database.begin() as conn:
+                rotation.rotate_encryption_key(conn, old, new)
+        with database.connect() as conn:
+            assert conn.scalar(select(table.c[column])) == payload
+        return
+    with database.begin() as conn:
         assert rotation.rotate_encryption_key(conn, old, new) == 1
-        values = conn.scalar(select(table.c[column]))["nested"]
-        assert new.decrypt(values[0].encode()) == b"secret"
-        assert values[1] == "plain"
+        migrated = conn.scalar(select(table.c[column]))
+        assert new.decrypt(migrated[field].encode()) == b"secret-value"
+        assert migrated["nested"] == payload["nested"]
+        assert migrated["items"] == payload["items"]
+        assert rotation.rotate_encryption_key(conn, old, new) == 0
+    rotation.validate_stored_encryption_keys()
+
+
+@pytest.mark.parametrize("store_full_payload", [False, True])
+def test_signed_webhook_metadata_cannot_poison_startup_or_migration_cli(
+    database, monkeypatch, capsys, store_full_payload
+):
+    key = Fernet(os.environ["ENCRYPTION_KEY"].encode())
+    secret = "diagnostic-webhook-secret"
+    trigger = AgentTrigger(
+        config={"store_full_payload": store_full_payload},
+        secret_encrypted=key.encrypt(secret.encode()).decode(),
+    )
+    token = base64.urlsafe_b64encode(b"\x80" + b"\0" * 72).decode()
+    timestamp = str(int(time.time()))
+    body = b'{"sample":"ordinary payload"}'
+    context = CallbackRequestContext(
+        provider="webhook",
+        callback_id="diagnostic",
+        headers={
+            "x-xagent-timestamp": timestamp,
+            "x-xagent-signature": sign_webhook_payload(secret, timestamp, body),
+            "x-xagent-event-id": token,
+            "x-xagent-event-type": token,
+        },
+    )
+    provider = WebhookProvider()
+    get_cipher.cache_clear()
+    try:
+        verification = asyncio.run(
+            provider.verify(context, db=None, trigger=trigger, raw_body=body)
+        )
+        assert verification.verified
+        event = asyncio.run(
+            provider.parse_events(context, db=None, trigger=trigger, raw_body=body)
+        )[0]
+        snapshot = _payload_snapshot(
+            trigger,
+            event.payload,
+            source_event_id=event.source_event_id,
+            event_type=event.event_type,
+            resource_id=event.resource_id,
+        )
+    finally:
+        get_cipher.cache_clear()
+    assert snapshot["metadata"]["source_event_id"] == token
+    assert snapshot["metadata"]["event_type"] == token
+    assert ("encrypted_payload" in snapshot) is store_full_payload
+    if store_full_payload:
+        assert (
+            json.loads(key.decrypt(snapshot["encrypted_payload"].encode()))
+            == event.payload
+        )
+    table = Table(
+        "trigger_runs",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("payload_snapshot", JSON),
+    )
+    table.create(database)
+    with database.begin() as conn:
+        conn.execute(table.insert().values(id=1, payload_snapshot=snapshot))
+    rotation.validate_stored_encryption_keys()
+    monkeypatch.setenv(
+        "XAGENT_ENCRYPTION_MIGRATION_KEY", Fernet.generate_key().decode()
+    )
+    monkeypatch.setattr(encryption_key_migration, "configure_db", Mock())
+    monkeypatch.setattr(encryption_key_migration, "get_engine", lambda: database)
+    encryption_key_migration.main()
+    assert "Re-encrypted 0 persisted credential fields." in capsys.readouterr().out
+    with database.connect() as conn:
+        assert conn.scalar(select(table.c.payload_snapshot)) == snapshot
 
 
 def test_worker_entrypoints_validate_before_admitting(monkeypatch):

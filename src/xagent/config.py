@@ -19,6 +19,7 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import base64
 import enum
 import json
 import logging
@@ -2221,19 +2222,29 @@ def get_tool_credentials_encryption_key() -> str:
     return raw if raw and raw.strip() else DEV_TOOL_CREDENTIALS_KEY
 
 
-def validate_encryption_config() -> None:
-    """Reject missing, public or malformed encryption keys before admission."""
-    if not requires_secure_secrets():
-        return
+def validate_private_encryption_key(key: str | None) -> None:
+    """Reject the public key by key material, not its Base64 spelling."""
     from cryptography.fernet import Fernet
 
-    key = os.getenv(ENCRYPTION_KEY)
-    if not key or key.strip() == DEV_FALLBACK_ENCRYPTION_KEY:
+    if not key:
         raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
     try:
         Fernet(key.encode("ascii"))
     except (ValueError, UnicodeError) as exc:
         raise RuntimeError("ENCRYPTION_KEY must provide a valid Fernet key") from exc
+    # Fernet accepts standard Base64, extra padding and embedded whitespace.
+    # All equivalent encodings of the published key are equally public.
+    if base64.urlsafe_b64decode(key) == base64.urlsafe_b64decode(
+        DEV_FALLBACK_ENCRYPTION_KEY
+    ):
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+
+
+def validate_encryption_config() -> None:
+    """Reject missing, public or malformed encryption keys before admission."""
+    if not requires_secure_secrets():
+        return
+    validate_private_encryption_key(os.getenv(ENCRYPTION_KEY))
     get_tool_credentials_encryption_key()
 
 

@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import pytest
 from cryptography.fernet import Fernet
-from sqlalchemy import create_engine
+from sqlalchemy import JSON, Column, Integer, MetaData, Table, create_engine, select
 from sqlalchemy.orm import Session
 
 from xagent.web.models.database import Base
@@ -100,5 +100,42 @@ def test_offline_migration_is_atomic_and_idempotent(
                     )
                     == b"postgresql://secret"
                 )
+    finally:
+        engine.dispose()
+
+
+def test_offline_tool_migration_accepts_pre_upgrade_schema(tmp_path, monkeypatch):
+    """Rotate before Alembic adds current ORM columns or per-user configs."""
+    old_key, new_key = "xagent-dev-key", "new-private-tool-key-01234567890123456789"
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", new_key)
+    engine = create_engine(f"sqlite:///{tmp_path / 'old-tool-schema.db'}")
+    table = Table(
+        "tool_configs",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("config", JSON),
+    )
+    table.create(engine)
+    token = cipher(old_key).encrypt(b"tool-secret").decode()
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                table.insert().values(
+                    id=1,
+                    config={"credentials": {"api_key": {"ciphertext": token}}},
+                )
+            )
+        with Session(engine) as db:
+            assert migrate_tool_credentials(db, old_key) == 1
+            assert migrate_tool_credentials(db, old_key) == 0
+        with engine.connect() as conn:
+            payload = conn.scalar(select(table.c.config))
+            assert (
+                cipher(new_key).decrypt(
+                    payload["credentials"]["api_key"]["ciphertext"].encode()
+                )
+                == b"tool-secret"
+            )
     finally:
         engine.dispose()

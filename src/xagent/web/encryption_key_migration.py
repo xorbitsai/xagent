@@ -6,9 +6,9 @@ from cryptography.fernet import Fernet
 from sqlalchemy.exc import SQLAlchemyError
 
 from ..config import (
-    DEV_FALLBACK_ENCRYPTION_KEY,
     ENCRYPTION_KEY,
     ENCRYPTION_MIGRATION_KEY,
+    validate_private_encryption_key,
 )
 from .models.database import configure_db, get_engine
 from .services.encryption_key_rotation import rotate_encryption_key
@@ -21,8 +21,10 @@ def main() -> None:
         raise SystemExit(
             f"Set {ENCRYPTION_MIGRATION_KEY} and an explicit private ENCRYPTION_KEY"
         )
-    if destination.strip() == DEV_FALLBACK_ENCRYPTION_KEY:
-        raise SystemExit("Refusing the published development destination key")
+    try:
+        validate_private_encryption_key(destination)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
     try:
         old, new = Fernet(source.encode()), Fernet(destination.encode())
     except (ValueError, UnicodeError):

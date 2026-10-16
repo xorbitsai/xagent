@@ -6,8 +6,9 @@ configuration, OAuth/MCP credentials and runtime values) and
 `SECRET_KEY` remains an alias for the latter. Preserve the exact old value if
 it already meets the requirement: whitespace is part of historical derivation.
 Web, standalone workers, combined launchers and Celery worker/beat validate
-encryption at startup. Web checks persisted ciphertext before database migrations
-or runtime admission; workers check before accepting work. An unreadable stored
+encryption at startup. Database initialization binds the configured database,
+then checks persisted ciphertext before any schema migration or seeding;
+workers also check before accepting work. An unreadable stored
 credential aborts startup with a table/row/field location and this upgrade guide,
 never a silent environment/default fallback. No plaintext or ciphertext is logged.
 
@@ -26,7 +27,9 @@ Before upgrading a deployment that used `xagent-dev-key` or a short key:
    `XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY` to the exact old tool key (explicitly
    `xagent-dev-key` only if that was really used), then run
    `python -m xagent.web.tool_credentials_key_migration`.
-4. The command re-encrypts global tool credentials and per-user SQL connection
+4. The command reads raw existing `config` columns without requiring the latest
+   ORM schema or a per-user table that older versions did not have. It
+   re-encrypts global tool credentials and per-user SQL connection
    ciphertext in one transaction, preserves unrelated fields, skips values
    already readable with the new key, and rolls back if any value cannot be
    decrypted. It never prints keys or plaintext. Unset the migration variable.
@@ -40,6 +43,8 @@ Older examples shipped a public development Fernet key; installs without an
 explicit key could also use it implicitly. Do not simply replace it and restart:
 existing model/channel/OAuth data needs re-encryption first. There is deliberately
 no production fallback to a published key.
+Equivalent Base64 spellings of that public key are rejected too, including
+standard-Base64 alphabet variants, extra padding and embedded whitespace.
 
 `python -m xagent.web.encryption_key_migration` reads the exact old Fernet key from
 `XAGENT_ENCRYPTION_MIGRATION_KEY` and the explicit private destination from

@@ -8,7 +8,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 
-from ...config import get_database_url, get_db_pool_kwargs
+from ...config import get_database_url, get_db_pool_kwargs, validate_encryption_config
 from ...db.sqlite import (
     apply_sqlite_concurrency_pragmas,
     ensure_sqlite_parent_directory,
@@ -333,6 +333,7 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
 def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
     # Import all models to ensure they are registered with Base.metadata
+    from ..services.encryption_key_rotation import validate_stored_encryption_keys
     from . import (  # noqa: F401
         AutoModelCandidate,
         AutoModelConfig,
@@ -372,7 +373,11 @@ def init_db(db_url: str | None = None) -> None:
     from .agent import Agent  # noqa: F401
     from .sandbox import SandboxInfo, SandboxSnapshot  # noqa: F401
 
+    validate_encryption_config()
     configure_db(db_url)
+    # Bind the requested database before inspecting raw ciphertext, but never
+    # migrate/seed it (or admit runtime work) while old credentials are unreadable.
+    validate_stored_encryption_keys()
     builtin_mcp_mismatches = _initialize_database_schema(get_engine())
 
     for mismatch in builtin_mcp_mismatches:

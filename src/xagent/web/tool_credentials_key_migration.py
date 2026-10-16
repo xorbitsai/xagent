@@ -2,15 +2,15 @@
 
 import copy
 import os
-from typing import cast
 
 from cryptography.fernet import Fernet, InvalidToken
+from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ..config import TOOL_CREDENTIALS_MIGRATION_KEY, get_tool_credentials_encryption_key
 from .models.database import configure_db, get_session_local
-from .models.tool_config import ToolConfig, UserToolConfig
+from .services.encryption_key_rotation import credential_rows
 from .services.tool_credentials import _build_fernet_key
 
 
@@ -30,45 +30,51 @@ def migrate_tool_credentials(db: Session, old_key: str) -> int:
     old, new = _cipher(old_key), _cipher(destination)
     count = 0
     with db.begin():
-        for model in (ToolConfig, UserToolConfig):
-            for record in db.query(model).all():
-                row = cast(ToolConfig | UserToolConfig, record)
-                payload = copy.deepcopy(row.config)
-                if not isinstance(payload, dict):
+        connection = db.connection()
+        # This command runs before schema upgrades; do not SELECT every column
+        # of today's ORM model or require tables introduced by later releases.
+        for table, row_id, column, value in credential_rows(
+            connection, {"tool_configs": ("config",), "user_tool_configs": ("config",)}
+        ):
+            payload = copy.deepcopy(value)
+            if not isinstance(payload, dict):
+                continue
+            changed = False
+            for group in ("credentials", "sql_connections"):
+                fields = payload.get(group)
+                if not isinstance(fields, dict):
                     continue
-                changed = False
-                for group in ("credentials", "sql_connections"):
-                    fields = payload.get(group)
-                    if not isinstance(fields, dict):
+                for field_name, item in fields.items():
+                    if not isinstance(item, dict) or not isinstance(
+                        item.get("ciphertext"), str
+                    ):
                         continue
-                    for field_name, item in fields.items():
-                        if not isinstance(item, dict) or not isinstance(
-                            item.get("ciphertext"), str
-                        ):
-                            continue
-                        location = f"{model.__tablename__} row {row.id} field {group}.{field_name!r}"
-                        try:
-                            encoded = item["ciphertext"].encode()
-                        except UnicodeError:
-                            raise RuntimeError(
-                                f"Unreadable {location}; migration rolled back"
-                            ) from None
-                        try:
-                            new.decrypt(encoded)
-                            continue
-                        except InvalidToken:
-                            pass
-                        try:
-                            plaintext = old.decrypt(encoded)
-                        except InvalidToken:
-                            raise RuntimeError(
-                                f"Unreadable {location}; migration rolled back"
-                            ) from None
-                        item["ciphertext"] = new.encrypt(plaintext).decode()
-                        changed = True
-                        count += 1
-                if changed:
-                    row.config = payload
+                    location = f"{table.name} row {row_id} field {group}.{field_name!r}"
+                    try:
+                        encoded = item["ciphertext"].encode()
+                    except UnicodeError:
+                        raise RuntimeError(
+                            f"Unreadable {location}; migration rolled back"
+                        ) from None
+                    try:
+                        new.decrypt(encoded)
+                        continue
+                    except InvalidToken:
+                        pass
+                    try:
+                        plaintext = old.decrypt(encoded)
+                    except InvalidToken:
+                        raise RuntimeError(
+                            f"Unreadable {location}; migration rolled back"
+                        ) from None
+                    item["ciphertext"] = new.encrypt(plaintext).decode()
+                    changed = True
+                    count += 1
+            if changed:
+                primary = next(iter(table.primary_key.columns))
+                connection.execute(
+                    update(table).where(primary == row_id).values(**{column: payload})
+                )
     return count
 
 

@@ -13,6 +13,7 @@ from sqlalchemy import (
     Table,
     Text,
     create_engine,
+    inspect,
     select,
 )
 from sqlalchemy.exc import OperationalError
@@ -278,19 +279,95 @@ def test_celery_disposes_pre_fork_database_pool_on_storage_failure(monkeypatch):
     engine.dispose.assert_called_once()
 
 
-def test_web_guard_precedes_database_migrations(monkeypatch):
+@pytest.mark.parametrize("unreadable", [False, True])
+def test_web_initializes_engine_before_guard_and_checks_before_migrations(
+    tmp_path, monkeypatch, unreadable
+):
     from xagent.web import app as web_app
+    from xagent.web.models import database as db_module
 
-    init = Mock()
-    monkeypatch.setattr(web_app, "init_db", init)
-    monkeypatch.setattr(
-        rotation,
-        "validate_stored_encryption_keys",
-        Mock(side_effect=RuntimeError("unreadable key")),
+    url = f"sqlite:///{tmp_path / 'web-startup.db'}"
+    key = Fernet.generate_key()
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENCRYPTION_KEY", key.decode())
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "s" * 40)
+    monkeypatch.setattr(db_module, "_engine", None)
+    monkeypatch.setattr(db_module, "_SessionLocal", None)
+    table = Table(
+        "models",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("_api_key_encrypted", Text),
     )
-    with pytest.raises(RuntimeError, match="unreadable key"):
-        asyncio.run(web_app._initialize_database_and_admit_runtime(web_app.app))
-    init.assert_not_called()
+    seed_engine = create_engine(url)
+    table.create(seed_engine)
+    stored_key = Fernet.generate_key() if unreadable else key
+    ciphertext = Fernet(stored_key).encrypt(b"model-secret").decode()
+    with seed_engine.begin() as conn:
+        conn.execute(table.insert().values(id=1, _api_key_encrypted=ciphertext))
+    seed_engine.dispose()
+    schema = Mock(return_value=[])
+    monkeypatch.setattr(db_module, "_initialize_database_schema", schema)
+    # Stop after database preparation; do not start any runtime/background work.
+    admission = Mock(side_effect=RuntimeError("reached host admission"))
+    monkeypatch.setattr(web_app, "run_host_startup_admissions", admission)
+    expected = (
+        "Unreadable encrypted credential" if unreadable else "reached host admission"
+    )
+    try:
+        with pytest.raises(RuntimeError, match=expected):
+            asyncio.run(web_app._initialize_database_and_admit_runtime(web_app.app))
+        if unreadable:
+            schema.assert_not_called()
+            admission.assert_not_called()
+        else:
+            schema.assert_called_once_with(db_module.get_engine())
+        with db_module.get_engine().connect() as conn:
+            assert conn.scalar(select(table.c._api_key_encrypted)) == ciphertext
+    finally:
+        if db_module._engine is not None:
+            db_module._engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        DEV_FALLBACK_ENCRYPTION_KEY,
+        DEV_FALLBACK_ENCRYPTION_KEY.replace("_", "/"),
+        DEV_FALLBACK_ENCRYPTION_KEY + "=",
+    ],
+)
+def test_master_cli_rejects_equivalent_public_destination_before_database(
+    monkeypatch, key
+):
+    monkeypatch.setenv(
+        "XAGENT_ENCRYPTION_MIGRATION_KEY", Fernet.generate_key().decode()
+    )
+    monkeypatch.setenv("ENCRYPTION_KEY", key)
+    configure = Mock()
+    monkeypatch.setattr(encryption_key_migration, "configure_db", configure)
+    with pytest.raises(SystemExit, match="private Fernet key"):
+        encryption_key_migration.main()
+    configure.assert_not_called()
+
+
+def test_fresh_production_database_initializes_with_real_schema(tmp_path, monkeypatch):
+    from xagent.web.models import database as db_module
+
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "s" * 40)
+    monkeypatch.setattr(db_module, "_engine", None)
+    monkeypatch.setattr(db_module, "_SessionLocal", None)
+    try:
+        db_module.init_db(f"sqlite:///{tmp_path / 'fresh-production.db'}")
+        tables = set(inspect(db_module.get_engine()).get_table_names())
+        assert set(rotation.ENCRYPTED_COLUMNS) <= tables
+        rotation.validate_stored_encryption_keys()
+    finally:
+        if db_module._engine is not None:
+            db_module._engine.dispose()
 
 
 def test_celery_worker_and_beat_abort_on_invalid_key(monkeypatch):

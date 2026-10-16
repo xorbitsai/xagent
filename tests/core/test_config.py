@@ -4071,9 +4071,20 @@ def test_tool_key_alias_and_boundary(monkeypatch, setting, length, valid):
             config.get_tool_credentials_encryption_key()
 
 
-def test_deployed_encryption_rejects_published_fernet_key(monkeypatch):
+@pytest.mark.parametrize(
+    "key",
+    [
+        config.DEV_FALLBACK_ENCRYPTION_KEY,
+        config.DEV_FALLBACK_ENCRYPTION_KEY.replace("_", "/"),
+        config.DEV_FALLBACK_ENCRYPTION_KEY + "=",
+        config.DEV_FALLBACK_ENCRYPTION_KEY[:10]
+        + "\n"
+        + config.DEV_FALLBACK_ENCRYPTION_KEY[10:],
+    ],
+)
+def test_deployed_encryption_rejects_published_fernet_key(monkeypatch, key):
     monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
-    monkeypatch.setenv("ENCRYPTION_KEY", config.DEV_FALLBACK_ENCRYPTION_KEY)
+    monkeypatch.setenv("ENCRYPTION_KEY", key)
     with pytest.raises(
         RuntimeError, match="^ENCRYPTION_KEY must provide a private Fernet key$"
     ):

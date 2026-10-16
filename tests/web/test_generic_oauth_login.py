@@ -84,7 +84,7 @@ def db_session(tmp_path):
 
 def _token_for(user: User) -> str:
     return create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={"sub": user.username, "user_id": user.id, "type": "access"},
         expires_delta=timedelta(minutes=5),
     )
 

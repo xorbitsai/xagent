@@ -43,6 +43,8 @@ class User(Base):  # type: ignore
     refresh_token_expires_at = Column(DateTime(timezone=True), nullable=True)
     password_reset_token_hash = Column(String(64), index=True, nullable=True)
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
+    # Changing the generation invalidates all previous user access credentials.
+    session_epoch = Column(String(32), nullable=True)
     # Onboarding-collected settings: {onboarded, department, industry, voice,
     # goals}. Written incrementally (one PATCH per onboarding step merges
     # into this dict, not replaces it) - see update_current_user_preferences

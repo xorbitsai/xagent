@@ -660,6 +660,7 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             "get_current_user",
             (),
         ),
+        ("web/api/auth.py", "_generic_oauth_login", "get_user_from_token", ()),
     )
     modules = {"xagent.web.auth_dependencies", "xagent.web.api.websocket_auth"}
     source_root = Path(auth_dependencies.__file__).parents[1]

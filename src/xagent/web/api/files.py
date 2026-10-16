@@ -108,6 +108,7 @@ from .legacy_file import (
     resolve_legacy_file_path,
     resolve_legacy_file_path_cross_user,
 )
+from ..auth_sessions import matches_user_session, user_session_claims
 
 # Optional import for python-pptx (used for upload-time text preview).
 pptx: ModuleType | None = None
@@ -1744,7 +1745,7 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
         ) from None
 
     user = db.query(User).filter(User.username == username, User.id == user_id).first()
-    if user is None:
+    if user is None or not matches_user_session(user, claims):
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
     return user
 
@@ -1846,9 +1847,8 @@ async def issue_preview_stream_ticket(
     """
     ticket = create_access_token(
         {
+            **user_session_claims(user),
             "type": FILE_STREAM_TICKET_TYPE,
-            "sub": user.username,
-            "user_id": user.id,
             "file_id": file_id,
         },
         expires_delta=timedelta(seconds=get_file_stream_ticket_ttl_seconds()),

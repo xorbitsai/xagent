@@ -60,7 +60,8 @@ from ..auth_config import (
     PASSWORD_MIN_LENGTH,
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, get_user_from_token
+from ..auth_sessions import user_session_claims
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
@@ -2011,7 +2012,7 @@ def _prepare_login_response(user: User | None, request: LoginRequest) -> Dict[st
     if needs_password_rehash(str(user.password_hash)):
         setattr(user, "password_hash", hash_password(request.password))
     with observe_duration("xagent.auth.login.token_creation.duration"):
-        identity = {"sub": user.username, "user_id": user.id}
+        identity = user_session_claims(user)
         access_token = create_access_token(
             data=identity,
             expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -2264,11 +2265,25 @@ async def reset_password(
                 success=False, message="Reset token has expired"
             )
 
-    setattr(user, "password_hash", await hash_password_async(request.new_password))
-    setattr(user, "password_reset_token_hash", None)
-    setattr(user, "password_reset_expires_at", None)
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
+    new_hash = await hash_password_async(request.new_password)
+    changed = (
+        db.query(User)
+        .filter(User.id == user.id, User.password_reset_token_hash == token_hash)
+        .update(
+            {
+                User.password_hash: new_hash,
+                User.password_reset_token_hash: None,
+                User.password_reset_expires_at: None,
+                User.refresh_token: None,
+                User.refresh_token_expires_at: None,
+                User.session_epoch: secrets.token_urlsafe(24),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return ResetPasswordResponse(success=False, message="Invalid reset token")
     db.commit()
 
     return ResetPasswordResponse(
@@ -2300,12 +2315,28 @@ async def change_password(
                 message=f"New password must be at least {PASSWORD_MIN_LENGTH} characters",
             )
 
-        # Update password
-        setattr(user, "password_hash", await hash_password_async(request.new_password))
-        # A password change invalidates every currently issued refresh
-        # session. Access tokens remain short-lived and will expire normally.
-        setattr(user, "refresh_token", None)
-        setattr(user, "refresh_token_expires_at", None)
+        previous_hash = str(user.password_hash)
+        new_hash = await hash_password_async(request.new_password)
+        changed = (
+            db.query(User)
+            .filter(User.id == user.id, User.password_hash == previous_hash)
+            .update(
+                {
+                    User.password_hash: new_hash,
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                    User.session_epoch: secrets.token_urlsafe(24),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return ChangePasswordResponse(
+                success=False, message="Password changed; sign in again"
+            )
         db.commit()
 
         return ChangePasswordResponse(
@@ -2589,7 +2620,7 @@ def _prepare_refresh_response(
         now = now.replace(tzinfo=None)
     if expires < now:
         raise HTTPException(status_code=401, detail="Refresh token has expired")
-    identity = {"sub": user.username, "user_id": user.id}
+    identity = user_session_claims(user)
     access_token = create_access_token(
         data=identity, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
@@ -3556,12 +3587,9 @@ def _generic_oauth_login(
 
     user_id = trusted_user_id
     if user_id is None and token:
-        payload = verify_token(token)
-        if payload and payload.get("type") == "access":
-            username = payload.get("sub")
-            user = db.query(User).filter(User.username == username).first()
-            if user:
-                user_id = int(user.id)
+        user = get_user_from_token(token, db)
+        if user:
+            user_id = int(user.id)
 
     if not user_id:
         return HTMLResponse(

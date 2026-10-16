@@ -9,6 +9,7 @@ from jose import ExpiredSignatureError, JWTError, jwt
 from sqlalchemy.orm import Session
 
 from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from .auth_sessions import matches_user_session
 from .jwt_validation import (
     has_matching_temporal_claim_conversion_failure,
     is_exact_integer_bindable,
@@ -92,6 +93,8 @@ def _resolve_access_token_user(token: str, db: Session) -> User:
     user = db.query(User).filter(User.username == username, User.id == user_id).first()
     if user is None:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.USER_NOT_FOUND)
+    if not matches_user_session(user, payload):
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)
     return user
 
 

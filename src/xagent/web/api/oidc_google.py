@@ -31,6 +31,7 @@ from ...config import (
     get_session_secret,
 )
 from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
+from ..auth_sessions import user_session_claims
 from ..models.database import get_db
 from ..models.oidc_consumed_token import OidcConsumedToken
 from ..models.user import User
@@ -283,7 +284,7 @@ def _get_or_create_google_user(db: Session, claims: dict[str, Any]) -> User:
 
 def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
     access_token = create_access_token(
-        data={"sub": user.username, "user_id": user.id},
+        data=user_session_claims(user),
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
     refresh_token = create_refresh_token(

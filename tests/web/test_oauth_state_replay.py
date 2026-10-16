@@ -97,11 +97,15 @@ def test_denied_provider_flow_is_consumed_and_cannot_be_replayed(
     assert db.query(OidcConsumedToken).count() == 1
     # Closing this Session models a return to another API worker.
     db.close()
-    replay = auth.generic_oauth_callback(
-        "custom", _callback(state, error=False), db, None
-    )
-    assert replay.status_code == 400
-    assert b"Invalid or expired state" in replay.body
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    alternate_bits = state[:-1] + alphabet[alphabet.index(state[-1]) ^ 1]
+    for variant in (state, state + "=", alternate_bits):
+        assert auth.verify_token(variant) is not None
+        replay = auth.generic_oauth_callback(
+            "custom", _callback(variant, error=False), db, None
+        )
+        assert replay.status_code == 400
+        assert b"Invalid or expired state" in replay.body
     post.assert_not_called()
 
 
@@ -144,8 +148,6 @@ def test_claim_store_outage_returns_sanitized_503_before_exchange(
 def test_public_callback_rejects_unbound_or_malformed_legacy_states(
     callback_client, monkeypatch, binding
 ):
-    delegate = Mock()
-    monkeypatch.setattr(auth, "generic_oauth_callback", delegate)
     state = auth.create_access_token(
         {
             "type": "oauth_state",
@@ -160,7 +162,13 @@ def test_public_callback_rejects_unbound_or_malformed_legacy_states(
     )
     assert response.status_code == 400
     assert "Invalid or expired state" in response.text
-    delegate.assert_not_called()
+    direct = auth.generic_oauth_callback(
+        "custom",
+        _callback(state, error=False),
+        callback_client.app.dependency_overrides[auth.get_db](),
+        None,
+    )
+    assert direct.status_code == 400
 
 
 def test_public_callback_checks_cookie_and_consumes_durable_state(

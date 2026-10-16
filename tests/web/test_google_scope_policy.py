@@ -349,6 +349,11 @@ def test_other_google_scopes(google_db, app_id):
 
 @pytest.mark.parametrize("has_catalog_row", [False, True])
 def test_gmail_callback_gate(google_db, monkeypatch, has_catalog_row):
+    from tests.shared.oauth_browser_fixture import (
+        create_access_token,
+        generic_oauth_callback,
+    )
+
     db, user = google_db
     gmail = db.query(PublicMCPApp).filter_by(app_id="gmail").one()
     if has_catalog_row:
@@ -356,7 +361,7 @@ def test_gmail_callback_gate(google_db, monkeypatch, has_catalog_row):
     else:
         db.delete(gmail)
     db.commit()
-    state = auth_api.create_access_token(
+    state = create_access_token(
         data={
             "type": "oauth_state",
             "user_id": user.id,
@@ -368,7 +373,7 @@ def test_gmail_callback_gate(google_db, monkeypatch, has_catalog_row):
     post = Mock(side_effect=AssertionError("Google must not be contacted"))
     monkeypatch.setattr(auth_api.requests, "post", post)
     request = SimpleNamespace(query_params={"code": "code", "state": state})
-    response = auth_api.generic_oauth_callback("google", request, db, _provider())
+    response = generic_oauth_callback("google", request, db, _provider())
     assert response.status_code == 404
     post.assert_not_called()
     assert db.query(UserOAuth).count() == 0

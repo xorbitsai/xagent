@@ -9,9 +9,12 @@ import requests
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_callback
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider

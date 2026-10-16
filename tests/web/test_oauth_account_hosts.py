@@ -20,10 +20,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.oauth_browser_fixture import create_access_token
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps, oauth_account_hosts
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_login, verify_token
+from xagent.web.api.auth import generic_oauth_login, verify_token
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -577,7 +578,9 @@ def _callback(
         query_params={"state": state, "code": "code"},
         cookies=cookies or {},
     )
-    return auth_api.generic_oauth_callback(
+    from tests.shared.oauth_browser_fixture import generic_oauth_callback
+
+    return generic_oauth_callback(
         provider, request, db=db, db_provider=_db_provider(provider)
     )
 
@@ -626,6 +629,9 @@ def test_callback_exchanges_the_code_on_the_account_bound_at_login(
     assert grant is not None
     assert grant.access_token == "new-access"
     assert grant.instance_url == "acme"
+    replay = _callback(db, state + "=", cookies=cookies)
+    assert replay.status_code == 400
+    assert post.call_count == 1
 
 
 def test_callback_keeps_the_bound_account_over_a_token_response_instance_url(

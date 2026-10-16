@@ -4043,6 +4043,18 @@ def generic_oauth_callback(
         )
 
     browser_nonce_hash = payload.get("browser_nonce_hash")
+    is_actor_flow = (
+        payload.get("actor_flow_nonce") is not None
+        or payload.get("resource_owner_key") is not None
+    )
+    if not is_actor_flow and (
+        not isinstance(browser_nonce_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", browser_nonce_hash) is None
+    ):
+        _log_oauth_callback_rejection(provider, "state_browser_binding_required")
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
     if browser_nonce_hash:
         browser_nonce = request.cookies.get(
             _ordinary_oauth_cookie_name(str(browser_nonce_hash))
@@ -4057,16 +4069,19 @@ def generic_oauth_callback(
             )
         try:
             claimed = claim_oauth_state(db, state, expires_at=payload.get("exp"))
-        except SQLAlchemyError:
+        except SQLAlchemyError as exc:
             # No provider exchange or credential write is allowed if the
             # durable replay store cannot record this callback's claim.
-            logger.error("OAuth state replay protection is unavailable")
+            logger.error(
+                "OAuth state replay protection is unavailable (%s)",
+                type(exc).__name__,
+            )
             return HTMLResponse(
                 content="<h1>Connection temporarily unavailable</h1><p>Please try again.</p>",
                 status_code=503,
             )
         if not claimed:
-            _log_oauth_callback_rejection(provider, "state_replayed")
+            _log_oauth_callback_rejection(provider, "state_consumed_or_expired")
             return HTMLResponse(
                 content="<h1>Error: Invalid or expired state</h1>", status_code=400
             )
@@ -5371,25 +5386,6 @@ def oauth_callback(
 ) -> Any:
     """Unified entry point for OAuth callback"""
     from ..models.oauth_provider import OAuthProvider
-
-    payload = verify_token(request.query_params.get("state", ""))
-    if (
-        payload
-        and payload.get("type") == "oauth_state"
-        and payload.get("actor_flow_nonce") is None
-        and payload.get("resource_owner_key") is None
-    ):
-        binding = payload.get("browser_nonce_hash")
-        if (
-            not isinstance(binding, str)
-            or re.fullmatch(r"[0-9a-f]{64}", binding) is None
-        ):
-            # Every current ordinary issuer binds a browser. Do not preserve
-            # an HTTP compatibility path for old unbound signed states.
-            _log_oauth_callback_rejection(provider, "state_browser_binding_required")
-            return HTMLResponse(
-                content="<h1>Error: Invalid or expired state</h1>", status_code=400
-            )
 
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()

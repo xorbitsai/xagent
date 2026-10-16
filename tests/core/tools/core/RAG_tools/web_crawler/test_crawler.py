@@ -600,6 +600,9 @@ class TestWebCrawler:
     def _install_fake_cffi(monkeypatch):
         """Install fake curl_cffi modules so optional-dependency tests stay hermetic."""
         cffi_module = types.ModuleType("curl_cffi")
+        from curl_cffi.const import CurlOpt
+
+        cffi_module.CurlOpt = CurlOpt
         requests_module = types.ModuleType("curl_cffi.requests")
         requests_module.AsyncSession = MagicMock()
         cffi_module.requests = requests_module

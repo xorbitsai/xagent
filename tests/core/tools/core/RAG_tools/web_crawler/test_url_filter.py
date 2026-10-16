@@ -1,6 +1,5 @@
 """Unit tests for URL filter."""
 
-from functools import partial
 from unittest.mock import MagicMock
 
 import httpx
@@ -19,12 +18,19 @@ from xagent.core.tools.core.RAG_tools.web_crawler.url_filter import (
 )
 
 
+def _filter(*args, **kwargs):
+    """Explicitly load robots rules through the test's mocked egress client."""
+    result = URLFilter(*args, **kwargs)
+    result._fetch_robots_txt("http://test-egress.invalid")
+    return result
+
+
 class TestURLFilter:
     """Test URL filtering functionality."""
 
     def test_same_domain_check(self):
         """Test same domain validation."""
-        filter = URLFilter("https://example.com")
+        filter = _filter("https://example.com")
 
         assert filter.is_same_domain("https://example.com/page1") is True
         assert filter.is_same_domain("https://example.com/page1/sub") is True
@@ -33,7 +39,7 @@ class TestURLFilter:
 
     def test_normalize_url(self):
         """Test URL normalization."""
-        filter = URLFilter("https://example.com")
+        filter = _filter("https://example.com")
 
         # Absolute URL
         assert (
@@ -58,7 +64,7 @@ class TestURLFilter:
 
     def test_normalize_url_accepts_uppercase_scheme(self):
         """Normalization should be case-insensitive for HTTP(S) schemes."""
-        filter = URLFilter("https://example.com")
+        filter = _filter("https://example.com")
 
         assert (
             filter.normalize_url("HTTP://Example.com/Test#section")
@@ -67,14 +73,14 @@ class TestURLFilter:
 
     def test_normalize_url_rejects_hostless_http_urls(self):
         """Hostless HTTP(S) inputs should fail before crawl-time errors."""
-        filter = URLFilter("https://example.com")
+        filter = _filter("https://example.com")
 
         assert filter.normalize_url("http://@") is None
         assert filter.normalize_url("http://:80") is None
 
     def test_should_crawl_same_domain_only(self):
         """Test crawling with same domain restriction."""
-        filter = URLFilter(
+        filter = _filter(
             "https://example.com", same_domain_only=True, respect_robots_txt=False
         )
 
@@ -83,7 +89,7 @@ class TestURLFilter:
 
     def test_should_crawl_cross_domain(self):
         """Test crawling without same domain restriction."""
-        filter = URLFilter(
+        filter = _filter(
             "https://example.com", same_domain_only=False, respect_robots_txt=False
         )
 
@@ -92,7 +98,7 @@ class TestURLFilter:
 
     def test_url_patterns(self):
         """Test URL pattern matching."""
-        filter = URLFilter(
+        filter = _filter(
             "https://example.com",
             url_patterns=[r"https://example.com/docs/.*"],
             respect_robots_txt=False,
@@ -103,7 +109,7 @@ class TestURLFilter:
 
     def test_exclude_patterns(self):
         """Test URL exclusion patterns."""
-        filter = URLFilter(
+        filter = _filter(
             "https://example.com",
             exclude_patterns=[r".*\.pdf$", r".*\.jpg$"],
             respect_robots_txt=False,
@@ -115,7 +121,7 @@ class TestURLFilter:
 
     def test_combined_patterns(self):
         """Test combined include and exclude patterns."""
-        filter = URLFilter(
+        filter = _filter(
             "https://example.com",
             url_patterns=[r"https://example.com/.*"],
             exclude_patterns=[r".*/admin/.*", r".*\.pdf$"],
@@ -128,7 +134,7 @@ class TestURLFilter:
 
     def test_invalid_protocols(self):
         """Test filtering of invalid protocols."""
-        filter = URLFilter("https://example.com")
+        filter = _filter("https://example.com")
 
         # JavaScript, mailto, tel should be filtered out during normalization
         assert filter.normalize_url("javascript:void(0)") is None
@@ -137,7 +143,7 @@ class TestURLFilter:
 
     def test_url_with_query_and_fragment(self):
         """Test URLs with query parameters and fragments."""
-        filter = URLFilter("https://example.com")
+        filter = _filter("https://example.com")
 
         normalized = filter.normalize_url(
             "https://example.com/page?param=value#section"
@@ -146,7 +152,7 @@ class TestURLFilter:
 
     def test_empty_and_none_patterns(self):
         """Test with no patterns configured (allow all)."""
-        filter = URLFilter(
+        filter = _filter(
             "https://example.com", url_patterns=None, respect_robots_txt=False
         )
 
@@ -190,10 +196,16 @@ _REAL_HTTPX_CLIENT = httpx.Client
 
 
 def _patch_client_with_handler(monkeypatch, handler):
+    def client(**kwargs):
+        # Route all test requests through MockTransport rather than creating
+        # httpx's real proxy mount. Real egress is covered in test_crawler_egress.
+        kwargs.pop("proxy", None)
+        return _REAL_HTTPX_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
+
     monkeypatch.setattr(
         httpx,
         "Client",
-        partial(_REAL_HTTPX_CLIENT, transport=httpx.MockTransport(handler)),
+        client,
     )
 
 
@@ -218,7 +230,7 @@ class TestRobotsTxtAvailability:
         self.get = self.client.return_value.__enter__.return_value.get
         self.get.side_effect = error or (lambda url, headers=None: response)
         monkeypatch.setattr(httpx, "Client", self.client)
-        return URLFilter("https://example.com", respect_robots_txt=True)
+        return _filter("https://example.com", respect_robots_txt=True)
 
     def test_robots_is_fetched_with_the_crawl_user_agent(self, monkeypatch):
         """A WAF that 403s an unrecognised UA would otherwise be read as "no
@@ -227,7 +239,7 @@ class TestRobotsTxtAvailability:
         self.get = self.client.return_value.__enter__.return_value.get
         self.get.side_effect = lambda url, headers=None: _FakeResponse(404)
         monkeypatch.setattr(httpx, "Client", self.client)
-        URLFilter("https://example.com", user_agent="XagentBot/1.0")
+        _filter("https://example.com", user_agent="XagentBot/1.0")
 
         assert self.get.call_args.kwargs["headers"] == {"User-Agent": "XagentBot/1.0"}
 
@@ -295,7 +307,7 @@ class TestRobotsTxtAvailability:
                 301, headers={"Location": f"{request.url}/again"}
             ),
         )
-        f = URLFilter("https://example.com", respect_robots_txt=True)
+        f = _filter("https://example.com", respect_robots_txt=True)
 
         assert f.should_crawl("https://example.com/docs/intro") is False
 
@@ -312,7 +324,7 @@ class TestRobotsTxtAvailability:
             return httpx.Response(200, text="User-agent: *\nDisallow: /private\n")
 
         _patch_client_with_handler(monkeypatch, handler)
-        f = URLFilter("https://example.com", respect_robots_txt=True)
+        f = _filter("https://example.com", respect_robots_txt=True)
 
         assert f.should_crawl("https://example.com/private/secret") is False
         assert f.should_crawl("https://example.com/public/page") is True
@@ -348,18 +360,18 @@ class TestRejectionReason:
     """should_crawl only says no; callers need to know which rule said it."""
 
     def test_reason_is_none_when_crawlable(self):
-        f = URLFilter("https://example.com", respect_robots_txt=False)
+        f = _filter("https://example.com", respect_robots_txt=False)
         assert f.rejection_reason("https://example.com/docs") is None
 
     def test_off_domain_is_reported_as_configuration(self):
-        f = URLFilter(
+        f = _filter(
             "https://example.com", same_domain_only=True, respect_robots_txt=False
         )
         assert f.rejection_reason("https://other.com/x") == REJECTED_OFF_DOMAIN
         assert REJECTED_OFF_DOMAIN not in SITE_REJECTIONS
 
     def test_exclusion_is_reported_as_configuration(self):
-        f = URLFilter(
+        f = _filter(
             "https://example.com",
             exclude_patterns=[r"/private"],
             respect_robots_txt=False,
@@ -375,14 +387,14 @@ class TestRejectionReason:
                 200, text="User-agent: *\nDisallow: /private\n"
             ),
         )
-        f = URLFilter("https://example.com", respect_robots_txt=True)
+        f = _filter("https://example.com", respect_robots_txt=True)
         assert f.rejection_reason("https://example.com/private/x") == REJECTED_ROBOTS
         assert REJECTED_ROBOTS in SITE_REJECTIONS
 
     def test_an_unsupported_scheme_is_not_the_site_refusing(self):
         """ftp:/data:/intent: anchors are this crawler's own limit, so they
         must not make the site look responsible for a crawl going nowhere."""
-        f = URLFilter("https://example.com", respect_robots_txt=False)
+        f = _filter("https://example.com", respect_robots_txt=False)
 
         assert f.rejection_reason("ftp://example.com/file") == REJECTED_UNPARSABLE
         assert REJECTED_UNPARSABLE not in SITE_REJECTIONS
@@ -397,7 +409,7 @@ class TestRejectionReason:
                 200, text="User-agent: *\nDisallow: /blog\n"
             ),
         )
-        f = URLFilter(
+        f = _filter(
             "https://example.com", url_patterns=[r"/docs"], respect_robots_txt=True
         )
 
@@ -413,7 +425,7 @@ class TestRejectionReason:
                 200, text="User-agent: *\nDisallow: /blog\n"
             ),
         )
-        f = URLFilter(
+        f = _filter(
             "https://example.com", exclude_patterns=[r"/blog"], respect_robots_txt=True
         )
 
@@ -426,12 +438,12 @@ class TestRejectionReason:
                 200, text="User-agent: *\nDisallow: /blog\n"
             ),
         )
-        f = URLFilter("https://example.com", respect_robots_txt=True)
+        f = _filter("https://example.com", respect_robots_txt=True)
 
         assert f.rejection_reason("https://example.com/blog/post") == REJECTED_ROBOTS
 
     def test_should_crawl_still_agrees_with_the_reason(self):
-        f = URLFilter(
+        f = _filter(
             "https://example.com", same_domain_only=True, respect_robots_txt=False
         )
         for url in ("https://example.com/ok", "https://other.com/no"):

@@ -10,9 +10,11 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 import httpx
 
+from .....utils.public_network_proxy import PublicNetworkEgressProxy
 from ..core.schemas import CrawlResult, WebCrawlConfig
 from .content_cleaner import ContentCleaner
 from .link_extractor import LinkExtractor
@@ -616,6 +618,15 @@ class WebCrawler:
                 explicit headers -- their impersonate spec sets them.
         """
         async with AsyncExitStack() as stack:
+            # Both HTTP clients, including WAF-fingerprint retries and every
+            # redirect, must connect through the same public-IP-pinning gate.
+            # No environment proxy/NO_PROXY setting may bypass this boundary.
+            proxy = PublicNetworkEgressProxy()
+            stack.push_async_callback(proxy.close)
+            proxy_url = await proxy.start()
+            # URLFilter construction is side-effect free: robots.txt must use
+            # the same egress gate, including redirects, before links are judged.
+            await asyncio.to_thread(self.url_filter._fetch_robots_txt, proxy_url)
             sessions: Dict[Optional[str], Any] = {}
             cffi_session_cls: Any = None
             for fp in self._tls_chain:
@@ -623,6 +634,8 @@ class WebCrawler:
                     sess: Any = httpx.AsyncClient(
                         headers=httpx_headers or {},
                         timeout=self.config.timeout,
+                        proxy=proxy_url,
+                        trust_env=False,
                     )
                 else:
                     if cffi_session_cls is None:
@@ -631,9 +644,20 @@ class WebCrawler:
                         from curl_cffi.requests import AsyncSession as CffiSession
 
                         cffi_session_cls = CffiSession
+                    from curl_cffi import CurlOpt
+
                     sess = cffi_session_cls(
                         impersonate=fp,
                         timeout=self.config.timeout,
+                        proxy=proxy_url,
+                        trust_env=False,
+                        curl_options={
+                            # libcurl can honor NO_PROXY even with an explicit
+                            # proxy. Also deny non-HTTP protocols on redirects.
+                            CurlOpt.NOPROXY: "",
+                            CurlOpt.PROTOCOLS_STR: "http,https",
+                            CurlOpt.REDIR_PROTOCOLS_STR: "http,https",
+                        },
                     )
                 sessions[fp] = await stack.enter_async_context(sess)
             yield sessions
@@ -666,6 +690,15 @@ class WebCrawler:
                 "this response is a failure, not a success".
             _FetchResult(None, None) only if every attempt raised an exception.
         """
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("Crawler only accepts HTTP(S) URLs without credentials")
+
         last_result = _FetchResult(response=None, fingerprint_used=None)
         last_status: Optional[int] = None
         exception_log: List[str] = []

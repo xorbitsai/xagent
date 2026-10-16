@@ -72,12 +72,11 @@ class URLFilter:
                 self.robots_url = f"{urlparse(normalized_base_url or base_url).scheme}://{self.base_domain}/robots.txt"
                 self.robots_parser = RobotFileParser()
                 self.robots_parser.set_url(self.robots_url)
-                self._fetch_robots_txt()
             except Exception as e:
                 logger.warning("Failed to fetch robots.txt: %s", e)
                 self.robots_parser = None
 
-    def _fetch_robots_txt(self) -> None:
+    def _fetch_robots_txt(self, proxy_url: str) -> None:
         """Fetch robots.txt and apply the three-way RFC 9309 s2.3 policy: parse
         it on a 2xx, drop the parser on a 4xx (unavailable means unrestricted),
         and leave it unread on a 5xx or transport error (undefined means
@@ -97,7 +96,11 @@ class URLFilter:
             # s2.3.1.2 asks crawlers to follow.
             headers = {"User-Agent": self.user_agent} if self.user_agent else None
             with httpx.Client(
-                timeout=10, follow_redirects=True, max_redirects=5
+                timeout=10,
+                follow_redirects=True,
+                max_redirects=5,
+                proxy=proxy_url,
+                trust_env=False,
             ) as client:
                 response = client.get(self.robots_url, headers=headers)
             if 200 <= response.status_code < 300:

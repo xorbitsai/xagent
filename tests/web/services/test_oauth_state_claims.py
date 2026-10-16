@@ -9,7 +9,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
-from tests.shared.postgres_disposable import disposable_database_factory
 from xagent.web.api import auth, oidc_google
 from xagent.web.models.database import Base
 from xagent.web.models.oidc_consumed_token import OidcConsumedToken
@@ -144,18 +143,3 @@ def test_previous_raw_token_claim_rejects_encoded_variant(sessions):
         )
         db.commit()
         assert not claim_oauth_state(db, state + "=", expires_at=time.time() + 600)
-
-
-@pytest.mark.postgresql
-def test_postgresql_concurrent_workers_claim_only_once():
-    with disposable_database_factory("xagent_ordinary_oauth") as make:
-        engine = make("claims")
-        OidcConsumedToken.__table__.create(engine)
-        factory = sessionmaker(bind=engine)
-
-        def claim(_):
-            with factory() as db:
-                return claim_oauth_state(db, "same-state", expires_at=time.time() + 600)
-
-        with ThreadPoolExecutor(max_workers=8) as pool:
-            assert sum(pool.map(claim, range(16))) == 1

@@ -5355,7 +5355,8 @@ def oauth_login(
     )
     if not db_provider:
         return HTMLResponse(
-            content=f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
         )
 
     # But now everything can be routed through generic
@@ -5371,12 +5372,32 @@ def oauth_callback(
     """Unified entry point for OAuth callback"""
     from ..models.oauth_provider import OAuthProvider
 
+    payload = verify_token(request.query_params.get("state", ""))
+    if (
+        payload
+        and payload.get("type") == "oauth_state"
+        and payload.get("actor_flow_nonce") is None
+        and payload.get("resource_owner_key") is None
+    ):
+        binding = payload.get("browser_nonce_hash")
+        if (
+            not isinstance(binding, str)
+            or re.fullmatch(r"[0-9a-f]{64}", binding) is None
+        ):
+            # Every current ordinary issuer binds a browser. Do not preserve
+            # an HTTP compatibility path for old unbound signed states.
+            _log_oauth_callback_rejection(provider, "state_browser_binding_required")
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
+
     db_provider = (
         db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
     )
     if not db_provider:
         return HTMLResponse(
-            content=f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
         )
 
     return generic_oauth_callback(provider, request, db, db_provider)

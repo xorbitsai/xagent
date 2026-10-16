@@ -4,6 +4,8 @@ from unittest.mock import Mock
 from urllib.parse import urlencode
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
@@ -11,6 +13,7 @@ from starlette.requests import Request
 
 from xagent.web.api import auth
 from xagent.web.models.database import Base
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.oidc_consumed_token import OidcConsumedToken
 from xagent.web.models.user import User
 
@@ -27,6 +30,27 @@ def db_session(tmp_path):
             yield db, user
     finally:
         engine.dispose()
+
+
+@pytest.fixture
+def callback_client(db_session):
+    db, _ = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="custom",
+            name="Custom",
+            client_id="client",
+            client_secret="secret",
+            auth_url="https://provider.example/authorize",
+            token_url="https://provider.example/token",
+        )
+    )
+    db.commit()
+    app = FastAPI()
+    app.include_router(auth.auth_router)
+    app.dependency_overrides[auth.get_db] = lambda: db
+    with TestClient(app) as client:
+        yield client
 
 
 def _callback(state, nonce="browser-secret", *, error=True):
@@ -114,3 +138,52 @@ def test_claim_store_outage_returns_sanitized_503_before_exchange(
     assert response.status_code == 503
     assert b"private" not in response.body
     post.assert_not_called()
+
+
+@pytest.mark.parametrize("binding", [None, "", "not-a-digest", "g" * 64, True])
+def test_public_callback_rejects_unbound_or_malformed_legacy_states(
+    callback_client, monkeypatch, binding
+):
+    delegate = Mock()
+    monkeypatch.setattr(auth, "generic_oauth_callback", delegate)
+    state = auth.create_access_token(
+        {
+            "type": "oauth_state",
+            "provider": "custom",
+            "user_id": 1,
+            "browser_nonce_hash": binding,
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    response = callback_client.get(
+        "/api/auth/custom/callback", params={"state": state, "code": "code"}
+    )
+    assert response.status_code == 400
+    assert "Invalid or expired state" in response.text
+    delegate.assert_not_called()
+
+
+def test_public_callback_checks_cookie_and_consumes_durable_state(
+    callback_client, db_session, monkeypatch
+):
+    post = Mock()
+    monkeypatch.setattr(auth.requests, "post", post)
+    state = _state()
+    request = _callback(state)
+    headers = {"Cookie": request.headers["cookie"]}
+    path = "/api/auth/custom/callback?" + request.scope["query_string"].decode()
+    assert callback_client.get(path, headers=headers).status_code == 400
+    assert db_session[0].query(OidcConsumedToken).count() == 1
+    replay = callback_client.get(path, headers=headers)
+    assert replay.status_code == 400
+    assert "Invalid or expired state" in replay.text
+    post.assert_not_called()
+
+
+def test_unknown_provider_error_escapes_request_input(db_session):
+    response = auth.oauth_callback(
+        '<img src=x onerror="alert(1)">', _callback("invalid"), db_session[0]
+    )
+    assert response.status_code == 400
+    assert b"<img" not in response.body
+    assert b"&lt;img" in response.body

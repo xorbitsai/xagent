@@ -943,6 +943,7 @@ def test_planner_catalog_login_requests_tasks_scope(db_session):
     query = parse_qs(urlparse(_location(response)).query)
     assert set(query["scope"][0].split()) == {
         "Tasks.ReadWrite",
+        "Team.ReadBasic.All",
         "User.Read",
         "offline_access",
     }

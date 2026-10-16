@@ -238,7 +238,13 @@ def test_registry_and_migration_values_match() -> None:
 
     for app_id, scopes in migration.CURRENT_SCOPES.items():
         assert rows[app_id]["provider_name"] == "microsoft"
-        assert rows[app_id]["oauth_scopes"] == list(scopes)
+        registry_scopes = rows[app_id]["oauth_scopes"]
+        if app_id == "planner":
+            # Team.ReadBasic.All was added after this frozen migration snapshot.
+            registry_scopes = [
+                scope for scope in registry_scopes if scope != "Team.ReadBasic.All"
+            ]
+        assert registry_scopes == list(scopes)
     assert {
         app_id: list(scopes) for app_id, scopes in migration.PREVIOUS_SCOPES.items()
     } == OLD_SCOPES

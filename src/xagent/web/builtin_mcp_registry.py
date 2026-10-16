@@ -805,7 +805,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "microsoft",
             "category": "Productivity",
-            "oauth_scopes": ["Tasks.ReadWrite", "offline_access"],
+            "oauth_scopes": [
+                "Tasks.ReadWrite",
+                "Team.ReadBasic.All",
+                "offline_access",
+            ],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

@@ -1594,6 +1594,7 @@ def _blocked_upload_extension(path: str) -> bool:
 
 def _is_public_upload_path(path: str) -> bool:
     """Only agent logos are safe to expose through the legacy static mount."""
+    path = path.replace(os.sep, "/")
     parts = path.split("/")
     return (
         len(parts) == 2

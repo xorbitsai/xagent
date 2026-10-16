@@ -2088,8 +2088,8 @@ async def public_download_file(
 ) -> Any:
     """Public source-download endpoint for the chat file-card 'Open' link.
 
-    Mirrors ``public_preview_file`` for resolution (UUID file id or
-    legacy cross-user path) but always returns
+    Resolves registered UUID file capabilities only, never legacy paths,
+    and always returns
     ``Content-Disposition: attachment; filename="..."`` so the browser
     saves under the source filename instead of trying to render the
     bytes inline. Used by ``InlineFilePreview`` 'Open' affordances
@@ -2171,8 +2171,7 @@ async def public_preview_file(
     db: Session = Depends(get_db),
     validation_only: bool = False,
 ) -> Any:
-    # For public preview, we need to handle both file_id and legacy paths
-    # Try UUID first
+    """Preview a registered UUID capability; legacy paths are never public."""
     file_record = None
     base_path = None
     owner_user_id = None

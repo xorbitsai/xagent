@@ -374,11 +374,15 @@ def _resolve_legacy_preview_storage_path(raw_path: str) -> Optional[tuple[Path, 
         normalized = candidate.lstrip("/")
         if not normalized:
             continue
-        glob_matches = list(get_uploads_dir().glob(f"user_*/{normalized}"))
-        if glob_matches:
-            resolved_path = glob_matches[0].resolve()
-            relative_path = str(resolved_path.relative_to(get_uploads_dir().resolve()))
-            return resolved_path, relative_path
+        # Only the user-directory prefix is a pattern. Treat the supplied
+        # path literally and reject symlinks/traversal outside the uploads root.
+        root = get_uploads_dir().resolve()
+        for user_dir in root.glob("user_*"):
+            resolved_path = (user_dir / normalized).resolve()
+            if not resolved_path.is_relative_to(user_dir.resolve()):
+                continue
+            if resolved_path.is_file() and resolved_path.is_relative_to(root):
+                return resolved_path, str(resolved_path.relative_to(root))
 
     return None
 
@@ -875,14 +879,10 @@ def _register_legacy_preview_isolated(legacy_path: str, requesting_user_id: int)
 
         owner_info = _infer_owner_from_relative_path(lookup_db, relative_path)
         if owner_info is None:
-            raise _LegacyPreviewRegistrationError(
-                "Cannot infer owner for legacy preview path"
-            )
+            raise _LegacyPreviewRegistrationError("Legacy preview target not found")
         owner_user_id, task_id = owner_info
         if owner_user_id != requesting_user_id:
-            raise _LegacyPreviewRegistrationError(
-                "Legacy preview path belongs to another user"
-            )
+            raise _LegacyPreviewRegistrationError("Legacy preview target not found")
 
     generated_file_id = _build_output_file_id(relative_path)
     scope_segments = _scope_segments_for_task(task_id)
@@ -1022,7 +1022,10 @@ async def redirect_legacy_preview(
             lambda: _register_legacy_preview_isolated(legacy_path, requesting_user_id)
         )
     except _LegacyPreviewRegistrationError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Do not disclose whether an unowned path exists or changed owners.
+        raise HTTPException(
+            status_code=404, detail="Legacy preview target not found"
+        ) from exc
 
     return RedirectResponse(
         url=f"/api/files/public/preview/{file_id}",

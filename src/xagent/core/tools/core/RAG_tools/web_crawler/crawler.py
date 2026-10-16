@@ -645,7 +645,10 @@ class WebCrawler:
             # URLFilter construction is side-effect free: robots.txt must use
             # the same egress gate, including redirects, before links are judged.
             await asyncio.to_thread(
-                self.url_filter.load_robots_txt, proxy_url, timeout=self.config.timeout
+                self.url_filter.load_robots_txt,
+                proxy_url,
+                timeout=self.config.timeout,
+                is_denied=proxy.is_denied,
             )
             sessions: Dict[Optional[str], Any] = {}
             cffi_session_cls: Any = None
@@ -882,10 +885,7 @@ class WebCrawler:
     def _check_egress_policy(self, url: str) -> None:
         # Only our local proxy's state is authoritative. An origin can choose
         # any HTTP status/reason, including the proxy's policy-denial text.
-        if (
-            self._egress_proxy
-            and urlsplit(url).hostname in self._egress_proxy.denied_hosts
-        ):
+        if self._egress_proxy and self._egress_proxy.is_denied(url):
             raise PublicNetworkPolicyError(
                 "Public-network egress policy denied a target"
             )
@@ -1155,10 +1155,14 @@ class WebCrawler:
 
                 return result, valid_links
 
+            except PublicNetworkPolicyError as e:
+                error_msg = f"Blocked by public-network egress policy: {e}"
+                logger.warning("Failed to crawl %s: %s", url, error_msg)
+                self.failed_urls[url] = error_msg
+                return None, set()
             except Exception as e:
-                # Network/protocol errors are already swallowed inside
-                # _fetch_with_fallback; this catches errors from text decode,
-                # content cleaning, link extraction etc.
+                # Retryable fetch errors are handled by _fetch_with_fallback;
+                # this catches decode, cleaning and extraction failures.
                 error_msg = f"Unexpected error: {str(e)}"
                 logger.error("Failed to crawl %s: %s", url, error_msg)
                 self.failed_urls[url] = error_msg

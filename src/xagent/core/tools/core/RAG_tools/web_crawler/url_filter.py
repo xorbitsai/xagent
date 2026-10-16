@@ -5,7 +5,7 @@ Provides URL validation, filtering, and normalization functionality.
 
 import logging
 import re
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
@@ -79,11 +79,19 @@ class URLFilter:
                 logger.warning("Failed to initialize robots.txt parser: %s", e)
                 self.robots_parser = None
 
-    def load_robots_txt(self, proxy_url: str, *, timeout: float = 10) -> None:
+    def load_robots_txt(
+        self,
+        proxy_url: str,
+        *,
+        timeout: float = 10,
+        is_denied: Callable[[str], bool] | None = None,
+    ) -> None:
         """Fetch robots.txt and apply the three-way RFC 9309 s2.3 policy: parse
         it on a 2xx, drop the parser on a 4xx (unavailable means unrestricted),
         and leave it unread on a 5xx or transport error (undefined means
-        complete disallow)."""
+        complete disallow). With PublicNetworkEgressProxy, supply its is_denied
+        predicate so local refusals cannot be confused with origin responses.
+        """
         import httpx
 
         if not self.robots_url:
@@ -110,15 +118,16 @@ class URLFilter:
                 verify=build_ca_bundle_ssl_context(),
             ) as client:
                 response = client.get(self.robots_url, headers=headers)
+            if is_denied and is_denied(str(response.url)):
+                logger.warning("robots.txt blocked by local egress policy")
+                return
             if 200 <= response.status_code < 300:
                 self.robots_parser.parse(response.text.splitlines())
                 logger.info("Loaded robots.txt from %s", self.robots_url)
-            elif (
-                400 <= response.status_code < 500
-                and response.status_code != 429
-                and getattr(response, "reason_phrase", "")
-                != "Public Network Policy Denied"
-            ):
+            elif 400 <= response.status_code < 500 and response.status_code not in {
+                407,
+                429,
+            }:
                 # RFC 9309 s2.3.1.3: unavailable means the crawler may access
                 # anything. Dropping the parser is what expresses that - keeping
                 # an unread RobotFileParser makes can_fetch() deny every URL,
@@ -127,8 +136,8 @@ class URLFilter:
                 # to that deny-all state instead: s2.3.1.4 makes an undefined
                 # robots.txt a complete disallow. s2.3.1.3 judges by meaning
                 # ("the resource is unavailable") and only cites 400-499 as an
-                # example, so 429 is excluded: a server asking us to slow down
-                # has not said it has no rules.
+                # example, so proxy-authentication errors (407) and throttling
+                # (429) are excluded: neither says the site has no rules.
                 self.robots_parser = None
                 logger.info(
                     "No robots.txt restrictions from %s (HTTP %s)",

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import logging
+import secrets
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -27,6 +28,8 @@ class PublicNetworkEgressProxy:
     proxy closes that TOCTOU gap: the proxy validates the hostname, connects
     directly to one of the validated public IPs, and then tunnels the original
     TLS/WebSocket handshake without changing its Host header or SNI.
+    Upstream-backed gates require per-instance authentication; keep the URL
+    returned by start() private. Direct browser gates carry no upstream identity.
     """
 
     def __init__(
@@ -40,6 +43,11 @@ class PublicNetworkEgressProxy:
         self._closing = False
         self._client_tasks: set[asyncio.Task[Any]] = set()
         self._responses_started: set[asyncio.StreamWriter] = set()
+        self._username = secrets.token_urlsafe(16)
+        self._password = secrets.token_urlsafe(16)
+        self._auth_token = base64.b64encode(
+            f"{self._username}:{self._password}".encode()
+        )
         self.denied_hosts: set[str] = set()
         self.connect_timeout = connect_timeout
         self.response_timeout = response_timeout
@@ -52,6 +60,17 @@ class PublicNetworkEgressProxy:
             or self._upstream.fragment
         ):
             raise ValueError("Trusted upstream proxy must be an HTTP(S) proxy URL")
+        if self._upstream and self._upstream.port == 0:
+            raise ValueError("Trusted upstream proxy port must be positive")
+        self._upstream_ssl = (
+            build_ca_bundle_ssl_context()
+            if self._upstream and self._upstream.scheme == "https"
+            else None
+        )
+
+    def is_denied(self, url: str) -> bool:
+        """Report this gate's policy refusals, independent of origin headers."""
+        return urlsplit(url).hostname in self.denied_hosts
 
     async def _resolve(self, url: str) -> list[str]:
         try:
@@ -60,6 +79,7 @@ class PublicNetworkEgressProxy:
             hostname = urlsplit(url).hostname
             if hostname:
                 self.denied_hosts.add(hostname)
+            logger.warning("Public-network egress policy denied host %r", hostname)
             raise PublicNetworkPolicyError(str(exc)) from exc
 
     async def start(self) -> str:
@@ -74,7 +94,8 @@ class PublicNetworkEgressProxy:
         )
         socket = self._server.sockets[0]
         port = socket.getsockname()[1]
-        return f"http://127.0.0.1:{port}"
+        credentials = f"{self._username}:{self._password}@" if self._upstream else ""
+        return f"http://{credentials}127.0.0.1:{port}"
 
     async def close(self) -> None:
         self._closing = True
@@ -82,8 +103,6 @@ class PublicNetworkEgressProxy:
         # queued by the event loop must also see _closing and exit without I/O.
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
-            self._server = None
         tasks = list(self._client_tasks)
         for task in tasks:
             if not task.done():
@@ -91,6 +110,11 @@ class PublicNetworkEgressProxy:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._client_tasks.clear()
+        # Python 3.12+ waits for accepted connections too: cancel/close their
+        # handlers before awaiting this, especially for long-lived CONNECTs.
+        if self._server is not None:
+            await self._server.wait_closed()
+            self._server = None
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -98,6 +122,7 @@ class PublicNetworkEgressProxy:
         task = asyncio.current_task()
         if task is not None:
             self._client_tasks.add(task)
+        request_started = False
         try:
             if self._closing:
                 return
@@ -105,6 +130,14 @@ class PublicNetworkEgressProxy:
                 reader.readuntil(b"\r\n\r\n"), self.connect_timeout
             )
             method, target, version, headers = self._parse_request(header)
+            scheme, _, token = headers.get("proxy-authorization", "").partition(" ")
+            if self._upstream and (
+                scheme.lower() != "basic"
+                or not secrets.compare_digest(token.encode("latin-1"), self._auth_token)
+            ):
+                await self._send_error(writer, 407, "Proxy Authentication Required")
+                return
+            request_started = True
             if method.upper() == "CONNECT":
                 await self._handle_connect(reader, writer, target)
             else:
@@ -114,12 +147,13 @@ class PublicNetworkEgressProxy:
         except asyncio.CancelledError:
             raise
         except PublicNetworkPolicyError:
-            logger.warning("Public-network egress policy denied a target")
             if writer not in self._responses_started:
                 await self._send_error(writer, 403, "Public Network Policy Denied")
         except Exception as exc:
-            logger.info(
-                "Public-network egress transport failed: %s", type(exc).__name__
+            logger.log(
+                logging.INFO if request_started else logging.DEBUG,
+                "Public-network egress transport failed: %s",
+                type(exc).__name__,
             )
             if writer not in self._responses_started:
                 await self._send_error(writer, 502, "Bad Gateway")
@@ -199,8 +233,6 @@ class PublicNetworkEgressProxy:
         websocket = scheme == "ws"
         if scheme == "ws":
             scheme = "http"
-        elif scheme == "wss":
-            scheme = "https"
         if scheme not in {"http", "https"} or parsed.hostname is None:
             raise ValueError("proxy only accepts HTTP(S) targets")
         if scheme == "https":
@@ -332,21 +364,25 @@ class PublicNetworkEgressProxy:
             await client_writer.drain()
         response_headers: list[bytes] = []
         content_length: int | None = None
-        chunked = False
+        chunked = any(
+            line.partition(b":")[0].lower().strip() == b"transfer-encoding"
+            and line.partition(b":")[2].lower().split(b",")[-1].strip() == b"chunked"
+            for line in lines[1:]
+        )
         for line in lines[1:]:
             name, _, value = line.partition(b":")
             normalized_name = name.lower().strip()
             if normalized_name in {b"connection", b"proxy-connection", b"keep-alive"}:
                 continue
             if normalized_name == b"content-length":
+                if chunked:
+                    continue
                 try:
                     content_length = int(value.strip())
                 except ValueError as exc:
                     raise ValueError("invalid upstream Content-Length") from exc
                 if content_length < 0:
                     raise ValueError("invalid upstream Content-Length")
-            elif normalized_name == b"transfer-encoding":
-                chunked = value.strip().lower() == b"chunked"
             response_headers.append(line)
         response_headers.append(b"Connection: close")
         self._responses_started.add(client_writer)
@@ -431,7 +467,7 @@ class PublicNetworkEgressProxy:
         reader, writer = await asyncio.open_connection(
             upstream.hostname,
             upstream.port or (443 if upstream.scheme == "https" else 80),
-            ssl=build_ca_bundle_ssl_context() if upstream.scheme == "https" else None,
+            ssl=self._upstream_ssl,
             limit=_PROXY_HEADER_LIMIT,
         )
         try:
@@ -449,13 +485,27 @@ class PublicNetworkEgressProxy:
                 )
             )
             await writer.drain()
-            header = await reader.readuntil(b"\r\n\r\n")
-            if header.split(b"\r\n", 1)[0].split(b" ")[1] != b"200":
+            try:
+                header = await reader.readuntil(b"\r\n\r\n")
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError) as exc:
+                raise OSError("Incomplete upstream CONNECT reply") from exc
+            status = header.split(b"\r\n", 1)[0].split(b" ", 2)
+            if (
+                len(status) < 2
+                or status[0] not in {b"HTTP/1.0", b"HTTP/1.1"}
+                or len(status[1]) != 3
+                or not status[1].isdigit()
+            ):
+                raise OSError("Malformed upstream CONNECT reply")
+            if status[1] != b"200":
                 raise OSError("Trusted upstream proxy refused CONNECT")
             return reader, writer
         except BaseException:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
             raise
 
     @staticmethod
@@ -464,10 +514,17 @@ class PublicNetworkEgressProxy:
     ) -> None:
         if writer.is_closing():
             return
+        authenticate = (
+            'Proxy-Authenticate: Basic realm="xagent-egress"\r\n'
+            if status == 407
+            else ""
+        )
         writer.write(
-            f"HTTP/1.1 {status} {reason}\r\n"
-            "Connection: close\r\n"
-            "Content-Length: 0\r\n\r\n".encode("ascii")
+            (
+                f"HTTP/1.1 {status} {reason}\r\n"
+                "Connection: close\r\n"
+                f"{authenticate}Content-Length: 0\r\n\r\n"
+            ).encode("ascii")
         )
         try:
             await writer.drain()
@@ -502,8 +559,3 @@ class PublicNetworkEgressProxy:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            remote_writer.close()
-            try:
-                await remote_writer.wait_closed()
-            except Exception:
-                pass

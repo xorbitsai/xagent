@@ -286,10 +286,11 @@ class TestRobotsTxtAvailability:
         f = self._filter_with_robots_response(monkeypatch, error=error)
         assert f.should_crawl("https://example.com/docs/intro") is False
 
-    def test_429_blocks_the_crawl(self, monkeypatch):
+    @pytest.mark.parametrize("status", [407, 429])
+    def test_proxy_auth_or_throttling_blocks_the_crawl(self, monkeypatch, status):
         """s2.3.1.3 judges by meaning, not by status class: a server asking us
         to slow down has not said it has no rules."""
-        f = self._filter_with_robots_response(monkeypatch, _FakeResponse(429))
+        f = self._filter_with_robots_response(monkeypatch, _FakeResponse(status))
         assert f.should_crawl("https://example.com/docs/intro") is False
 
     @pytest.mark.parametrize("first_status", [200, 404])

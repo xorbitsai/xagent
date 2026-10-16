@@ -5,6 +5,7 @@ import subprocess
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -584,7 +585,8 @@ class TestWebCrawler:
 
         def make_session(impersonate=None, **kwargs):
             assert kwargs["trust_env"] is False
-            assert kwargs["proxy"].startswith("http://127.0.0.1:")
+            gate = urlsplit(kwargs["proxy"])
+            assert gate.hostname == "127.0.0.1"
             assert kwargs["curl_options"] == {
                 10177: "",
                 10318: "http,https",

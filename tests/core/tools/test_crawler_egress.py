@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import logging
 import ssl
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import urlsplit
@@ -243,7 +244,10 @@ async def test_mid_response_timeout_never_appends_another_response(
     )
     request = asyncio.StreamReader()
     request.feed_data(
-        b"GET http://public.example/ HTTP/1.1\r\nHost: public.example\r\n\r\n"
+        b"GET http://public.example/ HTTP/1.1\r\nHost: public.example\r\n"
+        + b"Proxy-Authorization: Basic "
+        + proxy._auth_token
+        + b"\r\n\r\n"
     )
     client = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
     client.is_closing.return_value = False
@@ -355,7 +359,7 @@ async def test_proxy_stops_accepting_before_cancelling_active_clients(monkeypatc
     _, client = await asyncio.open_connection(url.hostname, url.port)
     try:
         await asyncio.wait_for(accepted.wait(), 1)
-        await proxy.close()
+        await asyncio.wait_for(proxy.close(), 1)
         assert cancelled == [False]
         assert not proxy._client_tasks
     finally:
@@ -428,10 +432,7 @@ async def test_trusted_upstream_tunnels_validated_ip_with_isolated_credentials(
     local_url = await proxy.start()
     try:
         async with httpx.AsyncClient(proxy=local_url, trust_env=False) as client:
-            response = await client.get(
-                "http://public.example/path",
-                headers={"Proxy-Authorization": "do-not-forward"},
-            )
+            response = await client.get("http://public.example/path")
         assert response.text == "ok"
         assert (
             received[0]
@@ -465,7 +466,9 @@ async def test_sessions_share_gate_and_honor_ca_and_trusted_proxy(monkeypatch):
     load = MagicMock()
     monkeypatch.setattr(crawler.url_filter, "load_robots_txt", load)
     async with crawler._open_sessions(None):
-        load.assert_called_once_with("http://local-gate:1234", timeout=37)
+        load.assert_called_once_with(
+            "http://local-gate:1234", timeout=37, is_denied=proxy.is_denied
+        )
         kwargs = client_factory.call_args.kwargs
         assert kwargs["proxy"] == "http://local-gate:1234"
         assert kwargs["trust_env"] is False
@@ -485,11 +488,15 @@ def test_robots_policy_denial_stays_closed_and_preserves_ca(monkeypatch):
     monkeypatch.setattr(module, "build_ca_bundle_ssl_context", lambda: context)
     client = MagicMock()
     client.return_value.__enter__.return_value.get.return_value = httpx.Response(
-        403, extensions={"reason_phrase": b"Public Network Policy Denied"}
+        403, request=httpx.Request("GET", "https://example.com/robots.txt")
     )
     monkeypatch.setattr(httpx, "Client", client)
     filter = URLFilter("https://example.com")
-    filter.load_robots_txt("http://local-gate:1234", timeout=37)
+    filter.load_robots_txt(
+        "http://local-gate:1234",
+        timeout=37,
+        is_denied=lambda url: url == "https://example.com/robots.txt",
+    )
     assert not filter.is_allowed("https://example.com/docs")
     assert client.call_args.kwargs == dict(
         timeout=37,
@@ -499,6 +506,120 @@ def test_robots_policy_denial_stays_closed_and_preserves_ca(monkeypatch):
         trust_env=False,
         verify=context,
     )
+
+
+def test_origin_robots_reason_phrase_is_not_authoritative(monkeypatch):
+    client = MagicMock()
+    client.return_value.__enter__.return_value.get.return_value = httpx.Response(
+        404,
+        request=httpx.Request("GET", "https://example.com/robots.txt"),
+        extensions={"reason_phrase": b"Public Network Policy Denied"},
+    )
+    monkeypatch.setattr(httpx, "Client", client)
+    filter = URLFilter("https://example.com")
+    filter.load_robots_txt("http://local-gate:1234", is_denied=lambda url: False)
+    assert filter.is_allowed("https://example.com/docs")
+
+
+@pytest.mark.parametrize("fingerprint", [None, "test-curl"])
+async def test_manual_redirect_relative_missing_location_and_limit(
+    monkeypatch, fingerprint
+):
+    validate = AsyncMock(return_value=["93.184.216.34"])
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.web_crawler.crawler.validate_public_http_url",
+        validate,
+    )
+    crawler = WebCrawler(WebCrawlConfig(start_url="https://public.example/dir/start"))
+    client = AsyncMock()
+    client.get.side_effect = [
+        httpx.Response(302, headers={"Location": "../next"}),
+        httpx.Response(200),
+    ]
+    result = await crawler._get_public_response(
+        client, fingerprint, crawler.config.start_url
+    )
+    assert result.status_code == 200
+    assert [call.args[0] for call in client.get.await_args_list] == [
+        "https://public.example/dir/start",
+        "https://public.example/next",
+    ]
+    assert validate.await_count == 2
+    client.get.reset_mock(side_effect=True)
+    client.get.return_value = httpx.Response(302)
+    assert (
+        await crawler._get_public_response(
+            client, fingerprint, crawler.config.start_url
+        )
+    ).status_code == 302
+    client.get.assert_awaited_once()
+    client.get.reset_mock()
+    client.get.return_value = httpx.Response(302, headers={"Location": "/again"})
+    with pytest.raises(ValueError, match="redirect limit"):
+        await crawler._get_public_response(
+            client, fingerprint, crawler.config.start_url
+        )
+    assert client.get.await_count == 6
+
+
+async def test_page_policy_denial_has_explicit_warning_and_failed_reason(
+    monkeypatch, caplog
+):
+    crawler = WebCrawler(WebCrawlConfig(start_url="https://public.example"))
+    monkeypatch.setattr(
+        crawler,
+        "_fetch_with_fallback",
+        AsyncMock(side_effect=PublicNetworkPolicyError("private target")),
+    )
+    with caplog.at_level(logging.WARNING):
+        result, links = await crawler._crawl_page(
+            {}, crawler.config.start_url, 0, asyncio.Semaphore(1)
+        )
+    assert result is None and not links
+    assert crawler.failed_urls[crawler.config.start_url].startswith(
+        "Blocked by public-network egress policy:"
+    )
+    assert "Unexpected error" not in caplog.text
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+@pytest.mark.parametrize("outcome", ["exception", "cancelled", "setup-error"])
+async def test_proxy_and_sessions_close_on_setup_failure_or_interrupted_crawl(
+    monkeypatch, outcome
+):
+    from xagent.core.tools.core.RAG_tools.web_crawler import crawler as module
+
+    proxy = PublicNetworkEgressProxy()
+    monkeypatch.setattr(module, "PublicNetworkEgressProxy", lambda **kwargs: proxy)
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    if outcome == "setup-error":
+        client.__aenter__.side_effect = RuntimeError("setup failed")
+    monkeypatch.setattr(httpx, "AsyncClient", MagicMock(return_value=client))
+    crawler = WebCrawler(
+        WebCrawlConfig(start_url="https://example.com", respect_robots_txt=False)
+    )
+    ready = asyncio.Event()
+
+    async def crawl():
+        async with crawler._open_sessions(None):
+            ready.set()
+            if outcome == "exception":
+                raise RuntimeError("crawl failed")
+            await asyncio.Future()
+
+    task = asyncio.create_task(crawl())
+    if outcome == "cancelled":
+        await asyncio.wait_for(ready.wait(), 1)
+        task.cancel()
+    with pytest.raises(
+        asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+    ):
+        await task
+    assert proxy._server is None and not proxy._client_tasks
+    assert crawler._egress_proxy is None
+    if outcome != "setup-error":
+        client.__aexit__.assert_awaited_once()
 
 
 @pytest.mark.parametrize("fingerprint", [None, "chrome116"])
@@ -563,6 +684,7 @@ async def test_real_tls_through_trusted_chain_preserves_host_sni_and_ca(
     origin_port = origin_server.sockets[0].getsockname()[1]
 
     async def upstream(reader, writer):
+        remote_writer = None
         try:
             tunnels.append(await reader.readuntil(b"\r\n\r\n"))
             remote_reader, remote_writer = await asyncio.open_connection(
@@ -574,6 +696,9 @@ async def test_real_tls_through_trusted_chain_preserves_host_sni_and_ca(
                 reader, writer, remote_reader, remote_writer
             )
         finally:
+            if remote_writer is not None:
+                remote_writer.close()
+                await remote_writer.wait_closed()
             writer.close()
             await writer.wait_closed()
 

@@ -2927,6 +2927,34 @@ def _private_websocket_task_access_sync(
         return "foreign"
 
 
+# The frontend ``use-websocket`` hook declares a connection dead after 30 s
+# without a frame (``DEAD_AFTER_MS``); the heartbeat must fit into that at
+# least twice.
+HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+
+async def _run_chat_heartbeat(websocket: WebSocket, task_id: int) -> None:
+    """Send heartbeats from a task of its own, independent of the read loop.
+
+    A failed send ends the task quietly. Any other exception is logged here
+    with its traceback and also ends the task; the read loop keeps serving.
+    """
+    try:
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await manager.send_personal_message({"type": "heartbeat"}, websocket)
+    except (
+        BrokenResourceError,
+        ClosedResourceError,
+        ConnectionError,
+        WebSocketDisconnect,
+        RuntimeError,
+    ):
+        return
+    except Exception:
+        logger.warning("Chat heartbeat stopped for task %s", task_id, exc_info=True)
+
+
 @ws_router.websocket("/ws/chat/{task_id}")
 async def websocket_chat_endpoint(
     websocket: WebSocket,
@@ -2977,7 +3005,21 @@ async def websocket_chat_endpoint(
     # before the first message is ever parsed.
     dispatching = "websocket initial status request"
 
+    heartbeat_task: Optional["asyncio.Task[None]"] = None
     try:
+        # Exactly one ``liveness=heartbeat`` asks for heartbeats. Acknowledge
+        # before the status snapshot and the first heartbeat; a registered
+        # socket may already have received a task broadcast, which the client
+        # tolerates.
+        if websocket.query_params.getlist("liveness") == ["heartbeat"]:
+            await manager.send_personal_message(
+                {"type": "connection_capabilities", "capabilities": ["heartbeat"]},
+                websocket,
+            )
+            heartbeat_task = asyncio.create_task(
+                _run_chat_heartbeat(websocket, task_id)
+            )
+
         # Send initial state
         await handle_status_request(websocket, task_id, user)
 
@@ -3045,7 +3087,18 @@ async def websocket_chat_endpoint(
         logger.error(f"Unexpected error in WebSocket: {e}")
         raise
     finally:
-        manager.disconnect(websocket)
+        try:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                (result,) = await asyncio.gather(heartbeat_task, return_exceptions=True)
+                if result is not None and not isinstance(
+                    result, asyncio.CancelledError
+                ):
+                    logger.warning(
+                        "Chat heartbeat failed for task %s: %r", task_id, result
+                    )
+        finally:
+            manager.disconnect(websocket)
 
 
 async def handle_intervention(

@@ -1445,7 +1445,13 @@ async def watchdog_check_once(
             input_required_frame(task_id, snapshot.pending_question)
         )
     if status is TaskStatus.PAUSED:
-        # SDK wait() semantics: PAUSED keeps waiting, doesn't close.
+        # SDK wait() semantics: PAUSED keeps waiting, doesn't close, because
+        # the task can still be resumed. A status-only caller's task whose
+        # automatic resume stopped for good, with nothing queued, is reported
+        # by the snapshot reader as FAILED (``status_only_terminal_view``) and
+        # closes the stream with ``task.completed`` on the next watchdog
+        # cycle; one a person cancelled or paused, or with a command queued,
+        # still arrives here as PAUSED.
         # A "was this paused by an orphaned process?" check was considered
         # and rejected: a normal pause and an orphaned one leave identical
         # values in every lease-tracking column (runner id, lease
@@ -1454,7 +1460,8 @@ async def watchdog_check_once(
         # so they only measure how long ago the pause happened, not
         # whether anyone is still managing it. Closing on that signal
         # would kill legitimately paused streams too. The 1-hour absolute
-        # cap is what actually bounds an orphaned paused stream's lifetime.
+        # cap is what bounds the lifetime of a paused stream nothing
+        # resumes or stops.
         sink.enqueue_status(status.value)
         return False
     return False  # pending/running: keep streaming

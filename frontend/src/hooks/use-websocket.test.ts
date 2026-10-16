@@ -1,10 +1,15 @@
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { useLayoutEffect } from "react"
-import { act, renderHook, waitFor } from "@testing-library/react"
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
+  DEAD_AFTER_MS,
   MessageDeliveryError,
+  type ConnectionPhaseFacts,
   type WebSocketConnection,
+  deriveConnectionPhase,
   useWebSocket,
 } from "./use-websocket"
 import { refreshStoredAccessToken } from "@/lib/api-wrapper"
@@ -124,6 +129,10 @@ function writeAuthCache(
     refreshExpiresAt: refreshExpiresIn ? now + refreshExpiresIn * 1000 : undefined,
   }))
 }
+
+// Hooks left mounted keep their real reconnect timers and would open sockets
+// into a later test's MockWebSocket.instances.
+afterEach(() => cleanup())
 
 describe("useWebSocket message delivery", () => {
   beforeEach(() => {
@@ -804,7 +813,10 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
-  it("rejects an unacknowledged delivery after 30 seconds", async () => {
+  it.each([
+    ["retires the connection when nothing at all arrives", false],
+    ["keeps the connection when any frame but no acknowledgement arrives", true],
+  ] as const)("%s for 30 seconds after a send", async (_name, frameAfterSend) => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 1,
@@ -818,14 +830,19 @@ describe("useWebSocket message delivery", () => {
     try {
       const delivery = result.current.sendChatMessage("timeout draft")
       const rejection = expect(delivery).rejects.toMatchObject({
-        message: "Message delivery was not acknowledged. Your draft was kept.",
+        message: frameAfterSend
+          ? "Message delivery was not acknowledged. Your draft was kept."
+          : "Connection lost before the message was accepted.",
         disposition: "outcome_unknown",
         errorCode: "message_outcome_unknown",
       })
+      if (frameAfterSend) act(() => socket.receive({ type: "heartbeat" }))
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
       await rejection
+      expect(socket.close.mock.calls).toEqual(frameAfterSend ? [] : [[1000, "Connection liveness timeout"]])
+      expect(result.current.connectionPhase).toBe(frameAfterSend ? "connected" : "reconnecting")
     } finally {
       vi.useRealTimers()
     }
@@ -917,7 +934,7 @@ describe("useWebSocket normalized connections", () => {
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
-    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?token=token")
+    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?token=token&liveness=heartbeat")
     expect(MockWebSocket.instances[0].protocols).toBeUndefined()
   })
 
@@ -1199,6 +1216,7 @@ describe("useWebSocket normalized connections", () => {
       first.catch(() => {})
       expect(JSON.parse(socket.send.mock.calls[0][0]).context)
         .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({ type: "status_update" }))
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
@@ -1245,6 +1263,7 @@ describe("useWebSocket normalized connections", () => {
       first.catch(() => {})
       expect(JSON.parse(socket.send.mock.calls[0][0]).context)
         .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({ type: "status_update" }))
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
@@ -1291,6 +1310,7 @@ describe("useWebSocket normalized connections", () => {
       first.catch(() => {})
       expect(JSON.parse(socket.send.mock.calls[0][0]).context)
         .toEqual({ timezone: "Australia/Melbourne" })
+      act(() => socket.receive({ type: "status_update" }))
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
@@ -1750,6 +1770,7 @@ describe("useWebSocket normalized connections", () => {
   })
 
   it("keeps legacy auth refresh, retry, pause, resume, and status behavior", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     authState.refreshAccessToken.mockResolvedValue(false)
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -1865,12 +1886,12 @@ describe("useWebSocket normalized connections", () => {
       url: "ws://localhost",
       taskId: 1,
       token: "token",
-    }, "ws://localhost/ws/chat/1?token=token"],
+    }, "ws://localhost/ws/chat/1?token=token&liveness=heartbeat"],
     ["an explicit empty legacy token", {
       url: "ws://localhost",
       taskId: 1,
       token: "",
-    }, "ws://localhost/ws/chat/1"],
+    }, "ws://localhost/ws/chat/1?liveness=heartbeat"],
     ["an explicit Session descriptor", {
       connection: sessionConnection(),
     }, "wss://embed.example/v1/external/chat/sessions/ws"],
@@ -1916,7 +1937,7 @@ describe("useWebSocket normalized connections", () => {
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const oldSocket = MockWebSocket.instances[0]
-    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?token=old-auth-token")
+    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?token=old-auth-token&liveness=heartbeat")
     act(() => oldSocket.open())
     vi.useFakeTimers()
 
@@ -1928,7 +1949,7 @@ describe("useWebSocket normalized connections", () => {
     hook.rerender()
     expect(MockWebSocket.instances).toHaveLength(2)
     const refreshedSocket = MockWebSocket.instances[1]
-    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?token=new-auth-token")
+    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?token=new-auth-token&liveness=heartbeat")
     act(() => refreshedSocket.open())
 
     await act(async () => {
@@ -2788,6 +2809,7 @@ describe("useWebSocket normalized connections", () => {
   })
 
   it("resets the transport reconnect delay after explicit disconnect without resetting auth refresh", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     vi.useFakeTimers()
@@ -2808,6 +2830,7 @@ describe("useWebSocket normalized connections", () => {
   })
 
   it("does not suppress a retry for an arbitrary close reason", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.5)
     const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     vi.useFakeTimers()
@@ -3618,5 +3641,357 @@ describe("useWebSocket normalized connections", () => {
 
     expect(oldSocket.send).not.toHaveBeenCalled()
     await rejection
+  })
+
+  describe("dead-connection detection and reconnect", () => {
+    const ACK = { type: "connection_capabilities", capabilities: ["heartbeat"] }
+    const HEARTBEAT = { type: "heartbeat" }
+
+    // Synchronous on purpose: React's async act helper draws from Math.random,
+    // which would consume the values the jitter tests pin.
+    const advance = (ms: number) => act(() => {
+      vi.advanceTimersByTime(ms)
+    })
+    const socketAt = (index: number) => MockWebSocket.instances[index]
+    const expectReconnectAfter = (delay: number, margin = 1) => {
+      const count = MockWebSocket.instances.length
+      advance(delay - margin)
+      expect(MockWebSocket.instances).toHaveLength(count)
+      advance(margin)
+      expect(MockWebSocket.instances).toHaveLength(count + 1)
+    }
+    const mountChat = (extra: Record<string, unknown> = {}) => renderHook(
+      (props: Record<string, unknown>) => useWebSocket({
+        url: "ws://localhost",
+        taskId: 7,
+        ...extra,
+        ...props,
+      }),
+      { initialProps: {} as Record<string, unknown> },
+    )
+
+    beforeEach(() => {
+      vi.useFakeTimers()
+    })
+
+    it("keeps the widget.js stable window at twice the dead threshold", () => {
+      const widgetScript = readFileSync(resolve(process.cwd(), "public/widget.js"), "utf8")
+      const stableWindow = Number(/var SESSION_STABLE_CONNECTION_MS = (\d+);/.exec(widgetScript)?.[1])
+      expect(stableWindow).toBe(2 * DEAD_AFTER_MS)
+    })
+
+    describe("dead rule", () => {
+      it.each([
+        ["a heartbeat frame", (socket: MockWebSocket) => socket.receive(HEARTBEAT)],
+        ["a frame that failed to parse", (socket: MockWebSocket) => socket.onmessage?.({ data: "{not json" } as MessageEvent)],
+      ] as const)("keeps the connection 29,999 ms after %s", (_name, sendFrame) => {
+        vi.spyOn(console, "error").mockImplementation(() => {})
+        const hook = mountChat()
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => socket.receive(ACK))
+        advance(15_000)
+        act(() => sendFrame(socket))
+
+        advance(29_999)
+
+        expect(socket.close).not.toHaveBeenCalled()
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
+
+      it("retires at 30,000 ms, reports the stream as unavailable, and hides liveness frames", () => {
+        const onMessage = vi.fn()
+        const hook = mountChat({ onMessage })
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => {
+          socket.receive(ACK)
+          socket.receive({ type: "trace_event", task_id: 7, stream_run_id: "run-1", data: {} })
+          socket.receive(HEARTBEAT)
+        })
+
+        advance(30_000)
+
+        expect(socket.close).toHaveBeenCalledWith(1000, "Connection liveness timeout")
+        expect(hook.result.current.isConnected).toBe(false)
+        const types = onMessage.mock.calls.map(([message]) => message.type)
+        expect(types).not.toContain("connection_capabilities")
+        expect(types).not.toContain("heartbeat")
+        expect(onMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "stream_unavailable", task_id: 7 }))
+      })
+
+      it.each([
+        ["no capability array", "heartbeat"],
+        ["other capabilities", ["other"]],
+      ])("does not enable the rule when the acknowledgement lists %s", (_name, capabilities) => {
+        const hook = mountChat()
+        const socket = socketAt(0)
+        act(() => socket.open())
+        act(() => socket.receive({ type: "connection_capabilities", capabilities }))
+
+        advance(120_000)
+
+        expect(socket.close).not.toHaveBeenCalled()
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
+    })
+
+    it("reconnect chain backs off and gives up", () => {
+      const random = vi.spyOn(Math, "random")
+        .mockReturnValueOnce(0)
+        .mockReturnValueOnce(0.9999)
+        .mockReturnValue(0.5)
+      const hook = mountChat()
+      const phase = () => hook.result.current.connectionPhase
+      const first = socketAt(0)
+      act(() => first.open())
+      act(() => first.receive(ACK))
+      expect(phase()).toBe("connected")
+
+      act(() => first.triggerClose(1006))
+      // Only the retry timer remains: the dead-connection timer is gone.
+      expect(vi.getTimerCount()).toBe(1)
+      expect(phase()).toBe("reconnecting")
+      expectReconnectAfter(800)
+      expect(phase()).toBe("reconnecting")
+
+      // Reconnects fail by error, handshake timeout, 1006, error, timeout.
+      act(() => socketAt(1).triggerError())
+      expect(phase()).toBe("reconnecting")
+      expectReconnectAfter(2_400, 2)
+
+      advance(9_998)
+      expect(phase()).toBe("reconnecting")
+      advance(2)
+      expect(phase()).toBe("reconnecting")
+      expectReconnectAfter(4_000, 2)
+
+      act(() => socketAt(3).triggerClose(1006))
+      expectReconnectAfter(8_000)
+
+      act(() => socketAt(4).triggerError())
+      expectReconnectAfter(15_000)
+      expect(phase()).toBe("reconnecting")
+
+      advance(10_000)
+      expect(phase()).toBe("lost")
+      advance(60_000)
+      expect(MockWebSocket.instances).toHaveLength(6)
+      expect(vi.getTimerCount()).toBe(0)
+      expect(random).toHaveBeenCalledTimes(5)
+    })
+
+    describe("first connection failures end in lost", () => {
+      it.each([
+        ["a transport error", (socket: MockWebSocket) => socket.triggerError()],
+        ["a handshake timeout", () => vi.advanceTimersByTime(10_000)],
+      ] as const)("does not retry a first connection that fails with %s", (_name, fail) => {
+        const hook = mountChat()
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+
+        act(() => {
+          fail(socketAt(0))
+        })
+        advance(60_000)
+
+        expect(MockWebSocket.instances).toHaveLength(1)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("does not carry the previous task's opened key to a newly selected task", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        act(() => socketAt(0).triggerClose(1006))
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+
+        hook.rerender({ taskId: 8 })
+        expect(MockWebSocket.instances).toHaveLength(2)
+        act(() => socketAt(1).triggerError())
+        advance(60_000)
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("reconnects an opened connection that only reports a transport error", () => {
+        vi.spyOn(Math, "random").mockReturnValue(0.5)
+        mountChat()
+        act(() => socketAt(0).open())
+        act(() => socketAt(0).triggerError())
+        expectReconnectAfter(1_000)
+      })
+    })
+
+    it.each([
+      ["a heartbeat connection with frames spanning 29,999 ms", true, 29_999, 2_000],
+      ["a heartbeat connection with frames spanning 30,000 ms", true, 30_000, 1_000],
+      ["a connection without heartbeat open for 29,999 ms", false, 29_999, 2_000],
+      ["a connection without heartbeat open for 30,000 ms", false, 30_000, 1_000],
+    ] as const)("budget reset rules: resets the count for %s", (_name, heartbeat, span, expectedDelay) => {
+      vi.spyOn(Math, "random").mockReturnValue(0.5)
+      mountChat()
+      // Spend one budget slot on an opened key.
+      act(() => socketAt(0).open())
+      act(() => socketAt(0).triggerClose(1006))
+      advance(1_000)
+      const socket = socketAt(1)
+      act(() => socket.open())
+      if (heartbeat) {
+        // The span counts from the first frame, 5 s after open.
+        advance(5_000)
+        act(() => socket.receive(ACK))
+        advance(15_000)
+        act(() => socket.receive(HEARTBEAT))
+        advance(span - 15_000)
+        act(() => socket.receive(HEARTBEAT))
+      } else {
+        advance(span)
+      }
+
+      act(() => socket.triggerClose(1006))
+      expectReconnectAfter(expectedDelay)
+    })
+
+    it("session transport hands dead connections to its owner", () => {
+      const onSessionConnectionFailure = vi.fn()
+      const hook = mountChat({
+        url: undefined,
+        taskId: undefined,
+        connection: sessionConnection(),
+        onSessionConnectionFailure,
+      })
+      const socket = socketAt(0)
+      socket.protocol = "xagent-session-v1"
+      act(() => socket.open())
+      act(() => socket.receive(ACK))
+
+      advance(150_000)
+
+      expect(onSessionConnectionFailure.mock.calls).toEqual([
+        [expect.objectContaining({ recoverable: true }), "widget-session:1"],
+      ])
+      expect(MockWebSocket.instances).toHaveLength(1)
+      expect(hook.result.current.connectionPhase).toBe("lost")
+    })
+
+    describe("connection phase", () => {
+      const base: ConnectionPhaseFacts = {
+        hasDescriptor: true,
+        autoConnect: true,
+        stoppedByCaller: false,
+        ownerOpen: false,
+        ownerInFlight: false,
+        retryPending: false,
+        lifecycleEnded: false,
+      }
+
+      it.each([
+        ["no descriptor", { hasDescriptor: false, ownerOpen: true }, "idle"],
+        ["stopped by the caller, even with a timer", { stoppedByCaller: true, retryPending: true }, "idle"],
+        ["auto connect off and no connection object", { autoConnect: false, retryPending: true }, "idle"],
+        ["auto connect off with a connection object", { autoConnect: false, ownerInFlight: true }, "connecting"],
+        ["an open connection, even with a timer", { ownerOpen: true, retryPending: true }, "connected"],
+        ["a timer waiting", { retryPending: true }, "reconnecting"],
+        ["an unopened connection after a failed cycle", { ownerInFlight: true, lifecycleEnded: true }, "reconnecting"],
+        ["an unopened connection in a fresh cycle", { ownerInFlight: true }, "connecting"],
+        ["nothing yet in a fresh cycle", {}, "connecting"],
+        ["nothing left after a failed cycle", { lifecycleEnded: true }, "lost"],
+      ] as const)("derives the phase for %s", (_name, facts, expected) => {
+        expect(deriveConnectionPhase({ ...base, ...facts })).toBe(expected)
+      })
+
+      it("recomputes when a stale retry timer fires", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        act(() => socketAt(0).triggerClose(1006))
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+
+        // A manual connect makes the waiting retry timer stale.
+        act(() => hook.result.current.connect())
+        expect(MockWebSocket.instances).toHaveLength(2)
+        act(() => socketAt(1).triggerClose(1000))
+        expect(hook.result.current.connectionPhase).toBe("reconnecting")
+
+        advance(1_200)
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+      })
+
+      it("reads connecting, not reconnecting, when the caller connects again after a failure", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).triggerError())
+        expect(hook.result.current.connectionPhase).toBe("lost")
+
+        // No disconnect() in between: the caller starts a new cycle directly.
+        act(() => hook.result.current.connect())
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+
+        act(() => socketAt(1).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+      })
+    })
+
+    describe("descriptor changes keep the connection key", () => {
+      beforeEach(() => {
+        vi.spyOn(Math, "random").mockReturnValue(0.5)
+      })
+
+      it.each([
+        ["on a healthy connection is a reconnect that spends budget", false, 2_000],
+        ["while a retry timer waits still spends one slot", true, 4_000],
+      ] as const)("a routine descriptor change %s", (_name, dead, expectedDelay) => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        if (dead) {
+          act(() => socketAt(0).receive(ACK))
+          advance(30_000)
+          expect(hook.result.current.connectionPhase).toBe("reconnecting")
+        }
+
+        authState.session = { ...authState.session }
+        hook.rerender({})
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+        act(() => socketAt(1).triggerError())
+        expectReconnectAfter(expectedDelay)
+      })
+
+      it("starts a fresh key when another account takes over the same task", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        // Spend one reconnect slot under the old principal first.
+        act(() => socketAt(0).triggerClose(1006))
+
+        authState.user = { id: "user-2" }
+        authState.token = "token-2"
+        authState.session = { ...authState.session, accessToken: "token-2", userId: "user-2" }
+        hook.rerender({})
+        expect(MockWebSocket.instances).toHaveLength(2)
+        act(() => socketAt(1).triggerError())
+        advance(60_000)
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("lost")
+
+        act(() => hook.result.current.connect())
+        act(() => socketAt(2).open())
+        act(() => socketAt(2).triggerClose(1006))
+        expectReconnectAfter(1_000)
+      })
+
+      it("shows connecting, not reconnecting, after a caller disconnect and connect", () => {
+        const hook = mountChat()
+        act(() => socketAt(0).open())
+        expect(hook.result.current.connectionPhase).toBe("connected")
+
+        act(() => hook.result.current.disconnect())
+        expect(hook.result.current.connectionPhase).toBe("idle")
+        act(() => hook.result.current.connect())
+
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(hook.result.current.connectionPhase).toBe("connecting")
+      })
+    })
   })
 })

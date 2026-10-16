@@ -386,9 +386,9 @@ def test_infra_failure_pause_switch_does_not_gate_lease_expiry(factory, monkeypa
         # Ineligibility is permanent, so it wins over the temporary switch.
         ("a2a", "false", ("ineligible", "ineligible:source_a2a", "ineligible")),
         ("a2a", "true", ("ineligible", "ineligible:source_a2a", "ineligible")),
-        # A status-only source is never paused for a settlement failure, so
-        # the switch is not what kept it from pausing.
-        ("sdk", "false", ("manual", None, "interrupted")),
+        # A status-only source follows the same switch as any other task
+        # while automatic resume is on (the default here).
+        ("sdk", "false", ("disabled", None, "interrupted")),
         ("sdk", "true", ("manual", None, "interrupted")),
     ],
 )

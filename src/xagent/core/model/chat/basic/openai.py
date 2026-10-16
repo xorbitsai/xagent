@@ -1479,7 +1479,7 @@ class OpenAICompatibleLLM(BaseLLM):
             last_raw_chunk = None  # Track last raw chunk for usage extraction
             usage_received = False
             # No-progress guard (#2785): fed one observation per raw delta,
-            # because the runtime never sees the deltas ``_parse_stream_chunk``
+            # because the runtime never sees the deltas ``_parse_stream_chunks``
             # drops and the interval timeout only measures silence.
             progress_guard = StreamProgressGuard(
                 StreamProgressConfig.from_env(model_name=self._model_name)
@@ -1550,25 +1550,25 @@ class OpenAICompatibleLLM(BaseLLM):
                     ):
                         reasoning_texts = [delta_reasoning_content]
 
-                chunk = self._parse_stream_chunk(
+                parsed_chunks = self._parse_stream_chunks(
                     raw_chunk,
                     accumulated_tool_calls,
                     accumulated_reasoning_content,
                     has_reasoning_content=has_reasoning_content,
                 )
                 stream_abort = progress_guard.observe(
-                    has_content=bool(chunk is not None and chunk.is_token()),
+                    has_content=any(chunk.is_token() for chunk in parsed_chunks),
                     reasoning_texts=reasoning_texts,
                     reasoning_opaque=reasoning_opaque,
                     has_finish_reason=delta_has_finish_reason,
-                    has_usage=bool(chunk is not None and chunk.is_usage()),
+                    has_usage=any(chunk.is_usage() for chunk in parsed_chunks),
                     accumulated_tool_calls=accumulated_tool_calls,
                 )
                 if stream_abort is not None:
                     # The chunk that tripped the guard carries the garbage;
                     # the tail chunk yielded below stands in for it.
                     break
-                if chunk:
+                for chunk in parsed_chunks:
                     if chunk.is_usage():
                         usage_received = True
                     elif chunk.is_token():
@@ -1770,14 +1770,14 @@ class OpenAICompatibleLLM(BaseLLM):
             raw=raw,
         )
 
-    def _parse_stream_chunk(
+    def _parse_stream_chunks(
         self,
         raw_chunk: Any,
         accumulated_tool_calls: Dict,
         accumulated_reasoning_content: str = "",
         *,
         has_reasoning_content: bool = False,
-    ) -> Optional[StreamChunk]:
+    ) -> List[StreamChunk]:
         """
         Parse OpenAI streaming chunk
 
@@ -1786,7 +1786,11 @@ class OpenAICompatibleLLM(BaseLLM):
             accumulated_tool_calls: Accumulated tool calls (across chunks)
 
         Returns:
-            StreamChunk or None
+            The StreamChunks this chunk expands to, in emission order (empty
+            when there is nothing to emit). A delta that carries both text
+            and tool-call fragments expands to a TOKEN followed by a
+            TOOL_CALL: consumers dispatch on chunk type, so folding the tool
+            calls into the TOKEN would lose them.
         """
         # Check choices
         if not hasattr(raw_chunk, "choices") or not raw_chunk.choices:
@@ -1802,16 +1806,18 @@ class OpenAICompatibleLLM(BaseLLM):
                     call_type="stream_chat",
                 )
 
-                return StreamChunk(
-                    type=ChunkType.USAGE,
-                    usage={
-                        "prompt_tokens": raw_chunk.usage.prompt_tokens,
-                        "completion_tokens": raw_chunk.usage.completion_tokens,
-                        "total_tokens": raw_chunk.usage.total_tokens,
-                    },
-                    raw=raw_chunk,
-                )
-            return None
+                return [
+                    StreamChunk(
+                        type=ChunkType.USAGE,
+                        usage={
+                            "prompt_tokens": raw_chunk.usage.prompt_tokens,
+                            "completion_tokens": raw_chunk.usage.completion_tokens,
+                            "total_tokens": raw_chunk.usage.total_tokens,
+                        },
+                        raw=raw_chunk,
+                    )
+                ]
+            return []
 
         choice = raw_chunk.choices[0]
         delta = choice.delta
@@ -1819,19 +1825,21 @@ class OpenAICompatibleLLM(BaseLLM):
         # chunk as the final delta instead of on a trailing empty one, so the
         # delta-bearing chunks below carry it as well (#2786).
         finish_reason = getattr(choice, "finish_reason", None) or ""
+        chunks: List[StreamChunk] = []
 
         # Handle token content
         if hasattr(delta, "content") and delta.content:
-            return StreamChunk(
-                type=ChunkType.TOKEN,
-                content=delta.content,
-                delta=delta.content,
-                finish_reason=finish_reason,
-                raw=self._attach_reasoning_content_to_raw(
-                    raw_chunk,
-                    accumulated_reasoning_content,
-                    has_reasoning_content=has_reasoning_content,
-                ),
+            chunks.append(
+                StreamChunk(
+                    type=ChunkType.TOKEN,
+                    content=delta.content,
+                    delta=delta.content,
+                    raw=self._attach_reasoning_content_to_raw(
+                        raw_chunk,
+                        accumulated_reasoning_content,
+                        has_reasoning_content=has_reasoning_content,
+                    ),
+                )
             )
 
         # Handle tool calls
@@ -1900,47 +1908,61 @@ class OpenAICompatibleLLM(BaseLLM):
             # Return current accumulated tool calls
             tool_calls_list = list(accumulated_tool_calls.values())
             if tool_calls_list:
-                return StreamChunk(
-                    type=ChunkType.TOOL_CALL,
-                    tool_calls=tool_calls_list,
-                    finish_reason=finish_reason,
-                    raw=self._attach_reasoning_content_to_raw(
+                raw = (
+                    chunks[0].raw
+                    if chunks
+                    else self._attach_reasoning_content_to_raw(
                         raw_chunk,
                         accumulated_reasoning_content,
                         has_reasoning_content=has_reasoning_content,
-                    ),
+                    )
+                )
+                chunks.append(
+                    StreamChunk(
+                        type=ChunkType.TOOL_CALL,
+                        tool_calls=tool_calls_list,
+                        raw=raw,
+                    )
                 )
 
         # Check finish reason
-        if hasattr(choice, "finish_reason") and choice.finish_reason:
-            # If there are tool calls, return complete tool calls
-            if accumulated_tool_calls:
+        if finish_reason:
+            if chunks:
+                # The marker rides on this delta's last payload chunk, so a
+                # mixed final delta ends on its TOOL_CALL, not its TOKEN.
+                chunks[-1].finish_reason = finish_reason
+            # No payload on this delta: emit the final tool-call snapshot.
+            elif accumulated_tool_calls:
                 tool_calls_list = list(accumulated_tool_calls.values())
 
                 # Blank accumulated arguments pass through deliberately (#1501);
                 # the repair contract lives in the pattern layer, not here.
-                return StreamChunk(
-                    type=ChunkType.TOOL_CALL,
-                    tool_calls=tool_calls_list,
-                    finish_reason=choice.finish_reason,
-                    raw=self._attach_reasoning_content_to_raw(
-                        raw_chunk,
-                        accumulated_reasoning_content,
-                        has_reasoning_content=has_reasoning_content,
-                    ),
+                chunks.append(
+                    StreamChunk(
+                        type=ChunkType.TOOL_CALL,
+                        tool_calls=tool_calls_list,
+                        finish_reason=finish_reason,
+                        raw=self._attach_reasoning_content_to_raw(
+                            raw_chunk,
+                            accumulated_reasoning_content,
+                            has_reasoning_content=has_reasoning_content,
+                        ),
+                    )
+                )
+            else:
+                chunks.append(
+                    StreamChunk(
+                        type=ChunkType.END,
+                        finish_reason=finish_reason,
+                        raw=self._attach_reasoning_content_to_raw(
+                            raw_chunk,
+                            accumulated_reasoning_content,
+                            has_reasoning_content=has_reasoning_content,
+                        ),
+                    )
                 )
 
-            return StreamChunk(
-                type=ChunkType.END,
-                finish_reason=choice.finish_reason,
-                raw=self._attach_reasoning_content_to_raw(
-                    raw_chunk,
-                    accumulated_reasoning_content,
-                    has_reasoning_content=has_reasoning_content,
-                ),
-            )
-
-        return None
+        return chunks
 
     @staticmethod
     def _stream_tool_call_has_payload(tool_call: Any) -> bool:

@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import copy
 import json
 import logging
 import re
@@ -12,10 +13,11 @@ from unittest.mock import MagicMock
 import httpx
 import openai
 import pytest
-from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from openai.types.chat.chat_completion_chunk import ChatCompletionChunk, ChoiceDelta
 from pydantic import BaseModel, ConfigDict
 
 from xagent.core.agent.context.execution import ExecutionContext
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
 from xagent.core.model.chat.basic.openai import (
@@ -279,12 +281,86 @@ class TestOpenAILLM:
             is_streaming=True,
         ) == {"trace_id": "abc"}
 
-    def test_parse_stream_chunk_ignores_empty_idless_tool_call_placeholder(self, llm):
+    def test_parse_stream_chunks_mixed_delta_emits_token_then_tool_call(self, llm):
+        """A delta carrying text and tool-call fragments expands to a TOKEN
+        followed by a TOOL_CALL snapshot, with the finish marker on the last
+        payload; blank text next to tool calls emits no TOKEN."""
+        accumulated_tool_calls = {}
+
+        mixed = _stream_chunk(
+            [
+                _tool_call_delta(0, "call_a", "search", '{"q":'),
+                _tool_call_delta(1, "call_b", "lookup", '{"id":1}'),
+            ]
+        )
+        mixed.choices[0].delta.content = "Checking"
+        chunks = llm._parse_stream_chunks(mixed, accumulated_tool_calls)
+        assert [chunk.type for chunk in chunks] == [
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+        ]
+        assert chunks[0].delta == "Checking"
+        assert [call["id"] for call in chunks[1].tool_calls] == ["call_a", "call_b"]
+        assert [chunk.finish_reason for chunk in chunks] == ["", ""]
+
+        assert llm._parse_stream_chunks(_stream_chunk(), accumulated_tool_calls) == []
+
+        blank = _stream_chunk(
+            [_tool_call_delta(0, None, None, '"x"}')], finish_reason="tool_calls"
+        )
+        blank.choices[0].delta.content = ""
+        (final,) = llm._parse_stream_chunks(blank, accumulated_tool_calls)
+        assert final.type == ChunkType.TOOL_CALL
+        assert final.finish_reason == "tool_calls"
+        assert accumulated_tool_calls["call_a"]["function"]["arguments"] == '{"q":"x"}'
+
+        text_end = _stream_chunk(finish_reason="stop")
+        text_end.choices[0].delta.content = "done"
+        (token,) = llm._parse_stream_chunks(text_end, {})
+        assert (token.type, token.delta, token.finish_reason) == (
+            ChunkType.TOKEN,
+            "done",
+            "stop",
+        )
+
+    def test_parse_stream_chunks_mixed_final_delta_reuses_reasoning_raw(self, llm):
+        mixed = _stream_chunk(
+            [_tool_call_delta(0, "call_a", "search", '{"q":"x"}')],
+            finish_reason="tool_calls",
+        )
+        mixed.choices[0].delta.content = "Checking"
+        mixed.model_dump = MagicMock(return_value={"id": "mixed-final"})
+
+        chunks = llm._parse_stream_chunks(
+            mixed, {}, "Checking the source", has_reasoning_content=True
+        )
+
+        assert [(chunk.type, chunk.finish_reason) for chunk in chunks] == [
+            (ChunkType.TOKEN, ""),
+            (ChunkType.TOOL_CALL, "tool_calls"),
+        ]
+        assert chunks[0].delta == "Checking"
+        assert chunks[1].tool_calls[0]["function"]["arguments"] == '{"q":"x"}'
+        mixed.model_dump.assert_called_once_with()
+        assert chunks[0].raw is chunks[1].raw
+        assert chunks[0].raw["reasoning_content"] == "Checking the source"
+
+        empty = _stream_chunk()
+        empty.model_dump = MagicMock()
+        assert (
+            llm._parse_stream_chunks(
+                empty, {}, "Checking the source", has_reasoning_content=True
+            )
+            == []
+        )
+        empty.model_dump.assert_not_called()
+
+    def test_parse_stream_chunks_ignores_empty_idless_tool_call_placeholder(self, llm):
         """Some OpenAI-compatible providers emit empty id-less tool-call slots."""
 
         accumulated_tool_calls = {}
 
-        llm._parse_stream_chunk(
+        llm._parse_stream_chunks(
             _stream_chunk(
                 [
                     _tool_call_delta(
@@ -297,7 +373,7 @@ class TestOpenAILLM:
             ),
             accumulated_tool_calls,
         )
-        llm._parse_stream_chunk(
+        llm._parse_stream_chunks(
             _stream_chunk(
                 [
                     _tool_call_delta(
@@ -310,12 +386,12 @@ class TestOpenAILLM:
             ),
             accumulated_tool_calls,
         )
-        llm._parse_stream_chunk(
+        llm._parse_stream_chunks(
             _stream_chunk([_tool_call_delta(2, None, "", "", None)]),
             accumulated_tool_calls,
         )
 
-        final_chunk = llm._parse_stream_chunk(
+        (final_chunk,) = llm._parse_stream_chunks(
             _stream_chunk(finish_reason="tool_calls"),
             accumulated_tool_calls,
         )
@@ -1527,12 +1603,12 @@ class TestOpenAILLM:
         ("empty_arguments", "expected"),
         [("", ""), ("   ", "   "), (None, "")],
     )
-    def test_parse_stream_chunk_passes_empty_tool_arguments_through(
+    def test_parse_stream_chunks_passes_empty_tool_arguments_through(
         self, llm, empty_arguments, expected
     ):
         """Same on the streaming finish-reason path; `None` accumulates as `""`."""
         accumulated_tool_calls = {}
-        llm._parse_stream_chunk(
+        llm._parse_stream_chunks(
             _stream_chunk(
                 [
                     _tool_call_delta(
@@ -1543,7 +1619,7 @@ class TestOpenAILLM:
             accumulated_tool_calls,
         )
 
-        final_chunk = llm._parse_stream_chunk(
+        (final_chunk,) = llm._parse_stream_chunks(
             _stream_chunk(finish_reason="tool_calls"),
             accumulated_tool_calls,
         )
@@ -2665,16 +2741,16 @@ class TestFinishReasonOnResponse:
         assert [c.finish_reason for c in tokens] == ["", "length"]
 
     @pytest.mark.asyncio
-    async def test_parse_stream_chunk_tool_call_delta_carries_finish_reason(
+    async def test_parse_stream_chunks_tool_call_delta_carries_finish_reason(
         self, openai_llm_config
     ):
         """A tool-call delta chunk that also carries ``finish_reason`` (some
         OpenAI-compatible endpoints put it on the same chunk as the final
-        delta, see ``_parse_stream_chunk`` above) must surface that reason on
+        delta, see ``_parse_stream_chunks`` above) must surface that reason on
         the returned ``StreamChunk`` rather than dropping it."""
         llm = OpenAILLM(**openai_llm_config)
 
-        chunk = llm._parse_stream_chunk(
+        (chunk,) = llm._parse_stream_chunks(
             _stream_chunk(
                 [_tool_call_delta(0, "call_1", "search", '{"q":1}')],
                 finish_reason="length",
@@ -2687,10 +2763,151 @@ class TestFinishReasonOnResponse:
         assert chunk.finish_reason == "length"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "openrouter-deepseek"])
+@pytest.mark.parametrize("usage_shape", ["separate", "coalesced", "both"])
+async def test_mixed_stream_delta_reaches_runtime_without_losing_payload(
+    mocker, provider, usage_shape
+):
+    """One SDK delta may carry text and tool arguments at the same time.
+
+    Both must reach typed consumers before the next SDK delta is consumed,
+    including when the last argument bytes share the finish/usage envelope.
+    """
+    from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
+    from xagent.core.model.chat.stream_progress import StreamProgressGuard
+
+    observed = []
+    prefix = '{"local_time": "'
+    suffix = '2026-10-14 15:30:00", "timezone": "Asia/Shanghai"}'
+    usage = {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+
+    def sdk_chunk(content, arguments, *, first=False, final=False):
+        return ChatCompletionChunk(
+            id="synthetic-mixed-stream",
+            created=0,
+            model="synthetic-model",
+            object="chat.completion.chunk",
+            choices=[
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": content,
+                        "reasoning_content": "first" if first else " second",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_clock" if first else None,
+                                "type": "function",
+                                "function": {
+                                    "name": "validate_local_time" if first else None,
+                                    "arguments": arguments,
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls" if final else None,
+                }
+            ],
+            usage=usage if final and usage_shape != "separate" else None,
+        )
+
+    async def sdk_stream():
+        yield sdk_chunk("Checking", prefix, first=True)
+        assert [chunk.type for chunk in observed] == [
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+        ]
+        assert observed[-1].tool_calls[0]["function"]["arguments"] == prefix
+        yield sdk_chunk(" now", suffix, final=True)
+        assert [chunk.type for chunk in observed[:4]] == [
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+            ChunkType.TOKEN,
+            ChunkType.TOOL_CALL,
+        ]
+        # No separate finish packet: the mixed final delta must suffice.
+        if usage_shape != "coalesced":
+            yield ChatCompletionChunk(
+                id="synthetic-mixed-stream",
+                created=0,
+                model="synthetic-model",
+                object="chat.completion.chunk",
+                choices=[],
+                usage=usage,
+            )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = sdk_stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI", return_value=mock_client
+    )
+    token_usage = mocker.patch("xagent.core.model.chat.basic.openai.add_token_usage")
+    observe = mocker.spy(StreamProgressGuard, "observe")
+    llm_class = OpenRouterLLM if provider.startswith("openrouter") else OpenAILLM
+    llm = llm_class(
+        model_name=(
+            "deepseek/deepseek-v4-flash"
+            if provider == "openrouter-deepseek"
+            else "dots-studio/dots-3-note-preview:free"
+        ),
+        base_url=None,
+        api_key="test-key",
+    )
+    non_streaming = mocker.patch.object(llm, "chat", new=mocker.AsyncMock())
+    result = await PatternRuntime().run_streaming_llm_call(
+        llm,
+        messages=[{"role": "user", "content": "Validate the synthetic local time."}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "validate_local_time",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "local_time": {"type": "string"},
+                            "timezone": {"type": "string"},
+                        },
+                        "required": ["local_time", "timezone"],
+                    },
+                },
+            }
+        ],
+        on_chunk=lambda chunk: observed.append(copy.deepcopy(chunk)),
+    )
+
+    assert result["content"] == "Checking now"
+    assert len(result["tool_calls"]) == 1
+    call = result["tool_calls"][0]
+    assert call["id"] == "call_clock"
+    assert call["function"]["name"] == "validate_local_time"
+    assert json.loads(call["function"]["arguments"]) == {
+        "local_time": "2026-10-14 15:30:00",
+        "timezone": "Asia/Shanghai",
+    }
+    assert result["finish_reason"] == "tool_calls"
+    assert result["reasoning_content"] == "first second"
+    assert result["usage"] == usage
+    assert [chunk.type for chunk in observed] == [
+        ChunkType.TOKEN,
+        ChunkType.TOOL_CALL,
+        ChunkType.TOKEN,
+        ChunkType.TOOL_CALL,
+        ChunkType.USAGE,
+    ]
+    assert [chunk.finish_reason for chunk in observed] == ["", "", "", "tool_calls", ""]
+    # The progress guard observes raw SDK deltas, not the expanded events.
+    assert observe.call_count == (2 if usage_shape == "coalesced" else 3)
+    token_usage.assert_called_once()
+    mock_client.chat.completions.create.assert_awaited_once()
+    non_streaming.assert_not_awaited()
+
+
 class TestStreamNoProgressAbort:
     """#2785: a stream that keeps emitting chunks but stopped making progress
     is abandoned by ``stream_chat`` itself, since the runtime never sees the
-    deltas ``_parse_stream_chunk`` drops and the interval timeout only
+    deltas ``_parse_stream_chunks`` drops and the interval timeout only
     measures silence."""
 
     _ENV = {

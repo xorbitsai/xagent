@@ -1,7 +1,7 @@
 """Unit tests for the streaming no-progress guard (#2785).
 
 The guard is pure: it is fed per-delta facts plus the accumulated tool-call
-state that ``OpenAICompatibleLLM._parse_stream_chunk`` maintains, and returns
+state that ``OpenAICompatibleLLM._parse_stream_chunks`` maintains, and returns
 an abort verdict or ``None``. Every "must not abort" case here protects a
 legitimate stream shape that shares the same code path (DeepSeek-style long
 reasoning, parallel tool calls, a still-open JSON object, keepalive chunks).
@@ -32,7 +32,7 @@ def _config(**overrides: object) -> StreamProgressConfig:
 
 
 def _tool_calls(*calls: tuple[str, str]) -> dict[str, dict]:
-    """``(call_id, arguments)`` pairs in the shape ``_parse_stream_chunk`` keeps."""
+    """``(call_id, arguments)`` pairs in the shape ``_parse_stream_chunks`` keeps."""
     return {
         call_id: {
             "index": position,

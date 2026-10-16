@@ -134,8 +134,11 @@ def test_seed_row_matches_registry(tmp_path):
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "planner"
     )
-    # offline_access was added after this seed by 20261008_microsoft_offline_access.
-    registry_scopes = [s for s in registry_row["oauth_scopes"] if s != "offline_access"]
+    # These scopes were added after this frozen seed snapshot.
+    later_scopes = {"offline_access", "Team.ReadBasic.All"}
+    registry_scopes = [
+        scope for scope in registry_row["oauth_scopes"] if scope not in later_scopes
+    ]
     assert migration.ROW == {**registry_row, "oauth_scopes": registry_scopes}
 
 

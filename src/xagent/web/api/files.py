@@ -53,6 +53,7 @@ from ..auth_dependencies import (
     is_admin_user,
     optional_security,
 )
+from ..auth_sessions import matches_user_session, user_session_claims
 from ..config import (
     BINARY_EXTENSIONS,
     MAX_FILE_SIZE,
@@ -108,7 +109,6 @@ from .legacy_file import (
     resolve_legacy_file_path,
     resolve_legacy_file_path_cross_user,
 )
-from ..auth_sessions import matches_user_session, user_session_claims
 
 # Optional import for python-pptx (used for upload-time text preview).
 pptx: ModuleType | None = None

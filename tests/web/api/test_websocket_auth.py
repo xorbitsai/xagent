@@ -557,3 +557,69 @@ async def test_progress_retains_invalid_credential_close_code(
     broadcaster.connect.assert_not_awaited()
     assert session.enter_count == 1
     assert session.exit_count == 1
+
+
+@pytest.mark.asyncio
+async def test_session_monitor_cancellation_drains_handler_cleanup(monkeypatch):
+    websocket, _ = _asgi_websocket(denial_extension=False)
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+            cleaned.set()
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 3600)
+    task = asyncio.create_task(endpoint(websocket, "token"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        await asyncio.wait_for(cleaning.wait(), timeout=5)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert cleaned.is_set()
+    assert not any(
+        task.get_name() == "websocket-session-monitor" for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_session_monitor_fails_closed_on_database_outage(monkeypatch):
+    websocket, messages = _asgi_websocket(denial_extension=False)
+    cleaned = asyncio.Event()
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    def broken_loader(_token):
+        raise TimeoutError("database password=private")
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.01)
+    monkeypatch.setattr(websocket_auth, "_load_websocket_principal_sync", broken_loader)
+    await asyncio.wait_for(endpoint(websocket, "token"), timeout=5)
+    assert messages[-1] == {
+        "type": "websocket.close",
+        "code": 1011,
+        "reason": "Internal server error",
+    }
+    assert cleaned.is_set()
+    assert "private" not in str(messages)

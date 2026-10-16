@@ -61,7 +61,7 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user, get_user_from_token
-from ..auth_sessions import user_session_claims
+from ..auth_sessions import commit_refresh_credentials, user_session_claims
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
@@ -2044,9 +2044,27 @@ def _login_in_worker(
     with session_factory() as session:
         with observe_duration("xagent.auth.login.sync_lookup.duration"):
             user = get_user_by_login_identifier(session, request.username)
+        previous_hash = str(user.password_hash) if user is not None else ""
+        previous_epoch = (
+            cast(str | None, user.session_epoch) if user is not None else None
+        )
         response = _prepare_login_response(user, request)
+        assert user is not None  # The response builder rejects missing users.
+        upgraded_hash = str(user.password_hash)
+        expires_at = user.refresh_token_expires_at
+        assert expires_at is not None
         with observe_duration("xagent.auth.login.sync_commit.duration"):
-            session.commit()
+            commit_refresh_credentials(
+                session,
+                user_id=int(response["user_id"]),
+                password_hash=previous_hash,
+                session_epoch=previous_epoch,
+                refresh_token=response["refresh_token"],
+                expires_at=cast(datetime, expires_at),
+                upgraded_password_hash=(
+                    upgraded_hash if upgraded_hash != previous_hash else None
+                ),
+            )
         # Do not access user here: expire_on_commit=True would issue another SELECT.
         return response
 
@@ -2268,7 +2286,11 @@ async def reset_password(
     new_hash = await hash_password_async(request.new_password)
     changed = (
         db.query(User)
-        .filter(User.id == user.id, User.password_reset_token_hash == token_hash)
+        .filter(
+            User.id == user.id,
+            User.password_reset_token_hash == token_hash,
+            User.password_reset_expires_at >= datetime.now(timezone.utc),
+        )
         .update(
             {
                 User.password_hash: new_hash,
@@ -2643,6 +2665,8 @@ def _refresh_in_worker(
     with session_factory() as session:
         user = session.query(User).filter(User.id == user_id).first()
         response = _prepare_refresh_response(user, request)
+        assert user is not None
+        previous_epoch = user.session_epoch
         # End the read snapshot before competing for a write. In SQLite this
         # avoids a deferred read-to-write lock upgrade; the conditional UPDATE
         # below, not the preceding SELECT, is the authority on token consumption.
@@ -2654,6 +2678,7 @@ def _refresh_in_worker(
                 User.id == user_id,
                 User.refresh_token == request.refresh_token,
                 User.refresh_token_expires_at >= now,
+                User.session_epoch == previous_epoch,
             )
             .update(
                 {

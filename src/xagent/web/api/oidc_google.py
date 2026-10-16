@@ -5,7 +5,7 @@ import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode
 
 from authlib.integrations.base_client import OAuthError  # type: ignore[import-untyped]
@@ -31,7 +31,11 @@ from ...config import (
     get_session_secret,
 )
 from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
-from ..auth_sessions import user_session_claims
+from ..auth_sessions import (
+    commit_refresh_credentials,
+    matches_user_session,
+    user_session_claims,
+)
 from ..models.database import get_db
 from ..models.oidc_consumed_token import OidcConsumedToken
 from ..models.user import User
@@ -57,6 +61,7 @@ router = APIRouter(prefix="/oidc/google", tags=["Authentication"])
 class OidcExchangeTransaction:
     user_id: int
     token_id: str
+    session_epoch: str | None = None
 
 
 class OidcExchangeRequest(BaseModel):
@@ -137,10 +142,14 @@ async def complete_google_oidc_authorization(
     return dict(userinfo)
 
 
-def _create_exchange_code(user_id: int) -> str:
+def _create_exchange_code(user_id: int, session_epoch: str | None = None) -> str:
     return str(
         _exchange_serializer().dumps(
-            {"user_id": user_id, "jti": secrets.token_urlsafe(32)}
+            {
+                "user_id": user_id,
+                "jti": secrets.token_urlsafe(32),
+                "session_epoch": session_epoch,
+            }
         )
     )
 
@@ -161,7 +170,12 @@ def _decode_exchange_code(code: str) -> OidcExchangeTransaction | None:
     token_id = data.get("jti")
     if not isinstance(token_id, str) or not token_id:
         return None
-    return OidcExchangeTransaction(user_id=user_id, token_id=token_id)
+    epoch = data.get("session_epoch")
+    if epoch is not None and not isinstance(epoch, str):
+        return None
+    return OidcExchangeTransaction(
+        user_id=user_id, token_id=token_id, session_epoch=epoch
+    )
 
 
 def _consume_exchange_code(db: Session, code: str) -> OidcExchangeTransaction | None:
@@ -283,6 +297,8 @@ def _get_or_create_google_user(db: Session, claims: dict[str, Any]) -> User:
 
 
 def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
+    previous_hash = str(user.password_hash)
+    previous_epoch = cast(str | None, user.session_epoch)
     access_token = create_access_token(
         data=user_session_claims(user),
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
@@ -290,15 +306,8 @@ def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
     refresh_token = create_refresh_token(
         data={"sub": user.username, "user_id": user.id}
     )
-    setattr(user, "refresh_token", refresh_token)
-    setattr(
-        user,
-        "refresh_token_expires_at",
-        _utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-    )
-    db.commit()
-
-    return {
+    # Detach the response before rollback/commit can expire ORM attributes.
+    response = {
         "success": True,
         "message": "Login successful",
         "user": {
@@ -316,6 +325,15 @@ def _issue_auth_payload(db: Session, user: User) -> dict[str, Any]:
         "refresh_expires_in": REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 * 60,
         "user_id": user.id,
     }
+    commit_refresh_credentials(
+        db,
+        user_id=int(user.id),
+        password_hash=previous_hash,
+        session_epoch=previous_epoch,
+        refresh_token=refresh_token,
+        expires_at=_utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
+    )
+    return response
 
 
 @router.get("/status")
@@ -364,7 +382,9 @@ async def google_oidc_callback(
             redirect_uri=redirect_uri,
         )
         user = _get_or_create_google_user(db, claims)
-        exchange_code = _create_exchange_code(int(user.id))
+        exchange_code = _create_exchange_code(
+            int(user.id), cast(str | None, user.session_epoch)
+        )
     except OAuthError as exc:
         logger.info("Google OIDC authorization failed: %s", exc.error)
         return _login_error_redirect("authorization_failed")
@@ -397,7 +417,9 @@ def google_oidc_exchange(
         )
 
     user = db.query(User).filter(User.id == transaction.user_id).first()
-    if user is None:
+    if user is None or not matches_user_session(
+        user, {"session_epoch": transaction.session_epoch}
+    ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid or expired OIDC exchange code",

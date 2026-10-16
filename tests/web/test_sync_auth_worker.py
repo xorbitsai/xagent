@@ -99,8 +99,8 @@ async def test_login_and_refresh_have_single_thread_owners(worker_db):
     assert [name for name, _ in events] == [
         "create",
         "SELECT",
-        "commit",
         "UPDATE",
+        "commit",
         "close",
     ]
     assert len({owner for _, owner in events}) == 1

@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
+from functools import wraps
+from typing import Any, TypeVar, cast
 
 from fastapi import WebSocket
 from fastapi.responses import JSONResponse
@@ -12,9 +17,17 @@ from starlette.websockets import WebSocketState
 from ...core.agent.voice_policy import voice_from_preferences
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_session_local
-from ..services.db_runtime import run_db_io_cancellation_safe
+from ..services.db_runtime import (
+    cancel_and_drain_async_task,
+    drain_async_task_cancellation_safe,
+    run_db_io_cancellation_safe,
+)
 
 logger = logging.getLogger(__name__)
+
+# Bound idle/streaming revocation latency without a process-local event bus.
+_SESSION_RECHECK_SECONDS = 5.0
+_Endpoint = TypeVar("_Endpoint", bound=Callable[..., Coroutine[Any, Any, None]])
 
 
 @dataclass(frozen=True)
@@ -109,3 +122,57 @@ async def get_authenticated_user(
             exc,
         )
         raise _WebSocketAuthenticationTerminated() from exc
+
+
+def revalidate_websocket_session(endpoint: _Endpoint) -> _Endpoint:
+    """Own the endpoint and its durable-session monitor for the same lifetime.
+
+    Polling also closes idle sockets and cancels in-flight streaming handlers,
+    including when the password changed in a different API process. Endpoint
+    finally blocks must finish unsubscribing/cancelling their own work before
+    this wrapper returns. Inbound commands additionally recheck before dispatch.
+    """
+    signature = inspect.signature(endpoint, eval_str=True)
+
+    @wraps(endpoint)
+    async def guarded(*args: Any, **kwargs: Any) -> None:
+        arguments = signature.bind(*args, **kwargs).arguments
+        websocket = arguments["websocket"]
+        token = arguments.get("token")
+        if not isinstance(token, str) or not token:
+            await endpoint(*args, **kwargs)
+            return
+
+        async def monitor() -> None:
+            while True:
+                await asyncio.sleep(_SESSION_RECHECK_SECONDS)
+                try:
+                    principal = await get_authenticated_user(websocket, token)
+                except _WebSocketAuthenticationTerminated:
+                    return
+                if principal is None:
+                    if websocket.application_state is WebSocketState.CONNECTED:
+                        await websocket.close(code=4001, reason="Session expired")
+                    return
+
+        handler = asyncio.create_task(endpoint(*args, **kwargs))
+        watcher = asyncio.create_task(monitor(), name="websocket-session-monitor")
+        try:
+            done, _ = await asyncio.wait(
+                (handler, watcher), return_when=asyncio.FIRST_COMPLETED
+            )
+            if handler in done:
+                await handler
+            else:
+                await watcher
+        finally:
+
+            async def cleanup() -> None:
+                await cancel_and_drain_async_task(watcher)
+                await cancel_and_drain_async_task(handler)
+
+            await drain_async_task_cancellation_safe(asyncio.create_task(cleanup()))
+
+    # Resolve annotations against the original module, not this wrapper's globals.
+    setattr(guarded, "__signature__", signature)
+    return cast(_Endpoint, guarded)

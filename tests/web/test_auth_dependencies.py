@@ -661,6 +661,50 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             (),
         ),
         ("web/api/auth.py", "_generic_oauth_login", "get_user_from_token", ()),
+        (
+            "web/api/websocket_auth.py",
+            "revalidate_websocket_session.guarded.monitor",
+            "get_authenticated_user",
+            terminated,
+        ),
+        (
+            websocket_file,
+            "websocket_chat_endpoint",
+            "get_authenticated_user",
+            (
+                "WebSocketDisconnect",
+                "_WebSocketAuthenticationTerminated",
+                "DurableObjectIntegrityError",
+                "DurableStorageOperationError",
+                "ConnectionError",
+                "RuntimeError",
+                "Exception",
+            ),
+        ),
+        *(
+            (
+                websocket_file,
+                endpoint,
+                "get_authenticated_user",
+                (
+                    "WebSocketDisconnect",
+                    "_WebSocketAuthenticationTerminated",
+                    "ConnectionError",
+                    "RuntimeError",
+                    "Exception",
+                ),
+            )
+            for endpoint in (
+                "websocket_builder_chat_endpoint",
+                "websocket_build_preview_endpoint",
+            )
+        ),
+        (
+            "web/api/progress_ws.py",
+            "progress_websocket_endpoint",
+            "get_authenticated_user",
+            ("WebSocketDisconnect", "_WebSocketAuthenticationTerminated", "Exception"),
+        ),
     )
     modules = {"xagent.web.auth_dependencies", "xagent.web.api.websocket_auth"}
     source_root = Path(auth_dependencies.__file__).parents[1]
@@ -694,7 +738,8 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
         names = {
             node.name
             for node in tree.body
-            if relative_path == "web/auth_dependencies.py"
+            if relative_path
+            in {"web/auth_dependencies.py", "web/api/websocket_auth.py"}
             and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
             and node.name in tracked
         }

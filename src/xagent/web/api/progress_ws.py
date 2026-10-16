@@ -22,6 +22,7 @@ from ..models.user import User
 from .websocket_auth import (
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
+    revalidate_websocket_session,
 )
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ progress_ws_router = APIRouter()
 
 
 @progress_ws_router.websocket("/ws/progress/{task_id}")
+@revalidate_websocket_session
 async def progress_websocket_endpoint(
     websocket: WebSocket,
     task_id: str,
@@ -114,12 +116,15 @@ async def progress_websocket_endpoint(
             while True:
                 # Wait for client messages (though we mainly send updates)
                 data = await websocket.receive_text()
+                if not await get_authenticated_user(websocket, token):
+                    await websocket.close(code=4001, reason="Session expired")
+                    break
                 logger.debug(f"Received message from progress client: {data}")
 
                 # For now, we don't handle client messages
                 # Could be extended to handle commands like "cancel_task"
 
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
             logger.info(f"Progress WebSocket disconnected for task {task_id}")
         except Exception as e:
             logger.error(f"Progress WebSocket error for task {task_id}: {e}")

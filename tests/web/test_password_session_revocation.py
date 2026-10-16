@@ -1,14 +1,18 @@
 """Real password changes must invalidate live credentials, not just refresh."""
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, WebSocket
 
 from tests.web import test_auth_api as auth_tests
 from tests.web.test_auth_api import test_db as test_db
-from xagent.web.api import auth, files
+from xagent.web.api import auth, files, oidc_google, progress_ws
+from xagent.web.api import websocket as websocket_api
+from xagent.web.api import websocket_auth
 from xagent.web.auth_dependencies import (
     get_user_from_token,
     get_user_from_websocket_token,
@@ -128,3 +132,301 @@ def test_reset_token_cannot_be_reused():
     assert not auth_tests.client.post("/api/auth/reset-password", json=request).json()[
         "success"
     ]
+
+
+def _change_password_in_separate_session(operation):
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        if operation == "reset":
+            result = asyncio.run(
+                auth.reset_password(
+                    auth.ResetPasswordRequest(
+                        token="race-reset", new_password="new-password-456"
+                    ),
+                    session,
+                )
+            )
+        else:
+            result = asyncio.run(
+                auth.change_password(
+                    auth.ChangePasswordRequest(
+                        current_password="old-password-123",
+                        new_password="new-password-456",
+                    ),
+                    session,
+                    user,
+                )
+            )
+        assert result.success
+
+
+@pytest.mark.parametrize("operation", ["change", "reset"])
+@pytest.mark.parametrize("issuer", ["login", "refresh", "oidc"])
+def test_password_change_wins_against_in_flight_token_publication(
+    monkeypatch, operation, issuer
+):
+    """Interleave real handlers at the old credential publication race window."""
+    auth_tests.setup_first_admin(password="old-password-123")
+    before = auth._login_in_worker(
+        auth.LoginRequest(username="administrator", password="old-password-123"),
+        auth_tests.TestingSessionLocal,
+    )
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        user_id = user.id
+        user.password_reset_token_hash = auth.hash_password_reset_token("race-reset")
+        user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=5
+        )
+        session.commit()
+
+    captured = {}
+    if issuer in {"login", "refresh"}:
+        name = (
+            "_prepare_login_response"
+            if issuer == "login"
+            else "_prepare_refresh_response"
+        )
+        original = getattr(auth, name)
+
+        def prepare_then_revoke(*args):
+            response = original(*args)
+            captured["refresh"] = (
+                response["refresh_token"]
+                if issuer == "login"
+                else response.refresh_token
+            )
+            _change_password_in_separate_session(operation)
+            return response
+
+        monkeypatch.setattr(auth, name, prepare_then_revoke)
+    else:
+        original = oidc_google.create_refresh_token
+
+        def create_then_revoke(*args, **kwargs):
+            token = original(*args, **kwargs)
+            captured["refresh"] = token
+            _change_password_in_separate_session(operation)
+            return token
+
+        monkeypatch.setattr(oidc_google, "create_refresh_token", create_then_revoke)
+
+    with pytest.raises(HTTPException) as error:
+        if issuer == "login":
+            auth._login_in_worker(
+                auth.LoginRequest(
+                    username="administrator", password="old-password-123"
+                ),
+                auth_tests.TestingSessionLocal,
+            )
+        elif issuer == "refresh":
+            auth._refresh_in_worker(
+                auth.RefreshTokenRequest(refresh_token=before["refresh_token"]),
+                user_id,
+                auth_tests.TestingSessionLocal,
+            )
+        else:
+            with auth_tests.TestingSessionLocal() as session:
+                oidc_google._issue_auth_payload(session, session.get(User, user_id))
+    assert error.value.status_code == 401
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.get(User, user_id)
+        assert auth.verify_password("new-password-456", user.password_hash)
+        assert user.session_epoch is not None
+        assert user.refresh_token is None
+        assert get_user_from_token(before["access_token"], session) is None
+    for token in (before["refresh_token"], captured["refresh"]):
+        with pytest.raises(HTTPException) as rejected:
+            auth._refresh_in_worker(
+                auth.RefreshTokenRequest(refresh_token=token),
+                user_id,
+                auth_tests.TestingSessionLocal,
+            )
+        assert rejected.value.status_code == 401
+
+
+def test_password_change_revokes_pending_oidc_exchange_code():
+    auth_tests.setup_first_admin(password="old-password-123")
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        code = oidc_google._create_exchange_code(user.id, user.session_epoch)
+    _change_password_in_separate_session("change")
+    with auth_tests.TestingSessionLocal() as session:
+        with pytest.raises(HTTPException) as error:
+            oidc_google.google_oidc_exchange(
+                oidc_google.OidcExchangeRequest(code=code), session
+            )
+        assert error.value.status_code == 400
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        current_code = oidc_google._create_exchange_code(user.id, user.session_epoch)
+        response = oidc_google.google_oidc_exchange(
+            oidc_google.OidcExchangeRequest(code=current_code), session
+        )
+        assert get_user_from_token(response["access_token"], session) is not None
+
+
+def test_login_preserves_atomic_legacy_password_upgrade():
+    auth_tests.setup_first_admin(password="old-password-123")
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        user.password_hash = hashlib.sha256(b"old-password-123").hexdigest()
+        session.commit()
+    response = auth._login_in_worker(
+        auth.LoginRequest(username="administrator", password="old-password-123"),
+        auth_tests.TestingSessionLocal,
+    )
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        assert user.password_hash.startswith("$2")
+        assert auth.verify_password("old-password-123", user.password_hash)
+        assert user.refresh_token == response["refresh_token"]
+
+
+def test_login_checks_session_version_even_when_password_hash_is_unchanged(monkeypatch):
+    auth_tests.setup_first_admin(password="old-password-123")
+    original = auth._prepare_login_response
+
+    def prepare_then_rotate(*args):
+        response = original(*args)
+        with auth_tests.TestingSessionLocal() as session:
+            session.query(User).update(
+                {User.session_epoch: "new-generation", User.refresh_token: None}
+            )
+            session.commit()
+        return response
+
+    monkeypatch.setattr(auth, "_prepare_login_response", prepare_then_rotate)
+    with pytest.raises(HTTPException) as error:
+        auth._login_in_worker(
+            auth.LoginRequest(username="administrator", password="old-password-123"),
+            auth_tests.TestingSessionLocal,
+        )
+    assert error.value.status_code == 401
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        assert user.session_epoch == "new-generation"
+        assert user.refresh_token is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["change", "reset"])
+@pytest.mark.parametrize("endpoint_name", ["chat", "builder", "preview", "progress"])
+@pytest.mark.parametrize("mode", ["idle", "command"])
+async def test_open_websocket_is_revoked_and_owned_work_is_drained(
+    monkeypatch, operation, endpoint_name, mode
+):
+    auth_tests.setup_first_admin(password="old-password-123")
+    tokens = auth._login_in_worker(
+        auth.LoginRequest(username="administrator", password="old-password-123"),
+        auth_tests.TestingSessionLocal,
+    )
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        user.password_reset_token_hash = auth.hash_password_reset_token("race-reset")
+        user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=5
+        )
+        session.commit()
+    incoming = asyncio.Queue()
+    await incoming.put({"type": "websocket.connect"})
+    accepted = asyncio.Event()
+    outgoing = []
+
+    async def send(message):
+        outgoing.append(message)
+        if message["type"] == "websocket.accept":
+            accepted.set()
+
+    websocket = WebSocket(
+        {"type": "websocket", "path": "/ws/test", "headers": []},
+        incoming.get,
+        send,
+    )
+    monkeypatch.setattr(
+        websocket_auth, "_SESSION_RECHECK_SECONDS", 0.01 if mode == "idle" else 3600
+    )
+    manager = MagicMock()
+    monkeypatch.setattr(websocket_api, "manager", manager)
+    monkeypatch.setattr(
+        websocket_api, "_private_websocket_task_access_sync", lambda **_: "authorized"
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+    chat_command = AsyncMock()
+    preview_command = AsyncMock()
+    monkeypatch.setattr(websocket_api, "handle_chat_message", chat_command)
+    monkeypatch.setattr(
+        websocket_api, "handle_build_preview_execution", preview_command
+    )
+    progress_manager = MagicMock()
+    progress_manager.get_task_progress.return_value = None
+    monkeypatch.setattr(progress_ws, "get_progress_manager", lambda: progress_manager)
+    broadcaster = MagicMock()
+    broadcaster.connect = AsyncMock()
+    broadcaster.disconnect = AsyncMock()
+    monkeypatch.setattr(progress_ws, "progress_broadcaster", broadcaster)
+    streaming = asyncio.Event()
+    drained = asyncio.Event()
+
+    async def stream_until_cancelled(*_):
+        streaming.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            drained.set()
+
+    monkeypatch.setattr(websocket_api, "handle_builder_chat", stream_until_cancelled)
+    endpoints = {
+        "chat": lambda: websocket_api.websocket_chat_endpoint(
+            websocket, 1, tokens["access_token"]
+        ),
+        "builder": lambda: websocket_api.websocket_builder_chat_endpoint(
+            websocket, tokens["access_token"]
+        ),
+        "preview": lambda: websocket_api.websocket_build_preview_endpoint(
+            websocket, tokens["access_token"]
+        ),
+        "progress": lambda: progress_ws.progress_websocket_endpoint(
+            websocket, "task", tokens["access_token"]
+        ),
+    }
+    handler = asyncio.create_task(endpoints[endpoint_name]())
+    try:
+        await asyncio.wait_for(accepted.wait(), timeout=5)
+        if endpoint_name == "builder" and mode == "idle":
+            await incoming.put(
+                {"type": "websocket.receive", "text": '{"message":"hello"}'}
+            )
+            await asyncio.wait_for(streaming.wait(), timeout=5)
+        await asyncio.to_thread(_change_password_in_separate_session, operation)
+        if mode == "command":
+            await incoming.put(
+                {
+                    "type": "websocket.receive",
+                    "text": '{"type":"preview"}'
+                    if endpoint_name == "preview"
+                    else '{"type":"chat","message":"hello"}',
+                }
+            )
+        await asyncio.wait_for(handler, timeout=5)
+    finally:
+        if not handler.done():
+            handler.cancel()
+        await asyncio.gather(handler, return_exceptions=True)
+    assert outgoing[-1] == {
+        "type": "websocket.close",
+        "code": 4001,
+        "reason": "Session expired",
+    }
+    if endpoint_name == "progress":
+        broadcaster.disconnect.assert_awaited_once()
+    elif endpoint_name == "builder":
+        assert drained.is_set() if mode == "idle" else not streaming.is_set()
+        assert websocket.state.chat_task is None
+    else:
+        manager.disconnect.assert_called_once_with(websocket)
+    chat_command.assert_not_awaited()
+    preview_command.assert_not_awaited()
+    assert not any(
+        task.get_name() == "websocket-session-monitor" for task in asyncio.all_tasks()
+    )

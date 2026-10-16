@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, cast
 
 from cryptography.fernet import Fernet, InvalidToken
+
+from ...config import get_environment, get_require_secure_secrets
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
@@ -169,11 +171,16 @@ ALLOWED_SQL_SCHEMES = {"postgresql", "mysql", "mariadb", "mssql", "sqlite"}
 
 
 def _build_fernet_key() -> bytes:
-    raw = (
-        os.getenv("XAGENT_SECRET_ENCRYPTION_KEY")
-        or os.getenv("SECRET_KEY")
-        or "xagent-dev-key"
-    )
+    raw = os.getenv("XAGENT_SECRET_ENCRYPTION_KEY") or os.getenv("SECRET_KEY")
+    if not raw:
+        environment = get_environment()
+        if environment != "development" or get_require_secure_secrets():
+            raise RuntimeError(
+                "XAGENT_SECRET_ENCRYPTION_KEY must be configured outside development"
+            )
+        # Keep local development convenient without allowing a predictable key
+        # to encrypt credentials in a deployed environment.
+        raw = "xagent-dev-key"
     digest = hashlib.sha256(raw.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 

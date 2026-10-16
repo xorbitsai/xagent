@@ -3,6 +3,7 @@
 import base64
 import hmac
 import importlib
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -62,6 +63,11 @@ def test_retained_sdk_signatures_remain_compatible(module_name, class_name, raw_
                 "id": "completion",
                 "created": 1,
                 "model": "test-model",
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
                 "choices": [
                     {
                         "index": 0,
@@ -73,10 +79,14 @@ def test_retained_sdk_signatures_remain_compatible(module_name, class_name, raw_
         )
 
     with httpx.Client(transport=httpx.MockTransport(send)) as transport:
-        client = getattr(importlib.import_module(module_name), class_name)(
-            api_key=f"test-id.{secret}",
-            http_client=transport,
-            disable_token_cache=raw_key,
+        client_type = getattr(importlib.import_module(module_name), class_name)
+        options = {}
+        if "disable_token_cache" in inspect.signature(client_type).parameters:
+            options["disable_token_cache"] = raw_key
+        elif raw_key:
+            pytest.skip("This locked SDK version only supports signed credentials")
+        client = client_type(
+            api_key=f"test-id.{secret}", http_client=transport, **options
         )
         result = client.chat.completions.create(
             model="test-model", messages=[{"role": "user", "content": "test"}]

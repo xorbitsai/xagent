@@ -5257,6 +5257,12 @@ class BackgroundTaskManager:
 
         return task is not None and task in self._explicitly_cancelled
 
+    @property
+    def shutting_down(self) -> bool:
+        """Whether ``shutdown`` has started cancelling the owned tasks."""
+
+        return self._shutting_down
+
     async def shutdown(self) -> None:
         """Fence new work, cancel every owned task, and drain its cleanup."""
 

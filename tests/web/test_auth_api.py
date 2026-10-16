@@ -1807,14 +1807,15 @@ class TestAuthAPI:
             == "If the email exists, a password reset link has been sent"
         )
         assert sent_payload["to_email"] == test_user_data["email"]
-        assert (
-            sent_payload["reset_link"].startswith(
-                "https://app.example.com/reset-password?token="
-            )
-            is True
+        assert sent_payload["reset_link"].startswith(
+            "https://app.example.com/reset-password#token="
         )
+        assert urlparse(sent_payload["reset_link"]).query == ""
 
-        token = sent_payload["reset_link"].split("token=", 1)[1]
+        token = parse_qs(urlparse(sent_payload["reset_link"]).fragment).get(
+            "token", [""]
+        )[0]
+        assert token
         reset_response = client.post(
             "/api/auth/reset-password",
             json={"token": token, "new_password": "newpassword123"},
@@ -1889,7 +1890,8 @@ class TestAuthAPI:
         assert parsed_link.scheme == "https"
         assert parsed_link.netloc == "trusted.example"
         assert parsed_link.path == "/app/reset-password"
-        assert "token" in parse_qs(parsed_link.query)
+        assert parsed_link.query == ""
+        assert "token" in parse_qs(parsed_link.fragment)
 
     def test_forgot_password_delivery_failure_returns_generic_success(
         self, test_db, test_user_data, monkeypatch, caplog

@@ -50,6 +50,7 @@ from xagent.web.services import (
 from xagent.web.services.task_auto_resume import (
     check_auto_resume_claim_sync,
     run_auto_resume_tick,
+    status_only_terminal_view,
 )
 from xagent.web.services.task_command_execution import ResumeCommandOutcome
 from xagent.web.services.task_command_transport import SettledTaskCommand
@@ -380,6 +381,56 @@ def test_rejected_start_after_supersede_leaves_the_task_paused(factory, monkeypa
     assert [c for c in _snapshot(factory, tid)["commands"] if c[0] == "resume"] == []
 
 
+@pytest.mark.parametrize("outcome", ["start_pending", "start_runs", "start_rejected"])
+@pytest.mark.parametrize(
+    "row", ["scheduled", "exhausted", "dispatch_failed", "manual_disabled"]
+)
+def test_append_outcomes_project(factory, monkeypatch, row, outcome):
+    """What a status-only caller reads after its append: ``paused`` while the
+    START is queued, the turn's own status once it runs, and ``failed`` if the
+    START is rejected (nothing will resume the task and the message was not
+    delivered). The same on a row automatic resume had already stopped, where
+    a rejected START reads the new-message text with the row's own state."""
+    tid = _seed(
+        factory,
+        source="sdk",
+        row="manual" if row == "manual_disabled" else row,
+    )
+    if row == "manual_disabled":
+        with factory() as db:
+            db.get(TaskAutoRecovery, tid).state_detail = "auto_resume_disabled"
+            db.commit()
+    prepared = _accept(factory, tid)
+
+    def read():
+        with factory() as db:
+            return status_only_terminal_view(db, tid)
+
+    if outcome == "start_pending":
+        assert read() is None
+        assert _snapshot(factory, tid)["task"][0] == TaskStatus.PAUSED
+        return
+    if outcome == "start_runs":
+        _hand_off_start(factory, tid, prepared.command_db_id)
+        assert read() is None
+        assert _snapshot(factory, tid)["task"][0] == TaskStatus.RUNNING
+        return
+    monkeypatch.setattr(
+        task_start_consumer, "command_identity_matches_task", lambda *_a: False
+    )
+    _hand_off_start(factory, tid, prepared.command_db_id)
+
+    view = read()
+    assert view is not None
+    assert (view.state, view.error) == (
+        # A pending resume is replaced by a ``manual`` row; a stopped row
+        # keeps its own state.
+        "manual" if row in {"scheduled", "manual_disabled"} else row,
+        "Task failed: the new message could not be started.",
+    )
+    assert _snapshot(factory, tid)["task"][0] == TaskStatus.PAUSED
+
+
 # --------------------------------------------------------------------------
 # Scope: only a pending resume of a status-only source, in shared mode
 # --------------------------------------------------------------------------
@@ -602,6 +653,7 @@ def test_recovery_state_writers():
     assert writers == {
         "_give_up_no_commit",
         "_process_due_candidate_no_commit",
+        "_record_status_only_fallback_no_commit",
         "_reschedule_dispatched_no_commit",
         "record_interruption_no_commit",
     }

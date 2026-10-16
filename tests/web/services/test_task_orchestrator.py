@@ -59,6 +59,7 @@ from xagent.web.models.trigger import (
     TriggerType,
 )
 from xagent.web.models.user import User
+from xagent.web.models.user_channel import UserChannel
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
 from xagent.web.services.assistant_history_safety import (
@@ -84,6 +85,10 @@ from xagent.web.services.connector_runtime import (
     get_ephemeral_runtime_values,
     pop_ephemeral_runtime_values,
     store_ephemeral_runtime_values,
+)
+from xagent.web.services.external_task_cancel import (
+    EXTERNAL_TASK_SOURCE,
+    EXTERNAL_TURN_INTERRUPTED_MESSAGE,
 )
 from xagent.web.services.llm_utils import AutoModelUnavailableError
 from xagent.web.services.mcp_runtime import (
@@ -4359,6 +4364,296 @@ async def test_runner_finalize_preserves_cancellation_from_reconcile(
     db_session.expire_all()
     stored = db_session.query(Task).filter(Task.id == task.id).one()
     assert stored.runner_id is None
+
+
+def _shutdown_handoff_fixture(
+    db_session,
+    monkeypatch,
+    *,
+    turn_id: str,
+    source: str = "internal",
+    switch: str | None = "true",
+    host_shutting_down: bool = True,
+):
+    """A RUNNING turn whose run the next await cancels, as a shutdown would."""
+    if switch is None:
+        monkeypatch.delenv("XAGENT_SHUTDOWN_HANDOFF_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("XAGENT_SHUTDOWN_HANDOFF_ENABLED", switch)
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_host_shutdown_in_progress",
+        lambda: host_shutting_down,
+    )
+    user, task, payload, lease = _finalize_turn_fixture(db_session, turn_id=turn_id)
+    task.source = source
+    db_session.commit()
+    return user, task, payload, lease
+
+
+async def _run_cancelled_turn(task, user, payload, lease, *, user_cancel=False):
+    from xagent.web.services.task_execution import background_task_manager
+
+    with (
+        _finalize_runner_patches(
+            lease, execute=AsyncMock(side_effect=asyncio.CancelledError())
+        ),
+        patch.object(
+            background_task_manager,
+            "cancel_was_requested",
+            return_value=user_cancel,
+        ),
+    ):
+        bg_task = _spawn_finalize_runner(task, user, payload)
+        with pytest.raises(asyncio.CancelledError):
+            await bg_task
+
+
+def _stored_task(db_session, task_id: int) -> Task:
+    db_session.expire_all()
+    return db_session.query(Task).filter(Task.id == task_id).one()
+
+
+def _assert_lease_retained(db_session, task: Task, turn_id: str) -> None:
+    stored = _stored_task(db_session, int(task.id))
+    assert stored.status == TaskStatus.RUNNING
+    assert stored.runner_id == "test-runner"
+    assert stored.lease_attempt_id == "test-attempt"
+    assert stored.run_id == "run-a"
+    assert stored.error_message is None
+    # Lease recovery closes the orphaned delivery row, as for any deferral.
+    assert _delivery_status(db_session, turn_id) == DELIVERY_PENDING
+
+
+def _assert_settled_cancelled(
+    db_session, task: Task, *, error_message: str = "task execution cancelled"
+) -> None:
+    stored = _stored_task(db_session, int(task.id))
+    assert stored.status == TaskStatus.FAILED
+    assert stored.runner_id is None
+    assert stored.error_message == error_message
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_hands_eligible_run_to_lease_recovery(
+    db_session, monkeypatch
+) -> None:
+    """A host shutdown leaves an auto-resumable run RUNNING under its exact
+    lease, so lease recovery pauses it and automatic resume continues it."""
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-handoff"
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_lease_retained(db_session, task, "turn-shutdown-handoff")
+
+
+@pytest.mark.asyncio
+async def test_user_cancel_during_shutdown_still_settles(
+    db_session, monkeypatch
+) -> None:
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-user-cancel"
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease, user_cancel=True)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sdk", "a2a", "widget", "shared_link"])
+async def test_shutdown_cancel_settles_sources_auto_recovery_excludes(
+    db_session, monkeypatch, source
+) -> None:
+    """Callers that own their stop protocol, and SDK callers that only read
+    the status (automatic recovery would resume an SDK task after a crash),
+    still get a terminal state now."""
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session,
+        monkeypatch,
+        turn_id=f"turn-shutdown-{source}",
+        source=source,
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_settles_external_task_with_visitor_message(
+    db_session, monkeypatch
+) -> None:
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session,
+        monkeypatch,
+        turn_id="turn-shutdown-external",
+        source=EXTERNAL_TASK_SOURCE,
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(
+        db_session, task, error_message=EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_settles_channel_task(db_session, monkeypatch) -> None:
+    """Channel tasks keep failing at shutdown, even where automatic recovery
+    would resume them (shared execution)."""
+    monkeypatch.setattr(
+        "xagent.web.services.task_auto_recovery.get_shared_task_execution_enabled",
+        lambda: True,
+    )
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-channel"
+    )
+    channel = UserChannel(
+        user_id=user.id, channel_type="slack", channel_name="ops", config={}
+    )
+    db_session.add(channel)
+    db_session.flush()
+    task.channel_id = int(channel.id)
+    db_session.commit()
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_settles_preview_task(db_session, monkeypatch) -> None:
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-preview"
+    )
+    task.is_visible = False
+    db_session.commit()
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_does_not_retain_a_row_another_writer_settled(
+    db_session, monkeypatch
+) -> None:
+    """A row that already left RUNNING (a pause that landed while the host was
+    going down) is not left under the cancelled run's lease."""
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-already-paused"
+    )
+    task.status = TaskStatus.PAUSED
+    db_session.commit()
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    stored = _stored_task(db_session, int(task.id))
+    assert stored.status == TaskStatus.PAUSED
+    assert stored.runner_id is None
+    assert stored.lease_attempt_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("switch", [None, "false"])
+async def test_shutdown_cancel_settles_when_switch_off(
+    db_session, monkeypatch, switch
+) -> None:
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session,
+        monkeypatch,
+        turn_id="turn-shutdown-switch-off",
+        switch=switch,
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancel_settles_when_auto_resume_off(
+    db_session, monkeypatch
+) -> None:
+    """Nothing would resume the paused run, so it fails as before."""
+    monkeypatch.setenv("XAGENT_TASK_AUTO_RESUME_ENABLED", "false")
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-auto-resume-off"
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_cancel_outside_shutdown_settles_with_switch_on(
+    db_session, monkeypatch
+) -> None:
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session,
+        monkeypatch,
+        turn_id="turn-cancel-no-shutdown",
+        host_shutting_down=False,
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_handoff_check_failure_settles(db_session, monkeypatch) -> None:
+    user, task, payload, lease = _shutdown_handoff_fixture(
+        db_session, monkeypatch, turn_id="turn-shutdown-check-fails"
+    )
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_shutdown_handoff_eligible_sync",
+        MagicMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    await _run_cancelled_turn(task, user, payload, lease)
+
+    _assert_settled_cancelled(db_session, task)
+
+
+@pytest.mark.asyncio
+async def test_host_shutdown_in_progress_follows_both_shutdown_paths(
+    monkeypatch,
+) -> None:
+    """Shared coordination cancels runs while closing its coordinators, before
+    the background task manager's own shutdown starts."""
+    from types import SimpleNamespace
+
+    from xagent.web.services import task_coordinator_runtime
+    from xagent.web.services.task_execution import background_task_manager
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(background_task_manager, "_shutting_down", False)
+    monkeypatch.setattr(task_coordinator_runtime, "_registry", None)
+    assert task_orchestrator_module._host_shutdown_in_progress() is False
+
+    monkeypatch.setattr(
+        task_coordinator_runtime,
+        "_registry",
+        SimpleNamespace(_close_task=None, loop=loop),
+    )
+    assert task_orchestrator_module._host_shutdown_in_progress() is False
+
+    monkeypatch.setattr(
+        task_coordinator_runtime,
+        "_registry",
+        SimpleNamespace(_close_task=object(), loop=loop),
+    )
+    assert task_orchestrator_module._host_shutdown_in_progress() is True
+
+    monkeypatch.setattr(task_coordinator_runtime, "_registry", None)
+    monkeypatch.setattr(background_task_manager, "_shutting_down", True)
+    assert task_orchestrator_module._host_shutdown_in_progress() is True
 
 
 @pytest.mark.parametrize(

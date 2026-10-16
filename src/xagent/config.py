@@ -59,6 +59,7 @@ TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECO
 TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
 TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
@@ -560,6 +561,26 @@ def get_task_auto_resume_enabled() -> bool:
     """
 
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_shutdown_handoff_enabled() -> bool:
+    """Whether a shutdown hands eligible running tasks to lease recovery.
+
+    Off, a host shutting down cancels its runs and fails them immediately.
+    On, a run the shutdown cancelled (not one a user cancelled) whose task
+    is eligible for automatic recovery keeps its lease instead: lease
+    recovery pauses it once the lease expires and automatic resume picks it
+    up, exactly as after a crash. Only takes effect while
+    :func:`get_task_auto_resume_enabled` is on. Channel tasks, status-only
+    (SDK) tasks and the sources automatic recovery excludes still fail
+    immediately.
+
+    Priority:
+        1. XAGENT_SHUTDOWN_HANDOFF_ENABLED environment variable
+        2. False
+    """
+
+    return _get_strict_bool_env(SHUTDOWN_HANDOFF_ENABLED, False)
 
 
 def get_task_auto_resume_poll_seconds() -> int:
@@ -2264,6 +2285,48 @@ def validate_encryption_config() -> None:
         return
     validate_private_encryption_key(os.getenv(ENCRYPTION_KEY))
     get_tool_credentials_encryption_key()
+
+
+AUTH_RATE_LIMIT_WINDOW_SECONDS = "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS"
+AUTH_LOGIN_IP_LIMIT = "XAGENT_AUTH_LOGIN_IP_LIMIT"
+AUTH_LOGIN_ACCOUNT_LIMIT = "XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT"
+AUTH_LOGIN_PAIR_LIMIT = "XAGENT_AUTH_LOGIN_PAIR_LIMIT"
+AUTH_RECOVERY_IP_LIMIT = "XAGENT_AUTH_RECOVERY_IP_LIMIT"
+AUTH_RECOVERY_EMAIL_LIMIT = "XAGENT_AUTH_RECOVERY_EMAIL_LIMIT"
+AUTH_RECOVERY_PAIR_LIMIT = "XAGENT_AUTH_RECOVERY_PAIR_LIMIT"
+AUTH_RATE_LIMIT_MAX_LOCAL_KEYS = "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS"
+
+
+def get_auth_rate_limit_window_seconds() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_WINDOW_SECONDS, 900)
+
+
+def get_auth_login_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_IP_LIMIT, 200)
+
+
+def get_auth_login_account_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_ACCOUNT_LIMIT, 50)
+
+
+def get_auth_login_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_PAIR_LIMIT, 5)
+
+
+def get_auth_recovery_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_IP_LIMIT, 200)
+
+
+def get_auth_recovery_email_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_EMAIL_LIMIT, 50)
+
+
+def get_auth_recovery_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_PAIR_LIMIT, 5)
+
+
+def get_auth_rate_limit_max_local_keys() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_MAX_LOCAL_KEYS, 10_000)
 
 
 def get_oidc_login_ttl_seconds() -> int:

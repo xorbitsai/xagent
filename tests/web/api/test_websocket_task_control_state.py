@@ -21,6 +21,8 @@ from xagent.web.models.user import User
 
 
 class _BlockingWebSocket:
+    query_params = SimpleNamespace(getlist=lambda key: [])
+
     def __init__(self) -> None:
         self.receive_started = asyncio.Event()
         self.accepted = False

@@ -616,14 +616,30 @@ class TaskInfoResponse(BaseModel):
         ...,
         description=(
             "One of: pending / running / paused / waiting_for_user / "
-            "completed / failed."
+            "completed / failed. A task whose automatic resume gave up is "
+            "reported as failed even though it is stored as paused; that "
+            "failed can change later if the task is resumed by hand or a "
+            "message is appended."
         ),
     )
     run_id: Optional[str] = Field(None, description="Current execution run identity.")
     state_version: int = Field(
-        0, description="Monotonic version of the task control state."
+        0,
+        description=(
+            "Monotonic version of the task's stored control state. A derived "
+            "failed (see status) does not change it: status and control_state "
+            "can go from paused to failed and back at the same run_id and "
+            "state_version, so do not detect status changes by this field "
+            "alone."
+        ),
     )
-    control_state: str = Field("idle", description="Detailed task control state.")
+    control_state: str = Field(
+        "idle",
+        description=(
+            "Detailed task control state. Reported as failed together with "
+            "status when the failure is derived (see status)."
+        ),
+    )
     input: Optional[str] = Field(
         None,
         description="Latest-turn user input. Null if no message yet recorded.",
@@ -637,14 +653,18 @@ class TaskInfoResponse(BaseModel):
     )
     error: Optional[str] = Field(
         None,
-        description="Last failure reason when status='failed'.",
+        description=(
+            "Last failure reason when status='failed'. For a derived failed, "
+            "a fixed text saying why automatic resume stopped."
+        ),
     )
     created_at: datetime
     completed_at: Optional[datetime] = Field(
         None,
         description=(
             "UTC timestamp when the task reached a terminal state "
-            "(completed or failed). Null while still running."
+            "(completed or failed). Null while still running. For a "
+            "derived failed, when automatic resume stopped."
         ),
     )
     pending_interaction: Optional[PendingInteraction] = Field(

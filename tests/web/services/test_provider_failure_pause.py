@@ -138,6 +138,7 @@ from xagent.web.services.task_auto_recovery import (
 from xagent.web.services.task_auto_resume import (
     TASK_AUTO_RESUME_EXHAUSTED_TRIGGER_ERROR,
     auto_resume_command_id,
+    status_only_terminal_view,
 )
 from xagent.web.services.task_execution import (
     _acquire_resume_task_lease,
@@ -852,6 +853,15 @@ async def _settle_status_only(path: str, factory, ids, lease, reason: str) -> No
         _settle_result(path, factory, ids, lease, RESULTS[reason])
 
 
+async def _settle_or_defer(path: str, factory, ids, lease, reason: str) -> bool:
+    """Settle the run; whether settlement was deferred to TTL recovery."""
+    try:
+        await _settle_status_only(path, factory, ids, lease, reason)
+    except InterruptionSettlementDeferred:
+        return True
+    return False
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("db", ["ok", "unavailable_during_eligibility"])
 @pytest.mark.parametrize("path", ["result", "resumed_result", "channel", "exception"])
@@ -861,9 +871,12 @@ async def _settle_status_only(path: str, factory, ids, lease, reason: str) -> No
 async def test_status_only_settlement(
     canonical, monkeypatch, auto, infra, reason, path, db
 ):
-    """An SDK task's interruption settles FAILED with its own error, whatever
-    the switches, exactly like an A2A task, and the verdict never reads the
-    database (so a connectivity failure cannot defer it)."""
+    """With automatic resume off, an SDK task's interruption settles FAILED
+    with its own error exactly like an A2A task, and the verdict never reads
+    the database (so a connectivity failure cannot defer it). With it on, the
+    task settles exactly like an internal task under the same switches and
+    the same database failure: paused unless the infra switch is false, and
+    deferred when eligibility cannot be read."""
 
     monkeypatch.setenv(AUTO_RESUME_SWITCH, "true" if auto == "on" else "false")
     if infra == "unset":
@@ -873,7 +886,7 @@ async def test_status_only_settlement(
     factory, _tid = canonical
     sdk, baseline = (
         _projected_task(factory, source="sdk"),
-        _projected_task(factory, source="a2a"),
+        _projected_task(factory, source="a2a" if auto == "off" else "internal"),
     )
     sdk_lease = _prepare_run(factory, sdk)
     baseline_lease = _prepare_run(factory, baseline)
@@ -881,20 +894,59 @@ async def test_status_only_settlement(
     with monkeypatch.context() as m:
         if db != "ok":
             _break_decision(m, "eligibility", _connection_reset())
-        await _settle_status_only(path, factory, sdk, sdk_lease, reason)
-    await _settle_status_only(path, factory, baseline, baseline_lease, reason)
+        sdk_deferred = await _settle_or_defer(path, factory, sdk, sdk_lease, reason)
+        if auto == "on":
+            baseline_deferred = await _settle_or_defer(
+                path, factory, baseline, baseline_lease, reason
+            )
+    if auto == "off":
+        baseline_deferred = await _settle_or_defer(
+            path, factory, baseline, baseline_lease, reason
+        )
+        assert (sdk_deferred, baseline_deferred) == (False, False)
 
     projection = _full_projection(factory, sdk, sdk_lease)
-    assert projection == _full_projection(factory, baseline, baseline_lease)
-    assert projection["status"] == TaskStatus.FAILED
-    assert projection["runner_id"] is None
+    other = _full_projection(factory, baseline, baseline_lease)
+    if projection["status"] == TaskStatus.RUNNING:
+        # Two runs hold their own lease identity and expiry while RUNNING; a
+        # settled run holds none, and the baseline must agree on that.
+        for key in ("lease_attempt_id", "lease_expires_at"):
+            projection.pop(key, None)
+            other.pop(key, None)
+    assert projection == other
+    assert sdk_deferred == baseline_deferred
     _task, row, _events = _state(factory, sdk["task"])
-    if db == "ok":
-        assert (row.reason, row.state) == (reason, "manual")
+    _task, baseline_row, _events = _state(factory, baseline["task"])
+    shape = None if row is None else (row.reason, row.state)
+    if auto == "on":
+        # The same row as an internal task's, the `disabled` label included.
+        assert shape == (
+            None if baseline_row is None else (baseline_row.reason, baseline_row.state)
+        )
+    if auto == "off":
+        assert projection["status"] == TaskStatus.FAILED
+        assert projection["runner_id"] is None
+        if db == "ok":
+            assert shape == (reason, "manual")
+        else:
+            # The recorder reads eligibility inside its own SAVEPOINT; a
+            # connectivity failure there skips the row, never the settlement.
+            assert row is None
     else:
-        # The recorder reads eligibility inside its own SAVEPOINT; a
-        # connectivity failure there skips the row, never the settlement.
-        assert row is None
+        pauses = infra != "false"
+        if not pauses:
+            assert projection["status"] == TaskStatus.FAILED
+            assert not sdk_deferred
+            if db == "ok":
+                assert shape == (reason, "disabled")
+        elif db != "ok":
+            # Eligibility cannot be read: the run keeps its lease for TTL
+            # recovery (the exception path reports it without raising).
+            assert sdk_deferred == (path != "exception")
+            assert projection["status"] == TaskStatus.RUNNING
+        else:
+            assert projection["status"] == TaskStatus.PAUSED
+            assert shape == (reason, "scheduled")
 
 
 @pytest.mark.parametrize(
@@ -1163,6 +1215,72 @@ def test_recording_failure_does_not_change_the_pause(
     assert left["status"] == TaskStatus.PAUSED
     assert left["trigger_run"][1] == TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR
     assert _state(factory, unrecorded["task"])[1:] == (None, [])
+
+
+@PAUSE_CASES
+@pytest.mark.parametrize("failure", ["python", "database", "marker"])
+def test_status_only_recording_failure_reads_failed(
+    canonical, monkeypatch, path, reason, failure
+):
+    """When recording an SDK task's pause fails, a minimal ``manual`` row is
+    written in its place, so the task's ``/v1`` read reports ``failed``
+    instead of waiting on a run nothing will resume."""
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory, source="sdk")
+    lease = _prepare_run(factory, ids)
+
+    with monkeypatch.context() as m:
+        _fail_recording(m, failure)
+        _settle_result(path, factory, ids, lease, RESULTS[reason])
+
+    task, row, _events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert (row.reason, row.state, row.state_detail) == (reason, "manual", None)
+    assert (row.run_id, row.paused_state_version) == (task.run_id, task.state_version)
+    assert row.next_attempt_at is None
+    with factory() as db:
+        view = status_only_terminal_view(db, ids["task"])
+    assert view is not None
+    assert (view.state, view.error) == (
+        "manual",
+        "Task failed after a system interruption; "
+        f"automatic resume will not continue it (reason: {reason}).",
+    )
+
+
+@PAUSE_CASES
+def test_status_only_fallback_failure_settles_without_a_row(
+    canonical, monkeypatch, path, reason
+):
+    monkeypatch.setenv(AUTO_RESUME_SWITCH, "true")
+    factory, _tid = canonical
+    ids = _projected_task(factory, source="sdk")
+    lease = _prepare_run(factory, ids)
+    real = task_auto_recovery._record_status_only_fallback_no_commit
+
+    def fallback_with_a_broken_read(db, **kwargs):
+        def broken(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("fallback row read failed")
+
+        db.get = broken  # type: ignore[method-assign]
+        try:
+            return real(db, **kwargs)
+        finally:
+            del db.get
+
+    with monkeypatch.context() as m:
+        _fail_recording(m, "python")
+        m.setattr(
+            task_auto_recovery,
+            "_record_status_only_fallback_no_commit",
+            fallback_with_a_broken_read,
+        )
+        _settle_result(path, factory, ids, lease, RESULTS[reason])
+
+    task, row, events = _state(factory, ids["task"])
+    assert (task.status, task.control_state) == (TaskStatus.PAUSED, "paused")
+    assert (row, events) == (None, [])
 
 
 @PAUSE_CASES

@@ -11,6 +11,8 @@ import os
 import signal
 import socket
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -514,16 +516,28 @@ class SharedExecutionApp:
         assert not failures, "\n".join(failures) + "\n" + self.diagnostics()
 
 
-@pytest.fixture
-def shared_app(tmp_path, monkeypatch, request):
+@contextmanager
+def open_shared_app(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    database_url: str,
+    host_database_url: str | None = None,
+    event_read_acceptance: bool = False,
+) -> Iterator[SharedExecutionApp]:
+    """A web host and a worker on ``database_url``, closed on exit.
+
+    The hosts reach the database through ``host_database_url`` when given;
+    this process always uses ``database_url`` directly.
+    """
     from xagent.web.models.database import get_engine, get_session_local, init_db
     from xagent.web.models.user import User
 
     root = tmp_path / "hosts"
     root.mkdir()
-    if getattr(request, "param", 1) == 2:
+    if event_read_acceptance:
         (root / "event-read-acceptance").touch()
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'shared.db'}")
+    monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "false")
     monkeypatch.setenv("XAGENT_TASK_LEASE_TTL_SECONDS", "10")
@@ -533,25 +547,39 @@ def shared_app(tmp_path, monkeypatch, request):
     monkeypatch.setenv("XAGENT_TRIGGER_DISPATCHER_STARTUP_JITTER_SECONDS", "0")
     monkeypatch.setenv("XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED", "false")
     init_db()
-    with get_session_local()() as db:
-        user = User(username="e2e-owner", password_hash="unused", is_admin=True)
-        db.add(user)
-        db.commit()
-        user_id = user.id
-    app = SharedExecutionApp(
-        root,
-        dict(os.environ),
-        build_access_token(username="e2e-owner", user_id=user_id),
-        user_id,
-    )
     try:
-        app.start_all("web", "worker")
-        yield app
-    finally:
+        with get_session_local()() as db:
+            user = User(username="e2e-owner", password_hash="unused", is_admin=True)
+            db.add(user)
+            db.commit()
+            user_id = user.id
+        environment = dict(os.environ)
+        if host_database_url is not None:
+            environment["DATABASE_URL"] = host_database_url
+        app = SharedExecutionApp(
+            root,
+            environment,
+            build_access_token(username="e2e-owner", user_id=user_id),
+            user_id,
+        )
         try:
-            app.close()
+            app.start_all("web", "worker")
+            yield app
         finally:
-            get_engine().dispose()
+            app.close()
+    finally:
+        get_engine().dispose()
+
+
+@pytest.fixture
+def shared_app(tmp_path, monkeypatch, request):
+    with open_shared_app(
+        tmp_path,
+        monkeypatch,
+        database_url=f"sqlite:///{tmp_path / 'shared.db'}",
+        event_read_acceptance=getattr(request, "param", 1) == 2,
+    ) as app:
+        yield app
 
 
 def receive_event(ws, event_type):

@@ -1,81 +1,15 @@
 """Disconnect only this application's real Redis sockets, then reconnect."""
 
 import json
-import select
-import socket
-import socketserver
-import threading
 import time
-from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 from websockets.sync.client import connect
 
 from tests.e2e.shared_execution_harness import receive_event
+from tests.e2e.tcp_link import ControllableTcpLink
 
 pytestmark = pytest.mark.e2e
-
-
-class _RedisConnection(socketserver.BaseRequestHandler):
-    def handle(self):
-        proxy = self.server
-        if not proxy.enabled.is_set():
-            return
-        upstream = socket.create_connection(proxy.upstream, timeout=3)
-        upstream.settimeout(None)
-        peers = [self.request, upstream]
-        with proxy.lock:
-            proxy.peers.update(peers)
-        try:
-            while proxy.enabled.is_set():
-                ready, _, _ = select.select(peers, [], [], 0.1)
-                for source in ready:
-                    data = source.recv(65536)
-                    if not data:
-                        return
-                    destination = upstream if source is self.request else self.request
-                    destination.sendall(data)
-        except (OSError, ValueError):
-            pass  # A cut deliberately closes active sockets from another thread.
-        finally:
-            with proxy.lock:
-                proxy.peers.difference_update(peers)
-            upstream.close()
-
-
-class _RedisProxy(socketserver.ThreadingTCPServer):
-    daemon_threads = True
-
-    def __init__(self, url):
-        parsed = urlsplit(url)
-        self.upstream = (parsed.hostname, parsed.port or 6379)
-        self.enabled = threading.Event()
-        self.enabled.set()
-        self.lock = threading.Lock()
-        self.peers = set()
-        super().__init__(("127.0.0.1", 0), _RedisConnection)
-        credentials = parsed.netloc.rpartition("@")[0]
-        authority = f"127.0.0.1:{self.server_address[1]}"
-        if credentials:
-            authority = credentials + "@" + authority
-        self.url = urlunsplit(parsed._replace(netloc=authority))
-        self.thread = threading.Thread(target=self.serve_forever, daemon=True)
-        self.thread.start()
-
-    def cut(self):
-        self.enabled.clear()
-        with self.lock:
-            for peer in self.peers:
-                try:
-                    peer.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-    def close(self):
-        self.cut()
-        self.shutdown()
-        self.thread.join(5)
-        self.server_close()
 
 
 def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
@@ -93,7 +27,7 @@ def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
     app.client.close()
     app.processes.clear()
     app.pipes.clear()
-    proxy = _RedisProxy(app.environment["XAGENT_REDIS_URL"])
+    proxy = ControllableTcpLink(app.environment["XAGENT_REDIS_URL"], default_port=6379)
     try:
         app.environment["XAGENT_REDIS_URL"] = proxy.url
         app.start_all("web", "worker")
@@ -127,7 +61,7 @@ def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
             (app.root / "model-release").touch()
             completed = app.wait_task(task_id)
             assert "Shared E2E answer" in completed["output"]
-            proxy.enabled.set()
+            proxy.restore()
             receive_event(ws, "stream_resync_required")
         with connect(url) as ws:
             snapshot, _ = receive_event(ws, "historical_data_complete")
@@ -142,7 +76,7 @@ def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
         ]
         assert len(calls) == 1
     finally:
-        proxy.enabled.set()
+        proxy.restore()
         try:
             app.close()
         finally:

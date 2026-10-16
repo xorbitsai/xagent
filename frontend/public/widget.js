@@ -12,6 +12,15 @@
   };
   var SESSION_RETRY_AFTER_FALLBACK_MS = 1000;
   var SESSION_REFRESH_THRESHOLD_MS = 60000;
+  // How long a Session connection must stay open before rapidRecoveries resets.
+  // beginStability only times this from session_connection_open; it never
+  // looks at frames. Once the Session server confirms heartbeats, the iframe
+  // declares a connection dead after 30 s without a frame (use-websocket
+  // DEAD_AFTER_MS), so staying open for twice that span implies frames arrived.
+  // Until the server confirms heartbeats, the trade-off is that a link dropping
+  // 15-60 s after opening, which a 15 s window would treat as stable, also
+  // counts toward the rapid-recovery breaker.
+  var SESSION_STABLE_CONNECTION_MS = 60000;
   var SESSION_ERROR_CODES = {
     grant_malformed: true,
     signature_invalid: true,
@@ -1397,7 +1406,7 @@
         state.awaitedDeliveryId = null;
         state.stableDeliveryId = deliveryId;
         state.rapidRecoveries = 0;
-      }, 15000);
+      }, SESSION_STABLE_CONNECTION_MS);
       state.stabilityTimer = timer;
     }
 

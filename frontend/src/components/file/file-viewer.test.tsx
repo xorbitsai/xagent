@@ -1,5 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
+import { renderToString } from "react-dom/server"
 import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
@@ -25,6 +26,52 @@ describe("FileViewer HTML preview", () => {
     vi.clearAllMocks()
   })
 
+  it("declares the scripts-only opaque-origin sandbox contract", () => {
+    render(
+      <FileViewer
+        fileName="untrusted.html"
+        fileId="untrusted-file"
+        content={'<p>Untrusted document</p>'}
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+    const iframe = screen.getByTitle("untrusted.html")
+    expect(iframe).toHaveAttribute("sandbox", "allow-scripts")
+    expect(iframe).toHaveAttribute("referrerpolicy", "no-referrer")
+  })
+
+  it("does not parse a browser document during server rendering", () => {
+    const parser = vi.spyOn(globalThis, "DOMParser").mockImplementation(() => {
+      throw new Error("DOMParser is browser-only")
+    })
+    try {
+      expect(() => renderToString(<FileViewer fileName="page.html" fileId="html-id"
+        content="<p>Preview</p>" isLoading={false} error={null} viewMode="preview" />)).not.toThrow()
+      expect(parser).not.toHaveBeenCalled()
+    } finally {
+      parser.mockRestore()
+    }
+  })
+
+  it("prepares untrusted HTML without creating a resource-loading DOM", () => {
+    const parser = vi.spyOn(globalThis, "DOMParser").mockImplementation(() => {
+      throw new Error("Do not materialize untrusted HTML in the app origin")
+    })
+    try {
+      render(<FileViewer fileName="page.html" fileId="html-id"
+        content={'<html lang="zh"><head><script src="https://example.com/app.js"></script></head><body><img src="https://example.com/pixel"></body></html>'}
+        isLoading={false} error={null} viewMode="preview" />)
+      const source = screen.getByTitle("page.html").getAttribute("srcdoc")!
+      expect(source).toContain('<html lang="zh">')
+      expect(source.indexOf('content="no-referrer"')).toBeLessThan(source.indexOf("<script"))
+      expect(parser).not.toHaveBeenCalled()
+    } finally {
+      parser.mockRestore()
+    }
+  })
+
   it("rewrites file id image sources to public preview URLs", () => {
     render(
       <FileViewer
@@ -39,8 +86,7 @@ describe("FileViewer HTML preview", () => {
 
     const iframe = screen.getByTitle("gallery.html")
 
-    expect(iframe).toHaveAttribute(
-      "srcdoc",
+    expect(iframe.getAttribute("srcdoc")).toContain(
       '<img src="http://api.local/api/files/public/preview/582e7b79-4de9-4905-b73b-7d5a70ad64fe">',
     )
   })
@@ -61,8 +107,7 @@ describe("FileViewer HTML preview", () => {
 
     const iframe = screen.getByTitle("gallery.html")
 
-    expect(iframe).toHaveAttribute(
-      "srcdoc",
+    expect(iframe.getAttribute("srcdoc")).toContain(
       '<img src="http://api.local/api/files/public/preview/582e7b79-4de9-4905-b73b-7d5a70ad64fe">',
     )
   })
@@ -81,10 +126,20 @@ describe("FileViewer HTML preview", () => {
 
     const iframe = screen.getByTitle("gallery.html")
 
-    expect(iframe).toHaveAttribute(
-      "srcdoc",
+    expect(iframe.getAttribute("srcdoc")).toContain(
       '<img src="http://api.local/api/files/public/preview/html-file-id?relative_path=.%2Fassets%2Fimage.png">',
     )
+  })
+
+  it("puts a single no-referrer policy before document subresources", () => {
+    render(<FileViewer fileName="page.html" fileId="html-file-id"
+      content={'<!doctype html><html><head><meta name="referrer" content="unsafe-url"><script src="https://example.com/script.js"></script></head><body><img src="https://example.com/image.png"></body></html>'}
+      isLoading={false} error={null} viewMode="preview" />)
+    const source = screen.getByTitle("page.html").getAttribute("srcdoc")!
+    const document = new DOMParser().parseFromString(source, "text/html")
+    expect(document.querySelectorAll('meta[name="referrer"]')).toHaveLength(1)
+    expect(document.head.firstElementChild?.outerHTML).toBe('<meta name="referrer" content="no-referrer">')
+    expect(source.indexOf('content="no-referrer"')).toBeLessThan(source.indexOf("<script"))
   })
 })
 

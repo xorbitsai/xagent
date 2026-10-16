@@ -823,3 +823,25 @@ A deployment layer registers a resolver with `xagent.web.services.task_retention
 ### Rollback
 
 Unregister the resolver (or stop registering it) and restart: the purge returns to the two variables alone. Rows already expired under a team's shorter period are not restored.
+
+## 2026-10-16 — SDK tasks: automatic resume after settlement interruptions, and a derived `failed` on `/v1`
+
+With automatic resume on, and `XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED` not set to `false`, a settlement interruption of an SDK task (`llm_unavailable`, a persistence failure, `model_output_invalid`) now pauses the task and resumes it automatically, as for other tasks. When automatic resume stops for good and nothing that could move the task is queued, the `/v1` reads report the task as `failed`; the task stays stored as `paused`.
+
+### Client-visible changes
+
+- `GET /v1/chat/tasks/{task_id}` and `GET /v1/chat/tasks/{task_id}/events` report `status` and `control_state` as `failed`, `output` as `null`, a fixed `error` text that names the interruption reason (or says that a newly appended message could not be started), and `completed_at` as the time automatic resume stopped. The events stream closes with `task.completed`.
+- This `failed` is not final. Appending a message, or the owner resuming an SDK workforce run from the web workforce run history, makes the next read show the task's real status. `run_id` and `state_version` do not change when it flips, so a client must not detect status changes by `state_version` alone.
+- The web chat, the WebSocket snapshot and the web workforce run history keep showing `paused`.
+- With automatic resume off, a settlement interruption still ends `failed` with the provider's error. An SDK task paused by a lease expiry, including one paused before this change, now reads `failed` once automatic resume has stopped for it; with automatic resume off its text says that automatic resume is disabled.
+
+### Deployment impact
+
+- No migration and no configuration. Reporting the derived `failed` writes nothing; the task row stays `paused`.
+- Retention purges only tasks stored as COMPLETED or FAILED, so it never purges an SDK task that reads `failed` through this view; such a task stays until its owner deletes it.
+- Deploy after the xagent-sdk release that documents this `failed`, and that it can change, in `wait()` and `TaskStatus` (tracked in xorbitsai/xagent-sdk#23).
+- Mixed versions: GET may alternate between `paused` from an old process and `failed` from a new one, and `wait()` returns at the first `failed`. An events stream attached to an old process stays open until its 1-hour cap.
+
+### Rollback
+
+- Nothing stored needs to be undone. Reads show `paused` again. SDK tasks paused by a settlement interruption keep being resumed automatically and rest `paused` when automatic resume stops; deploying again makes them read `failed`.

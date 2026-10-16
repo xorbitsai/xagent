@@ -139,7 +139,7 @@ class TestBrowserNavigate:
 class TestBrowserRequestGuard:
     @pytest.mark.asyncio
     async def test_egress_proxy_connects_to_validated_ip(self, monkeypatch):
-        proxy = browser_use._BrowserEgressProxy()
+        proxy = browser_use.PublicNetworkEgressProxy()
         client_reader = MagicMock()
         client_reader.read = AsyncMock(return_value=b"")
         client_writer = MagicMock()
@@ -151,8 +151,7 @@ class TestBrowserRequestGuard:
         remote_writer.wait_closed = AsyncMock()
 
         monkeypatch.setattr(
-            browser_use,
-            "validate_public_http_url",
+            "xagent.core.utils.public_network_proxy.validate_public_http_url",
             AsyncMock(return_value=["203.0.113.10"]),
         )
         open_connection = AsyncMock(return_value=(remote_reader, remote_writer))
@@ -167,13 +166,15 @@ class TestBrowserRequestGuard:
 
     @pytest.mark.asyncio
     async def test_egress_proxy_rejects_unvalidated_connect(self, monkeypatch):
-        proxy = browser_use._BrowserEgressProxy()
+        proxy = browser_use.PublicNetworkEgressProxy()
         client_reader = MagicMock()
         client_writer = MagicMock()
         client_writer.drain = AsyncMock()
         validate = AsyncMock(side_effect=ValueError("private target"))
         open_connection = AsyncMock()
-        monkeypatch.setattr(browser_use, "validate_public_http_url", validate)
+        monkeypatch.setattr(
+            "xagent.core.utils.public_network_proxy.validate_public_http_url", validate
+        )
         monkeypatch.setattr(browser_use.asyncio, "open_connection", open_connection)
 
         with pytest.raises(ValueError, match="private target"):
@@ -185,7 +186,7 @@ class TestBrowserRequestGuard:
 
     @pytest.mark.asyncio
     async def test_http_forward_is_one_shot_per_client_request(self, monkeypatch):
-        proxy = browser_use._BrowserEgressProxy()
+        proxy = browser_use.PublicNetworkEgressProxy()
         client_reader = MagicMock()
         client_reader.readexactly = AsyncMock(return_value=b"abc")
         client_reader.read = AsyncMock(
@@ -202,8 +203,7 @@ class TestBrowserRequestGuard:
         remote_writer.wait_closed = AsyncMock()
 
         monkeypatch.setattr(
-            browser_use,
-            "validate_public_http_url",
+            "xagent.core.utils.public_network_proxy.validate_public_http_url",
             AsyncMock(return_value=["203.0.113.10"]),
         )
         open_connection = AsyncMock(return_value=(remote_reader, remote_writer))
@@ -236,7 +236,7 @@ class TestBrowserRequestGuard:
     async def test_ws_forward_preserves_upgrade_and_bridges_bidirectionally(
         self, monkeypatch
     ):
-        proxy = browser_use._BrowserEgressProxy()
+        proxy = browser_use.PublicNetworkEgressProxy()
         client_reader = MagicMock()
         client_reader.readexactly = AsyncMock(return_value=b"")
         client_writer = MagicMock()
@@ -247,8 +247,7 @@ class TestBrowserRequestGuard:
         remote_writer.wait_closed = AsyncMock()
 
         monkeypatch.setattr(
-            browser_use,
-            "validate_public_http_url",
+            "xagent.core.utils.public_network_proxy.validate_public_http_url",
             AsyncMock(return_value=["203.0.113.10"]),
         )
         open_connection = AsyncMock(return_value=(remote_reader, remote_writer))
@@ -656,12 +655,12 @@ class TestBrowserSession:
     async def test_session_uses_sandbox_unless_explicitly_allowed(self, monkeypatch):
         monkeypatch.setattr(browser_use, "PLAYWRIGHT_AVAILABLE", True)
         monkeypatch.setattr(
-            browser_use._BrowserEgressProxy,
+            browser_use.PublicNetworkEgressProxy,
             "start",
             AsyncMock(return_value="http://127.0.0.1:43123"),
         )
         monkeypatch.setattr(
-            browser_use._BrowserEgressProxy,
+            browser_use.PublicNetworkEgressProxy,
             "close",
             AsyncMock(),
         )

@@ -536,23 +536,27 @@ describe("widget session mode", () => {
     fromIframe("ready")
     const deliveryId = post.mock.calls[0][0].session_delivery_id
 
-    await vi.advanceTimersByTimeAsync(14_999)
+    await vi.advanceTimersByTimeAsync(59_999)
     fromIframe("session_connection_open", { session_delivery_id: deliveryId })
     fromIframe("session_connection_open", { session_delivery_id: deliveryId })
-    await vi.advanceTimersByTimeAsync(14_999)
+    await vi.advanceTimersByTimeAsync(59_999)
     fromIframe("reconnect_request", { reason: "ws_closed" })
     await vi.advanceTimersByTimeAsync(0)
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   it.each([
-    [14_999, 2],
-    [15_000, 3],
+    [59_999, 2],
+    [60_000, 3],
   ])(
     "after %i ms of correlated open, admits exactly %i recoveries from the remaining rapid budget",
     async (stableMs, admittedRecoveries) => {
       vi.useFakeTimers()
-      fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, exchangeBody())))
+      // A rotating token, as on the server; a constant one keeps a 30 s deadline alive.
+      let exchanges = 0
+      fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, exchangeBody({
+        reconnect_token: `rt_${exchanges++}`,
+      }))))
       runWidget({ "data-encrypted-context": GRANT })
       const post = spyOnIframePostMessage()
       await vi.advanceTimersByTimeAsync(0)
@@ -606,7 +610,7 @@ describe("widget session mode", () => {
     expect(vi.getTimerCount()).toBe(0)
     fromIframe("session_connection_open", { session_delivery_id: deliveryB })
     expect(vi.getTimerCount()).toBe(1)
-    await vi.advanceTimersByTimeAsync(10_000)
+    await vi.advanceTimersByTimeAsync(55_000)
     fromIframe("session_connection_open", { session_delivery_id: deliveryB })
     expect(vi.getTimerCount()).toBe(1)
     await vi.advanceTimersByTimeAsync(5_000)
@@ -631,7 +635,7 @@ describe("widget session mode", () => {
     )
   })
 
-  it("a recovery at 14,999 ms invalidates the old stability callback before it can reset rapid count", async () => {
+  it("a recovery at 59,999 ms invalidates the old stability callback before it can reset rapid count", async () => {
     vi.useFakeTimers()
     let resolvePreBoundary: (response: Response) => void = () => undefined
     fetchMock
@@ -655,7 +659,7 @@ describe("widget session mode", () => {
       .filter(([message]) => message.type === "session_update")
       .at(-1)?.[0].session_delivery_id
     fromIframe("session_connection_open", { session_delivery_id: deliveryId })
-    await vi.advanceTimersByTimeAsync(14_999)
+    await vi.advanceTimersByTimeAsync(59_999)
 
     fromIframe("reconnect_request", { reason: "ws_closed" })
     expect(fetchMock).toHaveBeenCalledTimes(3)
@@ -678,7 +682,7 @@ describe("widget session mode", () => {
     )
   })
 
-  it("mints a fresh delivery epoch for a healthy bfcache restore and resets only at 15 seconds", async () => {
+  it("mints a fresh delivery epoch for a healthy bfcache restore and resets only at 60 seconds", async () => {
     vi.useFakeTimers()
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
@@ -705,7 +709,7 @@ describe("widget session mode", () => {
     }
     fromIframe("session_connection_open", { session_delivery_id: oldId })
     fromIframe("session_connection_open", { session_delivery_id: newId })
-    await vi.advanceTimersByTimeAsync(14_999)
+    await vi.advanceTimersByTimeAsync(59_999)
     expect(fetchMock).toHaveBeenCalledTimes(2)
     await vi.advanceTimersByTimeAsync(1)
 

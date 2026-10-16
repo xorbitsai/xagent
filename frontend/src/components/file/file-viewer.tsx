@@ -6,6 +6,7 @@ import { PptxPreviewRenderer } from "@/components/file/pptx-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
 import { useFileAccess } from "@/contexts/file-access-context"
+import { withPreviewReferrerPolicy } from "@/lib/html-preview-document"
 import {
   isHtmlFile,
   isMarkdownFile,
@@ -171,6 +172,7 @@ export function FileViewer({
   const audioMimeType = getAudioMimeType(fileName, mimeType, content)
   const base64Content = getBase64Payload(content)
   const [videoObjectUrl, setVideoObjectUrl] = React.useState<string | null>(null)
+  const [htmlPreviewContent, setHtmlPreviewContent] = React.useState("")
 
   React.useEffect(() => {
     if (!videoMimeType || !base64Content) {
@@ -205,10 +207,8 @@ export function FileViewer({
     }
   }, [base64Content, videoMimeType])
 
-  const processHtmlContent = (htmlContent: string, fileId: string) => {
-    if (!htmlContent || !fileId) return htmlContent
-
-    return htmlContent.replace(
+  const processHtmlContent = React.useCallback((htmlContent: string, fileId: string) => {
+    const rewritten = htmlContent.replace(
       /(src|href)=["']([^"']+)["']/g,
       (match, attr, path) => {
         if (path.match(/^(https?:\/|data:|\/\/|#)/)) return match
@@ -224,7 +224,17 @@ export function FileViewer({
         return `${attr}="${fileAccess.relativePreviewUrl(fileId, path)}"`
       }
     )
-  }
+    // srcDoc subresources do not inherit the iframe navigation's
+    // referrerPolicy. Set the document policy before any asset is parsed.
+    return withPreviewReferrerPolicy(rewritten)
+  }, [fileAccess])
+
+  React.useEffect(() => {
+    // Keep the initial SSR/client render blank; prepare before assigning srcDoc.
+    if (isHtmlFile(fileName) && viewMode === "preview") {
+      setHtmlPreviewContent(processHtmlContent(content || "", fileId))
+    }
+  }, [content, fileId, fileName, viewMode, processHtmlContent])
 
   if (isLoading) {
     return (
@@ -334,9 +344,13 @@ export function FileViewer({
           </pre>
         ) : (
           <iframe
-            srcDoc={processHtmlContent(content || '', fileId)}
+            srcDoc={htmlPreviewContent}
             className="w-full h-full border-0"
-            sandbox="allow-same-origin allow-scripts"
+            // An opaque origin lets generated scripts run without accessing
+            // the app's DOM, cookies or localStorage. Never pair this with
+            // allow-same-origin: srcDoc otherwise inherits the app's origin.
+            sandbox="allow-scripts"
+            referrerPolicy="no-referrer"
             title={fileName}
           />
         )

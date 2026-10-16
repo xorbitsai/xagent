@@ -10,9 +10,17 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from ......config import get_trusted_egress_proxy_enabled
+from .....utils.public_network_proxy import (
+    PublicNetworkEgressProxy,
+    PublicNetworkPolicyError,
+)
+from .....utils.security import build_ca_bundle_ssl_context, validate_public_http_url
+from ...web_content import get_trusted_proxy_url
 from ..core.schemas import CrawlResult, WebCrawlConfig
 from .content_cleaner import ContentCleaner
 from .link_extractor import LinkExtractor
@@ -479,6 +487,7 @@ class WebCrawler:
                 Args: (current_url, completed, total)
         """
         self.config = config
+        self._egress_proxy: PublicNetworkEgressProxy | None = None
         self.progress_callback = progress_callback
 
         # Resolve the TLS-fingerprint sequence to use for fetches.
@@ -549,6 +558,8 @@ class WebCrawler:
             List of crawl results
         """
         self.start_time = time.time()
+        # Fail before robots loading or session creation for an invalid target.
+        await validate_public_http_url(str(httpx.URL(self.config.start_url)))
 
         # Add start URL to pending
         start_url_normalized = self.url_filter.normalize_url(self.config.start_url)
@@ -599,7 +610,7 @@ class WebCrawler:
     async def _open_sessions(
         self, httpx_headers: Optional[Dict[str, str]]
     ) -> AsyncIterator[Dict[Optional[str], Any]]:
-        """Open one HTTP session per fingerprint in self._tls_chain.
+        """Start the egress gate, load robots, then open fingerprint sessions.
 
         Pre-opening sessions matters because curl_cffi.AsyncSession setup
         isn't free (it initializes a TLS context that mimics a specific
@@ -616,6 +627,29 @@ class WebCrawler:
                 explicit headers -- their impersonate spec sets them.
         """
         async with AsyncExitStack() as stack:
+            # Both HTTP clients, including WAF-fingerprint retries and every
+            # redirect, must connect through the same public-IP-pinning gate.
+            # No environment proxy/NO_PROXY setting may bypass this boundary.
+            upstream = (
+                get_trusted_proxy_url() if get_trusted_egress_proxy_enabled() else None
+            )
+            proxy = PublicNetworkEgressProxy(
+                connect_timeout=self.config.timeout,
+                response_timeout=self.config.timeout,
+                upstream_proxy_url=upstream,
+            )
+            stack.push_async_callback(proxy.close)
+            proxy_url = await proxy.start()
+            self._egress_proxy = proxy
+            stack.callback(setattr, self, "_egress_proxy", None)
+            # URLFilter construction is side-effect free: robots.txt must use
+            # the same egress gate, including redirects, before links are judged.
+            await asyncio.to_thread(
+                self.url_filter.load_robots_txt,
+                proxy_url,
+                timeout=self.config.timeout,
+                is_denied=proxy.is_denied,
+            )
             sessions: Dict[Optional[str], Any] = {}
             cffi_session_cls: Any = None
             for fp in self._tls_chain:
@@ -623,17 +657,30 @@ class WebCrawler:
                     sess: Any = httpx.AsyncClient(
                         headers=httpx_headers or {},
                         timeout=self.config.timeout,
+                        proxy=proxy_url,
+                        trust_env=False,
+                        verify=build_ca_bundle_ssl_context(),
                     )
                 else:
                     if cffi_session_cls is None:
                         # Imported lazily so environments using the default
                         # httpx path do not need the optional waf-crawl extra.
+                        from curl_cffi import CurlOpt
                         from curl_cffi.requests import AsyncSession as CffiSession
 
                         cffi_session_cls = CffiSession
                     sess = cffi_session_cls(
                         impersonate=fp,
                         timeout=self.config.timeout,
+                        proxy=proxy_url,
+                        trust_env=False,
+                        curl_options={
+                            # libcurl can honor NO_PROXY even with an explicit
+                            # proxy. Also deny non-HTTP protocols on redirects.
+                            CurlOpt.NOPROXY: "",
+                            CurlOpt.PROTOCOLS_STR: "http,https",
+                            CurlOpt.REDIR_PROTOCOLS_STR: "http,https",
+                        },
                     )
                 sessions[fp] = await stack.enter_async_context(sess)
             yield sessions
@@ -666,6 +713,15 @@ class WebCrawler:
                 "this response is a failure, not a success".
             _FetchResult(None, None) only if every attempt raised an exception.
         """
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("Crawler only accepts HTTP(S) URLs without credentials")
+
         last_result = _FetchResult(response=None, fingerprint_used=None)
         last_status: Optional[int] = None
         exception_log: List[str] = []
@@ -677,10 +733,10 @@ class WebCrawler:
                 # curl_cffi uses 'allow_redirects', httpx uses 'follow_redirects'.
                 # Custom headers are NOT passed: httpx's are baked into the
                 # session, curl_cffi's are owned by the impersonate spec.
-                if fp is None:
-                    response = await sess.get(url, follow_redirects=True)
-                else:
-                    response = await sess.get(url, allow_redirects=True)
+                response = await self._get_public_response(sess, fp, url)
+            except PublicNetworkPolicyError:
+                # A target-policy refusal cannot be repaired by another TLS UA.
+                raise
             except Exception as e:
                 exception_log.append(f"{fp_label}:{type(e).__name__}: {e}")
                 logger.debug(
@@ -794,6 +850,45 @@ class WebCrawler:
             )
 
         return _FetchResult(response=None, fingerprint_used=None)
+
+    async def _get_public_response(self, sess: Any, fp: Optional[str], url: str) -> Any:
+        """Validate each redirect before dispatch; the proxy also pins its DNS."""
+        for hop in range(6):
+            try:
+                # Use the same IDNA/URL spelling for validation, both clients,
+                # and proxy refusal tracking (not Unicode vs wire punycode).
+                url = str(httpx.URL(url))
+                await validate_public_http_url(url)
+            except ValueError as exc:
+                raise PublicNetworkPolicyError(str(exc)) from exc
+            kwargs = (
+                {"follow_redirects": False}
+                if fp is None
+                else {"allow_redirects": False}
+            )
+            try:
+                response = await sess.get(url, **kwargs)
+            except Exception:
+                self._check_egress_policy(url)
+                raise
+            self._check_egress_policy(url)
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                return response
+            location = response.headers.get("location")
+            if not location:
+                return response
+            if hop == 5:
+                raise ValueError("Crawler exceeded redirect limit")
+            url = urljoin(url, location)
+        raise AssertionError("unreachable")
+
+    def _check_egress_policy(self, url: str) -> None:
+        # Only our local proxy's state is authoritative. An origin can choose
+        # any HTTP status/reason, including the proxy's policy-denial text.
+        if self._egress_proxy and self._egress_proxy.is_denied(url):
+            raise PublicNetworkPolicyError(
+                "Public-network egress policy denied a target"
+            )
 
     async def _crawl_loop(self, sessions: Dict[Optional[str], Any]) -> None:
         """Main crawl loop with concurrency control.
@@ -1060,10 +1155,14 @@ class WebCrawler:
 
                 return result, valid_links
 
+            except PublicNetworkPolicyError as e:
+                error_msg = f"Blocked by public-network egress policy: {e}"
+                logger.warning("Failed to crawl %s: %s", url, error_msg)
+                self.failed_urls[url] = error_msg
+                return None, set()
             except Exception as e:
-                # Network/protocol errors are already swallowed inside
-                # _fetch_with_fallback; this catches errors from text decode,
-                # content cleaning, link extraction etc.
+                # Retryable fetch errors are handled by _fetch_with_fallback;
+                # this catches decode, cleaning and extraction failures.
                 error_msg = f"Unexpected error: {str(e)}"
                 logger.error("Failed to crawl %s: %s", url, error_msg)
                 self.failed_urls[url] = error_msg

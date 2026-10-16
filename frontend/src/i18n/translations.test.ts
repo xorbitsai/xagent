@@ -266,4 +266,10 @@ describe("translations", () => {
     expect(resolveTranslation("en", "onboarding.welcome.titleSuffix")).toBe(".")
     expect(resolveTranslation("zh", "onboarding.welcome.titleSuffix")).toBe("。")
   })
+
+  it("leaves the reconnecting status unpunctuated because the indicator animates its own dots", () => {
+    for (const locale of ["en", "zh"] as const) {
+      expect(resolveTranslation(locale, "clientErrors.connectionReconnecting")).not.toMatch(/(…|\.{3})$/)
+    }
+  })
 })

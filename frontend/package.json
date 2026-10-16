@@ -58,7 +58,7 @@
     "marked": "^5.1.2",
     "next": "^15.5.28",
     "parse-entities": "^4.0.2",
-    "postcss": "^8.4.0",
+    "postcss": "^8.5.30",
     "pptxgenjs": "4.0.1",
     "pptxviewjs": "^1.1.9",
     "react": "^18.0.0",
@@ -77,6 +77,11 @@
     "typescript": "^5.0.0",
     "unified": "^11.0.5",
     "xlsx": "^0.18.5"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "$postcss"
+    }
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.0",

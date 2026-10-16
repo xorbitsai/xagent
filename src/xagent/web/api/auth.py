@@ -89,6 +89,7 @@ from ..oauth_provider_quirks import (
     requires_pkce,
 )
 from ..services import gmail_provisioning
+from ..services.auth_attempts import clear_shared_attempt, reserve_shared_attempt
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
 from ..services.trigger_rate_limit import remote_ip_from_request
@@ -149,24 +150,16 @@ def _sweep_login_failures(current: float) -> None:
 
     Login identifiers are attacker-controlled, so pruning only the key being
     attempted would let a stream of unique usernames grow the dictionary
-    indefinitely. Sweep expired buckets periodically and evict the oldest
-    remaining buckets if a hard cap is reached.
+    indefinitely. Sweep expired buckets, but never evict active lockouts.
     """
     global _login_failure_last_sweep
     if (
         current - _login_failure_last_sweep < _LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS
-        and len(_login_failures) <= _LOGIN_FAILURE_MAX_KEYS
+        and len(_login_failures) < _LOGIN_FAILURE_MAX_KEYS
     ):
         return
     for key, attempts in list(_login_failures.items()):
         if not _prune_login_failures(key, current):
-            _login_failures.pop(key, None)
-    if len(_login_failures) > _LOGIN_FAILURE_MAX_KEYS:
-        oldest = sorted(
-            _login_failures,
-            key=lambda key: _login_failures[key][-1] if _login_failures[key] else 0,
-        )
-        for key in oldest[: len(_login_failures) - _LOGIN_FAILURE_MAX_KEYS]:
             _login_failures.pop(key, None)
     _login_failure_last_sweep = current
 
@@ -182,11 +175,25 @@ def _login_is_blocked(key: str, now: float | None = None) -> bool:
 
 def _reserve_login_attempt(key: str, now: float | None = None) -> bool:
     """Atomically admit one attempt, preventing concurrent burst bypasses."""
+    shared = reserve_shared_attempt(
+        "login",
+        key,
+        limit=_LOGIN_FAILURE_LIMIT,
+        window=_LOGIN_FAILURE_WINDOW_SECONDS,
+        max_keys=_LOGIN_FAILURE_MAX_KEYS,
+    )
+    if shared is not None:
+        return shared
     current = time.monotonic() if now is None else now
     with _login_failure_lock:
         _sweep_login_failures(current)
         attempts = _prune_login_failures(key, current)
         if len(attempts) >= _LOGIN_FAILURE_LIMIT:
+            return False
+        if (
+            key not in _login_failures
+            and len(_login_failures) >= _LOGIN_FAILURE_MAX_KEYS
+        ):
             return False
         _login_failures[key] = attempts
         attempts.append(current)
@@ -194,6 +201,8 @@ def _reserve_login_attempt(key: str, now: float | None = None) -> bool:
 
 
 def _clear_login_failures(key: str) -> None:
+    if clear_shared_attempt("login", key):
+        return
     with _login_failure_lock:
         _login_failures.pop(key, None)
 
@@ -211,6 +220,15 @@ def _password_recovery_attempt_key(
 
 def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bool:
     """Atomically limit password-recovery requests for one bounded key."""
+    shared = reserve_shared_attempt(
+        "recovery",
+        key,
+        limit=_PASSWORD_RECOVERY_LIMIT,
+        window=_PASSWORD_RECOVERY_WINDOW_SECONDS,
+        max_keys=_PASSWORD_RECOVERY_MAX_KEYS,
+    )
+    if shared is not None:
+        return shared
     global _password_recovery_last_sweep
     current = time.monotonic() if now is None else now
     with _password_recovery_lock:
@@ -219,7 +237,7 @@ def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bo
             attempts.popleft()
         if (
             current - _password_recovery_last_sweep >= 60
-            or len(_password_recovery_attempts) > _PASSWORD_RECOVERY_MAX_KEYS
+            or len(_password_recovery_attempts) >= _PASSWORD_RECOVERY_MAX_KEYS
         ):
             for candidate, candidate_attempts in list(
                 _password_recovery_attempts.items()
@@ -245,12 +263,13 @@ def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bo
         return True
 
 
-def _enforce_password_recovery_rate_limit(
+async def _enforce_password_recovery_rate_limit(
     request: Request | None, identifiers: tuple[tuple[str, str], ...]
 ) -> None:
     for namespace, value in identifiers:
-        if not _reserve_password_recovery_attempt(
-            _password_recovery_attempt_key(request, namespace, value)
+        if not await asyncio.to_thread(
+            _reserve_password_recovery_attempt,
+            _password_recovery_attempt_key(request, namespace, value),
         ):
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -2128,9 +2147,10 @@ async def login(
     outcome = "error"
     attempt_key = _login_attempt_key(http_request, request.username)
     account_key = _login_attempt_key(None, request.username)
-    if not _reserve_login_attempt(attempt_key) or not _reserve_login_attempt(
-        account_key
-    ):
+    keys = tuple(dict.fromkeys((attempt_key, account_key)))
+    for key in keys:
+        if await asyncio.to_thread(_reserve_login_attempt, key):
+            continue
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many failed login attempts. Try again later.",
@@ -2141,8 +2161,11 @@ async def login(
             "login_database_transaction", lambda: _login_in_worker(request, db)
         )
         outcome = "succeeded"
-        _clear_login_failures(attempt_key)
-        _clear_login_failures(account_key)
+        for key in keys:
+            try:
+                await asyncio.to_thread(_clear_login_failures, key)
+            except HTTPException:
+                logger.warning("Unable to clear a successful login's attempt budget")
         return response
     except HTTPException:
         outcome = "rejected"
@@ -2265,7 +2288,7 @@ async def forgot_password(
             message="Please enter a valid email address",
         )
 
-    _enforce_password_recovery_rate_limit(
+    await _enforce_password_recovery_rate_limit(
         http_request,
         (("ip", remote_ip_from_request(http_request) or "unknown"), ("email", email)),
     )
@@ -2313,7 +2336,7 @@ async def reset_password(
     db: Session = Depends(get_db),
     http_request: Request = None,  # type: ignore[assignment]
 ) -> ResetPasswordResponse:
-    _enforce_password_recovery_rate_limit(
+    await _enforce_password_recovery_rate_limit(
         http_request,
         (
             ("ip", remote_ip_from_request(http_request) or "unknown"),

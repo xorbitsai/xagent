@@ -73,3 +73,32 @@ def test_login_account_limit_cannot_be_bypassed_by_rotating_ips(monkeypatch):
             )
         assert error.value.status_code == (401 if index < 5 else 429)
     assert worker.await_count == 5
+
+
+def test_filling_login_table_does_not_unlock_an_active_account(monkeypatch):
+    monkeypatch.setattr(auth, "_LOGIN_FAILURE_MAX_KEYS", 2)
+    monkeypatch.setattr(auth, "_login_failures", {})
+    monkeypatch.setattr(auth, "_login_failure_last_sweep", 0)
+    for _ in range(5):
+        assert auth._reserve_login_attempt("victim", now=1)
+    assert not auth._reserve_login_attempt("victim", now=2)
+    assert auth._reserve_login_attempt("another", now=3)
+    for i in range(5):
+        assert not auth._reserve_login_attempt(f"flood-{i}", now=4)
+    assert not auth._reserve_login_attempt("victim", now=5)
+    assert auth._reserve_login_attempt("after-expiry", now=905)
+
+
+def test_missing_client_ip_does_not_charge_login_twice(monkeypatch):
+    monkeypatch.setattr(auth, "_login_failures", {})
+    worker = AsyncMock(side_effect=HTTPException(401, "Incorrect username or password"))
+    monkeypatch.setattr(auth, "run_auth_db_worker", worker)
+    for _ in range(5):
+        with pytest.raises(HTTPException) as error:
+            asyncio.run(
+                auth.login(
+                    auth.LoginRequest(username="same", password="incorrect"), object()
+                )
+            )
+        assert error.value.status_code == 401
+    assert worker.await_count == 5

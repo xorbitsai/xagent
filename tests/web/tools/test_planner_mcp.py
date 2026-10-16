@@ -498,8 +498,63 @@ def test_list_my_groups_missing_scope_asks_for_reconnect(monkeypatch):
     result = json.loads(planner.planner_list_my_groups())
 
     assert result["status"] == "error"
-    assert "Reconnect the Planner connector" in result["message"]
+    assert "Open Connectors" in result["message"]
+    assert "disconnect Planner" in result["message"]
     assert "Team.ReadBasic.All" in result["message"]
+    assert "Authorization_RequestDenied" in result["message"]
+    assert "Insufficient privileges" in result["message"]
+
+
+def test_list_my_groups_other_403_preserves_graph_error_without_reconnect(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "error": {
+                        "code": "accessDenied",
+                        "message": "Access is blocked by a conditional access policy.",
+                    }
+                },
+                status_code=403,
+            )
+        ),
+    )
+
+    result = json.loads(planner.planner_list_my_groups())
+
+    assert result["status"] == "error"
+    assert "accessDenied" in result["message"]
+    assert "conditional access policy" in result["message"]
+    assert "disconnect Planner" not in result["message"]
+
+
+def test_list_my_groups_server_error_preserves_graph_error_without_reconnect(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "error": {
+                        "code": "InternalError",
+                        "message": "Planner is temporarily unavailable.",
+                    }
+                },
+                status_code=500,
+            )
+        ),
+    )
+
+    result = json.loads(planner.planner_list_my_groups())
+
+    assert result["status"] == "error"
+    assert "InternalError" in result["message"]
+    assert "temporarily unavailable" in result["message"]
+    assert "disconnect Planner" not in result["message"]
 
 
 def test_list_plans_success(monkeypatch):
@@ -753,6 +808,34 @@ def test_create_plan_keeps_success_when_plan_id_is_invalid(monkeypatch):
     assert result["status"] == "success"
     assert result["plan"]["web_url"] is None
     assert result["plan"]["id"] == " . "
+
+
+def test_create_plan_403_names_group_and_preserves_graph_error(monkeypatch):
+    monkeypatch.setattr(
+        planner.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "error": {
+                        "code": "Forbidden",
+                        "message": "The signed-in user is not a member of the group.",
+                    }
+                },
+                status_code=403,
+            )
+        ),
+    )
+
+    result = json.loads(
+        planner.planner_create_plan("group-1", "New plan", group_name="Product Team")
+    )
+
+    assert result["status"] == "error"
+    assert '"Product Team" (group-1)' in result["message"]
+    assert "planner_list_my_groups" in result["message"]
+    assert "Forbidden" in result["message"]
+    assert "not a member" in result["message"]
 
 
 def test_create_plan_transport_failure_is_indeterminate(monkeypatch):

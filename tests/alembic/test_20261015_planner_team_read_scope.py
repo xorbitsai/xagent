@@ -154,15 +154,25 @@ def test_upgrade_does_not_disconnect_existing_grants(tmp_path) -> None:
     assert grant["refresh_token"] == "existing-refresh"
 
 
-def test_offline_sqlite_upgrade_applies_scope_list() -> None:
+def test_offline_sqlite_upgrade_and_downgrade_round_trip() -> None:
     migration = _load_migration_module()
-    output = StringIO()
-    context = MigrationContext.configure(
-        dialect_name="sqlite", opts={"as_sql": True, "output_buffer": output}
+    upgrade_output = StringIO()
+    upgrade_context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": upgrade_output},
     )
 
-    with Operations.context(context):
+    with Operations.context(upgrade_context):
         migration.upgrade()
+
+    downgrade_output = StringIO()
+    downgrade_context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": downgrade_output},
+    )
+
+    with Operations.context(downgrade_context):
+        migration.downgrade()
 
     connection = sqlite3.connect(":memory:")
     connection.execute(
@@ -173,13 +183,19 @@ def test_offline_sqlite_upgrade_applies_scope_list() -> None:
         "INSERT INTO public_mcp_apps VALUES ('planner', 'microsoft', ?)",
         (json.dumps(migration.PREVIOUS_SCOPES),),
     )
-    connection.executescript(output.getvalue())
+    connection.executescript(upgrade_output.getvalue())
+    stored = connection.execute(
+        "SELECT oauth_scopes FROM public_mcp_apps WHERE app_id='planner'"
+    ).fetchone()[0]
+    assert json.loads(stored) == list(migration.CURRENT_SCOPES)
+
+    connection.executescript(downgrade_output.getvalue())
     stored = connection.execute(
         "SELECT oauth_scopes FROM public_mcp_apps WHERE app_id='planner'"
     ).fetchone()[0]
     connection.close()
 
-    assert json.loads(stored) == list(migration.CURRENT_SCOPES)
+    assert json.loads(stored) == list(migration.PREVIOUS_SCOPES)
 
 
 def test_offline_postgresql_upgrade_uses_literal_json_cast() -> None:

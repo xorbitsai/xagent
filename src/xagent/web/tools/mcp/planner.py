@@ -86,6 +86,29 @@ class _GraphRequestError(RuntimeError):
         self.status_code = status_code
 
 
+def _is_insufficient_privileges_error(exc: _GraphRequestError) -> bool:
+    """Return whether Graph specifically describes a privilege/scope failure.
+
+    A 403 alone is not sufficient: conditional access, licensing, and guest
+    restrictions can return the same status and will not be fixed by granting
+    another OAuth scope. ``_graph_request`` preserves the sanitized Graph body
+    in the exception text, so match only explicit privilege/scope language.
+    """
+    if exc.status_code != 403:
+        return False
+    message = str(exc).casefold()
+    return any(
+        marker in message
+        for marker in (
+            "insufficient privileges",
+            "insufficient privilege",
+            "insufficient_scope",
+            "access_token_scope_insufficient",
+            "does not contain scopes",
+        )
+    )
+
+
 class _EtagConflictError(RuntimeError):
     """Raised when an etag-guarded write loses an optimistic-concurrency
     race (Graph responded 412 Precondition Failed)."""
@@ -643,7 +666,9 @@ def planner_list_my_groups(next_link: str | None = None) -> str:
     verified Microsoft 365 group id. Use only an id returned by this tool for
     the create call; never substitute a user id, SharePoint site or drive id,
     or a SharePoint drive owner's id. If several groups are returned, ask the
-    user which group should own the plan.
+    user which group should own the plan. This endpoint lists only groups
+    backed by Microsoft Teams. If it returns no groups or the intended group
+    is absent, ask the user for the exact Microsoft 365 group id; never guess.
 
     next_link is optional -- pass the next_link value from a previous
     response to fetch the next page instead of the first.
@@ -659,11 +684,12 @@ def planner_list_my_groups(next_link: str | None = None) -> str:
         )
     except _GraphRequestError as e:
         logger.error("Error listing the signed-in user's joined teams: %s", e)
-        if e.status_code == 403:
+        if _is_insufficient_privileges_error(e):
             return _error(
                 "Planner cannot list the signed-in user's Microsoft 365 groups. "
-                "Reconnect the Planner connector to grant Team.ReadBasic.All; "
-                "your Microsoft 365 administrator may need to approve it."
+                "Open Connectors, disconnect Planner, then connect it again to "
+                "grant Team.ReadBasic.All; your Microsoft 365 administrator may "
+                f"need to approve it. Graph response: {e}"
             )
         return _error(str(e))
     except Exception as e:
@@ -747,14 +773,18 @@ def planner_get_plan(plan_id: str) -> str:
 
 
 @mcp.tool()
-def planner_create_plan(group_id: str, title: str) -> str:
+def planner_create_plan(
+    group_id: str, title: str, group_name: str | None = None
+) -> str:
     """Create a new Planner plan owned by a Microsoft 365 group.
 
     When a verified group id was not supplied by the user, call
     ``planner_list_my_groups`` first and use an id it returns. Never guess or
     reuse a user id, SharePoint site or drive id, or SharePoint drive-owner id
     as ``group_id``. If several groups are available, ask the user which one
-    should own the plan before creating it.
+    should own the plan before creating it. When using a result from that tool,
+    pass its ``displayName`` as ``group_name`` so an authorization failure can
+    identify the intended group to the user.
 
     The returned plan's ``web_url`` is the browser-safe link to share with
     users. Never substitute the plan's Graph ``container.url`` for it. If
@@ -764,6 +794,7 @@ def planner_create_plan(group_id: str, title: str) -> str:
     The signed-in user must already be a member of the group (Graph
     enforces this; it is not merely a display requirement)."""
     try:
+        group_name = group_name.strip() if group_name else None
         title = title.strip()
         if not title:
             raise ValueError("title is required")
@@ -791,6 +822,19 @@ def planner_create_plan(group_id: str, title: str) -> str:
                 "match": {"title": title},
             },
         )
+    except _GraphRequestError as e:
+        logger.error("Error creating Planner plan for group %s: %s", group_id, e)
+        if e.status_code == 403:
+            group_label = (
+                f'"{group_name}" ({group_id})' if group_name else f"id {group_id}"
+            )
+            return _error(
+                f"Planner could not create the plan in Microsoft 365 group "
+                f"{group_label}: Graph returned 403. Confirm that the signed-in "
+                "user is a member of this group, or choose a group returned by "
+                f"planner_list_my_groups. Graph response: {e}"
+            )
+        return _error(str(e))
     except Exception as e:
         logger.error("Error creating Planner plan for group %s: %s", group_id, e)
         return _error(str(e))

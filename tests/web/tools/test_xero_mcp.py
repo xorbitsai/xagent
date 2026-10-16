@@ -322,6 +322,174 @@ def test_list_payments_where_clause_is_validated_and_built(fake: FakeXero) -> No
         xero.list_payments(reference='x" OR 1==1')
 
 
+def _paid_invoice(
+    number: str,
+    paid_on: str,
+    *,
+    total: float = 10,
+    currency: str = "AUD",
+    contact_id: str = CONTACT_ID,
+) -> dict[str, Any]:
+    record = _invoice(
+        number,
+        "2026-10-01",
+        0,
+        issued="2026-09-01",
+        currency=currency,
+        contact_id=contact_id,
+        status="PAID",
+    )
+    moment = datetime.fromisoformat(paid_on).replace(tzinfo=timezone.utc)
+    milliseconds = int(moment.timestamp() * 1000)
+    record["FullyPaidOnDate"] = f"/Date({milliseconds}+0000)/"
+    record["Total"] = total
+    record["AmountPaid"] = total
+    return record
+
+
+def _paid_pages(pages: list[list[dict[str, Any]]]) -> Callable[..., MockResponse]:
+    def respond(call: dict[str, Any]) -> MockResponse:
+        page = call["params"]["page"]
+        return MockResponse(
+            {
+                "pagination": {
+                    "page": page,
+                    "pageSize": xero.XERO_BULK_PAGE_SIZE,
+                    "pageCount": len(pages),
+                    "itemCount": sum(len(items) for items in pages),
+                },
+                "Invoices": pages[page - 1],
+            }
+        )
+
+    return respond
+
+
+def test_list_paid_invoices_reads_later_pages_after_mixed_dates(
+    fake: FakeXero,
+) -> None:
+    # Production regression: the first page contained ten 13 Oct settlements;
+    # the next page mixed five more with other dates. Updated ordering is not a
+    # valid boundary for FullyPaidOnDate.
+    first = [_paid_invoice(f"INV-{number}", "2026-10-13") for number in range(1, 11)]
+    second = [
+        *[_paid_invoice(f"INV-{number}", "2026-10-13") for number in range(11, 16)],
+        _paid_invoice("INV-OLDER", "2026-10-12"),
+    ]
+    fake.responder = _paid_pages([first, second])
+
+    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
+
+    assert result["complete"] is True
+    assert result["date_basis"] == "FullyPaidOnDate"
+    assert result["total_count"] == 15
+    assert result["returned"] == 15
+    assert result["has_more"] is False
+    assert {row["invoice_number"] for row in result["invoices"]} == {
+        f"INV-{number}" for number in range(1, 16)
+    }
+    assert result["total_invoice_amount_by_currency"] == {"AUD": "150.00"}
+    api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
+    assert [call["params"]["page"] for call in api_calls] == [1, 2]
+    assert api_calls[0]["params"]["Statuses"] == "PAID"
+    assert api_calls[0]["params"]["where"] == 'Type=="ACCREC"'
+    assert api_calls[0]["params"]["summaryOnly"] == "true"
+
+
+def test_list_paid_invoices_windows_totals_and_contact_filter(fake: FakeXero) -> None:
+    fake.responder = _paid_pages(
+        [
+            [
+                _paid_invoice("INV-A", "2026-10-13", total=12.5),
+                _paid_invoice(
+                    "INV-B",
+                    "2026-10-13",
+                    total=20.25,
+                    currency="USD",
+                ),
+            ]
+        ]
+    )
+
+    first = _call_tool(
+        "list_paid_invoices",
+        paidOnDate="2026-10-13",
+        contactIds=[CONTACT_ID],
+        limit=1,
+    )
+
+    assert first["total_count"] == 2
+    assert first["total_invoice_amount_by_currency"] == {
+        "AUD": "12.50",
+        "USD": "20.25",
+    }
+    assert first["returned"] == 1
+    assert first["has_more"] is True
+    assert first["next_skip"] == 1
+    assert first["invoices"][0]["invoice_number"] == "INV-A"
+    assert fake.calls[-1]["params"]["ContactIDs"] == CONTACT_ID
+
+    second = _call_tool(
+        "list_paid_invoices",
+        paidOnDate="2026-10-13",
+        contactIds=[CONTACT_ID],
+        skip=first["next_skip"],
+        limit=1,
+    )
+
+    assert second["returned"] == 1
+    assert second["has_more"] is False
+    assert second["invoices"][0]["invoice_number"] == "INV-B"
+
+
+def test_list_paid_invoices_rejects_paid_record_without_settlement_date(
+    fake: FakeXero,
+) -> None:
+    missing_date = _paid_invoice("INV-MISSING", "2026-10-13")
+    missing_date.pop("FullyPaidOnDate")
+    fake.responder = _paid_pages([[missing_date]])
+
+    with pytest.raises(RuntimeError, match="without FullyPaidOnDate"):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_partial_scan_without_pagination(
+    fake: FakeXero,
+) -> None:
+    fake.responder = lambda call: MockResponse(
+        {"Invoices": [_paid_invoice("INV-1", "2026-10-13")]}
+    )
+
+    with pytest.raises(
+        RuntimeError, match="refusing to report a partial settlement-date list"
+    ):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_partial_scan_at_safety_limit(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "PAID_INVOICE_MAX_PAGES", 1)
+    fake.responder = _paid_pages(
+        [
+            [_paid_invoice("INV-1", "2026-10-13")],
+            [_paid_invoice("INV-2", "2026-10-13")],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="paid-invoice scan reached the safety"):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
+
+
+def test_list_paid_invoices_rejects_invalid_date_before_calling_xero(
+    fake: FakeXero,
+) -> None:
+    with pytest.raises(ValueError, match="paidOnDate must be YYYY-MM-DD"):
+        xero.list_paid_invoices(paidOnDate="13/10/2026")
+
+    assert fake.calls == []
+
+
 def test_quotes_use_xero_pagination_metadata(fake: FakeXero) -> None:
     fake.responder = lambda call: MockResponse(
         {
@@ -605,6 +773,28 @@ def test_overdue_defaults_to_today(
 # --------------------------------------------------------------------------- #
 
 
+RECEIVABLES_SPREADSHEET_COLUMNS = [
+    {"header": "Company Name", "field": "contact_name"},
+    {"header": "Currency", "field": "currency"},
+    {"header": "Invoice Count", "field": "invoice_count"},
+    {"header": "Current", "field": "buckets.Current"},
+    {"header": "1-15 Days", "field": "buckets.1-15"},
+    {"header": "16-30 Days", "field": "buckets.16-30"},
+    {"header": "31-45 Days", "field": "buckets.31-45"},
+    {"header": "46-60 Days", "field": "buckets.46-60"},
+    {"header": "61-75 Days", "field": "buckets.61-75"},
+    {"header": "76+ Days", "field": "buckets.76+"},
+    {"header": "Total Due", "field": "total_due"},
+]
+
+
+def _resolve_field(row: dict[str, Any], field: str) -> Any:
+    value: Any = row
+    for part in field.split("."):
+        value = value[part]
+    return value
+
+
 @pytest.mark.parametrize(
     ("days", "bucket"),
     [
@@ -664,7 +854,17 @@ def test_ageing_has_one_named_row_per_contact_and_currency_with_every_bucket(
 
     assert result["total_invoice_count"] == 6
     assert result["bucket_names"] == list(xero.RECEIVABLE_BUCKETS)
+    assert result["spreadsheet_export"] == {
+        "row_source": "rows",
+        "columns": RECEIVABLES_SPREADSHEET_COLUMNS,
+        "retrieve_all_pages": True,
+    }
     rows = result["rows"]
+    for row in rows:
+        assert all(
+            _resolve_field(row, column["field"]) is not None
+            for column in result["spreadsheet_export"]["columns"]
+        )
     assert [(row["contact_name"], row["currency"]) for row in rows] == [
         ("Heebie", "AUD"),
         ("Acme", "AUD"),
@@ -720,8 +920,15 @@ def test_ageing_rows_window_resumes_with_next_skip(fake: FakeXero) -> None:
     )
 
     assert first["has_more"] is True and first["next_skip"] == 4
+    assert first["rows_complete"] is False
+    assert first["spreadsheet_export"]["row_source"] == "rows"
     assert [r["contact_name"] for r in second["rows"]] == ["C4", "C5"]
     assert second["has_more"] is False
+    assert second["rows_complete"] is True
+    assert second["spreadsheet_export"]["columns"][0] == {
+        "header": "Company Name",
+        "field": "contact_name",
+    }
     assert first["totals_by_currency"] == second["totals_by_currency"]
 
 
@@ -742,6 +949,35 @@ def test_ageing_trims_rows_and_preserves_resume_cursor(
     assert result["has_more"] is True
     assert result["next_skip"] == result["returned"]
     assert result["total_rows"] == 60
+    assert result["rows_complete"] is False
+    assert result["spreadsheet_export"]["retrieve_all_pages"] is True
+
+
+def test_ageing_export_contract_survives_an_empty_result(fake: FakeXero) -> None:
+    fake.responder = _overdue_pages([[]])
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    assert result["rows"] == []
+    assert result["rows_complete"] is True
+    assert result["spreadsheet_export"] == {
+        "row_source": "rows",
+        "columns": RECEIVABLES_SPREADSHEET_COLUMNS,
+        "retrieve_all_pages": True,
+    }
+
+
+def test_ageing_export_keeps_company_column_for_an_unnamed_contact(
+    fake: FakeXero,
+) -> None:
+    fake.responder = _overdue_pages(
+        [[_invoice("INV-1", "2026-09-01", 10, contact="", contact_id="contact-1")]]
+    )
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    assert result["rows"][0]["contact_name"] == "contact-1"
+    assert _resolve_field(result["rows"][0], "contact_name") == "contact-1"
 
 
 def test_ageing_fails_instead_of_reporting_partial_totals(
@@ -1201,6 +1437,7 @@ def _registered_tools() -> dict[str, Any]:
 
 def test_every_preserved_tool_is_registered_plus_the_new_ones() -> None:
     assert set(_registered_tools()) == PRESERVED_TOOLS | {
+        "list_paid_invoices",
         "list_overdue_invoices",
         "list_receivables_ageing",
     }
@@ -1217,3 +1454,13 @@ def test_paged_tools_no_longer_require_a_page_argument() -> None:
 
     for name in ("list_invoices", "list_credit_notes", "list_bank_transactions"):
         assert "page" not in tools[name].inputSchema.get("required", []), name
+
+
+def test_receivables_ageing_description_requires_named_spreadsheet_rows() -> None:
+    description = " ".join(
+        _registered_tools()["list_receivables_ageing"].description.split()
+    )
+
+    assert "follow spreadsheet_export" in description
+    assert "include Company Name from contact_name as the first column" in description
+    assert "do not substitute it for the contact rows" in description

@@ -169,7 +169,8 @@ def resolve_legacy_file_path_cross_user(file_path: str) -> Optional[Tuple[Path, 
     """
     Resolve a legacy file path across all user directories.
 
-    This is useful for public preview scenarios where user context is not available.
+    Internal compatibility lookup only. The caller must authenticate and verify
+    the resolved owner; public download/preview routes must never use this.
 
     Args:
         file_path: Legacy file path

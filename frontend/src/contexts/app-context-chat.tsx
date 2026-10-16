@@ -386,6 +386,7 @@ import {
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
+import { deriveConnectionNotice, type ConnectionNotice } from "./connection-notice"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
@@ -2273,6 +2274,7 @@ interface AppContextType {
   // was last connected to. The first connect for a task does not count.
   sameTaskReconnects: number
   connectionError: Error | null
+  connectionNotice: ConnectionNotice
   startNewConversation: () => Promise<void>
   canStopTask: boolean
   stopTask: () => void
@@ -2807,7 +2809,13 @@ export function AppProvider({
     }
   }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
-  const onConnect = useCallback(() => {
+  // Tasks a socket has opened for since this provider mounted, keyed by the
+  // opened socket's own task: during a task switch stateRef may already name
+  // the next task before the old socket is retired.
+  const openedTaskIdsRef = useRef(new Set<typeof state.taskId>())
+
+  const onConnect = useCallback((openedTaskId: number | undefined) => {
+    openedTaskIdsRef.current.add(openedTaskId ?? null)
     if (sessionTransport?.history === "none") {
       const connectionIdentity = sessionConnectionIdentityRef.current
       if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
@@ -2897,6 +2905,7 @@ export function AppProvider({
     resumeTask: wsResumeTask,
     requestStatus,
     connect,
+    connectionPhase,
   } = useWebSocket({
     taskId: state.taskId || undefined,
     token,
@@ -2956,6 +2965,15 @@ export function AppProvider({
     if (canStopTask) return
     releaseStopControl()
   }, [canStopTask, releaseStopControl])
+
+  const connectionNotice = deriveConnectionNotice({
+    isSessionTransport: sessionTransport !== undefined,
+    hadOpen: sessionTransport
+      ? openedTaskIdsRef.current.size > 0
+      : openedTaskIdsRef.current.has(state.taskId),
+    phase: connectionPhase,
+    isConnected,
+  })
 
   useEffect(() => {
     if (!sessionTransport || isConnected) return
@@ -7927,6 +7945,7 @@ export function AppProvider({
           isConnected,
           sameTaskReconnects,
           connectionError,
+          connectionNotice,
           startNewConversation,
           canStopTask,
           stopTask,

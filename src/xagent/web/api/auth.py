@@ -106,6 +106,7 @@ from ..services.auth_attempts import (
 )
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.oauth_state_claims import claim_oauth_state
 from ..services.trigger_rate_limit import remote_ip_from_request
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
@@ -131,8 +132,6 @@ _login_failure_lock = threading.Lock()
 _login_failures: dict[str, AttemptBucket] = {}
 _password_recovery_lock = threading.Lock()
 _password_recovery_attempts: dict[str, AttemptBucket] = {}
-_oauth_state_lock = threading.Lock()
-_used_ordinary_oauth_states: dict[str, float] = {}
 
 
 def _budget_key(kind: str, value: str) -> str:
@@ -241,20 +240,6 @@ def _login_budgets(
             get_auth_login_pair_limit(),
         ),
     )
-
-
-def _claim_ordinary_oauth_state(state: str) -> bool:
-    """Claim a browser-bound OAuth state once per process lifetime window."""
-    now = time.time()
-    digest = hashlib.sha256(state.encode("ascii", "ignore")).hexdigest()
-    with _oauth_state_lock:
-        for key, expires_at in list(_used_ordinary_oauth_states.items()):
-            if expires_at <= now:
-                _used_ordinary_oauth_states.pop(key, None)
-        if digest in _used_ordinary_oauth_states:
-            return False
-        _used_ordinary_oauth_states[digest] = now + 600
-        return True
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
@@ -4134,6 +4119,18 @@ def generic_oauth_callback(
         )
 
     browser_nonce_hash = payload.get("browser_nonce_hash")
+    is_actor_flow = (
+        payload.get("actor_flow_nonce") is not None
+        or payload.get("resource_owner_key") is not None
+    )
+    if not is_actor_flow and (
+        not isinstance(browser_nonce_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", browser_nonce_hash) is None
+    ):
+        _log_oauth_callback_rejection(provider, "state_browser_binding_required")
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
     if browser_nonce_hash:
         browser_nonce = request.cookies.get(
             _ordinary_oauth_cookie_name(str(browser_nonce_hash))
@@ -4146,8 +4143,21 @@ def generic_oauth_callback(
             return HTMLResponse(
                 content="<h1>Error: Invalid or expired state</h1>", status_code=400
             )
-        if not _claim_ordinary_oauth_state(state):
-            _log_oauth_callback_rejection(provider, "state_replayed")
+        try:
+            claimed = claim_oauth_state(db, state, expires_at=payload.get("exp"))
+        except SQLAlchemyError as exc:
+            # No provider exchange or credential write is allowed if the
+            # durable replay store cannot record this callback's claim.
+            logger.error(
+                "OAuth state replay protection is unavailable (%s)",
+                type(exc).__name__,
+            )
+            return HTMLResponse(
+                content="<h1>Connection temporarily unavailable</h1><p>Please try again.</p>",
+                status_code=503,
+            )
+        if not claimed:
+            _log_oauth_callback_rejection(provider, "state_consumed_or_expired")
             return HTMLResponse(
                 content="<h1>Error: Invalid or expired state</h1>", status_code=400
             )
@@ -5436,7 +5446,8 @@ def oauth_login(
     )
     if not db_provider:
         return HTMLResponse(
-            content=f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
         )
 
     # But now everything can be routed through generic
@@ -5457,7 +5468,8 @@ def oauth_callback(
     )
     if not db_provider:
         return HTMLResponse(
-            content=f"<h1>Unsupported provider: {provider}</h1>", status_code=400
+            content=f"<h1>Unsupported provider: {html.escape(provider)}</h1>",
+            status_code=400,
         )
 
     return generic_oauth_callback(provider, request, db, db_provider)

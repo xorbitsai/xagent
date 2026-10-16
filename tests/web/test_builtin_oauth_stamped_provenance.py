@@ -23,13 +23,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
+from tests.shared.oauth_browser_fixture import generic_oauth_callback
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
     _ensure_user_mcp_server,
     _require_actor_oauth_personal_link,
-    generic_oauth_callback,
     start_builtin_oauth_for_resource_owner,
 )
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps

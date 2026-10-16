@@ -4,9 +4,16 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from xagent.web.api.files import _inline_preview_response
-from xagent.web.app import _blocked_upload_extension, _security_header_values
+from xagent.web.app import (
+    SafeUploadsStaticFiles,
+    _blocked_upload_extension,
+    _is_public_upload_path,
+    _security_header_values,
+)
 
 
 @pytest.mark.parametrize(
@@ -28,6 +35,30 @@ def test_active_upload_document_extensions_are_blocked(filename: str) -> None:
 
 def test_passive_upload_image_extension_is_not_blocked() -> None:
     assert not _blocked_upload_extension("logo.PNG")
+
+
+def test_public_upload_mount_only_allows_agent_logos() -> None:
+    assert _is_public_upload_path("agent_logos/agent_1.png")
+    assert not _is_public_upload_path("agent_logos/")
+    assert not _is_public_upload_path("user_1/private/report.pdf")
+    assert not _is_public_upload_path("../user_1/private/report.pdf")
+    assert not _is_public_upload_path("agent_logos/../user_1/report.pdf")
+    assert not _is_public_upload_path("agent_logos/..")
+
+
+def test_static_upload_mount_enforces_allowlist(tmp_path):
+    logo = tmp_path / "agent_logos/a.png"
+    logo.parent.mkdir()
+    logo.write_bytes(b"logo")
+    private = tmp_path / "user_1/x.pdf"
+    private.parent.mkdir()
+    private.write_bytes(b"private")
+    app = FastAPI()
+    app.mount("/uploads", SafeUploadsStaticFiles(directory=str(tmp_path)))
+    with TestClient(app) as client:
+        assert client.get("/uploads/agent_logos/a.png").content == b"logo"
+        assert client.get("/uploads/user_1/x.pdf").status_code == 404
+        assert client.get("/uploads/agent_logos/%2e%2e/user_1/x.pdf").status_code == 404
 
 
 def test_security_headers_keep_widget_and_preview_embeddable() -> None:

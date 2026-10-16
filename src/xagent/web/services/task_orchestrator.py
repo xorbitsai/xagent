@@ -56,7 +56,10 @@ from uuid import uuid4
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ...config import get_shared_task_execution_enabled
+from ...config import (
+    get_shared_task_execution_enabled,
+    get_shutdown_handoff_enabled,
+)
 from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.agent.interruption import InterruptionReason
 from ...core.execution_scope import resolve_execution_scope
@@ -107,6 +110,7 @@ from .task_auto_recovery import (
     interruption_pause_result,
     is_status_only_source,
     settlement_interruption_for_failure,
+    shutdown_handoff_eligible,
 )
 from .task_command_transport import ClaimedTaskCommand
 from .task_execution_controller import (
@@ -908,6 +912,26 @@ def _log_delivery_projection_failure(
         )
 
 
+def _host_shutdown_in_progress() -> bool:
+    """Whether this host is shutting down and cancelling its executions.
+
+    Shared coordination closes the coordinators first, and their close cancels
+    the executions they own; the background task manager's own shutdown then
+    cancels whatever is left.
+    """
+    from .task_coordinator_runtime import task_coordinators_closing
+    from .task_execution import background_task_manager
+
+    return background_task_manager.shutting_down or task_coordinators_closing()
+
+
+def _shutdown_handoff_eligible_sync(task_id: int) -> bool:
+    from ..models.database import get_session_local
+
+    with get_session_local()() as db:
+        return shutdown_handoff_eligible(db, task_id)
+
+
 def _reconcile_finalized_turn_delivery(
     *,
     task_id: int,
@@ -1358,7 +1382,11 @@ def _accept_turn_no_commit(
         # rejected (for example ``start_identity_changed``) leaves the task
         # PAUSED with automatic resume stopped (``manual`` / ``new_turn``):
         # the message is marked delivery-failed and the paused run is not
-        # resumed. No terminal status is reported to the caller in that case.
+        # resumed. The ``/v1`` read of such a task reports ``failed`` with the
+        # new-message text (see ``status_only_terminal_view``), as it does for
+        # a START rejected at the task's current version on a task whose
+        # automatic resume had already stopped, which this call leaves
+        # untouched.
         #
         # The START is staged at the version this may move: the version
         # snapshot below is read after it.
@@ -2426,6 +2454,9 @@ def _schedule_bg(
         classify_unknown_tool_effect = False
         settlement_interruption: InterruptionReason | None = None
         defer_settlement_to_ttl_recovery = False
+        # Set when a host shutdown, not a user, cancelled the run; settlement
+        # then checks whether the task can be left to lease recovery instead.
+        shutdown_handoff_candidate = False
         skip_delivery_reconciliation = False
         # Positive evidence for finalize's delivery target: once
         # ``execute_task_background`` has been invoked, the run may have
@@ -2625,6 +2656,13 @@ def _schedule_bg(
                     client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
                 else:
                     settlement_error = "task execution cancelled"
+                shutdown_handoff_candidate = (
+                    get_shutdown_handoff_enabled()
+                    and not background_task_manager.cancel_was_requested(
+                        asyncio.current_task()
+                    )
+                    and _host_shutdown_in_progress()
+                )
                 raise
             except Exception as setup_or_run_err:
                 # Handled setup/run failures settle and return normally, so
@@ -2773,6 +2811,34 @@ def _schedule_bg(
                         task_id,
                         exc_info=True,
                     )
+
+                if shutdown_handoff_candidate and not defer_settlement_to_ttl_recovery:
+                    # Treat the shutdown like a crash: keep the lease so lease
+                    # recovery pauses the run once it expires and automatic
+                    # resume continues it on another host. A task automatic
+                    # recovery would not resume still fails now, so its caller
+                    # sees a terminal state. Any doubt settles as before.
+                    try:
+                        defer_settlement_to_ttl_recovery = (
+                            await run_db_io_cancellation_safe(
+                                lambda: _shutdown_handoff_eligible_sync(task_id)
+                            )
+                        )
+                    except asyncio.CancelledError as exc:
+                        cleanup_cancellation = cleanup_cancellation or exc
+                    except Exception:
+                        logger.warning(
+                            "task %s shutdown handoff check failed; settling "
+                            "the cancelled run immediately",
+                            task_id,
+                            exc_info=True,
+                        )
+                    if defer_settlement_to_ttl_recovery:
+                        logger.info(
+                            "task_id=%s component=shutdown-handoff run cancelled "
+                            "by host shutdown; retaining lease for TTL recovery",
+                            task_id,
+                        )
 
                 if not defer_settlement_to_ttl_recovery:
                     lease_settled = False

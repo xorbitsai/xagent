@@ -19,12 +19,14 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
     _is_salesforce_provider,
     _resolve_oauth_secret,
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
     verify_token,
 )
@@ -943,6 +945,7 @@ def test_planner_catalog_login_requests_tasks_scope(db_session):
     query = parse_qs(urlparse(_location(response)).query)
     assert set(query["scope"][0].split()) == {
         "Tasks.ReadWrite",
+        "Team.ReadBasic.All",
         "User.Read",
         "offline_access",
     }

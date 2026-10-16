@@ -57,6 +57,7 @@ TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECO
 TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
 TASK_INFRA_FAILURE_PAUSE_ENABLED = "XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED"
 TASK_AUTO_RESUME_ENABLED = "XAGENT_TASK_AUTO_RESUME_ENABLED"
+SHUTDOWN_HANDOFF_ENABLED = "XAGENT_SHUTDOWN_HANDOFF_ENABLED"
 TASK_AUTO_RESUME_POLL_SECONDS = "XAGENT_TASK_AUTO_RESUME_POLL_SECONDS"
 TASK_AUTO_RESUME_MAX_PER_TICK = "XAGENT_TASK_AUTO_RESUME_MAX_PER_TICK"
 TASK_AUTO_RESUME_MAX_INFLIGHT = "XAGENT_TASK_AUTO_RESUME_MAX_INFLIGHT"
@@ -558,6 +559,26 @@ def get_task_auto_resume_enabled() -> bool:
     """
 
     return _get_strict_bool_env(TASK_AUTO_RESUME_ENABLED, True)
+
+
+def get_shutdown_handoff_enabled() -> bool:
+    """Whether a shutdown hands eligible running tasks to lease recovery.
+
+    Off, a host shutting down cancels its runs and fails them immediately.
+    On, a run the shutdown cancelled (not one a user cancelled) whose task
+    is eligible for automatic recovery keeps its lease instead: lease
+    recovery pauses it once the lease expires and automatic resume picks it
+    up, exactly as after a crash. Only takes effect while
+    :func:`get_task_auto_resume_enabled` is on. Channel tasks, status-only
+    (SDK) tasks and the sources automatic recovery excludes still fail
+    immediately.
+
+    Priority:
+        1. XAGENT_SHUTDOWN_HANDOFF_ENABLED environment variable
+        2. False
+    """
+
+    return _get_strict_bool_env(SHUTDOWN_HANDOFF_ENABLED, False)
 
 
 def get_task_auto_resume_poll_seconds() -> int:

@@ -2088,8 +2088,8 @@ async def public_download_file(
 ) -> Any:
     """Public source-download endpoint for the chat file-card 'Open' link.
 
-    Mirrors ``public_preview_file`` for resolution (UUID file id or
-    legacy cross-user path) but always returns
+    Resolves registered UUID file capabilities only, never legacy paths,
+    and always returns
     ``Content-Disposition: attachment; filename="..."`` so the browser
     saves under the source filename instead of trying to render the
     bytes inline. Used by ``InlineFilePreview`` 'Open' affordances
@@ -2139,14 +2139,9 @@ async def public_download_file(
         else:
             target_path = file_ref.local_path
     else:
-        # Legacy non-UUID file id: resolve across user directories
-        # (same fallback as public_preview_file).
-        result = resolve_legacy_file_path_cross_user(file_id)
-        if result is None:
-            raise HTTPException(status_code=404, detail="File not found")
-        target_path, owner_user_id = result
-        _ensure_under_uploads(target_path, owner_user_id)
-        file_name = target_path.name
+        # Legacy paths have no unguessable capability and no owner context.
+        # Never resolve them across all user directories from a public route.
+        raise HTTPException(status_code=404, detail="File not found")
 
     if not target_is_durable:
         _ensure_under_uploads(target_path, owner_user_id)
@@ -2176,8 +2171,7 @@ async def public_preview_file(
     db: Session = Depends(get_db),
     validation_only: bool = False,
 ) -> Any:
-    # For public preview, we need to handle both file_id and legacy paths
-    # Try UUID first
+    """Preview a registered UUID capability; legacy paths are never public."""
     file_record = None
     base_path = None
     owner_user_id = None
@@ -2221,12 +2215,9 @@ async def public_preview_file(
                 public_validation=True,
             )
     else:
-        # Try to resolve as legacy path across all user directories
-        result = resolve_legacy_file_path_cross_user(file_id)
-        if result is None:
-            raise HTTPException(status_code=404, detail="File not found")
-
-        base_path, owner_user_id = result
+        # Legacy paths have no unguessable capability and no owner context.
+        # Never resolve them across all user directories from a public route.
+        raise HTTPException(status_code=404, detail="File not found")
 
     target_path = _resolve_public_preview_target(
         base_path,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
@@ -25,13 +26,31 @@ from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
+from xagent.web.models.oidc_consumed_token import OidcConsumedToken
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.oauth_state_claims import claim_oauth_state
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import WebToolConfig
 
 pytestmark = pytest.mark.postgresql
+
+
+def test_concurrent_ordinary_oauth_state_claims(postgresql_engine):
+    # Keep this in the PostgreSQL suite explicitly run by test-migrations.yml,
+    # rather than a mixed service file excluded by the fast test job.
+    OidcConsumedToken.__table__.create(postgresql_engine)
+    factory = sessionmaker(bind=postgresql_engine)
+    expiry = time.time() + 600
+
+    def claim(_):
+        with factory() as db:
+            return claim_oauth_state(db, "same-signed-state", expires_at=expiry)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert sum(pool.map(claim, range(16))) == 1
+
 
 TEST_BUILTIN_APP_ID = "calendar"
 TEST_BUILTIN_EXECUTION = {

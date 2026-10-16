@@ -1296,6 +1296,7 @@ async def test_legacy_preview_staging_releases_request_pool_slot(
         response = await websocket_api.redirect_legacy_preview(
             relative_path,
             request_db,
+            User(id=user_id),
         )
 
         assert response.status_code == 307
@@ -1340,6 +1341,7 @@ async def test_legacy_preview_metadata_failure_compensates_staged_object(
             await websocket_api.redirect_legacy_preview(
                 relative_path,
                 request_db,
+                User(id=user_id),
             )
 
         check_db = _direct_db_session()
@@ -1391,7 +1393,9 @@ async def test_cancelled_legacy_preview_drains_failed_registration_compensation(
         fail_metadata_after_cancel,
     )
     registration = asyncio.create_task(
-        websocket_api.redirect_legacy_preview(relative_path, request_db)
+        websocket_api.redirect_legacy_preview(
+            relative_path, request_db, User(id=user_id)
+        )
     )
     try:
         assert await asyncio.to_thread(metadata_started.wait, DB_PROGRESS_TIMEOUT)

@@ -5,8 +5,8 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from xagent.web.api.files import public_download_file, public_preview_file
 from xagent.web.api import websocket as websocket_api
+from xagent.web.api.files import public_download_file, public_preview_file
 
 
 def test_public_download_rejects_legacy_paths():

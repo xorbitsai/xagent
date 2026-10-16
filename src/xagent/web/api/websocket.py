@@ -58,6 +58,7 @@ from ...core.runtime_performance import (
     observe_duration,
     observe_value,
 )
+from ..auth_dependencies import get_current_user
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
@@ -68,7 +69,6 @@ from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
-from ..auth_dependencies import get_current_user
 from ..services import task_command_execution as command_execution_service
 from ..services import task_start as task_start_service
 from ..services.assistant_history_safety import (

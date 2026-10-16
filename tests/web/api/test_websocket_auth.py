@@ -21,6 +21,7 @@ from tests.web.auth_token_cases import (
     RejectedAccessTokenCase,
     build_access_token,
 )
+from xagent.core.tools.core.RAG_tools.progress.realtime import ProgressBroadcaster
 from xagent.web.api import progress_ws
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
@@ -623,3 +624,51 @@ async def test_open_session_monitor_fails_closed_on_database_outage(monkeypatch)
     }
     assert cleaned.is_set()
     assert "private" not in str(messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["connect", "initial-send"])
+async def test_progress_cancellation_before_receive_loop_unsubscribes(
+    monkeypatch, phase
+):
+    websocket, _ = _asgi_websocket(denial_extension=False)
+    started = asyncio.Event()
+    broadcaster = ProgressBroadcaster()
+    original_connect = broadcaster.connect
+
+    async def connect(task_id, connection):
+        await original_connect(task_id, connection)
+        if phase == "connect":
+            started.set()
+            await asyncio.Event().wait()
+
+    async def send_text(_data):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(websocket, "send_text", send_text)
+    monkeypatch.setattr(broadcaster, "connect", connect)
+    monkeypatch.setattr(progress_ws, "progress_broadcaster", broadcaster)
+    monkeypatch.setattr(
+        progress_ws,
+        "get_authenticated_user",
+        AsyncMock(return_value=websocket_auth.WebSocketPrincipal(id=1, is_admin=False)),
+    )
+    manager = MagicMock()
+    manager.get_task_progress.return_value.user_id = 1
+    monkeypatch.setattr(progress_ws, "get_progress_manager", lambda: manager)
+    monkeypatch.setattr(progress_ws, "ProgressUpdateEvent", MagicMock())
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 3600)
+    task = asyncio.create_task(
+        progress_ws.progress_websocket_endpoint(websocket, "task", "token")
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert broadcaster._connections == {}

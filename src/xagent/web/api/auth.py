@@ -119,6 +119,12 @@ _LOGIN_FAILURE_MAX_KEYS = 10_000
 _login_failure_lock = threading.Lock()
 _login_failures: dict[str, deque[float]] = defaultdict(deque)
 _login_failure_last_sweep = 0.0
+_PASSWORD_RECOVERY_WINDOW_SECONDS = 15 * 60
+_PASSWORD_RECOVERY_LIMIT = 5
+_PASSWORD_RECOVERY_MAX_KEYS = 10_000
+_password_recovery_lock = threading.Lock()
+_password_recovery_attempts: dict[str, deque[float]] = defaultdict(deque)
+_password_recovery_last_sweep = 0.0
 _oauth_state_lock = threading.Lock()
 _used_ordinary_oauth_states: dict[str, float] = {}
 
@@ -190,6 +196,58 @@ def _reserve_login_attempt(key: str, now: float | None = None) -> bool:
 def _clear_login_failures(key: str) -> None:
     with _login_failure_lock:
         _login_failures.pop(key, None)
+
+
+def _password_recovery_attempt_key(
+    request: Request | None, namespace: str, value: str
+) -> str:
+    client_host = remote_ip_from_request(request) if request else "unknown"
+    return hashlib.sha256(
+        f"password-recovery\0{namespace}\0{client_host}\0{value}".encode()
+    ).hexdigest()
+
+
+def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bool:
+    """Atomically limit password-recovery requests for one bounded key."""
+    global _password_recovery_last_sweep
+    current = time.monotonic() if now is None else now
+    with _password_recovery_lock:
+        attempts = _password_recovery_attempts.get(key, deque())
+        while attempts and current - attempts[0] >= _PASSWORD_RECOVERY_WINDOW_SECONDS:
+            attempts.popleft()
+        if (
+            current - _password_recovery_last_sweep >= 60
+            or len(_password_recovery_attempts) > _PASSWORD_RECOVERY_MAX_KEYS
+        ):
+            for candidate, candidate_attempts in list(
+                _password_recovery_attempts.items()
+            ):
+                while candidate_attempts and (
+                    current - candidate_attempts[0] >= _PASSWORD_RECOVERY_WINDOW_SECONDS
+                ):
+                    candidate_attempts.popleft()
+                if not candidate_attempts:
+                    _password_recovery_attempts.pop(candidate, None)
+            _password_recovery_last_sweep = current
+        if len(attempts) >= _PASSWORD_RECOVERY_LIMIT:
+            return False
+        _password_recovery_attempts[key] = attempts
+        attempts.append(current)
+        return True
+
+
+def _enforce_password_recovery_rate_limit(
+    request: Request | None, identifiers: tuple[tuple[str, str], ...]
+) -> None:
+    for namespace, value in identifiers:
+        if not _reserve_password_recovery_attempt(
+            _password_recovery_attempt_key(request, namespace, value)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many password recovery attempts. Try again later.",
+                headers={"Retry-After": str(_PASSWORD_RECOVERY_WINDOW_SECONDS)},
+            )
 
 
 def _claim_ordinary_oauth_state(state: str) -> bool:
@@ -2185,6 +2243,7 @@ async def register(
 async def forgot_password(
     request: ForgotPasswordRequest,
     db: Session = Depends(get_db),
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> ForgotPasswordResponse:
     email = normalize_email(request.email)
     if not is_valid_email(email):
@@ -2192,6 +2251,11 @@ async def forgot_password(
             success=False,
             message="Please enter a valid email address",
         )
+
+    _enforce_password_recovery_rate_limit(
+        http_request,
+        (("ip", remote_ip_from_request(http_request) or "unknown"), ("email", email)),
+    )
 
     user = get_user_by_email(db, email)
     if user is None:
@@ -2234,7 +2298,15 @@ async def forgot_password(
 async def reset_password(
     request: ResetPasswordRequest,
     db: Session = Depends(get_db),
+    http_request: Request = None,  # type: ignore[assignment]
 ) -> ResetPasswordResponse:
+    _enforce_password_recovery_rate_limit(
+        http_request,
+        (
+            ("ip", remote_ip_from_request(http_request) or "unknown"),
+            ("token", hash_password_reset_token(request.token)),
+        ),
+    )
     if len(request.new_password) < PASSWORD_MIN_LENGTH:
         return ResetPasswordResponse(
             success=False,

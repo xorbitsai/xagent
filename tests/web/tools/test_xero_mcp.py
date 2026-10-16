@@ -324,6 +324,11 @@ def test_list_invoice_history_returns_xero_notes_oldest_first(fake: FakeXero) ->
                     "User": "Toby Example",
                     "DateUTCString": "2026-10-19T23:00:00Z",
                 },
+                {
+                    "Details": "Imported note without timestamp",
+                    "Changes": "Note",
+                    "User": "Migration",
+                },
             ]
         }
     )
@@ -345,11 +350,16 @@ def test_list_invoice_history_returns_xero_notes_oldest_first(fake: FakeXero) ->
                 "user": "Hannah Example",
                 "date_utc": "2026-10-20T01:00:00Z",
             },
+            {
+                "details": "Imported note without timestamp",
+                "changes": "Note",
+                "user": "Migration",
+            },
         ],
-        "total_count": 2,
+        "total_count": 3,
         "complete": True,
         "skip": 0,
-        "returned": 2,
+        "returned": 3,
         "has_more": False,
     }
     assert fake.calls[-1]["path"] == f"Invoices/{INVOICE_ID}/History"
@@ -360,6 +370,53 @@ def test_list_invoice_history_returns_xero_notes_oldest_first(fake: FakeXero) ->
     assert first["has_more"] is True
     assert first["next_skip"] == 1
     assert first["history"][0]["details"] == "Invoice authorised"
+
+    second = _call_tool(
+        "list_invoice_history",
+        invoiceId=INVOICE_ID,
+        skip=first["next_skip"],
+        limit=1,
+    )
+    assert second["skip"] == 1
+    assert second["returned"] == 1
+    assert second["has_more"] is True
+    assert second["next_skip"] == 2
+    assert second["history"][0]["details"] == ("Customer promised payment on Friday")
+
+    last = _call_tool(
+        "list_invoice_history",
+        invoiceId=INVOICE_ID,
+        skip=second["next_skip"],
+        limit=1,
+    )
+    assert last["skip"] == 2
+    assert last["returned"] == 1
+    assert last["has_more"] is False
+    assert "next_skip" not in last
+    assert last["history"][0]["details"] == "Imported note without timestamp"
+
+
+def test_list_invoice_history_handles_empty_history_and_clamps_window(
+    fake: FakeXero,
+) -> None:
+    fake.responder = lambda call: MockResponse({})
+
+    result = _call_tool(
+        "list_invoice_history",
+        invoiceId=INVOICE_ID,
+        skip=-10,
+        limit=0,
+    )
+
+    assert result == {
+        "status": "success",
+        "total_count": 0,
+        "complete": True,
+        "skip": 0,
+        "returned": 0,
+        "has_more": False,
+        "history": [],
+    }
 
 
 def test_list_invoice_history_rejects_unsafe_invoice_id(fake: FakeXero) -> None:

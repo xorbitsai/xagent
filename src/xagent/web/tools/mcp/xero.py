@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from ....config import get_tool_max_output_length
-from .utils import clamp_limit, setup_proxy_env, url_path_id
+from .utils import clamp_limit, clamp_offset, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("xero-mcp")
@@ -62,6 +62,7 @@ OVERDUE_DEFAULT_LIMIT = 50
 OVERDUE_MAX_LIMIT = 200
 PAID_INVOICE_DEFAULT_LIMIT = 100
 PAID_INVOICE_MAX_LIMIT = 200
+INVOICE_HISTORY_MAX_LIMIT = 200
 OVERDUE_TOP_CONTACTS = 25
 OPEN_INVOICE_EXCLUDES = ["credit_notes", "overpayments", "prepayments"]
 DEFAULT_INVOICE_TERMS_DAYS = 30
@@ -1191,7 +1192,8 @@ def list_invoice_history(
 
     Use this when a user asks for notes, comments or change history they can
     see in an invoice's History & Notes panel. These records are separate from
-    the invoice Reference and are not returned by list_invoices.
+    the invoice Reference and are not returned by list_invoices. When has_more
+    is true, call again with next_skip to read the remaining history.
 
     invoiceId: Xero invoice GUID from list_invoices.
     skip, limit: window into the complete history (limit 1-200, default 100).
@@ -1204,9 +1206,14 @@ def list_invoice_history(
     )
     records = data.get("HistoryRecords") or []
     history = [_history_record_view(record) for record in records]
-    history.sort(key=lambda record: record.get("date_utc", ""))
-    skip = max(0, int(skip))
-    limit = max(1, min(int(limit), 200))
+    history.sort(
+        key=lambda record: (
+            "date_utc" not in record,
+            record.get("date_utc", ""),
+        )
+    )
+    skip = clamp_offset(skip)
+    limit = clamp_limit(limit, max_limit=INVOICE_HISTORY_MAX_LIMIT)
     window = history[skip : skip + limit]
 
     def build(shown: list[Any], truncated: bool) -> dict[str, Any]:

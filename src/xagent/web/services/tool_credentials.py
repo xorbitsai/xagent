@@ -8,12 +8,11 @@ from datetime import datetime, timezone
 from typing import Any, Callable, cast
 
 from cryptography.fernet import Fernet, InvalidToken
-
-from ...config import get_tool_credentials_encryption_key
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from ...config import get_tool_credentials_encryption_key
 from ...core.tools.core.sql_tool import validate_external_database_url
 from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig

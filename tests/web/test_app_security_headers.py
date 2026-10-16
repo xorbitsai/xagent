@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from xagent.web.api.files import _inline_preview_response
-from xagent.web.app import _blocked_upload_extension, _security_header_values
+from xagent.web.app import (
+    _blocked_upload_extension,
+    _is_public_upload_path,
+    _security_header_values,
+)
 
 
 @pytest.mark.parametrize(
@@ -28,6 +32,13 @@ def test_active_upload_document_extensions_are_blocked(filename: str) -> None:
 
 def test_passive_upload_image_extension_is_not_blocked() -> None:
     assert not _blocked_upload_extension("logo.PNG")
+
+
+def test_public_upload_mount_only_allows_agent_logos() -> None:
+    assert _is_public_upload_path("agent_logos/agent_1.png")
+    assert not _is_public_upload_path("agent_logos/")
+    assert not _is_public_upload_path("user_1/private/report.pdf")
+    assert not _is_public_upload_path("../user_1/private/report.pdf")
 
 
 def test_security_headers_keep_widget_and_preview_embeddable() -> None:

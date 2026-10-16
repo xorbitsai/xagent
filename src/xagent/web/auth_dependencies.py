@@ -5,11 +5,12 @@ from typing import NoReturn, Optional, assert_never
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import ExpiredSignatureError, JWTError, jwt
 from sqlalchemy.orm import Session
 
+from . import jwt_codec as jwt
 from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from .auth_sessions import matches_user_session
+from .jwt_codec import ExpiredSignatureError, JWTError
 from .jwt_validation import (
     has_matching_temporal_claim_conversion_failure,
     is_exact_integer_bindable,
@@ -73,7 +74,17 @@ def _resolve_access_token_user(
         )
     except ExpiredSignatureError:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.EXPIRED) from None
-    except JWTError:
+    except JWTError as error:
+        # PyJWT wraps malformed NumericDate conversions in its JWT exception
+        # family. Preserve the existing public payload-rejection contract
+        # without classifying signature failures or unrelated errors as such.
+        conversion = error.__context__
+        if isinstance(conversion, (TypeError, OverflowError)) and (
+            has_matching_temporal_claim_conversion_failure(token, conversion)
+        ):
+            raise _AccessTokenRejected(
+                _AccessTokenRejectionReason.INVALID_CLAIMS
+            ) from None
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID) from None
     except (TypeError, OverflowError) as error:
         if has_matching_temporal_claim_conversion_failure(token, error):

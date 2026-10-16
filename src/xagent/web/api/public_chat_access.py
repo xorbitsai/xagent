@@ -13,7 +13,6 @@ from typing import Any, Callable, Protocol, TypeGuard, TypeVar
 
 from fastapi import Depends, HTTPException, Query, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -21,7 +20,9 @@ from ...core.task_runtime import (
     FILE_OPERATION_ACCESS_VERSION,
     FILE_OPERATION_ACCESS_VERSION_KEY,
 )
+from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from ..jwt_codec import JWTError
 from ..jwt_validation import (
     has_matching_temporal_claim_conversion_failure,
     is_exact_integer_bindable,

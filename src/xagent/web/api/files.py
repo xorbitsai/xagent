@@ -24,7 +24,6 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.security import HTTPAuthorizationCredentials
-from jose import JWTError, jwt
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -45,6 +44,7 @@ from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
+from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..auth_dependencies import (
     _AccessTokenRejected,
@@ -62,6 +62,7 @@ from ..config import (
     is_allowed_file,
 )
 from ..content_security import is_active_content_type
+from ..jwt_codec import JWTError
 from ..jwt_validation import has_matching_temporal_claim_conversion_failure
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task

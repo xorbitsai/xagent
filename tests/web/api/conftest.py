@@ -32,13 +32,13 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from jose import jwt
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.auth_database import auth_db_override
 from tests.shared.db_teardown import drop_all_tables
+from xagent.web import jwt_codec as jwt
 from xagent.web.api.a2a import router as a2a_router
 from xagent.web.api.agent_api_keys import router as agent_api_keys_router
 from xagent.web.api.agents import router as agents_router

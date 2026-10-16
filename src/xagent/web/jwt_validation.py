@@ -2,7 +2,8 @@
 
 from typing import TypeGuard
 
-from jose import JWTError, jwt
+from . import jwt_codec as jwt
+from .jwt_codec import JWTError
 
 _SQLITE_INTEGER_MIN = -(2**63)
 _SQLITE_INTEGER_MAX = 2**63 - 1

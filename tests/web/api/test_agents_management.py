@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from jose import jwt as jose_jwt
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
@@ -18,6 +17,7 @@ from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     execution_scope_from_agent_config,
 )
+from xagent.web import jwt_codec as jose_jwt
 from xagent.web.api import agents as agents_api
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.widget import (

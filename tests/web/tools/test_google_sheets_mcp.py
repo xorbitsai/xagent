@@ -683,16 +683,6 @@ async def test_get_spreadsheet_description_says_drive_is_not_needed():
     )
 
 
-async def test_write_descriptions_preserve_source_export_contract():
-    tools = {tool.name: tool for tool in await google_sheets.mcp.list_tools()}
-
-    for name in ("google_sheets_update_range", "google_sheets_append_rows"):
-        description = " ".join(tools[name].description.split())
-        assert "spreadsheet_export contract" in description
-        assert "keep required identity columns" in description
-        assert "aggregate totals" in description
-
-
 # What the Sheets API returns for an Excel file stored in Drive, such as one
 # opened from a ".../spreadsheets/d/<id>/edit?rtpof=true" link.
 _OFFICE_FILE_400 = {

@@ -605,6 +605,28 @@ def test_overdue_defaults_to_today(
 # --------------------------------------------------------------------------- #
 
 
+RECEIVABLES_SPREADSHEET_COLUMNS = [
+    {"header": "Company Name", "field": "contact_name"},
+    {"header": "Currency", "field": "currency"},
+    {"header": "Invoice Count", "field": "invoice_count"},
+    {"header": "Current", "field": "buckets.Current"},
+    {"header": "1-15 Days", "field": "buckets.1-15"},
+    {"header": "16-30 Days", "field": "buckets.16-30"},
+    {"header": "31-45 Days", "field": "buckets.31-45"},
+    {"header": "46-60 Days", "field": "buckets.46-60"},
+    {"header": "61-75 Days", "field": "buckets.61-75"},
+    {"header": "76+ Days", "field": "buckets.76+"},
+    {"header": "Total Due", "field": "total_due"},
+]
+
+
+def _resolve_field(row: dict[str, Any], field: str) -> Any:
+    value: Any = row
+    for part in field.split("."):
+        value = value[part]
+    return value
+
+
 @pytest.mark.parametrize(
     ("days", "bucket"),
     [
@@ -666,20 +688,15 @@ def test_ageing_has_one_named_row_per_contact_and_currency_with_every_bucket(
     assert result["bucket_names"] == list(xero.RECEIVABLE_BUCKETS)
     assert result["spreadsheet_export"] == {
         "row_source": "rows",
-        "columns": [
-            {"header": "Company Name", "field": "contact_name"},
-            {"header": "Currency", "field": "currency"},
-            {"header": "Invoice Count", "field": "invoice_count"},
-            *[
-                {"header": bucket, "field": f"buckets.{bucket}"}
-                for bucket in xero.RECEIVABLE_BUCKETS
-            ],
-            {"header": "Total Due", "field": "total_due"},
-        ],
+        "columns": RECEIVABLES_SPREADSHEET_COLUMNS,
         "retrieve_all_pages": True,
-        "summary_only": False,
     }
     rows = result["rows"]
+    for row in rows:
+        assert all(
+            _resolve_field(row, column["field"]) is not None
+            for column in result["spreadsheet_export"]["columns"]
+        )
     assert [(row["contact_name"], row["currency"]) for row in rows] == [
         ("Heebie", "AUD"),
         ("Acme", "AUD"),
@@ -735,8 +752,15 @@ def test_ageing_rows_window_resumes_with_next_skip(fake: FakeXero) -> None:
     )
 
     assert first["has_more"] is True and first["next_skip"] == 4
+    assert first["rows_complete"] is False
+    assert first["spreadsheet_export"]["row_source"] == "rows"
     assert [r["contact_name"] for r in second["rows"]] == ["C4", "C5"]
     assert second["has_more"] is False
+    assert second["rows_complete"] is True
+    assert second["spreadsheet_export"]["columns"][0] == {
+        "header": "Company Name",
+        "field": "contact_name",
+    }
     assert first["totals_by_currency"] == second["totals_by_currency"]
 
 
@@ -757,6 +781,35 @@ def test_ageing_trims_rows_and_preserves_resume_cursor(
     assert result["has_more"] is True
     assert result["next_skip"] == result["returned"]
     assert result["total_rows"] == 60
+    assert result["rows_complete"] is False
+    assert result["spreadsheet_export"]["retrieve_all_pages"] is True
+
+
+def test_ageing_export_contract_survives_an_empty_result(fake: FakeXero) -> None:
+    fake.responder = _overdue_pages([[]])
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    assert result["rows"] == []
+    assert result["rows_complete"] is True
+    assert result["spreadsheet_export"] == {
+        "row_source": "rows",
+        "columns": RECEIVABLES_SPREADSHEET_COLUMNS,
+        "retrieve_all_pages": True,
+    }
+
+
+def test_ageing_export_keeps_company_column_for_an_unnamed_contact(
+    fake: FakeXero,
+) -> None:
+    fake.responder = _overdue_pages(
+        [[_invoice("INV-1", "2026-09-01", 10, contact="", contact_id="contact-1")]]
+    )
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    assert result["rows"][0]["contact_name"] == "contact-1"
+    assert _resolve_field(result["rows"][0], "contact_name") == "contact-1"
 
 
 def test_ageing_fails_instead_of_reporting_partial_totals(

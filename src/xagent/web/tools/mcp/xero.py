@@ -1239,7 +1239,10 @@ RECEIVABLES_SPREADSHEET_COLUMNS = (
     {"header": "Currency", "field": "currency"},
     {"header": "Invoice Count", "field": "invoice_count"},
     *(
-        {"header": bucket, "field": f"buckets.{bucket}"}
+        {
+            "header": bucket if bucket == "Current" else f"{bucket} Days",
+            "field": f"buckets.{bucket}",
+        }
         for bucket in RECEIVABLE_BUCKETS
     ),
     {"header": "Total Due", "field": "total_due"},
@@ -1282,6 +1285,8 @@ def list_receivables_ageing(
     even when only part of the rows fit in one response. When has_more is true,
     call again with next_skip to read the remaining rows. Each window re-scans
     the open ledger, so prefer the largest practical limit (up to 500).
+    complete confirms the ledger scan and totals are complete; rows_complete
+    confirms that pagination has reached the final contact-row page.
 
     When creating a spreadsheet or table, follow spreadsheet_export: retrieve
     every page, use rows as the row source, and include Company Name from
@@ -1346,7 +1351,9 @@ def list_receivables_ageing(
         _compact(
             {
                 "contact_id": row["contact_id"],
-                "contact_name": row["contact_name"],
+                "contact_name": (
+                    row["contact_name"] or row["contact_id"] or "Unknown contact"
+                ),
                 "currency": row["currency"],
                 "invoice_count": row["invoice_count"],
                 "buckets": render(row["buckets"]),
@@ -1382,9 +1389,9 @@ def list_receivables_ageing(
                 "row_source": "rows",
                 "columns": list(RECEIVABLES_SPREADSHEET_COLUMNS),
                 "retrieve_all_pages": True,
-                "summary_only": False,
             },
             "complete": True,
+            "rows_complete": not has_more,
             "skip": skip,
             "returned": len(shown),
             "has_more": has_more,

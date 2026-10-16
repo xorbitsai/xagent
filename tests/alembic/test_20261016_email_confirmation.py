@@ -33,3 +33,26 @@ def test_email_confirmation_migration_keeps_recovery_address():
             connection.exec_driver_sql("SELECT email FROM users").scalar_one()
             == "original@example.com"
         )
+        migration.downgrade()
+
+
+def test_email_confirmation_migration_skips_schema_without_users():
+    path = (
+        Path(__file__).parents[2]
+        / "src/xagent/migrations/versions/20261016_add_email_confirmation.py"
+    )
+    spec = importlib.util.spec_from_file_location("email_confirmation_migration", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    engine = sa.create_engine("sqlite:///:memory:")
+    try:
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                "CREATE TABLE unrelated (id INTEGER PRIMARY KEY)"
+            )
+            migration.op = Operations(MigrationContext.configure(connection))
+            migration.upgrade()
+            migration.downgrade()
+            assert sa.inspect(connection).get_table_names() == ["unrelated"]
+    finally:
+        engine.dispose()

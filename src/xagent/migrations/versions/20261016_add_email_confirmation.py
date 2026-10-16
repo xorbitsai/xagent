@@ -10,7 +10,10 @@ depends_on = None
 
 
 def upgrade() -> None:
-    columns = {c["name"] for c in sa.inspect(op.get_bind()).get_columns("users")}
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table("users"):
+        return
+    columns = {c["name"] for c in inspector.get_columns("users")}
     for column in (
         sa.Column("pending_email", sa.String(255), nullable=True),
         sa.Column("email_confirmation_hash", sa.String(64), nullable=True),
@@ -23,7 +26,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table("users"):
+        return
+    columns = {c["name"] for c in inspector.get_columns("users")}
     with op.batch_alter_table("users") as batch:
-        batch.drop_column("email_confirmation_expires_at")
-        batch.drop_column("email_confirmation_hash")
-        batch.drop_column("pending_email")
+        for column in (
+            "email_confirmation_expires_at",
+            "email_confirmation_hash",
+            "pending_email",
+        ):
+            if column in columns:
+                batch.drop_column(column)

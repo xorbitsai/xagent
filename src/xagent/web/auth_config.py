@@ -5,6 +5,7 @@ from ..config import (
     get_environment,
     get_require_secure_secrets,
     get_session_secret,
+    validate_encryption_config,
 )
 
 MIN_SECRET_LENGTH = 32
@@ -46,6 +47,7 @@ def validate_auth_config() -> None:
             "XAGENT_SESSION_SECRET or XAGENT_JWT_SECRET must provide a unique "
             "session signing value"
         )
+    validate_encryption_config()
 
 
 def _get_positive_int_from_env(name: str, default: int) -> int:

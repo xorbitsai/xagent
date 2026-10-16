@@ -35,7 +35,9 @@ def test_secure_secret_override_rejects_the_development_fallback(monkeypatch):
 
 def test_configured_encryption_key_is_used(monkeypatch):
     monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
-    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "deployment-secret")
+    monkeypatch.setenv(
+        "XAGENT_SECRET_ENCRYPTION_KEY", "deployment-secret-01234567890123456789"
+    )
     monkeypatch.delenv("SECRET_KEY", raising=False)
 
     assert _build_fernet_key()

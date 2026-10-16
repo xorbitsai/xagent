@@ -2194,6 +2194,35 @@ def get_require_secure_secrets() -> bool:
     return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
 
 
+def get_tool_credentials_encryption_key() -> str:
+    """Keep the historical key derivation while refusing deployed defaults."""
+    raw = os.getenv("XAGENT_SECRET_ENCRYPTION_KEY") or os.getenv("SECRET_KEY")
+    requires_secure = get_environment() != "development" or get_require_secure_secrets()
+    if requires_secure and (
+        not raw or len(raw.strip()) < 32 or raw.strip().lower() == "xagent-dev-key"
+    ):
+        raise RuntimeError(
+            "XAGENT_SECRET_ENCRYPTION_KEY must contain at least 32 secret characters"
+        )
+    return raw or "xagent-dev-key"
+
+
+def validate_encryption_config() -> None:
+    """Reject missing, public or malformed encryption keys before admission."""
+    if get_environment() == "development" and not get_require_secure_secrets():
+        return
+    from cryptography.fernet import Fernet
+
+    key = os.getenv(ENCRYPTION_KEY)
+    if not key or key.strip() == DEV_FALLBACK_ENCRYPTION_KEY:
+        raise RuntimeError("ENCRYPTION_KEY must provide a private Fernet key")
+    try:
+        Fernet(key.encode("ascii"))
+    except (ValueError, UnicodeError) as exc:
+        raise RuntimeError("ENCRYPTION_KEY must provide a valid Fernet key") from exc
+    get_tool_credentials_encryption_key()
+
+
 def get_oidc_login_ttl_seconds() -> int:
     """Return the short-lived OIDC login transaction TTL."""
     return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)

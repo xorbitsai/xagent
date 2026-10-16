@@ -204,7 +204,9 @@ def _password_recovery_attempt_key(
     if namespace == "ip":
         client_host = remote_ip_from_request(request) if request else "unknown"
         value = client_host or "unknown"
-    return hashlib.sha256(f"password-recovery\0{namespace}\0{value}".encode()).hexdigest()
+    return hashlib.sha256(
+        f"password-recovery\0{namespace}\0{value}".encode()
+    ).hexdigest()
 
 
 def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bool:
@@ -230,6 +232,13 @@ def _reserve_password_recovery_attempt(key: str, now: float | None = None) -> bo
                     _password_recovery_attempts.pop(candidate, None)
             _password_recovery_last_sweep = current
         if len(attempts) >= _PASSWORD_RECOVERY_LIMIT:
+            return False
+        # Do not evict active buckets: that would let an attacker recover a
+        # blocked identity by filling the table with disposable identifiers.
+        if (
+            key not in _password_recovery_attempts
+            and len(_password_recovery_attempts) >= _PASSWORD_RECOVERY_MAX_KEYS
+        ):
             return False
         _password_recovery_attempts[key] = attempts
         attempts.append(current)
@@ -2118,7 +2127,10 @@ async def login(
     started_at = time.perf_counter()
     outcome = "error"
     attempt_key = _login_attempt_key(http_request, request.username)
-    if not _reserve_login_attempt(attempt_key):
+    account_key = _login_attempt_key(None, request.username)
+    if not _reserve_login_attempt(attempt_key) or not _reserve_login_attempt(
+        account_key
+    ):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many failed login attempts. Try again later.",
@@ -2130,6 +2142,7 @@ async def login(
         )
         outcome = "succeeded"
         _clear_login_failures(attempt_key)
+        _clear_login_failures(account_key)
         return response
     except HTTPException:
         outcome = "rejected"

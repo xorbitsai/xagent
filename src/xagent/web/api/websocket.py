@@ -68,6 +68,7 @@ from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..auth_dependencies import get_current_user
 from ..services import task_command_execution as command_execution_service
 from ..services import task_start as task_start_service
 from ..services.assistant_history_safety import (
@@ -846,7 +847,9 @@ class _LegacyPreviewRegistrationError(RuntimeError):
     """A legacy preview path cannot be registered for a public redirect."""
 
 
-def _register_legacy_preview_isolated(legacy_path: str) -> str:
+def _register_legacy_preview_isolated(
+    legacy_path: str, requesting_user_id: int | None = None
+) -> str:
     """Register one legacy local preview without overlapping DB and file I/O.
 
     Owner discovery and the final insert each own a short Session. Durable
@@ -876,6 +879,10 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
                 "Cannot infer owner for legacy preview path"
             )
         owner_user_id, task_id = owner_info
+        if requesting_user_id is not None and owner_user_id != requesting_user_id:
+            raise _LegacyPreviewRegistrationError(
+                "Legacy preview path belongs to another user"
+            )
 
     generated_file_id = _build_output_file_id(relative_path)
     scope_segments = _scope_segments_for_task(task_id)
@@ -994,6 +1001,7 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
 async def redirect_legacy_preview(
     legacy_path: str,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> Any:
     if not release_db_connection_if_clean(db):
         raise RuntimeError(
@@ -1002,7 +1010,7 @@ async def redirect_legacy_preview(
         )
     try:
         file_id = await run_db_io_cancellation_safe(
-            lambda: _register_legacy_preview_isolated(legacy_path)
+            lambda: _register_legacy_preview_isolated(legacy_path, int(user.id))
         )
     except _LegacyPreviewRegistrationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

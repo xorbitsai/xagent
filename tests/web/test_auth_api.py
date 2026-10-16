@@ -1810,6 +1810,7 @@ class TestAuthAPI:
         assert sent_payload["reset_link"].startswith(
             "https://app.example.com/reset-password#token="
         )
+        assert urlparse(sent_payload["reset_link"]).query == ""
 
         token = parse_qs(urlparse(sent_payload["reset_link"]).fragment).get(
             "token", [""]

@@ -32,18 +32,28 @@ export function ResetPasswordPage() {
     tokenRead.current = true
     const fragment = window.location.hash.replace(/^#/, "")
     const fragmentParams = new URLSearchParams(fragment)
-    setToken(fragmentParams.get("token") || "")
+    const queryParams = new URLSearchParams(window.location.search)
+    // Accept outstanding pre-upgrade emails for their remaining lifetime.
+    // New emails use fragments; strip either representation immediately.
+    const resetToken = fragmentParams.get("token") || queryParams.get("token") || ""
+    setToken(resetToken)
+    if (!resetToken) setError(t("resetPassword.alerts.invalid_token"))
+    const hadQueryToken = queryParams.has("token")
+    queryParams.delete("token")
+    fragmentParams.delete("token")
 
     // Remove the one-time token from the address bar and browser history after
     // reading it. The token remains only in component state for the POST.
-    if (window.location.hash) {
+    if (window.location.hash || hadQueryToken) {
+      const query = queryParams.toString()
+      const hash = fragmentParams.toString()
       window.history.replaceState(
         null,
         "",
-        `${window.location.pathname}${window.location.search}`
+        `${window.location.pathname}${query ? `?${query}` : ""}${hash ? `#${hash}` : ""}`
       )
     }
-  }, [])
+  }, [t])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

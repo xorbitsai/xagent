@@ -1733,7 +1733,10 @@ def build_password_reset_url(token: str) -> str:
         raise RuntimeError(
             "XAGENT_APP_BASE_URL must be configured for password reset emails"
         )
-    return f"{base_url}/reset-password?token={token}"
+    # Keep the one-time token in the URL fragment. Browsers do not send the
+    # fragment in HTTP requests or Referer headers, so it cannot leak through
+    # reverse-proxy access logs or third-party resources loaded by the page.
+    return f"{base_url}/reset-password#token={token}"
 
 
 def has_users(db: Session) -> bool:

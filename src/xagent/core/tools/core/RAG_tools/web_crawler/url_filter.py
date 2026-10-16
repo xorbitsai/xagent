@@ -9,6 +9,7 @@ from typing import Optional
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
+from .....utils.security import build_ca_bundle_ssl_context
 from ..core.web_url_utils import normalize_web_url
 
 logger = logging.getLogger(__name__)
@@ -32,6 +33,8 @@ class URLFilter:
     """URL filtering and validation.
 
     Handles URL filtering based on domain, regex patterns, and robots.txt rules.
+    Construction performs no I/O. With robots enabled, URLs are denied until
+    load_robots_txt(proxy_url) loads rules through the caller's egress gate.
     """
 
     def __init__(
@@ -73,10 +76,10 @@ class URLFilter:
                 self.robots_parser = RobotFileParser()
                 self.robots_parser.set_url(self.robots_url)
             except Exception as e:
-                logger.warning("Failed to fetch robots.txt: %s", e)
+                logger.warning("Failed to initialize robots.txt parser: %s", e)
                 self.robots_parser = None
 
-    def _fetch_robots_txt(self, proxy_url: str) -> None:
+    def load_robots_txt(self, proxy_url: str, *, timeout: float = 10) -> None:
         """Fetch robots.txt and apply the three-way RFC 9309 s2.3 policy: parse
         it on a 2xx, drop the parser on a 4xx (unavailable means unrestricted),
         and leave it unread on a 5xx or transport error (undefined means
@@ -92,21 +95,27 @@ class URLFilter:
             # whole site, with the Disallow rules left unread at the redirect
             # target. Client rather than httpx.get because only Client takes
             # max_redirects, and timeout is per-request: 20 default hops
-            # stretch the ceiling to ~200s. Five is the floor RFC 9309
+            # multiply the configured timeout. Five is the floor RFC 9309
             # s2.3.1.2 asks crawlers to follow.
             headers = {"User-Agent": self.user_agent} if self.user_agent else None
             with httpx.Client(
-                timeout=10,
+                timeout=timeout,
                 follow_redirects=True,
                 max_redirects=5,
                 proxy=proxy_url,
                 trust_env=False,
+                verify=build_ca_bundle_ssl_context(),
             ) as client:
                 response = client.get(self.robots_url, headers=headers)
             if 200 <= response.status_code < 300:
                 self.robots_parser.parse(response.text.splitlines())
                 logger.info("Loaded robots.txt from %s", self.robots_url)
-            elif 400 <= response.status_code < 500 and response.status_code != 429:
+            elif (
+                400 <= response.status_code < 500
+                and response.status_code != 429
+                and getattr(response, "reason_phrase", "")
+                != "Public Network Policy Denied"
+            ):
                 # RFC 9309 s2.3.1.3: unavailable means the crawler may access
                 # anything. Dropping the parser is what expresses that - keeping
                 # an unread RobotFileParser makes can_fetch() deny every URL,
@@ -131,16 +140,14 @@ class URLFilter:
                     response.status_code,
                 )
         except Exception as e:
-            # Deliberately broad: narrowing to transport errors would let a bug
-            # in here escape to __init__, which clears the parser and so fails
-            # open on the whole site instead of closed.
+            # Keep the unread parser on any loading failure: fail closed.
             logger.warning("Could not fetch robots.txt from %s: %s", self.robots_url, e)
 
     def is_allowed(self, url: str, user_agent: str = "*") -> bool:
         """Check if URL is allowed by robots.txt.
 
         A parser of None is the upstream decision that the site has no rules
-        (see _fetch_robots_txt), not a defensive fallback: returning True there
+        (see load_robots_txt), not a defensive fallback: returning True there
         is what makes a site without robots.txt crawlable.
 
         Args:

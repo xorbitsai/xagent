@@ -155,13 +155,6 @@ _HTTP_FETCH_PATTERNS = [
 ]
 
 
-class _BrowserEgressProxy(PublicNetworkEgressProxy):
-    """Browser adapter retaining its existing target-validation boundary."""
-
-    async def _resolve(self, url: str) -> list[str]:
-        return await validate_public_http_url(url)
-
-
 class BrowserSession:
     """Browser session with lazy initialization."""
 
@@ -216,7 +209,7 @@ class BrowserSession:
         self._guarded_pages: set[int] = set()
         self._page_guard_futures: dict[int, asyncio.Future[None]] = {}
         self._cdp_sessions_by_page: dict[int, Any] = {}
-        self._egress_proxy: _BrowserEgressProxy | None = None
+        self._egress_proxy: PublicNetworkEgressProxy | None = None
         self._created_at = datetime.now()
         self._last_used = datetime.now()
         self._initialized = False
@@ -442,7 +435,7 @@ class BrowserSession:
             if allow_unsandboxed:
                 browser_args.append("--no-sandbox")
             try:
-                self._egress_proxy = _BrowserEgressProxy()
+                self._egress_proxy = PublicNetworkEgressProxy()
                 proxy_server = await self._egress_proxy.start()
                 self._browser = await self._playwright.chromium.launch(
                     headless=self.headless,

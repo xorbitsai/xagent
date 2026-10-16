@@ -1,11 +1,12 @@
 """Public-network-only HTTP CONNECT/forward proxy shared by untrusted fetchers."""
 
 import asyncio
+import base64
 import logging
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
-from .security import validate_public_http_url
+from .security import build_ca_bundle_ssl_context, validate_public_http_url
 
 logger = logging.getLogger(__name__)
 
@@ -15,21 +16,50 @@ _PROXY_RESPONSE_TIMEOUT = 10.0
 _PROXY_MAX_REQUEST_BODY = 64 * 1024 * 1024
 
 
+class PublicNetworkPolicyError(ValueError):
+    """A terminal target-policy refusal, not an origin/WAF failure."""
+
+
 class PublicNetworkEgressProxy:
     """Small loopback proxy that pins each connection to validated DNS IPs.
 
-    Chromium resolves hosts independently of Python.  A browser-wide CONNECT
+    HTTP clients resolve hosts independently of Python. A shared CONNECT
     proxy closes that TOCTOU gap: the proxy validates the hostname, connects
     directly to one of the validated public IPs, and then tunnels the original
     TLS/WebSocket handshake without changing its Host header or SNI.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        connect_timeout: float = _PROXY_CONNECT_TIMEOUT,
+        response_timeout: float = _PROXY_RESPONSE_TIMEOUT,
+        upstream_proxy_url: str | None = None,
+    ) -> None:
         self._server: asyncio.AbstractServer | None = None
         self._client_tasks: set[asyncio.Task[Any]] = set()
+        self._responses_started: set[asyncio.StreamWriter] = set()
+        self.denied_hosts: set[str] = set()
+        self.connect_timeout = connect_timeout
+        self.response_timeout = response_timeout
+        self._upstream = urlsplit(upstream_proxy_url) if upstream_proxy_url else None
+        if self._upstream and (
+            self._upstream.scheme not in {"http", "https"}
+            or not self._upstream.hostname
+            or self._upstream.path not in {"", "/"}
+            or self._upstream.query
+            or self._upstream.fragment
+        ):
+            raise ValueError("Trusted upstream proxy must be an HTTP(S) proxy URL")
 
     async def _resolve(self, url: str) -> list[str]:
-        return await validate_public_http_url(url)
+        try:
+            return await validate_public_http_url(url)
+        except ValueError as exc:
+            hostname = urlsplit(url).hostname
+            if hostname:
+                self.denied_hosts.add(hostname)
+            raise PublicNetworkPolicyError(str(exc)) from exc
 
     async def start(self) -> str:
         self._server = await asyncio.start_server(
@@ -63,7 +93,7 @@ class PublicNetworkEgressProxy:
             self._client_tasks.add(task)
         try:
             header = await asyncio.wait_for(
-                reader.readuntil(b"\r\n\r\n"), _PROXY_CONNECT_TIMEOUT
+                reader.readuntil(b"\r\n\r\n"), self.connect_timeout
             )
             method, target, version, headers = self._parse_request(header)
             if method.upper() == "CONNECT":
@@ -74,10 +104,18 @@ class PublicNetworkEgressProxy:
                 )
         except asyncio.CancelledError:
             raise
+        except PublicNetworkPolicyError:
+            logger.warning("Public-network egress policy denied a target")
+            if writer not in self._responses_started:
+                await self._send_error(writer, 403, "Public Network Policy Denied")
         except Exception as exc:
-            logger.debug("Public-network egress proxy rejected request: %s", exc)
-            await self._send_error(writer, 502, "Bad Gateway")
+            logger.info(
+                "Public-network egress transport failed: %s", type(exc).__name__
+            )
+            if writer not in self._responses_started:
+                await self._send_error(writer, 502, "Bad Gateway")
         finally:
+            self._responses_started.discard(writer)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -118,6 +156,7 @@ class PublicNetworkEgressProxy:
         resolved = await self._resolve(f"https://{target}")
         remote_reader, remote_writer = await self._open_validated(resolved, port)
         try:
+            self._responses_started.add(writer)
             writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             await writer.drain()
             await self._bridge(reader, writer, remote_reader, remote_writer)
@@ -170,6 +209,7 @@ class PublicNetworkEgressProxy:
             for name, value in headers.items():
                 if (
                     name == "proxy-connection"
+                    or name == "proxy-authorization"
                     or name == "expect"
                     or (not websocket and name == "connection")
                     or (chunked and name == "content-length")
@@ -191,12 +231,13 @@ class PublicNetworkEgressProxy:
             remote_writer.write(request + body)
             await remote_writer.drain()
             if websocket:
+                self._responses_started.add(writer)
                 # A WebSocket stays on this one validated origin after the
                 # HTTP upgrade, so it needs the normal bidirectional bridge.
                 await self._bridge(reader, writer, remote_reader, remote_writer)
             else:
                 # Do not bridge client_reader here. Once this request has been
-                # sent, any additional bytes on Chromium's keep-alive socket
+                # sent, any additional bytes on a client's keep-alive socket
                 # must never reach this origin's upstream connection.
                 await self._relay_response(remote_reader, writer)
         finally:
@@ -206,9 +247,8 @@ class PublicNetworkEgressProxy:
             except Exception:
                 pass
 
-    @staticmethod
     async def _read_forward_body(
-        reader: asyncio.StreamReader, headers: dict[str, str]
+        self, reader: asyncio.StreamReader, headers: dict[str, str]
     ) -> bytes:
         """Read exactly one bounded HTTP request body before opening upstream."""
         transfer_encoding = headers.get("transfer-encoding", "").lower()
@@ -219,7 +259,7 @@ class PublicNetworkEgressProxy:
             total = 0
             while True:
                 size_line = await asyncio.wait_for(
-                    reader.readuntil(b"\r\n"), _PROXY_CONNECT_TIMEOUT
+                    reader.readuntil(b"\r\n"), self.connect_timeout
                 )
                 try:
                     size_text = size_line[:-2].split(b";", 1)[0].strip()
@@ -230,7 +270,7 @@ class PublicNetworkEgressProxy:
                 if chunk_size == 0:
                     while True:
                         trailer = await asyncio.wait_for(
-                            reader.readuntil(b"\r\n"), _PROXY_CONNECT_TIMEOUT
+                            reader.readuntil(b"\r\n"), self.connect_timeout
                         )
                         body.extend(trailer)
                         if trailer == b"\r\n":
@@ -239,7 +279,7 @@ class PublicNetworkEgressProxy:
                 if total > _PROXY_MAX_REQUEST_BODY:
                     raise ValueError("proxy request body is too large")
                 chunk = await asyncio.wait_for(
-                    reader.readexactly(chunk_size + 2), _PROXY_CONNECT_TIMEOUT
+                    reader.readexactly(chunk_size + 2), self.connect_timeout
                 )
                 if not chunk.endswith(b"\r\n"):
                     raise ValueError("invalid chunked proxy request body")
@@ -255,17 +295,16 @@ class PublicNetworkEgressProxy:
             return b""
         try:
             return await asyncio.wait_for(
-                reader.readexactly(content_length), _PROXY_CONNECT_TIMEOUT
+                reader.readexactly(content_length), self.connect_timeout
             )
         except asyncio.IncompleteReadError as exc:
             raise ValueError("proxy request body ended early") from exc
 
-    @staticmethod
     async def _relay_response(
-        remote_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
+        self, remote_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
     ) -> None:
         header = await asyncio.wait_for(
-            remote_reader.readuntil(b"\r\n\r\n"), _PROXY_RESPONSE_TIMEOUT
+            remote_reader.readuntil(b"\r\n\r\n"), self.response_timeout
         )
         lines = header[:-4].split(b"\r\n")
         response_headers: list[bytes] = []
@@ -287,6 +326,7 @@ class PublicNetworkEgressProxy:
                 chunked = value.strip().lower() == b"chunked"
             response_headers.append(line)
         response_headers.append(b"Connection: close")
+        self._responses_started.add(client_writer)
         client_writer.write(b"\r\n".join([lines[0], *response_headers, b"", b""]))
         await client_writer.drain()
 
@@ -295,7 +335,7 @@ class PublicNetworkEgressProxy:
             while remaining:
                 data = await asyncio.wait_for(
                     remote_reader.read(min(64 * 1024, remaining)),
-                    _PROXY_RESPONSE_TIMEOUT,
+                    self.response_timeout,
                 )
                 if not data:
                     break
@@ -307,7 +347,7 @@ class PublicNetworkEgressProxy:
         if chunked:
             while True:
                 size_line = await asyncio.wait_for(
-                    remote_reader.readuntil(b"\r\n"), _PROXY_RESPONSE_TIMEOUT
+                    remote_reader.readuntil(b"\r\n"), self.response_timeout
                 )
                 client_writer.write(size_line)
                 await client_writer.drain()
@@ -315,47 +355,80 @@ class PublicNetworkEgressProxy:
                     chunk_size = int(size_line[:-2].split(b";", 1)[0].strip(), 16)
                 except ValueError as exc:
                     raise ValueError("invalid upstream chunked response") from exc
-                chunk = await asyncio.wait_for(
-                    remote_reader.readexactly(chunk_size + 2),
-                    _PROXY_RESPONSE_TIMEOUT,
-                )
-                client_writer.write(chunk)
-                await client_writer.drain()
                 if chunk_size == 0:
                     while True:
                         trailer = await asyncio.wait_for(
                             remote_reader.readuntil(b"\r\n"),
-                            _PROXY_RESPONSE_TIMEOUT,
+                            self.response_timeout,
                         )
                         client_writer.write(trailer)
                         await client_writer.drain()
                         if trailer == b"\r\n":
                             return
-
-        try:
-            while data := await asyncio.wait_for(
-                remote_reader.read(64 * 1024), _PROXY_RESPONSE_TIMEOUT
-            ):
-                client_writer.write(data)
+                chunk = await asyncio.wait_for(
+                    remote_reader.readexactly(chunk_size + 2),
+                    self.response_timeout,
+                )
+                client_writer.write(chunk)
                 await client_writer.drain()
-        except (ConnectionError, asyncio.IncompleteReadError, asyncio.TimeoutError):
-            pass
 
-    @staticmethod
+        while data := await asyncio.wait_for(
+            remote_reader.read(64 * 1024), self.response_timeout
+        ):
+            client_writer.write(data)
+            await client_writer.drain()
+
     async def _open_validated(
-        addresses: list[str], port: int
+        self, addresses: list[str], port: int
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         last_error: OSError | None = None
         for address in addresses:
             try:
                 return await asyncio.wait_for(
-                    asyncio.open_connection(address, port), _PROXY_CONNECT_TIMEOUT
+                    self._connect_address(address, port), self.connect_timeout
                 )
             except (OSError, asyncio.TimeoutError) as exc:
                 last_error = exc
         if last_error is not None:
             raise last_error
         raise OSError("validated host did not provide any addresses")
+
+    async def _connect_address(
+        self, address: str, port: int
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Tunnel a validated literal IP, never delegate target DNS upstream."""
+        upstream = self._upstream
+        if upstream is None:
+            return await asyncio.open_connection(address, port)
+        reader, writer = await asyncio.open_connection(
+            upstream.hostname,
+            upstream.port or (443 if upstream.scheme == "https" else 80),
+            ssl=build_ca_bundle_ssl_context() if upstream.scheme == "https" else None,
+            limit=_PROXY_HEADER_LIMIT,
+        )
+        try:
+            authority = f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+            auth = ""
+            if upstream.username is not None:
+                credentials = (
+                    f"{unquote(upstream.username)}:{unquote(upstream.password or '')}"
+                )
+                encoded = base64.b64encode(credentials.encode()).decode("ascii")
+                auth = f"Proxy-Authorization: Basic {encoded}\r\n"
+            writer.write(
+                f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{auth}\r\n".encode(
+                    "ascii"
+                )
+            )
+            await writer.drain()
+            header = await reader.readuntil(b"\r\n\r\n")
+            if header.split(b"\r\n", 1)[0].split(b" ")[1] != b"200":
+                raise OSError("Trusted upstream proxy refused CONNECT")
+            return reader, writer
+        except BaseException:
+            writer.close()
+            await writer.wait_closed()
+            raise
 
     @staticmethod
     async def _send_error(

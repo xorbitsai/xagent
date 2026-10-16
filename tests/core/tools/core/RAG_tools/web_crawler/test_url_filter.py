@@ -1,5 +1,6 @@
 """Unit tests for URL filter."""
 
+import ssl
 from unittest.mock import MagicMock
 
 import httpx
@@ -21,7 +22,7 @@ from xagent.core.tools.core.RAG_tools.web_crawler.url_filter import (
 def _filter(*args, **kwargs):
     """Explicitly load robots rules through the test's mocked egress client."""
     result = URLFilter(*args, **kwargs)
-    result._fetch_robots_txt("http://test-egress.invalid")
+    result.load_robots_txt("http://test-egress.invalid")
     return result
 
 
@@ -199,7 +200,9 @@ def _patch_client_with_handler(monkeypatch, handler):
     def client(**kwargs):
         # Route all test requests through MockTransport rather than creating
         # httpx's real proxy mount. Real egress is covered in test_crawler_egress.
-        kwargs.pop("proxy", None)
+        assert kwargs.pop("proxy") == "http://test-egress.invalid"
+        assert kwargs["trust_env"] is False
+        assert isinstance(kwargs["verify"], ssl.SSLContext)
         return _REAL_HTTPX_CLIENT(transport=httpx.MockTransport(handler), **kwargs)
 
     monkeypatch.setattr(

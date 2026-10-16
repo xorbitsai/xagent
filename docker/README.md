@@ -660,6 +660,7 @@ POSTGRES_IMAGE_TAG="17-bookworm"
 
 # Security
 ENCRYPTION_KEY="your-encryption-key"
+XAGENT_SECRET_ENCRYPTION_KEY="a-separate-private-32-or-more-character-tool-key"
 XAGENT_JWT_SECRET="a-unique-random-secret"
 ```
 
@@ -672,6 +673,12 @@ secret; deployments with an existing strong value keep it unchanged.
 Any browser session or password-reset token previously signed with the example
 placeholder is intentionally invalid after that first startup, so users must
 sign in again.
+
+Key bootstrap does not re-encrypt old data. Upgrades from published development
+keys or an implicit tool key must run the offline procedures in
+[the key upgrade guide](../docs/tool-credential-key-upgrade.md) before restart.
+Unreadable stored credentials now refuse production startup instead of silently
+appearing unconfigured. Celery worker and scheduler validate these keys too.
 
 This release also replaces wildcard credentialed CORS for private API routes
 with `XAGENT_CORS_ORIGINS` (default: `XAGENT_FRONTEND_URL`). Before upgrading,

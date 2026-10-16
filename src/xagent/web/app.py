@@ -1751,6 +1751,10 @@ async def stop_app_process_diagnostics(app_instance: FastAPI) -> None:
 
 async def _initialize_database_and_admit_runtime(app_instance: FastAPI) -> None:
     """Prepare the database, admit the host, then open runtime work ingress."""
+    from .services.encryption_key_rotation import validate_stored_encryption_keys
+
+    # Check old ciphertext before migrations can read or rewrite credentials.
+    await asyncio.to_thread(validate_stored_encryption_keys)
     with _startup_phase("database init"):
         init_db()
 

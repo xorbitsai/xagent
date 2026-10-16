@@ -31,12 +31,20 @@ def test_docker_tool_key_bootstrap_reuses_persistent_key_or_explicit_alias(
         probe = 'test "$SECRET_KEY" = "existing-alias-secret-01234567890123456789" && test "$XAGENT_SECRET_ENCRYPTION_KEY" = " "'
     else:
         probe = 'test "${#XAGENT_SECRET_ENCRYPTION_KEY}" -ge 32 && test "$XAGENT_SECRET_ENCRYPTION_KEY" = "$(tr -d "\\n" < "$XAGENT_SECRET_ENCRYPTION_KEY_FILE")"'
+    first_key = None
     for _ in range(2):
-        subprocess.run(
+        result = subprocess.run(
             ["bash", str(root / "docker/entrypoint.sh"), "bash", "-c", probe],
             env=env,
             check=True,
             capture_output=True,
             text=True,
         )
+        if not alias:
+            assert "Tool credential secret at" in result.stderr
+            assert "JWT secret" not in result.stderr
+            current = key_file.read_text().strip()
+            if first_key is None:
+                first_key = current
+            assert current == first_key
     assert key_file.exists() is not alias

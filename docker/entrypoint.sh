@@ -29,7 +29,7 @@ legacy_tool_credentials_key="${SECRET_KEY:-}"
 if [[ -n "${XAGENT_SECRET_ENCRYPTION_KEY_FILE:-}" \
       && -z "${tool_credentials_key//[[:space:]]/}" \
       && -z "${legacy_tool_credentials_key//[[:space:]]/}" ]]; then
-  XAGENT_SECRET_ENCRYPTION_KEY="$(python -m xagent.web.jwt_secret_bootstrap "${XAGENT_SECRET_ENCRYPTION_KEY_FILE}")"
+  XAGENT_SECRET_ENCRYPTION_KEY="$(python -m xagent.web.jwt_secret_bootstrap "${XAGENT_SECRET_ENCRYPTION_KEY_FILE}" --label 'Tool credential secret')"
   export XAGENT_SECRET_ENCRYPTION_KEY
 fi
 

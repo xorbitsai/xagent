@@ -169,8 +169,9 @@ SQL_CONNECTION_ENV_PREFIX = "XAGENT_EXTERNAL_DB_"
 ALLOWED_SQL_SCHEMES = {"postgresql", "mysql", "mariadb", "mssql", "sqlite"}
 
 
-def _build_fernet_key() -> bytes:
-    raw = get_tool_credentials_encryption_key()
+def _build_fernet_key(raw: str | None = None) -> bytes:
+    if raw is None:
+        raw = get_tool_credentials_encryption_key()
     digest = hashlib.sha256(raw.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 
@@ -187,7 +188,10 @@ def _decrypt(ciphertext: str) -> str | None:
     try:
         return _fernet().decrypt(ciphertext.encode("utf-8")).decode("utf-8")
     except (InvalidToken, ValueError):
-        return None
+        raise RuntimeError(
+            "Stored tool credential is unreadable with the active key; "
+            "see docs/tool-credential-key-upgrade.md"
+        ) from None
 
 
 def _mask_value(value: str) -> str:

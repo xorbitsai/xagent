@@ -89,6 +89,9 @@ async def run_worker(
         )
     configure_db()
     await asyncio.to_thread(validate_worker_schema)
+    from .services.encryption_key_rotation import validate_stored_encryption_keys
+
+    await asyncio.to_thread(validate_stored_encryption_keys)
     validate_interaction_rollout_at_startup()
     await asyncio.to_thread(lock_deployment_kb_engine)
     recovery = None

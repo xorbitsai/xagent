@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     Dict,
@@ -55,6 +56,10 @@ from ...core.mcp.sessions import (
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
 from .base import AbstractBaseTool, ToolVisibility
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateScope
+
 from .config import is_http_status_code
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -3696,9 +3701,7 @@ async def load_execution_scoped_chrome_tools(
     allow_users: Optional[List[str]] = None,
 ) -> SandboxedMCPLoadResult:
     # Lazy web import preserves the existing core-only MCP adapter import path.
-    from .....web.services.chrome_mcp_runtime import (
-        get_chrome_execution_session_pool,
-    )
+    from .....web.services.chrome_mcp_runtime import get_chrome_execution_session_pool
 
     launch = ChromeDaemonLaunchSpec.from_connection(connection)
     pool = get_chrome_execution_session_pool()
@@ -4209,6 +4212,8 @@ async def load_mcp_tools_as_agent_tools(
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
     workspace: Any | None = None,
+    approval_scope: "MCPApprovalGateScope | None" = None,
+    approval_supported: bool = True,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -4363,6 +4368,8 @@ async def load_mcp_tools_as_agent_tools(
                     server_tools,
                     connection=connection,
                     connector_ref=(connector_refs or {}).get(server_name),
+                    approval_scope=approval_scope,
+                    approval_supported=approval_supported,
                 )
             )
             if server_tools:

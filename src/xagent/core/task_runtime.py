@@ -10,7 +10,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from .tools.adapters.vibe.mcp_approval_gate import MCPApprovalGateScope
 
 PREFERRED_INPUT_MODALITIES_METADATA_KEY = "preferred_input_modalities"
 # Server-owned marker and workspace-config key for the minimal new-public-task
@@ -136,8 +139,9 @@ class TaskRuntimeContribution:
     honour it degrades by routing without it. Only modalities the conversation
     itself carries are enforced as hard requirements.
 
-    ``tools``, ``environment`` and ``preferred_input_modalities`` are the only
-    provider-owned fields. The remaining three are registry-internal
+    ``tools``, ``environment``, ``preferred_input_modalities`` and
+    ``mcp_approval_gate_scope`` are provider-owned fields. The remaining three
+    are registry-internal
     bookkeeping: a provider *may* set them because ``frozen=True`` only blocks
     post-init mutation, but ``normalize_task_runtime_contribution`` strips them
     from every provider-returned value, so setting them has no effect and
@@ -147,6 +151,10 @@ class TaskRuntimeContribution:
     tools: tuple[Any, ...] = ()
     environment: str | None = None
     preferred_input_modalities: tuple[str, ...] = ()
+    # Server-trusted, per-task opt-in for a statically registered MCP approval
+    # policy. Providers resolve this from durable task state in build_runtime;
+    # it is never accepted from model arguments or public task metadata.
+    mcp_approval_gate_scope: MCPApprovalGateScope | None = None
     # Populated by the registry merge for filtering diagnostics. Registry
     # bookkeeping: a provider-set value is discarded by normalization.
     tool_origins: tuple[tuple[str, str], ...] = ()
@@ -275,6 +283,12 @@ def normalize_task_runtime_contribution(
             f"Task runtime contribution exceeds the {MAX_TASK_RUNTIME_TOOLS}-tool limit"
         )
     modalities = normalize_input_modalities(value.preferred_input_modalities)
+    approval_scope = value.mcp_approval_gate_scope
+    if approval_scope is not None:
+        from .tools.adapters.vibe.mcp_approval_gate import MCPApprovalGateScope
+
+        if not isinstance(approval_scope, MCPApprovalGateScope):
+            raise TypeError("mcp_approval_gate_scope must be MCPApprovalGateScope")
     # ``tool_origins``, ``provider_contributions`` and ``source_contribution``
     # are registry-internal bookkeeping. ``frozen=True`` only blocks post-init
     # mutation, so nothing at the type level stops an out-of-tree provider from
@@ -288,6 +302,7 @@ def normalize_task_runtime_contribution(
         tools=tools,
         environment=environment,
         preferred_input_modalities=modalities,
+        mcp_approval_gate_scope=approval_scope,
     )
 
 
@@ -301,6 +316,7 @@ def merge_task_runtime_contributions(
     modalities: list[str] = []
     tool_origins: list[tuple[str, str]] = []
     provider_contributions: list[tuple[str, TaskRuntimeContribution]] = []
+    approval_scope: MCPApprovalGateScope | None = None
     for provider_name, contribution in contributions.items():
         normalized = normalize_task_runtime_contribution(contribution)
         provider_contributions.append((provider_name, normalized))
@@ -318,6 +334,15 @@ def merge_task_runtime_contributions(
         if normalized.environment:
             environments.append(normalized.environment)
         modalities.extend(normalized.preferred_input_modalities)
+        if normalized.mcp_approval_gate_scope is not None:
+            if (
+                approval_scope is not None
+                and approval_scope != normalized.mcp_approval_gate_scope
+            ):
+                raise ValueError(
+                    "Task runtime providers contributed conflicting MCP approval scopes"
+                )
+            approval_scope = normalized.mcp_approval_gate_scope
 
     environment = "\n\n".join(environments) or None
     if (
@@ -333,6 +358,7 @@ def merge_task_runtime_contributions(
         tools=tuple(tools),
         environment=environment,
         preferred_input_modalities=tuple(dict.fromkeys(modalities)),
+        mcp_approval_gate_scope=approval_scope,
         tool_origins=tuple(tool_origins),
         provider_contributions=tuple(provider_contributions),
     )

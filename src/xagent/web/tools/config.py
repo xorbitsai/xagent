@@ -5,6 +5,8 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+from __future__ import annotations
+
 import asyncio
 import copy
 import inspect
@@ -20,6 +22,7 @@ from functools import partial
 from pathlib import Path
 from types import MappingProxyType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Awaitable,
     Callable,
@@ -42,6 +45,7 @@ from ...core.agent.result import (
     is_oauth_token_required_code,
     normalize_tool_failure_code,
 )
+from ...core.task_runtime import full_task_runtime_contribution
 from ...core.tools.adapters.vibe.config import (
     ACTOR_STDIO_SHADOWED_REASON,
     BaseToolConfig,
@@ -91,6 +95,9 @@ from ..services.tool_credentials import (
 from ..services.user_oauth import is_ordinary_gmail, scoped_user_oauth_query
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ...core.tools.adapters.vibe.mcp_approval_gate import MCPApprovalGateScope
 
 
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
@@ -1790,6 +1797,8 @@ class WebToolConfig(BaseToolConfig):
         voice: Optional[str] = None,
         mcp_actor_stdio_connection_adapter: Any = None,
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+        mcp_approval_gate_scope: MCPApprovalGateScope | None = None,
+        mcp_approval_supported: bool = True,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1822,11 +1831,15 @@ class WebToolConfig(BaseToolConfig):
         # actor and lifecycle identity on every secret read.
         self._mcp_actor_stdio_connection_adapter = mcp_actor_stdio_connection_adapter
         self._mcp_actor_execution_identity = mcp_actor_execution_identity
+        self._mcp_approval_gate_scope = mcp_approval_gate_scope
+        self._mcp_approval_supported = bool(mcp_approval_supported)
         self._mcp_actor_stdio_session_identities: dict[
             str, ActorMCPStdioSessionIdentity
         ] = {}
         self._task_runtime_contribution: Any = None
         self._task_runtime_workspace: Any = None
+        self._task_runtime_refresher: Callable[[], Awaitable[Any]] | None = None
+        self._skip_next_task_runtime_refresh = False
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -2591,6 +2604,29 @@ class WebToolConfig(BaseToolConfig):
 
         return self._task_runtime_contribution
 
+    def set_task_runtime_refresher(
+        self, refresher: Callable[[], Awaitable[Any]]
+    ) -> None:
+        """Re-resolve the detached task contribution on later turns.
+
+        Tool construction already resolved the current turn, so the first
+        policy refresh only clears the skip flag. Subsequent turns replace a
+        transient rollback fence (or a changed ON/OFF scope) from durable host
+        state instead of latching it for the lifetime of a cached AgentService.
+        """
+
+        self._task_runtime_refresher = refresher
+        self._skip_next_task_runtime_refresh = True
+
+    async def _refresh_task_runtime_contribution(self) -> None:
+        refresher = self._task_runtime_refresher
+        if refresher is None:
+            return
+        if self._skip_next_task_runtime_refresh:
+            self._skip_next_task_runtime_refresh = False
+            return
+        self._task_runtime_contribution = await refresher()
+
     def set_task_runtime_workspace(self, workspace: Any) -> None:
         """Retain the workspace already prepared for runtime providers."""
 
@@ -2723,6 +2759,19 @@ class WebToolConfig(BaseToolConfig):
     def get_mcp_unavailable_reason(self) -> Optional[str]:
         """See BaseToolConfig.get_mcp_unavailable_reason's docstring."""
         return self._mcp_unavailable_reason
+
+    def get_mcp_approval_gate_scope(self) -> MCPApprovalGateScope | None:
+        """Return the explicit inherited scope or this task's contribution."""
+
+        if self._mcp_approval_gate_scope is not None:
+            return self._mcp_approval_gate_scope
+        contribution = self._task_runtime_contribution
+        if contribution is not None:
+            contribution = full_task_runtime_contribution(contribution)
+        return getattr(contribution, "mcp_approval_gate_scope", None)
+
+    def get_mcp_approval_supported(self) -> bool:
+        return self._mcp_approval_supported
 
     def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
         """Record that a policy input could not be resolved for this turn.
@@ -3011,6 +3060,7 @@ class WebToolConfig(BaseToolConfig):
     async def refresh_runtime_policy(self) -> None:
         """Refresh only detached per-turn policy before signature comparison."""
         self.discard_prepared_factory_runtime()
+        await self._refresh_task_runtime_contribution()
         if self._user_id is None or not has_user_tool_policy_hooks():
             policy_snapshot = _ToolRuntimePolicySnapshot()
         else:

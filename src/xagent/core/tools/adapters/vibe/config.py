@@ -12,7 +12,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeGuard, TypeVar
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateScope
 
 from ..... import config as _root_config
 
@@ -558,6 +561,16 @@ class BaseToolConfig(ABC):
         no ``task_source`` of its own and would otherwise read as
         unregistered and dispatch ungated."""
         return None
+
+    def get_mcp_approval_gate_scope(self) -> "MCPApprovalGateScope | None":
+        """Trusted per-task MCP approval scope, or ``None`` when disabled."""
+
+        return None
+
+    def get_mcp_approval_supported(self) -> bool:
+        """Whether this execution can pause and resume connector approval."""
+
+        return True
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""

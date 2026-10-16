@@ -14,7 +14,7 @@ import logging
 import re
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, Literal, cast
 
@@ -508,11 +508,22 @@ async def create_task_extensions(
 async def build_task_runtime(
     context: TaskRuntimeContext,
 ) -> TaskRuntimeContribution:
-    """Build providers independently and merge every successful contribution."""
+    """Build providers, fencing scoped approval when resolution is ambiguous.
 
+    Providers remain fail-soft for ordinary task sources. For a source with a
+    scoped approval registration, however, any provider failure could be the
+    provider that owns the durable ON/OFF bit. Treating that ambiguity as OFF
+    would silently permit protected writes, so the resulting tool set carries
+    an invalid rollback scope and fails closed for this turn.
+    """
+
+    provider_items = _registered_extension_items()
     contributions: dict[str, TaskRuntimeContribution | None] = {}
     merged = EMPTY_TASK_RUNTIME_CONTRIBUTION
-    for name, provider in _registered_extension_items():
+    approval_resolution_failed = not provider_items
+    approval_resolution_ambiguous = False
+    ambiguous_scope_source: str | None = None
+    for name, provider in provider_items:
         try:
             contribution = await _invoke_provider_hook(
                 provider,
@@ -520,6 +531,27 @@ async def build_task_runtime(
                 context,
             )
             normalized = normalize_task_runtime_contribution(contribution)
+            approval_scope = normalized.mcp_approval_gate_scope
+            if (
+                approval_scope is not None
+                and approval_scope.task_source != context.source
+            ):
+                approval_resolution_ambiguous = True
+                ambiguous_scope_source = approval_scope.task_source
+                raise ValueError(
+                    "Task runtime provider contributed an MCP approval scope "
+                    "for a different task source"
+                )
+            if (
+                approval_scope is not None
+                and merged.mcp_approval_gate_scope is not None
+                and approval_scope != merged.mcp_approval_gate_scope
+            ):
+                approval_resolution_ambiguous = True
+                ambiguous_scope_source = approval_scope.task_source
+                raise ValueError(
+                    "Task runtime providers contributed conflicting MCP approval scopes"
+                )
             candidate = {**contributions, name: normalized}
             merged = merge_task_runtime_contributions(candidate)
         except BaseException as exc:
@@ -530,9 +562,67 @@ async def build_task_runtime(
                 exc,
                 exc_info=True,
             )
+            approval_resolution_failed = True
             continue
         contributions[name] = normalized
-    return merged
+    return approval_safe_task_runtime_contribution(
+        merged,
+        task_source=context.source,
+        resolution_failed=approval_resolution_failed,
+        resolution_ambiguous=approval_resolution_ambiguous,
+        ambiguous_scope_source=ambiguous_scope_source,
+    )
+
+
+def approval_safe_task_runtime_contribution(
+    contribution: TaskRuntimeContribution,
+    *,
+    task_source: str | None,
+    resolution_failed: bool,
+    resolution_ambiguous: bool = False,
+    ambiguous_scope_source: str | None = None,
+) -> TaskRuntimeContribution:
+    """Fence only unresolved or contradictory scoped-approval resolution.
+
+    A valid scope is authoritative even when an unrelated extension fails.
+    Conflicting or source-mismatched scopes remain ambiguous and therefore
+    fail closed.  If no provider is registered, ``resolution_failed`` is true:
+    a partially deployed host must not silently interpret a durable ON task as
+    OFF merely because its runtime provider did not start.
+    """
+
+    from ...core.tools.adapters.vibe.mcp_approval_gate import (
+        has_scoped_approval_gate_for_source,
+        mcp_approval_gate_rollback_fence,
+    )
+
+    scope = contribution.mcp_approval_gate_scope
+    if resolution_ambiguous:
+        fence_source = (
+            task_source
+            if isinstance(task_source, str) and task_source.strip()
+            else ambiguous_scope_source
+        )
+        if not isinstance(fence_source, str) or not fence_source.strip():
+            return contribution
+        return replace(
+            contribution,
+            mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
+                task_source=fence_source
+            ),
+        )
+    if not has_scoped_approval_gate_for_source(task_source):
+        return contribution
+    scope_matches_source = scope is None or scope.task_source == task_source
+    must_fence = not scope_matches_source or (resolution_failed and scope is None)
+    if not must_fence:
+        return contribution
+    return replace(
+        contribution,
+        mcp_approval_gate_scope=mcp_approval_gate_rollback_fence(
+            task_source=cast(str, task_source)
+        ),
+    )
 
 
 async def get_task_runtime_public_metadata(

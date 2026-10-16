@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .....sandbox.base import Sandbox
     from .....web.services.actor_mcp_runtime import ActorMCPStdioSessionIdentity
     from .mcp_adapter import MCPServerLoadFailure
+    from .mcp_approval_gate import MCPApprovalGateScope
 
     ActorMCPStdioSessionConsumer = Callable[
         ...,
@@ -1162,6 +1163,8 @@ class ToolFactory:
         workspace: Any | None = None,
         actor_stdio_session_identities: "Mapping[str, ActorMCPStdioSessionIdentity] | None" = None,
         actor_stdio_session_consumer: "ActorMCPStdioSessionConsumer | None" = None,
+        approval_scope: "MCPApprovalGateScope | None" = None,
+        approval_supported: bool = True,
     ) -> list[Tool]:
         """Create MCP tools while keeping actor session identity host-only."""
         try:
@@ -1318,6 +1321,8 @@ class ToolFactory:
                                     connector_ref=ToolFactory._mcp_connector_refs(
                                         {server_name: configs_by_name[server_name]}
                                     ).get(server_name),
+                                    approval_scope=approval_scope,
+                                    approval_supported=approval_supported,
                                 )
                             )
                         except ConnectorRuntimeError:
@@ -1346,6 +1351,8 @@ class ToolFactory:
                             connector_refs=ToolFactory._mcp_connector_refs(
                                 configs_by_name
                             ),
+                            approval_scope=approval_scope,
+                            approval_supported=approval_supported,
                             sandbox=sandbox,
                             workspace=workspace,
                         )

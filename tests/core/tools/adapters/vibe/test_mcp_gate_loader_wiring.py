@@ -15,6 +15,7 @@ Two guarantees are covered here, both of which the host wiring depends on:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,8 +30,12 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     load_mcp_tools_as_agent_tools,
 )
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+    GatedCall,
     GateDecision,
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
     gate_mcp_tools,
+    mcp_approval_gate_scope,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
@@ -55,6 +60,7 @@ class _McpTarget(AbstractBaseTool):
         self.calls: list[dict[str, Any]] = []
         self.sync_calls: list[dict[str, Any]] = []
         self.source_server = "linkedin"
+        self.mcp_tool = SimpleNamespace(name="create_post")
         self._metadata = ToolMetadata(
             name="mcp_LinkedIn_create_post",
             concurrency_safe=True,
@@ -108,6 +114,7 @@ async def _load_one_wrapped(
     target: _McpTarget,
     *,
     connector_refs: dict[str, ConnectorRef] | None = None,
+    **loader_kwargs: Any,
 ) -> Any:
     """Run the real loader boundary and return the single tool it produced."""
 
@@ -126,6 +133,7 @@ async def _load_one_wrapped(
         result = await load_mcp_tools_as_agent_tools(
             {"linkedin": {"transport": "sse", "url": "https://example.invalid"}},
             connector_refs=connector_refs,
+            **loader_kwargs,
         )
     assert len(result.tools) == 1
     return result.tools[0]
@@ -207,6 +215,57 @@ async def test_loader_carries_the_connector_ref_for_its_own_server() -> None:
 
 
 @pytest.mark.asyncio
+async def test_real_loader_applies_scoped_matcher_and_classifier() -> None:
+    classified: list[GatedCall] = []
+
+    async def gate(_call: GatedCall) -> GateDecision:
+        raise AssertionError("read must not enter approval hook")
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    def classifier(call: GatedCall) -> bool:
+        classified.append(call)
+        return False
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda ref, name: (
+            ref == ConnectorRef("mcp", 41) and name == "create_post"
+        ),
+        classifier=classifier,
+        timeout_seconds=1,
+    )
+    target = _McpTarget()
+    try:
+        wrapped = await _load_one_wrapped(
+            target,
+            connector_refs={"linkedin": ConnectorRef("mcp", 41)},
+            approval_scope=mcp_approval_gate_scope(handle),
+        )
+        context = ToolCallExecutionContext(
+            task_source="external",
+            task_id="42",
+            run_id="run-1",
+            turn_id="turn-1",
+            tool_call_id="call-1",
+            pattern="react",
+            react_step_id="step-1",
+        )
+        with bind_tool_call_execution_context(context):
+            result = await wrapped.run_json_async({"text": "read"})
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert result["success"] is True
+    assert target.calls == [{"text": "read"}]
+    assert classified[0].raw_tool_name == "create_post"
+    assert classified[0].tool_name == "mcp_LinkedIn_create_post"
+
+
+@pytest.mark.asyncio
 async def test_config_seam_passes_persisted_server_ids_as_connector_refs() -> None:
     """The WebToolConfig/config-driven seam, mirroring the database-path test.
 
@@ -251,13 +310,20 @@ async def test_config_seam_passes_persisted_server_ids_as_connector_refs() -> No
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
         new=load,
     ):
-        await ToolFactory._create_mcp_tools_from_configs(configs)
+        approval_scope = object()
+        await ToolFactory._create_mcp_tools_from_configs(
+            configs,
+            approval_scope=approval_scope,
+            approval_supported=False,
+        )
 
     connector_refs = load.await_args.kwargs["connector_refs"]
     assert connector_refs == {"linkedin": ConnectorRef("mcp", 12)}
     # All four servers reached the loader; only the persisted one is
     # identifiable, so this is a scoping assertion, not a filtering artifact.
     assert set(load.await_args.args[0]) == {"linkedin", "scratch", "boolish", "zero"}
+    assert load.await_args.kwargs["approval_scope"] is approval_scope
+    assert load.await_args.kwargs["approval_supported"] is False
     # The transport mapping the loader (and, through it, a sandbox guest)
     # receives still carries no persisted identity.
     connections = load.await_args.args[0]
@@ -396,3 +462,39 @@ def test_load_summary_reads_source_server_through_metadata() -> None:
     assert _build_mcp_load_summary(
         configs, [direct_attribute_target]
     ).loaded_servers == ("linkedin",)
+
+
+def test_scoped_matcher_recovers_raw_name_through_real_sandbox_wrapper() -> None:
+    from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+        SandboxedToolWrapper,
+    )
+
+    seen: list[str] = []
+
+    async def gate(_call: GatedCall) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, name: seen.append(name) is None,
+        classifier=lambda _call: False,
+    )
+    target = _McpTarget()
+    sandboxed = object.__new__(SandboxedToolWrapper)
+    sandboxed._target = target
+    try:
+        (wrapped,) = gate_mcp_tools(
+            [sandboxed],
+            connector_ref=ConnectorRef("mcp", 41),
+            approval_scope=mcp_approval_gate_scope(handle),
+        )
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert wrapped.target is sandboxed
+    assert seen == ["create_post"]

@@ -16,11 +16,19 @@ actually has a registration.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.agent_tool import _nested_mcp_refusal_reason
+from xagent.core.tools.adapters.vibe.agent_tool import (
+    AgentTool,
+    PublishedAgentToolRecord,
+    _nested_mcp_refusal_reason,
+    create_agent_tools,
+)
 from xagent.core.tools.adapters.vibe.config import (
     _PUBLIC_MCP_UNAVAILABLE_REASONS,
     NESTED_DELEGATION_NOT_APPROVABLE_REASON,
@@ -30,6 +38,7 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     ToolCallExecutionContext,
     bind_tool_call_execution_context,
     has_approval_gate_for_source,
+    mcp_approval_gate_scope,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
@@ -293,56 +302,220 @@ async def test_an_unrestricted_selection_still_materializes_nothing(
     assert calls == []
 
 
-def test_the_delegated_config_is_actually_wired_to_the_refusal() -> None:
-    """The decision must reach the config that builds the child's tools.
+@pytest.mark.asyncio
+async def test_scope_propagates_through_real_child_config_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
 
-    Asserted structurally rather than by running a delegation: constructing a
-    real one needs a database, an LLM and a published agent row, none of which
-    this property depends on. What it does depend on is that the one
-    ``WebToolConfig`` ``AgentTool`` builds passes
-    ``mcp_unavailable_reason=_nested_mcp_refusal_reason() or
-    self._inherited_mcp_unavailable_reason`` -- drop either half and every
-    behavioural test above still passes while a bypass is open again: drop
-    the live read and the direct hop is ungated; drop the inherited
-    fallback and the grandchild hop is (see
-    ``test_refusal_is_sticky_through_a_grandchild_delegation``).
-    """
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
 
-    import ast
-    import inspect
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: True,
+    )
+    record = PublishedAgentToolRecord(
+        id=17,
+        name="Writer",
+        description="Writes content",
+        instructions=None,
+        status="published",
+    )
 
-    from xagent.core.tools.adapters.vibe import agent_tool
+    class FakeQuery:
+        def filter(self, *_args: Any) -> "FakeQuery":
+            return self
 
-    tree = ast.parse(inspect.getsource(agent_tool))
-    wired = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "WebToolConfig"
-    ]
-    assert wired, "AgentTool no longer builds a WebToolConfig; update this test"
+        def first(self) -> Any:
+            return SimpleNamespace(
+                name="Writer",
+                instructions=None,
+                knowledge_bases=None,
+                skills=None,
+                tool_categories=None,
+                models={"general": 1},
+                execution_mode="balanced",
+            )
 
-    for call in wired:
-        reason = [kw for kw in call.keywords if kw.arg == "mcp_unavailable_reason"]
-        assert reason, (
-            "a delegated WebToolConfig with no mcp_unavailable_reason lets a "
-            "gated parent's child materialize live MCP connectors"
+    class FakeDB:
+        def query(self, *_args: Any) -> FakeQuery:
+            return FakeQuery()
+
+    @contextmanager
+    def fake_session_scope(_factory: Any):
+        yield FakeDB()
+
+    captured_configs: list[WebToolConfig] = []
+
+    class FakeAgentService:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_configs.append(kwargs["tool_config"])
+            self.workspace = None
+
+        async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"status": "failed", "error": "stop after config capture"}
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.db_session.tool_session_scope",
+        fake_session_scope,
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.agent_tool._apply_agent_visibility_filters",
+        lambda query, *_args, **_kwargs: query,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.llm_utils.UserAwareModelStorage",
+        lambda _db: object(),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.agent_model_resolution.resolve_agent_model_llms",
+        lambda *_args, **_kwargs: (object(), None, None, None),
+    )
+    monkeypatch.setattr("xagent.core.agent.service.AgentService", FakeAgentService)
+    monkeypatch.setattr(AgentTool, "_trace_delegation", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        AgentTool, "_create_child_execution_tracer", lambda *_args, **_kwargs: None
+    )
+    try:
+        scope = mcp_approval_gate_scope(handle)
+        root = _child_config(
+            categories=["mcp:linkedin"],
+            mcp_approval_gate_scope=scope,
         )
-        value = reason[0].value
-        # ``_nested_mcp_refusal_reason() or self._inherited_mcp_unavailable_reason``:
-        # an ``or`` BoolOp whose first operand is the live-context call and
-        # whose second is the inherited-reason attribute read.
-        assert isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or)
-        assert len(value.values) == 2
-        live_call, inherited_read = value.values
+        root._tool_selection_spec = None
+        root.get_session_factory = lambda: object()  # type: ignore[method-assign]
+        root.get_published_agent_tool_records = lambda: [record]  # type: ignore[method-assign]
+        (child_tool,) = await create_agent_tools(root)
+        assert isinstance(child_tool, AgentTool)
+        await child_tool.run_json_async({"task": "capture child"})
+        child = captured_configs[-1]
 
-        assert isinstance(live_call, ast.Call) and isinstance(live_call.func, ast.Name)
-        assert live_call.func.id == "_nested_mcp_refusal_reason"
+        child.get_published_agent_tool_records = lambda: [record]  # type: ignore[method-assign]
+        (grandchild_tool,) = await create_agent_tools(child)
+        assert isinstance(grandchild_tool, AgentTool)
+        await grandchild_tool.run_json_async({"task": "capture grandchild"})
+        grandchild = captured_configs[-1]
+    finally:
+        unregister_mcp_approval_gate(handle)
 
-        assert isinstance(inherited_read, ast.Attribute)
-        assert inherited_read.attr == "_inherited_mcp_unavailable_reason"
-        assert (
-            isinstance(inherited_read.value, ast.Name)
-            and inherited_read.value.id == "self"
-        )
+    assert child.get_mcp_approval_gate_scope() == scope
+    assert child.get_mcp_approval_supported() is False
+    assert child.get_mcp_unavailable_reason() is None
+    assert grandchild.get_mcp_approval_gate_scope() == scope
+    assert grandchild.get_mcp_approval_supported() is False
+    assert grandchild.get_mcp_unavailable_reason() is None
+
+
+def test_cross_source_scope_keeps_parent_legacy_nested_refusal(
+    slack_gate: Any,
+) -> None:
+    async def gate(_call: Any) -> GateDecision:
+        return GateDecision.allow()
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    scoped_handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda _ref, _name: True,
+        classifier=lambda _call: False,
+    )
+    tool = object.__new__(AgentTool)
+    tool._mcp_approval_gate_scope = mcp_approval_gate_scope(scoped_handle)
+    tool._inherited_mcp_unavailable_reason = None
+    try:
+        with bind_tool_call_execution_context(_parent_context("toby-slack")):
+            kwargs = tool._delegated_mcp_config_kwargs()
+    finally:
+        unregister_mcp_approval_gate(scoped_handle)
+
+    assert kwargs["mcp_approval_gate_scope"].task_source == "external"
+    assert kwargs["mcp_approval_supported"] is False
+    assert kwargs["mcp_unavailable_reason"] == NESTED_DELEGATION_NOT_APPROVABLE_REASON
+
+
+@pytest.mark.asyncio
+async def test_legacy_inherited_refusal_reaches_real_child_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    record = PublishedAgentToolRecord(
+        id=17,
+        name="Writer",
+        description="Writes content",
+        instructions=None,
+        status="published",
+    )
+
+    class FakeQuery:
+        def filter(self, *_args: Any) -> "FakeQuery":
+            return self
+
+        def first(self) -> Any:
+            return SimpleNamespace(
+                name="Writer",
+                instructions=None,
+                knowledge_bases=None,
+                skills=None,
+                tool_categories=None,
+                models={"general": 1},
+                execution_mode="balanced",
+            )
+
+    @contextmanager
+    def fake_session_scope(_factory: Any):
+        yield SimpleNamespace(query=lambda *_args: FakeQuery())
+
+    captured: list[WebToolConfig] = []
+
+    class FakeAgentService:
+        def __init__(self, **kwargs: Any) -> None:
+            captured.append(kwargs["tool_config"])
+            self.workspace = None
+
+        async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            return {"status": "failed", "error": "stop after config capture"}
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.db_session.tool_session_scope",
+        fake_session_scope,
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.agent_tool._apply_agent_visibility_filters",
+        lambda query, *_args, **_kwargs: query,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.llm_utils.UserAwareModelStorage", lambda _db: object()
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.agent_model_resolution.resolve_agent_model_llms",
+        lambda *_args, **_kwargs: (object(), None, None, None),
+    )
+    monkeypatch.setattr("xagent.core.agent.service.AgentService", FakeAgentService)
+    monkeypatch.setattr(AgentTool, "_trace_delegation", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        AgentTool, "_create_child_execution_tracer", lambda *_args, **_kwargs: None
+    )
+
+    root = _child_config(
+        categories=["mcp:linkedin"],
+        mcp_unavailable_reason=NESTED_DELEGATION_NOT_APPROVABLE_REASON,
+    )
+    root._tool_selection_spec = None
+    root.get_session_factory = lambda: object()  # type: ignore[method-assign]
+    root.get_published_agent_tool_records = lambda: [record]  # type: ignore[method-assign]
+    (tool,) = await create_agent_tools(root)
+    await tool.run_json_async({"task": "capture child"})
+
+    assert captured[-1].get_mcp_approval_gate_scope() is None
+    assert captured[-1].get_mcp_approval_supported() is True
+    assert (
+        captured[-1].get_mcp_unavailable_reason()
+        == NESTED_DELEGATION_NOT_APPROVABLE_REASON
+    )

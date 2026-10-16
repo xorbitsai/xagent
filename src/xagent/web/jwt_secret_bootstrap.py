@@ -10,14 +10,10 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ..config import KNOWN_INSECURE_SECRETS
+
 _MIN_SECRET_LENGTH = 32
-_KNOWN_WEAK_SECRETS = {
-    "your-secret-key-change-in-production",
-    "change-me",
-    "change-me-to-a-random-session-secret",
-    "replace-with-a-long-random-secret",
-    "secret",
-}
+_KNOWN_WEAK_SECRETS = KNOWN_INSECURE_SECRETS
 
 
 def _validate_secret(secret: str, path: Path, label: str = "JWT secret") -> None:

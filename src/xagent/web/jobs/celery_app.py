@@ -80,15 +80,14 @@ celery_app = create_celery_app()
 @worker_init.connect
 @beat_init.connect
 def validate_worker_encryption(**_: Any) -> None:
-    from ..models.database import configure_db, get_engine
+    from ..models.database import create_database_engine
     from ..services.encryption_key_rotation import validate_stored_encryption_keys
 
     engine = None
     try:
         validate_encryption_config()
-        configure_db()
-        engine = get_engine()
-        validate_stored_encryption_keys()
+        engine = create_database_engine()
+        validate_stored_encryption_keys(engine)
     except Exception as exc:
         # Celery swallows ordinary signal exceptions. SystemExit must abort
         # admission; never print raw SQL/parameters or secret values.

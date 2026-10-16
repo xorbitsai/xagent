@@ -659,9 +659,12 @@ DATABASE_URL="postgresql://xagent:password@postgres:5432/xagent"
 POSTGRES_IMAGE_TAG="17-bookworm"
 
 # Security
-ENCRYPTION_KEY="your-encryption-key"
-XAGENT_SECRET_ENCRYPTION_KEY="a-separate-private-32-or-more-character-tool-key"
-XAGENT_JWT_SECRET="a-unique-random-secret"
+# Leave empty for persistent bootstrap by the stock image. For an explicit
+# deployment key, use Fernet.generate_key() / secrets.token_urlsafe(48), not
+# a copied placeholder. Preserve the generated values across upgrades.
+ENCRYPTION_KEY=""
+XAGENT_SECRET_ENCRYPTION_KEY=""
+XAGENT_JWT_SECRET=""
 ```
 
 The stock backend image persists generated encryption and JWT signing keys in

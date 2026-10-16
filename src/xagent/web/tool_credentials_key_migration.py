@@ -8,7 +8,11 @@ from sqlalchemy import update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ..config import TOOL_CREDENTIALS_MIGRATION_KEY, get_tool_credentials_encryption_key
+from ..config import (
+    TOOL_CREDENTIALS_MIGRATION_KEY,
+    get_tool_credentials_encryption_key,
+    validate_tool_credentials_key,
+)
 from .models.database import configure_db, get_session_local
 from .services.encryption_key_rotation import credential_rows
 from .services.tool_credentials import _build_fernet_key
@@ -23,10 +27,12 @@ def migrate_tool_credentials(db: Session, old_key: str) -> int:
     destination = get_tool_credentials_encryption_key()
     # This offline tool must never downgrade data to a development fallback,
     # even when an operator forgot to select the production environment.
-    if len(destination.strip()) < 32:
+    try:
+        validate_tool_credentials_key(destination, setting="Destination tool key")
+    except RuntimeError:
         raise RuntimeError(
             "Configure a private 32+ character destination tool key before migration"
-        )
+        ) from None
     old, new = _cipher(old_key), _cipher(destination)
     count = 0
     with db.begin():

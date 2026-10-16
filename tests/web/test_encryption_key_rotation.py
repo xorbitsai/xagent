@@ -299,7 +299,7 @@ def test_token_shaped_plaintext_is_never_scanned_or_rotated(
 )
 @pytest.mark.parametrize("readable_source", [True, False])
 def test_exact_json_secret_paths_still_fail_closed_and_rotate(
-    database, table_name, column, field, readable_source
+    database, caplog, table_name, column, field, readable_source
 ):
     old = Fernet(Fernet.generate_key())
     new = Fernet(os.environ["ENCRYPTION_KEY"].encode())
@@ -315,8 +315,12 @@ def test_exact_json_secret_paths_still_fail_closed_and_rotate(
     table.create(database)
     with database.begin() as conn:
         conn.execute(table.insert().values(id=1, **{column: payload}))
-    with pytest.raises(RuntimeError, match=f"{table_name} row 1 field {column}"):
+    if table_name == "trigger_runs":
         rotation.validate_stored_encryption_keys()
+        assert f"{table_name} row 1 field {column}" in caplog.text
+    else:
+        with pytest.raises(RuntimeError, match=f"{table_name} row 1 field {column}"):
+            rotation.validate_stored_encryption_keys()
     if not readable_source:
         with pytest.raises(RuntimeError, match="migration rolled back"):
             with database.begin() as conn:
@@ -475,8 +479,7 @@ def test_celery_disposes_pre_fork_database_pool_on_storage_failure(monkeypatch):
 
     engine = Mock()
     monkeypatch.setattr(celery_app, "validate_encryption_config", Mock())
-    monkeypatch.setattr(db_module, "configure_db", Mock())
-    monkeypatch.setattr(db_module, "get_engine", lambda: engine)
+    monkeypatch.setattr(db_module, "create_database_engine", lambda: engine)
     monkeypatch.setattr(
         rotation,
         "validate_stored_encryption_keys",
@@ -485,6 +488,213 @@ def test_celery_disposes_pre_fork_database_pool_on_storage_failure(monkeypatch):
     with pytest.raises(SystemExit, match="unreadable stored key"):
         celery_app.validate_worker_encryption()
     engine.dispose.assert_called_once()
+
+
+def test_celery_admission_preserves_lazy_child_database_initialization(
+    tmp_path, monkeypatch
+):
+    from xagent.web.jobs import celery_app, tasks
+    from xagent.web.models import database as db_module
+
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'celery-child.db'}")
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "s" * 40)
+    monkeypatch.setattr(db_module, "_engine", None)
+    monkeypatch.setattr(db_module, "_SessionLocal", None)
+    celery_app.validate_worker_encryption()
+    assert db_module._engine is None
+    assert db_module._SessionLocal is None
+    try:
+        with tasks._open_worker_session() as session:
+            assert "background_jobs" in inspect(session.get_bind()).get_table_names()
+    finally:
+        if db_module._engine is not None:
+            db_module._engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "table_name,column",
+    [
+        ("user_oauth", "access_token"),
+        ("user_oauth", "refresh_token"),
+        ("mcp_oauth_flow_states", "code_verifier"),
+        ("task_runtime_secrets", "ciphertext"),
+        ("trigger_runs", "payload_snapshot"),
+    ],
+)
+def test_reconnectable_or_transient_data_warns_without_changing_ciphertext(
+    database, caplog, table_name, column
+):
+    table = Table(
+        table_name,
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column(column, JSON if column == "payload_snapshot" else Text),
+    )
+    table.create(database)
+    old = Fernet(Fernet.generate_key())
+    token = old.encrypt(b"private-stale-token").decode()
+    value = {"encrypted_payload": token} if column == "payload_snapshot" else token
+    with database.begin() as conn:
+        conn.execute(table.insert().values(id=1, **{column: value}))
+    rotation.validate_stored_encryption_keys()
+    assert f"{table_name} row 1 field {column}" in caplog.text
+    assert "ciphertext preserved" in caplog.text
+    assert token not in caplog.text and "private-stale-token" not in caplog.text
+    with database.connect() as conn:
+        assert conn.scalar(select(table.c[column])) == value
+    # Offline migration remains strict, even though service recovery is allowed.
+    with pytest.raises(RuntimeError, match="migration rolled back"):
+        with database.begin() as conn:
+            rotation.rotate_encryption_key(
+                conn,
+                Fernet(Fernet.generate_key()),
+                Fernet(os.environ["ENCRYPTION_KEY"].encode()),
+            )
+
+
+def test_admin_reset_still_works_with_an_unreadable_oauth_token(
+    tmp_path, monkeypatch, caplog
+):
+    from types import SimpleNamespace
+
+    from sqlalchemy import text
+
+    from xagent.web import reset_admin_password
+    from xagent.web.api.auth import verify_password
+    from xagent.web.models import database as db_module
+    from xagent.web.models.user import User
+    from xagent.web.models.user_oauth import UserOAuth, is_undecryptable_oauth_token
+
+    url = f"sqlite:///{tmp_path / 'admin-recovery.db'}"
+    monkeypatch.setenv("DATABASE_URL", url)
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("XAGENT_SECRET_ENCRYPTION_KEY", "s" * 40)
+    monkeypatch.setattr(db_module, "_engine", None)
+    monkeypatch.setattr(db_module, "_SessionLocal", None)
+    monkeypatch.setattr(reset_admin_password, "load_dotenv", Mock())
+    monkeypatch.setattr(
+        reset_admin_password,
+        "parse_args",
+        lambda: SimpleNamespace(
+            username="recovery-admin",
+            password="replacement-admin-password",
+            yes=True,
+        ),
+    )
+    token = Fernet(Fernet.generate_key()).encrypt(b"old-oauth-secret").decode()
+    get_cipher.cache_clear()
+    try:
+        db_module.init_db()
+        with db_module.get_session_local()() as db:
+            db.add(
+                User(username="recovery-admin", password_hash="old-hash", is_admin=True)
+            )
+            db.commit()
+            user_id = db.query(User.id).filter_by(username="recovery-admin").scalar()
+        with db_module.get_engine().begin() as conn:
+            # Raw SQL must bypass the ORM encryption decorator for an old key.
+            conn.execute(
+                text(
+                    "INSERT INTO user_oauth (user_id, provider, access_token) "
+                    "VALUES (:user_id, 'google-drive', :token)"
+                ),
+                {"user_id": user_id, "token": token},
+            )
+        db_module.get_engine().dispose()
+        reset_admin_password.main()
+        with db_module.get_session_local()() as db:
+            user = db.query(User).filter_by(username="recovery-admin").one()
+            assert verify_password("replacement-admin-password", user.password_hash)
+            assert is_undecryptable_oauth_token(db.query(UserOAuth).one().access_token)
+            assert (
+                db.execute(text("SELECT access_token FROM user_oauth")).scalar_one()
+                == token
+            )
+        assert "Unreadable recoverable credential: user_oauth" in caplog.text
+        assert token not in caplog.text and "old-oauth-secret" not in caplog.text
+    finally:
+        get_cipher.cache_clear()
+        if db_module._engine is not None:
+            db_module._engine.dispose()
+
+
+def test_recoverable_warnings_are_bounded_for_large_stale_history(database, caplog):
+    table = Table(
+        "user_oauth",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("access_token", Text),
+    )
+    table.create(database)
+    old = Fernet(Fernet.generate_key())
+    with database.begin() as conn:
+        conn.execute(
+            table.insert(),
+            [
+                {"id": row_id, "access_token": old.encrypt(b"stale-secret").decode()}
+                for row_id in range(1, 13)
+            ],
+        )
+    rotation.validate_stored_encryption_keys()
+    assert caplog.text.count("Unreadable recoverable credential:") == 5
+    assert "7 additional unreadable recoverable credential fields" in caplog.text
+    assert "stale-secret" not in caplog.text
+
+
+def test_rotation_pages_are_fully_read_before_updates(database, monkeypatch):
+    from sqlalchemy import event
+
+    monkeypatch.setattr(rotation, "_ROW_BATCH_SIZE", 2)
+    table = Table(
+        "models",
+        MetaData(),
+        Column("id", Integer, primary_key=True),
+        Column("_api_key_encrypted", Text),
+    )
+    table.create(database)
+    old, new = (
+        Fernet(Fernet.generate_key()),
+        Fernet(os.environ["ENCRYPTION_KEY"].encode()),
+    )
+    with database.begin() as conn:
+        conn.execute(
+            table.insert(),
+            [
+                {
+                    "id": row_id,
+                    "_api_key_encrypted": old.encrypt(str(row_id).encode()).decode(),
+                }
+                for row_id in range(1, 8)
+            ]
+            + [{"id": 8, "_api_key_encrypted": None}],
+        )
+    statements = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.startswith("SELECT models."):
+            statements.append(statement)
+
+    event.listen(database, "before_cursor_execute", record)
+    try:
+        with database.begin() as conn:
+            assert rotation.rotate_encryption_key(conn, old, new) == 7
+        assert len(statements) == 5
+        assert all(
+            "LIMIT" in statement and "IS NOT NULL" in statement
+            for statement in statements
+        )
+        with database.connect() as conn:
+            for row_id, token in conn.execute(select(table)).all():
+                if row_id == 8:
+                    assert token is None
+                else:
+                    assert new.decrypt(token.encode()).decode() == str(row_id)
+        rotation.validate_stored_encryption_keys()
+    finally:
+        event.remove(database, "before_cursor_execute", record)
 
 
 @pytest.mark.parametrize("unreadable", [False, True])
@@ -576,6 +786,40 @@ def test_fresh_production_database_initializes_with_real_schema(tmp_path, monkey
     finally:
         if db_module._engine is not None:
             db_module._engine.dispose()
+
+
+def test_catalog_matches_live_columns_and_encryption_naming_conventions():
+    from xagent.web.models.database import Base
+    from xagent.web.models.user_oauth import EncryptedOAuthToken
+
+    catalog = {
+        (table_name, column)
+        for table_name, columns in rotation.ENCRYPTED_COLUMNS.items()
+        for column in columns
+    }
+    for table_name, column in catalog:
+        assert column in Base.metadata.tables[table_name].c
+    # A new conventionally named encrypted column or OAuth decorator must be
+    # explicitly admitted to the rotation catalog, not silently omitted.
+    candidates = {
+        (table.name, column.name)
+        for table in Base.metadata.tables.values()
+        for column in table.c
+        if "encrypted" in column.name
+        or "ciphertext" in column.name
+        or isinstance(column.type, EncryptedOAuthToken)
+        or column.name
+        in {"access_token", "refresh_token", "client_secret", "code_verifier", "env"}
+    }
+    # This is a signed application JWT refresh token, not Fernet-encrypted data.
+    candidates.discard(("users", "refresh_token"))
+    assert candidates <= catalog
+    json_columns = {
+        (table_name, column)
+        for table_name, column in catalog
+        if isinstance(Base.metadata.tables[table_name].c[column].type, JSON)
+    }
+    assert json_columns == rotation._ENV_COLUMNS | rotation._JSON_SECRET_FIELDS.keys()
 
 
 def test_celery_worker_and_beat_abort_on_invalid_key(monkeypatch):

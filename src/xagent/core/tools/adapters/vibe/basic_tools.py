@@ -4,6 +4,7 @@ import logging
 from typing import TYPE_CHECKING, Any, List
 
 from .....config import get_web_search_provider
+from ....utils.encryption import ToolCredentialUnreadableError
 from .factory import ToolFactory, register_tool
 
 if TYPE_CHECKING:
@@ -21,14 +22,22 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     tools: List[Any] = []
     workspace = ToolFactory.create_workspace(config.get_workspace_config())
 
-    # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> none
-    zhipu_api_key = config.get_tool_credential("zhipu_web_search", "api_key")
-    zhipu_base_url = config.get_tool_credential("zhipu_web_search", "base_url")
-    tavily_api_key = config.get_tool_credential("tavily_web_search", "api_key")
-    google_api_key = config.get_tool_credential("web_search", "api_key")
-    google_cse_id = config.get_tool_credential("web_search", "cse_id")
+    def credentials(tool_name: str, *fields: str) -> list[str | None]:
+        try:
+            return [config.get_tool_credential(tool_name, field) for field in fields]
+        except ToolCredentialUnreadableError:
+            # Disable this provider, not API/code/fetch tools or other providers.
+            # The resolver still refuses environment fallback for this stored key.
+            logger.warning("Skipping %s: stored credential is unreadable", tool_name)
+            return [None for _ in fields]
 
-    exa_api_key = config.get_tool_credential("exa_web_search", "api_key")
+    # Web search tool preference in auto mode: Zhipu -> Tavily -> Exa -> Google -> none
+    zhipu_api_key, zhipu_base_url = credentials(
+        "zhipu_web_search", "api_key", "base_url"
+    )
+    (tavily_api_key,) = credentials("tavily_web_search", "api_key")
+    google_api_key, google_cse_id = credentials("web_search", "api_key", "cse_id")
+    (exa_api_key,) = credentials("exa_web_search", "api_key")
     provider = get_web_search_provider()
 
     if provider in ("auto", "zhipu") and zhipu_api_key:

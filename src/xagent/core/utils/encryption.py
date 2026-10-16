@@ -14,6 +14,16 @@ from ...config import DEV_FALLBACK_ENCRYPTION_KEY, get_environment
 logger = logging.getLogger(__name__)
 
 
+class ToolCredentialUnreadableError(RuntimeError):
+    """A stored tool credential exists but must not fall back to environment."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Stored tool credential is unreadable with the active key; "
+            "see docs/tool-credential-key-upgrade.md"
+        )
+
+
 def _get_encryption_key() -> str:
     encryption_key = os.getenv("ENCRYPTION_KEY")
     if not encryption_key:

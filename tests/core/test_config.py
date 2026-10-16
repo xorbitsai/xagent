@@ -4071,6 +4071,23 @@ def test_tool_key_alias_and_boundary(monkeypatch, setting, length, valid):
             config.get_tool_credentials_encryption_key()
 
 
+@pytest.mark.parametrize("setting", ["XAGENT_SECRET_ENCRYPTION_KEY", "SECRET_KEY"])
+@pytest.mark.parametrize(
+    "value", [value for value in config.KNOWN_INSECURE_SECRETS if len(value) >= 32]
+)
+def test_tool_key_rejects_known_public_values_including_alias(
+    monkeypatch, setting, value
+):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.delenv("XAGENT_SECRET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    monkeypatch.setenv(setting, "  " + value.upper() + "  ")
+    with pytest.raises(
+        RuntimeError, match=f"^{setting} must not use a public placeholder"
+    ):
+        config.get_tool_credentials_encryption_key()
+
+
 @pytest.mark.parametrize(
     "key",
     [

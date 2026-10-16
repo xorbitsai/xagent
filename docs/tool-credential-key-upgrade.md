@@ -8,9 +8,17 @@ it already meets the requirement: whitespace is part of historical derivation.
 Web, standalone workers, combined launchers and Celery worker/beat validate
 encryption at startup. Database initialization binds the configured database,
 then checks persisted ciphertext before any schema migration or seeding;
-workers also check before accepting work. An unreadable stored
-credential aborts startup with a table/row/field location and this upgrade guide,
-never a silent environment/default fallback. No plaintext or ciphertext is logged.
+workers also check before accepting work. An unreadable durable credential
+(model/channel/MCP/tool or global authority) aborts startup with a table/row/field
+location and this guide, never a silent environment/default fallback.
+Unreadable `user_oauth` tokens and transient `mcp_oauth_flow_states`,
+`task_runtime_secrets` and `trigger_runs` values instead warn so account
+reauthorization and administrator recovery remain available. Their ciphertext
+is preserved; the affected connection, flow or run must be reauthorized/restarted,
+not treated as an empty credential or replaced by a default. The offline rotation
+CLI remains strict and rolls back on any unreadable encrypted field; restore the
+source key to rotate that data. No data is automatically discarded, and no
+plaintext or ciphertext is logged.
 
 The backend image generates a separate persistent tool secret at
 `/run/xagent-secrets/tool-credentials.secret` when neither tool-key variable is
@@ -22,7 +30,10 @@ Before upgrading a deployment that used `xagent-dev-key` or a short key:
 1. Back up the database and all original keys. Stop every web/worker/Celery
    writer; do not run mixed-key replicas.
 2. Configure the new strong `XAGENT_SECRET_ENCRYPTION_KEY` consistently on all
-   services. For Docker, initialize and reuse the persisted tool-key file.
+   services. Known public placeholders are rejected even if 32+ characters long.
+   For Docker, remove/unset an old short `SECRET_KEY` alias (and an old short
+   primary variable) before initializing and reusing the persisted tool-key file;
+   the entrypoint preserves explicit values rather than replacing weak keys.
 3. In an offline container/process with the same database configuration, set
    `XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY` to the exact old tool key (explicitly
    `xagent-dev-key` only if that was really used), then run
@@ -45,6 +56,8 @@ existing model/channel/OAuth data needs re-encryption first. There is deliberate
 no production fallback to a published key.
 Equivalent Base64 spellings of that public key are rejected too, including
 standard-Base64 alphabet variants, extra padding and embedded whitespace.
+The exact historical value is `DEV_FALLBACK_ENCRYPTION_KEY` in `xagent.config`;
+use that source only if it is the key your deployment actually used.
 
 `python -m xagent.web.encryption_key_migration` reads the exact old Fernet key from
 `XAGENT_ENCRYPTION_MIGRATION_KEY` and the explicit private destination from

@@ -14,6 +14,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from ...config import get_tool_credentials_encryption_key
 from ...core.tools.core.sql_tool import validate_external_database_url
+from ...core.utils.encryption import ToolCredentialUnreadableError
 from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig
 
@@ -184,14 +185,11 @@ def _encrypt(value: str) -> str:
     return _fernet().encrypt(value.encode("utf-8")).decode("utf-8")
 
 
-def _decrypt(ciphertext: str) -> str | None:
+def _decrypt(ciphertext: str) -> str:
     try:
         return _fernet().decrypt(ciphertext.encode("utf-8")).decode("utf-8")
     except (InvalidToken, ValueError):
-        raise RuntimeError(
-            "Stored tool credential is unreadable with the active key; "
-            "see docs/tool-credential-key-upgrade.md"
-        ) from None
+        raise ToolCredentialUnreadableError() from None
 
 
 def _mask_value(value: str) -> str:
@@ -596,7 +594,12 @@ def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
             else None
         )
         source = "db" if db_set else ("env" if env_value else "none")
-        resolved = resolve_tool_credential(db, tool_name, field_name)
+        error = None
+        try:
+            resolved = resolve_tool_credential(db, tool_name, field_name)
+        except ToolCredentialUnreadableError:
+            resolved = None
+            error = "unreadable"
         required = bool(spec.get("required", False))
         is_configured = bool(resolved)
         if required and not is_configured:
@@ -612,6 +615,7 @@ def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
             if db_set
             else (_mask_value(env_value) if env_value else ""),
             "env_names": spec.get("env", []),
+            "error": error,
         }
 
     return {

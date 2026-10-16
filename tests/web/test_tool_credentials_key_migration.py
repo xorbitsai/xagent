@@ -16,7 +16,17 @@ def cipher(raw):
     return Fernet(base64.urlsafe_b64encode(hashlib.sha256(raw.encode()).digest()))
 
 
-@pytest.mark.parametrize("destination", ["", "short-key", "xagent-dev-key"])
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "",
+        "short-key",
+        "xagent-dev-key",
+        "your-secret-key-change-in-production",
+        "change-me-to-a-random-session-secret",
+        "a-separate-private-32-or-more-character-tool-key",
+    ],
+)
 def test_migration_refuses_weak_destination_even_in_development(
     monkeypatch, destination
 ):
@@ -29,7 +39,14 @@ def test_migration_refuses_weak_destination_even_in_development(
     db.begin.assert_not_called()
 
 
-@pytest.mark.parametrize("old_key", ["xagent-dev-key", "short-key"])
+@pytest.mark.parametrize(
+    "old_key",
+    [
+        "xagent-dev-key",
+        "short-key",
+        "your-secret-key-change-in-production",
+    ],
+)
 @pytest.mark.parametrize("corrupt", [False, True])
 def test_offline_migration_is_atomic_and_idempotent(
     tmp_path, monkeypatch, old_key, corrupt

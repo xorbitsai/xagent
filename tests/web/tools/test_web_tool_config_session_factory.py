@@ -2311,6 +2311,40 @@ async def test_factory_prefetch_recovers_before_later_read_after_required_failur
 
 
 @pytest.mark.asyncio
+async def test_unreadable_credential_does_not_poison_unrelated_tools(monkeypatch):
+    from xagent.web.services.tool_credentials import ToolCredentialUnreadableError
+
+    def resolve(_db, tool_name, field_name):
+        if (tool_name, field_name) == ("tavily_web_search", "api_key"):
+            raise ToolCredentialUnreadableError()
+        return "independent-credential"
+
+    monkeypatch.setattr("xagent.web.tools.config.resolve_tool_credential", resolve)
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=_TrackingSession,
+        user_id=1,
+        task_id="_mock_",
+        workspace_config={"task_id": "_mock_"},
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["basic"]),
+    )
+    try:
+        await cfg.prepare_factory_runtime()
+        assert "basic" not in cfg._factory_runtime_snapshot.failed_inputs
+        with pytest.raises(ToolCredentialUnreadableError):
+            cfg.get_tool_credential("tavily_web_search", "api_key")
+        assert (
+            cfg.get_tool_credential("exa_web_search", "api_key")
+            == "independent-credential"
+        )
+    finally:
+        cfg.release_prepared_factory_runtime()
+        cfg.close()
+
+
+@pytest.mark.asyncio
 async def test_factory_prefetch_propagates_later_input_checkout_timeout(monkeypatch):
     """A later input's checkout timeout must not degrade to an empty model set."""
     sessions: list[_PostgresAbortSession] = []

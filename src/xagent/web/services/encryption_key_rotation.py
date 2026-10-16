@@ -4,12 +4,13 @@ Reflection deliberately bypasses ORM encryption decorators and property setters.
 The catalog is restricted to credential-bearing paths, never arbitrary JSON text.
 """
 
+import logging
 import os
 from collections.abc import Callable, Iterator
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
-from sqlalchemy import MetaData, Table, inspect, select, update
+from sqlalchemy import Engine, MetaData, Table, inspect, or_, select, update
 from sqlalchemy.engine import Connection
 
 from ...config import (
@@ -21,6 +22,9 @@ from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import _looks_like_fernet_token
 from ..models.database import get_engine
 from .tool_credentials import _build_fernet_key
+
+logger = logging.getLogger(__name__)
+_ROW_BATCH_SIZE = 200
 
 ENCRYPTED_COLUMNS = {
     "models": ("_api_key_encrypted",),
@@ -59,6 +63,14 @@ _ENV_COLUMNS = {
     ("actor_mcp_server_connections", "encrypted_env"),
     ("custom_apis", "env"),
 }
+# These consumers already fail closed per account/flow/run. An old unusable
+# token must not prevent unrelated accounts or admin recovery from starting.
+_RECOVERABLE_TABLES = {
+    "user_oauth",
+    "mcp_oauth_flow_states",
+    "task_runtime_secrets",
+    "trigger_runs",
+}
 
 
 def credential_rows(
@@ -75,9 +87,25 @@ def credential_rows(
         primary = list(table.primary_key.columns)
         if len(primary) != 1:
             raise RuntimeError(f"Unsupported credential table identity: {name}")
-        for row in connection.execute(select(primary[0], *columns)).mappings():
-            for column in columns:
-                yield table, row[primary[0].name], column.name, row[column.name]
+        last_id = None
+        while True:
+            statement = (
+                select(primary[0], *columns)
+                .where(or_(*(column.is_not(None) for column in columns)))
+                .order_by(primary[0])
+                .limit(_ROW_BATCH_SIZE)
+            )
+            if last_id is not None:
+                statement = statement.where(primary[0] > last_id)
+            # Exhaust the SELECT before the caller issues UPDATEs on SQLite.
+            # Keyset pagination bounds memory without skipping updated rows.
+            rows = connection.execute(statement).mappings().all()
+            if not rows:
+                break
+            for row in rows:
+                for column in columns:
+                    yield table, row[primary[0].name], column.name, row[column.name]
+            last_id = rows[-1][primary[0].name]
 
 
 def transform_credential_value(
@@ -108,7 +136,7 @@ def transform_credential_value(
     return transform_token(value)
 
 
-def validate_stored_encryption_keys() -> None:
+def validate_stored_encryption_keys(engine: Engine | None = None) -> None:
     """Refuse deployed admission rather than silently losing old credentials."""
     if not requires_secure_secrets():
         return
@@ -119,13 +147,26 @@ def validate_stored_encryption_keys() -> None:
         master.decrypt(token.encode())
         return token
 
-    with get_engine().connect() as connection:
+    recoverable_failures = 0
+    with (engine if engine is not None else get_engine()).connect() as connection:
         for table, row_id, column, value in credential_rows(
             connection, ENCRYPTED_COLUMNS
         ):
             try:
                 transform_credential_value(table.name, column, value, validate_token)
             except (InvalidToken, ValueError):
+                if table.name in _RECOVERABLE_TABLES:
+                    recoverable_failures += 1
+                    if recoverable_failures <= 5:
+                        logger.warning(
+                            "Unreadable recoverable credential: %s row %s field %s; "
+                            "reconnect the account or restart the affected flow/run; "
+                            "ciphertext preserved; see docs/tool-credential-key-upgrade.md",
+                            table.name,
+                            row_id,
+                            column,
+                        )
+                    continue
                 raise RuntimeError(
                     f"Unreadable encrypted credential: {table.name} row {row_id} field {column}; see docs/tool-credential-key-upgrade.md"
                 ) from None
@@ -148,6 +189,12 @@ def validate_stored_encryption_keys() -> None:
                             raise RuntimeError(
                                 f"Unreadable tool credential: {table.name} row {row_id} field {group}.{field!r}; see docs/tool-credential-key-upgrade.md"
                             ) from None
+    if recoverable_failures > 5:
+        logger.warning(
+            "%s additional unreadable recoverable credential fields; "
+            "ciphertext preserved; see docs/tool-credential-key-upgrade.md",
+            recoverable_failures - 5,
+        )
 
 
 def rotate_encryption_key(connection: Connection, old: Fernet, new: Fernet) -> int:

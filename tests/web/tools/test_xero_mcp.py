@@ -322,15 +322,26 @@ def test_list_payments_where_clause_is_validated_and_built(fake: FakeXero) -> No
         xero.list_payments(reference='x" OR 1==1')
 
 
-def _paid_invoice(number: str, paid_on: str, *, total: float = 10) -> dict[str, Any]:
+def _paid_invoice(
+    number: str,
+    paid_on: str,
+    *,
+    total: float = 10,
+    currency: str = "AUD",
+    contact_id: str = CONTACT_ID,
+) -> dict[str, Any]:
     record = _invoice(
         number,
         "2026-10-01",
         0,
         issued="2026-09-01",
+        currency=currency,
+        contact_id=contact_id,
         status="PAID",
     )
-    record["FullyPaidOnDate"] = f"{paid_on}T00:00:00"
+    moment = datetime.fromisoformat(paid_on).replace(tzinfo=timezone.utc)
+    milliseconds = int(moment.timestamp() * 1000)
+    record["FullyPaidOnDate"] = f"/Date({milliseconds}+0000)/"
     record["Total"] = total
     record["AmountPaid"] = total
     return record
@@ -382,6 +393,64 @@ def test_list_paid_invoices_reads_later_pages_after_mixed_dates(
     assert [call["params"]["page"] for call in api_calls] == [1, 2]
     assert api_calls[0]["params"]["Statuses"] == "PAID"
     assert api_calls[0]["params"]["where"] == 'Type=="ACCREC"'
+    assert api_calls[0]["params"]["summaryOnly"] == "true"
+
+
+def test_list_paid_invoices_windows_totals_and_contact_filter(fake: FakeXero) -> None:
+    fake.responder = _paid_pages(
+        [
+            [
+                _paid_invoice("INV-A", "2026-10-13", total=12.5),
+                _paid_invoice(
+                    "INV-B",
+                    "2026-10-13",
+                    total=20.25,
+                    currency="USD",
+                ),
+            ]
+        ]
+    )
+
+    first = _call_tool(
+        "list_paid_invoices",
+        paidOnDate="2026-10-13",
+        contactIds=[CONTACT_ID],
+        limit=1,
+    )
+
+    assert first["total_count"] == 2
+    assert first["total_invoice_amount_by_currency"] == {
+        "AUD": "12.50",
+        "USD": "20.25",
+    }
+    assert first["returned"] == 1
+    assert first["has_more"] is True
+    assert first["next_skip"] == 1
+    assert first["invoices"][0]["invoice_number"] == "INV-A"
+    assert fake.calls[-1]["params"]["ContactIDs"] == CONTACT_ID
+
+    second = _call_tool(
+        "list_paid_invoices",
+        paidOnDate="2026-10-13",
+        contactIds=[CONTACT_ID],
+        skip=first["next_skip"],
+        limit=1,
+    )
+
+    assert second["returned"] == 1
+    assert second["has_more"] is False
+    assert second["invoices"][0]["invoice_number"] == "INV-B"
+
+
+def test_list_paid_invoices_rejects_paid_record_without_settlement_date(
+    fake: FakeXero,
+) -> None:
+    missing_date = _paid_invoice("INV-MISSING", "2026-10-13")
+    missing_date.pop("FullyPaidOnDate")
+    fake.responder = _paid_pages([[missing_date]])
+
+    with pytest.raises(RuntimeError, match="without FullyPaidOnDate"):
+        xero.list_paid_invoices(paidOnDate="2026-10-13")
 
 
 def test_list_paid_invoices_rejects_partial_scan_without_pagination(

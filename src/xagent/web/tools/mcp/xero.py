@@ -4,7 +4,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterator, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -960,7 +960,9 @@ def list_invoices(
     The result reports total_count, page_count, has_more and next_page. If
     has_more is true the list is NOT finished: call again with next_page. To
     find overdue invoices do not page through this list; use
-    list_overdue_invoices, which reads all of them.
+    list_overdue_invoices, which reads all of them. For invoices settled on a
+    specific date use list_paid_invoices; UpdatedDateUTC ordering cannot prove
+    a FullyPaidOnDate list is complete.
 
     contactIds: only invoices for these contacts (from list_contacts).
     invoiceNumbers: only these invoice numbers; line items are then included.
@@ -1004,6 +1006,39 @@ def list_invoices(
     )
 
 
+def _iter_complete_invoice_pages(
+    params: dict[str, Any],
+    *,
+    max_pages: int,
+    label: str,
+    partial_result: str,
+    narrow_hint: str,
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield invoice pages until Xero confirms the filtered list is complete."""
+    page = 1
+    while True:
+        data = _request(
+            "GET", "Invoices", scope="invoices", params={**params, "page": page}
+        )
+        yield data.get("Invoices") or []
+
+        pagination = data.get("pagination") or {}
+        page_count = pagination.get("pageCount")
+        if page_count is None:
+            raise RuntimeError(
+                f"Xero {label} scan returned no pagination metadata; refusing "
+                f"to report {partial_result} as complete"
+            )
+        if page >= int(page_count):
+            break
+        if page >= max_pages:
+            raise RuntimeError(
+                f"Xero {label} scan reached the safety limit of {max_pages} pages "
+                f"before the end of the list; narrow the request with {narrow_hint}"
+            )
+        page += 1
+
+
 def _collect_paid_invoices(
     paid_on: date,
     invoice_type: str,
@@ -1027,20 +1062,25 @@ def _collect_paid_invoices(
 
     found: list[dict[str, Any]] = []
     seen_invoice_ids: set[str] = set()
-    page = 1
-    while True:
-        data = _request(
-            "GET", "Invoices", scope="invoices", params={**params, "page": page}
-        )
-        records = data.get("Invoices") or []
+    for records in _iter_complete_invoice_pages(
+        params,
+        max_pages=PAID_INVOICE_MAX_PAGES,
+        label="paid-invoice",
+        partial_result="a partial settlement-date list",
+        narrow_hint="contactIds",
+    ):
         for record in records:
+            if record.get("Type") != invoice_type or record.get("Status") != "PAID":
+                continue
             fully_paid_on = _xero_date(record.get("FullyPaidOnDate"))
-            if (
-                record.get("Type") != invoice_type
-                or record.get("Status") != "PAID"
-                or not fully_paid_on
-                or date.fromisoformat(fully_paid_on[:10]) != paid_on
-            ):
+            if not fully_paid_on:
+                identity = record.get("InvoiceID") or record.get("InvoiceNumber")
+                raise RuntimeError(
+                    "Xero returned PAID invoice "
+                    f"{identity or '<unknown>'} without FullyPaidOnDate; refusing "
+                    "to report a settlement-date list as complete"
+                )
+            if date.fromisoformat(fully_paid_on[:10]) != paid_on:
                 continue
             identity = str(
                 record.get("InvoiceID")
@@ -1051,23 +1091,6 @@ def _collect_paid_invoices(
                 continue
             seen_invoice_ids.add(identity)
             found.append(_invoice_view(record))
-
-        pagination = data.get("pagination") or {}
-        page_count = pagination.get("pageCount")
-        if page_count is None:
-            raise RuntimeError(
-                "Xero paid-invoice scan returned no pagination metadata; refusing "
-                "to report a partial settlement-date list as complete"
-            )
-        if page >= int(page_count):
-            break
-        if page >= PAID_INVOICE_MAX_PAGES:
-            raise RuntimeError(
-                "Xero paid-invoice scan reached the safety limit of "
-                f"{PAID_INVOICE_MAX_PAGES} pages before the end of the list; "
-                "narrow the request with contactIds"
-            )
-        page += 1
     return found
 
 
@@ -1091,6 +1114,12 @@ def list_paid_invoices(
     This reports invoices that became fully settled on the requested date. It
     is not a list of every payment received that day; partial payments belong
     in list_payments.
+
+    Each skip/limit window re-scans the complete PAID ledger, up to 50 pages of
+    1000 invoices. Prefer the largest practical limit (up to 200) to conserve
+    Xero's tenant request quota. Large tenants can narrow the scan with
+    contactIds; the tool fails rather than returning partial results if the
+    safety limit is reached.
 
     paidOnDate: settlement date in YYYY-MM-DD format.
     contactIds: optionally restrict to these contacts (from list_contacts).
@@ -1181,12 +1210,13 @@ def _collect_open_invoices(
 
     found: list[dict[str, Any]] = []
     seen_invoice_ids: set[str] = set()
-    page = 1
-    while True:
-        data = _request(
-            "GET", "Invoices", scope="invoices", params={**params, "page": page}
-        )
-        records = data.get("Invoices") or []
+    for records in _iter_complete_invoice_pages(
+        params,
+        max_pages=OPEN_INVOICE_MAX_PAGES,
+        label="invoice",
+        partial_result="partial ledger totals",
+        narrow_hint="contactIds or a stricter date range",
+    ):
         for record in records:
             amount_due = Decimal(str(record.get("AmountDue") or 0))
             due = _doc_date(record, "DueDate")
@@ -1218,23 +1248,6 @@ def _collect_open_invoices(
             view = _invoice_view(record)
             view["days_overdue"] = days
             found.append(view)
-        pagination = data.get("pagination") or {}
-        page_count = pagination.get("pageCount")
-        if page_count is None:
-            raise RuntimeError(
-                "Xero invoice scan returned no pagination metadata; refusing "
-                "to report partial ledger totals as complete"
-            )
-        finished = page >= int(page_count)
-        if finished:
-            break
-        if page >= OPEN_INVOICE_MAX_PAGES:
-            raise RuntimeError(
-                "Xero invoice scan reached the safety limit of "
-                f"{OPEN_INVOICE_MAX_PAGES} pages before the end of the list; "
-                "narrow the request with contactIds or a stricter date range"
-            )
-        page += 1
     return found
 
 

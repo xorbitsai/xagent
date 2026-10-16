@@ -1234,6 +1234,16 @@ def list_overdue_invoices(
 RECEIVABLE_BUCKETS = ("Current", "1-15", "16-30", "31-45", "46-60", "61-75", "76+")
 RECEIVABLES_DEFAULT_LIMIT = 100
 RECEIVABLES_MAX_LIMIT = 500
+RECEIVABLES_SPREADSHEET_COLUMNS = (
+    {"header": "Company Name", "field": "contact_name"},
+    {"header": "Currency", "field": "currency"},
+    {"header": "Invoice Count", "field": "invoice_count"},
+    *(
+        {"header": bucket, "field": f"buckets.{bucket}"}
+        for bucket in RECEIVABLE_BUCKETS
+    ),
+    {"header": "Total Due", "field": "total_due"},
+)
 
 
 def _receivable_bucket(days_overdue: int) -> str:
@@ -1272,6 +1282,12 @@ def list_receivables_ageing(
     even when only part of the rows fit in one response. When has_more is true,
     call again with next_skip to read the remaining rows. Each window re-scans
     the open ledger, so prefer the largest practical limit (up to 500).
+
+    When creating a spreadsheet or table, follow spreadsheet_export: retrieve
+    every page, use rows as the row source, and include Company Name from
+    contact_name as the first column. totals_by_currency is summary metadata;
+    do not substitute it for the contact rows unless the user explicitly asks
+    for a summary-only output.
 
     Historical limitation: a past asOfDate excludes invoices issued later, but
     payments, credits and allocations made after that date are not rolled back.
@@ -1362,6 +1378,12 @@ def list_receivables_ageing(
             "total_invoice_count": len(invoices),
             "total_rows": len(rendered_rows),
             "totals_by_currency": totals_by_currency,
+            "spreadsheet_export": {
+                "row_source": "rows",
+                "columns": list(RECEIVABLES_SPREADSHEET_COLUMNS),
+                "retrieve_all_pages": True,
+                "summary_only": False,
+            },
             "complete": True,
             "skip": skip,
             "returned": len(shown),

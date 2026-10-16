@@ -664,6 +664,21 @@ def test_ageing_has_one_named_row_per_contact_and_currency_with_every_bucket(
 
     assert result["total_invoice_count"] == 6
     assert result["bucket_names"] == list(xero.RECEIVABLE_BUCKETS)
+    assert result["spreadsheet_export"] == {
+        "row_source": "rows",
+        "columns": [
+            {"header": "Company Name", "field": "contact_name"},
+            {"header": "Currency", "field": "currency"},
+            {"header": "Invoice Count", "field": "invoice_count"},
+            *[
+                {"header": bucket, "field": f"buckets.{bucket}"}
+                for bucket in xero.RECEIVABLE_BUCKETS
+            ],
+            {"header": "Total Due", "field": "total_due"},
+        ],
+        "retrieve_all_pages": True,
+        "summary_only": False,
+    }
     rows = result["rows"]
     assert [(row["contact_name"], row["currency"]) for row in rows] == [
         ("Heebie", "AUD"),
@@ -1217,3 +1232,13 @@ def test_paged_tools_no_longer_require_a_page_argument() -> None:
 
     for name in ("list_invoices", "list_credit_notes", "list_bank_transactions"):
         assert "page" not in tools[name].inputSchema.get("required", []), name
+
+
+def test_receivables_ageing_description_requires_named_spreadsheet_rows() -> None:
+    description = " ".join(
+        _registered_tools()["list_receivables_ageing"].description.split()
+    )
+
+    assert "follow spreadsheet_export" in description
+    assert "include Company Name from contact_name as the first column" in description
+    assert "do not substitute it for the contact rows" in description

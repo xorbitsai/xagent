@@ -287,6 +287,12 @@ def google_sheets_update_range(
     value_input_option controls parsing: "USER_ENTERED" (default, parses
     formulas/numbers like typed input) or "RAW" (stores every value as a
     literal string).
+
+    When a source connector returns a spreadsheet_export contract, follow its
+    row_source and columns exactly. Retrieve all requested pages first and keep
+    required identity columns such as company/contact/customer name. Do not
+    replace record-level rows with aggregate totals unless the user explicitly
+    requests a summary-only sheet.
     """
     try:
         resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)
@@ -326,6 +332,12 @@ def google_sheets_append_rows(
     Append rows after the last row of data found in range_name, e.g.
     range_name="Sheet1!A1". values must be a 2D array of rows, e.g.
     [["a","b"],["c","d"]].
+
+    When a source connector returns a spreadsheet_export contract, follow its
+    row_source and columns exactly. Retrieve all requested pages first and keep
+    required identity columns such as company/contact/customer name. Do not
+    replace record-level rows with aggregate totals unless the user explicitly
+    requests a summary-only sheet.
     """
     try:
         resolved_spreadsheet_id = _resolve_spreadsheet_id(spreadsheet_id, editing=True)

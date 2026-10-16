@@ -55,6 +55,23 @@ describe("FileViewer HTML preview", () => {
     }
   })
 
+  it("prepares untrusted HTML without creating a resource-loading DOM", () => {
+    const parser = vi.spyOn(globalThis, "DOMParser").mockImplementation(() => {
+      throw new Error("Do not materialize untrusted HTML in the app origin")
+    })
+    try {
+      render(<FileViewer fileName="page.html" fileId="html-id"
+        content={'<html lang="zh"><head><script src="https://example.com/app.js"></script></head><body><img src="https://example.com/pixel"></body></html>'}
+        isLoading={false} error={null} viewMode="preview" />)
+      const source = screen.getByTitle("page.html").getAttribute("srcdoc")!
+      expect(source).toContain('<html lang="zh">')
+      expect(source.indexOf('content="no-referrer"')).toBeLessThan(source.indexOf("<script"))
+      expect(parser).not.toHaveBeenCalled()
+    } finally {
+      parser.mockRestore()
+    }
+  })
+
   it("rewrites file id image sources to public preview URLs", () => {
     render(
       <FileViewer

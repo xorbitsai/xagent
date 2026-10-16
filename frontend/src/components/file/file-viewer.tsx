@@ -6,6 +6,7 @@ import { PptxPreviewRenderer } from "@/components/file/pptx-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
 import { useFileAccess } from "@/contexts/file-access-context"
+import { withPreviewReferrerPolicy } from "@/lib/html-preview-document"
 import {
   isHtmlFile,
   isMarkdownFile,
@@ -225,18 +226,11 @@ export function FileViewer({
     )
     // srcDoc subresources do not inherit the iframe navigation's
     // referrerPolicy. Set the document policy before any asset is parsed.
-    const document = new DOMParser().parseFromString(rewritten, "text/html")
-    document.querySelectorAll('meta[name="referrer" i]').forEach((meta) => meta.remove())
-    const policy = document.createElement("meta")
-    policy.name = "referrer"
-    policy.content = "no-referrer"
-    document.head.prepend(policy)
-    return `<!DOCTYPE html>\n${document.documentElement.outerHTML}`
+    return withPreviewReferrerPolicy(rewritten)
   }, [fileAccess])
 
   React.useEffect(() => {
-    // DOMParser is browser-only. The initial SSR/client render stays blank;
-    // parse untrusted HTML only after mounting, before assigning srcDoc.
+    // Keep the initial SSR/client render blank; prepare before assigning srcDoc.
     if (isHtmlFile(fileName) && viewMode === "preview") {
       setHtmlPreviewContent(processHtmlContent(content || "", fileId))
     }

@@ -58,6 +58,7 @@
     "marked": "^5.1.2",
     "next": "^15.2.3",
     "parse-entities": "^4.0.2",
+    "parse5": "^7.3.0",
     "postcss": "^8.4.0",
     "pptxgenjs": "4.0.1",
     "pptxviewjs": "^1.1.9",

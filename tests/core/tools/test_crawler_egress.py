@@ -190,7 +190,17 @@ async def test_redirect_policy_failure_is_terminal(monkeypatch, target):
 
 
 @pytest.mark.parametrize("connect_error", [False, True])
-async def test_proxy_rebinding_denial_is_terminal(monkeypatch, connect_error):
+@pytest.mark.parametrize(
+    "url,hostname",
+    [
+        ("https://public.example", "public.example"),
+        ("https://bücher.example", "xn--bcher-kva.example"),
+        ("https://faß.example", "xn--fa-hia.example"),
+    ],
+)
+async def test_proxy_rebinding_denial_is_terminal(
+    monkeypatch, connect_error, url, hostname
+):
     monkeypatch.setattr(
         "xagent.core.tools.core.RAG_tools.web_crawler.crawler.validate_public_http_url",
         AsyncMock(return_value=["93.184.216.34"]),
@@ -200,7 +210,7 @@ async def test_proxy_rebinding_denial_is_terminal(monkeypatch, connect_error):
     crawler._egress_proxy = PublicNetworkEgressProxy()
 
     async def denied(*args, **kwargs):
-        crawler._egress_proxy.denied_hosts.add("public.example")
+        crawler._egress_proxy.denied_hosts.add(hostname)
         if connect_error:
             raise httpx.ProxyError("403")
         return httpx.Response(403)
@@ -208,9 +218,8 @@ async def test_proxy_rebinding_denial_is_terminal(monkeypatch, connect_error):
     first, backup = AsyncMock(), AsyncMock()
     first.get.side_effect = denied
     with pytest.raises(PublicNetworkPolicyError):
-        await crawler._fetch_with_fallback(
-            {None: first, "backup": backup}, "https://public.example"
-        )
+        await crawler._fetch_with_fallback({None: first, "backup": backup}, url)
+    first.get.assert_awaited_once_with(f"https://{hostname}", follow_redirects=False)
     backup.get.assert_not_awaited()
 
 
@@ -286,6 +295,104 @@ async def test_complete_chunked_response_does_not_wait_for_extra_terminator():
     client = MagicMock(drain=AsyncMock())
     await proxy._relay_response(remote, client)
     assert b"".join(call.args[0] for call in client.write.call_args_list).endswith(body)
+
+
+@pytest.mark.parametrize(
+    "method,status", [("HEAD", 200), ("GET", 304), ("GET", 204), ("GET", 200)]
+)
+@pytest.mark.parametrize(
+    "informational",
+    [b"", b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"],
+)
+async def test_bodyless_response_finishes_without_waiting_for_origin_eof(
+    monkeypatch, method, status, informational
+):
+    proxy = PublicNetworkEgressProxy()
+    remote = asyncio.StreamReader()
+    body = b"ok" if method == "GET" and status == 200 else b""
+    length = 2 if body else 42
+    remote.feed_data(
+        informational
+        + f"HTTP/1.1 {status} OK\r\nContent-Length: {length}\r\n\r\n".encode()
+        + body
+    )
+    writer = MagicMock(drain=AsyncMock())
+    remote_writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+    monkeypatch.setattr(proxy, "_resolve", AsyncMock(return_value=["93.184.216.34"]))
+    monkeypatch.setattr(
+        proxy, "_open_validated", AsyncMock(return_value=(remote, remote_writer))
+    )
+    await asyncio.wait_for(
+        proxy._handle_forward(
+            asyncio.StreamReader(),
+            writer,
+            method,
+            "http://public.example/",
+            "HTTP/1.1",
+            {},
+        ),
+        0.1,
+    )
+    output = b"".join(call.args[0] for call in writer.write.call_args_list)
+    assert output.startswith(informational + f"HTTP/1.1 {status} OK\r\n".encode())
+    assert output.endswith(b"\r\n\r\n" + body)
+
+
+async def test_proxy_stops_accepting_before_cancelling_active_clients(monkeypatch):
+    proxy = PublicNetworkEgressProxy()
+    original_handler = proxy._handle_client
+    accepted, cancelled = asyncio.Event(), []
+
+    async def handle(reader, writer):
+        accepted.set()
+        try:
+            await original_handler(reader, writer)
+        finally:
+            cancelled.append(proxy._server is not None and proxy._server.is_serving())
+
+    monkeypatch.setattr(proxy, "_handle_client", handle)
+    url = urlsplit(await proxy.start())
+    _, client = await asyncio.open_connection(url.hostname, url.port)
+    try:
+        await asyncio.wait_for(accepted.wait(), 1)
+        await proxy.close()
+        assert cancelled == [False]
+        assert not proxy._client_tasks
+    finally:
+        client.close()
+        await client.wait_closed()
+        await proxy.close()
+
+
+async def test_late_proxy_handler_does_not_read_after_close():
+    proxy = PublicNetworkEgressProxy()
+    await proxy.close()
+    reader = AsyncMock()
+    writer = MagicMock(drain=AsyncMock(), wait_closed=AsyncMock())
+    await proxy._handle_client(reader, writer)
+    reader.readuntil.assert_not_awaited()
+    writer.write.assert_not_called()
+    writer.close.assert_called_once()
+
+
+async def test_origin_reason_phrase_cannot_masquerade_as_local_policy(monkeypatch):
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.web_crawler.crawler.validate_public_http_url",
+        AsyncMock(return_value=["93.184.216.34"]),
+    )
+    crawler = WebCrawler(WebCrawlConfig(start_url="https://public.example"))
+    crawler._tls_chain = (None, "backup")
+    crawler._egress_proxy = PublicNetworkEgressProxy()
+    first, backup = AsyncMock(), AsyncMock()
+    first.get.return_value = httpx.Response(
+        403, extensions={"reason_phrase": b"Public Network Policy Denied"}
+    )
+    backup.get.return_value = httpx.Response(404)
+    result = await crawler._fetch_with_fallback(
+        {None: first, "backup": backup}, "https://public.example"
+    )
+    assert result.response.status_code == 404
+    backup.get.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

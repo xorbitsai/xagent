@@ -559,7 +559,7 @@ class WebCrawler:
         """
         self.start_time = time.time()
         # Fail before robots loading or session creation for an invalid target.
-        await validate_public_http_url(self.config.start_url)
+        await validate_public_http_url(str(httpx.URL(self.config.start_url)))
 
         # Add start URL to pending
         start_url_normalized = self.url_filter.normalize_url(self.config.start_url)
@@ -852,6 +852,9 @@ class WebCrawler:
         """Validate each redirect before dispatch; the proxy also pins its DNS."""
         for hop in range(6):
             try:
+                # Use the same IDNA/URL spelling for validation, both clients,
+                # and proxy refusal tracking (not Unicode vs wire punycode).
+                url = str(httpx.URL(url))
                 await validate_public_http_url(url)
             except ValueError as exc:
                 raise PublicNetworkPolicyError(str(exc)) from exc
@@ -862,30 +865,10 @@ class WebCrawler:
             )
             try:
                 response = await sess.get(url, **kwargs)
-            except Exception as exc:
-                if (
-                    self._egress_proxy
-                    and urlsplit(url).hostname in self._egress_proxy.denied_hosts
-                ):
-                    raise PublicNetworkPolicyError(
-                        "Public-network egress policy denied a target"
-                    ) from exc
+            except Exception:
+                self._check_egress_policy(url)
                 raise
-            if (
-                self._egress_proxy
-                and urlsplit(url).hostname in self._egress_proxy.denied_hosts
-            ):
-                raise PublicNetworkPolicyError(
-                    "Public-network egress policy denied a target"
-                )
-            if (
-                response.status_code == 403
-                and getattr(response, "reason_phrase", "")
-                == "Public Network Policy Denied"
-            ):
-                raise PublicNetworkPolicyError(
-                    "Public-network egress policy denied a target"
-                )
+            self._check_egress_policy(url)
             if response.status_code not in {301, 302, 303, 307, 308}:
                 return response
             location = response.headers.get("location")
@@ -895,6 +878,17 @@ class WebCrawler:
                 raise ValueError("Crawler exceeded redirect limit")
             url = urljoin(url, location)
         raise AssertionError("unreachable")
+
+    def _check_egress_policy(self, url: str) -> None:
+        # Only our local proxy's state is authoritative. An origin can choose
+        # any HTTP status/reason, including the proxy's policy-denial text.
+        if (
+            self._egress_proxy
+            and urlsplit(url).hostname in self._egress_proxy.denied_hosts
+        ):
+            raise PublicNetworkPolicyError(
+                "Public-network egress policy denied a target"
+            )
 
     async def _crawl_loop(self, sessions: Dict[Optional[str], Any]) -> None:
         """Main crawl loop with concurrency control.

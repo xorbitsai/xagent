@@ -292,6 +292,25 @@ class TestRobotsTxtAvailability:
         f = self._filter_with_robots_response(monkeypatch, _FakeResponse(429))
         assert f.should_crawl("https://example.com/docs/intro") is False
 
+    @pytest.mark.parametrize("first_status", [200, 404])
+    def test_reloading_robots_discards_previous_allow_on_failure(
+        self, monkeypatch, first_status
+    ):
+        f = self._filter_with_robots_response(monkeypatch, _FakeResponse(first_status))
+        assert f.is_allowed("https://example.com/docs")
+        self.get.side_effect = httpx.ConnectError("offline")
+        f.load_robots_txt("http://test-egress.invalid")
+        assert not f.is_allowed("https://example.com/docs")
+
+    def test_reloading_after_missing_robots_can_apply_new_disallow(self, monkeypatch):
+        f = self._filter_with_robots_response(monkeypatch, _FakeResponse(404))
+        self.get.side_effect = lambda *args, **kwargs: _FakeResponse(
+            200, "User-agent: *\nDisallow: /private\n"
+        )
+        f.load_robots_txt("http://test-egress.invalid")
+        assert not f.is_allowed("https://example.com/private")
+        assert f.is_allowed("https://example.com/public")
+
     def test_fetch_is_bounded_in_time(self, monkeypatch):
         """timeout is per-request, so it and the redirect limit together are
         what bound the total wait."""

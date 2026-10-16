@@ -86,8 +86,11 @@ class URLFilter:
         complete disallow)."""
         import httpx
 
-        if not self.robots_parser or not self.robots_url:
+        if not self.robots_url:
             return
+        # Reloads must not retain old allow rules or a previous 404's None
+        # parser while the latest rules are unavailable.
+        self.robots_parser = RobotFileParser(self.robots_url)
 
         try:
             # follow_redirects is required, not incidental: httpx defaults to

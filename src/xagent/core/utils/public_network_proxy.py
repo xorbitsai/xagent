@@ -37,6 +37,7 @@ class PublicNetworkEgressProxy:
         upstream_proxy_url: str | None = None,
     ) -> None:
         self._server: asyncio.AbstractServer | None = None
+        self._closing = False
         self._client_tasks: set[asyncio.Task[Any]] = set()
         self._responses_started: set[asyncio.StreamWriter] = set()
         self.denied_hosts: set[str] = set()
@@ -62,6 +63,9 @@ class PublicNetworkEgressProxy:
             raise PublicNetworkPolicyError(str(exc)) from exc
 
     async def start(self) -> str:
+        if self._server is not None:
+            raise RuntimeError("Egress proxy is already started")
+        self._closing = False
         self._server = await asyncio.start_server(
             self._handle_client,
             host="127.0.0.1",
@@ -73,6 +77,13 @@ class PublicNetworkEgressProxy:
         return f"http://127.0.0.1:{port}"
 
     async def close(self) -> None:
+        self._closing = True
+        # Stop accepting before taking the task snapshot. A callback already
+        # queued by the event loop must also see _closing and exit without I/O.
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+            self._server = None
         tasks = list(self._client_tasks)
         for task in tasks:
             if not task.done():
@@ -80,10 +91,6 @@ class PublicNetworkEgressProxy:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._client_tasks.clear()
-        if self._server is not None:
-            self._server.close()
-            await self._server.wait_closed()
-            self._server = None
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -92,6 +99,8 @@ class PublicNetworkEgressProxy:
         if task is not None:
             self._client_tasks.add(task)
         try:
+            if self._closing:
+                return
             header = await asyncio.wait_for(
                 reader.readuntil(b"\r\n\r\n"), self.connect_timeout
             )
@@ -121,8 +130,9 @@ class PublicNetworkEgressProxy:
                 await writer.wait_closed()
             except Exception:
                 pass
-            if task is not None:
-                self._client_tasks.discard(task)
+            finally:
+                if task is not None:
+                    self._client_tasks.discard(task)
 
     @staticmethod
     def _parse_request(
@@ -239,7 +249,7 @@ class PublicNetworkEgressProxy:
                 # Do not bridge client_reader here. Once this request has been
                 # sent, any additional bytes on a client's keep-alive socket
                 # must never reach this origin's upstream connection.
-                await self._relay_response(remote_reader, writer)
+                await self._relay_response(remote_reader, writer, method=method)
         finally:
             remote_writer.close()
             try:
@@ -301,12 +311,25 @@ class PublicNetworkEgressProxy:
             raise ValueError("proxy request body ended early") from exc
 
     async def _relay_response(
-        self, remote_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter
+        self,
+        remote_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        *,
+        method: str = "GET",
     ) -> None:
-        header = await asyncio.wait_for(
-            remote_reader.readuntil(b"\r\n\r\n"), self.response_timeout
-        )
-        lines = header[:-4].split(b"\r\n")
+        while True:
+            header = await asyncio.wait_for(
+                remote_reader.readuntil(b"\r\n\r\n"), self.response_timeout
+            )
+            lines = header[:-4].split(b"\r\n")
+            status = int(lines[0].split(b" ", 2)[1])
+            if not 100 <= status < 200 or status == 101:
+                break
+            # Early Hints/Continue precede, rather than replace, the final
+            # response. Do not apply HEAD/304 body rules until that arrives.
+            self._responses_started.add(client_writer)
+            client_writer.write(header)
+            await client_writer.drain()
         response_headers: list[bytes] = []
         content_length: int | None = None
         chunked = False
@@ -329,6 +352,11 @@ class PublicNetworkEgressProxy:
         self._responses_started.add(client_writer)
         client_writer.write(b"\r\n".join([lines[0], *response_headers, b"", b""]))
         await client_writer.drain()
+
+        # Content-Length on HEAD/304 describes the selected representation,
+        # not bytes on this connection. 204 likewise never carries a body.
+        if method.upper() == "HEAD" or status in {204, 304}:
+            return
 
         if content_length is not None:
             remaining = content_length

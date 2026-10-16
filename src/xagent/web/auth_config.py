@@ -29,7 +29,7 @@ def _is_insecure_secret(value: str) -> bool:
 
 
 def validate_auth_config() -> None:
-    """Fail production startup when the JWT signing secret is not configured."""
+    """Validate deployed signing, session and encryption keys at startup."""
     environment = get_environment()
     requires_secure_secret = environment != "development"
     requires_secure_secret = requires_secure_secret or get_require_secure_secrets()

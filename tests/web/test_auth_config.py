@@ -28,7 +28,7 @@ def test_startup_rejects_missing_or_invalid_encryption_key(monkeypatch, value):
         monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
     else:
         monkeypatch.setenv("ENCRYPTION_KEY", value)
-    with pytest.raises(RuntimeError, match="ENCRYPTION_KEY"):
+    with pytest.raises(RuntimeError, match="^ENCRYPTION_KEY must"):
         auth_config.validate_auth_config()
 
 

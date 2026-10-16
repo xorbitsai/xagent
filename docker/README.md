@@ -59,6 +59,12 @@ tags are bumped to a release containing the worker-pool default. To run that
 image as a local single-process backend instead, set `XAGENT_WORKER_COUNT=` and
 `XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` in `.env`.
 
+Production also requires a separate tool-credential key. The image persists it
+in `xagent_secrets/tool-credentials.secret` unless an explicit
+`XAGENT_SECRET_ENCRYPTION_KEY` or legacy `SECRET_KEY` is supplied. Existing
+default/short-key deployments must follow the offline
+[key upgrade procedure](../docs/tool-credential-key-upgrade.md) before restart.
+
 Optional Gmail incoming-email trigger provisioning:
 
 ```bash

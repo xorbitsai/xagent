@@ -2194,22 +2194,35 @@ def get_require_secure_secrets() -> bool:
     return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
 
 
+TOOL_CREDENTIALS_ENCRYPTION_KEY = "XAGENT_SECRET_ENCRYPTION_KEY"
+LEGACY_TOOL_CREDENTIALS_KEY_ALIAS = "SECRET_KEY"
+TOOL_CREDENTIALS_MIGRATION_KEY = "XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY"
+DEV_TOOL_CREDENTIALS_KEY = "xagent-dev-key"
+
+
+def requires_secure_secrets() -> bool:
+    return get_environment() != "development" or get_require_secure_secrets()
+
+
 def get_tool_credentials_encryption_key() -> str:
     """Keep the historical key derivation while refusing deployed defaults."""
-    raw = os.getenv("XAGENT_SECRET_ENCRYPTION_KEY") or os.getenv("SECRET_KEY")
-    requires_secure = get_environment() != "development" or get_require_secure_secrets()
-    if requires_secure and (
-        not raw or len(raw.strip()) < 32 or raw.strip().lower() == "xagent-dev-key"
-    ):
-        raise RuntimeError(
-            "XAGENT_SECRET_ENCRYPTION_KEY must contain at least 32 secret characters"
-        )
-    return raw or "xagent-dev-key"
+    setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+    raw = os.getenv(setting)
+    if not raw or not raw.strip():
+        setting = LEGACY_TOOL_CREDENTIALS_KEY_ALIAS
+        raw = os.getenv(setting)
+    if requires_secure_secrets() and (not raw or len(raw.strip()) < 32):
+        if not raw or not raw.strip():
+            setting = TOOL_CREDENTIALS_ENCRYPTION_KEY
+        raise RuntimeError(f"{setting} must contain at least 32 secret characters")
+    # Preserve historical derivation for explicitly configured keys, including
+    # surrounding whitespace; only blank values are ignored when selecting.
+    return raw if raw and raw.strip() else DEV_TOOL_CREDENTIALS_KEY
 
 
 def validate_encryption_config() -> None:
     """Reject missing, public or malformed encryption keys before admission."""
-    if get_environment() == "development" and not get_require_secure_secrets():
+    if not requires_secure_secrets():
         return
     from cryptography.fernet import Fernet
 

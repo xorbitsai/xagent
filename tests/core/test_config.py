@@ -4073,7 +4073,8 @@ def test_tool_key_alias_and_boundary(monkeypatch, setting, length, valid):
 
 @pytest.mark.parametrize("setting", ["XAGENT_SECRET_ENCRYPTION_KEY", "SECRET_KEY"])
 @pytest.mark.parametrize(
-    "value", [value for value in config.KNOWN_INSECURE_SECRETS if len(value) >= 32]
+    "value",
+    sorted(value for value in config.KNOWN_INSECURE_SECRETS if len(value) >= 32),
 )
 def test_tool_key_rejects_known_public_values_including_alias(
     monkeypatch, setting, value

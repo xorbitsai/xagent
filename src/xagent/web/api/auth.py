@@ -111,7 +111,10 @@ from ..services.auth_attempts import (
     reserve_local_attempts,
     reserve_shared_attempts,
 )
-from ..services.auth_email import send_password_reset_email
+from ..services.auth_email import (
+    send_email_change_confirmation,
+    send_password_reset_email,
+)
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
 from ..services.oauth_state_claims import claim_oauth_state
 from ..services.trigger_rate_limit import remote_ip_from_request
@@ -1563,6 +1566,11 @@ class UpdateEmailResponse(BaseModel):
     success: bool
     message: str
     user: Optional[Dict[str, Any]] = None
+    pending_confirmation: bool = False
+
+
+class ConfirmEmailRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=128)
 
 
 # The 5 voice options the onboarding "Launch" step offers - each agent's
@@ -2369,6 +2377,9 @@ async def reset_password(
                 User.refresh_token: None,
                 User.refresh_token_expires_at: None,
                 User.session_epoch: new_session_epoch(),
+                User.pending_email: None,
+                User.email_confirmation_hash: None,
+                User.email_confirmation_expires_at: None,
             },
             synchronize_session=False,
         )
@@ -2420,6 +2431,9 @@ async def change_password(
                     User.password_reset_token_hash: None,
                     User.password_reset_expires_at: None,
                     User.session_epoch: new_session_epoch(),
+                    User.pending_email: None,
+                    User.email_confirmation_hash: None,
+                    User.email_confirmation_expires_at: None,
                 },
                 synchronize_session=False,
             )
@@ -2465,6 +2479,11 @@ async def update_current_user_email(
     user: User = Depends(get_current_user),
 ) -> UpdateEmailResponse:
     has_password = not str(user.password_hash).startswith("!")
+    if not has_password:
+        return UpdateEmailResponse(
+            success=False,
+            message="Manage your email through your sign-in provider",
+        )
     if has_password and not request.current_password:
         return UpdateEmailResponse(
             success=False, message="Current password is required"
@@ -2490,14 +2509,124 @@ async def update_current_user_email(
     if email_namespace_error:
         return UpdateEmailResponse(success=False, message=email_namespace_error)
 
-    setattr(user, "email", email)
-    # Email is an account-recovery identifier; changing it revokes the
-    # current refresh session so a stolen token cannot survive the change.
-    setattr(user, "refresh_token", None)
-    setattr(user, "refresh_token_expires_at", None)
+    token = secrets.token_urlsafe(32)
+    token_hash = hash_password_reset_token(token)
+    user_id = int(user.id)
+    changed = (
+        db.query(User)
+        .filter(
+            User.id == user_id,
+            User.password_hash == str(user.password_hash),
+            User.session_epoch == user.session_epoch,
+        )
+        .update(
+            {
+                User.pending_email: email,
+                User.email_confirmation_hash: token_hash,
+                User.email_confirmation_expires_at: datetime.now(timezone.utc)
+                + timedelta(minutes=15),
+            },
+            synchronize_session=False,
+        )
+    )
+    if changed != 1:
+        db.rollback()
+        return UpdateEmailResponse(success=False, message="Please sign in again")
     db.commit()
+    try:
+        await asyncio.to_thread(
+            send_email_change_confirmation, email, token, get_app_name()
+        )
+    except Exception:
+        db.query(User).filter(
+            User.id == user_id,
+            User.email_confirmation_hash == token_hash,
+        ).update(
+            {
+                User.pending_email: None,
+                User.email_confirmation_hash: None,
+                User.email_confirmation_expires_at: None,
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+        logger.error("Unable to deliver email-change confirmation for user %s", user_id)
+        return UpdateEmailResponse(
+            success=False, message="Unable to send confirmation email; try again later"
+        )
     db.refresh(user)
+    return UpdateEmailResponse(
+        success=True,
+        pending_confirmation=True,
+        message="Enter the confirmation code sent to your new email address",
+        user=serialize_auth_user(user),
+    )
 
+
+@auth_router.post("/email/confirm", response_model=UpdateEmailResponse)
+async def confirm_current_user_email(
+    request: ConfirmEmailRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdateEmailResponse:
+    token_hash = hash_password_reset_token(request.token.strip())
+    now = datetime.now(timezone.utc)
+    candidate = (
+        db.query(User)
+        .filter(
+            User.id == user.id,
+            User.email_confirmation_hash == token_hash,
+            User.email_confirmation_expires_at > now,
+        )
+        .populate_existing()
+        .first()
+    )
+    if candidate is None or not candidate.pending_email:
+        return UpdateEmailResponse(
+            success=False, message="Invalid or expired confirmation code"
+        )
+    email = str(candidate.pending_email)
+    conflict = get_user_by_email(db, email)
+    if (
+        conflict is not None and conflict.id != user.id
+    ) or validate_email_for_login_namespace(db, email, current_user_id=int(user.id)):
+        return UpdateEmailResponse(
+            success=False, message="Email address is no longer available"
+        )
+    try:
+        changed = (
+            db.query(User)
+            .filter(
+                User.id == user.id,
+                User.email_confirmation_hash == token_hash,
+                User.email_confirmation_expires_at > now,
+            )
+            .update(
+                {
+                    User.email: email,
+                    User.pending_email: None,
+                    User.email_confirmation_hash: None,
+                    User.email_confirmation_expires_at: None,
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            db.rollback()
+            return UpdateEmailResponse(
+                success=False, message="Invalid or expired confirmation code"
+            )
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        return UpdateEmailResponse(
+            success=False, message="Email address is no longer available"
+        )
+    db.refresh(user)
     return UpdateEmailResponse(
         success=True,
         message="Email updated successfully",

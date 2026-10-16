@@ -23,6 +23,38 @@ def get_password_reset_email_subject(app_name: str) -> str:
 
 
 def send_password_reset_email(to_email: str, reset_link: str, app_name: str) -> None:
+    message = EmailMessage()
+    message["Subject"] = get_password_reset_email_subject(app_name)
+    message["To"] = to_email
+    message.set_content(
+        "\n".join(
+            [
+                f"You requested a password reset for {app_name}.",
+                "",
+                "Open the link below to set a new password:",
+                reset_link,
+                "",
+                f"This link expires in {get_password_reset_expire_minutes()} minutes.",
+                "If you did not request this, you can ignore this email.",
+            ]
+        )
+    )
+    _send_auth_message(message, app_name)
+
+
+def send_email_change_confirmation(to_email: str, token: str, app_name: str) -> None:
+    message = EmailMessage()
+    message["Subject"] = f"Confirm your {app_name} email address"
+    message["To"] = to_email
+    message.set_content(
+        f"Enter this confirmation code in {app_name} Settings:\n\n{token}\n\n"
+        "This code expires in 15 minutes. Your email address will not change "
+        "until you confirm. If you did not request this, ignore this email."
+    )
+    _send_auth_message(message, app_name)
+
+
+def _send_auth_message(message: EmailMessage, app_name: str) -> None:
     smtp_host = get_smtp_host()
     smtp_port = get_smtp_port()
     smtp_username = get_smtp_username()
@@ -35,26 +67,7 @@ def send_password_reset_email(to_email: str, reset_link: str, app_name: str) -> 
     if not smtp_host or not from_email:
         raise RuntimeError("SMTP is not configured for password reset emails")
 
-    message = EmailMessage()
-    message["Subject"] = get_password_reset_email_subject(app_name)
     message["From"] = f"{from_name} <{from_email}>"
-    message["To"] = to_email
-    message.set_content(
-        "\n".join(
-            [
-                f"You requested a password reset for {app_name}.",
-                "",
-                "Open the link below to set a new password:",
-                reset_link,
-                "",
-                (
-                    "This link expires in "
-                    f"{get_password_reset_expire_minutes()} minutes."
-                ),
-                "If you did not request this, you can ignore this email.",
-            ]
-        )
-    )
 
     smtp_client_cls = smtplib.SMTP_SSL if smtp_use_ssl else smtplib.SMTP
     with smtp_client_cls(smtp_host, smtp_port, timeout=10) as server:

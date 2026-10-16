@@ -26,6 +26,7 @@ export default function SettingsPage() {
   const { t, locale, setLocale } = useI18n()
   const [email, setEmail] = useState(user?.email || "")
   const [emailCurrentPassword, setEmailCurrentPassword] = useState("")
+  const [emailConfirmationToken, setEmailConfirmationToken] = useState("")
   const [isProfileLoading, setIsProfileLoading] = useState(true)
   const [isSavingEmail, setIsSavingEmail] = useState(false)
   const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -172,12 +173,30 @@ export default function SettingsPage() {
             )}
 
             <Button
-              onClick={handleEmailUpdate}
+              onClick={() => void handleEmailUpdate()}
               disabled={isProfileLoading || isSavingEmail || !email.trim() || (hasPassword && !emailCurrentPassword)}
               className="w-full"
             >
               {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
             </Button>
+            <div className="space-y-2">
+              <Label htmlFor="email-confirmation-code">{t("settings.email.confirmationCode")}</Label>
+              <Input
+                id="email-confirmation-code"
+                value={emailConfirmationToken}
+                onChange={(event) => setEmailConfirmationToken(event.target.value)}
+                autoComplete="one-time-code"
+                disabled={isProfileLoading || isSavingEmail}
+              />
+              <p className="text-sm text-muted-foreground">{t("settings.email.confirmationHint")}</p>
+              <Button
+                onClick={() => void handleEmailUpdate(true)}
+                disabled={isProfileLoading || isSavingEmail || !emailConfirmationToken.trim()}
+                className="w-full"
+              >
+                {t("settings.email.confirm")}
+              </Button>
+            </div>
           </CardContent>
         </Card>
 
@@ -310,8 +329,8 @@ export default function SettingsPage() {
     }
   }
 
-  async function handleEmailUpdate() {
-    if (!email.trim()) {
+  async function handleEmailUpdate(confirm = false) {
+    if (!confirm && !email.trim()) {
       setEmailMessage({ type: 'error', text: t("settings.email.errors.required") })
       return
     }
@@ -321,12 +340,12 @@ export default function SettingsPage() {
 
     try {
       const capturedSession = session
-      const response = await apiRequest(`${getApiUrl()}/api/auth/email`, {
-        method: 'PATCH',
+      const response = await apiRequest(`${getApiUrl()}/api/auth/email${confirm ? "/confirm" : ""}`, {
+        method: confirm ? 'POST' : 'PATCH',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(confirm ? { token: emailConfirmationToken.trim() } : {
           email,
           ...(hasPassword ? { current_password: emailCurrentPassword } : {}),
         })
@@ -335,11 +354,18 @@ export default function SettingsPage() {
       const data = await response.json()
 
       if (response.ok && data.success) {
+        if (data.pending_confirmation) {
+          setEmailCurrentPassword('')
+          setEmailConfirmationToken('')
+          setEmailMessage({ type: 'success', text: t("settings.email.confirmationSent") })
+          return
+        }
         const nextEmail = data.user?.email || ""
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
           setEmailCurrentPassword('')
+          setEmailConfirmationToken('')
           setEmailMessage({ type: 'success', text: t("settings.email.success") })
         } else if (updated.status === "advanced") {
           applyCanonicalEmail()

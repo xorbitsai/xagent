@@ -45,6 +45,9 @@ class User(Base):  # type: ignore
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Changing the generation invalidates all previous user access credentials.
     session_epoch = Column(String(32), nullable=True)
+    pending_email = Column(String(255), nullable=True)
+    email_confirmation_hash = Column(String(64), nullable=True)
+    email_confirmation_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Onboarding-collected settings: {onboarded, department, industry, voice,
     # goals}. Written incrementally (one PATCH per onboarding step merges
     # into this dict, not replaces it) - see update_current_user_preferences

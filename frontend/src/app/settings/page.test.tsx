@@ -136,6 +136,31 @@ describe("SettingsPage auth profile synchronization", () => {
     expect(screen.getByDisplayValue("old@example.com")).toBeInTheDocument()
   })
 
+  it("keeps the recovery address unchanged until the emailed code is confirmed", async () => {
+    apiRequest
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: authState.user })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, pending_confirmation: true, user: authState.user })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: { ...authState.user, email: "new@example.com" } })))
+    const view = render(<SettingsPage />)
+    const input = screen.getByLabelText("settings.email.current")
+    await waitFor(() => expect(input).not.toBeDisabled())
+    const loaded = inspectAuthSession()
+    if (loaded.status !== "valid") throw new Error("expected loaded profile")
+    authState.session = loaded.projection.snapshot
+    view.rerender(<SettingsPage />)
+    fireEvent.change(input, { target: { value: "new@example.com" } })
+    fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#email-current-password" }), { target: { value: "current-password" } })
+    fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
+    await screen.findByText("settings.email.confirmationSent")
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "old@example.com" } } } })
+    fireEvent.change(screen.getByLabelText("settings.email.confirmationCode"), { target: { value: "confirmation-secret" } })
+    fireEvent.click(screen.getByRole("button", { name: "settings.email.confirm" }))
+    await screen.findByText("settings.email.success")
+    expect(apiRequest.mock.calls[2][0]).toMatch(/\/api\/auth\/email\/confirm$/)
+    expect(JSON.parse(apiRequest.mock.calls[2][1].body)).toEqual({ token: "confirmation-secret" })
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "new@example.com" } } } })
+  })
+
   it("retains the username label for an email-less account", async () => {
     authState.user = { id: "1", username: "legacy-admin", email: null }
     const replacement = await createSession({

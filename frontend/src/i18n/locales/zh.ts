@@ -472,6 +472,10 @@ const zh = {
       submit: "更新邮箱",
       submitting: "更新中...",
       success: "邮箱更新成功",
+      confirmationCode: "确认码",
+      confirmationHint: "请在 15 分钟内输入发送到新邮箱的确认码。",
+      confirmationSent: "确认邮件已发送，完成确认前仍使用原邮箱。",
+      confirm: "确认新邮箱",
       failed: "邮箱更新失败",
       errors: {
         required: "请输入邮箱地址",

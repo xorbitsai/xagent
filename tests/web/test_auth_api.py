@@ -1382,7 +1382,13 @@ class TestAuthAPI:
 
         mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
-    def test_update_current_user_email(self, test_db, test_user_data):
+    def test_update_current_user_email(self, test_db, test_user_data, monkeypatch):
+        sent = {}
+        monkeypatch.setattr(
+            auth_api,
+            "send_email_change_confirmation",
+            lambda email, token, app: sent.update(token=token),
+        )
         setup_first_admin()
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200
@@ -1401,7 +1407,15 @@ class TestAuthAPI:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["user"]["email"] == "updated@example.com"
+        assert data["pending_confirmation"] is True
+        assert data["user"]["email"] == test_user_data["email"]
+        confirmed = client.post(
+            "/api/auth/email/confirm",
+            json={"token": sent["token"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert confirmed.json()["success"] is True
+        assert confirmed.json()["user"]["email"] == "updated@example.com"
 
     def test_logout_revokes_the_refresh_token_supplied_by_the_client(
         self, test_db, test_user_data
@@ -1431,7 +1445,7 @@ class TestAuthAPI:
         )
         assert refresh.status_code == 401
 
-    def test_oidc_user_email_update_does_not_require_local_password(self, test_db):
+    def test_oidc_user_email_update_requires_provider_reauthentication(self, test_db):
         db = TestingSessionLocal()
         try:
             user = User(
@@ -1451,10 +1465,8 @@ class TestAuthAPI:
                 )
             )
 
-            assert result.success is True
-            assert result.user is not None
-            assert result.user["email"] == "new@example.com"
-            assert result.user["has_password"] is False
+            assert result.success is False
+            assert user.email == "oidc@example.com"
         finally:
             db.close()
 

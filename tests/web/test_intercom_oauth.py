@@ -386,7 +386,12 @@ def test_hidden_intercom_app_rejects_oauth_login_redirect(hidden_db_session):
     connecting at the provider)."""
     db, user = hidden_db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 

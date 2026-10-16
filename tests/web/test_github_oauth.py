@@ -289,7 +289,12 @@ def test_bare_github_login_does_not_disturb_an_existing_scoped_connection(
     # Now attempt the bare login route a malicious/confused re-connect
     # attempt would use.
     login_token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
     login_response = generic_oauth_login(

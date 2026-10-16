@@ -124,7 +124,12 @@ def test_scope_separator_joins_linear_scopes_with_commas():
 def test_login_sends_comma_separated_scope_param(db_session):
     db, user = db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 
@@ -144,7 +149,12 @@ def test_login_forces_consent_prompt(db_session):
     silently leave the user on the earlier, narrower grant."""
     db, user = db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 

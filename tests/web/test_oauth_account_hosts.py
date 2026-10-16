@@ -290,7 +290,12 @@ def _db_provider(provider_name: str = FAKE_PROVIDER) -> SimpleNamespace:
 
 def _token_for(user: User) -> str:
     return create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 
@@ -312,6 +317,38 @@ def _state_payload(response) -> dict:
     payload = verify_token(state)
     assert payload is not None
     return payload
+
+
+@pytest.mark.parametrize(
+    "credential", ["current", "missing-id", "wrong-id", "stale-epoch"]
+)
+def test_oauth_login_requires_current_user_bound_credentials(oauth_db, credential):
+    db, user = oauth_db
+    user.session_epoch = "current-generation"
+    db.commit()
+    claims = {
+        "sub": user.username,
+        "user_id": user.id,
+        "session_epoch": user.session_epoch,
+    }
+    if credential == "missing-id":
+        claims.pop("user_id")
+    elif credential == "wrong-id":
+        claims["user_id"] = user.id + 1
+    elif credential == "stale-epoch":
+        claims["session_epoch"] = "revoked-generation"
+    response = generic_oauth_login(
+        FAKE_PROVIDER,
+        token=create_access_token(data=claims),
+        app_id=FAKE_APP_ID,
+        db=db,
+        db_provider=_db_provider(),
+        account="acme",
+    )
+    assert response.status_code == (307 if credential == "current" else 401)
+    if credential != "current":
+        assert "location" not in response.headers
+        assert "set-cookie" not in response.headers
 
 
 def test_login_redirects_to_the_account_authorize_endpoint(oauth_db):

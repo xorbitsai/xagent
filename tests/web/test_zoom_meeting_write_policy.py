@@ -184,7 +184,13 @@ def test_zoom_authorize_requests_write_scope_only_when_enabled(
 
     response = auth_api.generic_oauth_login(
         "zoom",
-        token=auth_api.create_access_token(data={"sub": user.username}),
+        token=auth_api.create_access_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "session_epoch": user.session_epoch,
+            }
+        ),
         app_id="zoom",
         db=db,
         db_provider=_zoom_provider(),

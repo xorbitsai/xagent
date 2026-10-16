@@ -98,7 +98,13 @@ def _login(db, user, app_id, flow, provider=None):
         )
     return auth_api.generic_oauth_login(
         "google",
-        token=auth_api.create_access_token(data={"sub": user.username}),
+        token=auth_api.create_access_token(
+            data={
+                "sub": user.username,
+                "user_id": user.id,
+                "session_epoch": user.session_epoch,
+            }
+        ),
         app_id=app_id,
         db=db,
         db_provider=provider,

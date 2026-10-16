@@ -86,7 +86,12 @@ def _jira_provider() -> SimpleNamespace:
 def test_login_sends_audience_and_prompt_consent(db_session):
     db, user = db_session
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 

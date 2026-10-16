@@ -700,7 +700,12 @@ def test_ordinary_oauth_flow_binds_state_to_cookie_and_provisions(
 ) -> None:
     db, user = oauth_db
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
     start = generic_oauth_login(
@@ -736,7 +741,12 @@ def test_concurrent_ordinary_oauth_flows_use_independent_browser_cookies(
     db, user = oauth_db
     _catalog_link(db, user)
     token = create_access_token(
-        data={"sub": user.username, "type": "access"},
+        data={
+            "sub": user.username,
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+            "type": "access",
+        },
         expires_delta=timedelta(minutes=5),
     )
 

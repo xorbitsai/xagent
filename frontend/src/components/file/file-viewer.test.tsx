@@ -25,6 +25,25 @@ describe("FileViewer HTML preview", () => {
     vi.clearAllMocks()
   })
 
+  it("isolates generated scripts from the application's origin and navigation", () => {
+    render(
+      <FileViewer
+        fileName="untrusted.html"
+        fileId="untrusted-file"
+        content={'<script>parent.localStorage.getItem("token")</script>'}
+        isLoading={false}
+        error={null}
+        viewMode="preview"
+      />,
+    )
+    const iframe = screen.getByTitle("untrusted.html")
+    expect(iframe).toHaveAttribute("sandbox", "allow-scripts")
+    expect(iframe).toHaveAttribute("referrerpolicy", "no-referrer")
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-same-origin")
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-top-navigation")
+    expect(iframe.getAttribute("sandbox")).not.toContain("allow-popups")
+  })
+
   it("rewrites file id image sources to public preview URLs", () => {
     render(
       <FileViewer

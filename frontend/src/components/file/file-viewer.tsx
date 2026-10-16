@@ -336,7 +336,11 @@ export function FileViewer({
           <iframe
             srcDoc={processHtmlContent(content || '', fileId)}
             className="w-full h-full border-0"
-            sandbox="allow-same-origin allow-scripts"
+            // An opaque origin lets generated scripts run without accessing
+            // the app's DOM, cookies or localStorage. Never pair this with
+            // allow-same-origin: srcDoc otherwise inherits the app's origin.
+            sandbox="allow-scripts"
+            referrerPolicy="no-referrer"
             title={fileName}
           />
         )

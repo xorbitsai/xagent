@@ -171,6 +171,7 @@ export function FileViewer({
   const audioMimeType = getAudioMimeType(fileName, mimeType, content)
   const base64Content = getBase64Payload(content)
   const [videoObjectUrl, setVideoObjectUrl] = React.useState<string | null>(null)
+  const [htmlPreviewContent, setHtmlPreviewContent] = React.useState("")
 
   React.useEffect(() => {
     if (!videoMimeType || !base64Content) {
@@ -205,10 +206,8 @@ export function FileViewer({
     }
   }, [base64Content, videoMimeType])
 
-  const processHtmlContent = (htmlContent: string, fileId: string) => {
-    if (!htmlContent || !fileId) return htmlContent
-
-    return htmlContent.replace(
+  const processHtmlContent = React.useCallback((htmlContent: string, fileId: string) => {
+    const rewritten = htmlContent.replace(
       /(src|href)=["']([^"']+)["']/g,
       (match, attr, path) => {
         if (path.match(/^(https?:\/|data:|\/\/|#)/)) return match
@@ -224,7 +223,24 @@ export function FileViewer({
         return `${attr}="${fileAccess.relativePreviewUrl(fileId, path)}"`
       }
     )
-  }
+    // srcDoc subresources do not inherit the iframe navigation's
+    // referrerPolicy. Set the document policy before any asset is parsed.
+    const document = new DOMParser().parseFromString(rewritten, "text/html")
+    document.querySelectorAll('meta[name="referrer" i]').forEach((meta) => meta.remove())
+    const policy = document.createElement("meta")
+    policy.name = "referrer"
+    policy.content = "no-referrer"
+    document.head.prepend(policy)
+    return `<!DOCTYPE html>\n${document.documentElement.outerHTML}`
+  }, [fileAccess])
+
+  React.useEffect(() => {
+    // DOMParser is browser-only. The initial SSR/client render stays blank;
+    // parse untrusted HTML only after mounting, before assigning srcDoc.
+    if (isHtmlFile(fileName) && viewMode === "preview") {
+      setHtmlPreviewContent(processHtmlContent(content || "", fileId))
+    }
+  }, [content, fileId, fileName, viewMode, processHtmlContent])
 
   if (isLoading) {
     return (
@@ -334,7 +350,7 @@ export function FileViewer({
           </pre>
         ) : (
           <iframe
-            srcDoc={processHtmlContent(content || '', fileId)}
+            srcDoc={htmlPreviewContent}
             className="w-full h-full border-0"
             // An opaque origin lets generated scripts run without accessing
             // the app's DOM, cookies or localStorage. Never pair this with

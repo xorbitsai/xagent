@@ -15,7 +15,7 @@ from redis.backoff import NoBackoff
 from redis.exceptions import RedisError
 from redis.retry import Retry
 
-from ...config import get_environment, get_redis_url, get_require_secure_secrets
+from ...config import get_redis_url, requires_secure_secrets
 
 # Check every bucket before charging any. Per-IP admission bounds key churn;
 # Redis expires buckets without an attacker-exhaustible global key index.
@@ -23,13 +23,15 @@ _RESERVE = """
 local t = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local window = tonumber(ARGV[1])
+local retry = 0
 for i, key in ipairs(KEYS) do
   redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
   if redis.call('ZCARD', key) >= tonumber(ARGV[i + 2]) then
     local first = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
-    return math.max(1, math.ceil((tonumber(first[2]) + window - now) / 1000))
+    retry = math.max(retry, 1, math.ceil((tonumber(first[2]) + window - now) / 1000))
   end
 end
+if retry > 0 then return retry end
 for _, key in ipairs(KEYS) do
   redis.call('ZADD', key, now, ARGV[2])
   redis.call('PEXPIRE', key, window)
@@ -38,8 +40,11 @@ return 0
 """
 
 
-def _requires_shared() -> bool:
-    return get_environment() != "development" or get_require_secure_secrets()
+def _storage_failure() -> None:
+    if requires_secure_secrets():
+        raise HTTPException(
+            503, "Authentication rate limiting is unavailable"
+        ) from None
 
 
 @lru_cache(maxsize=2)
@@ -56,14 +61,14 @@ def _backend() -> Redis | None:
     url = get_redis_url()
     if url:
         return _client(url)
-    if _requires_shared():
+    if requires_secure_secrets():
         raise HTTPException(503, "Authentication rate limiting is unavailable")
     return None
 
 
 def validate_auth_attempt_storage() -> None:
     """Fail production startup before serving a nonfunctional login API."""
-    if not _requires_shared():
+    if not requires_secure_secrets():
         return
     try:
         client = _backend()
@@ -82,7 +87,11 @@ def _key(namespace: str, key: str) -> str:
 
 
 def reserve_shared_attempts(
-    namespace: str, budgets: tuple[tuple[str, int], ...], *, window: int
+    namespace: str,
+    budgets: tuple[tuple[str, int], ...],
+    *,
+    window: int,
+    member: str | None = None,
 ) -> int | None:
     """Return retry seconds, zero on success, None for local development."""
     try:
@@ -96,24 +105,13 @@ def reserve_shared_attempts(
                 len(budgets),
                 *(_key(namespace, key) for key, _ in budgets),
                 str(window * 1000),
-                secrets.token_hex(16),
+                member or secrets.token_hex(16),
                 *(str(limit) for _, limit in budgets),
             ),
         )
     except (RedisError, ValueError):
-        if not _requires_shared():
-            return None
-        raise HTTPException(
-            503, "Authentication rate limiting is unavailable"
-        ) from None
-
-
-def reserve_shared_attempt(
-    namespace: str, key: str, *, limit: int, window: int, max_keys: int
-) -> bool | None:
-    """Compatibility wrapper; Redis no longer has a global key cap."""
-    retry = reserve_shared_attempts(namespace, ((key, limit),), window=window)
-    return None if retry is None else retry == 0
+        _storage_failure()
+        return None
 
 
 def clear_shared_attempt(namespace: str, key: str) -> bool:
@@ -123,18 +121,25 @@ def clear_shared_attempt(namespace: str, key: str) -> bool:
             return False
         client.delete(_key(namespace, key))
     except (RedisError, ValueError):
-        if not _requires_shared():
-            return False
-        raise HTTPException(
-            503, "Authentication rate limiting is unavailable"
-        ) from None
+        _storage_failure()
+        return False
     return True
+
+
+def refund_shared_attempt(namespace: str, key: str, member: str) -> None:
+    """Remove only this request's reservation, never another caller's failures."""
+    try:
+        client = _backend()
+        if client is not None:
+            client.zrem(_key(namespace, key), member)
+    except (RedisError, ValueError):
+        _storage_failure()
 
 
 @dataclass
 class AttemptBucket:
     limit: int
-    attempts: deque[float] = field(default_factory=deque)
+    attempts: deque[tuple[str, float]] = field(default_factory=deque)
 
 
 def reserve_local_attempts(
@@ -145,19 +150,25 @@ def reserve_local_attempts(
     window: int,
     max_keys: int,
     now: float | None = None,
+    member: str | None = None,
 ) -> int:
     """Atomic local admission; evict unlocked buckets, never active lockouts."""
     current = time.monotonic() if now is None else now
     with lock:
         for key, bucket in list(store.items()):
-            while bucket.attempts and bucket.attempts[0] <= current - window:
+            while bucket.attempts and bucket.attempts[0][1] <= current - window:
                 bucket.attempts.popleft()
             if not bucket.attempts:
                 store.pop(key)
+        retry = 0
         for key, limit in budgets:
             existing = store.get(key)
             if existing and len(existing.attempts) >= limit:
-                return max(1, math.ceil(existing.attempts[0] + window - current))
+                retry = max(
+                    retry, 1, math.ceil(existing.attempts[0][1] + window - current)
+                )
+        if retry:
+            return retry
         requested = {key for key, _ in budgets}
         missing = len(requested - store.keys())
         for key, bucket in list(store.items()):
@@ -169,6 +180,22 @@ def reserve_local_attempts(
             raise HTTPException(
                 503, "Authentication rate limit capacity is unavailable"
             )
+        reservation = member or secrets.token_hex(16)
         for key, limit in budgets:
-            store.setdefault(key, AttemptBucket(limit)).attempts.append(current)
+            store.setdefault(key, AttemptBucket(limit)).attempts.append(
+                (reservation, current)
+            )
         return 0
+
+
+def refund_local_attempt(
+    store: dict[str, AttemptBucket], lock: LockType, key: str, member: str
+) -> None:
+    with lock:
+        bucket = store.get(key)
+        if bucket:
+            bucket.attempts = deque(
+                item for item in bucket.attempts if item[0] != member
+            )
+            if not bucket.attempts:
+                store.pop(key)

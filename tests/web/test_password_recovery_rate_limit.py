@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -24,29 +25,29 @@ def _request(client_host="198.51.100.10"):
 
 
 def test_local_admission_expires_and_evicts_only_unlocked_buckets(monkeypatch):
-    monkeypatch.setattr(auth, "_LOGIN_FAILURE_MAX_KEYS", 2)
+    monkeypatch.setenv("XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS", "2")
     for _ in range(5):
-        assert auth._reserve_login_attempt("victim", now=1)
-    assert auth._reserve_login_attempt("unlocked", now=2)
-    assert auth._reserve_login_attempt("replacement", now=3)
+        assert auth._reserve_auth_budgets("login", (("victim", 5),), now=1) == 0
+    assert auth._reserve_auth_budgets("login", (("unlocked", 5),), now=2) == 0
+    assert auth._reserve_auth_budgets("login", (("replacement", 5),), now=3) == 0
     assert "unlocked" not in auth._login_failures
-    assert not auth._reserve_login_attempt("victim", now=4)
+    assert not (auth._reserve_auth_budgets("login", (("victim", 5),), now=4) == 0)
     assert len(auth._login_failures) == 2
-    assert auth._reserve_login_attempt("after-expiry", now=905)
+    assert auth._reserve_auth_budgets("login", (("after-expiry", 5),), now=905) == 0
     assert "victim" not in auth._login_failures
 
 
 def test_recovery_evicts_unlocked_buckets(monkeypatch):
-    monkeypatch.setattr(auth, "_PASSWORD_RECOVERY_MAX_KEYS", 2)
-    assert auth._reserve_password_recovery_attempt("a", now=1)
-    assert auth._reserve_password_recovery_attempt("b", now=2)
-    assert auth._reserve_password_recovery_attempt("c", now=3)
+    monkeypatch.setenv("XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS", "2")
+    assert auth._reserve_auth_budgets("recovery", (("a", 5),), now=1) == 0
+    assert auth._reserve_auth_budgets("recovery", (("b", 5),), now=2) == 0
+    assert auth._reserve_auth_budgets("recovery", (("c", 5),), now=3) == 0
     assert len(auth._password_recovery_attempts) == 2
 
 
 def test_multi_bucket_rejection_does_not_charge_another_bucket():
     for _ in range(5):
-        assert auth._reserve_login_attempt("locked", now=1)
+        assert auth._reserve_auth_budgets("login", (("locked", 5),), now=1) == 0
     assert (
         auth._reserve_auth_budgets("login", (("new-ip", 200), ("locked", 5)), now=2) > 0
     )
@@ -135,7 +136,7 @@ def test_forgot_password_endpoint_429_and_retry_header_without_global_email_lock
 def test_reset_guesses_share_ip_budget_and_short_password_does_not_charge(
     client, monkeypatch
 ):
-    monkeypatch.setattr(auth, "_PASSWORD_RECOVERY_IP_LIMIT", 3)
+    monkeypatch.setenv("XAGENT_AUTH_RECOVERY_IP_LIMIT", "3")
     short = client.post(
         "/api/auth/reset-password", json={"token": "guess", "new_password": "x"}
     )
@@ -159,7 +160,7 @@ def test_reset_guesses_share_ip_budget_and_short_password_does_not_charge(
 
 
 def test_ip_churn_cannot_deny_other_ips(client, monkeypatch):
-    monkeypatch.setattr(auth, "_LOGIN_IP_LIMIT", 3)
+    monkeypatch.setenv("XAGENT_AUTH_LOGIN_IP_LIMIT", "3")
     for i in range(3):
         assert (
             client.post(
@@ -184,7 +185,7 @@ def test_ip_churn_cannot_deny_other_ips(client, monkeypatch):
     )
 
 
-def test_successful_login_clears_identity_budgets_but_not_ip(client):
+def test_successful_login_refunds_own_ip_but_preserves_other_failures(client):
     assert (
         client.post(
             "/api/auth/login", json={"username": "alice", "password": "wrong"}
@@ -199,8 +200,83 @@ def test_successful_login_clears_identity_budgets_but_not_ip(client):
         == 200
     )
     keys = auth._login_budgets("ip-a", "alice", SimpleNamespace(id=1))
-    assert keys[0][0] in auth._login_failures
+    assert len(auth._login_failures[keys[0][0]].attempts) == 1
     assert all(key not in auth._login_failures for key, _ in keys[1:])
+
+
+def test_shared_egress_allows_more_successes_than_ip_budget(client, monkeypatch):
+    monkeypatch.setenv("XAGENT_AUTH_LOGIN_IP_LIMIT", "1")
+    for _ in range(6):
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "alice", "password": "correct-password"},
+            ).status_code
+            == 200
+        )
+    assert auth._login_ip_budget("ip-a")[0] not in auth._login_failures
+
+
+def test_ip_rejection_precedes_auth_database_worker(client, monkeypatch):
+    monkeypatch.setenv("XAGENT_AUTH_LOGIN_IP_LIMIT", "2")
+    worker = AsyncMock(side_effect=HTTPException(401, "bad credentials"))
+    monkeypatch.setattr(auth, "run_auth_db_worker", worker)
+    for expected in (401, 401, 429):
+        assert (
+            client.post(
+                "/api/auth/login", json={"username": "alice", "password": "wrong"}
+            ).status_code
+            == expected
+        )
+    assert worker.await_count == 2
+
+
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/api/auth/login", {"username": "alice", "password": "wrong"}),
+        ("/api/auth/forgot-password", {"email": "alice@example.com"}),
+        (
+            "/api/auth/reset-password",
+            {"token": "guess", "new_password": "long-enough-password"},
+        ),
+    ],
+)
+def test_auth_endpoint_storage_outage_returns_sanitized_503(
+    client, monkeypatch, path, payload
+):
+    from redis.exceptions import ConnectionError
+
+    from xagent.web.services import auth_attempts
+
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_REDIS_URL", "redis://private.invalid")
+    backend = Mock()
+    backend.eval.side_effect = ConnectionError("private-infrastructure")
+    monkeypatch.setattr(auth_attempts, "_client", lambda _: backend)
+    worker = AsyncMock()
+    monkeypatch.setattr(auth, "run_auth_db_worker", worker)
+    response = client.post(path, json=payload)
+    assert response.status_code == 503
+    assert "private" not in response.text
+    worker.assert_not_called()
+
+
+def test_forgot_and_reset_intentionally_share_recovery_ip_budget(client, monkeypatch):
+    monkeypatch.setenv("XAGENT_AUTH_RECOVERY_IP_LIMIT", "1")
+    assert (
+        client.post(
+            "/api/auth/forgot-password", json={"email": "missing@example.com"}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/api/auth/reset-password",
+            json={"token": "guess", "new_password": "long-password"},
+        ).status_code
+        == 429
+    )
 
 
 def test_clear_outage_does_not_fail_successful_login(client, monkeypatch):
@@ -218,7 +294,7 @@ def test_clear_outage_does_not_fail_successful_login(client, monkeypatch):
 
 
 def test_rotating_ips_share_account_limit_without_alias_bypass(client, monkeypatch):
-    monkeypatch.setattr(auth, "_LOGIN_ACCOUNT_LIMIT", 6)
+    monkeypatch.setenv("XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT", "6")
     monkeypatch.setattr(auth, "verify_password", lambda *args: False)
     for i in range(6):
         assert (

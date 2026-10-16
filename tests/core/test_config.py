@@ -4055,3 +4055,34 @@ def test_blank_environment_override_falls_back_to_legacy_alias(monkeypatch):
     monkeypatch.setenv("XAGENT_ENVIRONMENT", "  ")
     monkeypatch.setenv("ENVIRONMENT", " production ")
     assert config.get_environment() == "production"
+
+
+@pytest.mark.parametrize(
+    "setting,getter,default",
+    [
+        (
+            "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS",
+            config.get_auth_rate_limit_window_seconds,
+            900,
+        ),
+        ("XAGENT_AUTH_LOGIN_IP_LIMIT", config.get_auth_login_ip_limit, 200),
+        ("XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT", config.get_auth_login_account_limit, 50),
+        ("XAGENT_AUTH_LOGIN_PAIR_LIMIT", config.get_auth_login_pair_limit, 5),
+        ("XAGENT_AUTH_RECOVERY_IP_LIMIT", config.get_auth_recovery_ip_limit, 200),
+        ("XAGENT_AUTH_RECOVERY_EMAIL_LIMIT", config.get_auth_recovery_email_limit, 50),
+        ("XAGENT_AUTH_RECOVERY_PAIR_LIMIT", config.get_auth_recovery_pair_limit, 5),
+        (
+            "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS",
+            config.get_auth_rate_limit_max_local_keys,
+            10000,
+        ),
+    ],
+)
+def test_auth_rate_budget_configuration(monkeypatch, setting, getter, default):
+    monkeypatch.delenv(setting, raising=False)
+    assert getter() == default
+    monkeypatch.setenv(setting, "123")
+    assert getter() == 123
+    for invalid in ("", "0", "-1", "invalid"):
+        monkeypatch.setenv(setting, invalid)
+        assert getter() == default

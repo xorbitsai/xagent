@@ -2194,6 +2194,52 @@ def get_require_secure_secrets() -> bool:
     return _get_bool_env(REQUIRE_SECURE_SECRETS, False)
 
 
+def requires_secure_secrets() -> bool:
+    return get_environment() != "development" or get_require_secure_secrets()
+
+
+AUTH_RATE_LIMIT_WINDOW_SECONDS = "XAGENT_AUTH_RATE_LIMIT_WINDOW_SECONDS"
+AUTH_LOGIN_IP_LIMIT = "XAGENT_AUTH_LOGIN_IP_LIMIT"
+AUTH_LOGIN_ACCOUNT_LIMIT = "XAGENT_AUTH_LOGIN_ACCOUNT_LIMIT"
+AUTH_LOGIN_PAIR_LIMIT = "XAGENT_AUTH_LOGIN_PAIR_LIMIT"
+AUTH_RECOVERY_IP_LIMIT = "XAGENT_AUTH_RECOVERY_IP_LIMIT"
+AUTH_RECOVERY_EMAIL_LIMIT = "XAGENT_AUTH_RECOVERY_EMAIL_LIMIT"
+AUTH_RECOVERY_PAIR_LIMIT = "XAGENT_AUTH_RECOVERY_PAIR_LIMIT"
+AUTH_RATE_LIMIT_MAX_LOCAL_KEYS = "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS"
+
+
+def get_auth_rate_limit_window_seconds() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_WINDOW_SECONDS, 900)
+
+
+def get_auth_login_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_IP_LIMIT, 200)
+
+
+def get_auth_login_account_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_ACCOUNT_LIMIT, 50)
+
+
+def get_auth_login_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_LOGIN_PAIR_LIMIT, 5)
+
+
+def get_auth_recovery_ip_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_IP_LIMIT, 200)
+
+
+def get_auth_recovery_email_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_EMAIL_LIMIT, 50)
+
+
+def get_auth_recovery_pair_limit() -> int:
+    return _get_positive_int_env(AUTH_RECOVERY_PAIR_LIMIT, 5)
+
+
+def get_auth_rate_limit_max_local_keys() -> int:
+    return _get_positive_int_env(AUTH_RATE_LIMIT_MAX_LOCAL_KEYS, 10_000)
+
+
 def get_oidc_login_ttl_seconds() -> int:
     """Return the short-lived OIDC login transaction TTL."""
     return _get_positive_int_env(OIDC_LOGIN_TTL_SECONDS, 600)

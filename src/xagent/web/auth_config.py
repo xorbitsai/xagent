@@ -2,9 +2,8 @@ import os
 
 from ..config import (
     INSECURE_SECRET_PLACEHOLDER,
-    get_environment,
-    get_require_secure_secrets,
     get_session_secret,
+    requires_secure_secrets,
 )
 
 MIN_SECRET_LENGTH = 32
@@ -29,9 +28,7 @@ def _is_insecure_secret(value: str) -> bool:
 
 def validate_auth_config() -> None:
     """Fail production startup when the JWT signing secret is not configured."""
-    environment = get_environment()
-    requires_secure_secret = environment != "development"
-    requires_secure_secret = requires_secure_secret or get_require_secure_secrets()
+    requires_secure_secret = requires_secure_secrets()
     # Read the environment again here rather than trusting the import-time JWT
     # constant. Startup validation must catch a missing deployment setting even
     # when another test or an embedding process imported this module earlier.

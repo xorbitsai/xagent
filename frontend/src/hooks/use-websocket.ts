@@ -256,6 +256,7 @@ const isSameLoginPrincipal = (previous: WebSocketConnection, next: WebSocketConn
     const before = previous.protocols ?? []
     const after = next.protocols ?? []
     return previous.url === next.url
+      && previous.loginToken === next.loginToken
       && before.length === after.length
       && before.every((protocol, index) => protocol === after[index])
   }
@@ -268,6 +269,8 @@ export interface WebSocketConnection {
   identity: string
   url: string
   protocols?: string[]
+  /** Validated only when connecting, so a malformed cache cannot crash render. */
+  loginToken?: string
   expectedProtocol?: string
   taskId?: number
   chatTaskIdMode: "required" | "omit"
@@ -280,7 +283,7 @@ const getConnectionProtocols = (
   currentTaskId: number | undefined,
 ): string[] | undefined => {
   if (connection.taskBindingMode !== "session-subprotocol") {
-    return connection.protocols
+    return connection.loginToken ? websocketAuthProtocols(connection.loginToken) : connection.protocols
   }
 
   const baseProtocols = (connection.protocols ?? []).filter(protocol => (
@@ -489,8 +492,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           token: effectiveToken,
         })
         : `${baseUrl}/ws/chat/${taskId}?liveness=heartbeat`,
-      protocols: !buildWebSocketUrl && effectiveToken
-        ? websocketAuthProtocols(effectiveToken)
+      loginToken: !buildWebSocketUrl && effectiveToken
+        ? effectiveToken
         : undefined,
       taskId,
       chatTaskIdMode: "required",

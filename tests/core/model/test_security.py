@@ -28,9 +28,18 @@ def test_redact_navigation_tickets_and_websocket_credentials(scheme):
     result = redact_sensitive_text(text)
     assert "private-launch-proof" not in result
     assert "private-access-token" not in result
-    assert "example/ws" in result
+    # URL masking encodes the stars; assignment-only masking cannot satisfy
+    # this, so reverting URL_PATTERN to HTTP-only breaks ws/wss coverage.
+    assert f"{scheme}://example/ws?ticket=%2A%2A%2Aroof&token=" in result
     assert "private-login-jwt" not in redact_sensitive_text(
         "Sec-WebSocket-Protocol: xagent-auth-v1, xagent-auth-token.private-login-jwt"
+    )
+
+
+def test_non_url_support_ticket_identifiers_are_not_credentials():
+    assert (
+        redact_sensitive_text("support_ticket=42 ticket=123")
+        == "support_ticket=42 ticket=123"
     )
 
 

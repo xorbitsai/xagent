@@ -140,6 +140,17 @@ function writeAuthCache(
 afterEach(() => cleanup())
 
 describe("useWebSocket message delivery", () => {
+  it("reports malformed explicit credentials without throwing during render or retrying", async () => {
+    const onConnectionFailure = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost", taskId: 1, token: "invalid+/=credential",
+      onConnectionFailure,
+    }))
+    await waitFor(() => expect(result.current.connectionError).toBeInstanceOf(Error))
+    expect(MockWebSocket.instances).toHaveLength(0)
+    expect(onConnectionFailure).toHaveBeenCalledWith(expect.objectContaining({ recoverable: false }))
+    expect(String(result.current.connectionError)).not.toContain("invalid+/=")
+  })
   beforeEach(() => {
     MockWebSocket.instances = []
     MockWebSocket.constructorError = null

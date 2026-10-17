@@ -61,7 +61,6 @@ _CREDENTIAL_KEY_SUFFIXES = (
     "access-token",
     "accesstoken",
     "token",
-    "ticket",
     "password",
     "secret",
     "key",

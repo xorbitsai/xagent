@@ -112,8 +112,10 @@ def test_header_credential_parsing(headers, expected):
 def test_malformed_or_ambiguous_credentials_fail_without_echo(headers):
     with pytest.raises(InvalidWebSocketCredentials) as error:
         websocket_header_token(_scope(headers))
-    assert "secret" not in str(error.value)
-    assert "one" not in str(error.value)
+    assert str(error.value) in {
+        "Invalid WebSocket credentials",
+        "Ambiguous WebSocket credentials",
+    }
 
 
 @pytest.fixture

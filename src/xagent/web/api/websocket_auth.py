@@ -184,9 +184,7 @@ def revalidate_websocket_session(endpoint: _Endpoint) -> _Endpoint:
             # Reject the legacy URI contract even when a valid header is also
             # present. Do not retain a credential-leaking fallback.
             if {"token", "access_token"}.intersection(query):
-                await websocket.close(
-                    code=4001, reason="Header authentication required"
-                )
+                await websocket.close(code=4001)
                 return
             try:
                 header_token = websocket_header_token(scope)

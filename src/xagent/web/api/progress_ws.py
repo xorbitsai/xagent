@@ -42,7 +42,10 @@ progress_ws_router = APIRouter()
 async def progress_websocket_endpoint(
     websocket: WebSocket,
     task_id: str,
-    token: Optional[str] = Query(None, description="Deprecated; use handshake headers"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket endpoint for real-time progress monitoring."""
     try:

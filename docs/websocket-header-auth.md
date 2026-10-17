@@ -36,6 +36,9 @@ administrator/user login credentials and are not granted access by this helper.
 
 Deploy matching frontend and every API replica together. Old private query-JWT
 clients must migrate; old API replicas do not understand browser header login.
+Legacy URI credentials are rejected before the upgrade. In production this is
+an HTTP 403 failed handshake (typically browser close 1006), not a delivered
+WebSocket close reason. There is no authenticated legacy fallback.
 Proxies must forward `Sec-WebSocket-Protocol` unchanged on upgrade requests.
 
 Before deploying the new core into SaaS, include the corresponding middleware

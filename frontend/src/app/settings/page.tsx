@@ -27,6 +27,9 @@ export default function SettingsPage() {
   const [email, setEmail] = useState(user?.email || "")
   const [emailCurrentPassword, setEmailCurrentPassword] = useState("")
   const [emailConfirmationToken, setEmailConfirmationToken] = useState("")
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null)
+  const [emailChangeAvailable, setEmailChangeAvailable] = useState(true)
+  const [confirmationMinutes, setConfirmationMinutes] = useState(15)
   const [isProfileLoading, setIsProfileLoading] = useState(true)
   const [isSavingEmail, setIsSavingEmail] = useState(false)
   const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -55,6 +58,9 @@ export default function SettingsPage() {
           if (!isMounted) return
           if (updated.status === "updated") {
             setEmail(data.user.email || "")
+            setPendingEmail(data.user.pending_email || null)
+            setEmailChangeAvailable(data.user.email_change_available !== false)
+            setConfirmationMinutes(data.user.email_confirmation_expire_minutes || 15)
             setEmailMessage(null)
           } else if (updated.status === "advanced") {
             applyCanonicalEmail()
@@ -154,9 +160,15 @@ export default function SettingsPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder={t("settings.email.placeholder")}
-                disabled={isProfileLoading || isSavingEmail}
+                disabled={isProfileLoading || isSavingEmail || !hasPassword || !emailChangeAvailable}
               />
             </div>
+
+            {!hasPassword ? (
+              <p className="text-sm text-muted-foreground">{t("settings.email.providerManaged")}</p>
+            ) : !emailChangeAvailable && (
+              <p className="text-sm text-muted-foreground">{t("settings.email.smtpRequired")}</p>
+            )}
 
             {hasPassword && (
               <div className="space-y-2">
@@ -174,21 +186,22 @@ export default function SettingsPage() {
 
             <Button
               onClick={() => void handleEmailUpdate()}
-              disabled={isProfileLoading || isSavingEmail || !email.trim() || (hasPassword && !emailCurrentPassword)}
+              disabled={isProfileLoading || isSavingEmail || !hasPassword || !emailChangeAvailable || !email.trim() || !emailCurrentPassword}
               className="w-full"
             >
               {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
             </Button>
-            <div className="space-y-2">
+            {hasPassword && pendingEmail && <div className="space-y-2">
+              <p className="text-sm">{t("settings.email.pendingAddress", { email: pendingEmail })}</p>
               <Label htmlFor="email-confirmation-code">{t("settings.email.confirmationCode")}</Label>
               <Input
                 id="email-confirmation-code"
                 value={emailConfirmationToken}
                 onChange={(event) => setEmailConfirmationToken(event.target.value)}
-                autoComplete="one-time-code"
+                autoComplete="off"
                 disabled={isProfileLoading || isSavingEmail}
               />
-              <p className="text-sm text-muted-foreground">{t("settings.email.confirmationHint")}</p>
+              <p className="text-sm text-muted-foreground">{t("settings.email.confirmationHint", { minutes: confirmationMinutes })}</p>
               <Button
                 onClick={() => void handleEmailUpdate(true)}
                 disabled={isProfileLoading || isSavingEmail || !emailConfirmationToken.trim()}
@@ -196,7 +209,7 @@ export default function SettingsPage() {
               >
                 {t("settings.email.confirm")}
               </Button>
-            </div>
+            </div>}
           </CardContent>
         </Card>
 
@@ -354,19 +367,14 @@ export default function SettingsPage() {
       const data = await response.json()
 
       if (response.ok && data.success) {
-        if (data.pending_confirmation) {
-          setEmailCurrentPassword('')
-          setEmailConfirmationToken('')
-          setEmailMessage({ type: 'success', text: t("settings.email.confirmationSent") })
-          return
-        }
         const nextEmail = data.user?.email || ""
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
+          setPendingEmail(data.user?.pending_email || (data.pending_confirmation ? email.trim() : null))
           setEmailCurrentPassword('')
           setEmailConfirmationToken('')
-          setEmailMessage({ type: 'success', text: t("settings.email.success") })
+          setEmailMessage({ type: 'success', text: t(data.pending_confirmation ? "settings.email.confirmationSent" : "settings.email.success") })
         } else if (updated.status === "advanced") {
           applyCanonicalEmail()
           setEmailMessage(null)
@@ -376,7 +384,11 @@ export default function SettingsPage() {
           return
         }
       } else {
-        setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
+        const localizedError = data.error_code === "smtp_not_configured"
+          ? t("settings.email.smtpRequired")
+          : data.error_code === "provider_managed" ? t("settings.email.providerManaged") : null
+        if (data.error_code === "smtp_not_configured") setEmailChangeAvailable(false)
+        setEmailMessage({ type: 'error', text: localizedError || data.message || data.detail || t("settings.email.failed") })
       }
     } catch {
       setEmailMessage({ type: 'error', text: t("settings.email.errors.network") })
@@ -393,6 +405,7 @@ export default function SettingsPage() {
   }
 
   function applyCanonicalEmail() {
+    setPendingEmail(null)
     const inspection = inspectAuthSession()
     if (inspection.status === "valid") setEmail(inspection.projection.cache.user.email || "")
   }

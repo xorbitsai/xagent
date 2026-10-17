@@ -11,7 +11,7 @@ from alembic.script import ScriptDirectory
 from xagent.db.config import create_alembic_config
 
 
-def test_email_confirmation_migration_keeps_recovery_address():
+def _load_migration():
     path = (
         Path(__file__).parents[2]
         / "src/xagent/migrations/versions/20261016_add_email_confirmation.py"
@@ -19,6 +19,11 @@ def test_email_confirmation_migration_keeps_recovery_address():
     spec = importlib.util.spec_from_file_location("email_confirmation_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
+    return migration
+
+
+def test_email_confirmation_migration_keeps_recovery_address():
+    migration = _load_migration()
     engine = sa.create_engine("sqlite:///:memory:")
     with engine.begin() as connection:
         connection.exec_driver_sql(
@@ -42,13 +47,7 @@ def test_email_confirmation_migration_keeps_recovery_address():
 
 
 def test_email_confirmation_migration_skips_schema_without_users():
-    path = (
-        Path(__file__).parents[2]
-        / "src/xagent/migrations/versions/20261016_add_email_confirmation.py"
-    )
-    spec = importlib.util.spec_from_file_location("email_confirmation_migration", path)
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
+    migration = _load_migration()
     engine = sa.create_engine("sqlite:///:memory:")
     try:
         with engine.begin() as connection:

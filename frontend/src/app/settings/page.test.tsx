@@ -6,7 +6,7 @@ import SettingsPage from "./page"
 import { claimAuthLoginIntent, createAuthSession, inspectAuthSession, updateAuthSessionUser, type AuthSessionSnapshot, type AuthTokenPayload } from "@/lib/auth-cache"
 
 const authState = vi.hoisted(() => ({
-  user: { id: "1", username: "alice", email: "old@example.com" as string | null },
+  user: { id: "1", username: "alice", email: "old@example.com" } as { id: string; username: string; email: string | null; has_password?: boolean },
   session: null as AuthSessionSnapshot | null,
 }))
 const apiRequest = vi.hoisted(() => vi.fn())
@@ -152,13 +152,48 @@ describe("SettingsPage auth profile synchronization", () => {
     fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#email-current-password" }), { target: { value: "current-password" } })
     fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
     await screen.findByText("settings.email.confirmationSent")
+    expect(input).toHaveValue("old@example.com")
     expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "old@example.com" } } } })
+    const staged = inspectAuthSession()
+    if (staged.status !== "valid") throw new Error("expected staged profile")
+    authState.session = staged.projection.snapshot
+    view.rerender(<SettingsPage />)
     fireEvent.change(screen.getByLabelText("settings.email.confirmationCode"), { target: { value: "confirmation-secret" } })
     fireEvent.click(screen.getByRole("button", { name: "settings.email.confirm" }))
     await screen.findByText("settings.email.success")
     expect(apiRequest.mock.calls[2][0]).toMatch(/\/api\/auth\/email\/confirm$/)
     expect(JSON.parse(apiRequest.mock.calls[2][1].body)).toEqual({ token: "confirmation-secret" })
     expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "new@example.com" } } } })
+  })
+
+  it.each(["smtp", "provider"])("explains and disables unavailable email changes (%s)", async reason => {
+    authState.user.has_password = reason !== "provider"
+    apiRequest.mockResolvedValue(new Response(JSON.stringify({
+      success: true, user: { ...authState.user, email_change_available: reason !== "smtp" },
+    })))
+    render(<SettingsPage />)
+    await screen.findByText(reason === "smtp" ? "settings.email.smtpRequired" : "settings.email.providerManaged")
+    expect(screen.getByLabelText("settings.email.current")).toBeDisabled()
+    expect(screen.getByRole("button", { name: "settings.email.submit" })).toBeDisabled()
+    expect(screen.queryByLabelText("settings.email.confirmationCode")).not.toBeInTheDocument()
+  })
+
+  it("restores a pending confirmation after reload and preserves it on a confirmation error", async () => {
+    apiRequest
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: { ...authState.user, pending_email: "pending@example.com" } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: false, message: "Invalid or expired confirmation code" })))
+    const view = render(<SettingsPage />)
+    await screen.findByLabelText("settings.email.confirmationCode")
+    const loaded = inspectAuthSession()
+    if (loaded.status !== "valid") throw new Error("expected profile")
+    authState.session = loaded.projection.snapshot
+    view.rerender(<SettingsPage />)
+    expect(screen.getByLabelText("settings.email.current")).toHaveValue("old@example.com")
+    fireEvent.change(screen.getByLabelText("settings.email.confirmationCode"), { target: { value: "bad-code" } })
+    fireEvent.click(screen.getByRole("button", { name: "settings.email.confirm" }))
+    await screen.findByText("Invalid or expired confirmation code")
+    expect(screen.getByLabelText("settings.email.confirmationCode")).toHaveValue("bad-code")
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "old@example.com" } } } })
   })
 
   it("retains the username label for an email-less account", async () => {

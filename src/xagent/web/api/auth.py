@@ -47,6 +47,7 @@ from ...config import (
     get_auth_recovery_email_limit,
     get_auth_recovery_ip_limit,
     get_auth_recovery_pair_limit,
+    get_email_confirmation_expire_minutes,
     get_google_restricted_scopes,
     get_password_reset_expire_minutes,
 )
@@ -112,7 +113,9 @@ from ..services.auth_attempts import (
     reserve_shared_attempts,
 )
 from ..services.auth_email import (
+    is_auth_email_configured,
     send_email_change_confirmation,
+    send_email_changed_notice,
     send_password_reset_email,
 )
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
@@ -1567,6 +1570,7 @@ class UpdateEmailResponse(BaseModel):
     message: str
     user: Optional[Dict[str, Any]] = None
     pending_confirmation: bool = False
+    error_code: Optional[str] = None
 
 
 class ConfirmEmailRequest(BaseModel):
@@ -1766,8 +1770,12 @@ def is_valid_email(email: str) -> bool:
     return bool(EMAIL_PATTERN.match(email))
 
 
-def hash_password_reset_token(token: str) -> str:
+def hash_auth_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def hash_password_reset_token(token: str) -> str:
+    return hash_auth_token(token)
 
 
 def generate_password_reset_token() -> str:
@@ -2028,12 +2036,23 @@ def _normalized_preferences(user: User) -> Dict[str, Any]:
 
 
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
+    expires = getattr(user, "email_confirmation_expires_at", None)
+    if isinstance(expires, datetime) and expires.tzinfo is None:
+        expires = expires.replace(tzinfo=timezone.utc)
+    pending = (
+        getattr(user, "pending_email", None)
+        if isinstance(expires, datetime) and expires > datetime.now(timezone.utc)
+        else None
+    )
     payload: Dict[str, Any] = {
         "id": user.id,
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
         "has_password": not str(user.password_hash).startswith("!"),
+        "pending_email": pending,
+        "email_change_available": is_auth_email_configured(),
+        "email_confirmation_expire_minutes": get_email_confirmation_expire_minutes(),
         "preferences": _normalized_preferences(user),
     }
     if include_login_time:
@@ -2475,6 +2494,7 @@ async def get_current_user_profile(
 @auth_router.patch("/email", response_model=UpdateEmailResponse)
 async def update_current_user_email(
     request: UpdateEmailRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdateEmailResponse:
@@ -2483,21 +2503,46 @@ async def update_current_user_email(
         return UpdateEmailResponse(
             success=False,
             message="Manage your email through your sign-in provider",
+            error_code="provider_managed",
         )
-    if has_password and not request.current_password:
+    email = normalize_email(request.email)
+    if not is_valid_email(email):
+        return UpdateEmailResponse(success=False, message="Invalid email address")
+    await asyncio.to_thread(
+        _enforce_budgets,
+        "email-change",
+        (
+            (
+                _budget_key("email-change-user", str(user.id)),
+                get_auth_recovery_pair_limit(),
+            ),
+            (
+                _budget_key("email-change-target", email),
+                get_auth_recovery_email_limit(),
+            ),
+            (
+                _budget_key(
+                    "email-change-ip", remote_ip_from_request(http_request) or "unknown"
+                ),
+                get_auth_recovery_ip_limit(),
+            ),
+        ),
+    )
+    if not request.current_password:
         return UpdateEmailResponse(
             success=False, message="Current password is required"
         )
-    if has_password and not await verify_password_async(
-        request.current_password or "", str(user.password_hash)
+    if not await verify_password_async(
+        request.current_password, str(user.password_hash)
     ):
         return UpdateEmailResponse(
             success=False, message="Current password is incorrect"
         )
 
-    email = normalize_email(request.email)
-    if not is_valid_email(email):
-        return UpdateEmailResponse(success=False, message="Invalid email address")
+    if email == normalize_email(str(user.email or "")):
+        return UpdateEmailResponse(
+            success=True, message="Email is unchanged", user=serialize_auth_user(user)
+        )
 
     existing_user = get_user_by_email(db, email)
     if existing_user and existing_user.id != user.id:
@@ -2509,8 +2554,15 @@ async def update_current_user_email(
     if email_namespace_error:
         return UpdateEmailResponse(success=False, message=email_namespace_error)
 
+    if not is_auth_email_configured():
+        return UpdateEmailResponse(
+            success=False,
+            message="Ask your administrator to configure SMTP before changing your email",
+            error_code="smtp_not_configured",
+        )
+
     token = secrets.token_urlsafe(32)
-    token_hash = hash_password_reset_token(token)
+    token_hash = hash_auth_token(token)
     user_id = int(user.id)
     changed = (
         db.query(User)
@@ -2524,7 +2576,7 @@ async def update_current_user_email(
                 User.pending_email: email,
                 User.email_confirmation_hash: token_hash,
                 User.email_confirmation_expires_at: datetime.now(timezone.utc)
-                + timedelta(minutes=15),
+                + timedelta(minutes=get_email_confirmation_expire_minutes()),
             },
             synchronize_session=False,
         )
@@ -2550,7 +2602,13 @@ async def update_current_user_email(
             synchronize_session=False,
         )
         db.commit()
-        logger.error("Unable to deliver email-change confirmation for user %s", user_id)
+        # SMTP exceptions may include recipients or provider text; retain the
+        # traceback server-side, never project it into the API response.
+        logger.error(
+            "Unable to deliver email-change confirmation for user %s",
+            user_id,
+            exc_info=True,
+        )
         return UpdateEmailResponse(
             success=False, message="Unable to send confirmation email; try again later"
         )
@@ -2569,7 +2627,7 @@ async def confirm_current_user_email(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdateEmailResponse:
-    token_hash = hash_password_reset_token(request.token.strip())
+    token_hash = hash_auth_token(request.token.strip())
     now = datetime.now(timezone.utc)
     candidate = (
         db.query(User)
@@ -2586,6 +2644,7 @@ async def confirm_current_user_email(
             success=False, message="Invalid or expired confirmation code"
         )
     email = str(candidate.pending_email)
+    previous_email = str(candidate.email or "")
     conflict = get_user_by_email(db, email)
     if (
         conflict is not None and conflict.id != user.id
@@ -2627,6 +2686,17 @@ async def confirm_current_user_email(
             success=False, message="Email address is no longer available"
         )
     db.refresh(user)
+    if previous_email:
+        try:
+            await asyncio.to_thread(
+                send_email_changed_notice, previous_email, get_app_name()
+            )
+        except Exception:
+            logger.warning(
+                "Unable to notify previous recovery address for user %s",
+                user.id,
+                exc_info=True,
+            )
     return UpdateEmailResponse(
         success=True,
         message="Email updated successfully",

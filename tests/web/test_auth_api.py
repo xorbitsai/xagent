@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import SQLAlchemyError
@@ -1383,6 +1383,9 @@ class TestAuthAPI:
         mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
     def test_update_current_user_email(self, test_db, test_user_data, monkeypatch):
+        monkeypatch.setenv("XAGENT_SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("XAGENT_SMTP_FROM_EMAIL", "no-reply@example.com")
+        monkeypatch.setattr(auth_api, "send_email_changed_notice", MagicMock())
         sent = {}
         monkeypatch.setattr(
             auth_api,
@@ -1460,6 +1463,7 @@ class TestAuthAPI:
             result = asyncio.run(
                 auth_api.update_current_user_email(
                     request=auth_api.UpdateEmailRequest(email="new@example.com"),
+                    http_request=Request({"type": "http", "headers": []}),
                     db=db,
                     user=user,
                 )

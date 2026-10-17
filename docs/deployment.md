@@ -1,5 +1,25 @@
 # Deployment changes
 
+## Recovery email confirmation
+
+Apply the email-confirmation migrations before serving the new authentication
+code. Changing or adding a recovery address now requires configured SMTP
+(`XAGENT_SMTP_HOST` and `XAGENT_SMTP_FROM_EMAIL`), even for an email-less account.
+Without it, Settings explains that an administrator must configure mail; the API
+does not stage a proof or allow an unverified fallback. Passwordless accounts
+must manage their address through their sign-in provider. Existing recovery
+addresses remain authoritative until confirmation succeeds.
+
+`XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES` defaults to 15 and controls the API,
+email message and Settings hint. Email-change requests share the existing auth
+window and storage backend, with separate email-change buckets: per-user uses
+`XAGENT_AUTH_RECOVERY_PAIR_LIMIT`, per-target uses `XAGENT_AUTH_RECOVERY_EMAIL_LIMIT`
+and per-source-IP uses `XAGENT_AUTH_RECOVERY_IP_LIMIT`. A successful confirmation
+sends a best-effort notice to the old address; notification failure cannot undo
+the committed change. Refresh credentials and recovery links are cleared;
+existing access sessions keep their current lifecycle (password reset/change
+revokes them). This is not an overall CASA-closure claim.
+
 ## 2026-10-17 — Password changes revoke sign-in sessions
 
 Apply migrations through the single Alembic head before serving traffic, and

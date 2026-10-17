@@ -267,6 +267,7 @@ GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
 PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+EMAIL_CONFIRMATION_EXPIRE_MINUTES = "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES"
 APP_BASE_URL = "XAGENT_APP_BASE_URL"
 SLACK_CLIENT_ID = "XAGENT_SLACK_CLIENT_ID"
 SLACK_CLIENT_SECRET = "XAGENT_SLACK_CLIENT_SECRET"
@@ -839,6 +840,11 @@ def _reject_url_userinfo(env_var: str, value: str | None) -> str | None:
 def get_password_reset_expire_minutes() -> int:
     """Return the password reset token expiry window in minutes."""
     return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
+
+
+def get_email_confirmation_expire_minutes() -> int:
+    """Return the recovery-email confirmation expiry window in minutes."""
+    return _get_positive_int_env(EMAIL_CONFIRMATION_EXPIRE_MINUTES, 15)
 
 
 def get_app_base_url() -> str | None:

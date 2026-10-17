@@ -982,6 +982,11 @@ jobs:
         working-directory: ./frontend
         run: npm run test:kb-components
 
+      - name: Run file preview security regressions
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npm run test:file-previews
+
       - name: Run App Router tests
         if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend

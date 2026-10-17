@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { McpApp } from "@/contexts/mcp-apps-context"
+import type { ClarificationOnSend } from "@/components/chat/clarification-delivery"
 import { resolveTranslation } from "@/i18n/translations"
 
 const appContextMock = vi.hoisted(() => ({
@@ -763,7 +764,7 @@ describe("ClarificationForm delivery failures", () => {
     errorCode: string | null = null,
   ) => Object.assign(new Error(message), { disposition, userFacing, errorCode })
 
-  const submitAnswer = async (onSend: ReturnType<typeof vi.fn>) => {
+  const submitAnswer = async (onSend: ClarificationOnSend) => {
     render(
       <ClarificationForm
         interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}

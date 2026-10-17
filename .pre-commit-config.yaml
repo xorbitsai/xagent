@@ -68,8 +68,6 @@ repos:
           - playwright
           - nest-asyncio
           - anthropic
-          # The public egress SDK client is HTTPX 1.x; OpenAI 3.x switched
-          # to HTTPX2. Keep type checking on the supported runtime major.
           - openai>=2.26.0,<3
           - python-pptx
           - cloudpickle

@@ -54,7 +54,7 @@
     "framer-motion": "^12.28.1",
     "highlight.js": "^11.11.1",
     "jszip": "^3.10.1",
-    "katex": "^0.16.38",
+    "katex": "0.18.2",
     "lucide-react": "^0.263.1",
     "marked": "^5.1.2",
     "next": "^15.5.28",
@@ -81,6 +81,7 @@
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "overrides": {
+    "katex": "$katex",
     "next": {
       "postcss": "$postcss"
     }

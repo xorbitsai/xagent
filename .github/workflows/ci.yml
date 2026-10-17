@@ -982,7 +982,7 @@ jobs:
         working-directory: ./frontend
         run: npm run test:kb-components
 
-      - name: Run file preview security regressions
+      - name: Run file component tests
         if: needs.changes.outputs.frontend == 'true'
         working-directory: ./frontend
         run: npm run test:file-previews

@@ -23,8 +23,8 @@ export function createExcelSheetPreview(
 
   for (const [address, cell] of Object.entries(sheet)) {
     if (address.startsWith("!")) continue
-    // Format a copy before removing raw attribute values. Keeping raw values
-    // out of generated attributes also preserves cell text and table structure.
+    // Format a copy before dropping raw v/z attributes, preserving cell text
+    // and table structure. Link targets follow the export escaping path below.
     let html = ""
     if (cell.v != null) {
       // Rich-text runs can contain table markup. Keep them inline before

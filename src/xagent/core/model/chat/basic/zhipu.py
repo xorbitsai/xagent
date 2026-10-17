@@ -7,12 +7,6 @@ import threading
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
-try:
-    from zai import ZhipuAiClient  # type: ignore
-except ImportError:
-    # Fallback for when zai SDK is not available
-    ZhipuAiClient = None
-
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..stream_deadline import await_before_deadline
@@ -20,6 +14,15 @@ from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
 from .base import BaseLLM
+
+ZhipuAiClient: "type[_ZhipuAiClient] | None"
+try:
+    from zai import ZhipuAiClient as _ZhipuAiClient
+except ImportError:
+    # Fallback for when zai SDK is not available
+    ZhipuAiClient = None
+else:
+    ZhipuAiClient = _ZhipuAiClient
 
 logger = logging.getLogger(__name__)
 
@@ -1178,7 +1181,9 @@ class ZhipuLLM(BaseLLM):
             # Try to use SDK's models.list() method if available
             try:
                 # zai SDK should have a models.list() method
-                models_response = await asyncio.to_thread(client.models.list)
+                models_response = await asyncio.to_thread(
+                    getattr(client, "models").list
+                )
 
                 models = []
                 for model in models_response.data:
@@ -1206,8 +1211,8 @@ class ZhipuLLM(BaseLLM):
                 url = base_url.rstrip("/") + "/models"
                 headers = {"Authorization": f"Bearer {api_key}"}
 
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    response = await client.get(url, headers=headers)
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    response = await http_client.get(url, headers=headers)
                     response.raise_for_status()
                     data = response.json()
 

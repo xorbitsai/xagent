@@ -15,6 +15,21 @@ from xagent.web.api import public_chat_access
 from xagent.web.api.websocket import WebSocketPrincipal
 
 
+@pytest.mark.parametrize("value", [None, [], float("inf")])
+def test_public_token_malformed_expiry_has_shared_claim_rejection(value):
+    token = public_chat_access.jwt.encode(
+        {"exp": value},
+        public_chat_access.JWT_SECRET_KEY,
+        algorithm=public_chat_access.JWT_ALGORITHM,
+    )
+    with pytest.raises(public_chat_access._PublicTokenRejected) as raised:
+        public_chat_access._decode_public_token(token)
+    assert (
+        raised.value.reason
+        is public_chat_access._PublicTokenRejectionReason.INVALID_CLAIMS
+    )
+
+
 class _SingleMessageWebSocket:
     def __init__(self, message: dict[str, object]) -> None:
         self._message = json.dumps(message)

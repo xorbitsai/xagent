@@ -131,13 +131,20 @@ def test_denied_provider_flow_is_consumed_and_cannot_be_replayed(
     db.close()
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     alternate_bits = state[:-1] + alphabet[alphabet.index(state[-1]) ^ 1]
-    for variant in (state, state + "=", alternate_bits):
-        assert auth.verify_token(variant) is not None
+    # PyJWT accepts canonical signatures with optional padding, but rejects
+    # nonzero unused base64url bits before the durable replay check.
+    for variant, valid_encoding in (
+        (state, True),
+        (state + "=", True),
+        (alternate_bits, False),
+    ):
+        assert (auth.verify_token(variant) is not None) is valid_encoding
         replay = auth.generic_oauth_callback(
             "custom", _callback(variant, error=False), db, None
         )
         assert replay.status_code == 400
         assert b"Invalid or expired state" in replay.body
+    assert db.query(OidcConsumedToken).count() == 1
     post.assert_not_called()
 
 

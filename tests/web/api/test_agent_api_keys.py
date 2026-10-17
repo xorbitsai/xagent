@@ -139,7 +139,7 @@ class TestPostGenerateApiKey:
         headers = _headers()
         agent_id = _create_agent(headers)
         resp = client.post(f"/api/agents/{agent_id}/api-key")
-        # python-jose / HTTPBearer raises 401 with "Not authenticated"
+        # HTTPBearer can raise 401 with "Not authenticated"
         # when the header is missing; 403 is the FastAPI default for
         # HTTPBearer missing credentials. Accept either.
         assert resp.status_code in (401, 403)

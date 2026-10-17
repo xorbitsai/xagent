@@ -56,6 +56,11 @@ jobs:
             || { echo "::error::wheel is missing the bundled frontend (frontend_dist)"; exit 1; }
           echo "Frontend bundle present in wheel."
 
+      - name: Verify published wheel dependencies resolve without project overrides
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --dry-run --ignore-installed dist/*.whl
+
       - name: Verify the wheel has self-contained startup defaults
         run: |
           set -e

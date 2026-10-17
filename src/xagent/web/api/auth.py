@@ -22,7 +22,6 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from jose import JWTError, jwt
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -62,6 +61,7 @@ from ...core.runtime_performance import (
 )
 from ...core.utils.api_key import verify_dummy
 from ...core.utils.security import host_matches_suffix
+from .. import jwt_codec as jwt
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -79,6 +79,7 @@ from ..auth_sessions import (
 )
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
+from ..jwt_codec import JWTError
 from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
 from ..models.actor_oauth_flow import ActorOAuthFlowState
 from ..models.auth_database import (

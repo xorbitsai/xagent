@@ -1122,10 +1122,10 @@ def test_full_admission_queue_postpones_only_that_row(factory, notified, monkeyp
     full_for: set[int] = set()
     real = task_execution_admission.stage_task_admission
 
-    def admission(db, command):
+    def admission(db, command, policy):
         if command.task_id in full_for:
             raise AdmissionQueueFull("Execution queue is full")
-        real(db, command)
+        real(db, command, policy)
 
     monkeypatch.setattr(
         "xagent.web.services.task_execution_admission.stage_task_admission", admission
@@ -1155,7 +1155,7 @@ def test_full_admission_queue_postpones_only_that_row(factory, notified, monkeyp
 
 
 def _team_admission(
-    factory: sessionmaker, monkeypatch, request, *, full_for: User
+    factory: sessionmaker, monkeypatch, request, *, full_for: User, install: str
 ) -> None:
     """Admission buckets per user (a stand-in for a team), the user's bucket
     already holding its one pending slot."""
@@ -1167,8 +1167,19 @@ def _team_admission(
             return None
         return AdmissionPolicy(bucket=f"team:{task.user_id}", capacity=1, max_pending=1)
 
-    task_execution_admission.set_task_admission_hook(classify)
-    request.addfinalizer(lambda: task_execution_admission.set_task_admission_hook(None))
+    if install == "legacy":
+        task_execution_admission.set_task_admission_hook(classify)
+        request.addfinalizer(
+            lambda: task_execution_admission.set_task_admission_hook(None)
+        )
+    else:
+        task_execution_admission.set_command_classifier(
+            lambda db, command: task_execution_admission.CommandClassification(
+                admission=classify(db, command)
+            ),
+            admission_enabled=True,
+        )
+        request.addfinalizer(task_execution_admission.reset_command_classifier)
     now = utc_now()
     with factory() as db:
         holder = _seed(db, now, user=full_for, state="manual", due_in=None)
@@ -1195,9 +1206,10 @@ def _team_admission(
         db.commit()
 
 
+@pytest.mark.parametrize("install", ["legacy", "classifier"])
 @pytest.mark.parametrize("team_a_rows", [1, 200])
 def test_admission_full_in_one_team_does_not_block_another(
-    factory, notified, monkeypatch, request, team_a_rows
+    factory, notified, monkeypatch, request, team_a_rows, install
 ):
     now = utc_now()
     with factory() as db:
@@ -1206,7 +1218,7 @@ def test_admission_full_in_one_team_does_not_block_another(
         team_a_id, team_b_id = team_a.id, team_b.id
     with factory() as db:
         team_a, team_b = db.get(User, team_a_id), db.get(User, team_b_id)
-        _team_admission(factory, monkeypatch, request, full_for=team_a)
+        _team_admission(factory, monkeypatch, request, full_for=team_a, install=install)
         # Team A's rows are due first; team B's row and an internal row the
         # host's hook does not classify come after them.
         a_rows = [
@@ -2329,10 +2341,10 @@ def test_failure_while_postponing(
     real = task_execution_admission.stage_task_admission
     full_for: set[int] = set()
 
-    def admission(db, command):
+    def admission(db, command, policy):
         if command.task_id in full_for:
             raise AdmissionQueueFull("Execution queue is full")
-        real(db, command)
+        real(db, command, policy)
 
     def broken(*_args, **_kwargs):
         raise postpone_error

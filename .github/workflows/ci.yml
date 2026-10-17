@@ -328,7 +328,10 @@ jobs:
   pytest-fast:
     name: Pytest Fast (${{ matrix.name }})
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The web leg's test step alone takes about 35 minutes on a healthy run,
+    # and slow runners pushed it past a 40-minute limit near the end. Hung
+    # tests are cut by pytest-timeout (300 s per test), not by this limit.
+    timeout-minutes: 60
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     needs: [changes, pre-commit]
     strategy:
@@ -422,7 +425,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v
+          python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v --durations=30
 
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
@@ -833,6 +836,7 @@ jobs:
               tests/e2e/test_shared_channel_auto_resume.py
               tests/e2e/test_shared_provider_outage.py
               tests/e2e/test_shared_database_outage.py
+              tests/e2e/test_shared_sdk_auto_resume.py
           - shard: rest
             paths: >-
               tests/e2e
@@ -844,6 +848,7 @@ jobs:
               --ignore=tests/e2e/test_shared_channel_auto_resume.py
               --ignore=tests/e2e/test_shared_provider_outage.py
               --ignore=tests/e2e/test_shared_database_outage.py
+              --ignore=tests/e2e/test_shared_sdk_auto_resume.py
 
     services:
       redis:

@@ -728,6 +728,19 @@ def create_task(app, title: str, description: str) -> int:
     return response.json()["task_id"]
 
 
+def create_sdk_task(app, content: str) -> tuple[int, str, dict[str, str]]:
+    """An agent's SDK task: its id, run id and the caller's headers."""
+    agent_id, headers = app.create_agent()
+    response = app.client.post(
+        "/v1/chat/tasks",
+        headers=headers,
+        json={"agent_id": agent_id, "message": {"role": "user", "content": content}},
+    )
+    assert response.status_code == 202, response.text
+    accepted = response.json()
+    return accepted["task_id"], accepted["run_id"], headers
+
+
 def start_task(app, description: str = "e2e:gate") -> int:
     """An owner's internal balanced task, executed over the WebSocket.
 

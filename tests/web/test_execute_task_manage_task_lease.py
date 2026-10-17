@@ -13,6 +13,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.pool_contention_shared import (
     GUARD_TIMEOUT,
     LOOP_LIVENESS_TICKS,
@@ -568,14 +569,14 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
 
     def blocking_workforce_sync(*_args, **_kwargs) -> bool:
         workforce_started.set()
-        assert allow_workforce_timeout.wait(timeout=2)
+        assert allow_workforce_timeout.wait(timeout=DB_PROGRESS_TIMEOUT)
         raise workforce_timeout
 
     def blocking_heartbeat_batch(
         _leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], object]:
         heartbeat_started.set()
-        assert allow_heartbeat_timeout.wait(timeout=2)
+        assert allow_heartbeat_timeout.wait(timeout=DB_PROGRESS_TIMEOUT)
         raise heartbeat_timeout
 
     with (
@@ -619,8 +620,8 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
             )
         )
         try:
-            assert await asyncio.to_thread(workforce_started.wait, 1)
-            assert await asyncio.to_thread(heartbeat_started.wait, 1)
+            assert await asyncio.to_thread(workforce_started.wait, DB_PROGRESS_TIMEOUT)
+            assert await asyncio.to_thread(heartbeat_started.wait, DB_PROGRESS_TIMEOUT)
 
             allow_workforce_timeout.set()
             await asyncio.sleep(0.02)
@@ -629,7 +630,7 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
 
             allow_heartbeat_timeout.set()
             with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
-                await asyncio.wait_for(execution, timeout=1)
+                await asyncio.wait_for(execution, timeout=DB_PROGRESS_TIMEOUT)
             assert exc_info.value is workforce_timeout
         finally:
             allow_workforce_timeout.set()
@@ -639,7 +640,7 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
                 await asyncio.gather(execution, return_exceptions=True)
             await asyncio.wait_for(
                 task_lease_service.wait_for_heartbeat_manager_idle(),
-                timeout=1,
+                timeout=DB_PROGRESS_TIMEOUT,
             )
 
     tracker_factory.assert_not_called()
@@ -667,16 +668,19 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
     heartbeat_timeout = SQLAlchemyTimeoutError("heartbeat pool exhausted")
     release_lease = MagicMock(return_value=True)
 
+    # The thread waits below are hang detectors: under xdist CI load the
+    # execution has missed a 1 s bound to reach usage settlement. The test
+    # releases every gate itself, so a long bound costs nothing when it passes.
     def blocking_usage(*_args, **_kwargs) -> bool:
         usage_started.set()
-        assert allow_usage.wait(timeout=2)
+        assert allow_usage.wait(timeout=DB_PROGRESS_TIMEOUT)
         return True
 
     def blocking_heartbeat_batch(
         _leases: tuple[TaskLease, ...],
     ) -> dict[tuple[int, str, str | None], object]:
         heartbeat_started.set()
-        assert allow_heartbeat_timeout.wait(timeout=2)
+        assert allow_heartbeat_timeout.wait(timeout=DB_PROGRESS_TIMEOUT)
         raise heartbeat_timeout
 
     with (
@@ -730,8 +734,8 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
             )
         )
         try:
-            assert await asyncio.to_thread(usage_started.wait, 1)
-            assert await asyncio.to_thread(heartbeat_started.wait, 1)
+            assert await asyncio.to_thread(usage_started.wait, DB_PROGRESS_TIMEOUT)
+            assert await asyncio.to_thread(heartbeat_started.wait, DB_PROGRESS_TIMEOUT)
 
             allow_usage.set()
             await asyncio.sleep(0.02)
@@ -740,7 +744,7 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
 
             allow_heartbeat_timeout.set()
             with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
-                await asyncio.wait_for(execution, timeout=1)
+                await asyncio.wait_for(execution, timeout=DB_PROGRESS_TIMEOUT)
             assert exc_info.value is heartbeat_timeout
         finally:
             allow_usage.set()
@@ -750,7 +754,7 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
                 await asyncio.gather(execution, return_exceptions=True)
             await asyncio.wait_for(
                 task_lease_service.wait_for_heartbeat_manager_idle(),
-                timeout=1,
+                timeout=DB_PROGRESS_TIMEOUT,
             )
 
     release_lease.assert_not_called()

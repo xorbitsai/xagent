@@ -491,7 +491,8 @@ def stage_task_command(
        adding a new row, so a repeated call is idempotent without relying on
        the unique constraint to reject it.
     6. Add and flush the new row last, so any remaining IntegrityError is
-       attributable to the command insert itself.
+       attributable to the command insert itself. Classification runs once per
+       new execution command, after the row is flushed.
 
     Caller obligations:
 
@@ -633,9 +634,19 @@ def stage_task_command(
                 "target_state_version": int(snapshot.state_version or 0),
             },
         )
-    from .task_execution_admission import stage_task_admission
+    from .task_execution_admission import (
+        classify_command_no_commit,
+        stage_task_admission,
+    )
 
-    stage_task_admission(db, command)
+    classification = (
+        classify_command_no_commit(db, command)
+        if command.kind in EXECUTION_OPENING_KINDS
+        else None
+    )
+    stage_task_admission(
+        db, command, classification.admission if classification else None
+    )
     return StagedTaskCommand(
         staged_db_id=int(command.id),
         client_command_id=normalized_id,

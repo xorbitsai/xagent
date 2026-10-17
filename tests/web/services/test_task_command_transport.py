@@ -1910,8 +1910,11 @@ def _dispatch_diagnostics(db_session, dispatch_task, command_db_id) -> str:
         )
     )
     lines.append(
-        "admission_hook={!r}".format(
-            getattr(task_execution_admission, "_hook", "<no admission module>")
+        "admission_installed={!r} admission_enabled={!r}".format(
+            getattr(task_execution_admission, "_installed", "<no admission module>"),
+            task_execution_admission.admission_enabled()
+            if task_execution_admission is not None
+            else "<no admission module>",
         )
     )
     lines.append(

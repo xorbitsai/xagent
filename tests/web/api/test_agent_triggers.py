@@ -48,6 +48,7 @@ from xagent.web.services.triggers import (
     _coerce_utc,
     _compute_next_run_at,
     _finish_trigger_run_after_task,
+    _mark_trigger_run_started,
     _PreparedTriggerStart,
     _start_prepared_trigger_run_id,
     dispatch_pending_trigger_runs,
@@ -600,6 +601,41 @@ def test_finish_trigger_run_after_task_finalizes_terminal_run(
         assert run.status == expected_run_status
         assert run.error_message == expected_error
         assert run.finished_at is not None
+    finally:
+        db.close()
+
+
+def test_mark_trigger_run_started_keeps_a_run_the_task_already_settled() -> None:
+    # The task runs in the background from begin_turn on and can fail and
+    # settle the run before the started marker's thread runs.
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    _set_task_status(start.task_id, TaskStatus.FAILED, error_message="boom")
+    _finish_trigger_run_after_task(start)
+    db = _direct_db_session()
+    try:
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == start.trigger_id).one()
+        )
+        # An earlier run's start failure: this run's start succeeded.
+        trigger.last_error = "TaskTurnError: earlier run"
+        db.commit()
+    finally:
+        db.close()
+
+    _mark_trigger_run_started(start)
+
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == start.run_id).one()
+        trigger = (
+            db.query(AgentTrigger).filter(AgentTrigger.id == start.trigger_id).one()
+        )
+        assert run.status == TriggerRunStatus.FAILED.value
+        assert run.error_message == "boom"
+        assert run.finished_at is not None
+        assert trigger.last_run_at is not None
+        assert trigger.last_error is None
     finally:
         db.close()
 

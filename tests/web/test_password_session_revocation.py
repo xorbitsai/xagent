@@ -101,9 +101,7 @@ def test_password_change_revokes_access_refresh_and_file_tickets(operation):
         raw_ticket = ticket["path"].split("ticket=", 1)[1]
         assert get_user_from_token(before["access_token"], session) is not None
         if operation == "reset":
-            user.password_reset_token_hash = auth.hash_password_reset_token(
-                "reset-secret"
-            )
+            user.password_reset_token_hash = auth.hash_auth_token("reset-secret")
             user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
                 minutes=5
             )
@@ -181,7 +179,7 @@ def test_reset_token_cannot_be_reused():
     auth_tests.setup_first_admin(password="old-password-123")
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).first()
-        user.password_reset_token_hash = auth.hash_password_reset_token("one-use")
+        user.password_reset_token_hash = auth.hash_auth_token("one-use")
         user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
             minutes=5
         )
@@ -205,7 +203,7 @@ def test_password_update_loses_conditional_write_without_rotating_epoch(
     token = auth_tests.login_and_get_token("administrator", "old-password-123")
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).one()
-        user.password_reset_token_hash = auth.hash_password_reset_token("race-reset")
+        user.password_reset_token_hash = auth.hash_auth_token("race-reset")
         user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
             minutes=5
         )
@@ -220,9 +218,7 @@ def test_password_update_loses_conditional_write_without_rotating_epoch(
             if conflict == "password-changed":
                 user.password_hash = winner_hash
             elif conflict == "reset-reissued":
-                user.password_reset_token_hash = auth.hash_password_reset_token(
-                    "replacement"
-                )
+                user.password_reset_token_hash = auth.hash_auth_token("replacement")
             else:
                 user.password_reset_expires_at = datetime.now(timezone.utc) - timedelta(
                     seconds=1
@@ -322,7 +318,7 @@ def test_admin_cli_reset_revokes_all_credentials(monkeypatch, late_publication):
                     "file_id": "example-file",
                 }
             )
-            user.password_reset_token_hash = auth.hash_password_reset_token("old-reset")
+            user.password_reset_token_hash = auth.hash_auth_token("old-reset")
             user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
                 minutes=5
             )
@@ -405,7 +401,7 @@ def test_password_change_wins_against_in_flight_token_publication(
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).one()
         user_id = user.id
-        user.password_reset_token_hash = auth.hash_password_reset_token("race-reset")
+        user.password_reset_token_hash = auth.hash_auth_token("race-reset")
         user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
             minutes=5
         )
@@ -554,7 +550,7 @@ async def test_open_websocket_is_revoked_and_owned_work_is_drained(
     )
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).one()
-        user.password_reset_token_hash = auth.hash_password_reset_token("race-reset")
+        user.password_reset_token_hash = auth.hash_auth_token("race-reset")
         user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
             minutes=5
         )

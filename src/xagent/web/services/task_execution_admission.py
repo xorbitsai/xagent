@@ -27,6 +27,7 @@ held task, including the waiter's own; it is display only (#2700).
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -80,27 +81,135 @@ class AdmissionQueueFull(RuntimeError):
     """The host must translate this retryable refusal at its ingress boundary."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class CommandClassification:
+    """What a deployment decided for one new execution command at acceptance."""
+
+    admission: AdmissionPolicy | None = None
+
+
+CommandClassifier = Callable[[Session, TaskExecutionCommand], CommandClassification]
 AdmissionHook = Callable[[Session, TaskExecutionCommand], AdmissionPolicy | None]
-_hook: AdmissionHook | None = None
+
+
+def upstream_command_classifier(
+    db: Session, command: TaskExecutionCommand
+) -> CommandClassification:
+    return CommandClassification()
+
+
+@dataclass(frozen=True)
+class _InstalledClassifier:
+    """The classifier and its admission declaration, replaced as one unit."""
+
+    classifier: CommandClassifier
+    admission_enabled: bool
+    legacy: bool = False
+
+
+_UPSTREAM = _InstalledClassifier(upstream_command_classifier, False)
+_installed = _UPSTREAM
+
+
+def _describe(classifier: CommandClassifier) -> str:
+    return getattr(classifier, "__qualname__", None) or repr(classifier)
+
+
+def _install(
+    classifier: CommandClassifier, admission_enabled: bool, *, legacy: bool
+) -> None:
+    global _installed
+    if not callable(classifier):
+        raise TypeError("command classifier must be callable")
+    if not isinstance(admission_enabled, bool):
+        raise TypeError("admission_enabled must be a bool")
+    _installed = _InstalledClassifier(classifier, admission_enabled, legacy)
+    logger.info(
+        "Command classifier installed: %s admission_enabled=%s",
+        _describe(classifier),
+        admission_enabled,
+    )
+
+
+def set_command_classifier(
+    classifier: CommandClassifier, *, admission_enabled: bool
+) -> None:
+    """Install the trusted deployment classifier for new execution commands.
+
+    Install it in every process that accepts commands and every process that
+    executes them. It is called once per new execution command, after the
+    command row is flushed and before the acceptance transaction commits.
+    The classifier runs inside the acceptance transaction: it must not commit
+    or roll back, and must not do slow I/O, because under SQLite that
+    transaction holds the database-wide writer lock.
+    Construct every field of its return value by keyword.
+    ``admission_enabled`` (a ``bool``) declares whether it may return an
+    admission policy.
+    """
+    _install(classifier, admission_enabled, legacy=False)
+
+
+def reset_command_classifier() -> None:
+    """Restore the upstream classifier; for tests and for clearing a legacy hook."""
+    global _installed
+    _installed = _UPSTREAM
+    logger.info("Command classifier reset to the upstream default")
 
 
 def set_task_admission_hook(hook: AdmissionHook | None) -> None:
-    """Install the trusted host classifier in both ingress and execution hosts."""
-    global _hook
-    _hook = hook
+    """Legacy entry point: install an admission-only classifier.
+
+    ``None`` clears a classifier installed through this function; a classifier
+    installed with ``set_command_classifier`` is left in place. Otherwise the
+    hook is called with ``(db, command)`` and its policy is staged as the
+    ticket.
+    """
+    if hook is None:
+        if _installed.legacy:
+            reset_command_classifier()
+        return
+
+    @functools.wraps(hook)
+    def legacy_admission_hook(
+        db: Session, command: TaskExecutionCommand
+    ) -> CommandClassification:
+        return CommandClassification(admission=hook(db, command))
+
+    _install(legacy_admission_hook, True, legacy=True)
 
 
 def admission_enabled() -> bool:
-    """Whether this host installed a classifier; without one it stages no ticket."""
-    return _hook is not None
+    """Whether the installed classifier declared that it stages admission tickets."""
+    return _installed.admission_enabled
 
 
-def stage_task_admission(db: Session, command: TaskExecutionCommand) -> None:
+def classify_command_no_commit(
+    db: Session, command: TaskExecutionCommand
+) -> CommandClassification:
+    """Run the installed classifier for one new execution command, exactly once.
+
+    Classifier exceptions propagate to the acceptance transaction unchanged.
+    A result of the wrong type, or an admission policy from a classifier that
+    declared ``admission_enabled=False``, is rejected before its admission
+    ticket is staged; the caller's rollback discards the flushed command row.
+    """
+    installed = _installed
+    result = installed.classifier(db, command)
+    if not isinstance(result, CommandClassification):
+        raise TypeError("command classifier must return CommandClassification")
+    if not installed.admission_enabled and result.admission is not None:
+        raise TypeError(
+            "command classifier returned an admission policy but was installed "
+            "with admission_enabled=False"
+        )
+    return result
+
+
+def stage_task_admission(
+    db: Session, command: TaskExecutionCommand, policy: AdmissionPolicy | None
+) -> None:
     """Stage a new command's ticket in its acceptance transaction, exactly once."""
-    if _hook is None or command.kind not in _EXECUTION_KINDS:
-        return
-    policy = _hook(db, command)
-    if policy is None:
+    if policy is None or command.kind not in _EXECUTION_KINDS:
         return
     if not get_shared_task_execution_enabled():
         raise RuntimeError("Execution admission requires shared task execution")
@@ -320,7 +429,8 @@ def waiting_for_capacity(db: Session, command_id: int) -> bool:
 
     Ingress uses this to acknowledge durable acceptance instead of holding a
     request until capacity opens; it never predicts the later execution. A
-    host without a classifier staged no ticket, so it has nothing to check.
+    host whose classifier did not declare admission staged no ticket, so it has
+    nothing to check.
     """
     if not admission_enabled():
         return False

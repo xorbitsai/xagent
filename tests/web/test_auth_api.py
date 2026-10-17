@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.exc import SQLAlchemyError
@@ -1382,7 +1382,16 @@ class TestAuthAPI:
 
         mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
-    def test_update_current_user_email(self, test_db, test_user_data):
+    def test_update_current_user_email(self, test_db, test_user_data, monkeypatch):
+        monkeypatch.setenv("XAGENT_SMTP_HOST", "smtp.example.com")
+        monkeypatch.setenv("XAGENT_SMTP_FROM_EMAIL", "no-reply@example.com")
+        monkeypatch.setattr(auth_api, "send_email_changed_notice", MagicMock())
+        sent = {}
+        monkeypatch.setattr(
+            auth_api,
+            "send_email_change_confirmation",
+            lambda email, token, app: sent.update(token=token),
+        )
         setup_first_admin()
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200
@@ -1401,7 +1410,15 @@ class TestAuthAPI:
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is True
-        assert data["user"]["email"] == "updated@example.com"
+        assert data["pending_confirmation"] is True
+        assert data["user"]["email"] == test_user_data["email"]
+        confirmed = client.post(
+            "/api/auth/email/confirm",
+            json={"token": sent["token"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert confirmed.json()["success"] is True
+        assert confirmed.json()["user"]["email"] == "updated@example.com"
 
     def test_logout_revokes_the_refresh_token_supplied_by_the_client(
         self, test_db, test_user_data
@@ -1431,12 +1448,15 @@ class TestAuthAPI:
         )
         assert refresh.status_code == 401
 
-    def test_oidc_user_email_update_does_not_require_local_password(self, test_db):
+    @pytest.mark.parametrize("email", [None, "oidc@example.com"])
+    def test_oidc_user_email_update_is_disabled_without_local_password(
+        self, test_db, email
+    ):
         db = TestingSessionLocal()
         try:
             user = User(
                 username="oidc-user",
-                email="oidc@example.com",
+                email=email,
                 password_hash="!oidc-google",
             )
             db.add(user)
@@ -1446,15 +1466,17 @@ class TestAuthAPI:
             result = asyncio.run(
                 auth_api.update_current_user_email(
                     request=auth_api.UpdateEmailRequest(email="new@example.com"),
+                    http_request=Request({"type": "http", "headers": []}),
                     db=db,
                     user=user,
                 )
             )
 
-            assert result.success is True
-            assert result.user is not None
-            assert result.user["email"] == "new@example.com"
-            assert result.user["has_password"] is False
+            assert result.success is False
+            assert result.error_code == "provider_managed"
+            assert "passwordless" in result.message
+            assert "administrator" in result.message
+            assert user.email == email
         finally:
             db.close()
 

@@ -10,7 +10,7 @@ from .api.auth import hash_password
 from .auth_config import PASSWORD_MIN_LENGTH
 from .auth_sessions import new_session_epoch
 from .models.database import get_db, init_db
-from .models.user import User
+from .models.user import User, email_confirmation_clear_values
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +113,7 @@ def reset_admin_password(username: str, new_password: str) -> None:
                     User.password_reset_token_hash: None,
                     User.password_reset_expires_at: None,
                     User.session_epoch: new_session_epoch(),
+                    **email_confirmation_clear_values(),
                 },
                 synchronize_session=False,
             )

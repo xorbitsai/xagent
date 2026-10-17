@@ -313,7 +313,13 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
 ) -> None:
     host = cap_host
     set_limit(monkeypatch, 3)
-    monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 30.0)
+    # Short enough to stay well inside the waits below. A losing attempt for
+    # the task that just won can hold its reservation until that execution
+    # ends; releasing it signals nothing (see dispatch_one_task_command), so
+    # the slot is taken at the next idle poll. What this test proves is the
+    # cap admitting exactly one, which no idle poll can change;
+    # test_release_wakeups_outcome[1] proves a freed slot wakes the dispatcher.
+    monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 1.0)
     for _ in range(2):
         host.live(host.new_task())
     rolling_trials, concurrent_trials = 25, 30
@@ -337,12 +343,25 @@ async def test_one_notify_one_free_slot_admits_exactly_one(
         assert len(host.claimed) == before + 1, trial
     assert max(host.registered_active_sizes) <= 3
     await transport.stop_task_command_dispatcher()
+    # A losing attempt for the task that just won waits in execute_command for
+    # that execution to end. Stopping the dispatcher interrupts it, and the
+    # owner may then close and cancel that execution. Let every owner settle,
+    # then free slots until exactly one is open, whatever the stop freed.
+    await eventually(
+        lambda: all(
+            coordinator.state == runtime.CoordinatorState.ACTIVE
+            and not coordinator._command_tasks
+            for coordinator in host.registry._coordinators.values()
+        )
+    )
+    while len(host.manager._active_task_ids()) >= 3:
+        victim = host.held.pop(next(i for i, h in enumerate(host.held) if not h.done()))
+        victim.cancel()
+        await asyncio.gather(victim, return_exceptions=True)
+    assert len(host.manager._active_task_ids()) == 2
 
     # Four attempts that all saw an open cap and hold different candidates
     # race for the one free slot: exactly one may take it.
-    victim = host.held.pop(next(i for i, h in enumerate(host.held) if not h.done()))
-    victim.cancel()
-    await asyncio.gather(victim, return_exceptions=True)
     real_find = transport._find_command_candidate
     for trial in range(concurrent_trials):
         pending = pending_start_commands(host)[:4]
@@ -955,7 +974,12 @@ async def test_release_wakeups_outcome(
 ) -> None:
     host = cap_host
     attempts = Attempts(monkeypatch)
-    if row != 4:
+    if row == 1:
+        # Idle waits never time out within the test, so only the end of an
+        # execution can wake the dispatcher. That proves the wake-up without a
+        # wall-clock bound, which a loaded CI runner can miss (#3141).
+        monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 3600.0)
+    elif row != 4:
         monkeypatch.setattr(transport, "DISPATCHER_IDLE_SECONDS", 30.0)
 
     if row == 1:
@@ -963,13 +987,13 @@ async def test_release_wakeups_outcome(
         lives = [host.live(host.new_task()) for _ in range(2)]
         pending = host.enqueue(host.new_task(), "start")
         transport.start_task_command_dispatcher(host.handler)
-        await eventually(lambda: attempts.count >= 1)
+        # Every worker has taken its cap snapshot, so none can see the freed
+        # slot through a first attempt that starts late.
+        await eventually(lambda: attempts.count >= transport.DISPATCHER_CONCURRENCY)
         await asyncio.sleep(0.2)
         assert host.row(pending).status == "pending"
         lives[0][1].set()
-        started = time.monotonic()
-        await eventually(lambda: len(host.claimed) == 1, timeout=1.0)
-        assert time.monotonic() - started < 1.0
+        await eventually(lambda: len(host.claimed) == 1)
     elif row in (2, 3):
         set_limit(monkeypatch, 80)
         if row == 3:

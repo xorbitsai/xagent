@@ -1803,12 +1803,29 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
         if run is None or trigger is None:
             return
         started_at = run.started_at or _now()
-        setattr(run, "status", TriggerRunStatus.RUNNING.value)
-        setattr(run, "started_at", started_at)
-        setattr(run, "error_message", None)
+        # The task runs in the background from begin_turn on, so it can fail
+        # and settle this run before this thread gets here. Never move a
+        # settled run back to running: it would keep its finished_at and stay
+        # "running" for good, since the run is settled only once.
+        db.execute(
+            update(TriggerRun)
+            .where(TriggerRun.id == start.run_id)
+            .where(
+                TriggerRun.status.in_(
+                    (TriggerRunStatus.PENDING.value, TriggerRunStatus.RUNNING.value)
+                )
+            )
+            .values(
+                status=TriggerRunStatus.RUNNING.value,
+                started_at=started_at,
+                error_message=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        # The start succeeded either way. last_error records start failures
+        # only (_mark_run_failed), so whatever it holds is an earlier run's.
         setattr(trigger, "last_run_at", started_at)
         setattr(trigger, "last_error", None)
-        db.add(run)
         db.add(trigger)
         db.commit()
     finally:

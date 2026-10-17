@@ -1,4 +1,5 @@
 import uuid
+from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -45,6 +46,9 @@ class User(Base):  # type: ignore
     password_reset_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Changing the generation invalidates all previous user access credentials.
     session_epoch = Column(String(32), nullable=True)
+    pending_email = Column(String(255), nullable=True)
+    email_confirmation_hash = Column(String(64), nullable=True)
+    email_confirmation_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Onboarding-collected settings: {onboarded, department, industry, voice,
     # goals}. Written incrementally (one PATCH per onboarding step merges
     # into this dict, not replaces it) - see update_current_user_preferences
@@ -129,6 +133,15 @@ class User(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username='{self.username}', is_admin={self.is_admin})>"
+
+
+def email_confirmation_clear_values() -> dict[Any, None]:
+    """Clear the complete pending proof in the caller's atomic user update."""
+    return {
+        User.pending_email: None,
+        User.email_confirmation_hash: None,
+        User.email_confirmation_expires_at: None,
+    }
 
 
 class UserModel(Base):  # type: ignore

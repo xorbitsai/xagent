@@ -740,8 +740,9 @@ async def test_fenced_reply_rejection_settles_busy_without_resuming(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("install", ["legacy", "classifier"])
 async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
-    reply, monkeypatch, request
+    reply, monkeypatch, request, install
 ):
     source = "sdk"
     from unittest.mock import Mock
@@ -750,10 +751,21 @@ async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
     from xagent.web.services import task_execution_admission as admission
 
     monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
-    admission.set_task_admission_hook(
-        lambda db, command: admission.AdmissionPolicy("tenant:batch", 1, 20)
-    )
-    request.addfinalizer(lambda: admission.set_task_admission_hook(None))
+
+    def hook(db, command):
+        return admission.AdmissionPolicy("tenant:batch", 1, 20)
+
+    if install == "legacy":
+        admission.set_task_admission_hook(hook)
+        request.addfinalizer(lambda: admission.set_task_admission_hook(None))
+    else:
+        admission.set_command_classifier(
+            lambda db, command: admission.CommandClassification(
+                admission=hook(db, command)
+            ),
+            admission_enabled=True,
+        )
+        request.addfinalizer(admission.reset_command_classifier)
     holding = saturate_bucket(reply.task_owner_user_id, reply.agent_id)
 
     async def submit():

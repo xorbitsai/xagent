@@ -272,7 +272,8 @@ async def enqueue_resume_input(
     )
     notify_task_command_dispatcher()
     # Only SDK ingress projects a queued reply; A2A has no projection for it
-    # and keeps waiting, and a host without a classifier staged no ticket.
+    # and keeps waiting, and a host whose classifier did not declare admission
+    # staged no ticket.
     acknowledge_queued = source == "sdk" and admission_enabled()
     # These APIs already wait for checkpoint validation and local scheduling.
     # Preserve that response boundary while preparation now runs on a worker.

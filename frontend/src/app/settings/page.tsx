@@ -21,11 +21,21 @@ import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 import { ExecutionBudgetSettings } from "@/components/settings/execution-budget"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 
+function emailErrorText(data: { message?: unknown; detail?: unknown }, fallback: string): string {
+  if (typeof data.message === "string" && data.message) return data.message
+  if (typeof data.detail === "string" && data.detail) return data.detail
+  return fallback
+}
+
 export default function SettingsPage() {
   const { user, session } = useAuth()
   const { t, locale, setLocale } = useI18n()
   const [email, setEmail] = useState(user?.email || "")
   const [emailCurrentPassword, setEmailCurrentPassword] = useState("")
+  const [emailConfirmationToken, setEmailConfirmationToken] = useState("")
+  const [pendingEmail, setPendingEmail] = useState<string | null>(null)
+  const [emailChangeAvailable, setEmailChangeAvailable] = useState(true)
+  const [confirmationMinutes, setConfirmationMinutes] = useState(15)
   const [isProfileLoading, setIsProfileLoading] = useState(true)
   const [isSavingEmail, setIsSavingEmail] = useState(false)
   const [emailMessage, setEmailMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -54,12 +64,15 @@ export default function SettingsPage() {
           if (!isMounted) return
           if (updated.status === "updated") {
             setEmail(data.user.email || "")
+            setPendingEmail(data.user.pending_email || null)
+            setEmailChangeAvailable(data.user.email_change_available !== false)
+            setConfirmationMinutes(data.user.email_confirmation_expire_minutes || 15)
             setEmailMessage(null)
           } else if (updated.status === "advanced") {
             applyCanonicalEmail()
           }
         } else {
-          setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
+          setEmailMessage({ type: 'error', text: emailErrorText(data, t("settings.email.failed")) })
         }
       } catch {
         if (isMounted) {
@@ -153,9 +166,15 @@ export default function SettingsPage() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 placeholder={t("settings.email.placeholder")}
-                disabled={isProfileLoading || isSavingEmail}
+                disabled={isProfileLoading || isSavingEmail || !hasPassword || !emailChangeAvailable}
               />
             </div>
+
+            {!hasPassword ? (
+              <p className="text-sm text-muted-foreground">{t("settings.email.providerManaged")}</p>
+            ) : !emailChangeAvailable && (
+              <p className="text-sm text-muted-foreground">{t("settings.email.smtpRequired")}</p>
+            )}
 
             {hasPassword && (
               <div className="space-y-2">
@@ -172,12 +191,32 @@ export default function SettingsPage() {
             )}
 
             <Button
-              onClick={handleEmailUpdate}
-              disabled={isProfileLoading || isSavingEmail || !email.trim() || (hasPassword && !emailCurrentPassword)}
+              onClick={() => void handleEmailUpdate()}
+              disabled={isProfileLoading || isSavingEmail || !hasPassword || !emailChangeAvailable || !email.trim() || !emailCurrentPassword}
               className="w-full"
             >
               {isSavingEmail ? t("settings.email.submitting") : t("settings.email.submit")}
             </Button>
+            {hasPassword && pendingEmail && <div className="space-y-2">
+              <p className="text-sm">{t("settings.email.pendingAddress", { email: pendingEmail })}</p>
+              <Label htmlFor="email-confirmation-code">{t("settings.email.confirmationCode")}</Label>
+              <Input
+                id="email-confirmation-code"
+                value={emailConfirmationToken}
+                onChange={(event) => setEmailConfirmationToken(event.target.value)}
+                autoComplete="off"
+                maxLength={128}
+                disabled={isProfileLoading || isSavingEmail}
+              />
+              <p className="text-sm text-muted-foreground">{t("settings.email.confirmationHint", { minutes: confirmationMinutes })}</p>
+              <Button
+                onClick={() => void handleEmailUpdate(true)}
+                disabled={isProfileLoading || isSavingEmail || !emailConfirmationToken.trim()}
+                className="w-full"
+              >
+                {t("settings.email.confirm")}
+              </Button>
+            </div>}
           </CardContent>
         </Card>
 
@@ -310,8 +349,8 @@ export default function SettingsPage() {
     }
   }
 
-  async function handleEmailUpdate() {
-    if (!email.trim()) {
+  async function handleEmailUpdate(confirm = false) {
+    if (!confirm && !email.trim()) {
       setEmailMessage({ type: 'error', text: t("settings.email.errors.required") })
       return
     }
@@ -321,14 +360,14 @@ export default function SettingsPage() {
 
     try {
       const capturedSession = session
-      const response = await apiRequest(`${getApiUrl()}/api/auth/email`, {
-        method: 'PATCH',
+      const response = await apiRequest(`${getApiUrl()}/api/auth/email${confirm ? "/confirm" : ""}`, {
+        method: confirm ? 'POST' : 'PATCH',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
+        body: JSON.stringify(confirm ? { token: emailConfirmationToken.trim() } : {
           email,
-          ...(hasPassword ? { current_password: emailCurrentPassword } : {}),
+          current_password: emailCurrentPassword,
         })
       })
 
@@ -336,21 +375,32 @@ export default function SettingsPage() {
 
       if (response.ok && data.success) {
         const nextEmail = data.user?.email || ""
+        const nextPendingEmail = data.user?.pending_email || (data.pending_confirmation ? email.trim() : null)
+        const messageKey = data.unchanged
+          ? nextPendingEmail ? "settings.email.unchangedPending" : "settings.email.unchanged"
+          : data.pending_confirmation ? "settings.email.confirmationSent" : "settings.email.success"
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
-          setEmailCurrentPassword('')
-          setEmailMessage({ type: 'success', text: t("settings.email.success") })
         } else if (updated.status === "advanced") {
+          // Keep the newer canonical profile, but retain this request's pending
+          // confirmation UI. Never carry it across a replacement login.
           applyCanonicalEmail()
-          setEmailMessage(null)
         } else {
           applyCanonicalEmail()
           setEmailMessage({ type: 'error', text: t("settings.email.failed") })
           return
         }
+        setPendingEmail(nextPendingEmail)
+        setEmailCurrentPassword('')
+        setEmailConfirmationToken('')
+        setEmailMessage({ type: 'success', text: t(messageKey) })
       } else {
-        setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
+        const localizedError = data.error_code === "smtp_not_configured"
+          ? t("settings.email.smtpRequired")
+          : data.error_code === "provider_managed" ? t("settings.email.providerManaged") : null
+        if (data.error_code === "smtp_not_configured") setEmailChangeAvailable(false)
+        setEmailMessage({ type: 'error', text: localizedError || emailErrorText(data, t("settings.email.failed")) })
       }
     } catch {
       setEmailMessage({ type: 'error', text: t("settings.email.errors.network") })
@@ -367,6 +417,7 @@ export default function SettingsPage() {
   }
 
   function applyCanonicalEmail() {
+    setPendingEmail(null)
     const inspection = inspectAuthSession()
     if (inspection.status === "valid") setEmail(inspection.projection.cache.user.email || "")
   }

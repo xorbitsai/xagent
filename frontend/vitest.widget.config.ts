@@ -4,7 +4,7 @@ import baseConfig from "./vitest.config"
 const widgetConfig = mergeConfig(baseConfig, defineConfig({
   test: {
     coverage: {
-      provider: "v8",
+      provider: "istanbul",
       include: [
         "public/widget.js",
         "src/app/widget/chat/[[]token[]]/page-client.tsx",

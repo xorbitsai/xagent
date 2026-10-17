@@ -9,6 +9,7 @@ export default defineConfig({
     alias: { "@": path.resolve(__dirname, "src") },
   },
   test: {
+    clearMocks: true,
     environment: "jsdom",
     setupFiles: ["./src/vitest.setup.ts"],
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],

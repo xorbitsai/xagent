@@ -2535,7 +2535,7 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     const RealDateTimeFormat = Intl.DateTimeFormat
     const dtfSpy = vi
       .spyOn(Intl, "DateTimeFormat")
-      .mockImplementation((...args: ConstructorParameters<typeof Intl.DateTimeFormat>) => {
+      .mockImplementation(function (...args: ConstructorParameters<typeof Intl.DateTimeFormat>) {
         if (args.length === 0) {
           return { resolvedOptions: () => ({ timeZone: "America/New_York" }) } as Intl.DateTimeFormat
         }
@@ -2601,7 +2601,7 @@ describe("AgentTriggersDialog schedule recurrence", () => {
     const RealDateTimeFormat = Intl.DateTimeFormat
     const dtfSpy = vi
       .spyOn(Intl, "DateTimeFormat")
-      .mockImplementation((...args: ConstructorParameters<typeof Intl.DateTimeFormat>) => {
+      .mockImplementation(function (...args: ConstructorParameters<typeof Intl.DateTimeFormat>) {
         if (args.length === 0) {
           return { resolvedOptions: () => ({ timeZone: "America/New_York" }) } as Intl.DateTimeFormat
         }

@@ -989,7 +989,7 @@ describe("ChatInput", () => {
   })
 
   it("stops a stale media stream when voice capability is restored before getUserMedia resolves", async () => {
-    let resolveStream!: (stream: { getTracks: () => Array<{ stop: ReturnType<typeof vi.fn> }> }) => void
+    let resolveStream!: (stream: typeof staleStream) => void
     const staleTrackStop = vi.fn()
     const staleStream = {
       getTracks: () => [{ stop: staleTrackStop }],

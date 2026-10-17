@@ -1,12 +1,7 @@
-import { readFileSync } from "node:fs"
-import { resolve } from "node:path"
-import { pathToFileURL } from "node:url"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { WidgetParentMessageType } from "@/lib/widget-parent-message"
 
-const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
-const widgetScript = readFileSync(widgetScriptPath, "utf8")
-const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
+import { evaluateWidgetScript, widgetScript } from "@/test-utils/widget-script"
 
 const HOST = "https://chat.example"
 
@@ -18,7 +13,7 @@ function runWidget(attributes: Record<string, string> = { "data-widget-key": "wi
   }
   document.body.appendChild(script)
   Object.defineProperty(document, "currentScript", { configurable: true, value: script })
-  window.eval(`${widgetScript}\n//# sourceURL=${widgetScriptUrl}`)
+  evaluateWidgetScript()
 }
 
 function panelEl() {

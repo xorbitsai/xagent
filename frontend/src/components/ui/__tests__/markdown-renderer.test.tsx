@@ -6,6 +6,11 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn() }),
+  usePathname: () => '/task',
+}))
+
 describe('KaTeX renderer trust boundary', () => {
   it.each([
     String.raw`\href{javascript:alert(1)}{click}`,
@@ -85,6 +90,21 @@ import {
 describe('MarkdownRenderer', () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+  })
+
+  it('loads an enabled agent card through the authenticated API boundary', async () => {
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => ({
+      name: 'Verified agent', description: 'Bounded agent details', status: 'draft',
+    }) })
+    render(<MarkdownRenderer content="[Read agent](agent://42)" agentCardsEnabled />)
+    expect(await screen.findByText('Verified agent')).toBeInTheDocument()
+    expect(apiRequestMock).toHaveBeenCalledWith('http://api.local/api/agents/42')
+  })
+
+  it('renders failed agent lookup as an inert fallback card', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, statusText: 'Not found' })
+    render(<MarkdownRenderer content="[Unknown agent](agent://missing)" agentCardsEnabled />)
+    expect(await screen.findByText('markdownRenderer.loadAgentDetailsFailed')).toBeInTheDocument()
   })
 
   it('retains snake-case filenames as the safe label for file records', () => {

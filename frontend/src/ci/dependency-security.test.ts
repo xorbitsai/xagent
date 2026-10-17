@@ -10,7 +10,6 @@ describe("patched dependency resolution", () => {
     ["form-data", "4.0.6"],
     ["image-size", "2.0.3"],
     ["postcss-selector-parser", "7.1.6"],
-    ["tinypool", "2.1.2"],
   ])("pins every transitive %s copy to its verified patch", (name, version) => {
     expect(manifest.overrides[name]).toBe(version)
     const copies = Object.entries(lock.packages).filter(([location]) =>
@@ -21,12 +20,13 @@ describe("patched dependency resolution", () => {
   })
 
   it("keeps the verified test runner, coverage provider and Vite in the lockfile", () => {
-    for (const name of ["vitest", "@vitest/coverage-v8"]) {
-      expect(manifest.devDependencies[name]).toBe("3.2.6")
-      expect(lock.packages[`node_modules/${name}`].version).toBe("3.2.6")
+    for (const name of ["vitest", "@vitest/coverage-istanbul"]) {
+      expect(manifest.devDependencies[name]).toBe("4.1.12")
+      expect(lock.packages[`node_modules/${name}`].version).toBe("4.1.12")
     }
     expect(lock.packages["node_modules/vite"].version).toBe("7.3.7")
     expect(manifest.dependencies.pptxgenjs).toBe("4.0.1")
+    expect(Object.keys(lock.packages).some(location => location.endsWith("node_modules/tinypool"))).toBe(false)
   })
 
   it("still creates a real Node PPTX containing the original PNG", () => {

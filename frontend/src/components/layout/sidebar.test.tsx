@@ -18,6 +18,7 @@ const authState = vi.hoisted(() => ({
 const toast = vi.hoisted(() => ({ error: vi.fn() }))
 const routeState = vi.hoisted(() => ({ pathname: "/task" }))
 const navState = vi.hoisted(() => ({ groups: [] as unknown[] }))
+const apiRequestMock = vi.hoisted(() => vi.fn(async () => new Response(null, { status: 401 })))
 
 vi.mock("next/navigation", () => ({ usePathname: () => routeState.pathname, useRouter: () => ({ push: vi.fn() }) }))
 vi.mock("next/image", () => ({ default: (props: React.ImgHTMLAttributes<HTMLImageElement>) => <img {...props} /> }))
@@ -26,11 +27,57 @@ vi.mock("@/contexts/auth-context", () => ({ useAuth: () => authState }))
 vi.mock("@/contexts/app-context-chat", () => ({ useApp: () => ({ state: { lastTaskUpdate: 0 } }) }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 vi.mock("@/components/ui/sonner", () => ({ toast }))
+vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 vi.mock("@/lib/branding", () => ({ getBrandingFromEnv: () => ({ appName: "Xagent" }) }))
 vi.mock("@/lib/extra-nav", () => ({ default: [] }))
 vi.mock("@/lib/sidebar-navigation", () => ({
   getNavigationGroupsForUser: () => navState.groups, getUserMenuItemsForUser: () => [],
 }))
+
+describe("Sidebar task and release presentation", () => {
+  beforeEach(() => {
+    routeState.pathname = "/task/current"
+    navState.groups = []
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(async () => new Response(JSON.stringify({ tasks: [], pagination: { total_pages: 1 } })))
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 503 })))
+  })
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    apiRequestMock.mockImplementation(async () => new Response(null, { status: 401 }))
+  })
+
+  it("renders active task status, channel badges and agent icons from the task list", async () => {
+    const tasks = ["running", "completed", "failed", "paused", "waiting_for_user", "pending"].map((status, index) => ({
+      task_id: index === 0 ? "current" : `task-${index}`, title: `Task ${status}`, status,
+      channel_name: `Support ${index}`, channel_type: ["telegram", "slack", "feishu", "custom", "", undefined][index],
+      ...(index === 0 ? { agent_id: 42, agent_logo_url: "/agent.svg" } : {}),
+    }))
+    apiRequestMock.mockImplementation(async () => new Response(JSON.stringify({ tasks, pagination: { total_pages: 1 } })))
+    render(<Sidebar allowCollapse={false} />)
+    for (const task of tasks) expect(await screen.findByRole("link", { name: new RegExp(task.title) })).toHaveAttribute("href", `/task/${task.task_id}`)
+    expect(screen.getByAltText("Agent Logo")).toHaveAttribute("src", expect.stringContaining("/agent.svg"))
+    expect(screen.getAllByText(/Support/)).toHaveLength(6)
+  })
+
+  it.each([
+    { stars: 42, formatted: "42", latest: true, status: "versionLatest" },
+    { stars: 1200, formatted: "1.2k", latest: false, status: "versionUpdateAvailable" },
+    { stars: 2400000, formatted: "2.4M", latest: null, status: "versionStatusUnknown" },
+  ])("shows release status and formats $stars repository stars", async ({ stars, formatted, latest, status }) => {
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => new Response(JSON.stringify(
+      url.includes("api.github.com") ? { stargazers_count: stars } : { version: "1.2.3", display_version: "v1.2.3", is_latest: latest },
+    ))))
+    render(<Sidebar allowCollapse={false} />)
+    fireEvent.click(screen.getByRole("button", { name: /alice@example\.com/i }))
+    fireEvent.click(screen.getByRole("button", { name: "sidebar.about.menu" }))
+    expect(await screen.findByText(`sidebar.about.stars: ${formatted}`)).toBeInTheDocument()
+    expect(screen.getByTitle(`sidebar.about.${status}`)).toBeInTheDocument()
+    expect(screen.getByText(/v1\.2\.3/)).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "sidebar.about.license" })).toHaveAttribute("rel", "noopener noreferrer")
+  })
+})
 
 describe("Sidebar logout", () => {
   beforeEach(() => {

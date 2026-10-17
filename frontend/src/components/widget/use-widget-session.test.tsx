@@ -58,6 +58,33 @@ afterEach(() => {
 })
 
 describe("useWidgetSession", () => {
+  it.each([
+    null, [], {},
+    { id: 0, name: "Agent", suggested_prompts: [] },
+    { id: 1, name: " ", suggested_prompts: [] },
+    { id: 1, name: "Agent", description: 1, suggested_prompts: [] },
+    { id: 1, name: "Agent", logo_url: {}, suggested_prompts: [] },
+    { id: 1, name: "Agent", suggested_prompts: [1] },
+  ])("rejects malformed untrusted agent metadata: %p", agent => {
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ agent }))
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.session).toBeNull()
+    expect(result.current.terminalCode).toBe("unexpected_error")
+  })
+
+  it.each([null, [], false, "invalid"])("ignores non-record parent messages: %p", data => {
+    const { result } = renderHook(() => useWidgetSession())
+    act(() => window.dispatchEvent(new MessageEvent("message", {
+      data, origin: PARENT_ORIGIN, source: EMBEDDED_PARENT as unknown as Window,
+    })))
+    expect(result.current.status).toBe("waiting")
+  })
+
+  it("rejects non-HTTP WebSocket origins", () => {
+    expect(() => buildWidgetSessionWebSocketUrl("file:///tmp/result")).toThrow("HTTP(S)")
+  })
+
   it("announces credential-free readiness with the bootstrap target origin", () => {
     const postMessage = vi.spyOn(window, "postMessage")
 

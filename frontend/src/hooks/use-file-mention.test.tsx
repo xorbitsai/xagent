@@ -26,7 +26,7 @@ vi.mock("@/components/chat/FileChip", () => ({
 
 import { useFileMention } from "./use-file-mention"
 
-function HookHarness({ filesDisabled = false }: { filesDisabled?: boolean }) {
+function HookHarness({ filesDisabled = false, inputKey = "Enter" }: { filesDisabled?: boolean; inputKey?: string }) {
   const editorRef = React.useRef<HTMLDivElement>(null)
   const containerRef = React.useRef<HTMLDivElement>(null)
   const [keyHandled, setKeyHandled] = React.useState<boolean | null>(null)
@@ -52,7 +52,7 @@ function HookHarness({ filesDisabled = false }: { filesDisabled?: boolean }) {
         insert-file
       </button>
       <button onClick={() => setKeyHandled(mention.handleKeyDown({
-        key: "Enter",
+        key: inputKey,
         preventDefault: vi.fn(),
       } as unknown as React.KeyboardEvent))}>
         handle-key
@@ -90,6 +90,16 @@ describe("useFileMention", () => {
     vi.restoreAllMocks()
     vi.useRealTimers()
     cleanup()
+  })
+
+  it.each(["ArrowUp", "ArrowDown", "Escape", "Tab", "x"])("handles the open picker's %s key according to its keyboard contract", async key => {
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => ({ files: [] }) })
+    render(<HookHarness inputKey={key} />)
+    fireEvent.click(screen.getByText("force-picker"))
+    fireEvent.click(screen.getByText("handle-key"))
+    expect(screen.getByTestId("key-handled")).toHaveTextContent(String(key !== "x"))
+    expect(screen.getByTestId("picker-visible")).toHaveTextContent(String(key !== "Escape"))
+    expect(createFileChipHTMLMock).not.toHaveBeenCalled()
   })
 
   it("uses server-side search for mention queries", async () => {
@@ -182,5 +192,22 @@ describe("useFileMention", () => {
 
     expect(screen.getByTestId("picker-visible")).toHaveTextContent("false")
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("closes a mention and clears its query when the selection disappears", () => {
+    render(<HookHarness />)
+    fireEvent.click(screen.getByText("force-picker"))
+    window.getSelection()?.removeAllRanges()
+    fireEvent.click(screen.getByText("check-trigger"))
+    expect(screen.getByTestId("picker-visible")).toHaveTextContent("false")
+  })
+
+  it("reports an authenticated listing error and clears loading", async () => {
+    apiRequestMock.mockRejectedValue(new Error("listing failed"))
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    render(<HookHarness />)
+    fireEvent.click(screen.getByText("force-picker"))
+    await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+    expect(toastErrorMock).toHaveBeenCalledWith("files.previewDialog.errors.loadFailed")
   })
 })

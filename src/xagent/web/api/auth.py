@@ -128,6 +128,7 @@ from ..services.user_oauth import (
     scoped_user_oauth_query,
 )
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
+from ..utils.script_json import script_safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -5682,7 +5683,9 @@ def generic_oauth_callback(
             try:
                 parsed = urlparse(redirect_url)
                 if parsed.scheme and parsed.netloc:
-                    target_origin = json.dumps(f"{parsed.scheme}://{parsed.netloc}")
+                    target_origin = script_safe_json(
+                        f"{parsed.scheme}://{parsed.netloc}"
+                    )
             except Exception:
                 pass
 
@@ -5694,8 +5697,8 @@ def generic_oauth_callback(
                 <script>
                     window.opener.postMessage({{
                         type: 'oauth-success',
-                        email: {json.dumps(email)},
-                        provider: {json.dumps(app_id or provider)}
+                        email: {script_safe_json(email)},
+                        provider: {script_safe_json(app_id or provider)}
                     }}, {target_origin});
                     window.close();
                 </script>

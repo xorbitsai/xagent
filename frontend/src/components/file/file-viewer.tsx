@@ -171,41 +171,36 @@ export function FileViewer({
   const videoMimeType = getVideoMimeType(fileName, mimeType)
   const audioMimeType = getAudioMimeType(fileName, mimeType, content)
   const base64Content = getBase64Payload(content)
-  const [videoObjectUrl, setVideoObjectUrl] = React.useState<string | null>(null)
+  const blobMimeType = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')
+    ? 'application/pdf' : videoMimeType
+  const [mediaObjectUrl, setMediaObjectUrl] = React.useState<string | null>(null)
   const [htmlPreviewContent, setHtmlPreviewContent] = React.useState("")
 
   React.useEffect(() => {
-    if (!videoMimeType || !base64Content) {
-      setVideoObjectUrl(null)
+    if (!blobMimeType || !base64Content) {
+      setMediaObjectUrl(null)
       return
     }
 
-    let active = true
     let objectUrl: string | null = null
-
-    fetch(`data:${videoMimeType};base64,${base64Content.replace(/\s/g, "")}`)
-      .then((response) => response.blob())
-      .then((blob) => {
-        objectUrl = URL.createObjectURL(blob)
-        if (!active) {
-          URL.revokeObjectURL(objectUrl)
-          return
-        }
-        setVideoObjectUrl(objectUrl)
-      })
-      .catch((error) => {
-        if (!active) return
-        console.error("Video preview decode error:", error)
-        setVideoObjectUrl(null)
-      })
+    try {
+      // Decode locally: fetch(data:) is blocked by the page's connect-src.
+      const decoded = atob(base64Content.replace(/\s/g, ""))
+      const bytes = new Uint8Array(decoded.length)
+      for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i)
+      objectUrl = URL.createObjectURL(new Blob([bytes], { type: blobMimeType }))
+      setMediaObjectUrl(objectUrl)
+    } catch (error) {
+      console.error("Media preview decode error:", error)
+      setMediaObjectUrl(null)
+    }
 
     return () => {
-      active = false
       if (objectUrl) {
         URL.revokeObjectURL(objectUrl)
       }
     }
-  }, [base64Content, videoMimeType])
+  }, [base64Content, blobMimeType])
 
   const processHtmlContent = React.useCallback((htmlContent: string, fileId: string) => {
     const rewritten = htmlContent.replace(
@@ -283,7 +278,7 @@ export function FileViewer({
       ) : mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf') ? (
         <div className="flex items-center justify-center h-full p-4">
           <iframe
-            src={`data:application/pdf;base64,${base64Content}`}
+            src={mediaObjectUrl || undefined}
             className="w-full h-full border-0"
             title={fileName}
           />
@@ -294,7 +289,7 @@ export function FileViewer({
             controls
             playsInline
             preload="metadata"
-            src={videoObjectUrl || undefined}
+            src={mediaObjectUrl || undefined}
             className="max-h-full max-w-full rounded border border-border/30 bg-black shadow-sm"
             aria-label={fileName}
             title={fileName}

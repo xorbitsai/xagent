@@ -76,7 +76,7 @@ export const createFileChipHTML = (path: string, fileId?: string, filename?: str
   const containerClass = cn(fileChipBaseClasses, "relative top-[-2px] mr-2 cursor-pointer hover:bg-secondary/90 file-chip-preview", className);
 
   return `
-    <span contenteditable="false" data-file-path="${path}" data-file-id="${fileId || ''}" data-filename="${displayFileName}" class="${containerClass}">
+    <span contenteditable="false" data-file-path="${escapeChipHtml(path)}" data-file-id="${escapeChipHtml(fileId || '')}" data-filename="${escapeChipHtml(displayFileName)}" class="${escapeChipHtml(containerClass)}">
       <span class="relative w-3.5 h-3.5 flex items-center justify-center">
         <span class="absolute inset-0 flex items-center justify-center transition-opacity group-hover:opacity-0">
           ${iconHtml}
@@ -85,7 +85,29 @@ export const createFileChipHTML = (path: string, fileId?: string, filename?: str
           ${deleteIconHtml}
         </button>
       </span>
-      <span class="text-[11px] font-medium text-foreground/70 truncate max-w-[200px]">${displayFileName}</span>
+      <span class="text-[11px] font-medium text-foreground/70 truncate max-w-[200px]">${escapeChipHtml(displayFileName)}</span>
     </span>&#8203;
   `.trim();
 };
+
+function escapeChipHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+/** Parse raw message tokens before escaping; never reparse generated chip HTML. */
+export function renderFileMentionsHtml(source: string, legacyBackticks = false): string {
+  const tokens = legacyBackticks
+    ? /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)|`([^`]+)`/g
+    : /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
+  let result = "";
+  let copied = 0;
+  for (const match of source.matchAll(tokens)) {
+    result += escapeChipHtml(source.slice(copied, match.index));
+    result += match[3] !== undefined
+      ? createFileChipHTML(match[3])
+      : createFileChipHTML(match[2], match[2], match[1]);
+    copied = match.index! + match[0].length;
+  }
+  return result + escapeChipHtml(source.slice(copied));
+}

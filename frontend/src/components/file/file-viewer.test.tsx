@@ -167,6 +167,23 @@ describe("FileViewer Markdown preview", () => {
   })
 })
 
+describe("FileViewer PDF preview", () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks() })
+
+  it("uses a revocable blob URL allowed by frame-src without a data fetch", () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
+    const view = render(<FileViewer fileName="report.pdf" fileId="pdf-id"
+      content="JVBERg==" mimeType="application/pdf" isLoading={false}
+      error={null} viewMode="preview" />)
+    expect(screen.getByTitle("report.pdf")).toHaveAttribute("src", "blob:mock-4")
+    expect(vi.mocked(URL.createObjectURL).mock.calls[0]?.[0]).toMatchObject({ size: 4, type: "application/pdf" })
+    expect(fetchSpy).not.toHaveBeenCalled()
+    fetchSpy.mockRestore()
+    view.unmount()
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-4")
+  })
+})
+
 describe("FileViewer video preview", () => {
   afterEach(() => {
     cleanup()
@@ -174,6 +191,7 @@ describe("FileViewer video preview", () => {
   })
 
   it("renders video controls with a blob URL for video mime types", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch")
     const view = render(
       <FileViewer
         fileName="generated"
@@ -193,6 +211,8 @@ describe("FileViewer video preview", () => {
     await waitFor(() => expect(video).toHaveAttribute("src", "blob:mock-8"))
     const blobArg = vi.mocked(URL.createObjectURL).mock.calls[0]?.[0]
     expect(blobArg).toMatchObject({ size: 8, type: "video/mp4" })
+    expect(fetchSpy).not.toHaveBeenCalled()
+    fetchSpy.mockRestore()
 
     view.unmount()
 

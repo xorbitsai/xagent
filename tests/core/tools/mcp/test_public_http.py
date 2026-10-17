@@ -75,3 +75,13 @@ async def test_mcp_cannot_replay_credentials_across_origins(target, network):
         with pytest.raises(UnsafePublicHttpTarget, match="origin"):
             await client.post("https://example.com/mcp", content=b"secret")
     assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_configured_idna_hostname_has_the_same_origin_as_httpx_request(network):
+    seen, _ = network
+    async with create_mcp_http_client(
+        endpoint_url="https://b\u00fccher.example/mcp"
+    ) as client:
+        await client.get("https://xn--bcher-kva.example/messages")
+    assert seen[0].headers["Host"] == "xn--bcher-kva.example"

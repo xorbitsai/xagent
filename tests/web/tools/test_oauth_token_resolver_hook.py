@@ -1175,7 +1175,7 @@ async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
             return httpx.Response(400, json={"error": "invalid_grant"})
 
     monkeypatch.setattr(
-        web_tools_config.httpx, "AsyncClient", RotatedCredentialAsyncClient
+        web_tools_config, "create_public_async_client", RotatedCredentialAsyncClient
     )
 
     configs = await _tool_config(
@@ -1246,8 +1246,8 @@ async def test_user_oauth_refresh_does_not_commit_unrelated_caller_changes(
             )
 
     monkeypatch.setattr(
-        web_tools_config.httpx,
-        "AsyncClient",
+        web_tools_config,
+        "create_public_async_client",
         SuccessfulAsyncClient,
     )
 
@@ -1317,8 +1317,8 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
             )
 
     monkeypatch.setattr(
-        web_tools_config.httpx,
-        "AsyncClient",
+        web_tools_config,
+        "create_public_async_client",
         FailingAsyncClient,
     )
 
@@ -1476,7 +1476,9 @@ async def test_refresh_missing_provider_credentials_is_transient(
                 "when provider credentials are missing"
             )
 
-    monkeypatch.setattr(web_tools_config.httpx, "AsyncClient", ExplodingAsyncClient())
+    monkeypatch.setattr(
+        web_tools_config, "create_public_async_client", ExplodingAsyncClient()
+    )
 
     assert (
         await web_tools_config.refresh_oauth_token_if_needed(
@@ -1532,8 +1534,8 @@ async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monke
             return httpx.Response(502, json={"error": "bad_refresh_token"})
 
     monkeypatch.setattr(
-        web_tools_config.httpx,
-        "AsyncClient",
+        web_tools_config,
+        "create_public_async_client",
         FiveHundredAsyncClient,
     )
 
@@ -1590,8 +1592,8 @@ async def test_refresh_slack_style_200_invalid_refresh_token_is_permanent(
             )
 
     monkeypatch.setattr(
-        web_tools_config.httpx,
-        "AsyncClient",
+        web_tools_config,
+        "create_public_async_client",
         SlackAsyncClient,
     )
 
@@ -1642,8 +1644,8 @@ async def test_refresh_provider_specific_dead_token_codes_are_gated_by_provider(
             return httpx.Response(400, json={"error": "bad_refresh_token"})
 
     monkeypatch.setattr(
-        web_tools_config.httpx,
-        "AsyncClient",
+        web_tools_config,
+        "create_public_async_client",
         GoogleAsyncClient,
     )
 

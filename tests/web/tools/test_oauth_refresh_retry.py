@@ -147,7 +147,7 @@ async def test_refresh_retries_transient_network_error_then_succeeds(
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -185,7 +185,7 @@ async def test_refresh_retries_connect_error_then_succeeds(db_session, monkeypat
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -215,7 +215,7 @@ async def test_refresh_retries_proxy_error_then_succeeds(db_session, monkeypatch
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -248,7 +248,7 @@ async def test_refresh_retries_pool_timeout_then_succeeds(db_session, monkeypatc
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -274,7 +274,7 @@ async def test_refresh_succeeds_on_first_try_without_retry(db_session, monkeypat
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -301,7 +301,7 @@ async def test_refresh_retries_5xx_then_succeeds(db_session, monkeypatch):
         return MockResponse({"access_token": "new-token", "expires_in": 3600})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -327,7 +327,7 @@ async def test_refresh_does_not_retry_on_definitive_4xx(db_session, monkeypatch)
         return MockResponse({"error": "invalid_grant"}, status_code=400)
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -353,7 +353,7 @@ async def test_refresh_gives_up_after_max_attempts_on_persistent_network_error(
         raise httpx.ConnectTimeout("connection timed out")
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -386,7 +386,7 @@ async def test_refresh_gives_up_after_max_attempts_on_persistent_5xx(
         return MockResponse({"error": "server_error"}, status_code=503)
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -417,7 +417,7 @@ async def test_refresh_does_not_retry_on_ambiguous_read_timeout(
         raise httpx.ReadTimeout("timed out waiting for response")
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(post)
     )
 
     assert (
@@ -463,7 +463,7 @@ async def test_refresh_retries_transient_network_error_for_meta_get_path(
         return MockResponse({"access_token": "new-long-token", "expires_in": 5184000})
 
     monkeypatch.setattr(
-        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(get=get)
+        tool_config, "create_public_async_client", lambda: _FakeAsyncClient(get=get)
     )
 
     assert (

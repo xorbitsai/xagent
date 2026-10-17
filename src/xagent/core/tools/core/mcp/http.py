@@ -18,7 +18,9 @@ def _origin(url: str) -> str:
         port = 443 if parsed.scheme == "https" else 80
     if port <= 0:
         raise UnsafePublicHttpTarget("MCP endpoint port must be positive")
-    host = parsed.hostname
+    # HTTPX sends IDNA/canonical hostnames. Bind the configured endpoint in
+    # the same representation so a legitimate Unicode hostname stays usable.
+    host = httpx.URL(url).raw_host.decode("ascii")
     if ":" in host:
         host = f"[{host}]"
     return f"{parsed.scheme}://{host}:{port}"

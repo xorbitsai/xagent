@@ -1,6 +1,7 @@
 import asyncio
 import socket
 
+import anyio
 import pytest
 
 from xagent.core.tools.core.mcp import websocket as transport
@@ -77,3 +78,38 @@ async def test_websocket_pins_ip_keeps_tls_name_and_preserves_protocol(monkeypat
 def test_handshake_redirect_is_never_followed():
     error = RuntimeError("redirect to private host")
     assert transport._NoRedirectConnect.process_redirect(None, error) is error
+
+
+@pytest.mark.asyncio
+async def test_peer_eof_closes_incoming_stream_without_waiting_for_outer_exit(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+        ],
+    )
+
+    class ClosedPeer:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def __aiter__(self):
+            if False:
+                yield None
+
+        async def send(self, message):
+            pass
+
+    monkeypatch.setattr(transport, "_NoRedirectConnect", ClosedPeer)
+    async with transport.public_websocket_client("wss://example.com/") as (read, _):
+        with pytest.raises(anyio.EndOfStream):
+            await asyncio.wait_for(read.receive(), 1)

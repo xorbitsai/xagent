@@ -69,19 +69,26 @@ async def public_websocket_client(
     ):
 
         async def reader() -> None:
-            async for raw in websocket:
-                try:
-                    await read_writer.send(
-                        SessionMessage(JSONRPCMessage.model_validate_json(raw))
-                    )
-                except ValidationError as exc:
-                    await read_writer.send(exc)
+            # EOF must close the incoming memory stream immediately, rather
+            # than waiting for the outer context: ClientSession needs that
+            # EOF to stop waiting for a response from a disconnected peer.
+            async with read_writer:
+                async for raw in websocket:
+                    try:
+                        await read_writer.send(
+                            SessionMessage(JSONRPCMessage.model_validate_json(raw))
+                        )
+                    except ValidationError as exc:
+                        await read_writer.send(exc)
 
         async def writer() -> None:
-            async for message in write_reader:
-                await websocket.send(
-                    message.message.model_dump_json(by_alias=True, exclude_none=True)
-                )
+            async with write_reader:
+                async for message in write_reader:
+                    await websocket.send(
+                        message.message.model_dump_json(
+                            by_alias=True, exclude_none=True
+                        )
+                    )
 
         async with anyio.create_task_group() as group:
             group.start_soon(reader)

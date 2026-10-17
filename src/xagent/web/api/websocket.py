@@ -198,6 +198,7 @@ from ..utils.db_timezone import safe_timestamp_to_unix
 from .websocket_auth import (
     WebSocketPrincipal,
     _WebSocketAuthenticationTerminated,
+    accept_authenticated_websocket,
     get_authenticated_user,
     revalidate_websocket_session,
     send_websocket_authentication_infrastructure_failure,
@@ -2996,7 +2997,7 @@ async def websocket_chat_endpoint(
     # Accept before closing an access denial so the fixed close reason survives
     # the WebSocket handshake.  Do not register until ownership has been
     # checked: task broadcasts are an owner-scoped private audience.
-    await websocket.accept()
+    await accept_authenticated_websocket(websocket)
     try:
         access = await run_db_io_cancellation_safe(
             lambda: _private_websocket_task_access_sync(
@@ -3335,7 +3336,7 @@ async def websocket_builder_chat_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await websocket.accept()
+    await accept_authenticated_websocket(websocket)
     logger.info(f"Builder chat WebSocket connection established for user {user.id}")
     active_chat_task: asyncio.Task[None] | None = None
 
@@ -3808,7 +3809,7 @@ async def websocket_build_preview_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await websocket.accept()
+    await accept_authenticated_websocket(websocket)
     logger.info(f"Build preview WebSocket connection established for user {user.id}")
 
     try:

@@ -177,7 +177,9 @@ def test_task_uploads_agent_outputs_and_startup_sync_persist_to_minio(
         assert record.file_size == len(expected_content)
         assert minio_storage.object_bytes(record.storage_key) == expected_content
 
-    with client.websocket_connect(f"/ws/chat/{task_id}?token={token}") as websocket:
+    with client.websocket_connect(
+        f"/ws/chat/{task_id}", headers={"Authorization": f"Bearer {token}"}
+    ) as websocket:
         _receive_until_type(websocket, "trace_event")
         websocket.send_json({"type": "execute_task"})
         execution_started = _receive_until_type(websocket, "execution_started")
@@ -256,7 +258,9 @@ def test_websocket_output_persistence_sends_error_and_rolls_back_when_minio_writ
 
     monkeypatch.setattr(FsspecFileStorage, "put_file", fail_task_output_put_file)
 
-    with client.websocket_connect(f"/ws/chat/{task_id}?token={token}") as websocket:
+    with client.websocket_connect(
+        f"/ws/chat/{task_id}", headers={"Authorization": f"Bearer {token}"}
+    ) as websocket:
         _receive_until_type(websocket, "trace_event")
         websocket.send_json({"type": "execute_task"})
         execution_started = _receive_until_type(websocket, "execution_started")
@@ -334,7 +338,9 @@ def test_chat_task_materializes_missing_local_input_from_minio_before_agent_read
         )
         uploaded_local_path.unlink()
 
-        with client.websocket_connect(f"/ws/chat/{task_id}?token={token}") as websocket:
+        with client.websocket_connect(
+            f"/ws/chat/{task_id}", headers={"Authorization": f"Bearer {token}"}
+        ) as websocket:
             _receive_until_type(websocket, "trace_event")
             websocket.send_json(
                 {

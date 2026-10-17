@@ -8,6 +8,7 @@ import { clientErrorFallback, readClientErrorCode, readServerRejectionCode, type
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
+import { websocketAuthProtocols } from "@/lib/websocket-auth"
 
 interface RecentMessage {
   message: string
@@ -251,7 +252,13 @@ const loginKindOf = (connection: WebSocketConnection): LoginKind => {
 const isSameLoginPrincipal = (previous: WebSocketConnection, next: WebSocketConnection) => {
   const kind = loginKindOf(previous)
   if (kind !== loginKindOf(next)) return false
-  if (kind === "external") return previous.url === next.url
+  if (kind === "external") {
+    const before = previous.protocols ?? []
+    const after = next.protocols ?? []
+    return previous.url === next.url
+      && before.length === after.length
+      && before.every((protocol, index) => protocol === after[index])
+  }
   const [a, b] = [previous.credentialOwner, next.credentialOwner]
   return kind === "widget-session" || (a.kind === "auth-context" && b.kind === "auth-context"
     && a.userId === b.userId && a.session?.sessionId === b.session?.sessionId)
@@ -481,7 +488,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           taskId,
           token: effectiveToken,
         })
-        : `${baseUrl}/ws/chat/${taskId}?${effectiveToken ? `token=${effectiveToken}&` : ""}liveness=heartbeat`,
+        : `${baseUrl}/ws/chat/${taskId}?liveness=heartbeat`,
+      protocols: !buildWebSocketUrl && effectiveToken
+        ? websocketAuthProtocols(effectiveToken)
+        : undefined,
       taskId,
       chatTaskIdMode: "required",
       credentialOwner: !hasExplicitToken && authToken

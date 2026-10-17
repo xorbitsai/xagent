@@ -41,9 +41,9 @@ def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
         task_id = created.json()["task_id"]
         url = (
             str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-            + f"/ws/chat/{task_id}?token={app.token}"
+            + f"/ws/chat/{task_id}"
         )
-        with connect(url) as ws:
+        with connect(url, additional_headers=app.headers) as ws:
             receive_event(ws, "historical_data_complete")
             deadline = time.monotonic() + 30
             while (
@@ -63,7 +63,7 @@ def test_redis_gap_preserves_result_and_rejects_unaccepted_start(shared_app):
             assert "Shared E2E answer" in completed["output"]
             proxy.restore()
             receive_event(ws, "stream_resync_required")
-        with connect(url) as ws:
+        with connect(url, additional_headers=app.headers) as ws:
             snapshot, _ = receive_event(ws, "historical_data_complete")
             assert snapshot["task_id"] == task_id
         events = app.client.get(f"/v1/chat/tasks/{task_id}/events", headers=headers)

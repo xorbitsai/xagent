@@ -72,6 +72,11 @@ async def download(url, destination):
     "url",
     [
         "http://127.0.0.1/a",
+        "http://2130706433/a",
+        "http://127.1/a",
+        "http://0/a",
+        "http://169.254.43518/latest/meta-data/",
+        "http://127.1./a",
         "http://169.254.169.254/latest/meta-data/",
         "http://[::1]/a",
         "http://[::ffff:127.0.0.1]/a",
@@ -127,10 +132,16 @@ async def test_public_dns_answers_are_returned_to_the_connector_unchanged(monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 @pytest.mark.parametrize(
     "location",
     [
         "http://127.0.0.1/secret",
+        "http://2130706433/secret",
+        "http://127.1/secret",
+        "http://0/secret",
+        "http://169.254.43518/secret",
+        "http://example.com/downgrade",
         "http://169.254.169.254/",
         "file:///etc/passwd",
         "https://user:secret@example.com/a",
@@ -138,10 +149,10 @@ async def test_public_dns_answers_are_returned_to_the_connector_unchanged(monkey
     ],
 )
 async def test_redirect_target_is_checked_before_second_request(
-    location, tmp_path, session
+    location, status, tmp_path, session
 ):
     responses, instances = session
-    responses.append(Response(status=302, headers={"Location": location}))
+    responses.append(Response(status=status, headers={"Location": location}))
     with pytest.raises(ValueError):
         await download("https://example.com/a", tmp_path / "output")
     assert len(instances[0].calls) == 1

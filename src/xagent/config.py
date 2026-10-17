@@ -2566,10 +2566,11 @@ def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
     value = os.getenv(variable)
     if value is None:
         return default
-    limit = int(value)
-    if limit <= 0:
-        raise ValueError(f"{variable} must be a positive number of bytes")
-    return limit
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {variable} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, variable)
 
 
 def get_max_upload_size_bytes() -> int:

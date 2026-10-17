@@ -25,7 +25,7 @@ from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
-from ...utils.media_download import download_public_media
+from ...utils.media_download import download_public_media, resolve_workspace_media_path
 from ...utils.security import redact_sensitive_text
 from ...workspace import TaskWorkspace
 
@@ -419,18 +419,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         if not self._workspace:
             raise ValueError("No workspace available for local file access")
 
-        workspace_root = self._workspace.workspace_dir.resolve()
-        expanded_path = path.expanduser()
-        if expanded_path.is_absolute():
-            resolved_path = expanded_path.resolve()
-        else:
-            resolved_path = (workspace_root / expanded_path).resolve()
-        if resolved_path == workspace_root or resolved_path.is_relative_to(
-            workspace_root
-        ):
-            return resolved_path
-
-        raise ValueError("Access denied: local path is outside the workspace")
+        return resolve_workspace_media_path(path, self._workspace.workspace_dir)
 
     async def _ark_image_ref_to_data_url(self, image_ref: str) -> str:
         image_ref = str(image_ref).strip()

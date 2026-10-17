@@ -5,6 +5,7 @@ This module provides image generation capabilities using pre-configured image mo
 passed from the web layer.
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -17,7 +18,7 @@ from urllib import parse
 from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
-from ...utils.media_download import download_public_media
+from ...utils.media_download import download_public_media, resolve_workspace_media_path
 from ...utils.security import redact_sensitive_text
 from ...workspace import TaskWorkspace
 
@@ -622,20 +623,19 @@ Images are automatically saved to workspace.
                 parsed = parse.urlparse(image_url)
                 if parsed.scheme == "file":
                     local_path = Path(parse.unquote(parsed.path))
-            elif os.path.isabs(image_url) or os.path.exists(image_url):
+            elif not parse.urlparse(image_url).scheme:
                 local_path = Path(image_url)
 
             if local_path is not None:
-                workspace_root = self._workspace.workspace_dir.resolve()
-                local_path = local_path.resolve()
-                if not local_path.is_relative_to(workspace_root):
-                    raise ValueError(
-                        "Access denied: local path is outside the workspace"
-                    )
-                if not local_path.is_file():
+                local_path = await asyncio.to_thread(
+                    resolve_workspace_media_path,
+                    local_path,
+                    self._workspace.workspace_dir,
+                )
+                if not await asyncio.to_thread(local_path.is_file):
                     raise RuntimeError(f"Local image path is not a file: {local_path}")
-                if local_path != save_path.resolve():
-                    shutil.copyfile(local_path, save_path)
+                if local_path != await asyncio.to_thread(save_path.resolve):
+                    await asyncio.to_thread(shutil.copyfile, local_path, save_path)
                 logger.info(f"Copied local image to: {save_path}")
                 return str(save_path)
 

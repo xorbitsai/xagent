@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -53,9 +54,43 @@ async def test_workspace_local_media_is_preserved(kind, media_tools):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["image", "video"])
-async def test_provider_metadata_url_rejected_without_a_connection(kind, media_tools):
+async def test_provider_metadata_url_rejected_without_a_connection(
+    kind, media_tools, monkeypatch
+):
+    session = Mock()
+    monkeypatch.setattr("aiohttp.ClientSession", session)
     image, video, workspace = media_tools
     method = image._download_image if kind == "image" else video._download_video
     with pytest.raises(ValueError):
         await method("http://169.254.169.254/latest/meta-data/")
     assert not list(workspace.output_dir.iterdir())
+    session.assert_not_called()
+
+
+@pytest.mark.parametrize("kind", ["image", "video"])
+async def test_relative_local_media_is_resolved_from_workspace(
+    kind, media_tools, monkeypatch, tmp_path
+):
+    image, video, workspace = media_tools
+    source = workspace.workspace_dir / "relative.png"
+    source.write_bytes(b"provider result")
+    monkeypatch.chdir(tmp_path)
+    method = image._download_image if kind == "image" else video._download_video
+    from pathlib import Path
+
+    assert Path(await method("relative.png")).read_bytes() == b"provider result"
+
+
+@pytest.mark.parametrize("kind", ["image", "video"])
+async def test_configured_budget_reaches_result_download(
+    kind, media_tools, monkeypatch
+):
+    image, video, _ = media_tools
+    monkeypatch.setenv(f"XAGENT_{kind.upper()}_DOWNLOAD_MAX_BYTES", "1K")
+    downloader = AsyncMock()
+    monkeypatch.setattr(
+        f"xagent.core.tools.core.{kind}_tool.download_public_media", downloader
+    )
+    method = image._download_image if kind == "image" else video._download_video
+    await method("https://example.com/result")
+    assert downloader.await_args.kwargs["max_bytes"] == 1024

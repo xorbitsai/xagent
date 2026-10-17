@@ -264,6 +264,7 @@ export function TaskConversationPanel({
     isConversationResetPending,
     isMessageDeliveryPending,
     isSessionInteractionLocked,
+    connectionNotice,
   } = useApp()
   const fileAccess = useFileAccess()
   const { t, locale } = useI18n()
@@ -869,6 +870,11 @@ export function TaskConversationPanel({
         style={{ width: anyPreviewOpen ? `${leftWidth}%` : "100%" }}
         className={cn(anyPreviewOpen ? "" : "flex-1", "min-w-0 flex flex-col min-h-0 transition-[width] duration-0 relative")}
       >
+        {connectionNotice === "lost" && (
+          <div role="status" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            {t("clientErrors.connectionLost")}
+          </div>
+        )}
         {state.streamRecoveryTaskId === state.taskId && state.taskId !== null && (
           <div role="status" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
             {t("sharedStream.interrupted")}
@@ -943,6 +949,7 @@ export function TaskConversationPanel({
                         failureTaskId={
                           failureReferenceItemIds.has(item.id) ? state.taskId : undefined
                         }
+                        connectionNotice={connectionNotice}
                       />
                     )
                   })}
@@ -969,6 +976,7 @@ export function TaskConversationPanel({
                           ? state.taskId
                           : undefined
                       }
+                      connectionNotice={connectionNotice}
                     />
                   )}
                 </>

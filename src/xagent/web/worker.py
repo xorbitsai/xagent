@@ -21,6 +21,7 @@ from ..config import (
     get_task_execution_role,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
+    validate_encryption_config,
     validate_task_execution_host_config,
 )
 from ..core.tools.core.RAG_tools.storage.vector_backend import (
@@ -80,6 +81,7 @@ async def run_worker(
     initialize_host: Callable[[], Awaitable[None]] | None = None,
     stop: asyncio.Event | None = None,
 ) -> None:
+    validate_encryption_config()
     validate_task_execution_host_config()
     if not get_shared_task_execution_enabled() or get_task_execution_role() != "worker":
         raise ValueError(
@@ -87,6 +89,9 @@ async def run_worker(
         )
     configure_db()
     await asyncio.to_thread(validate_worker_schema)
+    from .services.encryption_key_rotation import validate_stored_encryption_keys
+
+    await asyncio.to_thread(validate_stored_encryption_keys)
     validate_interaction_rollout_at_startup()
     await asyncio.to_thread(lock_deployment_kb_engine)
     recovery = None

@@ -43,12 +43,18 @@ class SqlQueryTool:
             workspace: Optional workspace for file-based operations
         """
         self._workspace = workspace
+        self._has_connection_map = connection_map is not None
         self._connection_map = {
             key.upper(): value for key, value in (connection_map or {}).items()
         }
 
     def _resolve_connection_url(self, connection_name: str) -> Optional[str]:
-        return self._connection_map.get(connection_name.upper())
+        url = self._connection_map.get(connection_name.upper())
+        if not url and self._has_connection_map:
+            # An explicit map is authoritative, including omitted/unreadable
+            # entries. Do not let the core tool fall back to the environment.
+            raise ValueError(f"Database connection '{connection_name}' not found.")
+        return url
 
     def execute_sql_query(
         self, connection_name: str, query: str, output_file: Optional[str] = None

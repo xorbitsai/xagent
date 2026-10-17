@@ -9,11 +9,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.api.auth import (
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
 )
 from xagent.web.models.database import Base
@@ -925,7 +927,14 @@ def test_github_callback_does_not_leak_token_on_db_commit_failure(
         Mock(return_value=MockResponse({"login": "octocat", "id": 1})),
     )
 
+    original_commit = db.commit
+    commit_count = 0
+
     def failing_commit():
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 1:
+            return original_commit()  # Durable state consumption precedes token writes.
         raise RuntimeError(
             "(psycopg2.errors.UniqueViolation) duplicate key value "
             "[parameters: {'access_token': 'secret-token-xyz'}]"

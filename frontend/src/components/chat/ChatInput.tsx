@@ -157,10 +157,18 @@ export function ChatInput({
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
   const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
+  const mountedRef = useRef(false);
   const { t } = useI18n();
   const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -267,6 +275,11 @@ export function ChatInput({
   // Determine if controlled or uncontrolled
   const isControlled = inputValue !== undefined;
   const message = isControlled ? inputValue : internalMessage;
+  // The latest draft, for a send that settles after the user typed again.
+  const messageRef = useRef(message);
+  useEffect(() => {
+    messageRef.current = message;
+  }, [message]);
 
 
   // Handle click on delete button and file chip preview
@@ -888,6 +901,7 @@ export function ChatInput({
           : {}),
       };
 
+      const sentDraft = message;
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
       draftRequestSnapshotRef.current = null;
@@ -897,10 +911,13 @@ export function ChatInput({
       setTaskRuntimeSelection(null);
       fileMention.resetMention();
 
-      if (isControlled) {
-        onInputChange?.("");
-      } else {
-        setInternalMessage("");
+      // A send can wait minutes for a reconnect; keep a draft typed meanwhile.
+      if (messageRef.current === sentDraft) {
+        if (isControlled) {
+          onInputChange?.("");
+        } else {
+          setInternalMessage("");
+        }
       }
     } catch (error) {
       if (
@@ -913,6 +930,10 @@ export function ChatInput({
       // persistent error. Keep retry state, but do not duplicate its notice.
       if (typeof error === "object" && error !== null
         && (error as { notificationHandled?: unknown }).notificationHandled === true) return;
+      // A lost connection's failure can arrive up to a resend wait later, after
+      // the user left; no toast for a gone input. Other failures still notify.
+      if (!mountedRef.current && typeof error === "object" && error !== null
+        && (error as { connectionLost?: unknown }).connectionLost === true) return;
       const errorCode = typeof error === "object" && error !== null
         ? readClientErrorCode((error as { errorCode?: unknown }).errorCode)
         : null;

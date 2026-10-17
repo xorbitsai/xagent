@@ -10,48 +10,10 @@ from fastapi import HTTPException
 from xagent.web.api import auth as auth_api
 
 
-def test_login_attempt_key_uses_trusted_client_ip(monkeypatch) -> None:
-    monkeypatch.setattr(
-        auth_api, "remote_ip_from_request", lambda request: "203.0.113.7"
-    )
-    request = SimpleNamespace(client=SimpleNamespace(host="10.0.0.5"))
-
-    assert auth_api._login_attempt_key(
-        request, " Alice "
-    ) == auth_api._login_attempt_key(request, "alice")
-
-
-def test_login_attempt_reservation_is_atomic_and_expires(monkeypatch) -> None:
-    auth_api._login_failures.clear()
-    key = "test-login-key"
-    try:
-        assert all(auth_api._reserve_login_attempt(key, now=float(i)) for i in range(5))
-        assert not auth_api._reserve_login_attempt(key, now=5.0)
-        assert auth_api._reserve_login_attempt(
-            key, now=auth_api._LOGIN_FAILURE_WINDOW_SECONDS + 5.0
-        )
-    finally:
-        auth_api._login_failures.clear()
-
-
-def test_login_attempt_limiter_sweeps_expired_identifier_buckets() -> None:
-    auth_api._login_failures.clear()
-    auth_api._login_failure_last_sweep = 0.0
-    try:
-        assert auth_api._reserve_login_attempt("old-user", now=1.0)
-        assert "old-user" in auth_api._login_failures
-        assert auth_api._reserve_login_attempt(
-            "new-user",
-            now=float(
-                auth_api._LOGIN_FAILURE_WINDOW_SECONDS
-                + auth_api._LOGIN_FAILURE_SWEEP_INTERVAL_SECONDS
-                + 1
-            ),
-        )
-        assert "old-user" not in auth_api._login_failures
-    finally:
-        auth_api._login_failures.clear()
-        auth_api._login_failure_last_sweep = 0.0
+def test_login_budgets_normalize_unknown_identifiers() -> None:
+    assert auth_api._login_budgets(
+        "203.0.113.7", " Alice ", None
+    ) == auth_api._login_budgets("203.0.113.7", "alice", None)
 
 
 def test_unknown_login_pays_bcrypt_timing_floor(monkeypatch) -> None:

@@ -43,7 +43,10 @@ from ...config import (
     get_task_auto_resume_enabled,
     get_task_infra_failure_pause_enabled,
 )
-from ...core.agent.checkpoint import checkpoint_progress_marker
+from ...core.agent.checkpoint import (
+    checkpoint_progress_marker,
+    checkpoint_tool_call_in_flight,
+)
 from ...core.agent.interruption import (
     InterruptionReason,
     classify_run_failure,
@@ -96,6 +99,11 @@ SUPERSEDE_CHECK_FAILED_DETAIL = "supersede_check_failed"
 # cancelled (``task_auto_resume.cancel_pending_auto_resume_no_commit``); only
 # that cancel writes it, at the fence it moves the row to.
 AUTO_RESUME_USER_CANCELLED_DETAIL = "user_cancelled"
+# ``state_detail`` of a ``manual`` row whose run stopped with a tool call that
+# may have started and has no recorded outcome (a legacy, version-1 run; see
+# :func:`resolution_tool_call_in_flight`). Resuming would run that call again,
+# so only a person may decide to.
+TOOL_IN_FLIGHT_DETAIL = "tool_in_flight"
 
 # The recorded states automatic resume has a plan for: each is logged as an
 # extra event of its own name and announced as ``task_recovery_update``
@@ -232,6 +240,30 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
     return AutoRecoveryEligibility(eligible=True, kind="normal")
 
 
+def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
+    """Whether a run a host shutdown cancelled may be left to lease recovery.
+
+    Such a run keeps its lease instead of failing, so lease recovery pauses
+    it and automatic resume picks it up, as after a crash. That only helps a
+    task automatic recovery would resume (:func:`auto_recovery_eligibility`);
+    the others must still fail now so their callers see a terminal state.
+    Tasks of a status-only source (:func:`is_status_only_source`) still fail
+    now as well, as their settlement interruptions do: their caller reads
+    nothing but the status, and a deploy should not keep it waiting on a
+    lease TTL. Channel tasks are excluded too until their resumed reply is
+    proven, and nothing is handed off while automatic resume is off.
+    """
+
+    if not get_task_auto_resume_enabled():
+        return False
+    task = db.get(Task, task_id)
+    if task is None or task.status != TaskStatus.RUNNING:
+        return False
+    if is_status_only_source(task.source) or task.channel_id is not None:
+        return False
+    return auto_recovery_eligibility(db, task).eligible
+
+
 def record_interruption_no_commit(
     db: Session,
     *,
@@ -243,6 +275,7 @@ def record_interruption_no_commit(
     gated_by_settlement_switches: bool,
     last_error: str | None = None,
     now: datetime | None = None,
+    tool_call_in_flight: bool = False,
 ) -> TaskAutoRecovery | None:
     """Upsert ``task``'s recovery row for one interruption and log the event.
 
@@ -284,8 +317,11 @@ def record_interruption_no_commit(
     It rests in ``manual`` instead, with ``state_detail`` saying why, when
     automatic resume is switched off (``auto_resume_disabled``) and when the
     supersede check fails (``supersede_check_failed``; the row is still
-    written). A reason without a policy (a user pause, an unknown input
-    outcome) stays plain ``manual``.
+    written). A row that would be ``scheduled`` rests in ``manual`` with
+    ``tool_in_flight`` when ``tool_call_in_flight`` says resuming would repeat
+    a tool call that may already have run; the other verdicts stand. A reason
+    without a policy (a user pause, an unknown input outcome) stays plain
+    ``manual``.
     """
 
     run_id = task.run_id
@@ -384,7 +420,15 @@ def record_interruption_no_commit(
                 rng=task_auto_resume._AUTO_RESUME_RNG,
             )
             state = auto_resume_recovery_state(verdict.outcome)
-            row.next_attempt_at = verdict.next_attempt_at
+            if state is TaskAutoRecoveryState.SCHEDULED and tool_call_in_flight:
+                # Only a resume that would actually be dispatched is held;
+                # every other verdict already stops automatic resume.
+                state, state_detail = (
+                    TaskAutoRecoveryState.MANUAL,
+                    TOOL_IN_FLIGHT_DETAIL,
+                )
+            else:
+                row.next_attempt_at = verdict.next_attempt_at
         row.state = state.value
         row.state_detail = state_detail
 
@@ -683,6 +727,30 @@ def resolution_progress_marker(
     return checkpoint_progress_marker(snapshot if isinstance(snapshot, dict) else None)
 
 
+def resolution_tool_call_in_flight(resolution: CheckpointRecoveryResolution) -> bool:
+    """Whether resuming a recoverable legacy run would repeat a started tool call.
+
+    A version-two run records every tool attempt, and recovery already fails
+    one that started without a committed outcome (``UNKNOWN_TOOL_EFFECT``).
+    A legacy (``trace_events``) checkpoint has no such ledger: resuming from
+    a checkpoint written just before a tool call runs that call again, so a
+    message it sent or a write it made would happen twice
+    (:func:`checkpoint_tool_call_in_flight`). The fields read here are never
+    stored as refs, so the payload is read without decoding.
+    """
+
+    if (
+        resolution.verdict is not CheckpointRecoveryVerdict.RECOVERABLE
+        or not resolution.encoded
+        or not isinstance(resolution.checkpoint, dict)
+    ):
+        return False
+    snapshot = resolution.checkpoint.get("snapshot")
+    return checkpoint_tool_call_in_flight(
+        snapshot if isinstance(snapshot, dict) else None
+    )
+
+
 def record_lease_expiry_interruption_no_commit(
     db: Session,
     *,
@@ -739,6 +807,7 @@ def record_lease_expiry_interruption_no_commit(
             now=recovered_at,
             progress_marker=resolution_progress_marker(db, int(task.id), resolution),
             gated_by_settlement_switches=False,
+            tool_call_in_flight=resolution_tool_call_in_flight(resolution),
         )
         recorded = RecordedInterruption.from_row(row) if row is not None else None
     except Exception:
@@ -1091,6 +1160,10 @@ def apply_interruption_outcome_no_commit(
             ),
             gated_by_settlement_switches=True,
             last_error=error,
+            tool_call_in_flight=(
+                decision.resolution is not None
+                and resolution_tool_call_in_flight(decision.resolution)
+            ),
         )
         snapshot = RecordedInterruption.from_row(row) if row is not None else None
     except Exception:

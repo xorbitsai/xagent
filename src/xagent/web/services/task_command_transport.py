@@ -5,7 +5,10 @@ the committing wrapper most callers use, built on stage_task_command, the
 staging primitive that deliberately does not commit so a caller can fold a
 command into a larger transaction of its own. Every web worker runs the
 same dispatcher; a database claim chooses one consumer while per-task ordering
-prevents a later command from overtaking an earlier unfinished command.
+keeps a later command behind an earlier unfinished one. Controls are the
+exception: a cancel or pause may pass a command that waits for an admission
+ticket, and a process at its dispatch cap lets a cancel or pause pass a
+never-claimed command it holds for want of a slot (_unfinished_earlier_command).
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ from .task_command_terminal_events import (
     terminal_event_draft_for_error,
 )
 from .task_dispatch_cap import (
+    CAP_OVERTAKING_CONTROL_KINDS,
     CONTROL_KINDS,
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
@@ -151,11 +155,23 @@ class TaskCommandDeferred(RuntimeError):
 
 
 class TaskCommandRejected(RuntimeError):
-    """The downstream handoff reached a durable failed state."""
+    """The downstream handoff reached a durable failed state.
 
-    def __init__(self, message: str, *, reason: str | None = None) -> None:
+    ``settle_cap_held`` asks the failing write to settle the commands this
+    control passed while a dispatch cap held them
+    (``settle_cap_held_commands_no_commit``); only a pause rejected because
+    nothing of its task runs sets it. Such a pause still ends ``failed``
+    although it stopped those commands; when the START it targets waits for
+    an admission ticket instead, ``settle_queued_start_for_pause`` fails that
+    START and completes the pause.
+    """
+
+    def __init__(
+        self, message: str, *, reason: str | None = None, settle_cap_held: bool = False
+    ) -> None:
         super().__init__(message)
         self.reason = reason
+        self.settle_cap_held = settle_cap_held
 
 
 @dataclass(frozen=True)
@@ -822,22 +838,52 @@ def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
     )
 
 
-def _unfinished_earlier_command() -> Any:
+def _unfinished_earlier_command(cap: DispatchCapSnapshot | None = None) -> Any:
+    """An earlier command of the same task that still blocks this one.
+
+    A cancel or pause may pass an earlier command that waits for an
+    admission ticket. While ``cap`` is closed, a control in
+    ``CAP_OVERTAKING_CONTROL_KINDS`` may also pass an earlier pending command
+    that would open an execution, was never claimed, and whose task holds no
+    slot in this process: this process would not run it, so the control is
+    applied first and its completion, or a pause's rejection because nothing
+    of its task runs, settles that command
+    (``settle_cap_held_commands_no_commit``); a rejected cancel, or a pause
+    rejected for any other reason (for example access denied, ``stale_run``
+    or invalid data), settles nothing. Callers that claim must pass the
+    same snapshot to the candidate query and the claim UPDATE. Neither this
+    SQL nor the owner lease keeps the passed command unclaimed while the
+    control is processing: the lease lock lasts only for the claim
+    transaction, and the lease owner is the process applying the control.
+    What does is that an owner applies one command of a task at a time
+    (``busy_command_tasks`` and ``_command_tasks`` in
+    ``dispatch_one_task_command``, ``_command_lock`` in ``execute_command``).
+    A claim path that bypasses the task coordinator must keep that rule.
+    """
     from .task_execution_admission import waiting_admission
 
     earlier = aliased(TaskExecutionCommand)
-    return exists(
-        select(1).where(
-            earlier.task_id == TaskExecutionCommand.task_id,
-            earlier.id < TaskExecutionCommand.id,
-            earlier.status.notin_(COMMAND_TERMINAL),
+    clauses = [
+        earlier.task_id == TaskExecutionCommand.task_id,
+        earlier.id < TaskExecutionCommand.id,
+        earlier.status.notin_(COMMAND_TERMINAL),
+        ~and_(
+            TaskExecutionCommand.kind.in_(("cancel", "pause")),
+            earlier.status == COMMAND_PENDING,
+            waiting_admission(earlier.id),
+        ),
+    ]
+    if cap is not None and cap.closed:
+        clauses.append(
             ~and_(
-                TaskExecutionCommand.kind.in_(("cancel", "pause")),
+                TaskExecutionCommand.kind.in_(sorted(CAP_OVERTAKING_CONTROL_KINDS)),
                 earlier.status == COMMAND_PENDING,
-                waiting_admission(earlier.id),
-            ),
+                earlier.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+                earlier.attempt_count == 0,
+                TaskExecutionCommand.task_id.notin_(sorted(cap.active_ids)),
+            )
         )
-    )
+    return exists(select(1).where(*clauses))
 
 
 def _claimable_query(
@@ -864,7 +910,7 @@ def _claimable_query(
             ),
             _claim_availability_predicate(now),
             admission_eligible(),
-            ~_unfinished_earlier_command(),
+            ~_unfinished_earlier_command(cap),
             _command_routing_predicate(runner_id, now),
         )
     )
@@ -982,7 +1028,7 @@ def claim_task_command(
         .filter(
             TaskExecutionCommand.id == int(candidate.id),
             _claim_availability_predicate(now),
-            ~_unfinished_earlier_command(),
+            ~_unfinished_earlier_command(cap),
             routable_task,
         )
         .update(
@@ -991,6 +1037,11 @@ def claim_task_command(
                 TaskExecutionCommand.claimed_by: None if shared else resolved_runner_id,
                 TaskExecutionCommand.claim_expires_at: None if shared else expires,
                 TaskExecutionCommand.retry_available_at: None,
+                # The only write that moves a command to processing, and it
+                # always counts the attempt: _unfinished_earlier_command and
+                # settle_cap_held_commands_no_commit read attempt_count == 0 as
+                # "never claimed". A new path that claims or executes a
+                # command must count it the same way.
                 TaskExecutionCommand.attempt_count: (
                     TaskExecutionCommand.attempt_count + 1
                 ),
@@ -1160,9 +1211,13 @@ def finish_task_command_no_commit(
         synchronize_session=False,
     )
     if updated == 1:
-        from .task_execution_admission import settle_cancelled_admissions
+        from .task_execution_admission import (
+            settle_cancelled_admissions,
+            settle_cap_held_commands_no_commit,
+        )
 
         settle_cancelled_admissions(db, command_db_id)
+        settle_cap_held_commands_no_commit(db, command_db_id)
         stage_terminal_event(db, command_db_id=command_db_id)
     return updated == 1
 
@@ -1206,8 +1261,13 @@ def fail_task_command(
     expected_attempt_count: int | None = None,
     result: dict[str, Any] | None = None,
     terminal_event: TerminalTaskEventDraft | None = None,
+    settle_cap_held: bool = False,
 ) -> bool:
-    """Retry a failed claim, or make it terminal after bounded attempts."""
+    """Retry a failed claim, or make it terminal after bounded attempts.
+
+    ``settle_cap_held`` settles, in the same transaction as a terminal
+    failure, the commands the control passed while a dispatch cap held them.
+    """
 
     from ..models.database import get_session_local
 
@@ -1304,6 +1364,12 @@ def fail_task_command(
                     from .task_start_consumer import settle_failed_start_no_commit
 
                     settle_failed_start_no_commit(db, handoff)
+            if settle_cap_held:
+                from .task_execution_admission import (
+                    settle_cap_held_commands_no_commit,
+                )
+
+                settle_cap_held_commands_no_commit(db, command_db_id)
             stage_terminal_event(
                 db,
                 command_db_id=command_db_id,
@@ -1698,14 +1764,16 @@ def count_claimable_task_commands(db: Session, *, runner_id: str) -> int:
 
     The result is an upper bound on what a dispatcher in ``runner_id`` could
     claim now. Process-local state is not applied: the per-process dispatch
-    cap (``DispatchCapSnapshot``), which narrows the shared scan while closed
-    and reserves a slot once a candidate that opens an execution is picked,
-    and the busy-task list.
+    cap (``DispatchCapSnapshot``), which while closed narrows the shared scan,
+    or within one task swaps a held command for a later cancel or pause of
+    that task that this count does not include, and reserves a slot once a
+    candidate that opens an execution is picked; and the busy-task list.
     Neither are the checks made after a candidate is picked: whether the
     process consumes commands at all (``consumes_task_commands()``), task
     owner acquisition and lease checks, and the admission reservation that
-    rechecks capacity under lock. Each of them can only turn a counted
-    command away.
+    rechecks capacity under lock. Each of those checks can only turn a
+    counted command away, and the cap's swap is one for one per task, so the
+    result stays an upper bound on how many commands could be claimed.
 
     This is not a backlog depth either. Only the first unfinished command of
     each task passes, except that a cancel or pause may pass an earlier
@@ -1888,6 +1956,7 @@ async def _dispatch_task_command(
         rejection_result = (
             {"rejection_reason": exc.reason} if exc.reason is not None else None
         )
+        settle_cap_held = exc.settle_cap_held
 
         # An executor that bound its own presentation draft wins; the neutral
         # literal is only the fallback. The other two dispositions already
@@ -1908,6 +1977,7 @@ async def _dispatch_task_command(
                 expected_attempt_count=command.attempt_count,
                 result=rejection_result,
                 terminal_event=rejection_event,
+                settle_cap_held=settle_cap_held,
             )
 
         disposition_name = "fail_task_command"

@@ -10,22 +10,19 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ..config import KNOWN_INSECURE_SECRETS
+
 _MIN_SECRET_LENGTH = 32
-_KNOWN_WEAK_SECRETS = {
-    "your-secret-key-change-in-production",
-    "change-me",
-    "change-me-to-a-random-session-secret",
-    "replace-with-a-long-random-secret",
-    "secret",
-}
 
 
-def _validate_secret(secret: str, path: Path) -> None:
-    if len(secret) < _MIN_SECRET_LENGTH or secret.lower() in _KNOWN_WEAK_SECRETS:
-        raise ValueError(f"JWT secret file is weak or too short: {path}")
+def _validate_secret(secret: str, path: Path, label: str = "JWT secret") -> None:
+    if len(secret) < _MIN_SECRET_LENGTH or secret.lower() in KNOWN_INSECURE_SECRETS:
+        raise ValueError(f"{label} file is weak or too short: {path}")
 
 
-def load_or_create_jwt_secret(path: Path) -> tuple[str, bool]:
+def load_or_create_jwt_secret(
+    path: Path, *, label: str = "JWT secret"
+) -> tuple[str, bool]:
     """Return a strong persistent secret and whether this call created it."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -34,7 +31,7 @@ def load_or_create_jwt_secret(path: Path) -> tuple[str, bool]:
     # handles first creation and races between replicas.
     if path.exists():
         secret = path.read_text(encoding="utf-8").strip()
-        _validate_secret(secret, path)
+        _validate_secret(secret, path, label)
         return secret, False
 
     lock_path = path.with_name(f"{path.name}.lock")
@@ -44,7 +41,7 @@ def load_or_create_jwt_secret(path: Path) -> tuple[str, bool]:
 
         if path.exists():
             secret = path.read_text(encoding="utf-8").strip()
-            _validate_secret(secret, path)
+            _validate_secret(secret, path, label)
             return secret, False
 
         secret = secrets.token_urlsafe(48)
@@ -75,10 +72,11 @@ def main() -> None:
         description="Load or initialize a persistent JWT signing secret."
     )
     parser.add_argument("path", type=Path)
+    parser.add_argument("--label", default="JWT secret")
     args = parser.parse_args()
-    secret, created = load_or_create_jwt_secret(args.path)
+    secret, created = load_or_create_jwt_secret(args.path, label=args.label)
     action = "generated a new one" if created else "reusing the existing secret"
-    print(f"JWT secret at {args.path}: {action}.", file=sys.stderr)
+    print(f"{args.label} at {args.path}: {action}.", file=sys.stderr)
     print(secret)
 
 

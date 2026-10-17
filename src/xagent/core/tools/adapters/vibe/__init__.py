@@ -1,6 +1,7 @@
 from .base import Tool as Tool
 from .base import ToolMetadata as ToolMetadata
 from .base import ToolVisibility as ToolVisibility
+from .mcp_approval_gate import MCPApprovalReplayExecutor as MCPApprovalReplayExecutor
 
 # # Export basic file tools (unsafe, only for backward compatibility)
 # from .file_tool import BASIC_FILE_TOOLS

@@ -1,6 +1,6 @@
 """Shared fixtures for web crawler tests."""
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -8,10 +8,7 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_real_robots_fetch(monkeypatch):
-    """URLFilter fetches robots.txt synchronously in __init__, so any test that
-    builds one with the default respect_robots_txt fires a real request at the
-    start URL's host. The fetch swallows its own exception, so an offline run
-    would quietly exercise a different code path instead of failing.
+    """Explicit robots loading uses a mocked client; config/constructor stay I/O-free.
 
     404 keeps the behaviour these tests were already getting from the live
     request, minus the network. Tests that care about robots.txt override this
@@ -22,3 +19,9 @@ def _no_real_robots_fetch(monkeypatch):
         status_code=404, text=""
     )
     monkeypatch.setattr(httpx, "Client", client)
+    # Unit tests mock HTTP sessions, including target DNS validation. Real DNS
+    # policy and real clients are exercised outside this fixture's subtree.
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.web_crawler.crawler.validate_public_http_url",
+        AsyncMock(return_value=["93.184.216.34"]),
+    )

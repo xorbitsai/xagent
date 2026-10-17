@@ -1,20 +1,23 @@
 from datetime import datetime, timezone
 
-from xagent.web.models.user_channel import UserChannel
+import pytest
+
+from xagent.web.models.user_channel import CHANNEL_SECRET_FIELDS, UserChannel
 from xagent.web.schemas.user_channel import UserChannelResponse
 
 
-def test_user_channel_constructor_accepts_config_dict() -> None:
+@pytest.mark.parametrize("field", CHANNEL_SECRET_FIELDS)
+def test_user_channel_constructor_accepts_config_dict(field: str) -> None:
     channel = UserChannel(
         user_id=1,
         channel_type="telegram",
         channel_name="Telegram Bot",
-        config={"bot_token": "plain-token"},
+        config={field: "plain-token"},
         is_active=True,
     )
 
-    assert channel.config["bot_token"] == "plain-token"
-    assert channel._config["bot_token"] != "plain-token"
+    assert channel.config[field] == "plain-token"
+    assert channel._config[field] != "plain-token"
 
 
 def test_user_channel_encrypts_slack_app_token() -> None:

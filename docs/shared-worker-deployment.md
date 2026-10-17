@@ -11,6 +11,12 @@ standalone Agent worker.
 
 ## Combined process launcher
 
+Production web and worker hosts must also share the exact
+`XAGENT_SECRET_ENCRYPTION_KEY` (or legacy `SECRET_KEY`) for tool credentials.
+The image persists a separate tool key in the secrets volume. For existing
+default/short keys, follow [the offline upgrade procedure](tool-credential-key-upgrade.md)
+before starting upgraded replicas; runtime decryption never tries a public key.
+
 Set `XAGENT_TASK_EXECUTION_ROLE=combined` and `XAGENT_WORKER_COUNT=4`, then run
 `python -m xagent.web` (or `xagent-web`) to launch one web process and four
 standalone Agent worker processes. The Docker backend uses this same entrypoint.

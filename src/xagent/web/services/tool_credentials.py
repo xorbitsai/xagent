@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -12,11 +13,14 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from ...config import get_tool_credentials_encryption_key
 from ...core.tools.core.sql_tool import validate_external_database_url
+from ...core.utils.encryption import ToolCredentialUnreadableError
 from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig
 
 ToolFieldSpec = dict[str, Any]
+logger = logging.getLogger(__name__)
 
 # Hook signature: (db: Session, user: Any) -> dict[str, {"enabled": bool|None}]
 # Returns per-user overrides for tool enable/disable.
@@ -168,12 +172,9 @@ SQL_CONNECTION_ENV_PREFIX = "XAGENT_EXTERNAL_DB_"
 ALLOWED_SQL_SCHEMES = {"postgresql", "mysql", "mariadb", "mssql", "sqlite"}
 
 
-def _build_fernet_key() -> bytes:
-    raw = (
-        os.getenv("XAGENT_SECRET_ENCRYPTION_KEY")
-        or os.getenv("SECRET_KEY")
-        or "xagent-dev-key"
-    )
+def _build_fernet_key(raw: str | None = None) -> bytes:
+    if raw is None:
+        raw = get_tool_credentials_encryption_key()
     digest = hashlib.sha256(raw.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
 
@@ -186,11 +187,11 @@ def _encrypt(value: str) -> str:
     return _fernet().encrypt(value.encode("utf-8")).decode("utf-8")
 
 
-def _decrypt(ciphertext: str) -> str | None:
+def _decrypt(ciphertext: str) -> str:
     try:
         return _fernet().decrypt(ciphertext.encode("utf-8")).decode("utf-8")
     except (InvalidToken, ValueError):
-        return None
+        raise ToolCredentialUnreadableError() from None
 
 
 def _mask_value(value: str) -> str:
@@ -394,7 +395,14 @@ def resolve_sql_connection(db: Session, user_id: int | None, name: str) -> str |
         if isinstance(sql_connections, dict):
             item = sql_connections.get(normalized_name)
             if isinstance(item, dict) and isinstance(item.get("ciphertext"), str):
-                decrypted = _decrypt(item["ciphertext"])
+                try:
+                    decrypted = _decrypt(item["ciphertext"])
+                except ToolCredentialUnreadableError:
+                    logger.warning(
+                        "Skipping unreadable stored SQL connection %s; no environment fallback",
+                        normalized_name,
+                    )
+                    return None
                 if decrypted:
                     return decrypted
 
@@ -429,9 +437,18 @@ def get_sql_connection_map(db: Session, user_id: int | None) -> dict[str, str]:
                     continue
                 ciphertext = item.get("ciphertext")
                 if isinstance(ciphertext, str):
-                    decrypted = _decrypt(ciphertext)
+                    name = _sanitize_sql_connection_name(raw_name)
+                    try:
+                        decrypted = _decrypt(ciphertext)
+                    except ToolCredentialUnreadableError:
+                        result.pop(name, None)
+                        logger.warning(
+                            "Skipping unreadable stored SQL connection %s; no environment fallback",
+                            name,
+                        )
+                        continue
                     if decrypted:
-                        result[_sanitize_sql_connection_name(raw_name)] = decrypted
+                        result[name] = decrypted
 
     return result
 
@@ -595,7 +612,12 @@ def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
             else None
         )
         source = "db" if db_set else ("env" if env_value else "none")
-        resolved = resolve_tool_credential(db, tool_name, field_name)
+        error = None
+        try:
+            resolved = resolve_tool_credential(db, tool_name, field_name)
+        except ToolCredentialUnreadableError:
+            resolved = None
+            error = "unreadable"
         required = bool(spec.get("required", False))
         is_configured = bool(resolved)
         if required and not is_configured:
@@ -611,6 +633,7 @@ def get_tool_credential_view(db: Session, tool_name: str) -> dict[str, Any]:
             if db_set
             else (_mask_value(env_value) if env_value else ""),
             "env_names": spec.get("env", []),
+            "error": error,
         }
 
     return {

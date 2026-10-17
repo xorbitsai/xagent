@@ -35,14 +35,18 @@ Two obligations the gate cannot enforce for the host. Both are load-bearing;
 neither is checked at runtime, so a host that ignores them gets silent
 incorrectness rather than an error.
 
-1. **Persist a dispatch marker before awaiting the executor.** The resume hook
-   receives a one-shot ``executor``. Before awaiting it, the host must durably
-   record that this interaction has entered dispatch (an ``EXECUTING`` row, an
-   outbox entry - whatever its ledger calls it). The gate treats everything
-   after that await as possibly-committed and, on a cancellation, discards the
-   hook's settlement and re-raises (see :func:`_call_resume_hook`). Only the
-   host's own marker lets a later replay tell "never dispatched" from "may have
-   landed"; without it, a replay can issue a second external write.
+1. **Persist and acknowledge a dispatch marker before awaiting the executor.**
+   The resume hook receives a callable :class:`MCPApprovalReplayExecutor` under
+   the existing ``executor`` keyword. After durably recording that this
+   interaction has entered dispatch (an ``EXECUTING`` row, an outbox entry -
+   whatever its ledger calls it), the host must synchronously call
+   :meth:`MCPApprovalReplayExecutor.acknowledge_dispatch` before awaiting the
+   executor. From that acknowledgement onward the gate treats the call as
+   possibly committed, even if cancellation lands before executor entry. Old
+   integrations remain safe and source-compatible: entering the executor
+   performs the same acknowledgement automatically. Only the host's own marker
+   lets a later replay tell "never dispatched" from "may have landed"; without
+   it, a replay can issue a second external write.
 
 2. **Compare the approved argument hash before dispatching.** The gate freezes
    the approved arguments at pause time and exposes
@@ -119,6 +123,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from threading import Event as ThreadEvent
 from threading import RLock
 from typing import Any, Literal, Optional, Type
 from uuid import uuid4
@@ -326,6 +331,73 @@ class MCPApprovalReplayContext:
     interaction_id: str
     arguments_sha256: str
     execution_context: ToolCallExecutionContext
+
+
+class MCPApprovalReplayExecutor:
+    """One-shot replay callable with an explicit durable-dispatch boundary.
+
+    A durable host calls :meth:`acknowledge_dispatch` synchronously immediately
+    after committing its dispatch marker and before awaiting this object. The
+    acknowledgement does not dispatch the connector by itself; it tells the
+    wrapper that automatic retry authority has ended, so cancellation, timeout,
+    or a hook failure in the small marker-to-executor window is classified as
+    possibly dispatched rather than definitely not sent.
+
+    Calling the executor directly remains supported for legacy hooks and
+    performs the acknowledgement immediately before connector dispatch. The
+    capability is created for one resume interaction and becomes unusable when
+    that resume finishes, so it cannot opt another interaction into dispatch.
+    """
+
+    def __init__(
+        self,
+        *,
+        execute: Callable[[Mapping[str, Any]], Any],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        self._execute = execute
+        self._loop = loop
+        self._dispatch_acknowledged = ThreadEvent()
+        self._dispatch_notification = asyncio.Event()
+        self._lifecycle_lock = RLock()
+        self._active = True
+
+    def acknowledge_dispatch(self) -> None:
+        """Mark the host's durable transition into non-retryable dispatch.
+
+        The call is idempotent while this capability is active and is safe from
+        a host worker thread. The thread event is authoritative for immediate
+        classification; the loop notification only wakes an async waiter.
+        """
+
+        with self._lifecycle_lock:
+            if not self._active:
+                raise RuntimeError("approval replay executor is no longer available")
+            if self._dispatch_acknowledged.is_set():
+                return
+            self._dispatch_acknowledged.set()
+            self._loop.call_soon_threadsafe(self._dispatch_notification.set)
+
+    @property
+    def dispatch_acknowledged(self) -> bool:
+        """Whether the host has durably surrendered automatic retry authority."""
+
+        return self._dispatch_acknowledged.is_set()
+
+    async def wait_for_dispatch_acknowledgement(self) -> None:
+        if self.dispatch_acknowledged:
+            return
+        await self._dispatch_notification.wait()
+
+    async def __call__(self, arguments: Mapping[str, Any]) -> Any:
+        with self._lifecycle_lock:
+            if not self._active:
+                raise RuntimeError("approval replay executor is no longer available")
+        return await _ensure_awaitable(self._execute(arguments))
+
+    def _deactivate(self) -> None:
+        with self._lifecycle_lock:
+            self._active = False
 
 
 @dataclass(frozen=True)
@@ -561,7 +633,7 @@ def _connector_ref(connection: Mapping[str, Any]) -> ConnectorRef | None:
 async def _call_resume_hook(
     hook: Callable[..., Any],
     timeout_seconds: float,
-    dispatch_started: asyncio.Event,
+    executor: MCPApprovalReplayExecutor,
     /,
     *,
     dispatch_observe_seconds: float,
@@ -571,21 +643,21 @@ async def _call_resume_hook(
 
     Cancellation semantics, post-dispatch
     -------------------------------------
-    Once the host has entered the executor, this function's job is to make sure
-    the connector write is *observed*, not to keep the caller alive. An external
-    cancellation that arrives after dispatch therefore still propagates: the
-    drained hook's settlement, if it produced one, is deliberately **discarded**
-    and ``CancelledError`` is re-raised, so a write that demonstrably completed
-    is rolled back to "pending" from the runtime's point of view.
+    Once the host has acknowledged its durable marker (or entered the executor,
+    which acknowledges automatically), this function's job is to make sure the
+    possibly-started connector write is *observed*, not to keep the caller alive.
+    An external cancellation that arrives after acknowledgement therefore still
+    propagates: the drained hook's settlement, if it produced one, is deliberately
+    **discarded** and ``CancelledError`` is re-raised.
 
     That is the correct trade. The caller is being torn down (task cancel, lease
     loss); there is no longer a ledger to project a settlement onto, and
     smuggling a return value out of a cancelled frame would suppress the
     cancellation the host asked for. Correctness on replay comes from
     idempotency instead: the host resume hook must persist its EXECUTING /
-    dispatch marker *before* awaiting the executor - which the module docstring
-    already requires - so a later replay recognizes the in-flight attempt rather
-    than issuing a second write.
+    dispatch marker and acknowledge it *before* awaiting the executor - which
+    the module docstring already requires - so a later replay recognizes the
+    in-flight attempt rather than issuing a second write.
 
     ``dispatch_observe_seconds`` is spent exactly once per dispatched call,
     never twice. A monotonic deadline is recorded the moment the gate starts
@@ -600,7 +672,7 @@ async def _call_resume_hook(
     returned = _ensure_awaitable(hook(**kwargs))
 
     hook_task = asyncio.ensure_future(returned)
-    dispatch_wait = asyncio.create_task(dispatch_started.wait())
+    dispatch_wait = asyncio.create_task(executor.wait_for_dispatch_acknowledgement())
     # Set once the observation budget has already been spent waiting on this
     # same dispatched call, so the cleanup path does not spend it again.
     observed = False
@@ -618,11 +690,11 @@ async def _call_resume_hook(
         )
         if hook_task in done:
             return hook_task.result()
-        if dispatch_wait in done or dispatch_started.is_set():
-            # The host has entered the one-shot executor. Connector latency is
-            # no longer approval-policy latency and must not be cancelled by
-            # the short gate deadline: cancellation cannot prove a remote
-            # write did not commit.
+        if dispatch_wait in done or executor.dispatch_acknowledged:
+            # The host has durably surrendered retry authority. Connector
+            # latency is no longer approval-policy latency and must not be
+            # cancelled by the short gate deadline: cancellation cannot prove
+            # a remote write did not commit.
             #
             # SHIELDED, and that is load-bearing. A bare ``await hook_task``
             # here is the frame an external cancel lands on while the write is
@@ -638,8 +710,8 @@ async def _call_resume_hook(
             # BOUNDED as well: a hung connector RPC would otherwise park the
             # resume forever with no backstop, since the registration deadline
             # has already been spent by this point. The TimeoutError raised on
-            # expiry reaches the caller with ``dispatch_started`` set, which is
-            # what makes it settle as ``dispatch_unknown`` rather than a clean
+            # expiry reaches the caller with ``dispatch_acknowledged`` set,
+            # which makes it settle as ``dispatch_unknown`` rather than a clean
             # failure - the write may well have landed.
             observe_deadline = (
                 asyncio.get_running_loop().time() + dispatch_observe_seconds
@@ -673,7 +745,7 @@ async def _call_resume_hook(
         # running under an active CancelledError and would otherwise be
         # interrupted immediately.
         if not hook_task.done():
-            if not dispatch_started.is_set():
+            if not executor.dispatch_acknowledged:
                 hook_task.cancel()
                 await _drain(hook_task)
             elif not observed:
@@ -713,7 +785,7 @@ def _terminate_unobserved(
     invariant. That invariant protects the *observation* of a write that might
     still answer; by this point the full observation budget has already been
     spent and the caller has already been handed its outcome (``TimeoutError``
-    with ``dispatch_started`` set, which
+    with the durable dispatch boundary acknowledged, which
     :meth:`MCPApprovalGateTool.resume_user_interaction` projects as
     ``dispatch_unknown``). Cancelling cannot change that outcome, and the write
     may still have landed either way - which is exactly what
@@ -1047,13 +1119,11 @@ class MCPApprovalGateTool(AbstractBaseTool):
             return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
 
         connector_ref = self._connector_ref
-        active = True
         used = False
-        dispatch_started = asyncio.Event()
 
-        async def executor(arguments: Mapping[str, Any]) -> Any:
+        async def execute(arguments: Mapping[str, Any]) -> Any:
             nonlocal used
-            if not active or used:
+            if used:
                 raise RuntimeError("approval replay executor is no longer available")
             used = True
             canonical = GatedCall.from_arguments(
@@ -1069,20 +1139,25 @@ class MCPApprovalGateTool(AbstractBaseTool):
             )
             token = _CURRENT_REPLAY_CONTEXT.set(replay)
             try:
-                # The host resume hook must persist its EXECUTING/dispatch
-                # marker before awaiting this executor. From this point on,
-                # an exception is conservatively ambiguous unless the host
-                # returns a persisted known outcome.
-                dispatch_started.set()
+                # Legacy hooks enter the same conservative boundary immediately
+                # before connector dispatch. Durable hooks acknowledge earlier,
+                # immediately after their marker commits, closing the otherwise
+                # unobservable marker-to-executor window.
+                executor.acknowledge_dispatch()
                 return await self._target.run_json_async(canonical.arguments)
             finally:
                 _CURRENT_REPLAY_CONTEXT.reset(token)
+
+        executor = MCPApprovalReplayExecutor(
+            execute=execute,
+            loop=asyncio.get_running_loop(),
+        )
 
         try:
             result = await _call_resume_hook(
                 registration.resume,
                 registration.timeout_seconds,
-                dispatch_started,
+                executor,
                 dispatch_observe_seconds=registration.dispatch_observe_seconds,
                 interaction_id=host_interaction_id,
                 response=response,
@@ -1106,7 +1181,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 interaction_id,
                 exc_info=True,
             )
-            if dispatch_started.is_set():
+            if executor.dispatch_acknowledged:
                 return ToolInteractionSettlement.dispatch_unknown(
                     error=(
                         "The connector call may have reached the external system. "
@@ -1115,7 +1190,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 )
             return ToolInteractionSettlement.failed(result=dict(_GATE_FAILURE))
         finally:
-            active = False
+            executor._deactivate()
 
     async def setup(self, task_id: Optional[str] = None) -> None:
         await self._target.setup(task_id)

@@ -3260,6 +3260,64 @@ async def test_retried_durable_message_is_accepted_without_reexecution(
 
 
 @pytest.mark.asyncio
+async def test_same_id_resend_runs_one_turn(live_task_lease, db_session) -> None:
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id, task.run_id = "live-runner", "live-run"
+    db_session.commit()
+    live_task_lease(db_session, task)
+    release = asyncio.Event()
+
+    async def post_user_message(*_args, **_kwargs) -> UserMessageInjectionOutcome:
+        await release.wait()
+        return UserMessageInjectionOutcome.POSTED_FRESH
+
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(side_effect=post_user_message)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(), send_personal_message=AsyncMock()
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    frame = {"message": "Use the tool", "client_message_id": "resend-1", "files": []}
+
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+    ):
+        # The resend arrives while the first delivery is still being applied.
+        for _ in range(2):
+            await handle_chat_message(
+                MagicMock(), int(task.id), {**frame, "user": owner}
+            )
+        release.set()
+        for _ in range(int(DB_PROGRESS_TIMEOUT / 0.01)):
+            db_session.expire_all()
+            command = db_session.query(TaskExecutionCommand).one()
+            if command.status == "completed":
+                break
+            await asyncio.sleep(0.01)
+
+    assert command.status == "completed"
+    types = [c.args[0]["type"] for c in ws_manager.send_personal_message.call_args_list]
+    assert types.count("message_accepted") == 2
+    assert db_session.query(TaskChatMessage).filter_by(turn_id="resend-1").count() == 1
+    assert command.attempt_count == 1
+    assert agent.post_user_message.await_count == 1
+    bg_mgr.register_reserved_resume.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_reusing_client_id_with_different_content_is_rejected(
     db_session,
 ) -> None:

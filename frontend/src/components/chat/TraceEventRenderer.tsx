@@ -157,6 +157,7 @@ interface StepAction {
     error?: any;
     tool_calls?: any;
     tool_call_id?: string;
+    invocation_id?: string;
     sandboxed?: boolean;
     inline?: boolean;
     workforceSummary?: boolean;
@@ -379,19 +380,76 @@ export function processTraceEvents(
     // by "last running tool" mis-attributes results; the id makes it exact.
     // Returns null when the id is absent so callers can fall back to
     // findLastRunningAction (legacy / single-tool events).
-    const findRunningToolByCallId = (step: ProcessedStep, toolCallId?: string) => {
-      if (!toolCallId) return null;
+    const findRunningToolByCallId = (
+      step: ProcessedStep,
+      toolCallId?: string,
+      invocationId?: string,
+    ) => {
+      if (!invocationId && !toolCallId) return null;
       for (let i = step.actions.length - 1; i >= 0; i--) {
         const action = step.actions[i];
         if (
           action.type === 'tool' &&
           action.status === 'running' &&
-          action.data?.tool_call_id === toolCallId
+          (invocationId
+            ? action.data?.invocation_id === invocationId
+            : action.data?.tool_call_id === toolCallId)
         ) {
           return action;
         }
       }
       return null;
+    };
+
+    // A settlement lifecycle reopens a call whose pause pair already closed.
+    // New traces identify that call by invocation id. Historical traces fall
+    // back to the provider id and, only when necessary, the originating step.
+    const findToolActionAcrossSteps = (
+      toolCallId?: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => {
+      if (!invocationId && !toolCallId) return null;
+      const matches: { stepId: string; action: StepAction }[] = [];
+      for (const candidateStep of stepsMap.values()) {
+        for (const action of candidateStep.actions) {
+          if (
+            action.type === 'tool' &&
+            (invocationId
+              ? action.data?.invocation_id === invocationId
+              : action.data?.tool_call_id === toolCallId)
+          ) {
+            matches.push({ stepId: candidateStep.stepId, action });
+          }
+        }
+      }
+      if (matches.length === 0) return null;
+      if (matches.length === 1) return matches[0].action;
+      const exactStepMatches = matches.filter(({ stepId }) => stepId === originStepId);
+      return exactStepMatches.length === 1 ? exactStepMatches[0].action : null;
+    };
+
+    // A settlement START records the target its terminal event must close.
+    // Invocation ids are globally exact; the composite key is legacy-only.
+    const settlementTargets = new Map<string, StepAction>();
+    const settlementTargetKey = (
+      toolCallId: string | undefined,
+      invocationId?: string,
+      originStepId?: string,
+    ) => invocationId
+      ? `invocation:${invocationId}`
+      : `legacy:${toolCallId}::${originStepId ?? ''}`;
+    const isSettlementEvent = (event: TraceEvent) =>
+      event.data?.settlement_delivery === true;
+    const resolveSettlementTarget = (
+      toolCallId?: string,
+      invocationId?: string,
+      originStepId?: string,
+    ) => {
+      if (!invocationId && !toolCallId) return null;
+      const key = settlementTargetKey(toolCallId, invocationId, originStepId);
+      return settlementTargets.get(key)
+        || findToolActionAcrossSteps(toolCallId, invocationId, originStepId);
     };
 
     orderedEvents.forEach(({ event, index, timestamp }) => {
@@ -653,6 +711,7 @@ export function processTraceEvents(
         const toolName = rawToolName || t('traceEventRenderer.unknownTool');
         const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;
+        const invocationId = event.data?.invocation_id as string | undefined;
         const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
 
         if (typeof assistantContent === 'string' && assistantContent.trim()) {
@@ -669,27 +728,53 @@ export function processTraceEvents(
           });
         }
 
-        if (toolName) {
+        const settlementStartTarget = isSettlementEvent(event)
+          ? resolveSettlementTarget(toolCallId, invocationId, event.step_id ?? undefined)
+          : null;
+        if (isSettlementEvent(event) && !settlementStartTarget && !step.stepName) {
+          // A truncated history may omit the original task start. Keep the
+          // terminal outcome in a visible, named fallback step.
+          step.stepName = t('traceEventRenderer.taskExecution');
+        }
+
+        if (toolName && !settlementStartTarget) {
           // Merge with existing tools instead of replacing
           if (!step.tools.some(tItem => tItem.function.name === toolName)) {
             step.tools.push({ function: { name: toolName } });
           }
         }
 
-        step.actions.push({
-          id: eventId,
-          type: 'tool',
-          title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
-          status: 'running',
-          timestamp,
-          data: {
-            tool: toolName,
-            args: toolArgs,
-            code: step.code,
-            tool_call_id: toolCallId,
-            sandboxed: !!event.data?.sandboxed
+        if (settlementStartTarget) {
+          if (invocationId || toolCallId) {
+            settlementTargets.set(
+              settlementTargetKey(toolCallId, invocationId, event.step_id ?? undefined),
+              settlementStartTarget,
+            );
           }
-        });
+        } else {
+          const action: StepAction = {
+            id: eventId,
+            type: 'tool',
+            title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
+            status: 'running',
+            timestamp,
+            data: {
+              tool: toolName,
+              args: toolArgs,
+              code: step.code,
+              tool_call_id: toolCallId,
+              invocation_id: invocationId,
+              sandboxed: !!event.data?.sandboxed
+            }
+          };
+          step.actions.push(action);
+          if (isSettlementEvent(event) && (invocationId || toolCallId)) {
+            settlementTargets.set(
+              settlementTargetKey(toolCallId, invocationId, event.step_id ?? undefined),
+              action,
+            );
+          }
+        }
       }
 
       if (event.event_type === 'tool_execution_end') {
@@ -744,9 +829,14 @@ export function processTraceEvents(
             : undefined;
 
         const endToolCallId = event.data?.tool_call_id as string | undefined;
-        const action =
-          findRunningToolByCallId(step, endToolCallId) ||
-          findLastRunningAction(step, 'tool');
+        const endInvocationId = event.data?.invocation_id as string | undefined;
+        const action = isSettlementEvent(event)
+          ? resolveSettlementTarget(endToolCallId, endInvocationId, event.step_id ?? undefined)
+          : findRunningToolByCallId(step, endToolCallId, endInvocationId) ||
+            (!endInvocationId ? findLastRunningAction(step, 'tool') : null);
+        if (isSettlementEvent(event) && !action && !step.stepName) {
+          step.stepName = t('traceEventRenderer.taskExecution');
+        }
         if (action) {
           action.status = 'completed';
           action.data.output = output;
@@ -865,10 +955,30 @@ export function processTraceEvents(
 
         // If no running action found, or type mismatch, try to find the last action of corresponding type
         if (event.event_type === 'tool_execution_failed') {
-          const lastTool =
-            findRunningToolByCallId(step, errorData.tool_call_id as string | undefined) ||
-            findLastRunningAction(step, 'tool');
-          if (lastTool) runningAction = lastTool;
+          const settlementTarget = isSettlementEvent(event)
+            ? resolveSettlementTarget(
+              errorData.tool_call_id as string | undefined,
+              errorData.invocation_id as string | undefined,
+              event.step_id ?? undefined,
+            )
+            : null;
+          if (isSettlementEvent(event)) {
+            runningAction = settlementTarget ?? undefined;
+            if (settlementTarget) {
+              settlementTarget.data.rawResult = event.data?.result;
+              delete settlementTarget.data.output;
+            } else if (!step.stepName) {
+              step.stepName = t('traceEventRenderer.taskExecution');
+            }
+          } else {
+            const lastTool =
+              findRunningToolByCallId(
+                step,
+                errorData.tool_call_id as string | undefined,
+                errorData.invocation_id as string | undefined,
+              ) || (!errorData.invocation_id ? findLastRunningAction(step, 'tool') : null);
+            if (lastTool) runningAction = lastTool;
+          }
         } else if (event.event_type === 'llm_call_failed') {
           const lastLlm = findLastRunningAction(step, 'llm');
           if (lastLlm) runningAction = lastLlm;

@@ -169,9 +169,10 @@ def _consume_exchange_code(db: Session, code: str) -> OidcExchangeTransaction | 
         return None
 
     now = _utcnow()
-    db.query(OidcConsumedToken).filter(OidcConsumedToken.expires_at <= now).delete(
-        synchronize_session=False
-    )
+    db.query(OidcConsumedToken).filter(
+        ~OidcConsumedToken.token_id.startswith("oauth-state:"),
+        OidcConsumedToken.expires_at <= now,
+    ).delete(synchronize_session=False)
     db.add(
         OidcConsumedToken(
             token_id=transaction.token_id,

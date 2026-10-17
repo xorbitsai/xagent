@@ -7,6 +7,7 @@ to the ToolFactory in a unified way.
 """
 
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
@@ -496,7 +497,14 @@ class BaseToolConfig(ABC):
         return None
 
     def get_sql_connections(self) -> Dict[str, str]:
-        return {}
+        # Standalone tools historically read these at execution time. Include
+        # them in the authoritative snapshot instead of bypassing an omission.
+        prefix = "XAGENT_EXTERNAL_DB_"
+        return {
+            name[len(prefix) :]: url
+            for name, url in os.environ.items()
+            if name.startswith(prefix) and name != prefix and url
+        }
 
     def get_allowed_agent_ids(self) -> Optional[List[int]]:
         """Get explicitly allowed published agent IDs. None means use defaults."""
@@ -858,9 +866,6 @@ class ToolConfig(BaseToolConfig):
             return None
         value = tool_data.get(field_name)
         return value if isinstance(value, str) and value else None
-
-    def get_sql_connections(self) -> Dict[str, str]:
-        return {}
 
     def get_max_output_length(self) -> int:
         if self._custom_max_output_length is not None:

@@ -80,6 +80,7 @@ from ..services.slack_actor_runtime import (
 )
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
+    ToolCredentialUnreadableError,
     get_sql_connection_map,
     get_user_tool_allowlist,
     get_user_tool_overrides,
@@ -392,6 +393,7 @@ class _ToolFactoryRuntimeSnapshot:
 
     plan: _ToolFactoryRuntimeLoadPlan
     tool_credentials: dict[tuple[str, str], str | None] = field(default_factory=dict)
+    unreadable_credentials: frozenset[tuple[str, str]] = frozenset()
     sql_connections: dict[str, str] = field(default_factory=dict)
     failed_inputs: frozenset[str] = frozenset()
     custom_api_configs: list[dict[str, Any]] = field(default_factory=list)
@@ -1408,6 +1410,7 @@ def _load_tool_factory_runtime_snapshot(
     from ..services.db_runtime import is_database_pool_timeout
 
     tool_credentials: dict[tuple[str, str], str | None] = {}
+    unreadable_credentials: set[tuple[str, str]] = set()
     sql_connections: dict[str, str] = {}
     failed_inputs: set[str] = set()
     custom_api_configs: list[dict[str, Any]] = []
@@ -1483,9 +1486,12 @@ def _load_tool_factory_runtime_snapshot(
             loaded_credentials: dict[tuple[str, str], str | None] = {}
             for tool_name, field_specs in TOOL_CREDENTIAL_SPECS.items():
                 for field_name in field_specs:
-                    loaded_credentials[(tool_name, field_name)] = (
-                        resolve_tool_credential(db, tool_name, field_name)
-                    )
+                    try:
+                        loaded_credentials[(tool_name, field_name)] = (
+                            resolve_tool_credential(db, tool_name, field_name)
+                        )
+                    except ToolCredentialUnreadableError:
+                        unreadable_credentials.add((tool_name, field_name))
             return loaded_credentials
 
         tool_credentials = load_snapshot_input(
@@ -1634,6 +1640,7 @@ def _load_tool_factory_runtime_snapshot(
     return _ToolFactoryRuntimeSnapshot(
         plan=plan,
         tool_credentials=tool_credentials,
+        unreadable_credentials=frozenset(unreadable_credentials),
         sql_connections=sql_connections,
         failed_inputs=frozenset(failed_inputs),
         custom_api_configs=custom_api_configs,
@@ -3221,6 +3228,8 @@ class WebToolConfig(BaseToolConfig):
         if snapshot is not None and snapshot.plan.load_basic:
             if "basic" in snapshot.failed_inputs:
                 raise RuntimeError("Tool credential snapshot is unavailable")
+            if (tool_name, field_name) in snapshot.unreadable_credentials:
+                raise ToolCredentialUnreadableError()
             return snapshot.tool_credentials.get((tool_name, field_name))
         return resolve_tool_credential(self.db, tool_name, field_name)
 

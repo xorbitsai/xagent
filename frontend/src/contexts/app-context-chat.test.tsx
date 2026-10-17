@@ -49,7 +49,7 @@ const webSocketOptions = vi.hoisted(() => ({
       error: Error
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
-    onConnect?: () => void
+    onConnect?: (openedTaskId?: number) => void
     uploadFiles?: unknown
     token?: string
   },
@@ -61,7 +61,11 @@ const webSocketOptions = vi.hoisted(() => ({
 }))
 const sendChatMessageMock = vi.hoisted(() => vi.fn())
 const sendRawMessageMock = vi.hoisted(() => vi.fn())
-const wsHarness = vi.hoisted(() => ({ isConnected: true }))
+const wsHarness = vi.hoisted(() => ({
+  isConnected: true,
+  connectionPhase: "connected" as string,
+  loginIdentity: "auth:0" as string | null,
+}))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 // Mutable so connector-runtime dialog tests (which render the real
@@ -124,7 +128,7 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
       error: Error
     }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
-    onConnect?: () => void
+    onConnect?: (openedTaskId?: number) => void
     uploadFiles?: unknown
     token?: string
   }) => {
@@ -132,6 +136,8 @@ vi.mock("@/hooks/use-websocket", async (importOriginal) => ({
     webSocketOptions.all.push(options)
     return {
       isConnected: wsHarness.isConnected,
+      connectionPhase: wsHarness.connectionPhase,
+      getLoginIdentity: () => wsHarness.loginIdentity,
       connectionError: null,
       sendMessage: sendRawMessageMock,
       sendChatMessage: sendChatMessageMock,
@@ -156,13 +162,22 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   VERSIONED_TASK_EVENT_TYPES,
+  createInitialState,
   extractTaskControlEnvelope,
+  projectAppState,
   projectErrorFrameForDisplay,
   type AppProviderTransportConfig,
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { MessageDeliveryError } from "@/hooks/use-websocket"
+import {
+  RESEND_RECONNECT_DEADLINE_MS,
+  ResendWaiters,
+  mayResend,
+  sendWithResend,
+  type ResendOwnership,
+} from "./chat-delivery-resend"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 import type { Translate } from "@/contexts/i18n-context"
@@ -648,6 +663,7 @@ describe("AppProvider websocket message routing", () => {
     webSocketOptions.all = []
     sessionControls = null
     wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
     sendRawMessageMock.mockReset()
@@ -2065,6 +2081,86 @@ describe("AppProvider websocket message routing", () => {
       screen.getByTestId("messages").textContent || "[]"
     ) as Array<{ content: string }>
     expect(messages).toEqual([])
+  })
+
+  describe("connection notice", () => {
+    let setTask: ((id: number) => void) | undefined
+    function NoticeProbe() {
+      const { connectionNotice, setTaskId } = useApp()
+      setTask = (id) => setTaskId(id, { navigate: false })
+      return <span data-testid="notice">{connectionNotice ?? "none"}</span>
+    }
+
+    it("shows the reconnecting notice only for a task the socket opened earlier in this mount", () => {
+      render(
+        <AppProvider token="token">
+          <NoticeProbe />
+        </AppProvider>
+      )
+      for (const id of [1, 2]) {
+        act(() => setTask?.(id))
+        act(() => webSocketOptions.current?.onConnect?.(id))
+      }
+      wsHarness.connectionPhase = "reconnecting"
+      act(() => setTask?.(1))
+      expect(screen.getByTestId("notice").textContent).toBe("reconnecting")
+      act(() => setTask?.(3))
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+    })
+
+    it("credits an open that lands mid-switch to the socket's own task", () => {
+      const view = render(
+        <AppProvider token="token">
+          <NoticeProbe />
+        </AppProvider>
+      )
+      act(() => setTask?.(1))
+      // State already names task 2 when task 1's socket reports its open.
+      act(() => {
+        setTask?.(2)
+        webSocketOptions.current?.onConnect?.(1)
+      })
+      wsHarness.connectionPhase = "lost"
+      view.rerender(
+        <AppProvider token="token">
+          <NoticeProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+      act(() => setTask?.(1))
+      expect(screen.getByTestId("notice").textContent).toBe("lost")
+    })
+
+    it("shows reconnecting on the Session transport after any open, even once a task is adopted", async () => {
+      const transport = makeSessionTransport()
+      wsHarness.isConnected = false
+      const view = render(
+        <AppProvider token="token" transport={transport}>
+          <NoticeProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+
+      wsHarness.isConnected = true
+      act(() => webSocketOptions.current?.onConnect?.(undefined))
+      act(() => {
+        webSocketOptions.current?.onMessage?.(taskInfoMessage(1))
+      })
+      await waitFor(() => {
+        expect(screen.getByTestId("task-id").textContent).toBe("1")
+      })
+      expect(screen.getByTestId("notice").textContent).toBe("none")
+
+      wsHarness.isConnected = false
+      view.rerender(
+        <AppProvider token="token" transport={transport}>
+          <NoticeProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("notice").textContent).toBe("reconnecting")
+    })
   })
 
   it("does not retarget a different task's status when a failed-retry ack arrives after switching away", async () => {
@@ -11118,5 +11214,315 @@ describe("opens the first gate and the session check from one place each", () =>
 
   it("calls openSessionCheck only from the task page", () => {
     expect(callers(/\bopenSessionCheck\s*\(/g)).toEqual([{ file: "app/task/[id]/page-client.tsx", calls: 1 }])
+  })
+})
+
+describe("resend after reconnect", () => {
+  const ack = { client_message_id: "a", turn_id: "a" }
+  const connectionLost = (message: string) =>
+    new MessageDeliveryError(message, "outcome_unknown", { connectionLost: true })
+  const tree = (token = "token") => (
+    <AppProvider token={token}><SeedRunningTask /><SessionControlsProbe /></AppProvider>
+  )
+
+  beforeEach(() => {
+    sendChatMessageMock.mockReset()
+    sendChatMessageMock.mockResolvedValue(ack)
+    wsHarness.isConnected = true
+    wsHarness.connectionPhase = "connected"
+    wsHarness.loginIdentity = "auth:0"
+  })
+  afterEach(() => cleanup())
+
+  type Scene = { rerender: (ui: React.ReactElement) => void; unmount: () => void }
+  const sameLogin = ({ rerender }: Scene) => rerender(tree("token-2"))
+  const login = (identity: string | null) => () => { wsHarness.loginIdentity = identity }
+  const notSent = new MessageDeliveryError("not sent", "not_sent")
+  // [name, ids, rejections in call order (default: every first call is lost), change, wakes by reconnecting, ids sent, first call's rejection settles it]
+  it.each<[string, string[], Error[] | undefined, (scene: Scene) => void, boolean, string[], number | "ok"]>([
+    ["nothing changed, three messages", ["a", "b", "c"], undefined, () => {}, true, ["a", "b", "c", "a", "b", "c"], "ok"],
+    ["a token refresh of the same login", ["a"], undefined, sameLogin, true, ["a", "a"], "ok"],
+    ["a switch to another task", ["a"], undefined, () => act(() => getSessionControls().setTaskId(2, { navigate: false })), true, ["a"], 0],
+    ["another account", ["a"], undefined, login("auth:1"), true, ["a"], 0],
+    ["another guest token", ["a"], undefined, login("external:1"), true, ["a"], 0],
+    ["a login that cannot be read", ["a"], undefined, login(null), true, ["a"], 0],
+    ["a first failure that was not sent", ["a"], [notSent], () => {}, true, ["a"], 0],
+    ["two lost connections", ["a"], [connectionLost("first"), connectionLost("again")], () => {}, true, ["a", "a"], 1],
+    ["the phase turning lost", ["a"], undefined, ({ rerender }) => { wsHarness.connectionPhase = "lost"; rerender(tree()) }, false, ["a"], 0],
+    ["a switch to a view with no task", ["a"], undefined, ({ rerender }) => {
+      act(() => getSessionControls().setTaskId(null, { navigate: false }))
+      wsHarness.connectionPhase = "idle"
+      rerender(tree())
+    }, false, ["a"], 0],
+    ["an unmount", ["a"], undefined, ({ unmount }) => unmount(), false, ["a"], 0],
+    ["a phase that was already lost", ["a"], undefined, () => {}, false, ["a"], 0],
+  ])("resends after %s", async (_name, ids, rejections, change, reconnects, expectedIds, settlesWith) => {
+    const failures = rejections ?? ids.map(() => connectionLost("first"))
+    if (_name === "a phase that was already lost") wsHarness.connectionPhase = "lost"
+    failures.forEach(error => sendChatMessageMock.mockRejectedValueOnce(error))
+    const { rerender, unmount } = render(tree())
+    await act(async () => {})
+    const results = ids.map(id => getSessionControls()
+      .sendMessage(`m-${id}`, { clientMessageId: id }).then(() => "ok", (error: Error) => error))
+    await act(async () => {})
+
+    change({ rerender, unmount })
+    if (reconnects) act(() => webSocketOptions.current?.onConnect?.())
+    let settled: unknown[] = []
+    await act(async () => { settled = await Promise.all(results) })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(expectedIds)
+    expect(settled[0]).toBe(settlesWith === "ok" ? "ok" : failures[settlesWith])
+  })
+
+  it.each(["lost", "idle"] as const)("resends a Session send once on the new connection although its phase reads %s", async (phase) => {
+    wsHarness.connectionPhase = phase
+    sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
+    const sessionTree = (identity: string) => (
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(identity))}>
+        <SessionControlsProbe /><StateProbe />
+      </AppProvider>
+    )
+    const { rerender } = render(sessionTree("session-one"))
+    const outcome = getSessionControls().sendMessage("Resent turn", { clientMessageId: "s-1" }).then(() => "ok", (error: Error) => error)
+    await act(async () => {})
+
+    rerender(sessionTree("session-two"))
+    act(() => webSocketOptions.current?.onConnect?.())
+    await act(async () => { expect(await outcome).toBe("ok") })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["s-1", "s-1"])
+    // The bubble guard compares against the connection of the resend.
+    expect(screen.getByTestId("messages").textContent).toContain("Resent turn")
+  })
+
+  it("resends a queued first message once on the next connection", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ task_id: 7, title: "queued", description: "queued", status: "pending" }),
+    })
+    sendChatMessageMock.mockRejectedValueOnce(connectionLost("first"))
+    // The new task's socket has not connected yet, so the message is queued.
+    wsHarness.isConnected = false
+    render(<AppProvider token="token"><SessionControlsProbe /></AppProvider>)
+    let delivery: Promise<unknown> | undefined
+    await act(async () => {
+      delivery = getSessionControls().sendMessage("queued", { clientMessageId: "q-1" })
+        .then(() => "ok", (error: Error) => error)
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+
+    await act(async () => {
+      wsHarness.isConnected = true
+      webSocketOptions.current?.onConnect?.()
+      await new Promise(resolve => setTimeout(resolve, 0))
+    })
+    act(() => webSocketOptions.current?.onConnect?.())
+    await act(async () => { expect(await delivery).toBe("ok") })
+
+    expect(sendChatMessageMock.mock.calls.map(call => call[3])).toEqual(["q-1", "q-1"])
+  })
+
+  describe("a wait with no reconnect", () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    it("ends at 90 seconds with the original error and leaves no timer", async () => {
+      const lost = connectionLost("first")
+      const send = vi.fn().mockRejectedValueOnce(lost)
+      let outcome: unknown = "pending"
+      void sendWithResend(send, new ResendWaiters(), () => true).then(() => { outcome = "ok" }, (error) => { outcome = error })
+
+      await vi.advanceTimersByTimeAsync(89_999)
+      expect(outcome).toBe("pending")
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(outcome).toBe(lost)
+      expect(send).toHaveBeenCalledOnce()
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it("clears its deadline timer when the next open ends it", async () => {
+      const waiters = new ResendWaiters()
+      const send = vi.fn().mockRejectedValueOnce(connectionLost("first")).mockResolvedValueOnce("ok")
+      const outcome = sendWithResend(send, waiters, () => true)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(vi.getTimerCount()).toBe(1)
+
+      waiters.release(true)
+
+      expect(await outcome).toBe("ok")
+      expect(vi.getTimerCount()).toBe(0)
+    })
+  })
+
+  const bound = (taskId: number | null, deliveryGeneration = 0, phase = "bound"): ResendOwnership =>
+    ({ loginIdentity: "widget-session:0", boundTaskId: taskId, session: { deliveryGeneration, phase } })
+  it.each<[string, ResendOwnership, ResendOwnership, boolean]>([
+    ["nothing changed", bound(5), bound(5), true],
+    ["another delivery generation", bound(5), bound(5, 1), false],
+    ["a replacement conversation under way", bound(5), bound(5, 0, "replacement_sending"), false],
+    ["a task bound where there was none", bound(null, 0, "unbound"), bound(5), true],
+    ["another bound task", bound(5), bound(6), false],
+    ["a login that was never readable", { ...bound(5), loginIdentity: null }, { ...bound(5), loginIdentity: null }, false],
+  ])("a Session send after %s", (_name, first, now, resends) => {
+    expect(mayResend(first, now)).toBe(resends)
+  })
+
+  it("keeps the resend window at a fixed 90 seconds", () => {
+    expect(RESEND_RECONNECT_DEADLINE_MS).toBe(90_000)
+  })
+})
+
+describe("projectAppState exact settlement routing", () => {
+  type ProjectAction = Parameters<typeof projectAppState>[1]
+  type TracePayload = Extract<ProjectAction, { type: "ADD_TRACE_EVENT" }>["payload"]
+  type ProjectState = ReturnType<typeof createInitialState>
+  const trace = (
+    eventType: string,
+    eventId: string,
+    stepId: string,
+    data: Record<string, unknown>,
+  ): TracePayload => ({
+    event_id: eventId,
+    event_type: eventType,
+    step_id: stepId,
+    timestamp: eventId,
+    data,
+  })
+  const apply = (state: ProjectState, action: ProjectAction) =>
+    projectAppState(state, action)
+  const dispatch = (state: ProjectState, payload: TracePayload) =>
+    apply(state, { type: "ADD_TRACE_EVENT", payload })
+  const seal = (
+    state: ProjectState,
+    id: string,
+    content: string,
+  ) => apply(state, {
+    type: "ADD_MESSAGE",
+    payload: {
+      id,
+      role: "assistant",
+      content,
+      timestamp: id,
+      isResult: true,
+    },
+  })
+  const addUser = (state: ProjectState, id: string) => apply(state, {
+    type: "ADD_MESSAGE",
+    payload: { id, role: "user", content: id, timestamp: id },
+  })
+
+  it("routes a settlement to the exact invocation when one step reuses a provider id", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "a1", "same-step", {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+    }))
+    state = seal(state, "message-a", "A")
+    state = addUser(state, "between")
+    state = dispatch(state, trace("tool_execution_start", "b1", "same-step", {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-b",
+    }))
+    state = seal(state, "message-b", "B")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "a2", "same-step", {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+      settlement_delivery: true,
+      result: { output: "settled-a" },
+    }))
+
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["a1", "a2"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["b1"])
+    expect(state.traceEvents).toHaveLength(0)
+  })
+
+  it("routes an exact settlement across steps without consulting the provider id collision", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "a1", "step-a", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+    }))
+    state = seal(state, "message-a", "A")
+    state = addUser(state, "between")
+    state = dispatch(state, trace("tool_execution_start", "b1", "step-b", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-b",
+    }))
+    state = seal(state, "message-b", "B")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "a2", "new-resume-step", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "invocation-a",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["a1", "a2"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["b1"])
+  })
+
+  it("does not route an unknown exact invocation into a legacy owner", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "legacy", "step-a", {
+      tool_call_id: "tool_call_0",
+    }))
+    state = seal(state, "legacy-message", "legacy")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "exact", "step-a", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "unknown-invocation",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages.find(message => message.id === "legacy-message")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["legacy"])
+    expect(state.traceEvents.map(event => event.event_id)).toEqual(["exact"])
+  })
+
+  it("uses the original step to route an ambiguous legacy settlement", () => {
+    let state = createInitialState()
+    state = dispatch(state, trace("tool_execution_start", "a1", "step-a", {
+      tool_call_id: "tool_call_0",
+    }))
+    state = seal(state, "message-a", "A")
+    state = addUser(state, "between")
+    state = dispatch(state, trace("tool_execution_start", "b1", "step-b", {
+      tool_call_id: "tool_call_0",
+    }))
+    state = seal(state, "message-b", "B")
+    state = addUser(state, "reply")
+
+    state = dispatch(state, trace("tool_execution_end", "a2", "step-a", {
+      tool_call_id: "tool_call_0",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["a1", "a2"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
+      .toEqual(["b1"])
+  })
+
+  it("keeps an orphan settlement in the live buffer for truncated windows", () => {
+    const state = dispatch(createInitialState(), trace("tool_execution_end", "orphan", "old-step", {
+      tool_call_id: "tool_call_0",
+      invocation_id: "orphan-invocation",
+      settlement_delivery: true,
+    }))
+
+    expect(state.messages).toHaveLength(0)
+    expect(state.traceEvents.map(event => event.event_id)).toEqual(["orphan"])
   })
 })

@@ -311,6 +311,7 @@ ENV XAGENT_BUILD_TIME=${XAGENT_BUILD_TIME}
 ENV XAGENT_WORKER_COUNT=2
 ENV XAGENT_ENCRYPTION_KEY_FILE=/run/xagent-secrets/encryption.key
 ENV XAGENT_JWT_SECRET_FILE=/run/xagent-secrets/jwt.secret
+ENV XAGENT_SECRET_ENCRYPTION_KEY_FILE=/run/xagent-secrets/tool-credentials.secret
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

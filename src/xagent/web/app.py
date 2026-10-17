@@ -1582,6 +1582,7 @@ _BLOCKED_UPLOAD_EXTENSIONS = frozenset(
         ".rss",
     }
 )
+_PUBLIC_UPLOAD_PREFIX = "agent_logos/"
 
 
 def _blocked_upload_extension(path: str) -> bool:
@@ -1591,11 +1592,27 @@ def _blocked_upload_extension(path: str) -> bool:
     return PurePosixPath(path).suffix.lower() in _BLOCKED_UPLOAD_EXTENSIONS
 
 
+def _is_public_upload_path(path: str) -> bool:
+    """Only agent logos are safe to expose through the legacy static mount."""
+    path = path.replace(os.sep, "/")
+    parts = path.split("/")
+    return (
+        len(parts) == 2
+        and path.startswith(_PUBLIC_UPLOAD_PREFIX)
+        and parts[1] not in {"", ".", ".."}
+        and "\\" not in path
+    )
+
+
 class SafeUploadsStaticFiles(StaticFiles):
-    """Serve only non-active content from the legacy public uploads mount."""
+    """Serve only non-active agent logos from the legacy public mount.
+
+    User files live below the same storage root but must be served through the
+    authenticated file API, which enforces ownership and public-share tokens.
+    """
 
     async def get_response(self, path: str, scope: Scope) -> Any:
-        if _blocked_upload_extension(path):
+        if not _is_public_upload_path(path) or _blocked_upload_extension(path):
             return PlainTextResponse("Not found", status_code=404)
         return await super().get_response(path, scope)
 
@@ -1841,6 +1858,9 @@ async def startup_event() -> None:
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
     validate_auth_config()
+    from .services.auth_attempts import validate_auth_attempt_storage
+
+    await asyncio.to_thread(validate_auth_attempt_storage)
     validate_task_execution_host_config()
     if get_task_execution_role() == "worker":
         raise ValueError("Use python -m xagent.web.worker for the worker role")

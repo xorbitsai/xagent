@@ -13,7 +13,7 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from ....config import get_tool_max_output_length
-from .utils import clamp_limit, setup_proxy_env, url_path_id
+from .utils import clamp_limit, clamp_offset, setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("xero-mcp")
@@ -62,6 +62,7 @@ OVERDUE_DEFAULT_LIMIT = 50
 OVERDUE_MAX_LIMIT = 200
 PAID_INVOICE_DEFAULT_LIMIT = 100
 PAID_INVOICE_MAX_LIMIT = 200
+INVOICE_HISTORY_MAX_LIMIT = 200
 OVERDUE_TOP_CONTACTS = 25
 OPEN_INVOICE_EXCLUDES = ["credit_notes", "overpayments", "prepayments"]
 DEFAULT_INVOICE_TERMS_DAYS = 30
@@ -412,6 +413,8 @@ def _invoice_view(
             "contact": _contact_ref(record),
             "date": _doc_date(record, "Date"),
             "due_date": _doc_date(record, "DueDate"),
+            "expected_payment_date": _xero_date(record.get("ExpectedPaymentDate")),
+            "planned_payment_date": _xero_date(record.get("PlannedPaymentDate")),
             "currency": record.get("CurrencyCode"),
             "sub_total": record.get("SubTotal"),
             "total_tax": record.get("TotalTax"),
@@ -426,6 +429,19 @@ def _invoice_view(
     if with_lines:
         view["line_items"] = _line_items(record)
     return view
+
+
+def _history_record_view(record: dict[str, Any]) -> dict[str, Any]:
+    return _compact(
+        {
+            "details": record.get("Details"),
+            "changes": record.get("Changes"),
+            "user": record.get("User"),
+            "date_utc": _xero_date(
+                record.get("DateUTCString") or record.get("DateUTC")
+            ),
+        }
+    )
 
 
 def _contact_view(record: dict[str, Any]) -> dict[str, Any]:
@@ -1155,6 +1171,61 @@ def list_paid_invoices(
             "returned": len(shown),
             "has_more": has_more,
             "invoices": shown,
+        }
+        if has_more:
+            payload["next_skip"] = next_skip
+        if truncated:
+            payload["truncated"] = True
+        return payload
+
+    return _fit_list(build, window)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def list_invoice_history(
+    invoiceId: str,
+    skip: int = 0,
+    limit: int = 100,
+) -> str:
+    """
+    List Xero History & Notes records for one invoice, oldest to newest.
+
+    Use this when a user asks for notes, comments or change history they can
+    see in an invoice's History & Notes panel. These records are separate from
+    the invoice Reference and are not returned by list_invoices. When has_more
+    is true, call again with next_skip to read the remaining history.
+
+    invoiceId: Xero invoice GUID from list_invoices.
+    skip, limit: window into the complete history (limit 1-200, default 100).
+    """
+    safe_id = _guid(invoiceId, "invoiceId")
+    data = _request(
+        "GET",
+        f"Invoices/{safe_id}/History",
+        scope="invoices",
+    )
+    records = data.get("HistoryRecords") or []
+    history = [_history_record_view(record) for record in records]
+    history.sort(
+        key=lambda record: (
+            "date_utc" not in record,
+            record.get("date_utc", ""),
+        )
+    )
+    skip = clamp_offset(skip)
+    limit = clamp_limit(limit, max_limit=INVOICE_HISTORY_MAX_LIMIT)
+    window = history[skip : skip + limit]
+
+    def build(shown: list[Any], truncated: bool) -> dict[str, Any]:
+        next_skip = skip + len(shown)
+        has_more = next_skip < len(history)
+        payload: dict[str, Any] = {
+            "total_count": len(history),
+            "complete": True,
+            "skip": skip,
+            "returned": len(shown),
+            "has_more": has_more,
+            "history": shown,
         }
         if has_more:
             payload["next_skip"] = next_skip

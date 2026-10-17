@@ -274,8 +274,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # identity; the scanner visits both the constructor and the wrapper.
     # The external cancel's terminal broadcast sends one of two frames, one
     # per wording, so only the "didn't go through" one asserts a code: 57.
-    assert result.error_payloads == 57, (
-        f"expected exactly 57 error payloads, matched {result.error_payloads}; "
+    # The pause pre-check's not-applicable reply adds one: 58.
+    assert result.error_payloads == 58, (
+        f"expected exactly 58 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

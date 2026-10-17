@@ -9,7 +9,7 @@ from importlib import import_module
 from typing import Any
 
 from celery import Celery
-from celery.signals import worker_init
+from celery.signals import beat_init, worker_init
 
 from ...config import (
     get_background_job_sweep_interval_seconds,
@@ -17,6 +17,7 @@ from ...config import (
     get_celery_broker_url,
     get_celery_result_backend,
     get_kb_milvus_cleanup_interval_seconds,
+    validate_encryption_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,6 +75,28 @@ def create_celery_app() -> Any:
 
 
 celery_app = create_celery_app()
+
+
+@worker_init.connect
+@beat_init.connect
+def validate_worker_encryption(**_: Any) -> None:
+    from ..models.database import create_database_engine
+    from ..services.encryption_key_rotation import validate_stored_encryption_keys
+
+    engine = None
+    try:
+        validate_encryption_config()
+        engine = create_database_engine()
+        validate_stored_encryption_keys(engine)
+    except Exception as exc:
+        # Celery swallows ordinary signal exceptions. SystemExit must abort
+        # admission; never print raw SQL/parameters or secret values.
+        detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+        raise SystemExit(f"Refusing Celery startup: {detail}") from None
+    finally:
+        # No inherited DBAPI connections in prefork pool children.
+        if engine is not None:
+            engine.dispose()
 
 
 _REFUSED = 3

@@ -12,6 +12,7 @@ import {
 } from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import type { ConnectionNotice } from "@/contexts/connection-notice";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import {
   sanitizeFilesDisabledPresentationText,
@@ -111,12 +112,22 @@ export interface ChatMessageProps {
   // task to an admin. Rendered beside the content rather than inside it: the
   // stored failure text is replaced on reload and replayed as LLM context.
   failureTaskId?: number | null;
+  // Notice of the connection this turn streams over. Only a caller whose turns
+  // use the app's chat socket passes it; the agent builder streams over its
+  // own socket and leaves it unset.
+  connectionNotice?: ConnectionNotice;
 }
 
-function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string, taskStatus?: string }) {
+function GeneratingIndicator({ latestTitle, taskStatus, connectionNotice }: { latestTitle?: string, taskStatus?: string, connectionNotice: ConnectionNotice }) {
   const { t } = useI18n();
 
-  const displayTitle = taskStatus === 'paused'
+  // Paused, waiting and completed turns show no activity, so a connection
+  // notice would be misleading there and their own label stays. A lost
+  // connection is only named here; the panel banner says how to recover.
+  const showsActivity = !["paused", "waiting_for_user", "completed"].includes(taskStatus || "");
+  const displayTitle = showsActivity && connectionNotice
+    ? t(connectionNotice === "lost" ? "clientErrors.connectionLostStatus" : "clientErrors.connectionReconnecting")
+    : taskStatus === 'paused'
     ? t("common.taskPaused")
     : taskStatus === 'waiting_for_user'
       ? t("common.waitingForUser")
@@ -125,7 +136,7 @@ function GeneratingIndicator({ latestTitle, taskStatus }: { latestTitle?: string
   return (
     <div className="py-3 text-sm leading-relaxed text-muted-foreground flex items-center">
       <span>{displayTitle}</span>
-      {!["paused", "waiting_for_user", "completed"].includes(taskStatus || "") && (
+      {showsActivity && connectionNotice !== "lost" && (
         <span className="ml-1 inline-flex items-end gap-1">
           <span className="dot" />
           <span className="dot" />
@@ -336,6 +347,7 @@ export function ChatMessage({
   contextBadges,
   taskRuntimeExtensionMetadata,
   failureTaskId,
+  connectionNotice = null,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
@@ -599,7 +611,7 @@ export function ChatMessage({
                 // A past paused/waiting turn has showEmptyStatus=false, but with
                 // the trace hidden its status line is all that marks the turn.
                 !isUser && resolvedProcessStatus !== "interrupted" && (showEmptyStatus || (!showProcessView && isStoppedWithoutAnswer)) && (
-                  <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} />
+                  <GeneratingIndicator latestTitle={statusTitle} taskStatus={resolvedProcessStatus} connectionNotice={connectionNotice} />
                 )
               )}
               {failureReference && (

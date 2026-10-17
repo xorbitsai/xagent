@@ -58,6 +58,7 @@ from ...core.runtime_performance import (
     observe_duration,
     observe_value,
 )
+from ..auth_dependencies import get_current_user
 from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
@@ -373,11 +374,15 @@ def _resolve_legacy_preview_storage_path(raw_path: str) -> Optional[tuple[Path, 
         normalized = candidate.lstrip("/")
         if not normalized:
             continue
-        glob_matches = list(get_uploads_dir().glob(f"user_*/{normalized}"))
-        if glob_matches:
-            resolved_path = glob_matches[0].resolve()
-            relative_path = str(resolved_path.relative_to(get_uploads_dir().resolve()))
-            return resolved_path, relative_path
+        # Only the user-directory prefix is a pattern. Treat the supplied
+        # path literally and reject symlinks/traversal outside the uploads root.
+        root = get_uploads_dir().resolve()
+        for user_dir in root.glob("user_*"):
+            resolved_path = (user_dir / normalized).resolve()
+            if not resolved_path.is_relative_to(user_dir.resolve()):
+                continue
+            if resolved_path.is_file() and resolved_path.is_relative_to(root):
+                return resolved_path, str(resolved_path.relative_to(root))
 
     return None
 
@@ -846,7 +851,7 @@ class _LegacyPreviewRegistrationError(RuntimeError):
     """A legacy preview path cannot be registered for a public redirect."""
 
 
-def _register_legacy_preview_isolated(legacy_path: str) -> str:
+def _register_legacy_preview_isolated(legacy_path: str, requesting_user_id: int) -> str:
     """Register one legacy local preview without overlapping DB and file I/O.
 
     Owner discovery and the final insert each own a short Session. Durable
@@ -868,14 +873,16 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
             .first()
         )
         if existing is not None:
+            if int(existing.user_id) != requesting_user_id:
+                raise _LegacyPreviewRegistrationError("Legacy preview target not found")
             return str(existing.file_id)
 
         owner_info = _infer_owner_from_relative_path(lookup_db, relative_path)
         if owner_info is None:
-            raise _LegacyPreviewRegistrationError(
-                "Cannot infer owner for legacy preview path"
-            )
+            raise _LegacyPreviewRegistrationError("Legacy preview target not found")
         owner_user_id, task_id = owner_info
+        if owner_user_id != requesting_user_id:
+            raise _LegacyPreviewRegistrationError("Legacy preview target not found")
 
     generated_file_id = _build_output_file_id(relative_path)
     scope_segments = _scope_segments_for_task(task_id)
@@ -930,6 +937,10 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
                 .first()
             )
             if current is not None:
+                if int(current.user_id) != requesting_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview target not found"
+                    )
                 return str(current.file_id)
 
             if task_id is not None:
@@ -969,6 +980,10 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
                 )
                 if winner is None:
                     raise
+                if int(winner.user_id) != requesting_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview target not found"
+                    )
                 return str(winner.file_id)
             metadata_committed = True
             return applied.snapshot.file_id
@@ -994,7 +1009,9 @@ def _register_legacy_preview_isolated(legacy_path: str) -> str:
 async def redirect_legacy_preview(
     legacy_path: str,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> Any:
+    requesting_user_id = int(user.id)
     if not release_db_connection_if_clean(db):
         raise RuntimeError(
             "Cannot register a legacy preview while the request database "
@@ -1002,10 +1019,13 @@ async def redirect_legacy_preview(
         )
     try:
         file_id = await run_db_io_cancellation_safe(
-            lambda: _register_legacy_preview_isolated(legacy_path)
+            lambda: _register_legacy_preview_isolated(legacy_path, requesting_user_id)
         )
     except _LegacyPreviewRegistrationError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # Do not disclose whether an unowned path exists or changed owners.
+        raise HTTPException(
+            status_code=404, detail="Legacy preview target not found"
+        ) from exc
 
     return RedirectResponse(
         url=f"/api/files/public/preview/{file_id}",

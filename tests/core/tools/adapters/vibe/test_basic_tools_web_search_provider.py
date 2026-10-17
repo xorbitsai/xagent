@@ -6,10 +6,35 @@ from xagent.core.tools.adapters.vibe.basic_tools import create_basic_tools
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+from xagent.core.utils.encryption import ToolCredentialUnreadableError
 
 
 def _tool_names(tools):
     return [tool.name for tool in tools if hasattr(tool, "name")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["auto", "zhipu", "google"])
+async def test_unreadable_provider_preserves_other_basic_tools(
+    monkeypatch, caplog, provider
+):
+    monkeypatch.setenv("XAGENT_WEB_SEARCH_PROVIDER", provider)
+    config = ToolConfig({"workspace": None, "tool_credentials": {}})
+
+    def resolve(tool_name, field_name):
+        if tool_name == "zhipu_web_search":
+            raise ToolCredentialUnreadableError()
+        if tool_name == "web_search":
+            return "google-key" if field_name == "api_key" else "google-cse"
+        return None
+
+    monkeypatch.setattr(config, "get_tool_credential", resolve)
+    tools = await create_basic_tools(config)
+    assert "zhipu_web_search" not in _tool_names(tools)
+    assert "fetch_web_content" in _tool_names(tools)
+    assert "api_call" in _tool_names(tools)
+    assert ("web_search" in _tool_names(tools)) is (provider != "zhipu")
+    assert "Skipping zhipu_web_search" in caplog.text
 
 
 @pytest.mark.asyncio

@@ -191,6 +191,7 @@ export default defineConfig({
       "src/components/pages/oidc-callback.test.tsx",
       "src/components/task/task-conversation-panel.test.tsx",
       "src/components/ui/__tests__/markdown-renderer.test.tsx",
+      "src/components/ui/markdown-description.test.tsx",
       "src/components/widget/widget-bootstrap.test.ts",
       "src/components/widget/widget-session.test.ts",
       "src/components/widget/widget-chrome.test.ts",

@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect } from "react"
 import { cn } from "@/lib/utils"
 import { ChevronDown, X } from "lucide-react"
-import { marked } from "marked"
+import { MarkdownDescription } from "./markdown-description"
 import { useI18n } from "@/contexts/i18n-context"
 
 interface MultiSelectOption {
@@ -22,31 +22,6 @@ interface MultiSelectProps {
   creatable?: boolean
   searchable?: boolean
   disabled?: boolean
-}
-
-const MarkdownDescription = ({ content }: { content: string }) => {
-  const [html, setHtml] = useState<string>("")
-
-  useEffect(() => {
-    const parse = async () => {
-      try {
-        const result = await marked.parse(content)
-        setHtml(result)
-      } catch (e) {
-        setHtml(content)
-      }
-    }
-    parse()
-  }, [content])
-
-  if (!html) return null
-
-  return (
-    <div
-      className="text-xs text-muted-foreground mt-1 ml-2 [&_p]:m-0 [&_p]:leading-normal [&_strong]:text-foreground [&_code]:bg-muted [&_code]:px-1 [&_code]:rounded [&_code]:font-mono [&_ul]:pl-4 [&_ul]:m-0 [&_ol]:pl-4 [&_ol]:m-0"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  )
 }
 
 export function MultiSelect({ values, onValuesChange, options, placeholder, className, creatable, searchable, disabled }: MultiSelectProps) {

@@ -21,9 +21,9 @@ from typing import (
     cast,
 )
 
-from sqlalchemy import func
+from sqlalchemy import exists, func
 from sqlalchemy import null as sql_null
-from sqlalchemy import or_, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -3249,6 +3249,87 @@ def _pause_retry_found_its_run_paused(
     )
 
 
+async def _pause_cap_held_commands_without_agent(
+    reply: CommandReply,
+    command: ClaimedTaskCommand,
+    message_data: dict,
+    *,
+    held_start_run_id: str | None = None,
+) -> bool:
+    """Reject a PAUSE that nothing runs for, without building an agent, when it
+    passed commands a dispatch cap held; ``True`` when it did.
+
+    The rejection reads like ``pause_task``'s own and marks the pause as not
+    applicable, so its failing write settles the passed commands. With
+    ``held_start_run_id`` it applies only when one of them is the START that
+    opens that run. Anything else -- a run of the task live in this process,
+    no such command, an actor the task's owner check refuses, a RUNNING row,
+    or a retried pause whose run is paused -- is left to the caller's own
+    handling, as is a read that fails with ``ValueError``, ``KeyError`` or
+    ``TypeError``, which ``pause_task`` classifies. A database error raises.
+    """
+
+    if not get_shared_task_execution_enabled():
+        return False
+    from .task_dispatch_cap import build_dispatch_cap_snapshot
+
+    if command.task_id in build_dispatch_cap_snapshot().active_ids:
+        return False
+    user = message_data["user"]
+    started_run = (
+        ()
+        if held_start_run_id is None
+        else (
+            TaskExecutionCommand.kind == "start",
+            TaskExecutionCommand.target_run_id == held_start_run_id,
+        )
+    )
+
+    def read() -> Any | None:
+        from .task_execution_admission import cap_held_command_predicates
+        from .task_setup_snapshot import load_task_setup_snapshot_sync
+
+        with get_session_local()() as db:
+            held = db.scalar(
+                select(
+                    exists().where(
+                        *cap_held_command_predicates(command.task_id, command.id),
+                        *started_run,
+                    )
+                )
+            )
+        if not held:
+            return None
+        return load_task_setup_snapshot_sync(
+            command.task_id,
+            None,
+            actor_user_id=int(user.id),
+            actor_is_admin=bool(user.is_admin),
+        )
+
+    try:
+        snapshot = await run_db_io_cancellation_safe(read)
+    except (ValueError, KeyError, TypeError):
+        return False
+    if snapshot is None:
+        return False
+    status, run_id = snapshot.task.status, snapshot.task.run_id
+    if status == TaskStatus.RUNNING or _pause_retry_found_its_run_paused(
+        status, run_id, message_data
+    ):
+        return False
+    pause_failure = (
+        "Task is already paused"
+        if status == TaskStatus.PAUSED
+        else "No live execution found to pause"
+    )
+    message_data["_durable_command_error"] = pause_failure
+    message_data["_durable_pause_not_applicable"] = True
+    await reply(await _read_task_error_payload_offloop(command.task_id, pause_failure))
+    logger.warning("%s for task %s", pause_failure, command.task_id)
+    return True
+
+
 async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> None:
     """Handle task pause request"""
     try:
@@ -3383,6 +3464,7 @@ async def pause_task(reply: CommandReply, task_id: int, message_data: dict) -> N
                 await reply(
                     error_payload,
                 )
+                message_data["_durable_pause_not_applicable"] = True
                 logger.warning("%s for task %s", pause_failure, task_id)
                 return
             logger.info("Agent pause_execution completed")
@@ -4405,6 +4487,8 @@ async def _execute_durable_task_command(
             # Lets resume_task tell the sweeper's own commands apart; client
             # ingress strips every ``_durable_`` field, so it is never forged.
             "_durable_command_id": command.command_id,
+            # Set only by the pause handlers below; never taken from a payload.
+            "_durable_pause_not_applicable": False,
         }
     )
     if command.kind != TaskCommandKind.CANCEL:
@@ -4435,6 +4519,15 @@ async def _execute_durable_task_command(
                 )
                 if settled is not None:
                     return settled
+                if await _pause_cap_held_commands_without_agent(
+                    reply,
+                    command,
+                    message_data,
+                    held_start_run_id=command.target_run_id,
+                ):
+                    raise TaskCommandRejected(
+                        message_data["_durable_command_error"], settle_cap_held=True
+                    )
             raise TaskCommandRejected(
                 f"Task run changed before {command.kind.value} command "
                 f"{command.command_id} was applied",
@@ -4579,11 +4672,14 @@ async def _execute_durable_task_command(
     else:
         try:
             if command.kind == TaskCommandKind.PAUSE:
-                await pause_task(
-                    reply,
-                    command.task_id,
-                    message_data,
-                )
+                if not await _pause_cap_held_commands_without_agent(
+                    reply, command, message_data
+                ):
+                    await pause_task(
+                        reply,
+                        command.task_id,
+                        message_data,
+                    )
             elif command.kind == TaskCommandKind.RESUME:
                 resume_result = await resume_task(
                     reply,
@@ -4674,7 +4770,10 @@ async def _execute_durable_task_command(
             raise TaskCommandRejected(str(exc), reason="stale_run") from exc
     durable_error = message_data.get("_durable_command_error")
     if isinstance(durable_error, str) and durable_error:
-        raise TaskCommandRejected(durable_error)
+        raise TaskCommandRejected(
+            durable_error,
+            settle_cap_held=message_data.get("_durable_pause_not_applicable") is True,
+        )
     result = {
         "task_id": command.task_id,
         "command_id": command.command_id,

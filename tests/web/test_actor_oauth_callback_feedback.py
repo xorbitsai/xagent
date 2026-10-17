@@ -25,10 +25,13 @@ from jose import jwt
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_callback
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -1036,7 +1039,7 @@ def test_ordinary_flow_provider_error_pages_are_unchanged(
     denied = _ordinary_callback(db, state, error="access_denied")
     admin = _ordinary_callback(
         db,
-        state,
+        _ordinary_state(user),
         error="access_denied",
         error_subcode="cancel",
         error_description="AADSTS90094: The grant requires admin permission.",

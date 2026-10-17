@@ -1303,6 +1303,65 @@ describe("ChatInput", () => {
     expect(toastErrorMock).toHaveBeenCalledTimes(notificationHandled ? 0 : 1)
   })
 
+  it.each([
+    [false, false, 1],
+    [false, true, 1],
+    [true, false, 1],
+    [true, true, 0],
+  ])("notifies a late failure unless the input is gone and the connection was lost (unmounted: %s, connectionLost: %s)", async (unmounted, connectionLost, toasts) => {
+    let fail!: (error: Error) => void
+    const onSend = vi.fn(() => new Promise<void>((_resolve, reject) => { fail = reject }))
+    const { container, unmount } = render(
+      <ChatInput hideConfig hideFileUpload inputValue="late failure" onInputChange={vi.fn()} onSend={onSend} readOnlyConfig />
+    )
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    if (unmounted) unmount()
+
+    await act(async () => { fail(Object.assign(new Error("late failure"), { connectionLost })) })
+
+    expect(toastErrorMock).toHaveBeenCalledTimes(toasts)
+  })
+
+  it.each([
+    ["clears the sent draft", "sent draft", true],
+    ["keeps a draft typed while the send was pending", "typed meanwhile", false],
+  ])("%s once the send succeeds", async (_name, draftAtSuccess, cleared) => {
+    let succeed!: () => void
+    const onSend = vi.fn(() => new Promise<void>(resolve => { succeed = resolve }))
+    const onInputChange = vi.fn()
+    const input = (value: string) => (
+      <ChatInput hideConfig hideFileUpload inputValue={value} onInputChange={onInputChange} onSend={onSend} readOnlyConfig />
+    )
+    const { container, rerender } = render(input("sent draft"))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    rerender(input(draftAtSuccess))
+
+    await act(async () => { succeed() })
+
+    expect(onInputChange.mock.calls.some(([value]) => value === "")).toBe(cleared)
+  })
+
+  it.each([
+    ["clears the sent draft", "sent draft", ""],
+    ["keeps a draft typed while the send was pending", "typed meanwhile", "typed meanwhile"],
+  ])("%s once the send succeeds on an uncontrolled input", async (_name, draftAtSuccess, expected) => {
+    let succeed!: () => void
+    const onSend = vi.fn(() => new Promise<void>(resolve => { succeed = resolve }))
+    const { container } = render(<ChatInput hideConfig hideFileUpload onSend={onSend} readOnlyConfig />)
+    const editor = container.querySelector("[contenteditable]") as HTMLDivElement
+    const type = (text: string) => { editor.textContent = text; fireEvent.input(editor) }
+    type("sent draft")
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    type(draftAtSuccess)
+
+    await act(async () => { succeed() })
+
+    expect(editor.textContent).toBe(expected)
+  })
+
   it("localizes coded send failures without displaying their raw message", async () => {
     const onSend = vi.fn().mockRejectedValue(Object.assign(
       new Error("provider token=secret"),

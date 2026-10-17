@@ -81,7 +81,11 @@
     "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "overrides": {
+    "form-data": "4.0.6",
+    "image-size": "2.0.3",
+    "tinypool": "2.1.2",
     "katex": "$katex",
+    "postcss-selector-parser": "7.1.6",
     "next": {
       "postcss": "$postcss"
     }
@@ -93,9 +97,10 @@
     "@types/dagre": "^0.7.53",
     "@types/highlight.js": "^10.0.0",
     "@types/marked": "^5.0.0",
-    "@vitest/coverage-v8": "^2.1.9",
+    "@vitest/coverage-v8": "3.2.6",
     "jsdom": "^25.0.0",
-    "vitest": "^2.1.9",
+    "vite": "7.3.7",
+    "vitest": "3.2.6",
     "yaml": "^2.8.1"
   }
 }

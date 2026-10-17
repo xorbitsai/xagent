@@ -12,6 +12,7 @@
     "test:run": "vitest run",
     "test:pages": "vitest run --config vitest.config.ts src/components/pages src/ci/frontend-test-manifest.test.ts",
     "test:kb-components": "vitest run --config vitest.config.ts src/components/kb",
+    "test:file-previews": "vitest run --config vitest.config.ts src/components/file",
     "test:ci-manifest": "vitest run --config vitest.config.ts src/ci/frontend-test-manifest.test.ts",
     "test:app-pages": "vitest run --config vitest.config.ts src/app",
     "test:home-build-contracts": "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/background-jobs.test.ts src/lib/team-sharing-sanitizers.test.ts src/lib/oauth-account.test.ts src/lib/oauth-connect-account.test.ts",
@@ -77,7 +78,7 @@
     "tailwindcss-animate": "^1.0.7",
     "typescript": "^5.0.0",
     "unified": "^11.0.5",
-    "xlsx": "^0.18.5"
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
   },
   "overrides": {
     "next": {

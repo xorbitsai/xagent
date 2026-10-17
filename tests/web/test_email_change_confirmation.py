@@ -18,6 +18,11 @@ def configured_mail(monkeypatch):
     monkeypatch.setenv("XAGENT_SMTP_HOST", "smtp.example.com")
     monkeypatch.setenv("XAGENT_SMTP_FROM_EMAIL", "no-reply@example.com")
     monkeypatch.setattr(auth, "send_email_changed_notice", Mock())
+    monkeypatch.setattr(
+        auth,
+        "remote_ip_from_request",
+        lambda request: request.headers.get("x-test-ip", "ip-a"),
+    )
 
 
 @pytest.fixture
@@ -43,9 +48,7 @@ def email_change(monkeypatch):
     with auth_tests.TestingSessionLocal() as db:
         user = db.query(User).first()
         assert user.email == "administrator@example.com"
-        assert user.email_confirmation_hash == auth.hash_password_reset_token(
-            sent[-1][1]
-        )
+        assert user.email_confirmation_hash == auth.hash_auth_token(sent[-1][1])
         assert user.pending_email == "new@example.com"
     return headers, sent
 
@@ -114,9 +117,7 @@ def test_email_confirmation_rejects_invalid_proof(email_change, invalidity):
     elif invalidity == "password-recovered":
         with auth_tests.TestingSessionLocal() as db:
             user = db.query(User).one()
-            user.password_reset_token_hash = auth.hash_password_reset_token(
-                "recover-secret"
-            )
+            user.password_reset_token_hash = auth.hash_auth_token("recover-secret")
             user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
                 minutes=5
             )
@@ -207,9 +208,7 @@ def test_missing_smtp_is_actionable_and_does_not_replace_pending_proof(
     with auth_tests.TestingSessionLocal() as db:
         user = db.query(User).one()
         assert user.pending_email == "new@example.com"
-        assert user.email_confirmation_hash == auth.hash_password_reset_token(
-            sent[0][1]
-        )
+        assert user.email_confirmation_hash == auth.hash_auth_token(sent[0][1])
     profile = auth_tests.client.get("/api/auth/me", headers=headers).json()["user"]
     assert profile["email_change_available"] is False
     assert profile["pending_email"] == "new@example.com"
@@ -218,6 +217,13 @@ def test_missing_smtp_is_actionable_and_does_not_replace_pending_proof(
 
 def test_current_email_is_noop_without_mail_or_proof_replacement(email_change):
     headers, sent = email_change
+    with auth_tests.TestingSessionLocal() as db:
+        user = db.query(User).one()
+        pending_proof = (
+            user.pending_email,
+            user.email_confirmation_hash,
+            user.email_confirmation_expires_at,
+        )
     result = auth_tests.client.patch(
         "/api/auth/email",
         headers=headers,
@@ -227,29 +233,142 @@ def test_current_email_is_noop_without_mail_or_proof_replacement(email_change):
         },
     ).json()
     assert result["success"] and not result["pending_confirmation"]
+    assert result["unchanged"] is True
+    assert "unchanged" in result["message"]
+    assert result["user"]["pending_email"] == "new@example.com"
+    assert len(sent) == 1
+    with auth_tests.TestingSessionLocal() as db:
+        user = db.query(User).one()
+        assert (
+            user.pending_email,
+            user.email_confirmation_hash,
+            user.email_confirmation_expires_at,
+        ) == pending_proof
+    assert auth_tests.client.post(
+        "/api/auth/email/confirm", headers=headers, json={"token": sent[0][1]}
+    ).json()["success"]
+
+
+def _other_user_headers(username="other"):
+    with auth_tests.TestingSessionLocal() as db:
+        password_hash = (
+            db.query(User).filter_by(username="administrator").one().password_hash
+        )
+        user = User(
+            username=username,
+            email=f"{username}@example.com",
+            password_hash=password_hash,
+        )
+        db.add(user)
+        db.commit()
+        token = auth.create_access_token(auth.user_session_claims(user))
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_current_email_without_pending_proof_is_explicitly_unchanged(email_change):
+    headers, sent = email_change
+    assert auth_tests.client.post(
+        "/api/auth/email/confirm", headers=headers, json={"token": sent[0][1]}
+    ).json()["success"]
+    result = auth_tests.client.patch(
+        "/api/auth/email",
+        headers=headers,
+        json={"email": "new@example.com", "current_password": "admin123"},
+    ).json()
+    assert result["success"] and result["unchanged"]
+    assert not result["pending_confirmation"]
+    assert result["user"]["pending_email"] is None
     assert len(sent) == 1
 
 
-@pytest.mark.parametrize("dimension", ["PAIR", "EMAIL", "IP"])
+@pytest.mark.parametrize("dimension", ["user", "target", "ip"])
 def test_confirmation_requests_have_user_target_and_source_budgets(
     email_change, monkeypatch, dimension
 ):
     headers, sent = email_change
-    for name in ("PAIR", "EMAIL", "IP"):
-        monkeypatch.setenv(
-            f"XAGENT_AUTH_RECOVERY_{name}_LIMIT", "1" if name == dimension else "100"
-        )
+    settings = {
+        "user": "XAGENT_AUTH_RECOVERY_PAIR_LIMIT",
+        "target": "XAGENT_EMAIL_CHANGE_TARGET_LIMIT",
+        "ip": "XAGENT_AUTH_RECOVERY_IP_LIMIT",
+    }
+    for name, setting in settings.items():
+        monkeypatch.setenv(setting, "1" if name == dimension else "100")
+    # Keep only the tested dimension identical to the fixture's first request.
+    if dimension != "user":
+        headers = _other_user_headers()
+    headers = {**headers, "x-test-ip": "ip-a" if dimension == "ip" else "ip-b"}
     response = auth_tests.client.patch(
         "/api/auth/email",
         headers=headers,
         json={
-            "email": "new@example.com",
+            "email": "NEW@EXAMPLE.COM"
+            if dimension == "target"
+            else "second@example.com",
             "current_password": "admin123",
         },
     )
     assert response.status_code == 429
     assert int(response.headers["Retry-After"]) > 0
     assert len(sent) == 1
+
+
+@pytest.mark.parametrize("password", ["wrong-password", None])
+def test_bad_password_attempts_consume_user_budget(email_change, monkeypatch, password):
+    headers, sent = email_change
+    monkeypatch.setenv("XAGENT_AUTH_RECOVERY_PAIR_LIMIT", "2")
+    response = auth_tests.client.patch(
+        "/api/auth/email",
+        headers=headers,
+        json={"email": "second@example.com", "current_password": password},
+    )
+    assert response.status_code == 200
+    assert not response.json()["success"]
+    limited = auth_tests.client.patch(
+        "/api/auth/email",
+        headers={**headers, "x-test-ip": "ip-b"},
+        json={"email": "third@example.com", "current_password": "admin123"},
+    )
+    assert limited.status_code == 429
+    assert int(limited.headers["Retry-After"]) > 0
+    assert len(sent) == 1
+
+
+def test_default_target_budget_is_shared_across_users_and_ips(
+    email_change, monkeypatch
+):
+    _, sent = email_change
+    monkeypatch.delenv("XAGENT_EMAIL_CHANGE_TARGET_LIMIT", raising=False)
+    monkeypatch.setenv("XAGENT_AUTH_RECOVERY_EMAIL_LIMIT", "100")
+    for index in range(1, 6):
+        response = auth_tests.client.patch(
+            "/api/auth/email",
+            headers={
+                **_other_user_headers(f"other{index}"),
+                "x-test-ip": f"ip-{index}",
+            },
+            json={"email": "new@example.com", "current_password": "admin123"},
+        )
+        assert response.status_code == (200 if index < 5 else 429)
+        if index < 5:
+            assert response.json()["pending_confirmation"]
+    assert len(sent) == 5
+
+
+@pytest.mark.parametrize("expiry", ["expired", "missing"])
+def test_profile_hides_inactive_pending_target(email_change, expiry):
+    headers, _ = email_change
+    with auth_tests.TestingSessionLocal() as db:
+        user = db.query(User).one()
+        user.email_confirmation_expires_at = (
+            datetime.now(timezone.utc) - timedelta(seconds=1)
+            if expiry == "expired"
+            else None
+        )
+        db.commit()
+    profile = auth_tests.client.get("/api/auth/me", headers=headers).json()["user"]
+    assert profile["pending_email"] is None
+    assert profile["email"] == "administrator@example.com"
+    assert "email_confirmation_hash" not in profile
 
 
 @pytest.mark.parametrize("notice_fails", [False, True])

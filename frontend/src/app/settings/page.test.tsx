@@ -215,6 +215,76 @@ describe("SettingsPage auth profile synchronization", () => {
     expect(screen.getByDisplayValue("legacy-admin")).toBeInTheDocument()
   })
 
+  it.each([false, true])("reports an unchanged address without claiming an update (pending=%s)", async pending => {
+    const pending_email = pending ? "pending@example.com" : null
+    apiRequest
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: { ...authState.user, pending_email } })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, unchanged: true, user: { ...authState.user, pending_email } })))
+    render(<SettingsPage />)
+    await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toBeEnabled())
+    fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#email-current-password" }), { target: { value: "current-password" } })
+    fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
+    await screen.findByText(pending ? "settings.email.unchangedPending" : "settings.email.unchanged")
+    expect(screen.queryByText("settings.email.success")).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("settings.email.confirmationCode") !== null).toBe(pending)
+  })
+
+  it.each(["profile", "request", "confirm"])("renders structured validation errors safely (%s)", async phase => {
+    const invalid = { message: { invalid: true }, detail: [{ loc: ["body", "token"], msg: "Too long", type: "string_too_long" }] }
+    const error = new Response(JSON.stringify(invalid), { status: 422 })
+    if (phase === "profile") {
+      apiRequest.mockResolvedValueOnce(error)
+    } else {
+      apiRequest
+        .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: { ...authState.user, pending_email: "pending@example.com" } })))
+        .mockResolvedValueOnce(error)
+    }
+    render(<SettingsPage />)
+    if (phase !== "profile") {
+      await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toBeEnabled())
+      if (phase === "confirm") {
+        const code = screen.getByLabelText("settings.email.confirmationCode")
+        expect(code).toHaveAttribute("maxlength", "128")
+        fireEvent.change(code, { target: { value: "x".repeat(129) } })
+        fireEvent.click(screen.getByRole("button", { name: "settings.email.confirm" }))
+      } else {
+        fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#email-current-password" }), { target: { value: "current-password" } })
+        fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
+      }
+    }
+    await screen.findByText("settings.email.failed")
+    expect(screen.getByLabelText("settings.email.current")).toHaveValue("old@example.com")
+  })
+
+  it("keeps the sent confirmation available when another profile refresh advances the cache", async () => {
+    const response = deferred<Response>()
+    apiRequest
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: authState.user })))
+      .mockReturnValueOnce(response.promise)
+    const page = render(<SettingsPage />)
+    const input = screen.getByLabelText("settings.email.current")
+    await waitFor(() => expect(input).toBeEnabled())
+    const loaded = inspectAuthSession()
+    if (loaded.status !== "valid") throw new Error("expected loaded profile")
+    authState.session = loaded.projection.snapshot
+    page.rerender(<SettingsPage />)
+    fireEvent.change(input, { target: { value: "pending@example.com" } })
+    fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#email-current-password" }), { target: { value: "current-password" } })
+    fireEvent.click(screen.getByRole("button", { name: "settings.email.submit" }))
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledTimes(2))
+    expect(await updateAuthSessionUser(authState.session!, {
+      ...authState.user, email: "canonical@example.com",
+    })).toMatchObject({ status: "updated" })
+    response.resolve(new Response(JSON.stringify({
+      success: true, pending_confirmation: true,
+      user: { ...authState.user, pending_email: "pending@example.com" },
+    })))
+    await screen.findByText("settings.email.confirmationSent")
+    expect(screen.getByLabelText("settings.email.confirmationCode")).toBeEnabled()
+    expect(input).toHaveValue("canonical@example.com")
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { user: { email: "canonical@example.com" } } } })
+  })
+
   it("renders the distribution task runtime settings slot", async () => {
     apiRequest.mockResolvedValue(new Response(JSON.stringify({
       success: true,
@@ -329,9 +399,11 @@ describe("SettingsPage auth profile synchronization", () => {
     })
     if (replacement.status !== "created") throw new Error("expected replacement")
     update.resolve(new Response(JSON.stringify({
-      success: true, user: { id: "1", username: "alice", email: "stale@example.com" },
+      success: true, pending_confirmation: true, user: { id: "1", username: "alice", email: "stale@example.com", pending_email: "pending@example.com" },
     }), { headers: { "Content-Type": "application/json" } }))
     await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toHaveValue("replacement@example.com"))
     expect(screen.queryByText("settings.email.success")).not.toBeInTheDocument()
+    expect(screen.queryByText("settings.email.confirmationSent")).not.toBeInTheDocument()
+    expect(screen.queryByLabelText("settings.email.confirmationCode")).not.toBeInTheDocument()
   })
 })

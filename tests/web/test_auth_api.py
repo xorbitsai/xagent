@@ -1448,12 +1448,15 @@ class TestAuthAPI:
         )
         assert refresh.status_code == 401
 
-    def test_oidc_user_email_update_requires_provider_reauthentication(self, test_db):
+    @pytest.mark.parametrize("email", [None, "oidc@example.com"])
+    def test_oidc_user_email_update_is_disabled_without_local_password(
+        self, test_db, email
+    ):
         db = TestingSessionLocal()
         try:
             user = User(
                 username="oidc-user",
-                email="oidc@example.com",
+                email=email,
                 password_hash="!oidc-google",
             )
             db.add(user)
@@ -1470,7 +1473,10 @@ class TestAuthAPI:
             )
 
             assert result.success is False
-            assert user.email == "oidc@example.com"
+            assert result.error_code == "provider_managed"
+            assert "passwordless" in result.message
+            assert "administrator" in result.message
+            assert user.email == email
         finally:
             db.close()
 

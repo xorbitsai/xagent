@@ -4123,6 +4123,7 @@ def test_deployed_encryption_rejects_published_fernet_key(monkeypatch, key):
         ("XAGENT_AUTH_RECOVERY_IP_LIMIT", config.get_auth_recovery_ip_limit, 200),
         ("XAGENT_AUTH_RECOVERY_EMAIL_LIMIT", config.get_auth_recovery_email_limit, 50),
         ("XAGENT_AUTH_RECOVERY_PAIR_LIMIT", config.get_auth_recovery_pair_limit, 5),
+        ("XAGENT_EMAIL_CHANGE_TARGET_LIMIT", config.get_email_change_target_limit, 5),
         (
             "XAGENT_EMAIL_CONFIRMATION_EXPIRE_MINUTES",
             config.get_email_confirmation_expire_minutes,

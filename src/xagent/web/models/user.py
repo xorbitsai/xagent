@@ -1,4 +1,5 @@
 import uuid
+from typing import Any
 
 from sqlalchemy import (
     JSON,
@@ -132,6 +133,15 @@ class User(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username='{self.username}', is_admin={self.is_admin})>"
+
+
+def email_confirmation_clear_values() -> dict[Any, None]:
+    """Clear the complete pending proof in the caller's atomic user update."""
+    return {
+        User.pending_email: None,
+        User.email_confirmation_hash: None,
+        User.email_confirmation_expires_at: None,
+    }
 
 
 class UserModel(Base):  # type: ignore

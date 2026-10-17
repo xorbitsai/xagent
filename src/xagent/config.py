@@ -2300,6 +2300,7 @@ AUTH_LOGIN_PAIR_LIMIT = "XAGENT_AUTH_LOGIN_PAIR_LIMIT"
 AUTH_RECOVERY_IP_LIMIT = "XAGENT_AUTH_RECOVERY_IP_LIMIT"
 AUTH_RECOVERY_EMAIL_LIMIT = "XAGENT_AUTH_RECOVERY_EMAIL_LIMIT"
 AUTH_RECOVERY_PAIR_LIMIT = "XAGENT_AUTH_RECOVERY_PAIR_LIMIT"
+EMAIL_CHANGE_TARGET_LIMIT = "XAGENT_EMAIL_CHANGE_TARGET_LIMIT"
 AUTH_RATE_LIMIT_MAX_LOCAL_KEYS = "XAGENT_AUTH_RATE_LIMIT_MAX_LOCAL_KEYS"
 
 
@@ -2329,6 +2330,11 @@ def get_auth_recovery_email_limit() -> int:
 
 def get_auth_recovery_pair_limit() -> int:
     return _get_positive_int_env(AUTH_RECOVERY_PAIR_LIMIT, 5)
+
+
+def get_email_change_target_limit() -> int:
+    """Limit confirmation mail to an arbitrary, potentially unregistered target."""
+    return _get_positive_int_env(EMAIL_CHANGE_TARGET_LIMIT, 5)
 
 
 def get_auth_rate_limit_max_local_keys() -> int:

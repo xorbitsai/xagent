@@ -47,6 +47,7 @@ from ...config import (
     get_auth_recovery_email_limit,
     get_auth_recovery_ip_limit,
     get_auth_recovery_pair_limit,
+    get_email_change_target_limit,
     get_email_confirmation_expire_minutes,
     get_google_restricted_scopes,
     get_password_reset_expire_minutes,
@@ -91,7 +92,7 @@ from ..models.database import (
     release_db_connection_if_clean,
 )
 from ..models.system_setting import SystemSetting
-from ..models.user import User
+from ..models.user import User, email_confirmation_clear_values
 from ..models.user_oauth import UserOAuth
 from ..oauth_account_hosts import (
     OAuthAccountError,
@@ -1570,6 +1571,7 @@ class UpdateEmailResponse(BaseModel):
     message: str
     user: Optional[Dict[str, Any]] = None
     pending_confirmation: bool = False
+    unchanged: bool = False
     error_code: Optional[str] = None
 
 
@@ -1772,10 +1774,6 @@ def is_valid_email(email: str) -> bool:
 
 def hash_auth_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
-
-
-def hash_password_reset_token(token: str) -> str:
-    return hash_auth_token(token)
 
 
 def generate_password_reset_token() -> str:
@@ -2036,11 +2034,11 @@ def _normalized_preferences(user: User) -> Dict[str, Any]:
 
 
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
-    expires = getattr(user, "email_confirmation_expires_at", None)
+    expires = user.email_confirmation_expires_at
     if isinstance(expires, datetime) and expires.tzinfo is None:
         expires = expires.replace(tzinfo=timezone.utc)
     pending = (
-        getattr(user, "pending_email", None)
+        user.pending_email
         if isinstance(expires, datetime) and expires > datetime.now(timezone.utc)
         else None
     )
@@ -2311,7 +2309,7 @@ async def forgot_password(
         )
 
     reset_token = generate_password_reset_token()
-    reset_token_hash = hash_password_reset_token(reset_token)
+    reset_token_hash = hash_auth_token(reset_token)
     reset_expires_at = datetime.now(timezone.utc) + timedelta(
         minutes=get_password_reset_expire_minutes()
     )
@@ -2357,7 +2355,7 @@ async def reset_password(
         (("ip", remote_ip_from_request(http_request) or "unknown"),),
     )
 
-    token_hash = hash_password_reset_token(request.token)
+    token_hash = hash_auth_token(request.token)
     user = db.query(User).filter(User.password_reset_token_hash == token_hash).first()
     if user is None:
         return ResetPasswordResponse(success=False, message="Invalid reset token")
@@ -2396,9 +2394,7 @@ async def reset_password(
                 User.refresh_token: None,
                 User.refresh_token_expires_at: None,
                 User.session_epoch: new_session_epoch(),
-                User.pending_email: None,
-                User.email_confirmation_hash: None,
-                User.email_confirmation_expires_at: None,
+                **email_confirmation_clear_values(),
             },
             synchronize_session=False,
         )
@@ -2450,9 +2446,7 @@ async def change_password(
                     User.password_reset_token_hash: None,
                     User.password_reset_expires_at: None,
                     User.session_epoch: new_session_epoch(),
-                    User.pending_email: None,
-                    User.email_confirmation_hash: None,
-                    User.email_confirmation_expires_at: None,
+                    **email_confirmation_clear_values(),
                 },
                 synchronize_session=False,
             )
@@ -2502,7 +2496,7 @@ async def update_current_user_email(
     if not has_password:
         return UpdateEmailResponse(
             success=False,
-            message="Manage your email through your sign-in provider",
+            message="Self-service email changes are unavailable for passwordless accounts; contact your administrator for assistance",
             error_code="provider_managed",
         )
     email = normalize_email(request.email)
@@ -2518,7 +2512,7 @@ async def update_current_user_email(
             ),
             (
                 _budget_key("email-change-target", email),
-                get_auth_recovery_email_limit(),
+                get_email_change_target_limit(),
             ),
             (
                 _budget_key(
@@ -2541,7 +2535,10 @@ async def update_current_user_email(
 
     if email == normalize_email(str(user.email or "")):
         return UpdateEmailResponse(
-            success=True, message="Email is unchanged", user=serialize_auth_user(user)
+            success=True,
+            unchanged=True,
+            message="Email is unchanged; any pending change still requires confirmation",
+            user=serialize_auth_user(user),
         )
 
     existing_user = get_user_by_email(db, email)
@@ -2594,11 +2591,7 @@ async def update_current_user_email(
             User.id == user_id,
             User.email_confirmation_hash == token_hash,
         ).update(
-            {
-                User.pending_email: None,
-                User.email_confirmation_hash: None,
-                User.email_confirmation_expires_at: None,
-            },
+            email_confirmation_clear_values(),
             synchronize_session=False,
         )
         db.commit()
@@ -2663,9 +2656,7 @@ async def confirm_current_user_email(
             .update(
                 {
                     User.email: email,
-                    User.pending_email: None,
-                    User.email_confirmation_hash: None,
-                    User.email_confirmation_expires_at: None,
+                    **email_confirmation_clear_values(),
                     User.refresh_token: None,
                     User.refresh_token_expires_at: None,
                     User.password_reset_token_hash: None,

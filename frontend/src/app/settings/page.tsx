@@ -21,6 +21,12 @@ import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 import { ExecutionBudgetSettings } from "@/components/settings/execution-budget"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 
+function emailErrorText(data: { message?: unknown; detail?: unknown }, fallback: string): string {
+  if (typeof data.message === "string" && data.message) return data.message
+  if (typeof data.detail === "string" && data.detail) return data.detail
+  return fallback
+}
+
 export default function SettingsPage() {
   const { user, session } = useAuth()
   const { t, locale, setLocale } = useI18n()
@@ -66,7 +72,7 @@ export default function SettingsPage() {
             applyCanonicalEmail()
           }
         } else {
-          setEmailMessage({ type: 'error', text: data.message || data.detail || t("settings.email.failed") })
+          setEmailMessage({ type: 'error', text: emailErrorText(data, t("settings.email.failed")) })
         }
       } catch {
         if (isMounted) {
@@ -199,6 +205,7 @@ export default function SettingsPage() {
                 value={emailConfirmationToken}
                 onChange={(event) => setEmailConfirmationToken(event.target.value)}
                 autoComplete="off"
+                maxLength={128}
                 disabled={isProfileLoading || isSavingEmail}
               />
               <p className="text-sm text-muted-foreground">{t("settings.email.confirmationHint", { minutes: confirmationMinutes })}</p>
@@ -360,7 +367,7 @@ export default function SettingsPage() {
         },
         body: JSON.stringify(confirm ? { token: emailConfirmationToken.trim() } : {
           email,
-          ...(hasPassword ? { current_password: emailCurrentPassword } : {}),
+          current_password: emailCurrentPassword,
         })
       })
 
@@ -368,27 +375,32 @@ export default function SettingsPage() {
 
       if (response.ok && data.success) {
         const nextEmail = data.user?.email || ""
+        const nextPendingEmail = data.user?.pending_email || (data.pending_confirmation ? email.trim() : null)
+        const messageKey = data.unchanged
+          ? nextPendingEmail ? "settings.email.unchangedPending" : "settings.email.unchanged"
+          : data.pending_confirmation ? "settings.email.confirmationSent" : "settings.email.success"
         const updated = await syncCachedUser(capturedSession, data.user)
         if (updated.status === "updated") {
           setEmail(nextEmail)
-          setPendingEmail(data.user?.pending_email || (data.pending_confirmation ? email.trim() : null))
-          setEmailCurrentPassword('')
-          setEmailConfirmationToken('')
-          setEmailMessage({ type: 'success', text: t(data.pending_confirmation ? "settings.email.confirmationSent" : "settings.email.success") })
         } else if (updated.status === "advanced") {
+          // Keep the newer canonical profile, but retain this request's pending
+          // confirmation UI. Never carry it across a replacement login.
           applyCanonicalEmail()
-          setEmailMessage(null)
         } else {
           applyCanonicalEmail()
           setEmailMessage({ type: 'error', text: t("settings.email.failed") })
           return
         }
+        setPendingEmail(nextPendingEmail)
+        setEmailCurrentPassword('')
+        setEmailConfirmationToken('')
+        setEmailMessage({ type: 'success', text: t(messageKey) })
       } else {
         const localizedError = data.error_code === "smtp_not_configured"
           ? t("settings.email.smtpRequired")
           : data.error_code === "provider_managed" ? t("settings.email.providerManaged") : null
         if (data.error_code === "smtp_not_configured") setEmailChangeAvailable(false)
-        setEmailMessage({ type: 'error', text: localizedError || data.message || data.detail || t("settings.email.failed") })
+        setEmailMessage({ type: 'error', text: localizedError || emailErrorText(data, t("settings.email.failed")) })
       }
     } catch {
       setEmailMessage({ type: 'error', text: t("settings.email.errors.network") })

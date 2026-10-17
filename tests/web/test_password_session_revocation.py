@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from tests.web import test_auth_api as auth_tests
 from tests.web.test_auth_api import test_db as test_db
@@ -20,6 +22,65 @@ from xagent.web.auth_dependencies import (
 from xagent.web.models.user import User
 
 pytestmark = pytest.mark.usefixtures("test_db")
+
+
+@pytest.mark.parametrize(
+    "path,missing_token_code",
+    [
+        ("/ws/chat/1", 4001),
+        ("/ws/build/chat", 4001),
+        ("/ws/build/preview", 4001),
+        ("/ws/progress/task", 1008),
+    ],
+)
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_routed_websocket_requires_token_and_revokes_idle_session(
+    monkeypatch, path, missing_token_code, authenticated
+):
+    """Exercise FastAPI query binding, not just direct endpoint invocation."""
+    auth_tests.setup_first_admin(password="old-password-123")
+    tokens = auth._login_in_worker(
+        auth.LoginRequest(username="administrator", password="old-password-123"),
+        auth_tests.TestingSessionLocal,
+    )
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.01)
+    manager = MagicMock()
+    monkeypatch.setattr(websocket_api, "manager", manager)
+    monkeypatch.setattr(
+        websocket_api, "_private_websocket_task_access_sync", lambda **_: "authorized"
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+    progress_manager = MagicMock()
+    progress_manager.get_task_progress.return_value = None
+    monkeypatch.setattr(progress_ws, "get_progress_manager", lambda: progress_manager)
+    broadcaster = MagicMock()
+    broadcaster.connect = AsyncMock()
+    broadcaster.disconnect = AsyncMock()
+    monkeypatch.setattr(progress_ws, "progress_broadcaster", broadcaster)
+    app = FastAPI()
+    app.include_router(websocket_api.ws_router)
+    app.include_router(progress_ws.progress_ws_router)
+    with TestClient(app) as client:
+        if not authenticated:
+            with pytest.raises(WebSocketDisconnect) as error:
+                with client.websocket_connect(path):
+                    pytest.fail("A missing token must never establish a session")
+            assert error.value.code == missing_token_code
+            manager.register_connection.assert_not_called()
+            broadcaster.connect.assert_not_awaited()
+            return
+        with client.websocket_connect(
+            f"{path}?token={tokens['access_token']}"
+        ) as socket:
+            _change_password_in_separate_session("change")
+            # Starlette's public receive() has no timeout. Bound its underlying
+            # ASGI receive so a missing monitor fails instead of hanging CI.
+            message = socket.portal.call(asyncio.wait_for, socket._send_rx.receive(), 5)
+            assert message == {
+                "type": "websocket.close",
+                "code": 4001,
+                "reason": "Session expired",
+            }
 
 
 @pytest.mark.parametrize("operation", ["change", "reset"])

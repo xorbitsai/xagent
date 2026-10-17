@@ -99,6 +99,8 @@ def test_password_change_revokes_pending_connector_state_before_provider_exchang
     db.commit()
     post = Mock()
     monkeypatch.setattr(auth.requests, "post", post)
+    rejection = Mock()
+    monkeypatch.setattr(auth, "_log_oauth_callback_rejection", rejection)
     response = auth.generic_oauth_callback(
         "custom", _callback(state, error=False), db, None
     )
@@ -106,6 +108,13 @@ def test_password_change_revokes_pending_connector_state_before_provider_exchang
     assert b"Invalid or expired state" in response.body
     assert db.query(UserOAuth).count() == 0
     post.assert_not_called()
+    rejection.assert_called_once_with(
+        "custom",
+        "state_session_mismatch",
+        app_id=None,
+        actor_flow=False,
+        provider_error=None,
+    )
 
 
 def test_denied_provider_flow_is_consumed_and_cannot_be_replayed(

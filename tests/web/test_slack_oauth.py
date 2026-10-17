@@ -114,6 +114,8 @@ def test_password_change_fences_pending_slack_connector_write(
 
     post = Mock(side_effect=exchange)
     monkeypatch.setattr(auth_api.requests, "post", post)
+    rejection = Mock()
+    monkeypatch.setattr(auth_api, "_log_oauth_callback_rejection", rejection)
     monkeypatch.setattr(
         auth_api.requests,
         "get",
@@ -126,6 +128,15 @@ def test_password_change_fences_pending_slack_connector_write(
     assert "Invalid or expired state" in response.body.decode()
     assert db.query(UserOAuth).count() == 0
     assert post.call_count == (1 if phase == "during-exchange" else 0)
+    rejection.assert_called_once_with(
+        "slack",
+        "session_epoch_changed_after_exchange"
+        if phase == "during-exchange"
+        else "state_session_mismatch",
+        app_id="slack",
+        actor_flow=False,
+        provider_error=None,
+    )
 
 
 def test_slack_callback_persists_workspace_identity(db_session, monkeypatch):

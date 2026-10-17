@@ -507,7 +507,6 @@ const zh = {
         too_short: "新密码长度至少 {min} 位",
         network: "网络错误，请稍后重试",
       },
-      success: "密码更新成功",
       sign_in_again: "密码已更新，所有登录会话均已失效，请使用新密码重新登录。",
       failed: "密码更新失败",
     },

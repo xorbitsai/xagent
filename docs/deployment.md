@@ -27,10 +27,13 @@ instantaneous revocation guarantee, and database response time adds latency.
 Ordinary user-bound connector and Slack-channel OAuth states carry the initiating
 generation and are checked before provider exchange and fenced again when saving
 credentials. Pre-upgrade states without a generation work only for unrotated
-users. Already-connected provider grants, independent actor authorization flows,
-personal API keys and agent/workforce runtime keys have separate lifecycles and
-are not revoked by changing the login password. After suspected account compromise,
-explicitly audit/revoke those keys and disconnect provider grants as well.
+users. Pending remote-MCP OAuth flows (`MCPOAuthFlowState`, handled in `api/mcp.py`)
+are not generation-bound by this rollout and can still complete within their own
+expiry window after a password change. Already-connected provider grants,
+independent actor authorization flows, personal API keys and agent/workforce
+runtime keys also have separate lifecycles and are not revoked by changing the
+login password. After suspected account compromise, explicitly audit/revoke those
+keys and disconnect provider grants, including remote-MCP connections, as well.
 
 Do not downgrade past `20261016_user_session_epoch` on a live installation: dropping
 the column destroys revocation generations and can revalidate previously revoked,

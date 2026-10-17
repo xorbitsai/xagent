@@ -4315,6 +4315,13 @@ def generic_oauth_callback(
             db.query(User).filter(User.id == user_id).populate_existing().first()
         )
         if state_user is None or not matches_user_session(state_user, payload):
+            _log_oauth_callback_rejection(
+                provider,
+                "state_session_mismatch",
+                app_id=payload.get("app_id"),
+                actor_flow=is_actor_flow,
+                provider_error=provider_error,
+            )
             return HTMLResponse(
                 content="<h1>Error: Invalid or expired state</h1>", status_code=400
             )
@@ -5279,6 +5286,13 @@ def generic_oauth_callback(
                 )
             ):
                 db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "session_epoch_changed_after_exchange",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                    provider_error=provider_error,
+                )
                 return HTMLResponse(
                     content="<h1>Error: Invalid or expired state</h1>", status_code=400
                 )

@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from google import genai  # type: ignore[import-untyped,unused-ignore]
 from google.genai import errors as genai_errors
 
+from ....utils.public_http_transport import public_http_client_options
 from ....utils.security import redact_sensitive_text
 from ...providers import is_placeholder_api_key
 from ..error import is_context_length_error
@@ -354,7 +355,11 @@ class GeminiLLM(BaseLLM):
 
             try:
                 # Prepare HTTP options for custom base URL if configured
-                http_options = None
+                http_options = genai.types.HttpOptions(
+                    timeout=int(self.timeout * 1000),
+                    client_args=public_http_client_options(asynchronous=False),
+                    async_client_args=public_http_client_options(asynchronous=True),
+                )
                 if self.base_url:
                     # Remove trailing version paths (/v1beta, /v1) as SDK adds them automatically
                     base_url = self.base_url.rstrip("/")
@@ -366,10 +371,7 @@ class GeminiLLM(BaseLLM):
                             )
                             break
 
-                    http_options = genai.types.HttpOptions(
-                        base_url=base_url,
-                        timeout=int(self.timeout * 1000),
-                    )
+                    http_options.base_url = base_url
                     logger.info(f"Using custom base URL: {base_url}")
 
                 # Initialize the official Google Generative AI client
@@ -1168,7 +1170,11 @@ class GeminiLLM(BaseLLM):
             raise ValueError("An explicit, non-placeholder api_key is required")
         try:
             # Prepare HTTP options for custom base URL if configured
-            http_options = None
+            http_options = genai.types.HttpOptions(
+                timeout=30000,
+                client_args=public_http_client_options(asynchronous=False),
+                async_client_args=public_http_client_options(asynchronous=True),
+            )
             if base_url:
                 # Remove trailing version paths (/v1beta, /v1) as SDK adds them automatically
                 clean_base_url = base_url.rstrip("/")
@@ -1177,10 +1183,7 @@ class GeminiLLM(BaseLLM):
                         clean_base_url = clean_base_url[: -len(version_path)]
                         break
 
-                http_options = genai.types.HttpOptions(
-                    base_url=clean_base_url,
-                    timeout=30000,
-                )
+                http_options.base_url = clean_base_url
 
             # Initialize client with API key and optional custom base URL
             client = genai.Client(

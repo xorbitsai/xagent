@@ -3,9 +3,9 @@ import logging
 import os
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)

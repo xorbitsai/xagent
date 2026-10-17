@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from xagent.core.model.image.gemini import GeminiImageModel
+from xagent.core.model.image.openai import OpenAIImageModel
 from xagent.core.model.tts.base import BaseTTS, TTSResult
 from xagent.core.tools.core.audio_tool import AudioToolCore
 from xagent.core.utils import security
@@ -19,6 +20,34 @@ from xagent.core.utils.public_download import PublicDownloadError, download_publ
 from xagent.core.workspace import TaskWorkspace
 
 PUBLIC_IP = "93.184.216.34"
+
+
+@pytest.mark.asyncio
+async def test_openai_reference_download_uses_bounded_public_input_without_api_key(
+    network,
+):
+    _, seen, replies, _ = network
+    replies.append(httpx.Response(200, content=b"image-bytes"))
+    model = OpenAIImageModel(model_name="gpt-image-1", api_key="provider-secret")
+    path = await model._download_url("https://example.com/reference.png")
+    from pathlib import Path
+
+    try:
+        assert Path(path).read_bytes() == b"image-bytes"
+        assert seen[0].url.host == PUBLIC_IP
+        assert "authorization" not in seen[0].headers
+        assert "provider-secret" not in str(seen[0].url)
+    finally:
+        Path(path).unlink()
+
+
+@pytest.mark.asyncio
+async def test_openai_private_reference_never_reaches_socket(network):
+    _, seen, _, _ = network
+    model = OpenAIImageModel(model_name="gpt-image-1", api_key="provider-secret")
+    with pytest.raises(PublicDownloadError):
+        await model._download_url("http://192.168.1.1/reference.png")
+    assert not seen
 
 
 class FakeTTS(BaseTTS):
@@ -81,6 +110,7 @@ def network(monkeypatch):
 
     # Keep the real client, DNS policy and IP rewrite. Only sockets are fake.
     monkeypatch.setattr("httpx._client.AsyncHTTPTransport", transport)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
     return dns, seen, replies, options
 
 
@@ -378,7 +408,7 @@ async def test_gemini_reference_is_public_only_and_does_not_receive_provider_key
     model = GeminiImageModel(
         model_name="gemini-3-pro-image",
         api_key="provider-secret",
-        base_url="http://private-model.invalid/v1beta",
+        base_url="https://model.example/v1beta",
     )
     result = await model.edit_image("https://example.com/reference", "edit")
     assert result["image_url"] == "https://example.com/result.png"
@@ -386,7 +416,8 @@ async def test_gemini_reference_is_public_only_and_does_not_receive_provider_key
     assert seen[0].url.host == PUBLIC_IP
     assert "provider-secret" not in str(seen[0].url)
     assert "authorization" not in seen[0].headers
-    assert seen[1].url.host == "private-model.invalid"
+    assert seen[1].url.host == PUBLIC_IP
+    assert seen[1].headers["Host"] == "model.example"
     assert seen[1].headers["authorization"] == "Bearer provider-secret"
     part = json.loads(seen[1].content)["contents"][0]["parts"][0]["inlineData"]
     assert part == {

@@ -12,6 +12,7 @@ import logging
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, List
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -1242,6 +1243,10 @@ class TestRealOpenAIPath:
 
         monkeypatch.setattr(
             httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
+        )
+        monkeypatch.setattr(
+            "xagent.core.utils.public_http_transport.validate_public_http_url",
+            AsyncMock(return_value=["93.184.216.34"]),
         )
         for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE"):
             monkeypatch.delenv(name, raising=False)

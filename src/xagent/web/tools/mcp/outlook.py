@@ -6,11 +6,11 @@ from datetime import timezone as dt_timezone
 from typing import Any, cast
 from urllib.parse import quote, unquote, urlsplit
 
-import requests
 from dateutil import parser as _date_parser
 from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from .outlook_recurrence import build_graph_recurrence
 from .utils import InsufficientScopeError
 from .utils import conflict_response as _conflict_response

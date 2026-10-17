@@ -5,8 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional, Union
 
-from xinference_client import RESTfulClient as XinferenceClient
-
+from ..public_xinference import PublicXinferenceClient as XinferenceClient
 from .base import BaseEmbedding
 
 logger = logging.getLogger(__name__)

@@ -5,11 +5,11 @@ import os
 import urllib.parse
 from pathlib import Path
 
-import requests
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from ....core.utils import public_requests as requests
 from .utils import allowed_dirs_from_env
 
 app = Server("linkedin-mcp")

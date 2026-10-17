@@ -6,17 +6,23 @@ Provides common functionality for ASR, TTS, and other Xinference-based models.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from inspect import isawaitable
 from typing import Any, Optional, Protocol
 
-try:
-    from xinference.client.restful.restful_client import (
-        RESTfulClient as XinferenceClient,
-    )
-except ImportError:
-    from xinference_client import RESTfulClient as XinferenceClient  # noqa: F401
+from .public_xinference import PublicAsyncXinferenceClient
 
 logger = logging.getLogger(__name__)
+_PENDING_CLOSES: set[asyncio.Task[None]] = set()
+
+
+async def _finish_closes(pending: list[Any]) -> None:
+    for result in pending:
+        try:
+            await result
+        except Exception:
+            logger.debug("Xinference client cleanup failed", exc_info=False)
 
 
 class ModelProtocol(Protocol):
@@ -61,18 +67,9 @@ class BaseXinferenceModel:
     async def _get_session(self) -> Any:  # AsyncClient
         """Get or create async Xinference client."""
         if self._client is None:
-            try:
-                # Try to import from local xinference package first
-                from xinference.client.restful.async_restful_client import (
-                    AsyncClient,
-                )
-            except ImportError:
-                # Fallback to xinference_client package
-                from xinference_client.client.restful.async_restful_client import (  # type: ignore
-                    AsyncClient,
-                )
-
-            self._client = AsyncClient(base_url=self.base_url, api_key=self.api_key)
+            self._client = PublicAsyncXinferenceClient(
+                base_url=self.base_url, api_key=self.api_key
+            )
         return self._client
 
     async def _ensure_model_handle(self) -> Any:  # AsyncModelProtocol
@@ -85,23 +82,37 @@ class BaseXinferenceModel:
 
     def close(self) -> None:
         """Close the Xinference client and cleanup resources (sync version)."""
-        if self._model_handle is not None:
-            try:
-                self._model_handle.close()
-            except Exception:
-                pass
-            self._model_handle = None
+        pending = self._start_closes()
+        if not pending:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(_finish_closes(pending))
+        else:
+            task = loop.create_task(_finish_closes(pending))
+            _PENDING_CLOSES.add(task)
+            task.add_done_callback(_PENDING_CLOSES.discard)
 
-        if self._client is not None:
+    def _start_closes(self) -> list[Any]:
+        resources = [self._model_handle, self._client]
+        self._model_handle = None
+        self._client = None
+        pending: list[Any] = []
+        for resource in resources:
+            if resource is None:
+                continue
             try:
-                self._client.close()
+                result = resource.close()
+                if isawaitable(result):
+                    pending.append(result)
             except Exception:
                 pass
-            self._client = None
+        return pending
 
     async def aclose(self) -> None:
         """Close the Xinference client and cleanup resources (async version)."""
-        self.close()
+        await _finish_closes(self._start_closes())
 
     def __enter__(self) -> "BaseXinferenceModel":
         """Context manager entry."""

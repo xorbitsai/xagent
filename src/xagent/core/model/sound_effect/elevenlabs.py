@@ -9,6 +9,10 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...utils.security import redact_sensitive_text
+from ..public_elevenlabs import (
+    close_public_elevenlabs_http_client,
+    create_public_elevenlabs_client,
+)
 from .base import BaseSoundEffectModel, SoundEffectResult
 
 logger = logging.getLogger(__name__)
@@ -87,10 +91,14 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         if base_url:
             kwargs["base_url"] = base_url
         try:
-            return AsyncElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                AsyncElevenLabs, asynchronous=True, **kwargs
+            )
         except TypeError:
             kwargs.pop("base_url", None)
-            return AsyncElevenLabs(**kwargs)
+            return create_public_elevenlabs_client(
+                AsyncElevenLabs, asynchronous=True, **kwargs
+            )
 
     def _ensure_async_client(self) -> Any:
         if not self.api_key:
@@ -133,6 +141,7 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         self._async_client = None
         if client is None:
             return
+        await close_public_elevenlabs_http_client(client)
         close = getattr(client, "aclose", None) or getattr(client, "close", None)
         if callable(close):
             result = close()

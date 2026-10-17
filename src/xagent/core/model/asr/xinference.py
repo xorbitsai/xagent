@@ -288,12 +288,7 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
             ...     base_url="http://localhost:9997"
             ... )
         """
-        try:
-            from xinference_client import RESTfulClient as XinferenceClient
-        except ImportError:
-            from xinference.client.restful.restful_client import (
-                RESTfulClient as XinferenceClient,  # type: ignore
-            )
+        from ..public_xinference import PublicXinferenceClient as XinferenceClient
 
         client = XinferenceClient(base_url=base_url, api_key=api_key)
 

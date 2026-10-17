@@ -14,8 +14,9 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
 
-import requests
 from fastapi import HTTPException
+
+from ...core.utils import public_requests as requests
 
 logger = logging.getLogger(__name__)
 

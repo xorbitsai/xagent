@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
+from ...public_xinference import PublicAsyncXinferenceClient
 from ..exceptions import LLMTimeoutError
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
@@ -51,28 +52,7 @@ async def _await_before_deadline(
 
 
 def _create_async_client(base_url: str, api_key: Optional[str]) -> Any:
-    try:
-        from xinference_client.client.restful.async_restful_client import (  # type: ignore
-            AsyncClient,
-        )
-    except ImportError:
-        from xinference.client.restful.async_restful_client import AsyncClient
-
-    class NonBlockingAuthProbeAsyncClient(AsyncClient):  # type: ignore[valid-type,misc]
-        """Avoid the SDK's synchronous auth probe during construction."""
-
-        def __init__(self, client_base_url: str, client_api_key: Optional[str]) -> None:
-            self._api_key_configured = client_api_key is not None
-            super().__init__(client_base_url, api_key=client_api_key)
-
-        def _check_cluster_authenticated(self) -> None:
-            # The stock AsyncClient performs this probe with requests.get(),
-            # which blocks the event loop. Sending the Authorization header
-            # whenever an API key is configured works for both authenticated
-            # clusters and clusters that ignore authentication.
-            self._cluster_authed = self._api_key_configured
-
-    return NonBlockingAuthProbeAsyncClient(base_url, api_key)
+    return PublicAsyncXinferenceClient(base_url, api_key)
 
 
 def _normalize_model_list_response(

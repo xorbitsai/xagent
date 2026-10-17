@@ -258,9 +258,8 @@ def build_ca_bundle_ssl_context() -> ssl.SSLContext:
     return httpx.create_ssl_context(trust_env=True)
 
 
-async def validate_public_http_url(url: str) -> list[str]:
-    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
-
+def public_http_destination(url: str) -> tuple[str, int]:
+    """Validate URL syntax and literal hosts before either DNS implementation."""
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("url must be an absolute HTTP or HTTPS URL")
@@ -278,13 +277,10 @@ async def validate_public_http_url(url: str) -> list[str]:
     except ValueError as exc:
         raise ValueError("url contains an invalid port") from exc
 
-    addresses = await asyncio.to_thread(
-        socket.getaddrinfo,
-        hostname,
-        port,
-        socket.AF_UNSPEC,
-        socket.SOCK_STREAM,
-    )
+    return hostname, port
+
+
+def _public_addresses(addresses: list[tuple], hostname: str) -> list[str]:
     if not addresses:
         raise ValueError(f"Host {hostname!r} did not resolve to an address")
     resolved: list[str] = []
@@ -293,6 +289,29 @@ async def validate_public_http_url(url: str) -> list[str]:
         reject_private_network_host(ip)
         resolved.append(ip)
     return resolved
+
+
+def validate_public_http_url_sync(url: str) -> list[str]:
+    """Resolve and validate every address used by synchronous SDK clients."""
+    hostname, port = public_http_destination(url)
+    return _public_addresses(
+        socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM),
+        hostname,
+    )
+
+
+async def validate_public_http_url(url: str) -> list[str]:
+    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
+    hostname, port = public_http_destination(url)
+
+    addresses = await asyncio.to_thread(
+        socket.getaddrinfo,
+        hostname,
+        port,
+        socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+    )
+    return _public_addresses(addresses, hostname)
 
 
 def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:

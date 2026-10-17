@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Union
 
-import requests
-
+from ...utils import public_requests as requests
 from .base import BaseEmbedding
 
 

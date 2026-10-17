@@ -6,10 +6,10 @@ from datetime import date, datetime
 from os import environ
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id

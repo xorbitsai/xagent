@@ -3,9 +3,8 @@
 import logging
 from typing import Any, List, Optional
 
-from xinference_client import RESTfulClient as XinferenceClient
-
 from ..chat.token_context import MediaCallType
+from ..public_xinference import PublicXinferenceClient as XinferenceClient
 from .base import (
     BaseImageModel,
     InvalidImageResponseError,

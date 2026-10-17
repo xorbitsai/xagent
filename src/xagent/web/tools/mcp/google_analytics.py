@@ -5,10 +5,10 @@ import re
 from datetime import date
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)

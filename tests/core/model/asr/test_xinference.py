@@ -16,7 +16,7 @@ except ImportError:
         import xinference_client.client.restful.async_restful_client  # noqa: F401
 
         _ASYNC_CLIENT_PATH = (
-            "xinference_client.client.restful.async_restful_client.AsyncClient"
+            "xagent.core.model.xinference_base.PublicAsyncXinferenceClient"
         )
     except ImportError:
         pytest.skip(

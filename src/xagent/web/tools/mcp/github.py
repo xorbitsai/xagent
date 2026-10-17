@@ -7,9 +7,9 @@ import time
 from typing import Any
 from urllib.parse import quote
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)

@@ -7,6 +7,12 @@ import threading
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
+import httpx
+
+from ....utils.public_http_transport import (
+    create_public_async_client,
+    create_public_sync_client,
+)
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..stream_deadline import await_before_deadline
@@ -147,6 +153,7 @@ class ZhipuLLM(BaseLLM):
                     "zai SDK is not installed. Please install it with: pip install zai-sdk"
                 )
             self._client = ZhipuAiClient(
+                http_client=create_public_sync_client(timeout=self.timeout),
                 api_key=self.api_key,
                 base_url=self.base_url,
                 # Retry policy lives in the shared RetryWrapper only. The zai
@@ -1127,8 +1134,11 @@ class ZhipuLLM(BaseLLM):
 
     async def close(self) -> None:
         """Close the Zhipu client and cleanup resources."""
-        # The Zhipu client doesn't have an explicit close method
+        client = self._client
         self._client = None
+        close = getattr(client, "close", None)
+        if callable(close):
+            await asyncio.to_thread(close)
 
     async def __aenter__(self) -> "ZhipuLLM":
         """Async context manager entry."""
@@ -1174,9 +1184,10 @@ class ZhipuLLM(BaseLLM):
         if not base_url:
             base_url = "https://open.bigmodel.cn/v1"
 
+        public_http = create_public_sync_client(timeout=30.0)
         try:
             # Create client instance
-            client = ZhipuAiClient(api_key=api_key)
+            client = ZhipuAiClient(api_key=api_key, http_client=public_http)
 
             # Try to use SDK's models.list() method if available
             try:
@@ -1206,12 +1217,10 @@ class ZhipuLLM(BaseLLM):
 
             except AttributeError:
                 # If SDK doesn't have models.list(), use OpenAI-compatible endpoint
-                import httpx
-
                 url = base_url.rstrip("/") + "/models"
                 headers = {"Authorization": f"Bearer {api_key}"}
 
-                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                async with create_public_async_client(timeout=30.0) as http_client:
                     response = await http_client.get(url, headers=headers)
                     response.raise_for_status()
                     data = response.json()
@@ -1246,3 +1255,5 @@ class ZhipuLLM(BaseLLM):
             if raise_on_error:
                 raise
             return []
+        finally:
+            public_http.close()

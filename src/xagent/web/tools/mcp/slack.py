@@ -7,9 +7,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)

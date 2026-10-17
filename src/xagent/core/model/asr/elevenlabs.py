@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any, BinaryIO, Optional, Union
 
 from ...utils.security import redact_sensitive_text
+from ..public_elevenlabs import (
+    close_public_elevenlabs_http_client,
+    create_public_elevenlabs_client,
+)
 from .base import ASRResult, ASRSegment, BaseASR
 
 logger = logging.getLogger(__name__)
@@ -150,7 +154,9 @@ class ElevenLabsASR(BaseASR):
         if base_url:
             kwargs["base_url"] = base_url
 
-        return AsyncElevenLabs(**kwargs)
+        return create_public_elevenlabs_client(
+            AsyncElevenLabs, asynchronous=True, **kwargs
+        )
 
     def _ensure_async_client(self) -> Any:
         if not self.api_key:
@@ -163,6 +169,8 @@ class ElevenLabsASR(BaseASR):
     async def _close_client(client: Any) -> None:
         if client is None:
             return
+
+        await close_public_elevenlabs_http_client(client)
 
         close = getattr(client, "aclose", None) or getattr(client, "close", None)
         if callable(close):

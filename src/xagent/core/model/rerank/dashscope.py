@@ -2,8 +2,7 @@ import os
 from collections.abc import Sequence
 from typing import Any, Optional
 
-import requests
-
+from ...utils import public_requests as requests
 from .base import BaseRerank
 
 # Model names that use the OpenAI-compatible /compatible-api/v1/reranks

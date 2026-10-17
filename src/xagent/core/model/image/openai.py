@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Any, List, Optional
 from urllib.parse import urlparse
 
-import aiohttp
 from openai import APIResponseValidationError, AsyncOpenAI
 
+from ....config import get_media_download_max_bytes
+from ...utils.public_download import download_public_input
+from ...utils.public_http_transport import create_public_async_client
 from ..chat.token_context import MediaCallType
 from .base import (
     BaseImageModel,
@@ -154,6 +156,7 @@ class OpenAIImageModel(BaseImageModel):
     def _ensure_client(self) -> None:
         if self._client is None:
             self._client = AsyncOpenAI(
+                http_client=create_public_async_client(timeout=self.timeout),
                 base_url=self.base_url
                 if self.base_url != "https://api.openai.com/v1"
                 else None,
@@ -177,26 +180,21 @@ class OpenAIImageModel(BaseImageModel):
         return size
 
     async def _download_url(self, url: str) -> str:
+        result = await download_public_input(
+            url, max_bytes=get_media_download_max_bytes("image"), timeout=self.timeout
+        )
         parsed = urlparse(url)
-        extension = Path(parsed.path).suffix or ".png"
+        extension = Path(parsed.path).suffix.lower()
+        if extension not in {".png", ".jpg", ".jpeg", ".webp", ".gif"}:
+            extension = ".png"
         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp_file:
             tmp_path = tmp_file.name
-
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to download image: HTTP {response.status}"
-                        )
-                    with open(tmp_path, "wb") as output_file:
-                        async for chunk in response.content.iter_chunked(8192):
-                            output_file.write(chunk)
-            return tmp_path
-        except Exception:
-            Path(tmp_path).unlink(missing_ok=True)
-            raise
+            try:
+                tmp_file.write(result.content)
+            except BaseException:
+                Path(tmp_path).unlink(missing_ok=True)
+                raise
+        return tmp_path
 
     async def generate_image(
         self,

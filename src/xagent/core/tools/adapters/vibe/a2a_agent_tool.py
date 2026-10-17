@@ -323,7 +323,9 @@ def create_a2a_agent_tools_from_configs(
             else {},
             auth_token=_optional_str(item.get("auth_token")),
             timeout_seconds=request_timeout_seconds,
-            allow_private_networks=item.get("allow_private_networks") is True,
+            # Serialized tool configs are caller-controlled, not deployment
+            # policy. They must not turn off the actual-connection guard.
+            allow_private_networks=False,
         )
         tools.append(tool)
     return tools

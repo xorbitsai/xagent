@@ -419,7 +419,7 @@ class TestXinferenceLLM:
             "requests.Session.get",
             side_effect=AssertionError("synchronous auth probe must not run"),
         ):
-            client = _create_async_client("http://localhost:9997", api_key)
+            client = _create_async_client("https://xinference.example.com", api_key)
 
         try:
             assert client._headers.get("Authorization") == expected_authorization

@@ -4138,7 +4138,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "2.24.0"
+version = "2.54.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -4150,9 +4150,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/55/13/17e87641b89b74552ed408a92b231283786523edddc95f3545809fab673c/openai-2.24.0.tar.gz", hash = "sha256:1e5769f540dbd01cb33bc4716a23e67b9d695161a734aff9c5f925e2bf99a673", size = 658717, upload-time = "2026-02-24T20:02:07.958Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/50/9a/8c75e8c8a5b407a0586faeb2afac91674ff955c191ecc1d6d3b6669f6788/openai-2.54.0.tar.gz", hash = "sha256:e3e6f8bc1ba30ddf381ace1a14340eed381cb984a1a59bd0f34b5be3b5d49cfa", size = 1100285, upload-time = "2026-08-11T18:46:59.035Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c9/30/844dc675ee6902579b8eef01ed23917cc9319a1c9c0c14ec6e39340c96d0/openai-2.24.0-py3-none-any.whl", hash = "sha256:fed30480d7d6c884303287bde864980a4b137b60553ffbcf9ab4a233b7a73d94", size = 1120122, upload-time = "2026-02-24T20:02:05.669Z" },
+    { url = "https://files.pythonhosted.org/packages/64/a8/bb76c7356de8ad57f59d5ff993d434df0607f07f08bcc9c9a5c275e399c0/openai-2.54.0-py3-none-any.whl", hash = "sha256:89089789197ccdb87f173a03145ed1598d00795220c93e96cf712b1cbf5e5f2b", size = 1660351, upload-time = "2026-08-11T18:46:56.684Z" },
 ]
 
 [[package]]
@@ -8140,7 +8140,7 @@ requires-dist = [
     { name = "numba", marker = "extra == 'all'", specifier = ">=0.64.0" },
     { name = "numba", marker = "extra == 'document-processing'", specifier = ">=0.64.0" },
     { name = "numexpr", specifier = ">=2.11.0" },
-    { name = "openai", specifier = ">=1.50.0" },
+    { name = "openai", specifier = ">=2.26.0,<3" },
     { name = "openpyxl", marker = "extra == 'all'", specifier = ">=3.1.0" },
     { name = "openpyxl", marker = "extra == 'document-processing'", specifier = ">=3.1.0" },
     { name = "opentelemetry-api", specifier = ">=1.39.0,<2.0.0" },
@@ -8178,7 +8178,7 @@ requires-dist = [
     { name = "python-pptx", marker = "extra == 'document-processing'", specifier = ">=0.6.0" },
     { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "redis", specifier = ">=5.0.0" },
-    { name = "requests", specifier = ">=2.32.0" },
+    { name = "requests", specifier = ">=2.32.2" },
     { name = "rich", specifier = ">=14.0.0" },
     { name = "s3fs", specifier = ">=2026.2.0" },
     { name = "sentence-transformers", marker = "extra == 'all'", specifier = ">=3.0.0" },
@@ -8197,7 +8197,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.35.0" },
     { name = "volcengine-python-sdk", extras = ["ark"], specifier = ">=5.0.37" },
     { name = "websockets", specifier = ">=15.0.1" },
-    { name = "xinference-client", specifier = ">=2.3.0" },
+    { name = "xinference-client", specifier = ">=2.3.0,<3" },
     { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.3.6" },
     { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.3.6" },
     { name = "zai-sdk", specifier = ">=0.0.4" },

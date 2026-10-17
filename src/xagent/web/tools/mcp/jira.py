@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .jira_attachment import (

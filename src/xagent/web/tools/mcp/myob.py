@@ -3,10 +3,10 @@ import logging
 import os
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from .utils import (
     clamp_limit,
     clamp_offset,

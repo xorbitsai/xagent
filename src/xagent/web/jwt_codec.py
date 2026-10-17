@@ -1,7 +1,7 @@
 """Application JWT primitives backed by PyJWT, never python-jose.
 
 Keep a small import boundary so authentication owners share the same exception
-family. Unverified claims are diagnostic input only, never authentication.
+family. Rejection classification only inspects independently verified claims.
 """
 
 from typing import Any
@@ -21,10 +21,9 @@ class InvalidTemporalClaims(PyJWTError):
 
 def decode(
     token: str | bytes,
-    key: Any = "",
-    algorithms: list[str] | None = None,
+    key: Any,
+    algorithms: list[str],
     options: Options | None = None,
-    **kwargs: Any,
 ) -> dict[str, Any]:
     """Retain PyJWT validation and expose stable malformed-date classification.
 
@@ -34,7 +33,9 @@ def decode(
     Expired/not-yet-valid tokens retain PyJWT's original rejection and ordering.
     """
     try:
-        return _jwt.decode(token, key, algorithms=algorithms, options=options, **kwargs)
+        return _jwt.decode(token, key, algorithms=algorithms, options=options)
+    except _jwt.InvalidSignatureError:
+        raise
     except (_jwt.DecodeError, _jwt.InvalidIssuedAtError) as error:
         enabled: Options = options.copy() if options is not None else {}
         if not enabled.get("verify_signature", True):
@@ -49,7 +50,6 @@ def decode(
                 key,
                 algorithms=algorithms,
                 options=temporal_disabled,
-                **kwargs,
             )
         except PyJWTError:
             raise error from None
@@ -65,20 +65,3 @@ def decode(
             except (TypeError, OverflowError):
                 raise InvalidTemporalClaims("Invalid temporal claim") from None
         raise
-
-
-def get_unverified_claims(token: str) -> dict[str, Any]:
-    """Decode diagnostic claims without trusting them or following key URLs."""
-    return _jwt.decode(
-        token,
-        options={
-            "verify_signature": False,
-            "verify_exp": False,
-            "verify_nbf": False,
-            "verify_iat": False,
-            "verify_aud": False,
-            "verify_iss": False,
-            "verify_sub": False,
-            "verify_jti": False,
-        },
-    )

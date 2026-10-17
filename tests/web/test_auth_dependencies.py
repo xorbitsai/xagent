@@ -273,31 +273,6 @@ def test_numeric_temporal_claims_keep_the_library_accepted_behavior(
     assert db_session.info["user_query_count"] == 1
 
 
-@pytest.mark.parametrize("exception_type", (TypeError, OverflowError))
-def test_unrelated_decode_type_errors_propagate_by_identity(
-    db_session: Session,
-    monkeypatch: pytest.MonkeyPatch,
-    exception_type: type[Exception],
-) -> None:
-    """Only proven temporal-claim conversion failures are credential rejections."""
-    original = exception_type("unrelated decode failure")
-
-    def raise_original(*_args: object, **_kwargs: object) -> dict[str, object]:
-        raise original
-
-    monkeypatch.setattr(auth_dependencies.jwt, "decode", raise_original)
-    monkeypatch.setattr(
-        auth_dependencies.jwt, "get_unverified_claims", lambda _token: {"aud": "x"}
-    )
-    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="token")
-
-    with pytest.raises(exception_type) as raised:
-        get_current_user(credentials, db_session)
-
-    assert raised.value is original
-    assert db_session.info["user_query_count"] == 0
-
-
 @pytest.mark.parametrize(
     ("username", "user_id"),
     (

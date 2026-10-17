@@ -11,10 +11,7 @@ from . import jwt_codec as jwt
 from .auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from .auth_sessions import matches_user_session
 from .jwt_codec import ExpiredSignatureError, JWTError
-from .jwt_validation import (
-    has_matching_temporal_claim_conversion_failure,
-    is_exact_integer_bindable,
-)
+from .jwt_validation import is_exact_integer_bindable
 from .models.database import get_db
 from .models.user import User
 
@@ -78,12 +75,6 @@ def _resolve_access_token_user(
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS) from None
     except JWTError:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID) from None
-    except (TypeError, OverflowError) as error:
-        if has_matching_temporal_claim_conversion_failure(token, error):
-            raise _AccessTokenRejected(
-                _AccessTokenRejectionReason.INVALID_CLAIMS
-            ) from None
-        raise
 
     if "sub" in payload and type(payload["sub"]) is not str:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID)

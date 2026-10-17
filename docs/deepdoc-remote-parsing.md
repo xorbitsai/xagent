@@ -9,7 +9,7 @@ cost on CPU-only deployments — large documents take minutes.
 
 Two facts shape this design:
 
-- The original `deepdoc-lib` 0.2.2 integration had **no usable remote inference path**. The
+- `deepdoc-lib` (0.2.2 through 0.2.4) has **no usable remote inference path**. The
   `TENSORRT_DLA_SVR` hook in `vision/layout_recognizer.py` imports
   `deepdoc.vision.dla_cli`, a module that does not ship in the package.
 - Xinference now serves the whole pipeline. [xorbitsai/inference#5299][pr]

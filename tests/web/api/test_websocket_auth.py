@@ -714,7 +714,7 @@ async def test_poll_retries_transient_errors_but_closes_after_three_consecutive_
 async def test_expiry_after_handshake_keeps_stream_and_commands_alive_until_revocation(
     monkeypatch,
 ):
-    from jose import jwt
+    from jwt import api_jwt
 
     websocket, messages = _asgi_websocket(denial_extension=False)
     user = SimpleNamespace(
@@ -764,7 +764,7 @@ async def test_expiry_after_handshake_keeps_stream_and_commands_alive_until_revo
     task = asyncio.create_task(endpoint(websocket, token))
     try:
         await asyncio.wait_for(accepted.wait(), timeout=5)
-        monkeypatch.setattr(jwt, "datetime", Later)
+        monkeypatch.setattr(api_jwt, "datetime", Later)
         # The same expired token still cannot establish a fresh connection.
         assert original(token) is None
         advance.set()

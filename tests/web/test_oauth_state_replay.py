@@ -36,7 +36,7 @@ def db_session(tmp_path):
 
 
 @pytest.fixture
-def callback_client(db_session):
+def configured_provider(db_session):
     db, _ = db_session
     db.add(
         OAuthProvider(
@@ -49,6 +49,11 @@ def callback_client(db_session):
         )
     )
     db.commit()
+
+
+@pytest.fixture
+def callback_client(db_session, configured_provider):
+    db, _ = db_session
     app = FastAPI()
     app.include_router(auth.auth_router)
     app.dependency_overrides[auth.get_db] = lambda: db
@@ -101,7 +106,7 @@ def _state(session_epoch=None, **extra_claims):
 )
 @pytest.mark.parametrize("field", ["email", "app_id"])
 def test_success_callback_keeps_provider_identity_inert(
-    callback_client, db_session, monkeypatch, email, field
+    configured_provider, db_session, monkeypatch, email, field
 ):
     db, _ = db_session
     provider = db.query(OAuthProvider).filter_by(provider_name="custom").one()

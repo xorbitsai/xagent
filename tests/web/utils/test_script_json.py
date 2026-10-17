@@ -1,4 +1,4 @@
-"""HTML-tokenizer regression coverage for JSON embedded in popup scripts."""
+"""HTML-tokenizer regression coverage for the shared script JSON utility."""
 
 import json
 from html.parser import HTMLParser

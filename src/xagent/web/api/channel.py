@@ -38,7 +38,7 @@ from xagent.web.schemas.user_channel import (
 )
 
 from ..auth_sessions import lock_current_session_epoch, matches_user_session
-from ..utils.script_json import script_safe_json as _script_safe_json
+from ..utils.script_json import script_safe_json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -258,8 +258,8 @@ def _slack_oauth_popup_response(
     <script>
       if (window.opener) {{
         window.opener.postMessage(
-          {_script_safe_json(payload)},
-          {_script_safe_json(target_origin)}
+          {script_safe_json(payload)},
+          {script_safe_json(target_origin)}
         );
         window.close();
       }}

@@ -5,6 +5,7 @@ This module provides image generation capabilities using pre-configured image mo
 passed from the web layer.
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -14,10 +15,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import parse
 
-import aiohttp
-
+from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
+from ...utils.media_download import download_public_media, resolve_workspace_media_path
+from ...utils.security import redact_sensitive_text
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -621,35 +623,37 @@ Images are automatically saved to workspace.
                 parsed = parse.urlparse(image_url)
                 if parsed.scheme == "file":
                     local_path = Path(parse.unquote(parsed.path))
-            elif os.path.isabs(image_url) or os.path.exists(image_url):
+            elif not parse.urlparse(image_url).scheme:
                 local_path = Path(image_url)
 
             if local_path is not None:
-                if not local_path.is_file():
+                local_path = await asyncio.to_thread(
+                    resolve_workspace_media_path,
+                    local_path,
+                    self._workspace.workspace_dir,
+                )
+                if not await asyncio.to_thread(local_path.is_file):
                     raise RuntimeError(f"Local image path is not a file: {local_path}")
-                shutil.copyfile(local_path, save_path)
+                if local_path != await asyncio.to_thread(save_path.resolve):
+                    await asyncio.to_thread(shutil.copyfile, local_path, save_path)
                 logger.info(f"Copied local image to: {save_path}")
                 return str(save_path)
 
-            # Download the image with configurable timeout
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                async with session.get(image_url) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to download image: HTTP {response.status}"
-                        )
-
-                    # Save the image
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
+            await download_public_media(
+                image_url,
+                save_path,
+                timeout=timeout,
+                max_bytes=get_media_download_max_bytes("image"),
+                media_kind="image",
+            )
 
             logger.info(f"Downloaded image to: {save_path}")
             return str(save_path)
 
         except Exception as e:
-            logger.warning(f"Failed to download image from {image_url}: {e}")
+            logger.warning(
+                "Failed to download image: %s", redact_sensitive_text(str(e))
+            )
             raise
 
     async def generate_image(

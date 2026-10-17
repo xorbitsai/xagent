@@ -28,15 +28,16 @@ def get_tts_model_instance(db_model: Any) -> BaseTTS:
     api_key = str(db_model.api_key) if db_model.api_key else None
     base_url = str(db_model.base_url) if db_model.base_url else None
 
+    model: BaseTTS
     if provider == "xinference":
-        return XinferenceTTS(
+        model = XinferenceTTS(
             model=model_name,
             model_uid=model_name,
             base_url=base_url,
             api_key=api_key,
         )
     elif provider == "elevenlabs":
-        return ElevenLabsTTS(
+        model = ElevenLabsTTS(
             model=model_name,
             base_url=base_url,
             api_key=api_key,
@@ -46,6 +47,12 @@ def get_tts_model_instance(db_model: Any) -> BaseTTS:
             f"Unsupported TTS provider: {provider}. "
             "Supported providers: xinference, elevenlabs."
         )
+    # The provider records its own usage under this id, and saas prices media
+    # rows by model_id alone. Every entry point that builds from a DB row --
+    # the tools' registries, /speech/transcribe, the Telegram voice handler --
+    # comes through here, so they all bill one identity for one model.
+    setattr(model, "model_id", str(getattr(db_model, "model_id", None) or ""))
+    return model
 
 
 def get_tts_model(

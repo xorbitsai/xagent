@@ -9,6 +9,14 @@ from inspect import isawaitable
 from typing import Any, Literal, Optional, get_args, get_origin
 
 from ...utils.security import redact_sensitive_text
+from ..chat.token_context import MediaCallType
+from ..media_metering import (
+    BilledStream,
+    elevenlabs_billed_units,
+    measure_audio_seconds_async,
+    read_billed_stream,
+    record_provider_usage,
+)
 from .base import BaseMusicModel, MusicResult
 
 logger = logging.getLogger(__name__)
@@ -151,6 +159,34 @@ class ElevenLabsMusicModel(BaseMusicModel):
             **request_kwargs
         )
 
+    async def _record_usage(
+        self,
+        stream: BilledStream,
+        requested_seconds: Optional[float],
+        output_format: str,
+        *,
+        completed: bool,
+    ) -> None:
+        """Record one accepted generation, measured from the audio it returned.
+
+        The provider does not report a length, and the request's length is
+        absent whenever the caller let the model choose one, so the returned
+        audio is measured instead. A stream that broke partway is not measured
+        -- its bytes undercount what was generated and billed -- and falls back
+        to the requested length, then to an unmeasured 0.
+        """
+        seconds = (
+            await measure_audio_seconds_async(stream.audio, output_format)
+            if completed
+            else None
+        )
+        record_provider_usage(
+            self,
+            MediaCallType.MUSIC,
+            seconds if seconds is not None else requested_seconds,
+            provider_billed_units=elevenlabs_billed_units(stream.headers),
+        )
+
     async def generate_music(
         self,
         prompt: str,
@@ -178,20 +214,28 @@ class ElevenLabsMusicModel(BaseMusicModel):
         if music_length_seconds is not None:
             request_kwargs["music_length_ms"] = int(music_length_seconds * 1000)
 
+        stream = BilledStream()
+        completed = False
         try:
-            response = self._ensure_async_client().music.compose(**request_kwargs)
-            if isawaitable(response):
-                response = await response
-            chunks: list[bytes] = []
-            async for chunk in response:
-                chunks.append(bytes(chunk))
-            audio = b"".join(chunks)
+            audio = await read_billed_stream(
+                self._ensure_async_client().music,
+                "compose",
+                request_kwargs,
+                bytes,
+                stream,
+            )
+            completed = True
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
             logger.error("ElevenLabs music generation failed: %s", redacted_error)
             raise RuntimeError(
                 f"ElevenLabs music generation failed: {redacted_error}"
             ) from exc
+        finally:
+            if stream.accepted:
+                await self._record_usage(
+                    stream, music_length_seconds, output_format, completed=completed
+                )
 
         if not audio:
             raise RuntimeError("ElevenLabs music generation returned no audio")

@@ -204,6 +204,7 @@ class TokenUsage:
         tokens_estimated: bool = False,
         provider_text_input_tokens: Any = _ABSENT,
         provider_image_input_tokens: Any = _ABSENT,
+        provider_billed_units: Any = _ABSENT,
     ) -> None:
         """Append one media detail row. The only media write path.
 
@@ -301,6 +302,15 @@ class TokenUsage:
             optional_tokens = _coerce_optional_media_tokens(value)
             if optional_tokens is not None:
                 detail[key] = optional_tokens
+        # The provider's own count of what it charged, in its own billing
+        # unit (ElevenLabs reports credits per request). Kept beside
+        # `quantity`, never in place of it: `quantity` is always in the
+        # modality's declared unit, so the price table keeps one meaning per
+        # (model, unit), and a consumer can price either. Same optional rule
+        # as the modality splits: absent stays absent, an explicit 0 is kept.
+        billed_units = _coerce_optional_media_tokens(provider_billed_units)
+        if billed_units is not None:
+            detail["provider_billed_units"] = billed_units
         self.details.append(detail)
 
     def increment_llm_calls(self) -> None:
@@ -829,6 +839,7 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
     Provider input-modality splits are emitted only when every row in a group
     carries both valid fields; otherwise known subtotals stay hidden rather
     than being presented as complete coverage of a legacy/unknown row.
+    ``provider_billed_units`` follows the same rule.
 
     Pass a list you own. This iterates ``details`` directly, so handing in a
     live ``TokenUsage.details`` that another thread is appending to yields a
@@ -883,6 +894,7 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
                 "provider_tokens": 0,
                 "tokens_estimated": False,
                 "_provider_input_modality_complete": True,
+                "_provider_billed_units_complete": True,
             },
         )
         if not aggregate["model_name"] and model_name:
@@ -913,6 +925,17 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
             aggregate["provider_image_input_tokens"] = (
                 aggregate.get("provider_image_input_tokens", 0) + modality_values[1]
             )
+        billed_units = (
+            _coerce_optional_media_tokens(detail.get("provider_billed_units"))
+            if "provider_billed_units" in detail
+            else None
+        )
+        if billed_units is None:
+            aggregate["_provider_billed_units_complete"] = False
+        else:
+            aggregate["provider_billed_units"] = (
+                aggregate.get("provider_billed_units", 0) + billed_units
+            )
         if detail.get("tokens_estimated"):
             aggregate["tokens_estimated"] = True
 
@@ -921,6 +944,10 @@ def aggregate_media_usage_by_model(details: Any) -> List[Dict[str, Any]]:
         if not complete:
             aggregate.pop("provider_text_input_tokens", None)
             aggregate.pop("provider_image_input_tokens", None)
+        # A partial sum would read as the provider's full charge for the
+        # group while some of its calls reported nothing, so it is withheld.
+        if not aggregate.pop("_provider_billed_units_complete"):
+            aggregate.pop("provider_billed_units", None)
 
     return sorted(
         grouped.values(),
@@ -945,6 +972,7 @@ def add_media_usage(
     tokens_estimated: bool = False,
     provider_text_input_tokens: Any = _ABSENT,
     provider_image_input_tokens: Any = _ABSENT,
+    provider_billed_units: Any = _ABSENT,
 ) -> None:
     """Record non-LLM media model usage on the current context.
 
@@ -978,6 +1006,10 @@ def add_media_usage(
             tokens. Omitted when unavailable; an explicit 0 is preserved.
         provider_image_input_tokens: Provider-reported image portion of input
             tokens. Omitted when unavailable; an explicit 0 is preserved.
+        provider_billed_units: The provider's own report of what it charged,
+            in its own billing unit (e.g. ElevenLabs credits). Recorded beside
+            ``quantity``, which stays in the modality's unit. Omitted when
+            unavailable; an explicit 0 is preserved.
 
     Raises:
         ValueError: If ``call_type`` is not a known :class:`MediaCallType`
@@ -1000,6 +1032,7 @@ def add_media_usage(
         output_tokens=output_tokens,
         provider_text_input_tokens=provider_text_input_tokens,
         provider_image_input_tokens=provider_image_input_tokens,
+        provider_billed_units=provider_billed_units,
         resolution=resolution,
         tokens_estimated=tokens_estimated,
     )

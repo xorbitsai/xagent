@@ -149,7 +149,6 @@ Parameters:
 - return_last_frame (optional): ask the provider to return the last frame URL when supported.
 - first_frame_image_url / last_frame_image_url (optional): Seedance-style first/last-frame control.
 - reference_image_urls / reference_video_urls / reference_audio_urls (optional): public URLs used as references. Audio references require at least one image or video reference.
-- wait_for_result (optional): wait for task completion and download the result. Defaults to true.
 - poll_interval (optional): polling interval in seconds while waiting. Defaults to 30.
 - timeout (optional): maximum wait time in seconds.
 - model_id (optional): model ID from the list above. Omit to use the default model marked with ⭐[DEFAULT].
@@ -590,7 +589,6 @@ The generated video URL is temporary on the provider side, so completed videos a
         reference_image_urls: Optional[str | list[str]] = None,
         reference_video_urls: Optional[str | list[str]] = None,
         reference_audio_urls: Optional[str | list[str]] = None,
-        wait_for_result: bool = True,
         poll_interval: float = 30.0,
         timeout: Optional[float] = None,
         model_id: Optional[str] = None,
@@ -652,7 +650,6 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "generate_audio": generate_audio,
                 "watermark": watermark,
                 "return_last_frame": return_last_frame,
-                "wait_for_result": wait_for_result,
                 "poll_interval": poll_interval,
             }
             effective_seconds = self._normalize_seconds(
@@ -710,6 +707,12 @@ The generated video URL is temporary on the provider side, so completed videos a
                     normalized_reference_audio_urls
                 )
 
+            # Always wait for the finished video. A task started without
+            # waiting returns only its id, and nothing ever queries it again:
+            # the provider still bills the generation, but its duration and
+            # tokens never come back to be metered and the user never receives
+            # the video. A model that still sends the flag has it dropped.
+            kwargs.pop("wait_for_result", None)
             generate_params.update(kwargs)
             inner_video_model = getattr(video_model, "_inner", video_model)
             if isinstance(inner_video_model, ArkVideoModel):

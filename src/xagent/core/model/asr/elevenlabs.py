@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import mimetypes
@@ -12,6 +13,14 @@ from pathlib import Path
 from typing import Any, BinaryIO, Optional, Union
 
 from ...utils.security import redact_sensitive_text
+from ..chat.token_context import MediaCallType
+from ..media_metering import (
+    accepted_status,
+    call_with_headers,
+    elevenlabs_billed_units,
+    measure_audio_seconds_async,
+    record_provider_usage,
+)
 from .base import ASRResult, ASRSegment, BaseASR
 
 logger = logging.getLogger(__name__)
@@ -111,6 +120,22 @@ def _normalize_keyterms(value: Any) -> list[str]:
 
 def _content_type_for_filename(filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+
+async def _measure_input_seconds(
+    audio: Union[str, bytes], format: Optional[str]
+) -> Optional[float]:
+    """Seconds of local input audio, or None for a URL or unreadable input."""
+    if isinstance(audio, bytes):
+        return await measure_audio_seconds_async(audio, format or "")
+    if isinstance(audio, str) and not audio.startswith(("http://", "https://")):
+        try:
+            path = Path(audio)
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError:
+            return None
+        return await measure_audio_seconds_async(data, format or path.suffix[1:])
+    return None
 
 
 class ElevenLabsASR(BaseASR):
@@ -280,17 +305,27 @@ class ElevenLabsASR(BaseASR):
             request_kwargs["file"] = file_payload
 
         try:
-            response = await client.speech_to_text.convert(
+            response, headers = await call_with_headers(
+                client.speech_to_text,
+                "convert",
                 model_id=self.model,
                 **request_kwargs,
             )
         except Exception as exc:
+            if accepted_status(exc):
+                # A 2xx whose body the SDK could not parse: transcribed and
+                # charged, with no reported duration to read.
+                await self._record_usage(None, None, audio, format)
             redacted_error = redact_sensitive_text(str(exc))
             logger.error("ElevenLabs ASR failed: %s", redacted_error)
             raise RuntimeError(f"ElevenLabs ASR failed: {redacted_error}") from exc
         finally:
             if file_handle is not None:
                 file_handle.close()
+
+        # Recorded before the response is walked: the transcription is billed,
+        # and _normalize_response can still fail on an odd body.
+        await self._record_usage(response, headers, audio, format)
 
         text, segments, result_language, raw_response = self._normalize_response(
             response
@@ -303,6 +338,37 @@ class ElevenLabsASR(BaseASR):
             segments=segments if segments else None,
             language=result_language,
             raw_response=raw_response,
+        )
+
+    async def _record_usage(
+        self,
+        response: Any,
+        headers: Any,
+        audio: Union[str, bytes],
+        format: Optional[str],
+    ) -> None:
+        """Record one billed transcription, in seconds of input audio.
+
+        ElevenLabs reports ``audio_duration_secs`` on every response, verbose or
+        not, so callers that only want the text are still metered by duration.
+        Without it, local input audio is measured; a remote ``source_url`` the
+        provider fetched itself has nothing local to measure and records 0.
+        """
+        try:
+            seconds = (
+                response.get("audio_duration_secs")
+                if isinstance(response, dict)
+                else getattr(response, "audio_duration_secs", None)
+            )
+        except Exception:  # noqa: BLE001 - metering never breaks the call
+            seconds = None
+        if seconds is None:
+            seconds = await _measure_input_seconds(audio, format)
+        record_provider_usage(
+            self,
+            MediaCallType.ASR,
+            seconds,
+            provider_billed_units=elevenlabs_billed_units(headers),
         )
 
     @staticmethod

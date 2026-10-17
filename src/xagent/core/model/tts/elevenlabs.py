@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from ...utils.security import redact_sensitive_text
+from ..chat.token_context import MediaCallType
+from ..media_metering import (
+    BilledStream,
+    elevenlabs_billed_units,
+    read_billed_stream,
+    record_provider_usage,
+)
 from .base import BaseTTS, TTSResult
 
 logger = logging.getLogger(__name__)
@@ -615,26 +622,23 @@ class ElevenLabsTTS(BaseTTS):
             )
 
         client = self._ensure_async_client()
+        stream = BilledStream()
         try:
             if reference_audio:
                 voice_id = await self._get_or_create_cloned_voice(reference_audio)
-            response = client.text_to_speech.convert(
-                text=synthesis_text,
-                voice_id=voice_id,
-                model_id=self.model,
-                output_format=final_output_format,
-                **request_kwargs,
+            audio = await read_billed_stream(
+                client.text_to_speech,
+                "convert",
+                {
+                    "text": synthesis_text,
+                    "voice_id": voice_id,
+                    "model_id": self.model,
+                    "output_format": final_output_format,
+                    **request_kwargs,
+                },
+                self._coerce_audio_bytes,
+                stream,
             )
-            # ElevenLabs SDK 2.56+ exposes ``convert`` as an async generator,
-            # while older releases returned a coroutine that resolved to an
-            # async iterator. Support both contracts without awaiting a
-            # generator object directly.
-            if isawaitable(response):
-                response = await response
-            chunks: list[bytes] = []
-            async for chunk in response:
-                chunks.append(self._coerce_audio_bytes(chunk))
-            audio = b"".join(chunks)
         except Exception as exc:
             error_text = str(exc)
             if (
@@ -655,6 +659,17 @@ class ElevenLabsTTS(BaseTTS):
                 redacted_error,
             )
             raise RuntimeError(f"ElevenLabs TTS failed: {redacted_error}") from exc
+        finally:
+            # Once accepted, ElevenLabs charges for the text it was sent --
+            # the aliased text, not the caller's -- whether or not the audio
+            # stream then completes, so this records on failure too.
+            if stream.accepted:
+                record_provider_usage(
+                    self,
+                    MediaCallType.TTS,
+                    len(synthesis_text),
+                    provider_billed_units=elevenlabs_billed_units(stream.headers),
+                )
 
         if not audio:
             raise RuntimeError("ElevenLabs TTS returned no audio data")

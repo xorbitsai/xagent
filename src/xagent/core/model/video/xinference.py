@@ -11,7 +11,9 @@ from urllib.request import url2pathname
 
 import aiohttp
 
-from .base import BaseVideoModel
+from ..chat.token_context import MediaCallType
+from ..media_metering import record_provider_usage
+from .base import BaseVideoModel, BilledVideoTaskError
 
 logger = logging.getLogger(__name__)
 REFERENCE_MEDIA_FETCH_TIMEOUT = 60.0
@@ -103,8 +105,11 @@ class XinferenceVideoModel(BaseVideoModel):
         api_key: Optional[str] = None,
         timeout: float = 3600.0,
         abilities: Optional[List[str]] = None,
+        model_id: str = "",
     ) -> None:
         self.model_name = model_name
+        # The configured row id usage is billed under; see media_metering.
+        self.model_id = model_id
         self._model_uid = model_uid or model_name
         self.base_url = (base_url or "http://localhost:9997").rstrip("/")
         self.api_key = api_key
@@ -145,7 +150,15 @@ class XinferenceVideoModel(BaseVideoModel):
                     message=f"Xinference video request failed: detail: {detail}",
                     headers=response.headers,
                 )
-            return await response.json()
+            # The server answered 200, so the generation already ran. A body
+            # that will not decode is a billed response, not a retryable
+            # failure: retrying would generate (and pay for) it again.
+            try:
+                return await response.json()
+            except Exception as exc:  # noqa: BLE001 - positional classification
+                raise BilledVideoTaskError(
+                    f"Xinference video response could not be decoded: {exc}"
+                ) from exc
 
     async def _post_video_json(
         self,
@@ -329,6 +342,13 @@ class XinferenceVideoModel(BaseVideoModel):
         _ = wait_for_result, poll_interval
         if not self.has_ability("generate"):
             raise RuntimeError("This model doesn't support video generation")
+        if n not in (None, 1, "1"):
+            # Only the first video of a batch is ever returned to the caller,
+            # yet the server renders all of them; reject rather than bill for
+            # videos nobody receives.
+            raise ValueError(
+                "Xinference video generation supports one video per request"
+            )
 
         if content:
             for item in content:
@@ -414,15 +434,34 @@ class XinferenceVideoModel(BaseVideoModel):
                             "kwargs": json.dumps(kwargs),
                         },
                     )
+        except BilledVideoTaskError:
+            record_provider_usage(self, MediaCallType.VIDEO, 0)
+            raise
         except Exception as exc:
             logger.error("Xinference video generation failed: %s", exc)
             raise RuntimeError(f"Xinference video generation failed: {exc}") from exc
 
-        data = _to_plain_data(result)
-        item = _first_video_item(data)
+        try:
+            data = _to_plain_data(result)
+            item = _first_video_item(data)
+        except Exception as exc:  # noqa: BLE001 - positional classification
+            record_provider_usage(self, MediaCallType.VIDEO, 0)
+            raise BilledVideoTaskError(
+                f"Xinference video response was malformed: {exc}"
+            ) from exc
+        reported_seconds = item.get("duration") or item.get("seconds")
+        # Recorded before the response is validated: the video was rendered.
+        # The server's own duration wins; the requested length is the
+        # fallback, since a server that reports none rendered what was asked.
+        record_provider_usage(
+            self,
+            MediaCallType.VIDEO,
+            reported_seconds if reported_seconds is not None else effective_seconds,
+            resolution=str(item.get("resolution") or resolution or ""),
+        )
         video_url = _video_url_from_item(item)
         if not video_url:
-            raise RuntimeError(
+            raise BilledVideoTaskError(
                 "Xinference video generation response did not include "
                 "url, video_url, or b64_json"
             )

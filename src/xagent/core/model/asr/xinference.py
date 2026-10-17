@@ -5,6 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, Union
 
+from ..chat.token_context import MediaCallType
+from ..media_metering import (
+    measure_audio_seconds_async,
+    positive_seconds,
+    record_provider_usage,
+)
 from ..xinference_base import BaseXinferenceModel
 from .base import ASRResult, ASRSegment, BaseASR
 
@@ -44,6 +50,28 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
         """
         BaseXinferenceModel.__init__(self, model, model_uid, base_url, api_key)
         self.language = language
+
+    async def _record_usage(
+        self, result: Any, audio_data: bytes, format: Optional[str]
+    ) -> None:
+        """Record one transcription in seconds of input audio.
+
+        Whisper-style ``verbose_json`` reports the duration; plain ``json`` (what
+        callers wanting only text get) does not, so the input itself is measured
+        rather than billing those calls as zero.
+        """
+        try:
+            reported = (
+                result.get("duration")
+                if isinstance(result, dict)
+                else getattr(result, "duration", None)
+            )
+        except Exception:  # noqa: BLE001 - metering never breaks the call
+            reported = None
+        seconds = positive_seconds(reported)
+        if seconds is None:
+            seconds = await measure_audio_seconds_async(audio_data, format or "")
+        record_provider_usage(self, MediaCallType.ASR, seconds)
 
     async def transcribe(
         self,
@@ -117,6 +145,8 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
 
             # Call async transcriptions API (not speech - speech is for TTS!)
             result = await model_handle.transcriptions(audio=audio_data, **params)
+            # Recorded before the result is walked: the audio was transcribed.
+            await self._record_usage(result, audio_data, format)
 
             # Extract transcription result
             if isinstance(result, dict):

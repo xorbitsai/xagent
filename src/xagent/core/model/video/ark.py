@@ -6,7 +6,9 @@ import os
 import time
 from typing import Any, List, Optional
 
-from .base import BaseVideoModel
+from ..chat.token_context import MediaCallType
+from ..media_metering import record_provider_usage
+from .base import BaseVideoModel, BilledVideoTaskError, BilledVideoTaskTimeout
 
 ARK_DOMESTIC_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 ARK_BYTEPLUS_BASE_URL = "https://ark.ap-southeast.bytepluses.com/api/v3"
@@ -107,8 +109,11 @@ class ArkVideoModel(BaseVideoModel):
         timeout: float = 1800.0,
         abilities: Optional[List[str]] = None,
         model_provider: str = "volcengine-ark",
+        model_id: str = "",
     ):
         self.model_name = model_name
+        # The configured row id usage is billed under; see media_metering.
+        self.model_id = model_id
         self.model_provider = model_provider.lower().strip().replace("_", "-")
         is_byteplus = self.model_provider in {
             "byteplus",
@@ -293,6 +298,32 @@ class ArkVideoModel(BaseVideoModel):
             )
         return content
 
+    def _record_task_usage(
+        self, task_result: Optional[dict[str, Any]], *, succeeded: bool = False
+    ) -> None:
+        """Write the one usage row of a created task, at its last observation.
+
+        Every task that was created ends here exactly once, whichever way the
+        wait ends. Only a succeeded task bills its seconds; a task that failed,
+        was cancelled or was still running at the deadline records 0 seconds --
+        a call that happened with no produced duration -- plus whatever tokens
+        Ark reported, which is what Seedance actually charges by.
+        """
+        try:
+            result = task_result if isinstance(task_result, dict) else {}
+            usage = _get_nested(result.get("raw_response"), "usage")
+            output_tokens = _get_nested(usage, "completion_tokens")
+            resolution = result.get("resolution")
+            record_provider_usage(
+                self,
+                MediaCallType.VIDEO,
+                result.get("duration") if succeeded else 0,
+                output_tokens=0 if output_tokens is None else output_tokens,
+                resolution=resolution if isinstance(resolution, str) else "",
+            )
+        except Exception as e:  # noqa: BLE001 - metering never breaks the call
+            logger.warning("Failed to record Ark video usage: %s", e, exc_info=True)
+
     async def generate_video(
         self,
         prompt: str = "",
@@ -351,17 +382,23 @@ class ArkVideoModel(BaseVideoModel):
                 "Seedance audio references require at least one image or video reference"
             )
 
+        if not wait_for_result:
+            # Rejected before the task exists, so nothing is billed. A task
+            # nobody polls still finishes and is charged, but its duration and
+            # tokens are never read, so it could only be metered as zero.
+            raise ValueError(
+                "Ark video generation must wait for the task to finish; "
+                "wait_for_result=False is not supported"
+            )
+
         create_result = await self.create_video_task(request_content, **kwargs)
         task_id = create_result.get("task_id")
-        if not wait_for_result:
-            return {
-                **create_result,
-                "status": "created",
-                "video_url": None,
-                "last_frame_url": None,
-            }
         if not task_id:
-            raise RuntimeError("Ark did not return a video generation task id")
+            # The create call succeeded, so a task may exist that cannot be
+            # polled. Record it as unmeasured rather than leave a possible
+            # charge invisible, and do not retry into a second one.
+            self._record_task_usage(None)
+            raise BilledVideoTaskError("Ark did not return a video generation task id")
 
         deadline = time.monotonic() + (timeout or self.timeout)
         while True:
@@ -372,7 +409,8 @@ class ArkVideoModel(BaseVideoModel):
                     "Transient error polling video task %s: %s", task_id, exc
                 )
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(
+                    self._record_task_usage(None)
+                    raise BilledVideoTaskTimeout(
                         f"Timed out waiting for video generation task {task_id} "
                         "due to persistent polling errors"
                     ) from exc
@@ -380,14 +418,17 @@ class ArkVideoModel(BaseVideoModel):
                 continue
             status = task_result.get("status")
             if status == "succeeded":
+                self._record_task_usage(task_result, succeeded=True)
                 return task_result
             if status in {"failed", "cancelled", "expired"}:
-                raise RuntimeError(
+                self._record_task_usage(task_result)
+                raise BilledVideoTaskError(
                     f"Video generation task {task_id} ended with status {status}: "
                     f"{task_result.get('error')}"
                 )
             if time.monotonic() >= deadline:
-                raise TimeoutError(
+                self._record_task_usage(task_result)
+                raise BilledVideoTaskTimeout(
                     f"Timed out waiting for video generation task {task_id}; "
                     f"last status: {status}"
                 )

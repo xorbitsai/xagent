@@ -8,11 +8,16 @@ from ...model import VideoModelConfig
 from ...model.providers import canonical_provider_name
 from ...retry import create_retry_wrapper
 from .ark import ArkVideoModel
-from .base import BaseVideoModel
+from .base import BaseVideoModel, BilledVideoTaskError
 from .xinference import XinferenceVideoModel
 
 
 def retry_on(exc: Exception) -> bool:
+    # Checked first because the cause walk below would otherwise find the
+    # network error a polling timeout was raised from, and retry a generation
+    # the provider is already billing for.
+    if isinstance(exc, BilledVideoTaskError):
+        return False
     if isinstance(exc, aiohttp.ClientResponseError):
         return exc.status == 429 or 500 <= exc.status < 600
     if isinstance(
@@ -42,6 +47,12 @@ def retry_on(exc: Exception) -> bool:
 
 
 def get_video_model_instance(db_model: Any) -> BaseVideoModel:
+    """Build the configured provider, retry-wrapped, from its DB row.
+
+    The row's ``model_id`` is handed to the provider itself, not stamped on the
+    wrapper afterwards: the wrapper only forwards attribute *reads*, so an id
+    set on it never reaches the provider, which is where usage is recorded.
+    """
     provider = canonical_provider_name(str(db_model.model_provider))
     model_name = str(db_model.model_name)
     api_key = str(db_model.api_key) if db_model.api_key else None
@@ -60,10 +71,14 @@ def get_video_model_instance(db_model: Any) -> BaseVideoModel:
         abilities=abilities,
         max_retries=max_retries,
     )
-    return create_video_model(config)
+    return create_video_model(
+        config, model_id=str(getattr(db_model, "model_id", None) or "")
+    )
 
 
-def create_video_model(model_config: VideoModelConfig) -> BaseVideoModel:
+def create_video_model(
+    model_config: VideoModelConfig, model_id: str = ""
+) -> BaseVideoModel:
     if not isinstance(model_config, VideoModelConfig):
         raise TypeError(f"Invalid model type: {type(model_config).__name__}")
 
@@ -78,6 +93,7 @@ def create_video_model(model_config: VideoModelConfig) -> BaseVideoModel:
             base_url=model_config.base_url,
             timeout=model_config.timeout,
             abilities=model_config.abilities,
+            model_id=model_id,
         )
     else:
         model = ArkVideoModel(
@@ -87,6 +103,7 @@ def create_video_model(model_config: VideoModelConfig) -> BaseVideoModel:
             timeout=model_config.timeout,
             abilities=model_config.abilities,
             model_provider=provider,
+            model_id=model_id,
         )
 
     return create_retry_wrapper(

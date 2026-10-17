@@ -9,6 +9,14 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...utils.security import redact_sensitive_text
+from ..chat.token_context import MediaCallType
+from ..media_metering import (
+    BilledStream,
+    elevenlabs_billed_units,
+    measure_audio_seconds_async,
+    read_billed_stream,
+    record_provider_usage,
+)
 from .base import BaseSoundEffectModel, SoundEffectResult
 
 logger = logging.getLogger(__name__)
@@ -155,6 +163,34 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
                 safe_error,
             )
 
+    async def _record_usage(
+        self,
+        stream: BilledStream,
+        requested_seconds: Optional[float],
+        output_format: str,
+        *,
+        completed: bool,
+    ) -> None:
+        """Record one accepted generation, measured from the audio it returned.
+
+        The provider does not report a length, and the request's length is
+        absent whenever the caller let the model choose one, so the returned
+        audio is measured instead. A stream that broke partway is not measured
+        -- its bytes undercount what was generated and billed -- and falls back
+        to the requested length, then to an unmeasured 0.
+        """
+        seconds = (
+            await measure_audio_seconds_async(stream.audio, output_format)
+            if completed
+            else None
+        )
+        record_provider_usage(
+            self,
+            MediaCallType.SOUND_EFFECT,
+            seconds if seconds is not None else requested_seconds,
+            provider_billed_units=elevenlabs_billed_units(stream.headers),
+        )
+
     async def generate_sound_effect(
         self,
         text: str,
@@ -186,16 +222,17 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
         if duration_seconds is not None:
             request_kwargs["duration_seconds"] = duration_seconds
 
+        stream = BilledStream()
+        completed = False
         try:
-            response = self._ensure_async_client().text_to_sound_effects.convert(
-                **request_kwargs
+            audio = await read_billed_stream(
+                self._ensure_async_client().text_to_sound_effects,
+                "convert",
+                request_kwargs,
+                self._coerce_audio_bytes,
+                stream,
             )
-            if isawaitable(response):
-                response = await response
-            chunks: list[bytes] = []
-            async for chunk in response:
-                chunks.append(self._coerce_audio_bytes(chunk))
-            audio = b"".join(chunks)
+            completed = True
         except Exception as exc:
             redacted_error = redact_sensitive_text(str(exc))
             logger.error(
@@ -204,6 +241,11 @@ class ElevenLabsSoundEffectModel(BaseSoundEffectModel):
             raise RuntimeError(
                 f"ElevenLabs sound effect generation failed: {redacted_error}"
             ) from exc
+        finally:
+            if stream.accepted:
+                await self._record_usage(
+                    stream, duration_seconds, output_format, completed=completed
+                )
 
         if not audio:
             raise RuntimeError("ElevenLabs sound effect generation returned no audio")

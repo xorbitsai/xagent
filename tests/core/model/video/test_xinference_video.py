@@ -120,7 +120,7 @@ async def test_xinference_text_to_video_uses_openai_compatible_params(
         prompt="A camera push through a city",
         seconds=5,
         size="1280x720",
-        n=2,
+        n=1,
     )
 
     assert result["status"] == "succeeded"
@@ -132,7 +132,7 @@ async def test_xinference_text_to_video_uses_openai_compatible_params(
             "body": {
                 "model": "Wan2.1-1.3B",
                 "prompt": "A camera push through a city",
-                "n": 2,
+                "n": 1,
                 "kwargs": json.dumps({"seconds": 5, "size": "1280x720"}),
             },
             "headers": {"Authorization": "Bearer token"},

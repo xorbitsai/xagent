@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional, Protocol, Union
 
+from ..chat.token_context import MediaCallType
+from ..media_metering import record_provider_usage
 from ..xinference_base import BaseXinferenceModel
 from .base import BaseTTS, TTSResult
 
@@ -165,6 +167,9 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
             response = await model_handle.speech(
                 input=text, prompt_speech=prompt_speech, **params
             )
+            # The server synthesized the whole input; record before validating
+            # what came back.
+            record_provider_usage(self, MediaCallType.TTS, len(text))
 
             # The response should be bytes directly from xinference client
             if not isinstance(response, bytes):

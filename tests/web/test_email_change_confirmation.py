@@ -51,7 +51,14 @@ def test_email_confirmation_is_single_use(email_change):
 
 @pytest.mark.parametrize(
     "invalidity",
-    ["wrong-code", "expired", "other-user", "replaced", "password-changed"],
+    [
+        "wrong-code",
+        "expired",
+        "other-user",
+        "replaced",
+        "password-changed",
+        "admin-password-reset",
+    ],
 )
 def test_email_confirmation_rejects_invalid_proof(email_change, invalidity):
     headers, sent = email_change
@@ -87,6 +94,18 @@ def test_email_confirmation_rejects_invalid_proof(email_change, invalidity):
             },
         )
         assert changed.json()["success"]
+        headers = {
+            "Authorization": f"Bearer {auth_tests.login_and_get_token('administrator', 'new-password-123')}"
+        }
+    elif invalidity == "admin-password-reset":
+        from xagent.web.reset_admin_password import reset_admin_password
+
+        reset_admin_password("administrator", "new-password-123")
+        with auth_tests.TestingSessionLocal() as db:
+            user = db.query(User).filter_by(username="administrator").one()
+            assert user.pending_email is None
+            assert user.email_confirmation_hash is None
+            assert user.email_confirmation_expires_at is None
         headers = {
             "Authorization": f"Bearer {auth_tests.login_and_get_token('administrator', 'new-password-123')}"
         }

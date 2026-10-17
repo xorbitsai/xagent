@@ -113,6 +113,9 @@ def reset_admin_password(username: str, new_password: str) -> None:
                     User.password_reset_token_hash: None,
                     User.password_reset_expires_at: None,
                     User.session_epoch: new_session_epoch(),
+                    User.pending_email: None,
+                    User.email_confirmation_hash: None,
+                    User.email_confirmation_expires_at: None,
                 },
                 synchronize_session=False,
             )

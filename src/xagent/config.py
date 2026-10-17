@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
+IMAGE_DOWNLOAD_MAX_BYTES = "XAGENT_IMAGE_DOWNLOAD_MAX_BYTES"
+VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
@@ -2553,6 +2555,21 @@ def get_artifact_validation_timeout_seconds() -> float:
             f"{ARTIFACT_VALIDATION_TIMEOUT_SECONDS} must be positive and finite"
         )
     return value
+
+
+def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
+    """Bound provider downloads; invalid explicit limits fail closed."""
+    variable = (
+        IMAGE_DOWNLOAD_MAX_BYTES if media_kind == "image" else VIDEO_DOWNLOAD_MAX_BYTES
+    )
+    default = 64 * 1024 * 1024 if media_kind == "image" else 512 * 1024 * 1024
+    value = os.getenv(variable)
+    if value is None:
+        return default
+    limit = int(value)
+    if limit <= 0:
+        raise ValueError(f"{variable} must be a positive number of bytes")
+    return limit
 
 
 def get_max_upload_size_bytes() -> int:

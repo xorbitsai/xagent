@@ -1,5 +1,15 @@
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import { toast } from "@/components/ui/sonner"
+
+const callbackOrigins = new WeakMap<Window, string>()
+
+/** Trust only the configured callback origin returned by the authenticated POST. */
+export function isOAuthSuccessMessage(event: MessageEvent, popup: Window | null, provider: string): boolean {
+  return popup !== null && event.source === popup
+    && event.origin === callbackOrigins.get(popup)
+    && event.data?.type === "oauth-success" && event.data?.provider === provider
+}
 
 /** Open on the click stack; send the login credential only in the POST header. */
 export function openOAuthAuthorizationPopup(options: {
@@ -12,6 +22,9 @@ export function openOAuthAuthorizationPopup(options: {
 }): Window | null {
   const popup = window.open("about:blank", options.name, options.features)
   if (!popup) return null
+  // Named popups can reuse a WindowProxy from an older attempt. Do not trust
+  // its old callback origin while the new authenticated POST is pending.
+  callbackOrigins.delete(popup)
 
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), 30_000)
@@ -26,7 +39,7 @@ export function openOAuthAuthorizationPopup(options: {
           body: JSON.stringify({
             app_id: options.appId,
             account: options.account,
-            redirect: window.location.href,
+            redirect: window.location.origin,
           }),
           signal: controller.signal,
         },
@@ -36,6 +49,13 @@ export function openOAuthAuthorizationPopup(options: {
       const raw = data && typeof data === "object" && "authorization_url" in data
         ? data.authorization_url : null
       if (typeof raw !== "string") throw new Error("Invalid authorization response")
+      const callbackOrigin = data && typeof data === "object" && "callback_origin" in data ? data.callback_origin : null
+      if (typeof callbackOrigin !== "string") throw new Error("Missing callback origin")
+      const callback = new URL(callbackOrigin)
+      if (!["https:", "http:"].includes(callback.protocol) || callback.username || callback.password
+        || callback.pathname !== "/" || callback.search || callback.hash) {
+        throw new Error("Invalid callback origin")
+      }
       const endpoint = new URL(`${getApiUrl()}/api/auth/${encodeURIComponent(options.provider)}/login`, window.location.href)
       if (!raw.startsWith(`/api/auth/${encodeURIComponent(options.provider)}/login?`)) {
         throw new Error("Invalid authorization destination")
@@ -47,11 +67,14 @@ export function openOAuthAuthorizationPopup(options: {
         || url.searchParams.has("access_token")) {
         throw new Error("Invalid authorization destination")
       }
+      callbackOrigins.set(popup, callback.origin)
       if (!popup.closed) popup.location.replace(url.href)
     } catch {
+      callbackOrigins.delete(popup)
       // Never log a response body or URL: OAuth state can contain sensitive data.
       if (!popup.closed) popup.close()
-      options.onError?.()
+      if (options.onError) options.onError()
+      else toast.error("Authorization could not be started. Please try again.")
     } finally {
       window.clearTimeout(timeout)
     }

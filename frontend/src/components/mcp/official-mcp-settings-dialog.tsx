@@ -8,7 +8,7 @@ import { toast } from "@/components/ui/sonner"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { needsReconnect } from "@/lib/mcp-connection-status"
-import { openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
 
 import type { AppIntegration } from "./types"
 import { GoogleDrivePickerButton } from "./google-drive-picker-button"
@@ -116,12 +116,14 @@ export function OfficialMcpSettingsDialog({
       name: `${provider} OAuth`,
       features: `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`,
     });
-    if (!popup) return;
+    if (!popup) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.");
+      return;
+    }
 
     // Listen for the postMessage from the popup
     const handleMessage = (event: MessageEvent) => {
-      if (event.source === popup && event.origin === new URL(getApiUrl(), window.location.href).origin
-        && event.data?.type === 'oauth-success' && event.data?.provider === appToConnect.id) {
+      if (isOAuthSuccessMessage(event, popup, appToConnect.id)) {
         window.removeEventListener('message', handleMessage)
         // Stop the closed-popup poll too, so a popup that closes itself after
         // success is not read as a failed attempt below.

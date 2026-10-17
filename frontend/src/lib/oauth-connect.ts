@@ -1,7 +1,7 @@
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { MCP_OAUTH_POPUP_WINDOW_NAME, parseMcpOAuthErrorMessage } from "@/lib/mcp-utils";
-import { openOAuthAuthorizationPopup } from "@/lib/oauth-launch";
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch";
 
 /**
  * Opens the builtin-OAuth login popup for a connector app and resolves once
@@ -39,8 +39,6 @@ export function openBuiltinOAuthPopup(options: {
    * skips itself during that batch and needs its own app-scoped call), so
    * this is an opt-in per call, not a default. */
   appId?: string;
-  /** @deprecated Authentication comes from apiRequest's current session, not a URL argument. */
-  token: string | null | undefined;
   /** The account label for a provider declaring `oauth_account_input`
    * (lib/oauth-account.ts). Omit for every other provider: the backend
    * rejects the parameter there. */
@@ -86,8 +84,7 @@ export function openBuiltinOAuthPopup(options: {
     // listener, so without this provider/app_id check, one popup finishing
     // first would resolve every other pending call's promise as success too.
     const handleMessage = (event: MessageEvent) => {
-      if (event.source === popup && event.origin === new URL(getApiUrl(), window.location.href).origin
-        && event.data?.type === "oauth-success" && event.data?.provider === expectedProvider) {
+      if (isOAuthSuccessMessage(event, popup, expectedProvider)) {
         finish(true);
       }
     };
@@ -135,10 +132,8 @@ export async function openMcpOAuthPopup(options: {
   const left = window.screenX + (window.outerWidth - POPUP_WIDTH) / 2;
   const top = window.screenY + (window.outerHeight - POPUP_HEIGHT) / 2;
   // Opened on "about:blank" and navigated only after the connect POST
-  // resolves (rather than opening straight to the authorization URL, as
-  // openBuiltinOAuthPopup does) because this flow has to mint the OAuth
-  // client via Dynamic Client Registration server-side first - there is no
-  // fixed login URL to open synchronously the way the builtin flow has.
+  // resolves. Unlike the builtin launch-ticket POST, this flow first mints
+  // the OAuth client via Dynamic Client Registration server-side.
   const popup = window.open(
     "about:blank",
     MCP_OAUTH_POPUP_WINDOW_NAME,

@@ -14,6 +14,7 @@ const translateMock = vi.hoisted(() => vi.fn((key: string) => key))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 vi.mock("@/lib/oauth-launch", async () => ({
   openOAuthAuthorizationPopup: (await import("@/test/oauth-popup-double")).openOAuthPopupDouble,
+  isOAuthSuccessMessage: (await import("@/test/oauth-popup-double")).isOAuthSuccessMessageDouble,
 }))
 
 vi.mock("@/lib/utils", async () => {

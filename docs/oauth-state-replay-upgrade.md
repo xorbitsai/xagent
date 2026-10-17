@@ -43,8 +43,14 @@ consumes the ticket; restart from the POST rather than retrying the same URL.
 The resulting provider state retains its existing browser cookie, single-use
 callback claim, PKCE and password-generation checks.
 
-The frontend validates the launch destination and callback message origin,
-source popup and app identity. Launch responses and redirects use no-store and
+The POST also returns `callback_origin`, derived from the configured provider
+redirect URI, not from the incoming Host header or the frontend/API base URL.
+The frontend validates the launch destination and requires that callback
+origin, the exact source popup and app identity on completion messages (also
+for knowledge-base connectors). It sends only the opener origin, not its
+current path/query/fragment, as the completion target. Launch failures and
+blocked popups show safe user feedback without logging tickets or responses.
+Launch responses and redirects use no-store and
 no-referrer policies. No new database migration or deployment-owned secret is
 required beyond the existing OIDC schema and signing configuration.
 

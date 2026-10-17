@@ -992,6 +992,11 @@ jobs:
         working-directory: ./frontend
         run: npm run test:home-build-contracts
 
+      - name: Run builder reconnect contract
+        if: needs.changes.outputs.frontend == 'true'
+        working-directory: ./frontend
+        run: npx vitest run --config vitest.config.ts src/components/build/agent-builder-reconnect-dialog.test.tsx
+
       # Static export is the default build (served by FastAPI in the pip/uvx
       # deployment). Verify it produces a servable bundle: index shell plus the
       # dynamic-route __shell__ pages the SPA fallback depends on.

@@ -11,6 +11,7 @@ const connectStartApp = vi.hoisted(() => ({ current: null as Record<string, unkn
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 vi.mock("@/lib/oauth-launch", async () => ({
   openOAuthAuthorizationPopup: (await import("@/test/oauth-popup-double")).openOAuthPopupDouble,
+  isOAuthSuccessMessage: (await import("@/test/oauth-popup-double")).isOAuthSuccessMessageDouble,
 }))
 
 vi.mock("@/lib/utils", async () => {

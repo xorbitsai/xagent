@@ -31,7 +31,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { apiRequest } from "@/lib/api-wrapper"
-import { openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
 import { toast } from "@/components/ui/sonner"
 import { Input } from "@/components/ui/input"
 import { Select } from "@/components/ui/select"
@@ -1088,8 +1088,7 @@ export function ConnectMcpDialog({
 
     // Listen for the postMessage from the popup
     const handleMessage = (event: MessageEvent) => {
-      if (event.source === popup && event.origin === new URL(getApiUrl(), window.location.href).origin
-        && event.data?.type === 'oauth-success' && event.data?.provider === app.id) {
+      if (isOAuthSuccessMessage(event, popup, app.id)) {
         clearAppLoading(app.id)
         window.removeEventListener('message', handleMessage)
         mcpOauthMessageListenersRef.current.delete(handleMessage)

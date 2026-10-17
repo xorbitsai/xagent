@@ -112,7 +112,6 @@ describe("ConnectAppsField account step", () => {
     expect(openBuiltinOAuthPopupMock).toHaveBeenCalledWith({
       provider: "zendesk",
       appId: "zendesk",
-      token: "test-token",
       account: "acme",
     });
     await waitFor(() => expect(mcpAppsMock.refresh).toHaveBeenCalled());
@@ -200,7 +199,6 @@ describe("ConnectAppsField account step", () => {
     expect(openBuiltinOAuthPopupMock).toHaveBeenCalledWith({
       provider: "zendesk",
       appId: undefined,
-      token: "test-token",
       account: "acme",
     });
   });

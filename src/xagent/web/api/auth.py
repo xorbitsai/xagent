@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
+from urllib.parse import urlparse
 
 import bcrypt
 import requests
@@ -20,7 +21,7 @@ import requests
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
 from pydantic import (
@@ -5853,7 +5854,11 @@ def redeem_oauth_launch(
     # boundary so a simultaneous password change cannot restore the old epoch.
     db.expire_all()
     user = db.get(User, user_id)
-    if user is None or not matches_user_session(user, payload):
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
         raise HTTPException(
             401,
             "Invalid or expired authorization ticket",
@@ -5886,8 +5891,8 @@ def redeem_oauth_launch(
 @auth_router.post("/{provider}/login")
 def start_oauth_authorization(
     provider: str,
-    payload: OAuthLaunchRequest,
     request: Request,
+    payload: OAuthLaunchRequest | None = Body(default=None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Any:
@@ -5903,6 +5908,7 @@ def start_oauth_authorization(
         )
     # Existing connector manifests put the non-secret app/return options in
     # the query. Accept those on POST too, without ambiguous body overrides.
+    payload = payload or OAuthLaunchRequest()
     options = payload.model_dump()
     for name in ("app_id", "redirect", "account"):
         if name not in request.query_params:
@@ -5926,6 +5932,17 @@ def start_oauth_authorization(
         raise HTTPException(
             status_code=400, detail="Unsupported provider", headers=private_headers
         )
+    callback = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    if (
+        callback.scheme not in {"http", "https"}
+        or not callback.netloc
+        or callback.username
+        or callback.password
+    ):
+        raise HTTPException(
+            400, "Invalid OAuth callback configuration", headers=private_headers
+        )
+    callback_origin = f"{callback.scheme}://{callback.netloc}"
     from urllib.parse import quote, urlencode
 
     ticket = create_access_token(
@@ -5941,7 +5958,10 @@ def start_oauth_authorization(
     # Relative to the configured API base, resolved by the frontend. Do not
     # trust arbitrary forwarded Host headers to choose a credential destination.
     path = f"/api/auth/{quote(provider, safe='')}/login?{urlencode({'ticket': ticket})}"
-    return JSONResponse({"authorization_url": path}, headers=private_headers)
+    return JSONResponse(
+        {"authorization_url": path, "callback_origin": callback_origin},
+        headers=private_headers,
+    )
 
 
 @auth_router.get("/{provider}/callback")

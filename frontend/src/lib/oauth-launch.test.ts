@@ -4,7 +4,7 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 vi.mock("@/lib/utils", () => ({ getApiUrl: () => "https://api.example" }))
 
-import { openOAuthAuthorizationPopup } from "./oauth-launch"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "./oauth-launch"
 
 const options = { provider: "custom", appId: "app", account: "tenant", name: "OAuth", features: "width=600" }
 const navigation = "/api/auth/custom/login?ticket=short-proof"
@@ -33,10 +33,10 @@ describe("OAuth navigation launch", () => {
     expect(popup.location.replace).not.toHaveBeenCalled()
     expect(apiRequestMock).toHaveBeenCalledWith("https://api.example/api/auth/custom/login", expect.objectContaining({
       method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ app_id: "app", account: "tenant", redirect: window.location.href }),
+      body: JSON.stringify({ app_id: "app", account: "tenant", redirect: window.location.origin }),
       signal: expect.any(AbortSignal),
     }))
-    release(response({ authorization_url: navigation }))
+    release(response({ authorization_url: navigation, callback_origin: "https://callback.example" }))
     await vi.advanceTimersByTimeAsync(0)
     expect(popup.location.replace).toHaveBeenCalledWith(`https://api.example${navigation}`)
     expect(popup.close).not.toHaveBeenCalled()
@@ -47,6 +47,24 @@ describe("OAuth navigation launch", () => {
     vi.spyOn(window, "open").mockReturnValue(null)
     expect(openOAuthAuthorizationPopup(options)).toBeNull()
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("accepts only the POST-configured callback origin, source window and app", async () => {
+    const popup = { closed: false, close: vi.fn(), location: { replace: vi.fn() } } as unknown as Window
+    vi.spyOn(window, "open").mockReturnValue(popup)
+    apiRequestMock.mockResolvedValue(response({ authorization_url: navigation, callback_origin: "https://callback.example" }))
+    openOAuthAuthorizationPopup(options)
+    const valid = { source: popup, origin: "https://callback.example", data: { type: "oauth-success", provider: "app" } }
+    expect(isOAuthSuccessMessage(new MessageEvent("message", valid), popup, "app")).toBe(false)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(isOAuthSuccessMessage(new MessageEvent("message", valid), popup, "app")).toBe(true)
+    for (const change of [
+      { origin: "https://attacker.example" }, { origin: "https://api.example" },
+      { source: window }, { data: { type: "oauth-success", provider: "other" } },
+    ]) expect(isOAuthSuccessMessage(new MessageEvent("message", { ...valid, ...change }), popup, "app")).toBe(false)
+    apiRequestMock.mockReturnValue(new Promise(() => {}))
+    openOAuthAuthorizationPopup(options)
+    expect(isOAuthSuccessMessage(new MessageEvent("message", valid), popup, "app")).toBe(false)
   })
 
   it.each([
@@ -76,7 +94,7 @@ describe("OAuth navigation launch", () => {
   it("does not navigate a popup the user closed while the POST was pending", async () => {
     const popup = { closed: true, close: vi.fn(), location: { replace: vi.fn() } }
     vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
-    apiRequestMock.mockResolvedValue(response({ authorization_url: navigation }))
+    apiRequestMock.mockResolvedValue(response({ authorization_url: navigation, callback_origin: "https://callback.example" }))
     openOAuthAuthorizationPopup(options)
     await vi.advanceTimersByTimeAsync(0)
     expect(popup.location.replace).not.toHaveBeenCalled()

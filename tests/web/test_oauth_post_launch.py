@@ -148,12 +148,15 @@ def test_body_does_not_accept_a_login_credential(launch):
     assert _post(client, token, token=token).status_code == 422
 
 
-def test_deprecated_get_never_resolves_or_redirects_a_query_token(launch, monkeypatch):
+@pytest.mark.parametrize("field", ["token", "access_token"])
+def test_deprecated_get_never_resolves_or_redirects_a_query_token(
+    launch, monkeypatch, field
+):
     client, _, _, _, token = launch
     resolve = Mock(side_effect=AssertionError("Query tokens must not be resolved"))
     monkeypatch.setattr(auth, "get_user_from_token", resolve)
     response = client.get(
-        f"/api/auth/custom/login?token={token}", follow_redirects=False
+        f"/api/auth/custom/login?{field}={token}", follow_redirects=False
     )
     assert response.status_code == 410
     assert "location" not in response.headers
@@ -221,6 +224,43 @@ def test_password_change_between_issue_and_redeem_revokes_ticket(launch):
     assert client.get(url, follow_redirects=False).status_code == 401
 
 
+@pytest.mark.parametrize("change", ["subject", "deleted"])
+def test_redeem_requires_existing_matching_subject(launch, change):
+    client, db, user, _, token = launch
+    url = _post(client, token).json()["authorization_url"]
+    if change == "subject":
+        user.username = "renamed"
+    else:
+        db.delete(user)
+    db.commit()
+    response = client.get(url, follow_redirects=False)
+    assert response.status_code == 401
+    assert "location" not in response.headers
+    assert "set-cookie" not in response.headers
+
+
+@pytest.mark.parametrize("change", ["session_epoch", "username"])
+def test_redeem_rechecks_identity_after_consumption_commit(launch, monkeypatch, change):
+    from xagent.web.services import oauth_launch
+
+    client, _, _, _, token = launch
+    url = _post(client, token).json()["authorization_url"]
+    original = oauth_launch.consume_oauth_launch_ticket
+
+    def consume_and_change(db, claims):
+        consumed = original(db, claims)
+        user = db.get(User, claims["user_id"])
+        setattr(user, change, "changed-after-commit")
+        db.commit()
+        return consumed
+
+    monkeypatch.setattr(oauth_launch, "consume_oauth_launch_ticket", consume_and_change)
+    response = client.get(url, follow_redirects=False)
+    assert response.status_code == 401
+    assert "location" not in response.headers
+    assert "set-cookie" not in response.headers
+
+
 def test_expired_ticket_is_rejected_without_redirect_or_cookie(launch):
     client, _, user, _, _ = launch
     ticket = auth.create_access_token(
@@ -274,13 +314,21 @@ def test_manifest_post_options_are_bound_into_ticket_without_a_query_credential(
     response = client.post(
         "/api/auth/custom/login?app_id=custom-app&redirect=https://frontend.example/tools",
         headers={"Authorization": f"Bearer {token}"},
-        json={},
     )
     assert response.status_code == 200
     ticket = parse_qs(urlsplit(response.json()["authorization_url"]).query)["ticket"][0]
     claims = auth.verify_token(ticket)
     assert claims["options"]["app_id"] == "custom-app"
     assert claims["options"]["redirect"] == "https://frontend.example/tools"
+
+
+def test_launch_reports_the_configured_callback_origin_not_frontend_origin(launch):
+    client, db, _, provider, token = launch
+    provider.redirect_uri = "https://callback.example:8443/api/auth/custom/callback"
+    db.commit()
+    response = _post(client, token, redirect="https://frontend.example")
+    assert response.status_code == 200
+    assert response.json()["callback_origin"] == "https://callback.example:8443"
 
 
 def test_conflicting_or_oversized_manifest_options_are_rejected(launch):

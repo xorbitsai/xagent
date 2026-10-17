@@ -170,6 +170,45 @@ def test_malformed_temporal_claims_are_rejected_before_any_user_query(
     assert db_session.info["user_query_count"] == 0
 
 
+def test_bad_signature_with_malformed_expiry_is_invalid_token(db_session):
+    token = auth_dependencies.jwt.encode(
+        {"sub": "existing-user", "user_id": 1, "type": "access", "exp": None},
+        "wrong-signing-secret-with-at-least-32-bytes",
+        algorithm="HS256",
+    )
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+    assert raised.value.detail == "Invalid token"
+    assert raised.value.headers["Error-Type"] == "InvalidToken"
+    assert db_session.info["user_query_count"] == 0
+
+
+def test_unrelated_jwt_error_context_cannot_change_rejection(db_session, monkeypatch):
+    try:
+        raise TypeError("unrelated internal conversion")
+    except TypeError:
+        error = auth_dependencies.jwt.JWTError("invalid token")
+        try:
+            raise error from None
+        except auth_dependencies.jwt.JWTError:
+            pass
+    assert isinstance(error.__context__, TypeError)
+
+    def reject(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(auth_dependencies.jwt, "decode", reject)
+    token = _access_token()
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=token), db_session
+        )
+    assert raised.value.detail == "Invalid token"
+    assert raised.value.headers["Error-Type"] == "InvalidToken"
+    assert db_session.info["user_query_count"] == 0
+
+
 @pytest.mark.parametrize(
     "claims",
     (

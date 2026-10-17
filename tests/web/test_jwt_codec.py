@@ -47,6 +47,21 @@ def test_expired_and_wrong_algorithm_tokens_are_rejected():
         jwt.decode(token, SECRET, algorithms=["HS512"])
 
 
+@pytest.mark.parametrize("claim", ["exp", "nbf", "iat"])
+def test_verified_non_convertible_dates_have_shared_error_type(claim):
+    token = jwt.encode({claim: None}, SECRET, algorithm="HS256")
+    with pytest.raises(jwt.InvalidTemporalClaims):
+        jwt.decode(token, SECRET, algorithms=["HS256"])
+    assert jwt.decode(
+        token, SECRET, algorithms=["HS256"], options={f"verify_{claim}": False}
+    ) == {claim: None}
+    with pytest.raises(jwt.JWTError) as error:
+        jwt.decode(
+            token, "different-secret-with-at-least-32-bytes", algorithms=["HS256"]
+        )
+    assert not isinstance(error.value, jwt.InvalidTemporalClaims)
+
+
 @pytest.mark.parametrize(
     "module_name,class_name", [("zhipuai", "ZhipuAI"), ("zai", "ZaiClient")]
 )

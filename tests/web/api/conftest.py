@@ -297,8 +297,8 @@ def _direct_db_session() -> Session:
 def _share_guest_id(token: str) -> str:
     """Decode a share guest JWT and return its server-minted ``guest_id`` (#973).
 
-    Uses ``jose`` (a declared dependency) to match production, not PyJWT (only a
-    transitive one). Accepts either a raw access token or a full
+    Uses the application's PyJWT-backed codec to match production.
+    Accepts either a raw access token or a full
     ``Authorization: Bearer <token>`` header value, so callers holding either
     shape reuse one decode path. Asserts the id is a non-empty string, letting
     tests compare against *this guest's* minted id rather than merely checking

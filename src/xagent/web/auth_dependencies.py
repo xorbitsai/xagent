@@ -74,17 +74,9 @@ def _resolve_access_token_user(
         )
     except ExpiredSignatureError:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.EXPIRED) from None
-    except JWTError as error:
-        # PyJWT wraps malformed NumericDate conversions in its JWT exception
-        # family. Preserve the existing public payload-rejection contract
-        # without classifying signature failures or unrelated errors as such.
-        conversion = error.__context__
-        if isinstance(conversion, (TypeError, OverflowError)) and (
-            has_matching_temporal_claim_conversion_failure(token, conversion)
-        ):
-            raise _AccessTokenRejected(
-                _AccessTokenRejectionReason.INVALID_CLAIMS
-            ) from None
+    except jwt.InvalidTemporalClaims:
+        raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID_CLAIMS) from None
+    except JWTError:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.INVALID) from None
     except (TypeError, OverflowError) as error:
         if has_matching_temporal_claim_conversion_failure(token, error):

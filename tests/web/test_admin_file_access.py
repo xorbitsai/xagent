@@ -1024,7 +1024,7 @@ class TestAdminFileAccess:
 
         # Bounded rather than exact: real wall-clock elapses between
         # before_mint and the token's own iat/exp computation, and
-        # python-jose floors exp to an integer second (timegm), so a naive
+        # PyJWT floors exp to an integer second (timegm), so a naive
         # ..120 upper bound flakes whenever that floor rounds up relative to
         # before_mint's own fractional second -- tightened to 119..121 (0
         # failures simulated across 400k runs) rather than widened, to keep
@@ -1777,13 +1777,8 @@ class TestAdminFileAccess:
     def test_preview_rejects_ticket_with_non_convertible_temporal_claim(
         self, test_db, temp_uploads_dir
     ):
-        # python-jose's own jwt.decode can raise a bare OverflowError (not
-        # JWTError) for a garbage-typed exp claim -- it does int(exp)
-        # internally without catching that -- which would 500 instead of
-        # the 401 every other malformed-ticket case here returns, without
-        # _user_from_stream_ticket's own guard mirroring the one
-        # get_current_user already has for access tokens
-        # (has_matching_temporal_claim_conversion_failure).
+        # Non-convertible NumericDates must remain a credential rejection,
+        # not a 500. The shared codec owns typed temporal-claim failures.
         import jwt as pyjwt
 
         from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY

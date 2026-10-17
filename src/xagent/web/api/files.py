@@ -63,7 +63,6 @@ from ..config import (
 )
 from ..content_security import is_active_content_type
 from ..jwt_codec import JWTError
-from ..jwt_validation import has_matching_temporal_claim_conversion_failure
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
@@ -1708,20 +1707,6 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
         )
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
-    except (TypeError, OverflowError) as error:
-        # Mirrors _resolve_access_token_user's guard (auth_dependencies.py):
-        # python-jose can raise these from its own temporal-claim (exp/nbf/
-        # iat) comparisons instead of JWTError for a garbage-typed claim, and
-        # this server is the sole minter today so that shouldn't happen --
-        # but a bare TypeError/OverflowError propagating out of this
-        # endpoint would 500 instead of the 401 every other malformed-ticket
-        # path here returns. Re-raise anything that *doesn't* reproduce a
-        # temporal-claim failure rather than swallowing an unrelated bug.
-        if not has_matching_temporal_claim_conversion_failure(ticket, error):
-            raise
-        raise HTTPException(
-            status_code=401, detail="Invalid or expired ticket"
-        ) from None
 
     if (
         claims.get("type") != FILE_STREAM_TICKET_TYPE

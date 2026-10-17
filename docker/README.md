@@ -59,6 +59,12 @@ tags are bumped to a release containing the worker-pool default. To run that
 image as a local single-process backend instead, set `XAGENT_WORKER_COUNT=` and
 `XAGENT_SHARED_TASK_EXECUTION_ENABLED=false` in `.env`.
 
+Production also requires a separate tool-credential key. The image persists it
+in `xagent_secrets/tool-credentials.secret` unless an explicit
+`XAGENT_SECRET_ENCRYPTION_KEY` or legacy `SECRET_KEY` is supplied. Existing
+default/short-key deployments must follow the offline
+[key upgrade procedure](../docs/tool-credential-key-upgrade.md) before restart.
+
 Optional Gmail incoming-email trigger provisioning:
 
 ```bash
@@ -653,8 +659,12 @@ DATABASE_URL="postgresql://xagent:password@postgres:5432/xagent"
 POSTGRES_IMAGE_TAG="17-bookworm"
 
 # Security
-ENCRYPTION_KEY="your-encryption-key"
-XAGENT_JWT_SECRET="a-unique-random-secret"
+# Leave empty for persistent bootstrap by the stock image. For an explicit
+# deployment key, use Fernet.generate_key() / secrets.token_urlsafe(48), not
+# a copied placeholder. Preserve the generated values across upgrades.
+ENCRYPTION_KEY=""
+XAGENT_SECRET_ENCRYPTION_KEY=""
+XAGENT_JWT_SECRET=""
 ```
 
 The stock backend image persists generated encryption and JWT signing keys in
@@ -666,6 +676,12 @@ secret; deployments with an existing strong value keep it unchanged.
 Any browser session or password-reset token previously signed with the example
 placeholder is intentionally invalid after that first startup, so users must
 sign in again.
+
+Key bootstrap does not re-encrypt old data. Upgrades from published development
+keys or an implicit tool key must run the offline procedures in
+[the key upgrade guide](../docs/tool-credential-key-upgrade.md) before restart.
+Unreadable stored credentials now refuse production startup instead of silently
+appearing unconfigured. Celery worker and scheduler validate these keys too.
 
 This release also replaces wildcard credentialed CORS for private API routes
 with `XAGENT_CORS_ORIGINS` (default: `XAGENT_FRONTEND_URL`). Before upgrading,

@@ -3,16 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
 from collections import deque
-from collections.abc import Iterator
 from functools import partial
 from pathlib import Path
 from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
-import psycopg2
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -25,11 +22,6 @@ from tests.e2e.app_harness import (
     init_e2e_db,
     run_e2e_app_client,
 )
-from tests.e2e.minio_harness import (
-    _docker_available,
-    _docker_client,
-    run_container_with_dynamic_ports,
-)
 from xagent.core.agent.service import AgentService
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
@@ -40,11 +32,6 @@ from xagent.web.tools.config import WebToolConfig
 
 pytestmark = [pytest.mark.e2e, pytest.mark.docker]
 
-POSTGRES_PASSWORD = "xagent_test"
-POSTGRES_DATABASE = "xagent_test"
-# WHY: the image tag is a floating major, so a drifted pull would otherwise keep
-# this suite green while silently testing against PostgreSQL 16.
-MIN_SERVER_VERSION_NUM = 170000
 SKILL_INDEX_SENTINEL = "Pool handoff regression fixture"
 QUESTION = "Which deployment target should I use?"
 # Mirrors interaction_types.DEFAULT_WAITING_INTERACTION as a literal on
@@ -82,62 +69,6 @@ AVAILABLE_TOOLS_MODEL_GETTERS = (
     "get_sound_effect_models",
     "get_music_models",
 )
-
-
-@pytest.fixture
-def postgres_url() -> Iterator[str]:
-    if not _docker_available():
-        pytest.skip("Requires reachable Docker daemon")
-
-    client = _docker_client()
-    container, host_ports = run_container_with_dynamic_ports(
-        client,
-        "postgres:17-bookworm",
-        name=f"xagent-postgres-e2e-{uuid4().hex[:12]}",
-        container_ports=("5432/tcp",),
-        tmpfs={"/var/lib/postgresql/data": "rw,size=256m"},
-        environment={
-            "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
-            "POSTGRES_DB": POSTGRES_DATABASE,
-        },
-    )
-    host_port = host_ports["5432/tcp"]
-
-    database_url = (
-        "postgresql+psycopg2://postgres:"
-        f"{POSTGRES_PASSWORD}@127.0.0.1:{host_port}/{POSTGRES_DATABASE}"
-    )
-    try:
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            try:
-                connection = psycopg2.connect(
-                    host="127.0.0.1",
-                    port=host_port,
-                    user="postgres",
-                    password=POSTGRES_PASSWORD,
-                    dbname=POSTGRES_DATABASE,
-                    connect_timeout=1,
-                )
-            except psycopg2.OperationalError:
-                time.sleep(0.25)
-            else:
-                with connection.cursor() as cursor:
-                    cursor.execute("SHOW server_version_num")
-                    server_version_num = int(cursor.fetchone()[0])
-                connection.close()
-                if server_version_num < MIN_SERVER_VERSION_NUM:
-                    raise RuntimeError(
-                        "e2e fixture requires PostgreSQL 17 or newer, got "
-                        f"server_version_num={server_version_num}"
-                    )
-                break
-        else:
-            raise RuntimeError("PostgreSQL did not become ready")
-
-        yield database_url
-    finally:
-        container.remove(force=True)
 
 
 def _configure_postgres_app(

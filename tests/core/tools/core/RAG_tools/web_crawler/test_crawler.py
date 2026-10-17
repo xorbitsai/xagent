@@ -5,6 +5,7 @@ import subprocess
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -583,6 +584,14 @@ class TestWebCrawler:
         """
 
         def make_session(impersonate=None, **kwargs):
+            assert kwargs["trust_env"] is False
+            gate = urlsplit(kwargs["proxy"])
+            assert gate.hostname == "127.0.0.1"
+            assert kwargs["curl_options"] == {
+                10177: "",
+                10318: "http,https",
+                10319: "http,https",
+            }
             sess = AsyncMock()
             sess.__aenter__ = AsyncMock(return_value=sess)
             sess.__aexit__ = AsyncMock(return_value=None)
@@ -600,12 +609,30 @@ class TestWebCrawler:
     def _install_fake_cffi(monkeypatch):
         """Install fake curl_cffi modules so optional-dependency tests stay hermetic."""
         cffi_module = types.ModuleType("curl_cffi")
+        cffi_module.CurlOpt = types.SimpleNamespace(
+            NOPROXY=10177, PROTOCOLS_STR=10318, REDIR_PROTOCOLS_STR=10319
+        )
         requests_module = types.ModuleType("curl_cffi.requests")
         requests_module.AsyncSession = MagicMock()
         cffi_module.requests = requests_module
         monkeypatch.setitem(sys.modules, "curl_cffi", cffi_module)
         monkeypatch.setitem(sys.modules, "curl_cffi.requests", requests_module)
         return requests_module
+
+    def test_fake_cffi_helper_does_not_import_optional_package(self, monkeypatch):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_cffi(name, *args, **kwargs):
+            if name.startswith("curl_cffi"):
+                raise ModuleNotFoundError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_cffi)
+        fake = self._install_fake_cffi(monkeypatch)
+        assert fake is sys.modules["curl_cffi.requests"]
+        assert sys.modules["curl_cffi"].CurlOpt.REDIR_PROTOCOLS_STR == 10319
 
     @pytest.mark.asyncio
     async def test_tls_fallback_chain_advances_on_waf_block(

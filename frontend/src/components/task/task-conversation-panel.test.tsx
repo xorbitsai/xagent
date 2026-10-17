@@ -42,6 +42,7 @@ const appControls = vi.hoisted(() => ({
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
   isSessionInteractionLocked: false,
+  connectionNotice: null as "reconnecting" | "lost" | null,
 }))
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -80,6 +81,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     isConversationResetPending: appControls.isConversationResetPending,
     isMessageDeliveryPending: appControls.isMessageDeliveryPending,
     isSessionInteractionLocked: appControls.isSessionInteractionLocked,
+    connectionNotice: appControls.connectionNotice,
   }),
 }))
 
@@ -289,6 +291,7 @@ describe("TaskConversationPanel", () => {
     appControls.isConversationResetPending = false
     appControls.isMessageDeliveryPending = false
     appControls.isSessionInteractionLocked = false
+    appControls.connectionNotice = null
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
@@ -672,6 +675,22 @@ describe("TaskConversationPanel", () => {
     appControls.isMessageDeliveryPending = false
     rerender(<TaskConversationPanel mode="page" />)
     expect(chatInputProps.current?.isLoading).toBe(false)
+  })
+
+  it("shows a status banner only once the connection is lost", () => {
+    realChatMessage.enabled = true
+    appState.messages = [{ id: "u1", role: "user", content: "Hello", timestamp: "1000" }]
+    appState.isProcessing = true
+    appControls.connectionNotice = "reconnecting"
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByText("clientErrors.connectionLost")).not.toBeInTheDocument()
+    expect(screen.getByText("clientErrors.connectionReconnecting")).toBeInTheDocument()
+
+    appControls.connectionNotice = "lost"
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.getAllByText("clientErrors.connectionLost")).toHaveLength(1)
+    expect(screen.getByRole("status")).toHaveTextContent("clientErrors.connectionLost")
+    expect(screen.getByText("clientErrors.connectionLostStatus")).toBeInTheDocument()
   })
 
   it("blocks the established-conversation composer when the Session outcome requires reload", () => {
@@ -1640,6 +1659,20 @@ describe("TaskConversationPanel", () => {
 
     beforeEach(() => {
       realChatMessage.enabled = true
+    })
+
+    it("passes the connection notice to a running turn that already has a trace", () => {
+      appState.messages = [turnOne]
+      appState.traceEvents = [
+        traceEvent("a-start", "react_task_start", "react_a", 1100, { pattern: "ReActPattern" }),
+      ]
+      appState.currentTask = task("running")
+      appState.isProcessing = true
+      appControls.connectionNotice = "reconnecting"
+
+      render(<TaskConversationPanel mode="page" />)
+
+      expect(screen.getByText("clientErrors.connectionReconnecting")).toBeInTheDocument()
     })
 
     it("keeps a resumed run spinning after a pause in the same turn", () => {

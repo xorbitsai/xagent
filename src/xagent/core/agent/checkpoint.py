@@ -245,6 +245,99 @@ def _accumulate_pattern_progress(state: Any, totals: dict[str, int]) -> None:
     _accumulate_pattern_progress(state.get("dag_state"), totals)
 
 
+# ReAct writes these immediately before it runs a serial tool call or a
+# concurrent batch, and removes the calls from ``pending_tool_calls`` only after
+# they return; ``after_tool``/``after_tool_batch`` follows once they have.
+_TOOL_START_LABELS = frozenset({"before_tool", "before_tool_batch"})
+# A child runtime re-labels its child's checkpoint with one of these prefixes.
+_CHILD_LABEL_PREFIXES = ("auto_child_", "dag_")
+
+
+def _innermost_label(label: Any) -> str | None:
+    if not isinstance(label, str):
+        return None
+    text: str = label
+    stripped = True
+    while stripped:
+        stripped = False
+        for prefix in _CHILD_LABEL_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix) :]
+                stripped = True
+    return text
+
+
+def _react_states_with_pending_calls(
+    state: Any, step_id: str | None, found: list[str | None]
+) -> None:
+    """Append the DAG step id (``None`` outside a step) of every ReAct state
+    under ``state`` that still lists pending tool calls."""
+
+    if not isinstance(state, dict):
+        return
+    if _count(state.get("pending_tool_calls")):
+        found.append(step_id)
+    raw_step_states = state.get("active_step_pattern_states")
+    step_states = dict(raw_step_states) if isinstance(raw_step_states, dict) else {}
+    active_step_id = state.get("active_step_id")
+    if (
+        isinstance(active_step_id, str)
+        and active_step_id
+        and state.get("active_step_pattern_state")
+    ):
+        step_states.setdefault(active_step_id, state.get("active_step_pattern_state"))
+    for child_step_id, step_state in step_states.items():
+        _react_states_with_pending_calls(step_state, str(child_step_id), found)
+    _react_states_with_pending_calls(state.get("react_state"), step_id, found)
+    _react_states_with_pending_calls(state.get("dag_state"), step_id, found)
+
+
+def checkpoint_tool_call_in_flight(checkpoint: dict[str, Any] | None) -> bool:
+    """Whether a tool call may have started after ``checkpoint`` was written.
+
+    On a run without a per-attempt tool ledger, resuming from such a
+    checkpoint runs that call again, so an effect it already had (a message
+    sent, a write) would happen twice.
+
+    A ReAct state's pending calls are planned after ``after_llm`` and started
+    after ``before_tool``/``before_tool_batch``; nothing in the state itself
+    tells the two apart, so the checkpoint label does. Control tools are the
+    exception: a control segment (``send_message`` and the other
+    ``kind == "control"`` calls) runs with no checkpoint before it, so while
+    one is being handled the latest checkpoint is still ``after_llm`` (or the
+    previous ``after_tool``) and this returns False. A run stopped after a
+    ``send_message`` was delivered but before its status checkpoint is
+    therefore resumed and delivers the message again; that window is short,
+    and closing it needs a checkpoint before the control segment. The label belongs to
+    whichever state wrote the checkpoint: the only ReAct state outside a DAG
+    (Auto nests one), or the DAG step named by ``metadata.active_step_id``.
+    Another DAG step that still lists pending calls ran concurrently and its
+    position is unknown, so it counts as in flight. Missing or malformed
+    fields count as no pending calls.
+    """
+
+    if not isinstance(checkpoint, dict):
+        return False
+    pending: list[str | None] = []
+    _react_states_with_pending_calls(checkpoint.get("pattern_state"), None, pending)
+    if not pending:
+        return False
+    metadata = checkpoint.get("metadata")
+    writer_step_id = (
+        metadata.get("active_step_id") if isinstance(metadata, dict) else None
+    )
+    writer_started_tools = (
+        _innermost_label(checkpoint.get("label")) in _TOOL_START_LABELS
+    )
+    for step_id in pending:
+        if step_id is None or step_id == writer_step_id:
+            if writer_started_tools:
+                return True
+        else:
+            return True
+    return False
+
+
 def checkpoint_progress_marker(checkpoint: dict[str, Any] | None) -> str:
     """Fingerprint how far a checkpoint's run has actually got.
 

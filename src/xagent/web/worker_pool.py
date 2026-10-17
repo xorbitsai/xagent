@@ -21,6 +21,7 @@ from ..config import (
     get_sandbox_worker_id,
     get_shared_task_execution_enabled,
     get_task_execution_role,
+    validate_encryption_config,
     validate_task_execution_host_config,
 )
 from .logging_config import LogLevel, setup_logging
@@ -84,6 +85,7 @@ def run_combined_worker_pool(
     *, worker_count: int, host: str, port: int, log_level: str | None
 ) -> None:
     """Supervise one web host and N workers; any child exit stops the group."""
+    validate_encryption_config()
     if (
         not get_shared_task_execution_enabled()
         or get_task_execution_role() != "combined"

@@ -948,6 +948,23 @@ async def execute_coordinated_command(
             continue
 
 
+def task_coordinators_closing() -> bool:
+    """Whether this loop's coordinators are being closed for host shutdown.
+
+    Host shutdown closes the registry before the background task manager, and
+    closing a coordinator cancels its executions, so a run cancelled that way
+    sees this, not the manager's shutdown flag. A single coordinator closing
+    on its own (idle release, lost renewal) does not count.
+    """
+
+    registry = _registry
+    return (
+        registry is not None
+        and registry._close_task is not None
+        and registry.loop is asyncio.get_running_loop()
+    )
+
+
 async def close_task_coordinators() -> None:
     global _registry
     if _registry is not None and _registry.loop is asyncio.get_running_loop():

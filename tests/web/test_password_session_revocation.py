@@ -134,6 +134,74 @@ def test_reset_token_cannot_be_reused():
     ]
 
 
+@pytest.mark.parametrize("late_publication", [False, True])
+def test_admin_cli_reset_revokes_all_credentials(monkeypatch, late_publication):
+    from xagent.web import reset_admin_password as admin_reset
+
+    auth_tests.setup_first_admin(password="old-password-123")
+    tokens = {}
+
+    def publish_credentials():
+        tokens.update(
+            auth._login_in_worker(
+                auth.LoginRequest(
+                    username="administrator", password="old-password-123"
+                ),
+                auth_tests.TestingSessionLocal,
+            )
+        )
+        with auth_tests.TestingSessionLocal() as session:
+            user = session.query(User).one()
+            tokens["ticket"] = files.create_access_token(
+                {
+                    **auth.user_session_claims(user),
+                    "type": files.FILE_STREAM_TICKET_TYPE,
+                    "file_id": "example-file",
+                }
+            )
+            user.password_reset_token_hash = auth.hash_password_reset_token("old-reset")
+            user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
+                minutes=5
+            )
+            session.commit()
+
+    if late_publication:
+        original_hash = admin_reset.hash_password
+
+        def publish_after_admin_read(password):
+            publish_credentials()
+            return original_hash(password)
+
+        monkeypatch.setattr(admin_reset, "hash_password", publish_after_admin_read)
+    else:
+        publish_credentials()
+
+    admin_reset.reset_admin_password("administrator", "new-password-456")
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        assert auth.verify_password("new-password-456", user.password_hash)
+        assert user.session_epoch is not None
+        assert user.refresh_token is None
+        assert user.refresh_token_expires_at is None
+        assert user.password_reset_token_hash is None
+        assert user.password_reset_expires_at is None
+        assert get_user_from_token(tokens["access_token"], session) is None
+        assert get_user_from_websocket_token(tokens["access_token"], session) is None
+        with pytest.raises(HTTPException) as rejected:
+            files._user_from_stream_ticket(session, tokens["ticket"], "example-file")
+        assert rejected.value.status_code == 401
+    assert (
+        auth_tests.client.post(
+            "/api/auth/refresh", json={"refresh_token": tokens["refresh_token"]}
+        ).status_code
+        == 401
+    )
+    assert not auth_tests.client.post(
+        "/api/auth/reset-password",
+        json={"token": "old-reset", "new_password": "another-password-789"},
+    ).json()["success"]
+
+
 def _change_password_in_separate_session(operation):
     with auth_tests.TestingSessionLocal() as session:
         user = session.query(User).one()
@@ -339,7 +407,7 @@ async def test_open_websocket_is_revoked_and_owned_work_is_drained(
             accepted.set()
 
     websocket = WebSocket(
-        {"type": "websocket", "path": "/ws/test", "headers": []},
+        {"type": "websocket", "path": "/ws/test", "headers": [], "query_string": b""},
         incoming.get,
         send,
     )

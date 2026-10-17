@@ -24,6 +24,12 @@ from ...config import (
 # exists (or to none) and never take one.
 EXECUTION_OPENING_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 CONTROL_KINDS = frozenset({"pause", "cancel"})
+# Controls a process at its dispatch cap claims ahead of the never-claimed
+# commands it holds for their task (``_unfinished_earlier_command``). Only
+# cancel: ``settle_cap_held_commands_no_commit`` defines what happens to the
+# passed commands for a cancel alone, so adding a kind here also requires
+# defining that kind's settlement, including when the control is rejected.
+CAP_OVERTAKING_CONTROL_KINDS = frozenset({"cancel"})
 
 
 @dataclass(frozen=True)

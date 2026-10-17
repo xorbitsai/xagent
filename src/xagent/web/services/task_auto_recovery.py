@@ -43,7 +43,10 @@ from ...config import (
     get_task_auto_resume_enabled,
     get_task_infra_failure_pause_enabled,
 )
-from ...core.agent.checkpoint import checkpoint_progress_marker
+from ...core.agent.checkpoint import (
+    checkpoint_progress_marker,
+    checkpoint_tool_call_in_flight,
+)
 from ...core.agent.interruption import (
     InterruptionReason,
     classify_run_failure,
@@ -96,6 +99,11 @@ SUPERSEDE_CHECK_FAILED_DETAIL = "supersede_check_failed"
 # cancelled (``task_auto_resume.cancel_pending_auto_resume_no_commit``); only
 # that cancel writes it, at the fence it moves the row to.
 AUTO_RESUME_USER_CANCELLED_DETAIL = "user_cancelled"
+# ``state_detail`` of a ``manual`` row whose run stopped with a tool call that
+# may have started and has no recorded outcome (a legacy, version-1 run; see
+# :func:`resolution_tool_call_in_flight`). Resuming would run that call again,
+# so only a person may decide to.
+TOOL_IN_FLIGHT_DETAIL = "tool_in_flight"
 
 # The recorded states automatic resume has a plan for: each is logged as an
 # extra event of its own name and announced as ``task_recovery_update``
@@ -129,15 +137,20 @@ def interruption_pause_result() -> dict[str, Any]:
 # Callers that own their own protocol for a stopped run: A2A clients, external
 # cancellation, and anonymous visitors of a widget or shared link. SDK tasks
 # are eligible: an SDK ``wait()`` keeps waiting on a PAUSED task, so a client
-# still waiting on it receives the resumed run's result.
+# still waiting on it receives the resumed run's result. Once automatic resume
+# stops, the ``/v1`` read of such a task reports ``failed`` (see
+# ``task_auto_resume.status_only_terminal_view``), so that wait returns.
 _INELIGIBLE_SOURCES = frozenset({"a2a", "external", "widget", "shared_link"})
 
 # Callers that only ever read a task's status. A settlement interruption of
-# one of their runs ends FAILED with the provider's error, as it always has;
-# pausing it would leave the task PAUSED for good once automatic resume gives
-# up, which is worse for a caller that sees nothing but the status. Lease
-# expiry is not a settlement interruption and is paused (and resumed) for
-# them as for any other task.
+# one of their runs is paused only while automatic resume is on: pausing is
+# worth it only when something will resume the run, and when automatic resume
+# stops, the ``/v1`` read of the task reports ``failed``
+# (``task_auto_resume.status_only_terminal_view``). When recording such a
+# pause fails, a minimal ``manual`` row is written in its place so that read
+# still reports ``failed``. With automatic resume off the run ends FAILED with
+# the provider's error. Lease expiry is not a settlement interruption and is
+# paused (and resumed) for them as for any other task.
 _STATUS_ONLY_SOURCES = frozenset({"sdk"})
 
 
@@ -227,6 +240,30 @@ def auto_recovery_eligibility(db: Session, task: Task) -> AutoRecoveryEligibilit
     return AutoRecoveryEligibility(eligible=True, kind="normal")
 
 
+def shutdown_handoff_eligible(db: Session, task_id: int) -> bool:
+    """Whether a run a host shutdown cancelled may be left to lease recovery.
+
+    Such a run keeps its lease instead of failing, so lease recovery pauses
+    it and automatic resume picks it up, as after a crash. That only helps a
+    task automatic recovery would resume (:func:`auto_recovery_eligibility`);
+    the others must still fail now so their callers see a terminal state.
+    Tasks of a status-only source (:func:`is_status_only_source`) still fail
+    now as well, as their settlement interruptions do: their caller reads
+    nothing but the status, and a deploy should not keep it waiting on a
+    lease TTL. Channel tasks are excluded too until their resumed reply is
+    proven, and nothing is handed off while automatic resume is off.
+    """
+
+    if not get_task_auto_resume_enabled():
+        return False
+    task = db.get(Task, task_id)
+    if task is None or task.status != TaskStatus.RUNNING:
+        return False
+    if is_status_only_source(task.source) or task.channel_id is not None:
+        return False
+    return auto_recovery_eligibility(db, task).eligible
+
+
 def record_interruption_no_commit(
     db: Session,
     *,
@@ -238,6 +275,7 @@ def record_interruption_no_commit(
     gated_by_settlement_switches: bool,
     last_error: str | None = None,
     now: datetime | None = None,
+    tool_call_in_flight: bool = False,
 ) -> TaskAutoRecovery | None:
     """Upsert ``task``'s recovery row for one interruption and log the event.
 
@@ -279,8 +317,11 @@ def record_interruption_no_commit(
     It rests in ``manual`` instead, with ``state_detail`` saying why, when
     automatic resume is switched off (``auto_resume_disabled``) and when the
     supersede check fails (``supersede_check_failed``; the row is still
-    written). A reason without a policy (a user pause, an unknown input
-    outcome) stays plain ``manual``.
+    written). A row that would be ``scheduled`` rests in ``manual`` with
+    ``tool_in_flight`` when ``tool_call_in_flight`` says resuming would repeat
+    a tool call that may already have run; the other verdicts stand. A reason
+    without a policy (a user pause, an unknown input outcome) stays plain
+    ``manual``.
     """
 
     run_id = task.run_id
@@ -379,7 +420,15 @@ def record_interruption_no_commit(
                 rng=task_auto_resume._AUTO_RESUME_RNG,
             )
             state = auto_resume_recovery_state(verdict.outcome)
-            row.next_attempt_at = verdict.next_attempt_at
+            if state is TaskAutoRecoveryState.SCHEDULED and tool_call_in_flight:
+                # Only a resume that would actually be dispatched is held;
+                # every other verdict already stops automatic resume.
+                state, state_detail = (
+                    TaskAutoRecoveryState.MANUAL,
+                    TOOL_IN_FLIGHT_DETAIL,
+                )
+            else:
+                row.next_attempt_at = verdict.next_attempt_at
         row.state = state.value
         row.state_detail = state_detail
 
@@ -678,6 +727,30 @@ def resolution_progress_marker(
     return checkpoint_progress_marker(snapshot if isinstance(snapshot, dict) else None)
 
 
+def resolution_tool_call_in_flight(resolution: CheckpointRecoveryResolution) -> bool:
+    """Whether resuming a recoverable legacy run would repeat a started tool call.
+
+    A version-two run records every tool attempt, and recovery already fails
+    one that started without a committed outcome (``UNKNOWN_TOOL_EFFECT``).
+    A legacy (``trace_events``) checkpoint has no such ledger: resuming from
+    a checkpoint written just before a tool call runs that call again, so a
+    message it sent or a write it made would happen twice
+    (:func:`checkpoint_tool_call_in_flight`). The fields read here are never
+    stored as refs, so the payload is read without decoding.
+    """
+
+    if (
+        resolution.verdict is not CheckpointRecoveryVerdict.RECOVERABLE
+        or not resolution.encoded
+        or not isinstance(resolution.checkpoint, dict)
+    ):
+        return False
+    snapshot = resolution.checkpoint.get("snapshot")
+    return checkpoint_tool_call_in_flight(
+        snapshot if isinstance(snapshot, dict) else None
+    )
+
+
 def record_lease_expiry_interruption_no_commit(
     db: Session,
     *,
@@ -734,6 +807,7 @@ def record_lease_expiry_interruption_no_commit(
             now=recovered_at,
             progress_marker=resolution_progress_marker(db, int(task.id), resolution),
             gated_by_settlement_switches=False,
+            tool_call_in_flight=resolution_tool_call_in_flight(resolution),
         )
         recorded = RecordedInterruption.from_row(row) if row is not None else None
     except Exception:
@@ -786,8 +860,9 @@ def _pausable_with_infra_switch(
     """Whether ``XAGENT_TASK_INFRA_FAILURE_PAUSE_ENABLED`` decides ``reason``.
 
     False for a deferred reason and for a status-only ``source``
-    (:data:`_STATUS_ONLY_SOURCES`): settlement never pauses their runs, so the
-    switch does not decide them. ``model_output_invalid`` is not an
+    (:data:`_STATUS_ONLY_SOURCES`) while automatic resume is off: nothing
+    would resume their paused run, so the switch does not decide it.
+    ``model_output_invalid`` is not an
     infrastructure failure: a run paused for it is worth stopping only when
     an automatic resume will resample it, so it also needs automatic resume
     on and, when ``kind`` is known, a task kind it schedules
@@ -795,7 +870,9 @@ def _pausable_with_infra_switch(
     is unreachable and kept as the seam). Otherwise it fails as before.
     """
 
-    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS or is_status_only_source(source):
+    if reason in SETTLEMENT_PAUSE_DEFERRED_REASONS:
+        return False
+    if is_status_only_source(source) and not get_task_auto_resume_enabled():
         return False
     if reason is InterruptionReason.MODEL_OUTPUT_INVALID:
         return get_task_auto_resume_enabled() and (
@@ -929,8 +1006,9 @@ def decide_interruption(
     1. Settlement does not pause for ``reason`` (:func:`settlement_pause_enabled`:
        the switch is off, the reason is deferred, or it is
        ``model_output_invalid`` with automatic resume off), a task of a
-       status-only source (:data:`_STATUS_ONLY_SOURCES`, decided from the row
-       alone before anything is read), an ineligible task, or
+       status-only source (:data:`_STATUS_ONLY_SOURCES`) while automatic
+       resume is off (decided from the row alone before anything is read; with
+       it on, such a task is judged like any other), an ineligible task, or
        ``model_output_invalid`` on a task kind automatic resume does not
        schedule (:func:`auto_resume_schedulable`; nothing would resample it;
        unreachable today, every eligible kind is scheduled): ``LEGACY``.
@@ -952,7 +1030,9 @@ def decide_interruption(
         return legacy_interruption_decision(reason)
     # Attribute-only, before any database read: a connectivity failure
     # reading eligibility must not defer a run that was never going to pause.
-    if is_status_only_source(task.source):
+    # A status-only caller's paused run is worth having only when automatic
+    # resume will pick it up.
+    if is_status_only_source(task.source) and not get_task_auto_resume_enabled():
         return legacy_interruption_decision(reason)
     try:
         eligibility = auto_recovery_eligibility(db, task)
@@ -1048,8 +1128,12 @@ def apply_interruption_outcome_no_commit(
     ``record_lease_expiry_interruption_no_commit``: a failure inside it is
     logged and skipped, so the settlement commits exactly as it would without
     the row; a SAVEPOINT that cannot be opened, released or rolled back
-    propagates. Its preconditions hold here: the settling write has opened
-    the transaction, and everything staged so far is flushed first.
+    propagates. For a status-only source that settles PAUSED, a failed
+    recording is followed by a minimal ``manual`` row for the run in a second
+    SAVEPOINT, so its status-only reader does not wait on a run nothing will
+    resume; if that also fails, it settles without the row. Its preconditions
+    hold here: the settling write has opened the transaction, and everything
+    staged so far is flushed first.
     ``error`` becomes the row's operator-only ``last_error``. The row is
     gated by the settlement switch (``disabled`` when it is off for an eligible
     task and a reason it would pause for). Returns what was recorded, for the
@@ -1076,21 +1160,90 @@ def apply_interruption_outcome_no_commit(
             ),
             gated_by_settlement_switches=True,
             last_error=error,
+            tool_call_in_flight=(
+                decision.resolution is not None
+                and resolution_tool_call_in_flight(decision.resolution)
+            ),
         )
         snapshot = RecordedInterruption.from_row(row) if row is not None else None
     except Exception:
         savepoint.rollback()
+        fallback = decision.pause and is_status_only_source(task.source)
         logger.exception(
-            "Recording the settlement interruption of task %s failed; "
-            "settling it without auto-recovery metadata",
+            "Recording the settlement interruption of task %s failed; %s",
             task.id,
+            "writing a minimal manual row in its place"
+            if fallback
+            else "settling it without auto-recovery metadata",
         )
+        if fallback:
+            recorded = _record_status_only_fallback_no_commit(
+                db, task=task, reason=decision.reason, error=error
+            )
     else:
         savepoint.commit()
         recorded = snapshot
     if decision.pause:
         _project_interruption_pause_no_commit(db, task, recorded)
     return recorded
+
+
+def _record_status_only_fallback_no_commit(
+    db: Session,
+    *,
+    task: Task,
+    reason: InterruptionReason,
+    error: str | None,
+) -> RecordedInterruption | None:
+    """Write the minimal ``manual`` row of a status-only task's PAUSED run.
+
+    Used when :func:`record_interruption_no_commit` failed: the row carries
+    no schedule, so nothing resumes the run, and its fence is the task's
+    current ``state_version``, so the status-only reader reports the task as
+    stopped instead of waiting on it. It runs in its own SAVEPOINT; a failure
+    is logged and returns ``None``, leaving the settlement as if no row had
+    been written. A SAVEPOINT that cannot be opened, released or rolled back
+    propagates.
+    """
+
+    if task.run_id is None:
+        return None
+    savepoint = db.begin_nested()
+    try:
+        now = utc_now()
+        row = db.get(TaskAutoRecovery, task.id)
+        if row is None:
+            row = TaskAutoRecovery(task_id=task.id)
+            db.add(row)
+        row.run_id = task.run_id
+        row.reason = reason.value
+        row.state = TaskAutoRecoveryState.MANUAL.value
+        row.state_detail = None
+        row.paused_state_version = int(task.state_version or 0)
+        row.interrupted_at = now
+        row.episode_started_at = now
+        row.no_progress_resumes = 0
+        row.total_resumes = 0
+        row.progress_marker = None
+        row.next_attempt_at = None
+        row.last_command_id = None
+        row.last_error = (
+            error[:TASK_AUTO_RECOVERY_LAST_ERROR_MAX_CHARS]
+            if error is not None
+            else None
+        )
+        db.flush()
+        snapshot = RecordedInterruption.from_row(row)
+    except Exception:
+        savepoint.rollback()
+        logger.exception(
+            "Writing the fallback recovery row of task %s failed; "
+            "settling it without auto-recovery metadata",
+            task.id,
+        )
+        return None
+    savepoint.commit()
+    return snapshot
 
 
 def _project_interruption_pause_no_commit(

@@ -8,7 +8,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import NullPool, QueuePool
 
-from ...config import get_database_url, get_db_pool_kwargs
+from ...config import get_database_url, get_db_pool_kwargs, validate_encryption_config
 from ...db.sqlite import (
     apply_sqlite_concurrency_pragmas,
     ensure_sqlite_parent_directory,
@@ -216,28 +216,19 @@ def get_engine() -> Engine:
     return _engine
 
 
-def configure_db(
+def create_database_engine(
     db_url: str | None = None,
     *,
     read_only: bool = False,
-) -> None:
-    """Bind the engine and session factory without initializing the schema.
-
-    This is the database entry point for read-only operational commands that
-    must inspect an already-deployed schema without running migrations,
-    creating tables, or seeding application data. SQLite's write-oriented
-    connection pragmas are deliberately omitted in ``read_only`` mode.
-    """
-    global _SessionLocal
-    global _engine
-
+) -> Engine:
+    """Create an unbound engine without changing process-global DB state."""
     database_url = db_url if db_url is not None else get_database_url()
     if make_url(database_url).get_backend_name() == "sqlite":
         if read_only:
             database_url = _sqlite_read_only_url(database_url)
         else:
             database_url = ensure_sqlite_parent_directory(database_url)
-        _engine = create_engine(
+        engine = create_engine(
             database_url,
             connect_args={"check_same_thread": False},
             poolclass=NullPool,
@@ -252,7 +243,7 @@ def configure_db(
         if not read_only:
             # WAL + busy_timeout let concurrent writes wait for the lock instead
             # of failing with "database is locked".
-            apply_sqlite_concurrency_pragmas(_engine)
+            apply_sqlite_concurrency_pragmas(engine)
     else:
         engine_kwargs: dict[str, Any] = {
             "poolclass": QueuePool,
@@ -266,11 +257,28 @@ def configure_db(
             # each connection begins a transaction. This makes audit safety a
             # database-enforced property rather than a reconciler convention.
             engine_kwargs["execution_options"] = {"postgresql_readonly": True}
-        _engine = create_engine(
+        engine = create_engine(
             database_url,
             **engine_kwargs,
         )
+    return engine
 
+
+def configure_db(
+    db_url: str | None = None,
+    *,
+    read_only: bool = False,
+) -> None:
+    """Bind the engine/session factory without migrating or seeding the schema.
+
+    Read-only operational commands omit SQLite write pragmas and use database-
+    enforced read-only access. Celery admission uses create_database_engine
+    instead, so prefork children retain their lazy initialization fallback.
+    """
+    global _SessionLocal
+    global _engine
+
+    _engine = create_database_engine(db_url, read_only=read_only)
     _SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=_engine)
     from ..services.kb_reference_protection import install_file_reference_validator
 
@@ -332,7 +340,9 @@ def _initialize_database_schema(engine: Engine) -> list[dict[str, Any]]:
 
 def init_db(db_url: str | None = None) -> None:
     """Initialize database, create all tables and default users"""
+    global _engine, _SessionLocal
     # Import all models to ensure they are registered with Base.metadata
+    from ..services.encryption_key_rotation import validate_stored_encryption_keys
     from . import (  # noqa: F401
         AutoModelCandidate,
         AutoModelConfig,
@@ -372,8 +382,24 @@ def init_db(db_url: str | None = None) -> None:
     from .agent import Agent  # noqa: F401
     from .sandbox import SandboxInfo, SandboxSnapshot  # noqa: F401
 
-    configure_db(db_url)
-    builtin_mcp_mismatches = _initialize_database_schema(get_engine())
+    validate_encryption_config()
+    try:
+        configure_db(db_url)
+        # Never migrate/seed or admit runtime work with unreadable credentials.
+        validate_stored_encryption_keys()
+        builtin_mcp_mismatches = _initialize_database_schema(get_engine())
+    except BaseException:
+        # Lazy workers use an unbound factory to detect that init_db must retry.
+        # A failed admission/schema upgrade must not leave a usable factory.
+        failed_engine = _engine
+        _engine = None
+        _SessionLocal = None
+        if failed_engine is not None:
+            try:
+                failed_engine.dispose()
+            except Exception:
+                logger.warning("Failed to dispose rejected database engine")
+        raise
 
     for mismatch in builtin_mcp_mismatches:
         logger.warning(

@@ -16,10 +16,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import create_access_token
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web import mcp_apps, oauth_account_hosts
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_login
+from xagent.web.api.auth import generic_oauth_login
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer

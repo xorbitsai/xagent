@@ -299,9 +299,13 @@ def _mark_cancelled_turn_delivery_dispatched(
     belongs to. When this finalize wins that race the settlement is fenced
     out, so nothing else ever moves the row off ``pending`` and every later
     resend of the same client message id is refused forever.
-    ``dispatched`` rather than ``failed`` is the honest target: the run had
-    already started, so the message may have been consumed and a retry
-    invitation could double-execute it.
+    ``dispatched`` rather than ``failed`` is the honest target when the run
+    had already started: the message may have been consumed and a retry
+    invitation could double-execute it. A message held by a full dispatch cap
+    never ran: the cancel passes it, its command fails as
+    ``cancelled_before_admission`` (``settle_cap_held_commands_no_commit``),
+    and if its turn already has a pending row, that row is still closed as
+    ``dispatched`` here, so the message can only be sent again under a new id.
 
     ``turn_id`` names the exact row when the command carries one, which is
     the only way to be certain the row closed belongs to the turn the stop

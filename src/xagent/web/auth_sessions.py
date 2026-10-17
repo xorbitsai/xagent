@@ -25,7 +25,13 @@ def matches_user_session(user: User, claims: dict[str, Any]) -> bool:
     # generation is durable and shared by all API processes.
     if epoch is None:
         return supplied is None
-    return type(supplied) is str and secrets.compare_digest(str(epoch), supplied)
+    # Generations are URL-safe ASCII; compare_digest rejects non-ASCII strings.
+    # Malformed claims must be credential rejections, not infrastructure errors.
+    return (
+        type(supplied) is str
+        and supplied.isascii()
+        and secrets.compare_digest(str(epoch), supplied)
+    )
 
 
 def commit_refresh_credentials(

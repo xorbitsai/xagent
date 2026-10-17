@@ -49,16 +49,17 @@
     "docx-preview": "^0.3.7",
     "dompurify": "^3.4.16",
     "eslint": "^8.0.0",
-    "eslint-config-next": "15.0.0",
+    "eslint-config-next": "^15.5.28",
     "framer-motion": "^12.28.1",
     "highlight.js": "^11.11.1",
     "jszip": "^3.10.1",
     "katex": "^0.16.38",
     "lucide-react": "^0.263.1",
     "marked": "^5.1.2",
-    "next": "^15.2.3",
+    "next": "^15.5.28",
     "parse-entities": "^4.0.2",
-    "postcss": "^8.4.0",
+    "parse5": "^7.3.0",
+    "postcss": "^8.5.30",
     "pptxgenjs": "4.0.1",
     "pptxviewjs": "^1.1.9",
     "react": "^18.0.0",
@@ -77,6 +78,11 @@
     "typescript": "^5.0.0",
     "unified": "^11.0.5",
     "xlsx": "^0.18.5"
+  },
+  "overrides": {
+    "next": {
+      "postcss": "$postcss"
+    }
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.0",

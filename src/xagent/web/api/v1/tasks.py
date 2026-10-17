@@ -19,7 +19,7 @@ which is also used by the WebSocket UI path so both transports share
 one state machine.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, NoReturn, Optional, cast
 
@@ -29,6 +29,7 @@ from pydantic import TypeAdapter
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ....core.runtime_performance import increment_counter
 from ....core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ...config import is_allowed_file
 from ...models.database import get_session_local
@@ -62,6 +63,8 @@ from ...services.hot_path_cache import (
 from ...services.managed_file_ref import (
     DurableStorageOperationError,
 )
+from ...services.task_auto_resume import TerminalView, status_only_terminal_view
+from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -307,7 +310,11 @@ async def create_chat_task(
          ``start_task_in_background`` (which uses the same coroutine
          the WebSocket handler does). Returns 202 immediately --
          callers poll ``GET /v1/chat/tasks/{task_id}`` to observe the
-         eventual ``completed`` / ``failed`` status.
+         eventual ``completed`` / ``failed`` status. A ``failed`` status
+         can be derived: when automatic resume of an interrupted task
+         gives up, the task stays ``paused`` in storage and is reported
+         as ``failed``. It can change if the task's owner resumes it by
+         hand or the caller appends a message.
 
     Args:
         request: Validated :class:`CreateTaskRequest`. ``message.content``
@@ -398,6 +405,30 @@ class _TaskInfoSnapshot:
     updated_at: datetime | None
     pending_question: str | None
     pending_interactions: list[dict[str, Any]] | None
+    # Set when a status-only caller's task rests PAUSED after automatic resume
+    # stopped for good. Every other field keeps the stored value;
+    # :func:`effective_task_snapshot` and the GET response apply the view.
+    view: TerminalView | None = None
+
+
+def effective_task_snapshot(snapshot: _TaskInfoSnapshot) -> _TaskInfoSnapshot:
+    """``snapshot`` as the caller must read it: ``failed`` when it carries a
+    terminal view, the stored values otherwise.
+
+    ``run_id``, ``state_version`` and ``updated_at`` stay the stored ones, so
+    the stream's change detection compares what the task row says.
+    """
+
+    view = snapshot.view
+    if view is None:
+        return snapshot
+    return replace(
+        snapshot,
+        status=TaskStatus.FAILED,
+        control_state=TaskStatus.FAILED.value,
+        output=None,
+        error=view.error,
+    )
 
 
 @dataclass(frozen=True)
@@ -483,6 +514,18 @@ def _load_task_info_snapshot(
             pending_question, pending_interactions = get_pending_interaction_question(
                 db, task
             )
+        view: TerminalView | None = None
+        # The view re-checks both inside its own statement; this only skips
+        # the query for reads that cannot be terminal.
+        if (
+            task.status == TaskStatus.PAUSED
+            and task.control_state == TaskControlState.PAUSED.value
+        ):
+            view = status_only_terminal_view(db, int(task.id))
+        if view is not None:
+            increment_counter(
+                "xagent.v1.task.projected_failed", attributes={"state": view.state}
+            )
         return _TaskInfoSnapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
@@ -497,6 +540,7 @@ def _load_task_info_snapshot(
             updated_at=cast(datetime | None, task.updated_at),
             pending_question=pending_question,
             pending_interactions=pending_interactions,
+            view=view,
         )
 
 
@@ -635,6 +679,13 @@ def _get_chat_task_sync(
     ``tasks.updated_at``, so a cached entry has no way to prove its
     ``pending_interaction`` is still current. Caching it anyway would
     let a stale question survive a cache hit indefinitely.
+
+    The terminal view of a status-only caller's task is kept out of the
+    cache for the same reason: automatic resume stops by writing only the
+    recovery row, and an append queues a START without touching the task
+    row's ``updated_at``, so a cached body cannot prove the view is still
+    current. The cached body holds the stored values; the view is applied
+    to the response after every cache read or write.
     """
 
     task = _load_task_info_snapshot(task_id, principal)
@@ -647,12 +698,22 @@ def _get_chat_task_sync(
         if task.pending_question is not None
         else None
     )
+    overlay: dict[str, Any] = {"pending_interaction": pending_interaction}
+    if task.view is not None:
+        effective = effective_task_snapshot(task)
+        overlay.update(
+            status=effective.status.value,
+            control_state=effective.control_state,
+            output=effective.output,
+            error=effective.error,
+            completed_at=task.view.stopped_at,
+        )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)
     if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
         response = TaskInfoResponse.model_validate(cached["response"])
-        return response.model_copy(update={"pending_interaction": pending_interaction})
+        return response.model_copy(update=overlay)
 
     response = TaskInfoResponse(
         task_id=task.task_id,
@@ -678,7 +739,7 @@ def _get_chat_task_sync(
         },
         ttl_seconds=task_cache_ttl_seconds(),
     )
-    return response.model_copy(update={"pending_interaction": pending_interaction})
+    return response.model_copy(update=overlay)
 
 
 def _get_chat_task_steps_sync(
@@ -1213,8 +1274,11 @@ async def stream_chat_task_events(
         ``stream.error``, re-attaching is the supported recovery path
         (no replay of missed frames -- reconcile via ``steps()`` first).
       - A task that's ``paused`` does not close the stream (matching
-        SDK ``wait()`` semantics: another process may resume it); the
-        1-hour cap is what eventually ends an orphaned paused stream.
+        SDK ``wait()`` semantics: it may still be resumed). A paused
+        task whose automatic resume has stopped for good, with nothing
+        queued that could move it, is read as ``failed`` and closes
+        with ``task.completed`` within one watchdog cycle; the 1-hour
+        cap ends a paused stream that nothing resumes or stops.
       - No ``task.status`` frame is guaranteed to be fresh or in order,
         at any point in the stream's life, not only at attach: this
         endpoint never buffers or reconciles ``task.status`` frame
@@ -1288,13 +1352,15 @@ async def stream_chat_task_events(
             delivery path regardless of worker count.
     """
     snapshot = await run_db_io_cancellation_safe(
-        lambda: _load_task_info_snapshot(task_id, principal)
+        lambda: effective_task_snapshot(_load_task_info_snapshot(task_id, principal))
     )
     return await _events_stream.build_event_stream_response(
         task_id=task_id,
         principal=principal,
         initial_snapshot=snapshot,
-        read_task_snapshot=_load_task_info_snapshot,
+        read_task_snapshot=lambda tid, p: effective_task_snapshot(
+            _load_task_info_snapshot(tid, p)
+        ),
         read_task_steps_response=_get_chat_task_steps_sync,
         read_task_steps_version=_load_task_steps_version_snapshot,
     )

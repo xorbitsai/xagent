@@ -9,6 +9,7 @@ All models use Pydantic v2 ConfigDict for future compatibility.
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -2238,7 +2239,11 @@ class WebCrawlConfig(BaseModel):
     @classmethod
     def validate_start_url(cls, value: Any) -> str:
         """Normalize the crawl entrypoint once at the shared config boundary."""
-        return validate_and_normalize_web_url(value)
+        normalized = validate_and_normalize_web_url(value)
+        parsed = urlsplit(normalized)
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("start_url must not contain embedded credentials")
+        return normalized
 
 
 class CrawlResult(BaseModel):

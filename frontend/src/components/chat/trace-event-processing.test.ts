@@ -225,6 +225,178 @@ describe("processTraceEvents settling of stopped processes", () => {
   })
 })
 
+describe("processTraceEvents exact settlement projection", () => {
+  const toolActions = (events: Parameters<typeof processTraceEvents>[0]) =>
+    processTraceEvents(events, t).flatMap(step =>
+      step.actions.filter(action => action.type === "tool"),
+    )
+  const event = (
+    event_type: string,
+    step_id: string,
+    data: Record<string, unknown>,
+  ) => ({ event_type, step_id, data })
+  const startStep = (stepId: string, name = stepId) =>
+    event("react_task_start", stepId, { step_name: name })
+  const startTool = (
+    stepId: string,
+    invocationId: string | undefined,
+    result?: string,
+    settlement = false,
+  ) => [
+    event("tool_execution_start", stepId, {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      ...(invocationId ? { invocation_id: invocationId } : {}),
+      ...(settlement ? { settlement_delivery: true } : {}),
+    }),
+    event("tool_execution_end", stepId, {
+      tool_name: "approval_gate",
+      tool_call_id: "tool_call_0",
+      ...(invocationId ? { invocation_id: invocationId } : {}),
+      ...(settlement ? { settlement_delivery: true } : {}),
+      result: { output: result ?? "waiting" },
+    }),
+  ]
+
+  it("settles only the exact invocation when one step reuses a provider id", () => {
+    const events = [
+      startStep("same-step"),
+      ...startTool("same-step", "invocation-a", "first"),
+      ...startTool("same-step", "invocation-b", "second"),
+      ...startTool("same-step", "invocation-b", "settled-second", true),
+    ]
+
+    const steps = processTraceEvents(events, t)
+    const actions = steps.flatMap(step => step.actions.filter(action => action.type === "tool"))
+    expect(actions).toHaveLength(2)
+    expect(actions.find(action => action.data.invocation_id === "invocation-a")?.data.output).toBe("first")
+    expect(actions.find(action => action.data.invocation_id === "invocation-b")?.data.output).toBe("settled-second")
+  })
+
+  it("settles only the exact invocation across steps that reuse a provider id", () => {
+    const events = [
+      startStep("step-a"),
+      ...startTool("step-a", "invocation-a", "first"),
+      startStep("step-b"),
+      ...startTool("step-b", "invocation-b", "second"),
+      ...startTool("fresh-resume-step", "invocation-a", "settled-first", true),
+    ]
+
+    const steps = processTraceEvents(events, t)
+    const actions = steps.flatMap(step => step.actions.filter(action => action.type === "tool"))
+    expect(actions).toHaveLength(2)
+    expect(actions.find(action => action.data.invocation_id === "invocation-a")?.data.output).toBe("settled-first")
+    expect(actions.find(action => action.data.invocation_id === "invocation-b")?.data.output).toBe("second")
+    expect(steps.some(step => step.stepId === "fresh-resume-step")).toBe(false)
+  })
+
+  it("does not let an unknown exact identity hijack a legacy candidate", () => {
+    const events = [
+      startStep("step-a"),
+      ...startTool("step-a", undefined, "legacy"),
+      ...startTool("step-a", "unknown-invocation", "orphan-settlement", true),
+    ]
+
+    const actions = toolActions(events)
+    expect(actions).toHaveLength(2)
+    expect(actions.find(action => !action.data.invocation_id)?.data.output).toBe("legacy")
+    expect(actions.find(action => action.data.invocation_id === "unknown-invocation")?.data.output).toBe("orphan-settlement")
+  })
+
+  it("keeps a paired orphan settlement visible without a task-start event", () => {
+    const actions = toolActions([
+      ...startTool("truncated-step", "orphan-invocation", "terminal", true),
+    ])
+
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({
+      status: "completed",
+      data: {
+        invocation_id: "orphan-invocation",
+        output: "terminal",
+      },
+    })
+  })
+
+  it("keeps an orphan terminal event visible when settlement START is truncated", () => {
+    const steps = processTraceEvents([
+      event("tool_execution_end", "truncated-step", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "orphan-invocation",
+        settlement_delivery: true,
+        result: { output: "terminal" },
+      }),
+    ] as never, t)
+
+    expect(steps).toHaveLength(1)
+    expect(steps[0].stepName).toBe("traceEventRenderer.taskExecution")
+    expect(steps[0].actions).toEqual([
+      expect.objectContaining({
+        status: "completed",
+        data: expect.objectContaining({ output: "terminal" }),
+      }),
+    ])
+  })
+
+  it("uses step identity only for ambiguous legacy settlements", () => {
+    const events = [
+      startStep("step-a"),
+      ...startTool("step-a", undefined, "waiting-a"),
+      startStep("step-b"),
+      ...startTool("step-b", undefined, "waiting-b"),
+      ...startTool("step-a", undefined, "settled-a", true),
+      ...startTool("step-b", undefined, "settled-b", true),
+    ]
+
+    const actions = toolActions(events)
+    expect(actions).toHaveLength(2)
+    expect(actions.map(action => action.data.output).sort()).toEqual(["settled-a", "settled-b"])
+  })
+
+  it("namespaces exact and legacy settlement cache keys", () => {
+    const exactId = "tool_call_0::step-a"
+    const events = [
+      startStep("step-a"),
+      ...startTool("step-a", undefined, "legacy-waiting"),
+      startStep("step-b"),
+      ...startTool("step-b", exactId, "exact-waiting"),
+      ...startTool("step-a", undefined, "legacy-settled", true),
+      ...startTool("step-b", exactId, "exact-settled", true),
+    ]
+
+    const actions = toolActions(events)
+    expect(actions).toHaveLength(2)
+    expect(actions.find(action => !action.data.invocation_id)?.data.output).toBe("legacy-settled")
+    expect(actions.find(action => action.data.invocation_id === exactId)?.data.output).toBe("exact-settled")
+  })
+
+  it("projects a failed settlement onto the exact card and clears stale output", () => {
+    const events = [
+      startStep("step-a"),
+      ...startTool("step-a", "invocation-a", "Approve?"),
+      event("tool_execution_start", "resume", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-a",
+        settlement_delivery: true,
+      }),
+      event("tool_execution_failed", "resume", {
+        tool_name: "approval_gate",
+        tool_call_id: "tool_call_0",
+        invocation_id: "invocation-a",
+        settlement_delivery: true,
+        error: "Rejected",
+      }),
+    ]
+
+    const actions = toolActions(events)
+    expect(actions).toHaveLength(1)
+    expect(actions[0]).toMatchObject({ status: "failed", data: { error: "Rejected" } })
+    expect(actions[0].data.output).toBeUndefined()
+  })
+})
+
 describe("processTraceEvents tool_call_id attribution", () => {
   it("normalizes malformed trace data before nested access", () => {
     const malformedEvents = [

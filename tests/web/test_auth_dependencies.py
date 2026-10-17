@@ -574,6 +574,32 @@ def test_valid_access_token_returns_matching_user_across_adapters(
     assert user.username == "existing-user"
 
 
+@pytest.mark.parametrize("epoch", [None, "", 123, [], {}, "old", "é", "\ud800"])
+def test_invalid_session_epoch_is_a_credential_rejection(db_session, epoch):
+    user = db_session.get(User, 1)
+    user.session_epoch = "current-session-generation"
+    db_session.commit()
+    token = _access_token(session_epoch=epoch)
+    credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
+
+    with pytest.raises(HTTPException) as raised:
+        get_current_user(credentials, db_session)
+    assert raised.value.status_code == 401
+    assert get_current_user_optional(credentials, db_session) is None
+    assert get_user_from_token(token, db_session) is None
+    assert get_user_from_websocket_token(token, db_session) is None
+
+
+def test_current_session_epoch_authenticates(db_session):
+    user = db_session.get(User, 1)
+    user.session_epoch = "current-session-generation"
+    db_session.commit()
+    assert (
+        get_user_from_token(_access_token(session_epoch=user.session_epoch), db_session)
+        is user
+    )
+
+
 def test_invalid_claims_read_the_bound_dialect_without_pool_checkout() -> None:
     """Pre-query rejection inspects Session binding without acquiring a connection."""
     engine = create_engine(

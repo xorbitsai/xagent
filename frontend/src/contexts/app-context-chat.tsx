@@ -386,6 +386,7 @@ import {
   type WebSocketConnection,
   type WebSocketConnectionFailure,
 } from "@/hooks/use-websocket"
+import { deriveConnectionNotice, type ConnectionNotice } from "./connection-notice"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
@@ -1417,7 +1418,7 @@ type AppAction =
   | { type: "SET_HISTORY_LOADING"; payload: boolean }
   | { type: "SYNC_PROCESSING_STATUS" }
 
-const createInitialState = (): AppState => ({
+export const createInitialState = (): AppState => ({
   messages: [],
   stoppedTurnAnchorIds: [],
   currentTask: null,
@@ -1453,7 +1454,51 @@ const createInitialState = (): AppState => ({
   sessionConversation: { ...initialSessionConversationState },
 })
 
-function projectAppState(state: AppState, action: AppAction): AppState {
+function settlementTargetMessageIndex(
+  messages: Message[],
+  event: TraceEvent,
+): number {
+  const data = (event.data ?? {}) as Record<string, unknown>
+  if (data.settlement_delivery !== true) return -1
+
+  const invocationId = typeof data.invocation_id === "string" && data.invocation_id
+    ? data.invocation_id
+    : undefined
+  const toolCallId = typeof data.tool_call_id === "string" && data.tool_call_id
+    ? data.tool_call_id
+    : undefined
+  if (!invocationId && !toolCallId) return -1
+
+  const owningIndexes: number[] = []
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const ownsInvocation = (messages[index].traceEvents || []).some(candidate => {
+      if (candidate?.event_type !== "tool_execution_start") return false
+      const candidateData = (candidate.data ?? {}) as Record<string, unknown>
+      return invocationId
+        ? candidateData.invocation_id === invocationId
+        : candidateData.tool_call_id === toolCallId
+    })
+    if (ownsInvocation) owningIndexes.push(index)
+  }
+
+  if (owningIndexes.length === 0) return -1
+  if (invocationId || owningIndexes.length === 1) {
+    return owningIndexes.length === 1 ? owningIndexes[0] : -1
+  }
+
+  // Historical traces have no invocation id. Disambiguate reused provider
+  // ids by the original step when exactly one stored message matches it.
+  const stepMatches = owningIndexes.filter(index =>
+    (messages[index].traceEvents || []).some(candidate => {
+      if (candidate?.event_type !== "tool_execution_start") return false
+      const candidateData = (candidate.data ?? {}) as Record<string, unknown>
+      return candidateData.tool_call_id === toolCallId && candidate.step_id === event.step_id
+    }),
+  )
+  return stepMatches.length === 1 ? stepMatches[0] : -1
+}
+
+export function projectAppState(state: AppState, action: AppAction): AppState {
   console.log('🔍 Reducer called with action:', action.type, action)
 
   switch (action.type) {
@@ -2015,7 +2060,21 @@ function projectAppState(state: AppState, action: AppAction): AppState {
     case "SET_STEPS":
       return { ...state, steps: action.payload }
 
-    case "ADD_TRACE_EVENT":
+    case "ADD_TRACE_EVENT": {
+      const settlementTarget = settlementTargetMessageIndex(state.messages, action.payload)
+      if (settlementTarget >= 0) {
+        return {
+          ...state,
+          messages: state.messages.map((message, index) =>
+            index === settlementTarget
+              ? {
+                ...message,
+                traceEvents: [...(message.traceEvents || []), action.payload],
+              }
+              : message,
+          ),
+        }
+      }
       // If the last message is a result message from assistant, append the trace event to that message directly.
       // This ensures that events arriving after the result message (like react_task_end) are correctly displayed.
       const lastMsg = state.messages.length > 0 ? state.messages[state.messages.length - 1] : null
@@ -2030,6 +2089,7 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         }
       }
       return { ...state, traceEvents: [...state.traceEvents, action.payload] }
+    }
 
     case "SET_TRACE_EVENTS":
       return { ...state, traceEvents: action.payload }
@@ -2273,6 +2333,7 @@ interface AppContextType {
   // was last connected to. The first connect for a task does not count.
   sameTaskReconnects: number
   connectionError: Error | null
+  connectionNotice: ConnectionNotice
   startNewConversation: () => Promise<void>
   canStopTask: boolean
   stopTask: () => void
@@ -2807,7 +2868,13 @@ export function AppProvider({
     }
   }, [dispatchSessionConversation, releaseStopControl, requireSessionReload, sessionConnectionIdentity])
 
-  const onConnect = useCallback(() => {
+  // Tasks a socket has opened for since this provider mounted, keyed by the
+  // opened socket's own task: during a task switch stateRef may already name
+  // the next task before the old socket is retired.
+  const openedTaskIdsRef = useRef(new Set<typeof state.taskId>())
+
+  const onConnect = useCallback((openedTaskId: number | undefined) => {
+    openedTaskIdsRef.current.add(openedTaskId ?? null)
     if (sessionTransport?.history === "none") {
       const connectionIdentity = sessionConnectionIdentityRef.current
       if (connectionIdentity && connectionIdentity === sessionConnectionIdentity) {
@@ -2897,6 +2964,7 @@ export function AppProvider({
     resumeTask: wsResumeTask,
     requestStatus,
     connect,
+    connectionPhase,
   } = useWebSocket({
     taskId: state.taskId || undefined,
     token,
@@ -2956,6 +3024,15 @@ export function AppProvider({
     if (canStopTask) return
     releaseStopControl()
   }, [canStopTask, releaseStopControl])
+
+  const connectionNotice = deriveConnectionNotice({
+    isSessionTransport: sessionTransport !== undefined,
+    hadOpen: sessionTransport
+      ? openedTaskIdsRef.current.size > 0
+      : openedTaskIdsRef.current.has(state.taskId),
+    phase: connectionPhase,
+    isConnected,
+  })
 
   useEffect(() => {
     if (!sessionTransport || isConnected) return
@@ -7927,6 +8004,7 @@ export function AppProvider({
           isConnected,
           sameTaskReconnects,
           connectionError,
+          connectionNotice,
           startNewConversation,
           canStopTask,
           stopTask,

@@ -1,8 +1,7 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import Link from "next/link"
-import { useSearchParams } from "next/navigation"
 import { ArrowRight, Loader2, Eye, EyeOff, Lock, Workflow, Database, UserCheck } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -17,8 +16,8 @@ import { useSetupStatus } from "@/hooks/use-setup-status"
 export function ResetPasswordPage() {
   const branding = getBrandingFromEnv()
   const { t } = useI18n()
-  const searchParams = useSearchParams()
-  const token = useMemo(() => searchParams.get("token") || "", [searchParams])
+  const [token, setToken] = useState("")
+  const tokenRead = useRef(false)
   const [password, setPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
   const [showPassword, setShowPassword] = useState(false)
@@ -27,6 +26,34 @@ export function ResetPasswordPage() {
   const [error, setError] = useState("")
   const [success, setSuccess] = useState("")
   const { passwordMinLength } = useSetupStatus()
+
+  useEffect(() => {
+    if (tokenRead.current) return
+    tokenRead.current = true
+    const fragment = window.location.hash.replace(/^#/, "")
+    const fragmentParams = new URLSearchParams(fragment)
+    const queryParams = new URLSearchParams(window.location.search)
+    // Accept outstanding pre-upgrade emails for their remaining lifetime.
+    // New emails use fragments; strip either representation immediately.
+    const resetToken = fragmentParams.get("token") || queryParams.get("token") || ""
+    setToken(resetToken)
+    if (!resetToken) setError(t("resetPassword.alerts.invalid_token"))
+    const hadQueryToken = queryParams.has("token")
+    queryParams.delete("token")
+    fragmentParams.delete("token")
+
+    // Remove the one-time token from the address bar and browser history after
+    // reading it. The token remains only in component state for the POST.
+    if (window.location.hash || hadQueryToken) {
+      const query = queryParams.toString()
+      const hash = fragmentParams.toString()
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${query ? `?${query}` : ""}${hash ? `#${hash}` : ""}`
+      )
+    }
+  }, [t])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

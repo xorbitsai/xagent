@@ -27,6 +27,7 @@ held task, including the waiter's own; it is display only (#2700).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
@@ -51,9 +52,12 @@ from .task_coordinator_service import TaskLease
 if TYPE_CHECKING:
     from .task_command_transport import ClaimedTaskCommand, SettledTaskCommand
 
+logger = logging.getLogger(__name__)
+
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
 _STOPPED_BEFORE_START = "Task stopped before execution started."
+_CONTROL_STOPPED_COMMAND = "Task command stopped by a control request."
 
 
 @dataclass(frozen=True)
@@ -416,7 +420,7 @@ def release_command_admission(db: Session, lease: TaskLease, command_id: int) ->
 
 
 def waiting_admission(command_id: object) -> ColumnElement[bool]:
-    """Only unclaimed capacity-waiting commands may be overtaken by controls."""
+    """An unclaimed command that waits for an admission ticket; controls may pass it."""
     return exists(
         select(1).where(
             TaskAdmissionTicket.command_id == command_id,
@@ -604,7 +608,7 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
         )
         .values(
             status="failed",
-            error="Task command stopped by a control request.",
+            error=_CONTROL_STOPPED_COMMAND,
             completed_at=func.now(),
             result={"rejection_reason": "cancelled_before_admission"},
         )
@@ -626,4 +630,89 @@ def settle_cancelled_admissions(db: Session, command_id: int) -> None:
                 resend_safe=False,
                 include_command_identity=scope != "external",
             ),
+        )
+
+
+def settle_cap_held_commands_no_commit(db: Session, control_command_id: int) -> None:
+    """Fail the never-claimed commands a completed cancel passed while held.
+
+    Runs in the control's terminal-write transaction, after
+    ``settle_cancelled_admissions``, and writes what that function writes:
+    the command row, the START follow-up and one terminal event per row. It
+    does not touch message delivery rows; a held message never ran, so it has
+    none of its own, and its terminal event tells the client. Rows matched:
+    same task, older than the control, still ``pending``, never claimed, a
+    kind in ``EXECUTION_OPENING_KINDS``, and recorded at a state version other
+    than the task's current one. Rows waiting for an admission ticket need no
+    exclusion: ``settle_cancelled_admissions`` has already failed every one
+    of them this would match. With the cap open such rows exist only when a
+    command inserted before the cancel committed after the cancel was
+    claimed. Only those committed before this UPDATE are failed; a later one
+    stays ``pending`` and is claimed after the cancel, where a start or a
+    reply is rejected by its state-version check and a message is not.
+    """
+    if not get_shared_task_execution_enabled():
+        return
+    from collections import Counter
+
+    from .task_command_terminal_events import (
+        TerminalTaskEventDraft,
+        stage_terminal_event,
+    )
+    from .task_dispatch_cap import EXECUTION_OPENING_KINDS
+    from .task_start_consumer import settle_failed_start_no_commit
+
+    control = db.get(TaskExecutionCommand, control_command_id)
+    # These selection rules are defined for a cancel only: the version
+    # condition below holds for a cancel, and a rejected cancel settles
+    # nothing. A kind added to CAP_OVERTAKING_CONTROL_KINDS needs its own rules.
+    if control is None or control.kind != "cancel":
+        return
+    task = db.get(Task, control.task_id, populate_existing=True)
+    if task is None:
+        return
+    settled = db.scalars(
+        update(TaskExecutionCommand)
+        .where(
+            TaskExecutionCommand.task_id == task.id,
+            TaskExecutionCommand.id < control_command_id,
+            TaskExecutionCommand.status == "pending",
+            TaskExecutionCommand.attempt_count == 0,
+            TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
+            TaskExecutionCommand.target_state_version != task.state_version,
+        )
+        .values(
+            status="failed",
+            error=_CONTROL_STOPPED_COMMAND,
+            completed_at=func.now(),
+            result={"rejection_reason": "cancelled_before_admission"},
+        )
+        .returning(TaskExecutionCommand.id)
+    ).all()
+    kinds: Counter[str] = Counter()
+    for settled_id in settled:
+        row = db.get(TaskExecutionCommand, settled_id, populate_existing=True)
+        assert row is not None
+        kinds[str(row.kind)] += 1
+        scope = row.payload.get("scope") if isinstance(row.payload, dict) else None
+        if row.kind == "start":
+            settle_failed_start_no_commit(db, row)
+        stage_terminal_event(
+            db,
+            command_db_id=settled_id,
+            draft=TerminalTaskEventDraft(
+                message_code=None,
+                resend_safe=False,
+                include_command_identity=scope != "external",
+            ),
+        )
+    if settled:
+        logger.info(
+            "task_id=%s component=dispatch-cap control=%s control_command_id=%s "
+            "settled_commands=%s kinds=%s",
+            task.id,
+            control.kind,
+            control_command_id,
+            len(settled),
+            dict(kinds),
         )

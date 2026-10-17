@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import Mapping
 from dataclasses import replace
+from threading import Event as ThreadEvent
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from xagent.core.tools.adapters.vibe.interaction_types import TYPES_REQUIRING_OP
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     GatedCall,
     GateDecision,
+    MCPApprovalReplayExecutor,
     ToolCallExecutionContext,
     _gated_interaction_id,
     _gated_interaction_source,
@@ -102,6 +104,14 @@ def _register(registrations: list[Any], gate: Any, resume: Any, **kwargs: Any) -
         task_source="slack", gate=gate, resume=resume, **kwargs
     )
     registrations.append(handle)
+
+
+def test_replay_executor_is_exported_from_vibe_facade() -> None:
+    from xagent.core.tools.adapters.vibe import (
+        MCPApprovalReplayExecutor as FacadeReplayExecutor,
+    )
+
+    assert FacadeReplayExecutor is MCPApprovalReplayExecutor
 
 
 async def _unused_resume(**_: Any) -> None:
@@ -446,6 +456,42 @@ async def test_resume_uses_one_ephemeral_executor_for_host_payload(
 
 
 @pytest.mark.asyncio
+async def test_replay_executor_ack_is_thread_safe_idempotent_and_expires(
+    registrations: list[Any],
+) -> None:
+    captured: list[MCPApprovalReplayExecutor] = []
+
+    async def resume(
+        *, executor: MCPApprovalReplayExecutor, **_: Any
+    ) -> ToolInteractionSettlement:
+        captured.append(executor)
+
+        def acknowledge_twice() -> None:
+            executor.acknowledge_dispatch()
+            executor.acknowledge_dispatch()
+
+        await asyncio.to_thread(acknowledge_twice)
+        return ToolInteractionSettlement.succeeded(await executor({"text": "approved"}))
+
+    _register(registrations, lambda _: None, resume)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        settlement = await tool.resume_user_interaction(
+            interaction_id=_gated_interaction_id("slack", "interaction-1"),
+            response="approve",
+        )
+
+    assert settlement is not None and settlement.status == "succeeded"
+    assert target.calls == [{"text": "approved"}]
+    with pytest.raises(RuntimeError, match="no longer available"):
+        captured[0].acknowledge_dispatch()
+    with pytest.raises(RuntimeError, match="no longer available"):
+        await captured[0]({"text": "second"})
+
+
+@pytest.mark.asyncio
 async def test_resume_hook_failures_never_dispatch(
     registrations: list[Any],
 ) -> None:
@@ -467,6 +513,28 @@ async def test_resume_hook_failures_never_dispatch(
 
     assert result.status == "failed"
     assert result.projected_result()["status"] == "error"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resume_timeout_before_durable_ack_is_failed(
+    registrations: list[Any],
+) -> None:
+    async def resume(**_: Any) -> ToolInteractionSettlement:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    _register(registrations, lambda _: None, resume, timeout_seconds=0.01)
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    with bind_tool_call_execution_context(_context()):
+        settlement = await tool.resume_user_interaction(
+            interaction_id=_gated_interaction_id("slack", "interaction-1"),
+            response="approve",
+        )
+
+    assert settlement is not None and settlement.status == "failed"
     assert target.calls == []
 
 
@@ -500,6 +568,188 @@ async def test_resume_timeout_does_not_cancel_a_started_dispatch(
     assert result.status == "succeeded"
     assert result.projected_result()["success"] is True
     assert target.calls == [{"text": "approved"}]
+
+
+@pytest.mark.asyncio
+async def test_durable_ack_timeout_before_executor_is_dispatch_unknown(
+    registrations: list[Any],
+) -> None:
+    """Cancellation cleanup can acknowledge a marker committed off-loop.
+
+    The worker is deliberately non-abandonable: the policy timeout cancels the
+    hook while its commit is still blocked, then the commit wins before the
+    cancelled coroutine can return normally and perform its normal-path
+    acknowledgement. The cleanup reads that durable fact and acknowledges it;
+    classification must happen after the cleanup drain, not before it.
+    """
+
+    commit_started = ThreadEvent()
+    release_commit = ThreadEvent()
+    marker_committed = ThreadEvent()
+    cancellation_cleanup_started = asyncio.Event()
+    ledger = {"status": "approved"}
+
+    def commit_marker() -> None:
+        commit_started.set()
+        release_commit.wait()
+        ledger["status"] = "executing"
+        marker_committed.set()
+
+    async def resume(
+        *, executor: MCPApprovalReplayExecutor, **_: Any
+    ) -> ToolInteractionSettlement:
+        commit_task = asyncio.create_task(asyncio.to_thread(commit_marker))
+        try:
+            await asyncio.shield(commit_task)
+            executor.acknowledge_dispatch()
+        except asyncio.CancelledError:
+            cancellation_cleanup_started.set()
+            await asyncio.shield(commit_task)
+            assert marker_committed.is_set()
+            executor.acknowledge_dispatch()
+            ledger["status"] = "dispatch_unknown"
+            raise
+        return ToolInteractionSettlement.failed()
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=0.01,
+        dispatch_observe_seconds=0.02,
+    )
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def release_after_timeout() -> None:
+        await cancellation_cleanup_started.wait()
+        release_commit.set()
+
+    releaser = asyncio.create_task(release_after_timeout())
+    with bind_tool_call_execution_context(_context()):
+        settlement = await asyncio.wait_for(
+            tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            ),
+            timeout=5,
+        )
+    await releaser
+
+    assert commit_started.is_set() and marker_committed.is_set()
+    assert settlement is not None and settlement.status == "dispatch_unknown"
+    assert ledger["status"] == "dispatch_unknown"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_durable_ack_cancellation_before_executor_cannot_reopen_retry(
+    registrations: list[Any],
+) -> None:
+    """A late marker acknowledged in cancel cleanup replays, not dispatches."""
+
+    commit_started = ThreadEvent()
+    release_commit = ThreadEvent()
+    marker_committed = ThreadEvent()
+    cancellation_cleanup_started = asyncio.Event()
+    ledger = {"status": "approved"}
+
+    def commit_marker() -> None:
+        commit_started.set()
+        release_commit.wait()
+        ledger["status"] = "executing"
+        marker_committed.set()
+
+    async def resume(
+        *, executor: MCPApprovalReplayExecutor, **_: Any
+    ) -> ToolInteractionSettlement:
+        if ledger["status"] == "dispatch_unknown":
+            return ToolInteractionSettlement.dispatch_unknown()
+        commit_task = asyncio.create_task(asyncio.to_thread(commit_marker))
+        try:
+            await asyncio.shield(commit_task)
+            executor.acknowledge_dispatch()
+        except asyncio.CancelledError:
+            cancellation_cleanup_started.set()
+            await asyncio.shield(commit_task)
+            assert marker_committed.is_set()
+            executor.acknowledge_dispatch()
+            ledger["status"] = "dispatch_unknown"
+            raise
+        return ToolInteractionSettlement.failed()
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=30,
+        dispatch_observe_seconds=0.02,
+    )
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def run() -> ToolInteractionSettlement | None:
+        with bind_tool_call_execution_context(_context()):
+            return await tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", "interaction-1"),
+                response="approve",
+            )
+
+    task = asyncio.create_task(run())
+    await asyncio.to_thread(commit_started.wait)
+    task.cancel()
+    await cancellation_cleanup_started.wait()
+    release_commit.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=5)
+
+    replayed = await run()
+    assert replayed is not None and replayed.status == "dispatch_unknown"
+    assert marker_committed.is_set()
+    assert ledger["status"] == "dispatch_unknown"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_durable_ack_is_scoped_to_one_concurrent_resume(
+    registrations: list[Any],
+) -> None:
+    """One interaction's marker must not change another's retry class."""
+
+    first_acknowledged = asyncio.Event()
+
+    async def resume(
+        *, interaction_id: str, executor: MCPApprovalReplayExecutor, **_: Any
+    ) -> ToolInteractionSettlement:
+        if interaction_id == "first":
+            executor.acknowledge_dispatch()
+            first_acknowledged.set()
+            await asyncio.Event().wait()
+        await first_acknowledged.wait()
+        raise RuntimeError("failed before this interaction's marker")
+
+    _register(
+        registrations,
+        lambda _: None,
+        resume,
+        timeout_seconds=0.01,
+        dispatch_observe_seconds=0.02,
+    )
+    target = _Target()
+    (tool,) = gate_mcp_tools([target], connection={"id": 41})
+
+    async def run(interaction_id: str) -> ToolInteractionSettlement | None:
+        with bind_tool_call_execution_context(_context()):
+            return await tool.resume_user_interaction(
+                interaction_id=_gated_interaction_id("slack", interaction_id),
+                response="approve",
+            )
+
+    first, second = await asyncio.gather(run("first"), run("second"))
+
+    assert first is not None and first.status == "dispatch_unknown"
+    assert second is not None and second.status == "failed"
+    assert target.calls == []
 
 
 @pytest.mark.asyncio

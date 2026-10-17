@@ -1,4 +1,5 @@
 import pytest
+from cryptography.fernet import Fernet
 
 from xagent.web import auth_config
 
@@ -13,6 +14,31 @@ def _clear_auth_environment(monkeypatch):
         "XAGENT_SESSION_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ENCRYPTION_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv(
+        "XAGENT_SECRET_ENCRYPTION_KEY", "test-encryption-secret-01234567890123456789"
+    )
+
+
+@pytest.mark.parametrize("value", [None, "", "not-a-fernet-key"])
+def test_startup_rejects_missing_or_invalid_encryption_key(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_JWT_SECRET", "test-signing-secret-01234567890123456789")
+    if value is None:
+        monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ENCRYPTION_KEY", value)
+    with pytest.raises(RuntimeError, match="^ENCRYPTION_KEY must"):
+        auth_config.validate_auth_config()
+
+
+def test_startup_rejects_missing_tool_encryption_key(monkeypatch):
+    monkeypatch.setenv("XAGENT_ENVIRONMENT", "production")
+    monkeypatch.setenv("XAGENT_JWT_SECRET", "test-signing-secret-01234567890123456789")
+    monkeypatch.delenv("XAGENT_SECRET_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="XAGENT_SECRET_ENCRYPTION_KEY"):
+        auth_config.validate_auth_config()
 
 
 def test_development_allows_the_development_secret(monkeypatch):

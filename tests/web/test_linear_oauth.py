@@ -10,12 +10,14 @@ import requests
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from tests.shared.oauth_browser_fixture import (
+    create_access_token,
+    generic_oauth_callback,
+)
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api.auth import (
     _merge_oauth_scopes,
     _oauth_scope_separator,
-    create_access_token,
-    generic_oauth_callback,
     generic_oauth_login,
 )
 from xagent.web.models.database import Base

@@ -64,7 +64,7 @@ from ...config import (
     get_task_auto_resume_max_inflight,
     get_task_auto_resume_max_per_tick,
 )
-from ...core.agent.interruption import is_database_unavailable
+from ...core.agent.interruption import InterruptionReason, is_database_unavailable
 from ...core.runtime_performance import (
     increment_counter,
     observe_value,
@@ -92,6 +92,7 @@ from .task_auto_recovery import (
     TASK_INTERRUPTION_PAUSED_TRIGGER_ERROR,
     auto_recovery_eligibility,
     is_auto_resume_command_id,
+    is_status_only_source,
 )
 from .task_auto_recovery_policy import (
     auto_resume_limit,
@@ -111,6 +112,7 @@ from .task_command_transport import (
     notify_task_command_dispatcher,
     stage_task_command,
 )
+from .task_dispatch_cap import EXECUTION_OPENING_KINDS
 from .task_execution_admission import AdmissionQueueFull
 from .task_execution_controller import TaskControlState
 from .task_lease_service import utc_now
@@ -2472,4 +2474,261 @@ def cancel_pending_auto_resume_no_commit(
         run_id=str(row.run_id),
         state_version=task_version + 1,
         notice=result.notice,
+    )
+
+
+# --------------------------------------------------------------------------
+# Terminal view for status-only callers
+# --------------------------------------------------------------------------
+
+# Client-visible: what a caller that only reads the task's status is told when
+# automatic resume has stopped and nothing is queued that could still move the
+# task. Keyed by the recovery row's state; :func:`_with_reason` completes each
+# text with the row's interruption reason.
+_TERMINAL_VIEW_ERRORS = {
+    TaskAutoRecoveryState.EXHAUSTED.value: (
+        "Task failed after a system interruption; "
+        "automatic resume stopped after repeated attempts"
+    ),
+    TaskAutoRecoveryState.EXPIRED.value: (
+        "Task failed after a system interruption; "
+        "it was not resumed within the automatic-resume window"
+    ),
+    TaskAutoRecoveryState.DISPATCH_FAILED.value: (
+        "Task failed after a system interruption; automatic resume could not be started"
+    ),
+    TaskAutoRecoveryState.INELIGIBLE.value: (
+        "Task failed after a system interruption; "
+        "it can no longer be resumed automatically"
+    ),
+    TaskAutoRecoveryState.SUPERSEDED.value: (
+        "Task failed after a system interruption; "
+        "it can no longer be resumed automatically"
+    ),
+}
+_TERMINAL_VIEW_DISABLED_ERROR = (
+    "Task failed after a system interruption; automatic resume is disabled"
+)
+_TERMINAL_VIEW_NEW_TURN_ERROR = "Task failed: the new message could not be started."
+_TERMINAL_VIEW_MANUAL_ERROR = (
+    "Task failed after a system interruption; automatic resume will not continue it"
+)
+# ``state_detail`` that
+# :func:`supersede_pending_auto_resume_for_append_no_commit` writes on a
+# ``manual`` row when a caller's new message replaces a pending resume.
+_NEW_TURN_DETAIL = "new_turn"
+# Row states that end automatic resume for good, whatever their detail.
+_TERMINAL_VIEW_STOP_STATES = frozenset(_TERMINAL_VIEW_ERRORS)
+
+
+def _with_reason(text: str, reason: Any) -> str:
+    """A stop text completed with the row's interruption ``reason``."""
+
+    return f"{text} (reason: {reason})."
+
+
+# Commands of a person that can still change the paused task (a START or
+# MESSAGE of the caller is not one: a queued one is an opening command, and
+# one that ran moved the run).
+_PERSON_CONTROL_KINDS = (
+    TaskCommandKind.RESUME.value,
+    TaskCommandKind.RESUME_INPUT.value,
+    TaskCommandKind.PAUSE.value,
+    TaskCommandKind.CANCEL.value,
+)
+
+
+@dataclass(frozen=True)
+class TerminalView:
+    """What a status-only caller is told about a task automatic resume left.
+
+    ``state`` is the recovery row's state, ``error`` the client-visible text,
+    ``stopped_at`` when the row last changed (the stop) and ``reason`` the
+    row's interruption reason.
+    """
+
+    state: str
+    error: str
+    stopped_at: datetime
+    reason: str
+
+
+def _terminal_view_snapshot(db: Session, task_id: int) -> Any:
+    """The task, its recovery row and the command facts, in one statement."""
+
+    last_dispatch = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == TaskAutoRecovery.task_id,
+            TaskExecutionCommand.command_id == TaskAutoRecovery.last_command_id,
+        )
+        .correlate(TaskAutoRecovery)
+        .scalar_subquery()
+    )
+    person_control_since = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == Task.id,
+            TaskExecutionCommand.id > last_dispatch,
+            TaskExecutionCommand.kind.in_(_PERSON_CONTROL_KINDS),
+            # Exact, case-sensitive prefix, as ``_user_command_since_dispatch``
+            # tests it: ``startswith`` compiles to LIKE, which ignores ASCII
+            # case on SQLite, so a person's ``AUTO-RESUME:...`` command would
+            # pass for the sweeper's.
+            func.substr(
+                TaskExecutionCommand.command_id, 1, len(AUTO_RESUME_COMMAND_PREFIX)
+            )
+            != AUTO_RESUME_COMMAND_PREFIX,
+        )
+        .correlate(Task, TaskAutoRecovery)
+        .exists()
+    )
+    opening_queued = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == Task.id,
+            TaskExecutionCommand.kind.in_(EXECUTION_OPENING_KINDS),
+            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+        )
+        .correlate(Task)
+        .exists()
+    )
+    start_rejected = (
+        select(TaskExecutionCommand.id)
+        .where(
+            TaskExecutionCommand.task_id == Task.id,
+            TaskExecutionCommand.kind == TaskCommandKind.START.value,
+            TaskExecutionCommand.status == COMMAND_FAILED,
+            TaskExecutionCommand.target_state_version == Task.state_version,
+        )
+        .correlate(Task)
+        .exists()
+    )
+    return db.execute(
+        select(
+            Task.status,
+            Task.control_state,
+            Task.run_id,
+            Task.state_version,
+            Task.source,
+            TaskAutoRecovery.run_id.label("row_run_id"),
+            TaskAutoRecovery.state.label("row_state"),
+            TaskAutoRecovery.state_detail,
+            TaskAutoRecovery.reason,
+            TaskAutoRecovery.paused_state_version,
+            TaskAutoRecovery.updated_at,
+            last_dispatch.is_not(None).label("last_dispatch_exists"),
+            start_rejected.label("start_rejected"),
+            opening_queued.label("opening_queued"),
+            person_control_since.label("person_control_since"),
+        )
+        .select_from(Task)
+        .outerjoin(TaskAutoRecovery, TaskAutoRecovery.task_id == Task.id)
+        .where(Task.id == task_id)
+    ).one_or_none()
+
+
+def status_only_terminal_view(db: Session, task_id: int) -> TerminalView | None:
+    """Whether a status-only caller should read ``task_id`` as failed, and why.
+
+    A read model for the public ``/v1`` task reads only: its one caller is
+    ``_load_task_info_snapshot``, which calls it only for a task it loaded
+    PAUSED with control state ``paused``; it is never written anywhere, and
+    the task row stays PAUSED. A caller
+    that sees nothing but the status cannot tell a task waiting for its next
+    automatic resume from one that stopped for good, so it would wait on the
+    second forever. The answer is a :class:`TerminalView` when all hold:
+
+    1. the task's source is a status-only one;
+    2. the task is PAUSED with control state ``paused``;
+    3. the recovery row describes the task's current run;
+    4. the row's reason is not a person's pause, and the row either ended
+       automatic resume (``exhausted``, ``expired``, ``dispatch_failed``,
+       ``ineligible``, ``superseded``) or rests in ``manual`` for a reason
+       other than a person's own cancel (which is the person's intent);
+    5. the task is at the row's fence, or two versions on (a resume that
+       rolled back) when the row is ``dispatch_failed`` or ``manual``, its
+       last dispatch command still exists (without it nothing can tell
+       whether a person acted since), and no person has resumed, paused or
+       cancelled the task since (the sweeper's own commands do not count);
+    6. no command that could open an execution is queued or running (an
+       append's START, a person's resume).
+
+    Anything else, including a task without a row, is ``None``: the caller
+    keeps waiting and the next read decides again.
+
+    The text names the row's reason. When a START staged at the task's
+    current ``state_version`` was rejected, the text says the new message
+    could not be started, whatever the row's state; this changes the text
+    only, never whether the view is terminal.
+
+    One statement on purpose, like the channel reply hold's snapshot: under
+    PostgreSQL's READ COMMITTED two reads could straddle a resume that was
+    interrupted and recorded again, pairing one interruption's task version
+    with another's fence. It runs in a SAVEPOINT; a failed read is logged and
+    reads as ``None`` rather than as terminal, because a false ``failed``
+    would end the caller's wait on a task that may still resume, while a
+    missed one is corrected by the next read.
+    """
+
+    try:
+        with db.begin_nested():
+            snap = _terminal_view_snapshot(db, task_id)
+    except Exception:
+        logger.warning(
+            "Reading the terminal view of task %s failed; reporting none",
+            task_id,
+            exc_info=True,
+        )
+        return None
+    if (
+        snap is None
+        or not is_status_only_source(snap.source)
+        or snap.status != TaskStatus.PAUSED
+        or snap.control_state != TaskControlState.PAUSED.value
+        or snap.row_run_id is None
+        or snap.row_run_id != snap.run_id
+        or snap.reason == InterruptionReason.USER_PAUSE.value
+    ):
+        return None
+    state = str(snap.row_state)
+    detail = snap.state_detail
+    new_turn = False
+    if state == TaskAutoRecoveryState.MANUAL.value:
+        if detail == AUTO_RESUME_USER_CANCELLED_DETAIL:
+            return None
+        if detail == AUTO_RESUME_DISABLED_DETAIL:
+            text = _TERMINAL_VIEW_DISABLED_ERROR
+        elif detail == _NEW_TURN_DETAIL:
+            text, new_turn = _TERMINAL_VIEW_MANUAL_ERROR, True
+        else:
+            text = _TERMINAL_VIEW_MANUAL_ERROR
+    elif state in _TERMINAL_VIEW_STOP_STATES:
+        text = _TERMINAL_VIEW_ERRORS[state]
+    else:
+        return None
+    gap = int(snap.state_version or 0) - int(snap.paused_state_version)
+    if gap != 0 and not (
+        gap == 2
+        and state
+        in (
+            TaskAutoRecoveryState.DISPATCH_FAILED.value,
+            TaskAutoRecoveryState.MANUAL.value,
+        )
+        and snap.last_dispatch_exists
+        and not snap.person_control_since
+    ):
+        return None
+    if snap.opening_queued:
+        return None
+    error = (
+        _TERMINAL_VIEW_NEW_TURN_ERROR
+        if new_turn or snap.start_rejected
+        else _with_reason(text, snap.reason)
+    )
+    return TerminalView(
+        state=state,
+        error=error,
+        stopped_at=snap.updated_at,
+        reason=str(snap.reason),
     )

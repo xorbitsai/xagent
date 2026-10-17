@@ -11,6 +11,7 @@ import pytest
 import redis
 from cryptography.fernet import Fernet
 
+from tests.e2e.postgres_harness import postgres_url  # noqa: F401
 from tests.e2e.shared_execution_harness import shared_app  # noqa: F401
 
 

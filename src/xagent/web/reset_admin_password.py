@@ -1,6 +1,7 @@
 import argparse
 import getpass
 import logging
+import secrets
 import sys
 from typing import cast
 
@@ -77,7 +78,7 @@ def _confirm_reset(username: str, skip_confirmation: bool) -> None:
         return
 
     confirmed = input(
-        f"Reset password for admin '{username}' and revoke active refresh tokens? [y/N]: "
+        f"Reset password for admin '{username}' and revoke active sessions and reset links? [y/N]: "
     ).strip()
     if confirmed.lower() not in {"y", "yes"}:
         raise ValueError("Operation cancelled")
@@ -99,9 +100,25 @@ def reset_admin_password(username: str, new_password: str) -> None:
         if admin is None:
             raise ValueError(f"Admin user '{username}' not found")
 
-        setattr(admin, "password_hash", hash_password(new_password))
-        setattr(admin, "refresh_token", None)
-        setattr(admin, "refresh_token_expires_at", None)
+        # Write every revocation field, even when the loaded snapshot held None:
+        # another login/reset-link request may have published since that read.
+        changed = (
+            db.query(User)
+            .filter(User.id == admin.id, User.is_admin.is_(True))
+            .update(
+                {
+                    User.password_hash: hash_password(new_password),
+                    User.refresh_token: None,
+                    User.refresh_token_expires_at: None,
+                    User.password_reset_token_hash: None,
+                    User.password_reset_expires_at: None,
+                    User.session_epoch: secrets.token_urlsafe(24),
+                },
+                synchronize_session=False,
+            )
+        )
+        if changed != 1:
+            raise ValueError(f"Admin user '{username}' not found")
         db.commit()
     except Exception:
         db.rollback()

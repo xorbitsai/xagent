@@ -22,6 +22,17 @@ if [[ -n "${XAGENT_JWT_SECRET_FILE:-}" \
   export XAGENT_JWT_SECRET
 fi
 
+# Tool credentials use a different historical SHA-256 based derivation. Keep
+# their generated secret persistent, and never replace an explicit legacy alias.
+tool_credentials_key="${XAGENT_SECRET_ENCRYPTION_KEY:-}"
+legacy_tool_credentials_key="${SECRET_KEY:-}"
+if [[ -n "${XAGENT_SECRET_ENCRYPTION_KEY_FILE:-}" \
+      && -z "${tool_credentials_key//[[:space:]]/}" \
+      && -z "${legacy_tool_credentials_key//[[:space:]]/}" ]]; then
+  XAGENT_SECRET_ENCRYPTION_KEY="$(python -m xagent.web.jwt_secret_bootstrap "${XAGENT_SECRET_ENCRYPTION_KEY_FILE}" --label 'Tool credential secret')"
+  export XAGENT_SECRET_ENCRYPTION_KEY
+fi
+
 # Docker Compose uses this image for Celery worker and scheduler services too;
 # execute those overrides without an unnecessary Xvfb. A standalone Agent
 # worker can use browser automation, so its override continues through display

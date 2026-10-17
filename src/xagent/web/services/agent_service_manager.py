@@ -3906,14 +3906,21 @@ class AgentServiceManager:
                             "error_code": "quota_exceeded",
                         }
 
-                logger.info(
-                    "=== Task executed successfully, updating title if needed ==="
-                )
-                if task_id and turn_result.get("success"):
-                    await update_task_title_from_agent(
-                        agent_service,
-                        int(task_id),
-                        task_lease=execution_lease,
+                if turn_result.get("success"):
+                    logger.info(
+                        "=== Task executed successfully, updating title if needed ==="
+                    )
+                    if task_id:
+                        await update_task_title_from_agent(
+                            agent_service,
+                            int(task_id),
+                            task_lease=execution_lease,
+                        )
+                else:
+                    logger.warning(
+                        "Task execution failed: task_id=%s, status=%s",
+                        task_id or tracker_task_id,
+                        turn_result.get("status"),
                     )
                 return turn_result
 

@@ -5,7 +5,7 @@ import contextlib
 import json
 import logging
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -3318,6 +3318,38 @@ class _FailingFinishTraceTracer:
 
 class _RecordingReActPattern:
     __class__ = type("ReActPattern", (), {})  # noqa: A003 - mimic real class name
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_hook", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    ("result", "expected_status"),
+    [
+        ({"success": False, "status": "invalid_tool_protocol"}, "error"),
+        ({"success": False}, "error"),
+        ({"status": "completed"}, "error"),
+        ({"success": True, "status": "completed"}, "success"),
+    ],
+    ids=["failed", "failed-without-status", "missing-success", "succeeded"],
+)
+async def test_on_pattern_end_finishes_trace_with_result_status(
+    result: dict[str, Any], expected_status: str, async_hook: bool
+) -> None:
+    tracer = MagicMock(spec=["finish_trace"])
+    tracer.finish_trace = AsyncMock() if async_hook else MagicMock()
+    runtime = PatternRuntime(tracer=tracer, execution_id="exec-pattern-result")
+
+    await runtime.on_pattern_end(
+        context=ExecutionContext(execution_id="exec-pattern-result"),
+        pattern=_RecordingReActPattern(),
+        result=result,
+    )
+
+    tracer.finish_trace.assert_called_once()
+    assert tracer.finish_trace.call_args.kwargs["status"] == expected_status
+    assert tracer.finish_trace.call_args.kwargs["output"] is result
+    if async_hook:
+        tracer.finish_trace.assert_awaited_once()
 
 
 @pytest.mark.asyncio

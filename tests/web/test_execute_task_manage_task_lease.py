@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -200,6 +202,86 @@ async def test_local_execute_task_still_runs_without_a_lease() -> None:
         )
 
     assert result["success"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "turn_result",
+    [
+        {"success": False, "status": "invalid_tool_protocol"},
+        {"success": False},
+        {"status": "completed"},
+        {"success": True, "status": "completed"},
+    ],
+    ids=["failed", "failed-without-status", "missing-success", "succeeded"],
+)
+async def test_execute_task_logs_result_and_updates_title_only_on_success(
+    db_session,
+    caplog: pytest.LogCaptureFixture,
+    turn_result: dict[str, Any],
+) -> None:
+    user = User(username="result-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.flush()
+    task = Task(
+        user_id=user.id,
+        title="result test",
+        description="test",
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+    )
+    db_session.add(task)
+    db_session.commit()
+    task_id = int(task.id)
+    manager = AgentServiceManager()
+
+    class ResultAgent(_FakeAgentService):
+        async def execute_task(self, **_kwargs):
+            return turn_result
+
+    with (
+        patch.object(
+            manager, "_acquire_sandbox_task", new=AsyncMock(return_value=None)
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.services.agent_service_manager.update_task_title_from_agent",
+            new_callable=AsyncMock,
+        ) as update_title,
+        caplog.at_level(
+            logging.INFO, logger="xagent.web.services.agent_service_manager"
+        ),
+    ):
+        result = await manager.execute_task(
+            agent_service=ResultAgent(),
+            task="hello",
+            task_id=str(task_id),
+            manage_task_lease=False,
+        )
+
+    assert result is turn_result
+    success_logs = [
+        record
+        for record in caplog.records
+        if "Task executed successfully" in record.getMessage()
+    ]
+    failure_logs = [
+        record
+        for record in caplog.records
+        if "Task execution failed" in record.getMessage()
+    ]
+    if turn_result.get("success"):
+        assert len(success_logs) == 1
+        assert success_logs[0].levelno == logging.INFO
+        assert not failure_logs
+        update_title.assert_awaited_once()
+    else:
+        assert not success_logs
+        assert len(failure_logs) == 1
+        assert failure_logs[0].levelno == logging.WARNING
+        assert f"task_id={task_id}" in failure_logs[0].getMessage()
+        assert f"status={turn_result.get('status')}" in failure_logs[0].getMessage()
+        update_title.assert_not_awaited()
 
 
 @pytest.mark.asyncio

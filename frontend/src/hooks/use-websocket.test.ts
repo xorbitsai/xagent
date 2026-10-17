@@ -2272,7 +2272,7 @@ describe("useWebSocket normalized connections", () => {
       const secret = "disconnect callback raw secret"
       const oldUpload = deferred<Array<{ file_id: string }>>()
       const uploadFiles = vi.fn(() => oldUpload.promise)
-      const throwingDisconnect = vi.fn(() => {
+      const throwingDisconnect = vi.fn<() => void>(() => {
         throw new Error(secret)
       })
       const safeDisconnect = vi.fn()

@@ -67,6 +67,25 @@ function rawReport(overrides: Record<string, unknown> = {}) {
 }
 
 describe("readConnectorRuntimeReport", () => {
+  it.each([
+    null,
+    { connector_ref: null, name: "x", inputs: [] },
+    { connector_ref: { connector_type: 1, connector_id: 1 }, name: "x", inputs: [] },
+    { connector_ref: REF_A, name: null, inputs: [] },
+    { connector_ref: REF_A, name: "x", inputs: null },
+    ...[
+      null, { key: 1 }, { required: "yes" }, { satisfied: 1 }, { expired: null },
+    ].map(inputOverride => ({
+      connector_ref: REF_A, name: "x",
+      inputs: [inputOverride === null ? null : {
+        section: "context", key: "k", type: "string", required: false, satisfied: false, expired: false,
+        ...inputOverride,
+      }],
+    })),
+  ])("rejects malformed connector/ref/input values rather than partially trusting them: %p", value => {
+    expect(readConnectorRuntimeReport(rawReport({ connectors: [value] }))).toBeNull()
+  })
+
   it("accepts only the closed section and type sets", () => {
     expect(CONNECTOR_RUNTIME_SECTIONS).toHaveLength(3)
     expect(CONNECTOR_RUNTIME_TYPES).toHaveLength(2)

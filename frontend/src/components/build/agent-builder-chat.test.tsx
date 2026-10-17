@@ -1,6 +1,6 @@
 import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest"
 import type { ClarificationOnSend } from "@/components/chat/clarification-delivery"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -389,7 +389,7 @@ describe("AgentBuilderChat", () => {
   })
 
   const emitAgentToolEnd = async (
-    onUpdateConfig: ReturnType<typeof vi.fn>,
+    onUpdateConfig: Mock<(config: Partial<AgentConfig>) => void>,
     toolParams: Record<string, unknown>,
     storedCategories: string[] | null,
   ) => {

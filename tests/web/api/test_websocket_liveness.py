@@ -13,6 +13,7 @@ import pytest
 from anyio import BrokenResourceError, ClosedResourceError
 from fastapi import WebSocketDisconnect
 
+from tests.shared.async_waits import eventually
 from xagent.web.api import websocket as websocket_api
 
 TASK_ID = 41
@@ -200,6 +201,9 @@ async def test_ws_chat_heartbeat_survives_blocked_loop() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "access_delay", [0.0, 0.3], ids=["immediate", "delayed-access"]
+)
+@pytest.mark.parametrize(
     "send_error",
     [
         RuntimeError("socket closed"),
@@ -211,27 +215,45 @@ async def test_ws_chat_heartbeat_survives_blocked_loop() -> None:
     ids=lambda error: type(error).__name__,
 )
 async def test_ws_chat_heartbeat_send_failure_ends_quietly(
-    send_error: BaseException, caplog: pytest.LogCaptureFixture
+    send_error: BaseException, access_delay: float, caplog: pytest.LogCaptureFixture
 ) -> None:
     manager = websocket_api.ConnectionManager()
     websocket = _FakeSocket(["heartbeat"], heartbeat_error=send_error)
+    run_db_io = websocket_api.run_db_io_cancellation_safe
+
+    async def delayed_access(operation: Any) -> Any:
+        # Model a busy executor: authorization can legitimately outlast 200 ms.
+        await asyncio.sleep(access_delay)
+        return await run_db_io(operation)
 
     with (
         caplog.at_level(logging.WARNING, logger=HEARTBEAT_LOGGER),
-        _endpoint_env(manager, HEARTBEAT_INTERVAL_SECONDS=0.01),
+        _endpoint_env(
+            manager,
+            HEARTBEAT_INTERVAL_SECONDS=0.01,
+            run_db_io_cancellation_safe=delayed_access,
+        ),
     ):
         endpoint = _run_endpoint(websocket)
-        await asyncio.sleep(0.2)  # many heartbeat intervals
+        try:
+            # Wait for the send and task exit, not a wall-clock estimate of
+            # how long authorization and event-loop scheduling should take.
+            await eventually(
+                lambda: websocket.heartbeat_senders and not _running_heartbeats(),
+                timeout=5,
+            )
 
-        # One failed send ended the task; the read loop still answers.
-        assert websocket.heartbeat_senders == ["_run_chat_heartbeat"]
-        assert _running_heartbeats() == []
-        websocket.client_sends(json.dumps({"type": "status_request"}))
-        await asyncio.sleep(0.05)
-        assert websocket.frames.count(STATUS_MARKER) == 2
-
-        websocket.client_sends(WebSocketDisconnect())
-        assert await _finished(endpoint) == [None]
+            # One failed send ended the task; the read loop still answers.
+            assert websocket.heartbeat_senders == ["_run_chat_heartbeat"]
+            assert _running_heartbeats() == []
+            websocket.client_sends(json.dumps({"type": "status_request"}))
+            await eventually(
+                lambda: websocket.frames.count(STATUS_MARKER) >= 2, timeout=5
+            )
+            assert websocket.frames.count(STATUS_MARKER) == 2
+        finally:
+            websocket.client_sends(WebSocketDisconnect())
+            assert await _finished(endpoint) == [None]
 
     assert _heartbeat_warnings(caplog) == []
     assert manager.connection_count() == 0

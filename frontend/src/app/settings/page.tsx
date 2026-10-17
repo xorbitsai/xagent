@@ -16,7 +16,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n, type Locale } from "@/contexts/i18n-context"
 import { Select } from "@/components/ui/select"
-import { inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
+import { clearAuthSessionIfCurrent, inspectAuthSession, updateAuthSessionUser } from "@/lib/auth-cache"
 import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 import { ExecutionBudgetSettings } from "@/components/settings/execution-budget"
 import { useSetupStatus } from "@/hooks/use-setup-status"
@@ -274,6 +274,7 @@ export default function SettingsPage() {
     setPasswordMessage(null)
 
     try {
+      const capturedSession = session
       const response = await apiRequest(`${getApiUrl()}/api/auth/change-password`, {
         method: 'POST',
         headers: {
@@ -287,11 +288,18 @@ export default function SettingsPage() {
 
       const data = await response.json()
 
-      if (response.ok) {
-        setPasswordMessage({ type: 'success', text: t("settings.password.success") })
+      if (response.ok && data.success) {
+        setPasswordMessage({ type: 'success', text: t("settings.password.sign_in_again") })
         setCurrentPassword('')
         setNewPassword('')
         setConfirmPassword('')
+        // A refresh may have advanced credentials during this request. Clear
+        // only this login lineage, never a replacement login in another tab.
+        const current = inspectAuthSession()
+        if (current.status === "valid" && current.projection.snapshot.sessionId === capturedSession.sessionId) {
+          const cleared = await clearAuthSessionIfCurrent(current.projection.snapshot)
+          if (cleared.status === "cleared") window.location.href = "/login?password_changed=1"
+        }
       } else {
         setPasswordMessage({ type: 'error', text: data.message || t("settings.password.failed") })
       }

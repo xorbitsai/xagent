@@ -33,7 +33,7 @@ from ...config import (
 from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, REFRESH_TOKEN_EXPIRE_DAYS
 from ..auth_sessions import (
     commit_refresh_credentials,
-    matches_user_session,
+    epoch_matches,
     user_session_claims,
 )
 from ..models.database import get_db
@@ -61,7 +61,7 @@ router = APIRouter(prefix="/oidc/google", tags=["Authentication"])
 class OidcExchangeTransaction:
     user_id: int
     token_id: str
-    session_epoch: str | None = None
+    session_epoch: str | None
 
 
 class OidcExchangeRequest(BaseModel):
@@ -142,7 +142,7 @@ async def complete_google_oidc_authorization(
     return dict(userinfo)
 
 
-def _create_exchange_code(user_id: int, session_epoch: str | None = None) -> str:
+def _create_exchange_code(user_id: int, session_epoch: str | None) -> str:
     return str(
         _exchange_serializer().dumps(
             {
@@ -418,8 +418,8 @@ def google_oidc_exchange(
         )
 
     user = db.query(User).filter(User.id == transaction.user_id).first()
-    if user is None or not matches_user_session(
-        user, {"session_epoch": transaction.session_epoch}
+    if user is None or not epoch_matches(
+        cast(str | None, user.session_epoch), transaction.session_epoch
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

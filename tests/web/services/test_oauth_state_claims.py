@@ -124,7 +124,7 @@ def test_cleanup_preserves_other_namespace_even_with_fast_oidc_clock(
         assert db.get(OidcConsumedToken, "oidc-expired") is not None
         monkeypatch.setattr(oidc_google, "_utcnow", lambda: now + timedelta(days=1))
         assert oidc_google._consume_exchange_code(
-            db, oidc_google._create_exchange_code(1)
+            db, oidc_google._create_exchange_code(1, None)
         )
         assert db.get(OidcConsumedToken, "oauth-state:live") is not None
         assert not claim_oauth_state(db, "fresh", expires_at=time.time() + 600)

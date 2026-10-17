@@ -113,8 +113,7 @@ async def progress_websocket_endpoint(
             while True:
                 # Wait for client messages (though we mainly send updates)
                 data = await websocket.receive_text()
-                if not await get_authenticated_user(websocket, token):
-                    await websocket.close(code=4001, reason="Session expired")
+                if not await get_authenticated_user(websocket, token, revalidate=True):
                     break
                 logger.debug(f"Received message from progress client: {data}")
 

@@ -134,6 +134,108 @@ def test_reset_token_cannot_be_reused():
     ]
 
 
+@pytest.mark.parametrize(
+    "conflict", ["password-changed", "reset-reissued", "reset-expired"]
+)
+def test_password_update_loses_conditional_write_without_rotating_epoch(
+    monkeypatch, conflict
+):
+    auth_tests.setup_first_admin(password="old-password-123")
+    token = auth_tests.login_and_get_token("administrator", "old-password-123")
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        user.password_reset_token_hash = auth.hash_password_reset_token("race-reset")
+        user.password_reset_expires_at = datetime.now(timezone.utc) + timedelta(
+            minutes=5
+        )
+        session.commit()
+    original_hash = auth.hash_password_async
+    winner_hash = auth.hash_password("winning-password-789")
+
+    async def hash_after_conflict(password):
+        result = await original_hash(password)
+        with auth_tests.TestingSessionLocal() as session:
+            user = session.query(User).one()
+            if conflict == "password-changed":
+                user.password_hash = winner_hash
+            elif conflict == "reset-reissued":
+                user.password_reset_token_hash = auth.hash_password_reset_token(
+                    "replacement"
+                )
+            else:
+                user.password_reset_expires_at = datetime.now(timezone.utc) - timedelta(
+                    seconds=1
+                )
+            session.commit()
+        return result
+
+    monkeypatch.setattr(auth, "hash_password_async", hash_after_conflict)
+    if conflict == "password-changed":
+        response = auth_tests.client.post(
+            "/api/auth/change-password",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "current_password": "old-password-123",
+                "new_password": "new-password-456",
+            },
+        )
+    else:
+        response = auth_tests.client.post(
+            "/api/auth/reset-password",
+            json={"token": "race-reset", "new_password": "new-password-456"},
+        )
+    assert response.status_code == 200
+    assert not response.json()["success"]
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        assert user.session_epoch is None
+        assert user.refresh_token is not None
+        assert auth.verify_password(
+            "winning-password-789"
+            if conflict == "password-changed"
+            else "old-password-123",
+            user.password_hash,
+        )
+
+
+def test_refresh_checks_epoch_even_if_refresh_token_is_unchanged(monkeypatch):
+    auth_tests.setup_first_admin(password="old-password-123")
+    tokens = auth._login_in_worker(
+        auth.LoginRequest(username="administrator", password="old-password-123"),
+        auth_tests.TestingSessionLocal,
+    )
+    original = auth._prepare_refresh_response
+
+    def prepare_then_rotate(*args):
+        response = original(*args)
+        with auth_tests.TestingSessionLocal() as session:
+            session.query(User).update({User.session_epoch: "new-generation"})
+            session.commit()
+        return response
+
+    monkeypatch.setattr(auth, "_prepare_refresh_response", prepare_then_rotate)
+    with pytest.raises(HTTPException) as error:
+        auth._refresh_in_worker(
+            auth.RefreshTokenRequest(refresh_token=tokens["refresh_token"]),
+            tokens["user_id"],
+            auth_tests.TestingSessionLocal,
+        )
+    assert error.value.status_code == 401
+    with auth_tests.TestingSessionLocal() as session:
+        user = session.query(User).one()
+        assert user.session_epoch == "new-generation"
+        assert user.refresh_token == tokens["refresh_token"]
+
+
+def test_session_epoch_generator_fits_the_database_column():
+    from xagent.web.auth_sessions import new_session_epoch
+
+    first, second = new_session_epoch(), new_session_epoch()
+    assert len(first) == User.__table__.c.session_epoch.type.length == 32
+    assert first.isascii()
+    assert first != second
+
+
 @pytest.mark.parametrize("late_publication", [False, True])
 def test_admin_cli_reset_revokes_all_credentials(monkeypatch, late_publication):
     from xagent.web import reset_admin_password as admin_reset

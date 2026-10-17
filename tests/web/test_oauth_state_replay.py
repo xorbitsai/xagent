@@ -16,6 +16,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.oidc_consumed_token import OidcConsumedToken
 from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
 
 
 @pytest.fixture
@@ -73,16 +74,38 @@ def _callback(state, nonce="browser-secret", *, error=True):
     )
 
 
-def _state():
+def _state(session_epoch=None):
     return auth.create_access_token(
         {
             "type": "oauth_state",
             "provider": "custom",
             "user_id": 1,
+            "session_epoch": session_epoch,
             "browser_nonce_hash": hashlib.sha256(b"browser-secret").hexdigest(),
         },
         expires_delta=timedelta(minutes=10),
     )
+
+
+@pytest.mark.parametrize("initial_epoch", [None, "current-generation"])
+def test_password_change_revokes_pending_connector_state_before_provider_exchange(
+    db_session, monkeypatch, initial_epoch
+):
+    db, user = db_session
+    user.session_epoch = initial_epoch
+    db.commit()
+    state = _state(initial_epoch)
+    user.session_epoch = "revoked-generation"
+    db.commit()
+    post = Mock()
+    monkeypatch.setattr(auth.requests, "post", post)
+    response = auth.generic_oauth_callback(
+        "custom", _callback(state, error=False), db, None
+    )
+    assert response.status_code == 400
+    assert b"Invalid or expired state" in response.body
+    assert db.query(UserOAuth).count() == 0
+    post.assert_not_called()
 
 
 def test_denied_provider_flow_is_consumed_and_cannot_be_replayed(

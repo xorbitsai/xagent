@@ -60,14 +60,16 @@ def _validate_access_token_claim_bindability(
     return username, user_id
 
 
-def _resolve_access_token_user(token: str, db: Session) -> User:
+def _resolve_access_token_user(
+    token: str, db: Session, *, verify_exp: bool = True
+) -> User:
     """Return the matching user or raise a typed credential rejection."""
     try:
         payload = jwt.decode(
             token,
             JWT_SECRET_KEY,
             algorithms=[JWT_ALGORITHM],
-            options={"verify_sub": False},
+            options={"verify_sub": False, "verify_exp": verify_exp},
         )
     except ExpiredSignatureError:
         raise _AccessTokenRejected(_AccessTokenRejectionReason.EXPIRED) from None
@@ -230,13 +232,17 @@ def is_admin_user(user: User) -> bool:
     return bool(getattr(user, "is_admin", False))
 
 
-def get_user_from_websocket_token(token: str, db: Session) -> Optional[User]:
+def get_user_from_websocket_token(
+    token: str, db: Session, *, verify_exp: bool = True
+) -> Optional[User]:
     """
     Get user from a WebSocket authentication token.
 
     Args:
         token: Authentication token from WebSocket
         db: Database session
+        verify_exp: Keep True at handshake. Only an already-authenticated
+            connection may disable expiry for durable revocation rechecks.
 
     Returns:
         Optional[User]: User if credentials are valid, None if they are rejected.
@@ -244,4 +250,7 @@ def get_user_from_websocket_token(token: str, db: Session) -> Optional[User]:
     Raises:
         Exception: Database and unexpected operational failures propagate unchanged.
     """
-    return get_user_from_token(token, db)
+    try:
+        return _resolve_access_token_user(token, db, verify_exp=verify_exp)
+    except _AccessTokenRejected:
+        return None

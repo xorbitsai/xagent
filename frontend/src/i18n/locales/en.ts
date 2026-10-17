@@ -508,6 +508,7 @@ Build when you need.`,
         network: "Network error, please try again later",
       },
       success: "Password updated successfully",
+      sign_in_again: "Password updated. All sign-in sessions have been revoked. Please sign in again with your new password.",
       failed: "Password update failed",
     },
     defaultModels: {

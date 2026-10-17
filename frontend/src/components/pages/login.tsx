@@ -36,6 +36,7 @@ export function LoginPage() {
   const [isLoading, setIsLoading] = useState(false)
   const [isGoogleConfigured, setIsGoogleConfigured] = useState<boolean | null>(null)
   const [error, setError] = useState("")
+  const [notice, setNotice] = useState("")
   const [formData, setFormData] = useState({
     identifier: "",
     password: ""
@@ -54,6 +55,9 @@ export function LoginPage() {
     const params = new URLSearchParams(window.location.search)
     const authUnavailable = params.get("auth_unavailable")
     const oidcError = params.get("oidc_error")
+    if (params.get("password_changed") === "1") {
+      setNotice(t("settings.password.sign_in_again"))
+    }
     if (isAuthMutationUnavailableReason(authUnavailable)) {
       setError(authMutationUnavailableMessage(authUnavailable))
     } else if (oidcError) {
@@ -193,6 +197,7 @@ export function LoginPage() {
         }
       >
         <form onSubmit={handleSubmit} className="space-y-5">
+          {notice ? <p role="status" className="rounded-[16px] border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-800">{notice}</p> : null}
           {error ? (
             <div className="rounded-[16px] border border-[#FFD5D9] bg-[#FFF5F6] px-4 py-3">
               <p className="text-sm text-[#C53030]">{error}</p>

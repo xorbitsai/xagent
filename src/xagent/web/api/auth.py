@@ -68,7 +68,13 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user, get_user_from_token
-from ..auth_sessions import commit_refresh_credentials, user_session_claims
+from ..auth_sessions import (
+    commit_refresh_credentials,
+    lock_current_session_epoch,
+    matches_user_session,
+    new_session_epoch,
+    user_session_claims,
+)
 from ..builtin_mcp_registry import GOOGLE_RESTRICTED_SCOPES
 from ..first_admin_setup import FirstAdminIdentity, run_first_admin_setup_hook
 from ..mcp_apps import BuiltinOAuthServerDefinitionError, get_app_by_id
@@ -2362,7 +2368,7 @@ async def reset_password(
                 User.password_reset_expires_at: None,
                 User.refresh_token: None,
                 User.refresh_token_expires_at: None,
-                User.session_epoch: secrets.token_urlsafe(24),
+                User.session_epoch: new_session_epoch(),
             },
             synchronize_session=False,
         )
@@ -2413,7 +2419,7 @@ async def change_password(
                     User.refresh_token_expires_at: None,
                     User.password_reset_token_hash: None,
                     User.password_reset_expires_at: None,
-                    User.session_epoch: secrets.token_urlsafe(24),
+                    User.session_epoch: new_session_epoch(),
                 },
                 synchronize_session=False,
             )
@@ -3675,10 +3681,12 @@ def _generic_oauth_login(
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     user_id = trusted_user_id
+    session_epoch: str | None = None
     if user_id is None and token:
         user = get_user_from_token(token, db)
         if user:
             user_id = int(user.id)
+            session_epoch = cast(str | None, user.session_epoch)
 
     if not user_id:
         return HTMLResponse(
@@ -3747,6 +3755,7 @@ def _generic_oauth_login(
         "provider": provider,
         "app_id": app_id,
         "redirect": redirect,
+        "session_epoch": session_epoch,
     }
     if browser_state_nonce is not None:
         browser_nonce_hash = hashlib.sha256(
@@ -4292,6 +4301,14 @@ def generic_oauth_callback(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
     user_id = user_id_claim
+    if not is_actor_flow and user_id is not None:
+        state_user = (
+            db.query(User).filter(User.id == user_id).populate_existing().first()
+        )
+        if state_user is None or not matches_user_session(state_user, payload):
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired state</h1>", status_code=400
+            )
     app_id = payload.get("app_id")
     if error_response := _google_gmail_error(provider, app_id):
         _log_oauth_callback_rejection(
@@ -5243,6 +5260,19 @@ def generic_oauth_callback(
                 # Serialize replacement in the stable user namespace.
                 db.query(User.id).filter(User.id == user_id).with_for_update().one()
 
+            # Provider I/O happened after the initial generation check. Lock
+            # only now, before credential writes, so a reset wins this race.
+            if (
+                not is_actor_flow
+                and user_id_claim is not None
+                and not lock_current_session_epoch(
+                    db, user_id_claim, payload.get("session_epoch")
+                )
+            ):
+                db.rollback()
+                return HTMLResponse(
+                    content="<h1>Error: Invalid or expired state</h1>", status_code=400
+                )
             connector_key = app_id or provider
             oauth_account = _matching_gmail_reconnect_tombstone(
                 db,

@@ -3048,8 +3048,7 @@ async def websocket_chat_endpoint(
         while True:
             # Receive client message
             data = await websocket.receive_text()
-            if not await get_authenticated_user(websocket, token):
-                await websocket.close(code=4001, reason="Session expired")
+            if not await get_authenticated_user(websocket, token, revalidate=True):
                 break
             logger.info(
                 f"📨 Received WebSocket message for task {task_id}: {data[:200]}"
@@ -3343,8 +3342,7 @@ async def websocket_builder_chat_endpoint(
     try:
         while True:
             data = await websocket.receive_text()
-            if not await get_authenticated_user(websocket, token):
-                await websocket.close(code=4001, reason="Session expired")
+            if not await get_authenticated_user(websocket, token, revalidate=True):
                 break
             logger.info(f"📨 Received builder chat message: {data[:200]}")
 
@@ -3817,8 +3815,7 @@ async def websocket_build_preview_endpoint(
         while True:
             # Receive client message
             data = await websocket.receive_text()
-            if not await get_authenticated_user(websocket, token):
-                await websocket.close(code=4001, reason="Session expired")
+            if not await get_authenticated_user(websocket, token, revalidate=True):
                 break
             logger.info(f"📨 Received build preview WebSocket message: {data[:200]}")
 

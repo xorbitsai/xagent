@@ -1,7 +1,6 @@
 import argparse
 import getpass
 import logging
-import secrets
 import sys
 from typing import cast
 
@@ -9,6 +8,7 @@ from dotenv import load_dotenv
 
 from .api.auth import hash_password
 from .auth_config import PASSWORD_MIN_LENGTH
+from .auth_sessions import new_session_epoch
 from .models.database import get_db, init_db
 from .models.user import User
 
@@ -112,7 +112,7 @@ def reset_admin_password(username: str, new_password: str) -> None:
                     User.refresh_token_expires_at: None,
                     User.password_reset_token_hash: None,
                     User.password_reset_expires_at: None,
-                    User.session_epoch: secrets.token_urlsafe(24),
+                    User.session_epoch: new_session_epoch(),
                 },
                 synchronize_session=False,
             )

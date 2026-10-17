@@ -2,12 +2,17 @@
 
 import secrets
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from .models.user import User
+
+
+def new_session_epoch() -> str:
+    """Generate exactly 32 URL-safe characters for User.session_epoch."""
+    return secrets.token_urlsafe(24)
 
 
 def user_session_claims(user: User) -> dict[str, Any]:
@@ -19,8 +24,12 @@ def user_session_claims(user: User) -> dict[str, Any]:
 
 
 def matches_user_session(user: User, claims: dict[str, Any]) -> bool:
-    epoch = user.session_epoch
-    supplied = claims.get("session_epoch")
+    return epoch_matches(
+        cast(str | None, user.session_epoch), claims.get("session_epoch")
+    )
+
+
+def epoch_matches(epoch: str | None, supplied: object) -> bool:
     # Pre-upgrade JWTs remain valid until the first credential reset. The
     # generation is durable and shared by all API processes.
     if epoch is None:
@@ -31,6 +40,25 @@ def matches_user_session(user: User, claims: dict[str, Any]) -> bool:
         type(supplied) is str
         and supplied.isascii()
         and secrets.compare_digest(str(epoch), supplied)
+    )
+
+
+def lock_current_session_epoch(db: Session, user_id: int, epoch: object) -> bool:
+    """Fence an OAuth credential write against concurrent password revocation.
+
+    A no-op conditional UPDATE takes the user-row write lock until the caller's
+    credential transaction commits. Do not hold this lock during provider I/O.
+    """
+    if epoch is not None and (type(epoch) is not str or not epoch.isascii()):
+        return False
+    return (
+        db.query(User)
+        .filter(User.id == user_id, User.session_epoch == epoch)
+        .update(
+            {User.session_epoch: epoch, User.updated_at: User.updated_at},
+            synchronize_session=False,
+        )
+        == 1
     )
 
 

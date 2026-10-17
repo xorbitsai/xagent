@@ -86,6 +86,10 @@ On first startup, Xagent redirects to `/setup` to create the first administrator
 docker compose exec backend python -m xagent.web.reset_admin_password --username <admin_username>
 ```
 
+This also revokes the administrator's existing sign-in sessions, file-stream
+tickets and password-reset links. Sign in again with the new password. Independent
+API keys and existing provider grants must be revoked separately after a compromise.
+
 ---
 
 ## One platform, three ways to use it

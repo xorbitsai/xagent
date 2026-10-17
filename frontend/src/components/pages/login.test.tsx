@@ -61,6 +61,15 @@ function renderLogin() {
 }
 
 describe("LoginPage auth-session creation", () => {
+  it("explains why a password change requires signing in again", async () => {
+    window.history.replaceState({}, "", "/login?password_changed=1")
+    try {
+      render(<LoginPage />)
+      expect(await screen.findByRole("status")).toHaveTextContent("settings.password.sign_in_again")
+    } finally {
+      window.history.replaceState({}, "", "/")
+    }
+  })
   beforeEach(() => {
     apiRequest.mockReset()
     claimAuthLoginIntent.mockReset()

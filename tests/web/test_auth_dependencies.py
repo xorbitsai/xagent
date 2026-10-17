@@ -629,6 +629,7 @@ def test_invalid_claims_read_the_bound_dialect_without_pool_checkout() -> None:
 def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
     """Authentication consumers stay within the reviewed ownership topology."""
     tracked = {
+        "_load_websocket_principal_sync",
         "_resolve_access_token_user",
         "get_current_user",
         "get_current_user_optional",
@@ -649,7 +650,12 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             rejected,
         ),
         (auth_file, "get_user_from_token", "_resolve_access_token_user", rejected),
-        (auth_file, "get_user_from_websocket_token", "get_user_from_token", ()),
+        (
+            auth_file,
+            "get_user_from_websocket_token",
+            "_resolve_access_token_user",
+            rejected,
+        ),
         (
             "web/api/websocket_auth.py",
             "_load_websocket_principal_sync",
@@ -690,8 +696,14 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
         (
             "web/api/websocket_auth.py",
             "revalidate_websocket_session.guarded.monitor",
+            "_load_websocket_principal_sync",
+            ("OperationalError", "SQLAlchemyTimeoutError", "Exception"),
+        ),
+        (
+            "web/api/websocket_auth.py",
             "get_authenticated_user",
-            terminated,
+            "_load_websocket_principal_sync",
+            ("Exception",),
         ),
         (
             websocket_file,

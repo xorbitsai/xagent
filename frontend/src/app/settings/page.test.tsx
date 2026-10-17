@@ -51,6 +51,24 @@ async function createSession(payload: AuthTokenPayload) {
   return createAuthSession(payload, claim.intent)
 }
 
+function captureNavigation() {
+  const implementation = (window.location as unknown as Record<symbol, unknown>)[
+    Object.getOwnPropertySymbols(window.location).find(symbol => String(symbol) === "Symbol(impl)")!
+  ] as { _locationObjectSetterNavigate: (url: { path: string[]; query: string | null }) => void }
+  const targets: string[] = []
+  vi.spyOn(implementation, "_locationObjectSetterNavigate").mockImplementation(url => {
+    targets.push(`/${url.path.join("/")}${url.query ? `?${url.query}` : ""}`)
+  })
+  return targets
+}
+
+function submitPassword() {
+  fireEvent.change(screen.getByLabelText("settings.password.current", { selector: "#current-password" }), { target: { value: "current-password" } })
+  fireEvent.change(screen.getByLabelText("settings.password.new"), { target: { value: "new-password-123" } })
+  fireEvent.change(screen.getByLabelText("settings.password.confirm"), { target: { value: "new-password-123" } })
+  fireEvent.click(screen.getByRole("button", { name: "settings.password.submit" }))
+}
+
 describe("SettingsPage auth profile synchronization", () => {
   beforeEach(async () => {
     localStorage.clear()
@@ -67,6 +85,42 @@ describe("SettingsPage auth profile synchronization", () => {
     })
     if (created.status !== "created") throw new Error("expected session")
     authState.session = created.projection.snapshot
+  })
+
+  it.each([true, false])("signs out only when the password result succeeds (%s)", async success => {
+    const targets = captureNavigation()
+    apiRequest
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: authState.user })))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success, message: "Password changed; sign in again" })))
+    render(<SettingsPage />)
+    await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toBeEnabled())
+    submitPassword()
+    if (success) {
+      await waitFor(() => expect(targets).toEqual(["/login?password_changed=1"]))
+      expect(inspectAuthSession().status).toBe("absent")
+    } else {
+      expect(await screen.findByText("Password changed; sign in again")).toBeInTheDocument()
+      expect(screen.queryByText("settings.password.sign_in_again")).not.toBeInTheDocument()
+      expect(targets).toEqual([])
+      expect(inspectAuthSession().status).toBe("valid")
+    }
+  })
+
+  it("does not sign out a replacement login when an old password response succeeds", async () => {
+    const targets = captureNavigation()
+    const pending = deferred<Response>()
+    apiRequest
+      .mockResolvedValueOnce(new Response(JSON.stringify({ success: true, user: authState.user })))
+      .mockReturnValueOnce(pending.promise)
+    render(<SettingsPage />)
+    await waitFor(() => expect(screen.getByLabelText("settings.email.current")).toBeEnabled())
+    submitPassword()
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledTimes(2))
+    await createSession({ user: authState.user, access_token: "replacement-access", refresh_token: "replacement-refresh" })
+    pending.resolve(new Response(JSON.stringify({ success: true })))
+    await screen.findByText("settings.password.sign_in_again")
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { token: "replacement-access" } } })
+    expect(targets).toEqual([])
   })
 
   it("does not render the username when an email label is available", async () => {

@@ -728,6 +728,8 @@ async def test_oauth_callback_error_param_cannot_inject_script(
     _patch_slack_oauth_config(monkeypatch)
 
     with SessionLocal() as db:
+        db.add(User(id=1, username="xss-test-owner", password_hash="hash"))
+        db.commit()
         start_result = start_slack_oauth(
             _request(path="/api/channels/slack/oauth/start"),
             SimpleNamespace(id=1),
@@ -757,6 +759,87 @@ async def test_oauth_callback_error_param_cannot_inject_script(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase", ["before-callback", "during-exchange", "after-start-commit"]
+)
+async def test_channel_oauth_is_fenced_by_the_initiating_session(
+    monkeypatch, tmp_path, phase
+):
+    engine, SessionLocal = _oauth_test_session(tmp_path, "slack-session-epoch.db")
+    _patch_slack_oauth_config(monkeypatch)
+    calls = []
+
+    def rotate():
+        with SessionLocal() as other:
+            other.query(User).filter(User.id == 1).update(
+                {User.session_epoch: "revoked"}
+            )
+            other.commit()
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            calls.append(True)
+            rotate()
+            return SimpleNamespace(
+                raise_for_status=lambda: None,
+                json=lambda: {"ok": True, "access_token": "xoxb"},
+            )
+
+    monkeypatch.setattr("xagent.web.api.channel.httpx.AsyncClient", Client)
+    try:
+        with SessionLocal() as db:
+            user = User(
+                id=1,
+                username="reset-channel-owner",
+                password_hash="hash",
+                session_epoch="initiating-generation",
+            )
+            db.add(user)
+            db.commit()
+            if phase == "after-start-commit":
+                commit = db.commit
+                rotated = False
+
+                def commit_then_rotate():
+                    nonlocal rotated
+                    commit()
+                    if not rotated:
+                        rotated = True
+                        rotate()
+
+                monkeypatch.setattr(db, "commit", commit_then_rotate)
+            result = start_slack_oauth(
+                _request(path="/api/channels/slack/oauth/start"), user, db
+            )
+            state = parse_qs(urlparse(result["authorize_url"]).query)["state"][0]
+            assert verify_token(state)["session_epoch"] == "initiating-generation"
+            if phase == "before-callback":
+                rotate()
+            background = BackgroundTasks()
+            response = await slack_oauth_callback(
+                _request(
+                    path="/api/channels/slack/oauth/callback",
+                    query={"code": "oauth-code", "state": state},
+                ),
+                background,
+                db,
+            )
+            assert response.status_code == 400
+            assert "invalid or expired" in response.body.decode()
+            assert len(calls) == (1 if phase == "during-exchange" else 0)
+            assert db.query(UserChannel).count() == 0
+            assert not background.tasks
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_oauth_state_is_single_use(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -765,6 +848,8 @@ async def test_oauth_state_is_single_use(
     _patch_slack_oauth_config(monkeypatch)
 
     with SessionLocal() as db:
+        db.add(User(id=1, username="replay-test-owner", password_hash="hash"))
+        db.commit()
         start_result = start_slack_oauth(
             _request(path="/api/channels/slack/oauth/start"),
             SimpleNamespace(id=1),

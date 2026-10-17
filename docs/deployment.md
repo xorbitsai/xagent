@@ -1,5 +1,43 @@
 # Deployment changes
 
+## 2026-10-17 — Password changes revoke sign-in sessions
+
+Apply migrations through the single Alembic head before serving traffic, and
+roll out the same authentication code to every API worker. Password changes,
+recovery resets and the offline administrator reset rotate `users.session_epoch`
+and revoke all existing access tokens, refresh tokens, file-stream tickets and
+pending OIDC exchange codes. The settings UI clears the current login and asks
+the user to sign in with the new password. Legacy tokens without a generation
+remain valid only until that user's first password reset/change.
+
+Authenticated WebSockets validate token expiry at handshake. Existing connections
+check signature, user existence and session generation, not the connect-time
+token's expiry; a normal access-token refresh must not cancel an active stream.
+Each socket uses a short worker-owned database session and one user query every
+4–6 seconds (jittered around 5 seconds), plus a check before each inbound command.
+Capacity-plan database pools and monitor checkout latency for this added load.
+Revocation closes with 4001 and drains owned streaming work. Handshake and command
+checks fail closed on database errors (503 denial or 1011 close). Background polls
+tolerate at most two consecutive OperationalError/pool-timeout failures; a third
+closes with 1011. Successful checks reset that counter. Unexpected errors close
+immediately. During transient poll failures, existing streams may continue until
+the next successful check or terminal failure: this is bounded retry, not an
+instantaneous revocation guarantee, and database response time adds latency.
+
+Ordinary user-bound connector and Slack-channel OAuth states carry the initiating
+generation and are checked before provider exchange and fenced again when saving
+credentials. Pre-upgrade states without a generation work only for unrotated
+users. Already-connected provider grants, independent actor authorization flows,
+personal API keys and agent/workforce runtime keys have separate lifecycles and
+are not revoked by changing the login password. After suspected account compromise,
+explicitly audit/revoke those keys and disconnect provider grants as well.
+
+Do not downgrade past `20261016_user_session_epoch` on a live installation: dropping
+the column destroys revocation generations and can revalidate previously revoked,
+unexpired tokens if the old JWT secret is retained. A rollback requires stopping
+all workers and invalidating outstanding credentials (including coordinated JWT
+signing-secret rotation), not merely dropping the column or restoring old code.
+
 ## LanceDB memory compatibility
 
 The LanceDB dependency is bounded: `lancedb>=0.32.0,<0.38` in `pyproject.toml`.

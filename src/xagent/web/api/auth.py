@@ -4047,18 +4047,27 @@ def _ensure_user_mcp_server(
 
     mcp_server = db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
     if not mcp_server:
-        mcp_server = MCPServer(
-            name=app_info["name"],
-            description=app_info["description"],
-            managed="external",
-            transport="oauth",
-            auth=_oauth_auth_metadata(),
-        )
-        db.add(mcp_server)
+        # Caller-flush failures are not catalog-insert races to recover from.
+        db.flush()
+        if db.get_bind().dialect.name == "sqlite":
+            # In legacy SQLite mode SELECT/SAVEPOINT do not issue BEGIN. A
+            # zero-row write keeps RELEASE from committing the outer operation.
+            db.execute(text("UPDATE users SET id = id WHERE 1 = 0"))
         try:
-            db.flush()
+            # A competing user's catalog insert must not roll back the caller's
+            # OAuth credential writes or release its session-generation lock.
+            # Add the candidate AFTER begin_nested's mandatory outer flush.
+            with db.begin_nested():
+                mcp_server = MCPServer(
+                    name=app_info["name"],
+                    description=app_info["description"],
+                    managed="external",
+                    transport="oauth",
+                    auth=_oauth_auth_metadata(),
+                )
+                db.add(mcp_server)
+                db.flush()
         except IntegrityError:
-            db.rollback()
             mcp_server = (
                 db.query(MCPServer).filter(MCPServer.name == app_info["name"]).first()
             )

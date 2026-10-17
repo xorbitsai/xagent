@@ -169,6 +169,8 @@ def revalidate_websocket_session(endpoint: _Endpoint) -> _Endpoint:
             while True:
                 # Stagger connection-time cohorts instead of polling in lockstep.
                 await asyncio.sleep(_SESSION_RECHECK_SECONDS * random.uniform(0.8, 1.2))
+                if websocket.application_state is WebSocketState.DISCONNECTED:
+                    return
                 if websocket.application_state is not WebSocketState.CONNECTED:
                     continue
                 try:

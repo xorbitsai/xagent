@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from tests.shared.oauth_browser_fixture import generic_oauth_callback
@@ -32,6 +32,7 @@ from xagent.web.api.auth import (
     _require_actor_oauth_personal_link,
     start_builtin_oauth_for_resource_owner,
 )
+from xagent.web.auth_sessions import lock_current_session_epoch
 from xagent.web.builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
@@ -83,6 +84,61 @@ def _connect_from_catalog(db: Session, user: User, app_id: str) -> MCPServer:
     _ensure_user_mcp_server(db, int(user.id), app_info)
     db.commit()
     return db.query(MCPServer).filter(MCPServer.name == app_info["name"]).one()
+
+
+@pytest.mark.parametrize("autoflush", [False, True])
+def test_catalog_insert_collision_preserves_credential_transaction_and_epoch_lock(
+    seeded_db, monkeypatch, autoflush
+):
+    db, web_user, account = seeded_db
+    winner = _connect_from_catalog(db, account, "word")
+    app_info = _catalog_app(db, "word")
+    user_id, winner_id = int(web_user.id), int(winner.id)
+    db.autoflush = autoflush
+    assert lock_current_session_epoch(db, user_id, None)
+    outer = db.get_transaction()
+    db.add(UserOAuth(user_id=user_id, provider="word", access_token="new-credential"))
+    original_first = Query.first
+    missed = False
+
+    def stale_catalog_lookup(query):
+        nonlocal missed
+        if query.column_descriptions[0].get("entity") is MCPServer and not missed:
+            # Model a competing user's insert just after our initial SELECT.
+            # The persisted winner makes the subsequent INSERT hit the real
+            # unique constraint without needing concurrent SQLite writers.
+            missed = True
+            return None
+        return original_first(query)
+
+    monkeypatch.setattr(Query, "first", stale_catalog_lookup)
+    _ensure_user_mcp_server(db, user_id, app_info)
+    assert missed
+    assert db.get_transaction() is outer
+    assert outer.is_active
+    db.commit()
+    assert (
+        db.query(UserOAuth)
+        .filter_by(user_id=user_id, provider="word")
+        .one()
+        .access_token
+        == "new-credential"
+    )
+    assert (
+        db.query(UserMCPServer).filter_by(user_id=user_id).one().mcpserver_id
+        == winner_id
+    )
+    assert db.query(MCPServer).filter_by(name=app_info["name"]).count() == 1
+
+
+def test_catalog_savepoint_does_not_commit_a_new_server_before_the_caller(seeded_db):
+    db, web_user, _account = seeded_db
+    app_info = _catalog_app(db, "word")
+    user_id = int(web_user.id)
+    _ensure_user_mcp_server(db, user_id, app_info)
+    db.rollback()
+    assert db.query(MCPServer).filter_by(name=app_info["name"]).count() == 0
+    assert db.query(UserMCPServer).filter_by(user_id=user_id).count() == 0
 
 
 def _catalog_marker(db: Session, app_id: str) -> dict[str, Any]:

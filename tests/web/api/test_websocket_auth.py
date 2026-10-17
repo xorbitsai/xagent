@@ -629,6 +629,38 @@ async def test_open_session_monitor_fails_closed_on_database_outage(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_closed_transport_stops_monitor_and_drains_active_handler(monkeypatch):
+    websocket, messages = _asgi_websocket(denial_extension=False)
+    cleaned = asyncio.Event()
+    load = MagicMock(
+        side_effect=AssertionError("closed transport must not query users")
+    )
+
+    @websocket_auth.revalidate_websocket_session
+    async def endpoint(websocket: WebSocket, token: str) -> None:
+        await websocket.accept()
+        try:
+            await websocket.close(code=1000)
+            # A transport may close independently of work owned by the handler.
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    monkeypatch.setattr(websocket_auth, "_SESSION_RECHECK_SECONDS", 0.001)
+    monkeypatch.setattr(websocket_auth, "_load_websocket_principal_sync", load)
+    await asyncio.wait_for(endpoint(websocket, "token"), timeout=5)
+    assert cleaned.is_set()
+    load.assert_not_called()
+    assert (
+        len([message for message in messages if message["type"] == "websocket.close"])
+        == 1
+    )
+    assert not any(
+        task.get_name() == "websocket-session-monitor" for task in asyncio.all_tasks()
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [

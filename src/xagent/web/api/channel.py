@@ -1,5 +1,4 @@
 import html
-import json
 import logging
 import os
 import re
@@ -39,6 +38,7 @@ from xagent.web.schemas.user_channel import (
 )
 
 from ..auth_sessions import lock_current_session_epoch, matches_user_session
+from ..utils.script_json import script_safe_json as _script_safe_json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -224,22 +224,6 @@ def _frontend_origin_for_slack_oauth(request: Request) -> str:
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return f"{parsed.scheme}://{parsed.netloc}"
     return f"{request.url.scheme}://{request.url.netloc}"
-
-
-def _script_safe_json(value: Any) -> str:
-    """JSON-encode a value for embedding inside an inline <script> block.
-
-    ``json.dumps`` leaves ``/`` and ``<`` intact, so attacker-controlled data
-    containing ``</script>`` would close the surrounding script element early
-    and execute as injected markup. Escaping ``<``, ``>`` and ``&`` keeps the
-    output inert to the HTML tokenizer while remaining valid JSON.
-    """
-    return (
-        json.dumps(value)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-    )
 
 
 def _slack_oauth_popup_response(

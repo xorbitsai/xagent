@@ -206,6 +206,40 @@ async def test_cross_origin_307_cannot_replay_post_body(network):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+async def test_cross_origin_get_or_head_cannot_replay_a_body(method, network):
+    _, seen, replies, _ = network
+    replies.append(httpx.Response(307, headers={"Location": "https://other.example/"}))
+    result = await APIClientCore().call_api(
+        "https://example.com/",
+        method=method,
+        body="private-body",
+        headers={"Content-Length": "0"},
+    )
+    assert result["success"] is False
+    assert "network policy" in result["error"]
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_303_can_follow_an_actually_bodyless_get(network):
+    _, seen, replies, _ = network
+    replies.extend(
+        [
+            httpx.Response(303, headers={"Location": "https://other.example/"}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    result = await APIClientCore().call_api(
+        "https://example.com/", method="POST", body="private-body"
+    )
+    assert result["success"] is True
+    assert len(seen) == 2
+    assert seen[1].method == "GET"
+    assert seen[1].content == b""
+
+
+@pytest.mark.asyncio
 async def test_post_response_failure_is_not_retried(network):
     _, seen, replies, _ = network
     replies.append(httpx.ReadTimeout("reply lost"))

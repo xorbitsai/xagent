@@ -88,7 +88,11 @@ def public_api_redirect_guard(
         current = (request.url.scheme, request.url.host, request.url.port)
         if current == origin:
             return
-        if request.method not in {"GET", "HEAD"}:
+        if (
+            request.method not in {"GET", "HEAD"}
+            or not isinstance(request.stream, httpx.ByteStream)
+            or any(request.stream)
+        ):
             raise UnsafePublicHttpTarget(
                 "Cross-origin redirects cannot replay API request bodies"
             )

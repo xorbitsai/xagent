@@ -22,7 +22,9 @@ policies; production egress controls are still necessary.
   the proxy could resolve a checked hostname to a different destination.
 - Reject URL userinfo, non-HTTP(S) URLs, port zero, and CONNECT tunnels.
 - Follow at most five redirects when redirects are enabled. A cross-origin hop
-  is allowed only for GET/HEAD. All caller headers and cookies are removed,
+  is allowed only for a proven empty-body GET/HEAD. Even GET/HEAD bodies are
+  rejected instead of being forwarded to another origin. All caller headers
+  and cookies are removed,
   including unrecognized credential header names; only a canonical Host and
   fixed Accept/User-Agent values remain. POST/other body replays across origins
   are rejected.

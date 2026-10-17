@@ -14,10 +14,11 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import parse
 
-import aiohttp
-
+from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
+from ...utils.media_download import download_public_media
+from ...utils.security import redact_sensitive_text
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -625,31 +626,34 @@ Images are automatically saved to workspace.
                 local_path = Path(image_url)
 
             if local_path is not None:
+                workspace_root = self._workspace.workspace_dir.resolve()
+                local_path = local_path.resolve()
+                if not local_path.is_relative_to(workspace_root):
+                    raise ValueError(
+                        "Access denied: local path is outside the workspace"
+                    )
                 if not local_path.is_file():
                     raise RuntimeError(f"Local image path is not a file: {local_path}")
-                shutil.copyfile(local_path, save_path)
+                if local_path != save_path.resolve():
+                    shutil.copyfile(local_path, save_path)
                 logger.info(f"Copied local image to: {save_path}")
                 return str(save_path)
 
-            # Download the image with configurable timeout
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                async with session.get(image_url) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to download image: HTTP {response.status}"
-                        )
-
-                    # Save the image
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
+            await download_public_media(
+                image_url,
+                save_path,
+                timeout=timeout,
+                max_bytes=get_media_download_max_bytes("image"),
+                media_kind="image",
+            )
 
             logger.info(f"Downloaded image to: {save_path}")
             return str(save_path)
 
         except Exception as e:
-            logger.warning(f"Failed to download image from {image_url}: {e}")
+            logger.warning(
+                "Failed to download image: %s", redact_sensitive_text(str(e))
+            )
             raise
 
     async def generate_image(

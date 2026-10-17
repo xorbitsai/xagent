@@ -270,7 +270,11 @@ async def validate_public_http_url(url: str) -> list[str]:
     hostname = parsed.hostname
     reject_private_network_host(hostname)
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        if port <= 0:
+            raise ValueError("url contains an invalid port")
     except ValueError as exc:
         raise ValueError("url contains an invalid port") from exc
 

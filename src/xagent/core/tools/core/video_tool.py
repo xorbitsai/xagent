@@ -18,13 +18,15 @@ from typing import Annotated, Any, Dict, Optional, TypeAlias
 from urllib import parse
 from urllib.request import url2pathname
 
-import aiohttp
 from pydantic import Field
 
+from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
+from ...utils.media_download import download_public_media
+from ...utils.security import redact_sensitive_text
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -550,23 +552,21 @@ The generated video URL is temporary on the provider side, so completed videos a
                 logger.info("Copied local video to: %s", save_path)
                 return str(save_path)
 
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                async with session.get(video_url) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to download video: HTTP {response.status}"
-                        )
-
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            await asyncio.to_thread(f.write, chunk)
+            await download_public_media(
+                video_url,
+                save_path,
+                timeout=timeout,
+                max_bytes=get_media_download_max_bytes("video"),
+                media_kind="video",
+            )
 
             logger.info("Downloaded video to: %s", save_path)
             return str(save_path)
 
         except Exception as e:
-            logger.warning("Failed to download video from %s: %s", video_url, e)
+            logger.warning(
+                "Failed to download video: %s", redact_sensitive_text(str(e))
+            )
             raise
 
     async def generate_video(

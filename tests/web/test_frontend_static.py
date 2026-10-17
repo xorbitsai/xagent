@@ -43,7 +43,37 @@ def dist_dir(tmp_path: Path) -> Path:
     # Hashed build asset.
     _write(d / "_next" / "static" / "chunks" / "main.js", "console.log(1)")
     _write(d / "favicon.ico", "icon-bytes")
+    _write(d / "widget" / "chat" / "__shell__.html", "<html>widget</html>")
     return d
+
+
+@pytest.mark.parametrize(
+    "path", ["/", "/tools", "/tools.html", "/agent/123", "/unknown"]
+)
+def test_spa_html_has_enforced_baseline_csp(dist_dir, path):
+    response = TestClient(_app_with_backend_routes(dist_dir)).get(path)
+    policy = response.headers["content-security-policy"]
+    assert "object-src 'none'" in policy
+    assert "base-uri 'none'" in policy
+    assert "form-action 'self'" in policy
+    assert "frame-ancestors 'none'" in policy
+    assert "unsafe-eval" not in policy
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_spa_widget_keeps_embedding_but_not_unsafe_eval(dist_dir):
+    response = TestClient(_app_with_backend_routes(dist_dir)).get("/widget/chat/token")
+    policy = response.headers["content-security-policy"]
+    assert "frame-ancestors" not in policy
+    assert "x-frame-options" not in response.headers
+    assert "unsafe-eval" not in policy
+    assert "object-src 'none'" in policy
+
+
+def test_spa_rsc_and_javascript_are_not_treated_as_html(dist_dir):
+    client = TestClient(_app_with_backend_routes(dist_dir))
+    for path in ("/login.txt", "/_next/static/chunks/main.js"):
+        assert "content-security-policy" not in client.get(path).headers
 
 
 def _app_with_backend_routes(dist: Path) -> FastAPI:

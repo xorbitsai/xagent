@@ -1541,11 +1541,16 @@ def _security_header_values(path: str) -> dict[str, str]:
     }
     if is_api or is_upload:
         frame_ancestors = "'self'" if is_upload or is_preview else "'none'"
+        # OAuth callback pages run inline popup feedback. Other API/upload
+        # responses do not need scripts. Never enable eval for either path.
+        script_sources = (
+            "'self' 'unsafe-inline'" if path.startswith("/api/auth/") else "'none'"
+        )
         headers["Content-Security-Policy"] = (
             "default-src 'self'; base-uri 'self'; object-src 'none'; "
             f"frame-ancestors {frame_ancestors}; img-src 'self' data: blob: https:; "
             "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:"
+            f"script-src {script_sources}; connect-src 'self' https: wss:; form-action 'none'"
         )
     if not is_widget_page and not is_upload and not is_preview:
         headers["X-Frame-Options"] = "DENY"

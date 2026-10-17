@@ -77,8 +77,18 @@ def test_security_headers_harden_api_and_regular_pages() -> None:
 
     assert api["X-Frame-Options"] == "DENY"
     assert "frame-ancestors 'none'" in api["Content-Security-Policy"]
+    assert "script-src 'none'" in api["Content-Security-Policy"]
+    assert "unsafe-eval" not in api["Content-Security-Policy"]
     assert page["X-Frame-Options"] == "DENY"
     assert "Content-Security-Policy" not in page
+
+
+def test_security_headers_preserve_inline_oauth_popup_feedback_without_eval():
+    policy = _security_header_values("/api/auth/google/callback")[
+        "Content-Security-Policy"
+    ]
+    assert "script-src 'self' 'unsafe-inline'" in policy
+    assert "unsafe-eval" not in policy
 
 
 def test_security_headers_only_exempt_file_preview_routes() -> None:

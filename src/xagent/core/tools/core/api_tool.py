@@ -4,16 +4,26 @@ API Tool - HTTP Client for making arbitrary API calls
 Supports various HTTP methods, authentication, headers, and error handling.
 """
 
+import asyncio
 import base64
 import json
 import logging
-import os
 from typing import Any, Dict, Mapping, Optional, Union
 from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 import httpx
 
-from ...utils.security import host_matches_suffix, redact_url_credentials_for_logging
+from ...utils.public_http_transport import (
+    PublicHttpTransport,
+    UnsafePublicHttpTarget,
+    public_api_redirect_guard,
+)
+from ...utils.security import (
+    host_matches_suffix,
+    redact_sensitive_text,
+    redact_url_credentials_for_logging,
+    reject_private_network_host,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,11 +264,12 @@ def append_known_connector_domain_hint(
     hint = (
         f"This looks like a {connector_label} API endpoint, and this call "
         f"carried no credential in a form this tool recognizes "
-        f"(a credential-shaped header or query parameter, or Basic-Auth "
-        f"userinfo in the URL), which would explain a 401/403 here - if the "
+        f"(a credential-shaped header or query parameter), which would "
+        f"explain a 401/403 here - if the "
         f"dedicated {connector_label} connector tools cover this request, "
         "prefer those (they carry the account's own OAuth credential); "
-        "otherwise pass your own credential via one of those mechanisms."
+        "otherwise pass your own credential via the explicit authentication "
+        "fields or headers. URL-embedded credentials are not supported."
     )
     existing_error = (existing_error or "").strip()
     if not existing_error:
@@ -398,12 +409,16 @@ class APIClientCore:
         # Prepare body
         request_body = self._prepare_body(body, request_headers)
 
-        # Get proxy configuration
-        proxy_url = self._get_proxy_url()
+        # Untrusted destinations must not bypass validation through an ambient
+        # proxy's independent DNS lookup. Configured connector clients are
+        # separate from this generic, model-facing API tool.
+        proxy_url = None
 
         # Attempt request with retries
         last_error = None
+        attempts_made = 0
         for attempt in range(retry_count + 1):
+            attempts_made += 1
             try:
                 result = await self._make_request(
                     url=url,
@@ -431,15 +446,29 @@ class APIClientCore:
                 )
                 return result
 
+            except UnsafePublicHttpTarget as e:
+                return {
+                    "success": False,
+                    "status_code": 0,
+                    "headers": {},
+                    "body": None,
+                    "error": f"API network policy rejected the request: {redact_sensitive_text(str(e))}",
+                }
             except Exception as e:
-                last_error = e
+                last_error = redact_sensitive_text(str(e))
+                # A timeout/read failure can happen after a write took effect.
+                # Do not duplicate POST/PATCH/etc. on the server, even for a
+                # connect failure: a prior redirect hop may already have
+                # accepted the original write before the next hop failed.
+                if method not in {"GET", "HEAD", "OPTIONS"}:
+                    break
                 if attempt < retry_count:
                     logger.warning(
-                        f"⚠️ API Call failed (attempt {attempt + 1}/{retry_count + 1}): {str(e)}"
+                        f"⚠️ API Call failed (attempt {attempt + 1}/{retry_count + 1}): {last_error}"
                     )
                 else:
                     logger.error(
-                        f"❌ API Call failed after {retry_count + 1} attempts: {str(e)}"
+                        f"❌ API Call failed after {retry_count + 1} attempts: {last_error}"
                     )
 
         # All retries failed
@@ -448,7 +477,7 @@ class APIClientCore:
             "status_code": 0,
             "headers": {},
             "body": None,
-            "error": f"Request failed after {retry_count + 1} attempts: {str(last_error)}",
+            "error": f"Request failed after {attempts_made} attempts: {last_error}",
         }
 
     async def _make_request(
@@ -463,15 +492,22 @@ class APIClientCore:
         allow_redirects: bool,
     ) -> Dict[str, Any]:
         """Make the actual HTTP request with streaming to limit download size"""
-        client_kwargs: Dict[str, Any] = {"timeout": timeout}
         if proxy_url:
-            client_kwargs["proxy"] = proxy_url
-            logger.debug(
-                "   Using proxy: "
-                f"{redact_url_credentials_for_logging(proxy_url, redact_all_query_values=True)}"
+            raise UnsafePublicHttpTarget(
+                "Proxies are not supported for untrusted API destinations"
             )
+        client_kwargs: Dict[str, Any] = {
+            "timeout": timeout,
+            "trust_env": False,
+            "transport": PublicHttpTransport(),
+            "max_redirects": 5,
+            "event_hooks": {"request": [public_api_redirect_guard(url)]},
+        }
 
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        async with (
+            asyncio.timeout(timeout),
+            httpx.AsyncClient(**client_kwargs) as client,
+        ):
             # Use streaming to limit download size
             async with client.stream(
                 method=method,
@@ -602,6 +638,15 @@ class APIClientCore:
             if not result.netloc:
                 logger.error("❌ Invalid URL: missing network location")
                 return False
+            if (
+                not result.hostname
+                or result.username is not None
+                or result.password is not None
+            ):
+                return False
+            if result.port == 0:
+                return False
+            reject_private_network_host(result.hostname)
             return True
         except Exception as e:
             logger.error(f"❌ URL parsing failed: {str(e)}")
@@ -701,12 +746,6 @@ class APIClientCore:
                 return content.decode(encoding, errors="ignore")
             except Exception:
                 return None
-
-    def _get_proxy_url(self) -> Optional[str]:
-        """Get proxy URL from environment variables"""
-        https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-        http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        return https_proxy or http_proxy
 
 
 # Convenience function for direct usage

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from jose import jwt as jose_jwt
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
@@ -18,6 +17,7 @@ from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     execution_scope_from_agent_config,
 )
+from xagent.web import jwt_codec as jwt
 from xagent.web.api import agents as agents_api
 from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.widget import (
@@ -1273,7 +1273,7 @@ def test_widget_embed_ticket_flow_validates_embedding_origin() -> None:
 
     # The backend signs the validated embedding origin into the ticket, not
     # a caller-supplied value.
-    ticket_claims = jose_jwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    ticket_claims = jwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
     assert ticket_claims["type"] == EMBED_TICKET_TYPE
     assert ticket_claims["embed_origin"] == "trusted-site.com"
 
@@ -1600,7 +1600,7 @@ def test_widget_auth_rejects_expired_embed_ticket() -> None:
         allowed_domains=["trusted-site.com"],
     )
 
-    expired_ticket = jose_jwt.encode(
+    expired_ticket = jwt.encode(
         {
             "type": EMBED_TICKET_TYPE,
             "agent_id": agent_id,
@@ -1637,7 +1637,7 @@ def test_widget_auth_rejects_valid_signed_token_of_wrong_type() -> None:
         allowed_domains=["trusted-site.com"],
     )
 
-    wrong_type_ticket = jose_jwt.encode(
+    wrong_type_ticket = jwt.encode(
         {
             "type": "widget",
             "agent_id": agent_id,

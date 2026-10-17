@@ -7,10 +7,13 @@ from .exceptions import (
     LLMToolProtocolError,
 )
 
+ZaiAPIStatusError: "type[_ZaiAPIStatusError] | None"
 try:
-    from zai.core._errors import APIStatusError as ZaiAPIStatusError  # type: ignore
+    from zai.core._errors import APIStatusError as _ZaiAPIStatusError
 except ImportError:
     ZaiAPIStatusError = None
+else:
+    ZaiAPIStatusError = _ZaiAPIStatusError
 
 
 _CONTEXT_LENGTH_ERROR_MARKERS = (
@@ -140,7 +143,7 @@ def retry_on(e: Exception) -> bool:
 
         # Handle Zai/Zhipu SDK errors
         if (
-            ZaiAPIStatusError
+            ZaiAPIStatusError is not None
             and isinstance(exc, ZaiAPIStatusError)
             and not _provider_vetoed_retry(exc)
         ):

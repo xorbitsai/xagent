@@ -18,6 +18,8 @@ repos:
         exclude: ^src/xagent/migrations/
         pass_filenames: false
         additional_dependencies:
+          - PyJWT>=2.15.1,<3
+          - zai-sdk==0.2.3
           - "pydantic[mypy]"
           - aiohttp
           - redis==6.4.0

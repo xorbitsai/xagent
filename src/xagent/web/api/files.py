@@ -24,7 +24,6 @@ from fastapi.responses import (
     Response,
 )
 from fastapi.security import HTTPAuthorizationCredentials
-from jose import JWTError, jwt
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
@@ -45,6 +44,7 @@ from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
+from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..auth_dependencies import (
     _AccessTokenRejected,
@@ -62,7 +62,7 @@ from ..config import (
     is_allowed_file,
 )
 from ..content_security import is_active_content_type
-from ..jwt_validation import has_matching_temporal_claim_conversion_failure
+from ..jwt_codec import JWTError
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
@@ -1707,20 +1707,6 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
         )
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
-    except (TypeError, OverflowError) as error:
-        # Mirrors _resolve_access_token_user's guard (auth_dependencies.py):
-        # python-jose can raise these from its own temporal-claim (exp/nbf/
-        # iat) comparisons instead of JWTError for a garbage-typed claim, and
-        # this server is the sole minter today so that shouldn't happen --
-        # but a bare TypeError/OverflowError propagating out of this
-        # endpoint would 500 instead of the 401 every other malformed-ticket
-        # path here returns. Re-raise anything that *doesn't* reproduce a
-        # temporal-claim failure rather than swallowing an unrelated bug.
-        if not has_matching_temporal_claim_conversion_failure(ticket, error):
-            raise
-        raise HTTPException(
-            status_code=401, detail="Invalid or expired ticket"
-        ) from None
 
     if (
         claims.get("type") != FILE_STREAM_TICKET_TYPE

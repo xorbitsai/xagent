@@ -1,5 +1,22 @@
 # Deployment changes
 
+## 2026-10-17 — PyJWT migration and DeepDoc 0.2.4
+
+This authentication update uses `PyJWT[crypto]>=2.15.1,<3` and pins the released
+`deepdoc-lib==0.2.4`. DeepDoc and the application now share the maintained
+`zai-sdk` dependency; the obsolete `zhipuai` and `python-jose` packages are no
+longer in the core lockfile. No development-only PyJWT dependency override is
+required. Reinstall from the updated lockfile, or install the new application
+wheel, rather than upgrading only the JWT library in an old environment.
+
+DeepDoc model-cache keys have moved to the 0.2.4 namespace; provision and verify
+the model, NLTK and tiktoken resources before serving document ingestion. The
+local parser and optional Xinference routing/fallback remain unchanged. The
+Zhipu vision adapter retains the China endpoint and `ZHIPUAI_BASE_URL` override.
+PR and release workflows resolve the built application wheel without project
+overrides. Passing these checks does not deploy the application or update a
+downstream SaaS repository's core gitlink.
+
 ## 2026-10-17 — Recovery email confirmation
 
 Apply the email-confirmation migrations before serving the new authentication

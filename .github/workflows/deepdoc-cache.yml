@@ -28,9 +28,9 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
-          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-v1
           restore-keys: |
-            deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-
+            deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-
             deepdoc-${{ runner.os }}-py312-modelscope-
 
       - name: Ensure uv is available
@@ -131,4 +131,4 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: ${{ env.DEEPDOC_CACHE_PATH }}
-          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.2-v1
+          key: deepdoc-${{ runner.os }}-py312-modelscope-deepdoc-lib-0.2.4-v1

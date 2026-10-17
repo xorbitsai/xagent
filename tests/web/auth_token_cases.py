@@ -3,8 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from jose import jwt
-
+from xagent.web import jwt_codec as jwt
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 
 _DEFAULT_LIFETIME = timedelta(minutes=5)

@@ -4162,3 +4162,17 @@ def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
     monkeypatch.setenv("XAGENT_IMAGE_DOWNLOAD_MAX_BYTES", value)
     with pytest.raises(ValueError):
         config.get_media_download_max_bytes("image")
+
+
+def test_remote_json_download_size_default_and_override(monkeypatch):
+    monkeypatch.delenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", raising=False)
+    assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024
+    monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", "123")
+    assert config.get_remote_json_download_max_bytes() == 123
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "", "invalid", "1.5"])
+def test_remote_json_download_size_rejects_invalid_limits(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_remote_json_download_max_bytes()

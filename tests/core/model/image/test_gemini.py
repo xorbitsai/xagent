@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.core.model.image.gemini import GeminiImageModel
+from xagent.core.utils.public_download import PublicDownloadError
+from xagent.core.utils.security import PublicHttpResponse
 
 
 class TestGeminiImageModel:
@@ -246,15 +248,25 @@ class TestGeminiImageModel:
             abilities=["generate", "edit"],
         )
 
-        with patch("httpx.AsyncClient") as mock_client_class:
+        with (
+            patch("httpx.AsyncClient") as mock_client_class,
+            patch(
+                "xagent.core.model.image.gemini.download_public_input",
+                new_callable=AsyncMock,
+            ) as mock_download,
+        ):
             mock_client = MagicMock()
             mock_client_class.return_value.__aenter__.return_value = mock_client
 
-            # Mock the image download GET response
-            mock_get_response = MagicMock()
-            mock_get_response.status_code = 200
-            mock_get_response.content = b"fake_image_bytes"
-            mock_get_response.headers = {"content-type": "image/jpeg"}
+            # Provider-request unit test; actual DNS/pinning is tested by
+            # the remote-input boundary suite with real HTTPX clients.
+            mock_download.return_value = PublicHttpResponse(
+                content=b"fake_image_bytes",
+                url="https://example.com/image.jpg",
+                status_code=200,
+                content_type="image/jpeg",
+                encoding=None,
+            )
 
             # Mock the API POST response
             mock_post_response = MagicMock()
@@ -277,8 +289,7 @@ class TestGeminiImageModel:
                 },
             }
 
-            # Set up get and post methods
-            mock_client.get = AsyncMock(return_value=mock_get_response)
+            # Only the configured model API uses this HTTP client now.
             mock_client.post = AsyncMock(return_value=mock_post_response)
 
             result = await model.edit_image(
@@ -286,7 +297,8 @@ class TestGeminiImageModel:
             )
 
             assert result["image_url"] == "https://example.com/edited.jpg"
-            assert mock_client.get.called
+            mock_download.assert_awaited_once()
+            assert mock_download.call_args.args == ("https://example.com/image.jpg",)
             assert mock_client.post.called
 
     @pytest.mark.asyncio
@@ -453,16 +465,12 @@ class TestGeminiImageModel:
             abilities=["generate", "edit"],
         )
 
-        with patch("httpx.AsyncClient") as mock_client_class:
-            mock_client = MagicMock()
-            mock_client_class.return_value.__aenter__.return_value = mock_client
-
-            # Mock failed image download
-            mock_get_response = MagicMock()
-            mock_get_response.status_code = 404
-            mock_client.get = AsyncMock(return_value=mock_get_response)
-
-            with pytest.raises(RuntimeError, match="Failed to download image: 404"):
+        with patch(
+            "xagent.core.model.image.gemini.download_public_input",
+            new_callable=AsyncMock,
+            side_effect=PublicDownloadError("Remote input returned HTTP 404"),
+        ):
+            with pytest.raises(RuntimeError, match="Remote input returned HTTP 404"):
                 await model.edit_image(
                     image_url="https://example.com/notfound.jpg",
                     prompt="Edit the image",

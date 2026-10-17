@@ -125,6 +125,21 @@ OAUTH_ACCOUNT_HOSTS: dict[str, OAuthAccountHost] = {
             "refresh_token_expires_in": "7776000",
         },
     ),
+    "shopify": OAuthAccountHost(
+        host_suffix="myshopify.com",
+        authorize_path="/admin/oauth/authorize",
+        token_path="/admin/oauth/access_token",
+        # Shopify has no userinfo endpoint; the callback reads the shop's
+        # identity through shopify_oauth.fetch_shopify_shop_identity.
+        userinfo_path=None,
+        input_label="Shopify store",
+        input_placeholder="your-store",
+        input_help="The part before .myshopify.com in your store's admin URL.",
+        # New public apps must use expiring offline tokens (a one-hour access
+        # token and a 90-day refresh token), and every public app must from
+        # 2027-01-01.
+        token_params={"expiring": "1"},
+    ),
 }
 
 

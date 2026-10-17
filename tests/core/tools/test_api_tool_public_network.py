@@ -1,8 +1,8 @@
 """Exercise the real generic API client and policy transport with fake sockets."""
 
-import asyncio
 import socket
-from unittest.mock import AsyncMock
+import time
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -16,13 +16,9 @@ PUBLIC_IP = "93.184.216.34"
 @pytest.fixture
 def network(monkeypatch):
     records = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, 443))]
-    dns = AsyncMock(return_value=records)
-
-    async def to_thread(function, *args, **kwargs):
-        assert function is socket.getaddrinfo
-        return await dns(*args, **kwargs)
-
-    monkeypatch.setattr("xagent.core.utils.security.asyncio.to_thread", to_thread)
+    dns = Mock(return_value=records)
+    monkeypatch.setattr(socket, "getaddrinfo", dns)
+    monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
     seen = []
     replies = []
 
@@ -80,7 +76,7 @@ async def test_dns_mixed_answers_are_rejected_before_any_connection(network):
     result = await APIClientCore().call_api("https://example.com/")
     assert result["status_code"] == 0
     assert "network policy" in result["error"]
-    assert dns.await_count == 1
+    assert dns.call_count == 1
     assert seen == []
 
 
@@ -101,7 +97,7 @@ async def test_actual_connection_is_pinned_host_and_tls_sni_are_logical(
     )
     assert result["success"] is True
     assert result["body"] == {"ok": True}
-    assert dns.await_count == 1
+    assert dns.call_count == 1
     request = seen[0]
     assert request.url.host == PUBLIC_IP
     assert request.url.port == 8443
@@ -111,6 +107,7 @@ async def test_actual_connection_is_pinned_host_and_tls_sni_are_logical(
     assert request.headers["x-api-key"] == "caller-secret"
     assert options[0]["trust_env"] is False
     assert options[0]["http2"] is False
+    assert options[0]["limits"].max_keepalive_connections == 0
 
 
 @pytest.mark.asyncio
@@ -137,7 +134,7 @@ async def test_redirect_re_resolves_and_blocks_rebinding(network):
     result = await APIClientCore().call_api("https://example.com/first")
     assert result["success"] is False
     assert len(seen) == 1
-    assert dns.await_count == 2
+    assert dns.call_count == 2
 
 
 @pytest.mark.asyncio
@@ -277,7 +274,7 @@ async def test_opt_out_of_redirects_never_dispatches_location(network):
     )
     assert result["status_code"] == 302
     assert len(seen) == 1
-    assert dns.await_count == 1
+    assert dns.call_count == 1
 
 
 @pytest.mark.asyncio
@@ -319,16 +316,19 @@ async def test_redirect_url_cannot_introduce_basic_credentials(network):
 async def test_request_policy_has_a_whole_attempt_time_budget(network, monkeypatch):
     dns, seen, _, _ = network
 
-    async def blocked_dns(*args, **kwargs):
-        await asyncio.sleep(1)
-        return []
+    def blocked_dns(*args, **kwargs):
+        time.sleep(0.3)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, 443))]
 
     dns.side_effect = blocked_dns
+    started = time.monotonic()
     result = await APIClientCore(default_retry_count=0).call_api(
         "https://example.com/", timeout=0.02
     )
     assert result["success"] is False
     assert seen == []
+    assert "timed out" in result["error"]
+    assert time.monotonic() - started < 0.25
 
 
 @pytest.mark.asyncio
@@ -340,4 +340,97 @@ async def test_connect_tunnel_is_rejected_before_dns(network):
         with pytest.raises(ValueError, match="tunnels"):
             await client.request("CONNECT", "https://example.com/")
     assert seen == []
-    dns.assert_not_awaited()
+    dns.assert_not_called()
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_default_port_https_upgrade_keeps_credentials_and_body(method, network):
+    _, seen, replies, _ = network
+    replies.extend(
+        [
+            httpx.Response(307, headers={"Location": "https://example.com/secure"}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    result = await APIClientCore().call_api(
+        "http://example.com/start",
+        method=method,
+        body="payload" if method == "POST" else None,
+        auth_type="bearer",
+        auth_token="secret",
+    )
+    assert result["success"] is True
+    assert len(seen) == 2
+    assert seen[1].headers["Authorization"] == "Bearer secret"
+    assert seen[1].content == (b"payload" if method == "POST" else b"")
+
+
+@pytest.mark.parametrize(
+    "error", [httpx.ConnectError("unreachable"), httpx.ConnectTimeout("timeout")]
+)
+async def test_tries_remaining_validated_addresses_before_sending_body(error, network):
+    dns, _, _, _ = network
+    dns.return_value += [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+    connected, bodies = [], []
+
+    class ConnectionProbe(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            connected.append(request.url.host)
+            if len(connected) == 1:
+                raise error
+            bodies.append(await request.aread())
+            return httpx.Response(200, json={"ok": True})
+
+    transport = PublicHttpTransport()
+    transport._transport = ConnectionProbe()
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.post("https://example.com/", content=b"one-write")
+    assert response.status_code == 200
+    assert connected == [PUBLIC_IP, "1.1.1.1"]
+    assert bodies == [b"one-write"]
+
+
+async def test_read_failure_does_not_try_a_second_address(network):
+    dns, seen, replies, _ = network
+    dns.return_value += [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))]
+    replies.append(httpx.ReadError("response lost"))
+    result = await APIClientCore().call_api(
+        "https://example.com/", method="POST", body="write"
+    )
+    assert not result["success"]
+    assert len(seen) == 1
+
+
+async def test_explicitly_trusted_proxy_retains_logical_target(network, monkeypatch):
+    _, seen, replies, options = network
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    replies.append(httpx.Response(200, json={"ok": True}))
+    result = await APIClientCore().call_api("https://example.com/")
+    assert result["success"]
+    assert seen[0].url.host == "example.com"
+    assert options[0]["proxy"] == "http://127.0.0.1:3128"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://10.0.0.5/api",
+        "http://compose-service/api",
+        "https://user:secret@example.com/api",
+    ],
+)
+async def test_configured_custom_api_uses_the_same_public_network_policy(url, network):
+    from xagent.core.tools.adapters.vibe.api_tool_adapter import CustomApiTool
+
+    dns, seen, _, _ = network
+    if "compose-service" in url:
+        dns.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("172.18.0.5", 80))
+        ]
+    tool = CustomApiTool(name="fixture", description="fixture", env={}, url=url)
+    result = await tool.run_json_async({})
+    assert result["success"] is False
+    assert "network policy" in result["error"]
+    assert "secret" not in result["error"]
+    assert seen == []

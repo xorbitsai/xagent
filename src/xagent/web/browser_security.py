@@ -1,4 +1,12 @@
-"""Browser policy shared by API middleware and the packaged SPA server."""
+"""Packaged SPA policy; kept in parity with frontend/browser-security.mjs."""
+
+import posixpath
+
+
+def is_widget_page(path: str) -> bool:
+    """Classify the normalized URL path, never a traversal-shaped prefix."""
+    path = posixpath.normpath("/" + path.lstrip("/"))
+    return path == "/widget" or path.startswith("/widget/")
 
 
 def page_security_headers(*, embeddable: bool = False) -> dict[str, str]:
@@ -19,7 +27,7 @@ def page_security_headers(*, embeddable: bool = False) -> dict[str, str]:
         "media-src 'self' data: blob: https:",
         "font-src 'self' data: https:",
         "connect-src 'self' https: wss:",
-        "frame-src 'self' blob:",
+        "frame-src 'self' blob: https://docs.google.com",
         "worker-src 'self' blob:",
     ]
     headers = {

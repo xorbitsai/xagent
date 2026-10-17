@@ -9,11 +9,11 @@ export function browserSecurityHeaders({ embeddable = false, development = false
     "form-action 'self'",
     `script-src 'self' 'unsafe-inline' https:${development ? " 'unsafe-eval'" : ""}`,
     "style-src 'self' 'unsafe-inline' https:",
-    "img-src 'self' data: blob: https:",
-    "media-src 'self' data: blob: https:",
+    `img-src 'self' data: blob: https:${development ? " http:" : ""}`,
+    `media-src 'self' data: blob: https:${development ? " http:" : ""}`,
     "font-src 'self' data: https:",
     `connect-src 'self' https: wss:${development ? " http: ws:" : ""}`,
-    "frame-src 'self' blob:",
+    "frame-src 'self' blob: https://docs.google.com",
     "worker-src 'self' blob:",
   ]
   if (!embeddable) directives.push("frame-ancestors 'none'")

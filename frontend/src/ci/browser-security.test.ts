@@ -1,6 +1,11 @@
 import { spawnSync } from "node:child_process"
 import { describe, expect, it } from "vitest"
 import { browserSecurityHeaders } from "../../browser-security.mjs"
+import { createRequire } from "node:module"
+
+const { pathToRegexp } = createRequire(import.meta.url)("next/dist/compiled/path-to-regexp") as {
+  pathToRegexp: (source: string) => RegExp
+}
 
 describe("standalone browser security policy", () => {
   it("enforces baseline CSP without permitting production eval", () => {
@@ -12,6 +17,18 @@ describe("standalone browser security policy", () => {
     expect(policy).not.toContain("unsafe-eval")
     expect(headers["X-Frame-Options"]).toBe("DENY")
     expect(policy).toContain("script-src 'self' 'unsafe-inline' https:")
+    expect(policy).toContain("frame-src 'self' blob: https://docs.google.com")
+  })
+
+  it("permits local API media only in development", () => {
+    for (const development of [false, true]) {
+      const policy = browserSecurityHeaders({ development })[0].value
+      for (const directive of ["img-src", "media-src", "connect-src"]) {
+        const value = policy.split("; ").find((part) => part.startsWith(directive))!
+        expect(value.split(" ").includes("http:")).toBe(development)
+      }
+      expect(policy.includes("unsafe-eval")).toBe(development)
+    }
   })
 
   it("keeps widgets embeddable without lifting other restrictions", () => {
@@ -32,6 +49,9 @@ describe("standalone browser security policy", () => {
     if (output === "export") expect(config.headers).toBeNull()
     else {
       expect(config.headers).toHaveLength(2)
+      const route = pathToRegexp(config.headers[0].source)
+      for (const path of ["/", "/login", "/widgetfoo"]) expect(route.test(path)).toBe(true)
+      for (const path of ["/widget", "/widget/x"]) expect(route.test(path)).toBe(false)
       expect(config.headers[0].headers.find(({ key }: { key: string }) => key === "X-Frame-Options")?.value).toBe("DENY")
       expect(config.headers[1].source).toBe("/widget/:path*")
       expect(config.headers[1].headers.some(({ key }: { key: string }) => key === "X-Frame-Options")).toBe(false)

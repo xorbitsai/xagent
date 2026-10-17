@@ -1531,7 +1531,9 @@ app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
 def _security_header_values(path: str) -> dict[str, str]:
     """Return headers appropriate for an API, preview, upload, or SPA path."""
-    is_widget_page = path == "/widget" or path.startswith("/widget/")
+    from .browser_security import is_widget_page
+
+    widget_page = is_widget_page(path)
     is_upload = path == "/uploads" or path.startswith("/uploads/")
     is_api = path == "/api" or path.startswith("/api/")
     is_preview = path.startswith(("/api/files/preview/", "/api/files/public/preview/"))
@@ -1552,7 +1554,7 @@ def _security_header_values(path: str) -> dict[str, str]:
             "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
             f"script-src {script_sources}; connect-src 'self' https: wss:; form-action 'none'"
         )
-    if not is_widget_page and not is_upload and not is_preview:
+    if not widget_page and not is_upload and not is_preview:
         headers["X-Frame-Options"] = "DENY"
     return headers
 

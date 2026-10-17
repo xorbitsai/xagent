@@ -35,6 +35,12 @@ globally restoring eval, or by silently breaking interactive previews. The
 current policy can also intentionally block nested third-party iframes and
 generated eval-based code; staging must inventory any legitimate uses.
 
+Release acceptance must use real browsers (not jsdom) to open PDF and video
+previews and the Google Drive Picker under the enforced production policy.
+The Picker frame is restricted to https://docs.google.com; PDF/video bytes are
+decoded locally into revocable blob URLs, without broadening frame/connect
+permissions to data URLs.
+
 Release acceptance must cover login/OAuth popups, chat file mentions, builder
 instructions, spreadsheets/Markdown, interactive HTML previews, standalone and
 packaged frontend delivery, and a Widget embedded from another origin. SaaS

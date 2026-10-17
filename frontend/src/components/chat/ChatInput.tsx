@@ -205,7 +205,7 @@ export function ChatInput({
       const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
       while (walker.nextNode()) {
         const node = walker.currentNode as Text;
-        if (node.parentElement?.closest("[data-prompt-highlight]")) continue;
+        if (node.parentElement?.closest("[data-prompt-highlight], [data-file-path]")) continue;
         const index = node.data.indexOf(term);
         if (index < 0) continue;
         const match = node.splitText(index);

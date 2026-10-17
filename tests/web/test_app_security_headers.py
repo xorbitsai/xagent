@@ -83,6 +83,10 @@ def test_security_headers_harden_api_and_regular_pages() -> None:
     assert "Content-Security-Policy" not in page
 
 
+def test_widget_traversal_does_not_exempt_regular_page_headers():
+    assert _security_header_values("/widget/../tools.html")["X-Frame-Options"] == "DENY"
+
+
 def test_security_headers_preserve_inline_oauth_popup_feedback_without_eval():
     policy = _security_header_values("/api/auth/google/callback")[
         "Content-Security-Policy"

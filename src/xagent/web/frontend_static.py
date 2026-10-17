@@ -95,7 +95,7 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     def _file_response(file: Path, *, status_code: int = 200) -> FileResponse:
         headers = None
         if file.suffix.lower() == ".html":
-            route = file.relative_to(dist_dir).as_posix()
+            route = file.resolve().relative_to(resolved_root).as_posix()
             headers = page_security_headers(
                 embeddable=route == "widget.html" or route.startswith("widget/")
             )

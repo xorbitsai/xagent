@@ -19,9 +19,6 @@ resolution-markers = [
     "(python_full_version < '3.12' and platform_machine != 'aarch64' and sys_platform == 'linux') or (python_full_version < '3.12' and sys_platform != 'darwin' and sys_platform != 'linux')",
 ]
 
-[manifest]
-overrides = [{ name = "pyjwt", specifier = ">=2.15.1,<3" }]
-
 [[package]]
 name = "accelerate"
 version = "1.12.0"
@@ -1294,7 +1291,7 @@ sdist = { url = "https://files.pythonhosted.org/packages/9d/fe/db74bd405d515f066
 
 [[package]]
 name = "deepdoc-lib"
-version = "0.2.2"
+version = "0.2.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -1337,11 +1334,11 @@ dependencies = [
     { name = "trio" },
     { name = "xgboost" },
     { name = "xpinyin" },
-    { name = "zhipuai" },
+    { name = "zai-sdk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/0e/4a263228f5826dac97d250eb7cb9019bf4b0b2410d91605e2aeb145cfcb6/deepdoc_lib-0.2.2.tar.gz", hash = "sha256:8bd43a238f6b67b95ff5dca92a4ff699ae72203de4e8989b4341c413f7b49329", size = 4587340, upload-time = "2026-06-26T10:11:53.503Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8b/91/70624f1805527d94a48dc31ac9df9c262ca30685a6e228116bd835ef2e40/deepdoc_lib-0.2.4.tar.gz", hash = "sha256:a30465d7eb1060510067c4c2ab68000383b7104be05b1540d1e561ea5bcf1b8d", size = 4598946, upload-time = "2026-10-17T14:46:11.584Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f3/5b/f901b403b68a1c8848c11ce7b488b0827deb8bd7edddfd83526e0518b1b1/deepdoc_lib-0.2.2-py3-none-any.whl", hash = "sha256:155d2312625b206c6cef2e34985a187f9901f2c30cb1a822ff05e4c03a4ac511", size = 4666437, upload-time = "2026-06-26T10:11:51.469Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/6b/e6031d83ba99468be9a9894e4ee945eb5a417e0c8cb5810c5ecc1ec08d87/deepdoc_lib-0.2.4-py3-none-any.whl", hash = "sha256:58160b65cd4c9e235854e15c919e1047bb39767256e3c99d4fbc74dfe6afffb7", size = 4675647, upload-time = "2026-10-17T14:46:09.456Z" },
 ]
 
 [[package]]
@@ -5421,6 +5418,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/50/ca/44de4e75f8aadc457f0634be3b542815078ded46dca30efb960edeecad6e/pyjwt-2.15.1-py3-none-any.whl", hash = "sha256:42d59d631f7768a1028a64c7ff581a9bf7519804daf91fc5b6c56e30eec5e193", size = 33860, upload-time = "2026-09-28T18:40:41.429Z" },
 ]
 
+[package.optional-dependencies]
+crypto = [
+    { name = "cryptography" },
+]
+
 [[package]]
 name = "pylatexenc"
 version = "2.10"
@@ -7883,7 +7885,7 @@ dependencies = [
     { name = "prompt-toolkit" },
     { name = "pyarrow" },
     { name = "pydantic" },
-    { name = "pyjwt" },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "pypdf" },
     { name = "pypinyin" },
     { name = "python-dateutil" },
@@ -8100,7 +8102,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=3.0.0" },
     { name = "curl-cffi", marker = "extra == 'all'", specifier = ">=0.14.0" },
     { name = "curl-cffi", marker = "extra == 'waf-crawl'", specifier = ">=0.14.0" },
-    { name = "deepdoc-lib", specifier = "==0.2.2" },
+    { name = "deepdoc-lib", specifier = "==0.2.4" },
     { name = "defusedxml", specifier = ">=0.7.1" },
     { name = "docker", specifier = ">=7.1.0" },
     { name = "docling", marker = "extra == 'ai-document'", specifier = ">=2.68.0" },
@@ -8598,21 +8600,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/29/e6/f4954be9a8c70260a5de7a83035d5fbe7ec74799d7dd58857a82141c9a2f/zai_sdk-0.2.3.tar.gz", hash = "sha256:1481f6db746e64fe9e7e0da9a3727fd083890613f9eb8e1d14139ff76ef68a57", size = 76968, upload-time = "2026-06-16T03:07:25.43Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4b/18/2b2c012421936ed370436d844e250e9dbdefa20e845d6aeea7152c26a403/zai_sdk-0.2.3-py3-none-any.whl", hash = "sha256:f8d6417f8cff58d5b6cba5c27577ee55aa817ae825c6c88fe883f6f6f9265d90", size = 125632, upload-time = "2026-06-16T03:07:24.381Z" },
-]
-
-[[package]]
-name = "zhipuai"
-version = "2.0.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "cachetools" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pyjwt" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a4/90/299e3456ee7ee1e118593552e03b86da2e9adaa0d454e467aeb4b22032a4/zhipuai-2.0.1.tar.gz", hash = "sha256:297bbdbe9393da2d1dc8066c39cf39bb2342f170d86f2b7b7a13ba368c53d701", size = 16760, upload-time = "2024-01-16T11:44:07.936Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/05/c3d4556886b5c6cf8c0b96eb80448ee8154c0dcc87086df018e817779ed4/zhipuai-2.0.1-py3-none-any.whl", hash = "sha256:738033d95696c3d5117dc4487e37d924e3ebbcdfa0072812b3f63a08ff72274a", size = 26386, upload-time = "2024-01-16T11:44:05.803Z" },
 ]
 
 [[package]]

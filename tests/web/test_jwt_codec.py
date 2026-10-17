@@ -2,13 +2,12 @@
 
 import base64
 import hmac
-import importlib
-import inspect
 import json
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
+from zai import ZaiClient, ZhipuAiClient
 
 from xagent.web import jwt_codec as jwt
 
@@ -62,12 +61,8 @@ def test_verified_non_convertible_dates_have_shared_error_type(claim):
     assert not isinstance(error.value, jwt.InvalidTemporalClaims)
 
 
-@pytest.mark.parametrize(
-    "module_name,class_name", [("zhipuai", "ZhipuAI"), ("zai", "ZaiClient")]
-)
-@pytest.mark.parametrize("raw_key", [True, False])
-def test_retained_sdk_signatures_remain_compatible(module_name, class_name, raw_key):
-    secret = "sdk-test-secret-with-at-least-32-characters"
+@pytest.fixture
+def sdk_http_transport():
     seen = []
 
     def send(request):
@@ -94,15 +89,21 @@ def test_retained_sdk_signatures_remain_compatible(module_name, class_name, raw_
         )
 
     with httpx.Client(transport=httpx.MockTransport(send)) as transport:
-        client_type = getattr(importlib.import_module(module_name), class_name)
-        options = {}
-        if "disable_token_cache" in inspect.signature(client_type).parameters:
-            options["disable_token_cache"] = raw_key
-        elif raw_key:
-            pytest.skip("This locked SDK version only supports signed credentials")
-        client = client_type(
-            api_key=f"test-id.{secret}", http_client=transport, **options
-        )
+        yield transport, seen
+
+
+@pytest.mark.parametrize("client_type", [ZhipuAiClient, ZaiClient])
+@pytest.mark.parametrize("raw_key", [True, False])
+def test_retained_sdk_signatures_remain_compatible(
+    client_type, raw_key, sdk_http_transport
+):
+    secret = "sdk-test-secret-with-at-least-32-characters"
+    transport, seen = sdk_http_transport
+    with client_type(
+        api_key=f"test-id.{secret}",
+        http_client=transport,
+        disable_token_cache=raw_key,
+    ) as client:
         result = client.chat.completions.create(
             model="test-model", messages=[{"role": "user", "content": "test"}]
         )
@@ -121,3 +122,41 @@ def test_retained_sdk_signatures_remain_compatible(module_name, class_name, raw_
     assert signature == expected
     assert json.loads(base64.urlsafe_b64decode(payload + "==="))["api_key"] == "test-id"
     assert jwt.decode(token, secret, algorithms=["HS256"])["api_key"] == "test-id"
+
+
+@pytest.mark.parametrize("gateway", [None, "https://gateway.example.com/zhipu/"])
+def test_published_deepdoc_vision_uses_maintained_sdk(
+    sdk_http_transport, monkeypatch, gateway
+):
+    from deepdoc.depend import simple_cv_model
+
+    transport, seen = sdk_http_transport
+    monkeypatch.setenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4/")
+    if gateway:
+        monkeypatch.setenv("ZHIPUAI_BASE_URL", gateway)
+    else:
+        monkeypatch.delenv("ZHIPUAI_BASE_URL", raising=False)
+    monkeypatch.setattr(
+        simple_cv_model,
+        "ZhipuAiClient",
+        lambda **options: ZhipuAiClient(http_client=transport, **options),
+    )
+    model = simple_cv_model.Zhipu4V(
+        "test-id.sdk-test-secret-with-at-least-32-characters"
+    )
+    assert model.describe_with_prompt(b"image-bytes", "Describe") == "ok"
+    (request,) = seen
+    assert (
+        str(request.url)
+        == (gateway or "https://open.bigmodel.cn/api/paas/v4/") + "chat/completions"
+    )
+    assert request.headers["Authorization"]
+    payload = json.loads(request.content)
+    assert payload["model"] == "glm-4v"
+    assert payload["messages"][0]["content"] == [
+        {"type": "text", "text": "Describe"},
+        {
+            "type": "image_url",
+            "image_url": {"url": base64.b64encode(b"image-bytes").decode()},
+        },
+    ]

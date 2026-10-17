@@ -140,6 +140,17 @@ function writeAuthCache(
 afterEach(() => cleanup())
 
 describe("useWebSocket message delivery", () => {
+  it("reports malformed explicit credentials without throwing during render or retrying", async () => {
+    const onConnectionFailure = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost", taskId: 1, token: "invalid+/=credential",
+      onConnectionFailure,
+    }))
+    await waitFor(() => expect(result.current.connectionError).toBeInstanceOf(Error))
+    expect(MockWebSocket.instances).toHaveLength(0)
+    expect(onConnectionFailure).toHaveBeenCalledWith(expect.objectContaining({ recoverable: false }))
+    expect(String(result.current.connectionError)).not.toContain("invalid+/=")
+  })
   beforeEach(() => {
     MockWebSocket.instances = []
     MockWebSocket.constructorError = null
@@ -933,7 +944,7 @@ describe("useWebSocket normalized connections", () => {
     vi.unstubAllGlobals()
   })
 
-  it("normalizes an undefined connection through the unchanged legacy URL", async () => {
+  it("normalizes an undefined connection without putting login credentials in its URL", async () => {
     renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 7,
@@ -941,8 +952,8 @@ describe("useWebSocket normalized connections", () => {
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
-    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?token=token&liveness=heartbeat")
-    expect(MockWebSocket.instances[0].protocols).toBeUndefined()
+    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?liveness=heartbeat")
+    expect(MockWebSocket.instances[0].protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.token"])
   })
 
   it("keeps the task id in the legacy chat frame", async () => {
@@ -1903,7 +1914,7 @@ describe("useWebSocket normalized connections", () => {
       url: "ws://localhost",
       taskId: 1,
       token: "token",
-    }, "ws://localhost/ws/chat/1?token=token&liveness=heartbeat"],
+    }, "ws://localhost/ws/chat/1?liveness=heartbeat"],
     ["an explicit empty legacy token", {
       url: "ws://localhost",
       taskId: 1,
@@ -1954,7 +1965,8 @@ describe("useWebSocket normalized connections", () => {
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const oldSocket = MockWebSocket.instances[0]
-    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?token=old-auth-token&liveness=heartbeat")
+    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?liveness=heartbeat")
+    expect(oldSocket.protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.old-auth-token"])
     act(() => oldSocket.open())
     vi.useFakeTimers()
 
@@ -1966,7 +1978,8 @@ describe("useWebSocket normalized connections", () => {
     hook.rerender()
     expect(MockWebSocket.instances).toHaveLength(2)
     const refreshedSocket = MockWebSocket.instances[1]
-    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?token=new-auth-token&liveness=heartbeat")
+    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?liveness=heartbeat")
+    expect(refreshedSocket.protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.new-auth-token"])
     act(() => refreshedSocket.open())
 
     await act(async () => {

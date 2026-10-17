@@ -163,7 +163,7 @@ def test_message_while_scheduled_makes_the_resume_stale(shared_app):
         app,
         "the scheduled resume",
     )
-    with connect(ws_url(app, task_id)) as ws:
+    with connect(ws_url(app, task_id), additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
             json.dumps(
@@ -273,8 +273,9 @@ def test_later_scheduled_tick_supersedes_the_killed_one(shared_app):
     )
 
     wait_for(
-        lambda: (recovery_state(first["task_id"])[0] or {}).get("state")
-        == "superseded",
+        lambda: (
+            (recovery_state(first["task_id"])[0] or {}).get("state") == "superseded"
+        ),
         app,
         "the superseded resume",
     )

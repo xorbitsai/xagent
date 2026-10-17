@@ -229,7 +229,7 @@ def test_provider_that_stays_down_exhausts_then_manual_resume_completes(
     assert len(model_faults(app)) == 3 * ATTEMPTS
 
     clear_model_fault(app)
-    with connect(ws_url(app, task_id)) as ws:
+    with connect(ws_url(app, task_id), additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
             json.dumps({"type": "resume_task", "command_id": "manual-after-exhausted"})
@@ -263,7 +263,7 @@ def test_unusable_model_output_resumes_twice_then_stops(
             and event["auto_resume"]["status"] == "stopped"
         )
 
-    with connect(ws_url(app, task_id)) as ws:
+    with connect(ws_url(app, task_id), additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
         events_seen = collect_events(app, ws, stopped)

@@ -712,7 +712,7 @@ describe("widget session mode", () => {
     const newId = post.mock.calls.at(-1)?.[0].session_delivery_id
     expect(newId).not.toBe(oldId)
 
-    for (const session_delivery_id of [undefined, " ", 1, true, {}, []]) {
+    for (const session_delivery_id of [undefined, null, "", " ", 1, true, {}, []]) {
       fromIframe("session_connection_open", { session_delivery_id })
     }
     fromIframe("session_connection_open", { session_delivery_id: oldId })
@@ -823,9 +823,6 @@ describe("widget session mode", () => {
 
     for (const data of [null, false, {}, { xagent: false, v: 1 }, { xagent: true, v: 2 }]) {
       window.dispatchEvent(new MessageEvent("message", { data, origin: HOST, source: frameWindow }))
-    }
-    for (const session_delivery_id of [null, "", "  ", 42]) {
-      fromIframe("session_connection_open", { session_delivery_id })
     }
     expect(post).not.toHaveBeenCalled()
     fromIframe("ready")

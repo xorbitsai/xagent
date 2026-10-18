@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { Globe } from "lucide-react"
+import { CheckCircle2, Globe, Hash, Loader2, PauseCircle, Radio, Send, XCircle, type LucideIcon } from "lucide-react"
 import React from "react"
+import { renderToStaticMarkup } from "react-dom/server"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { NavigationGroup } from "@/lib/sidebar-navigation"
@@ -59,6 +60,23 @@ describe("Sidebar task and release presentation", () => {
     for (const task of tasks) expect(await screen.findByRole("link", { name: new RegExp(task.title) })).toHaveAttribute("href", `/task/${task.task_id}`)
     expect(screen.getByAltText("Agent Logo")).toHaveAttribute("src", expect.stringContaining("/agent.svg"))
     expect(screen.getAllByText(/Support/)).toHaveLength(6)
+    const statusIcons = [Loader2, CheckCircle2, XCircle, PauseCircle, PauseCircle, Loader2]
+    const channelIcons = [Send, Hash, null, Radio]
+    const iconContents = (Icon: LucideIcon) => {
+      const container = document.createElement("div")
+      container.innerHTML = renderToStaticMarkup(<Icon />)
+      return container.querySelector("svg")!.innerHTML
+    }
+    for (const [index, task] of tasks.entries()) {
+      const link = screen.getByRole("link", { name: new RegExp(task.title) })
+      expect(link.querySelector(".opacity-0 > svg")?.innerHTML).toBe(iconContents(statusIcons[index]))
+      expect(link.className.includes("bg-primary/[0.09]")).toBe(index === 0)
+      const channelBadge = link.querySelector("span[aria-label]")!
+      const ChannelIcon = channelIcons[index]
+      if (ChannelIcon) expect(channelBadge.querySelector("svg")?.innerHTML).toBe(iconContents(ChannelIcon))
+      else if (index === 2) expect(channelBadge.querySelector("img")).toHaveAttribute("src", "/icons/channels/feishu.svg")
+      else expect(channelBadge.querySelector("svg, img")).toBeNull()
+    }
   })
 
   it.each([

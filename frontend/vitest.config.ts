@@ -10,6 +10,8 @@ export default defineConfig({
   },
   test: {
     clearMocks: true,
+    globalSetup: ["./src/test-utils/coverage-context.ts"],
+    coverage: { provider: "istanbul" },
     environment: "jsdom",
     setupFiles: ["./src/vitest.setup.ts"],
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],

@@ -2,28 +2,28 @@ import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import { createInstrumenter } from "istanbul-lib-instrument"
+import { inject } from "vitest"
 
-export const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
+const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
 export const widgetScript = readFileSync(widgetScriptPath, "utf8")
 const scriptUrl = pathToFileURL(widgetScriptPath).href
 
-// This standalone browser asset is read, not imported through Vite. Apply
-// exactly the same Istanbul counters used for imported owners so coverage
-// records its real branch outcomes, including implicit else/guard paths.
-// Instrument once; every fresh controller contributes to the same file map.
-// This is the collector variable used by the pinned Vitest 4 Istanbul provider.
-const instrumented = createInstrumenter({
+// This static IIFE bypasses Vite transforms. Only coverage runs need standard
+// Istanbul counters; normal tests evaluate the exact browser asset. The
+// standalone instrumenter is not the provider's bundled implementation (e.g.
+// line-ignore hints differ). Revalidate if this asset gains such hints.
+// __VITEST_COVERAGE__ is private to the pinned provider: re-check this key
+// whenever @vitest/coverage-istanbul is upgraded. Widget floors fail closed
+// if it changes. Vitest's jsdom env aliases window to the worker global, so
+// no cross-realm collector bridge is needed.
+const script = inject("widgetCoverageEnabled") ? createInstrumenter({
+  esModules: true,
+  compact: false,
   coverageVariable: "__VITEST_COVERAGE__",
   coverageGlobalScope: "globalThis",
   coverageGlobalScopeFunc: false,
-}).instrumentSync(widgetScript, widgetScriptPath)
+}).instrumentSync(widgetScript, widgetScriptPath) : widgetScript
 
 export function evaluateWidgetScript() {
-  // jsdom's eval realm and the Vitest worker do not share global properties.
-  // Share the collector, not calculated coverage: the evaluated script itself
-  // increments the standard Istanbul counters used by the worker's reporter.
-  const worker = globalThis as typeof globalThis & { __VITEST_COVERAGE__?: Record<string, unknown> }
-  const page = window as typeof window & { __VITEST_COVERAGE__?: Record<string, unknown> }
-  page.__VITEST_COVERAGE__ = worker.__VITEST_COVERAGE__ ??= {}
-  window.eval(`${instrumented}\n//# sourceURL=${scriptUrl}`)
+  window.eval(`${script}\n//# sourceURL=${scriptUrl}`)
 }

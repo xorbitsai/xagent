@@ -19,6 +19,8 @@ Verified changes:
   named groups/peers, chained states, arbitrary variants and compound spacing/
   divider selectors. Keep this snapshot alongside the frontend build and full
   required coverage lane; a build alone cannot reveal silent selector drift.
+  The selector-parser 7.1.6 override crosses Tailwind 3's declared `^6.1.2`
+  major range, so this compatibility gate remains necessary.
 - `pptxgenjs` 4.0.1 declares `image-size` but its shipped runtime does not import
   it. The 2.0.3 override therefore has no runtime effect on that package; the
   real PPTX/PNG roundtrip guards `pptxgenjs`/`jszip`, not `image-size` API
@@ -33,7 +35,8 @@ The initial fresh audit found 20 affected package nodes (3 critical, 11 high,
 6 moderate). PR #3182 reduced this to 11 (0 critical, 8 high, 3 moderate).
 The Vitest 4 follow-up reduces it to 8 (0 critical, 8 high, 0 moderate).
 These are npm dependency-node counts, not counts of independent application
-exploits. This does not audit all Python, SaaS or Toby dependencies.
+exploits. This does not audit all Python dependencies, downstream applications
+or deployed images.
 
 Frontend development/testing requires Node.js `^20.19.0 || >=22.12.0` for
 Vite 7.3.7; Node 18 is no longer supported by this test toolchain.
@@ -51,8 +54,13 @@ restore behavior. No application behavior is changed to satisfy the tests.
 The required lane uses the official Istanbul provider. The static
 `public/widget.js` asset is evaluated by tests rather than imported through
 Vite, so `src/test-utils/widget-script.ts` applies standard Istanbul counters to
-the actual file and shares the pinned provider's collector across the jsdom
-and worker realms. It does not fabricate hits, exclude branches, or rewrite
+the actual file only in coverage runs. Normal tests evaluate the unmodified
+asset. Vitest's jsdom environment aliases `window` to the worker global;
+there is no separate-realm collector bridge. The standalone instrumenter is
+not identical to the provider's bundled implementation, including line-ignore
+hint handling. Revalidate the helper if the asset gains such hints, and check
+its private `__VITEST_COVERAGE__` key whenever the provider pin changes.
+It does not fabricate hits, exclude branches, or rewrite
 production widget code. A separate smoke test executes the exact
 uninstrumented asset. This avoids relying on V8 range-to-AST remapping of
 repeatedly evaluated script instances. All owners, including the widget, still

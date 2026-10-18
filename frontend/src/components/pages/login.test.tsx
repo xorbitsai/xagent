@@ -93,10 +93,14 @@ describe("LoginPage auth-session creation", () => {
   it("does not navigate to Google when login coordination is unavailable", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ configured: true }))))
     claimOidcAuthLoginIntent.mockResolvedValue({ status: "unavailable", reason: "coordination_unavailable" })
-    render(<LoginPage />)
-    fireEvent.click(await screen.findByRole("button", { name: /login.google.continue/ }))
-    expect(await screen.findByText("login.alerts.coordination_unavailable")).toBeInTheDocument()
-    expect(claimOidcAuthLoginIntent).toHaveBeenCalledOnce()
+    const navigation = captureNavigation()
+    try {
+      render(<LoginPage />)
+      fireEvent.click(await screen.findByRole("button", { name: /login.google.continue/ }))
+      expect(await screen.findByText("login.alerts.coordination_unavailable")).toBeInTheDocument()
+      expect(claimOidcAuthLoginIntent).toHaveBeenCalledOnce()
+      expect(navigation.targets).toEqual([])
+    } finally { navigation.restore() }
   })
 
   it("fails closed when checking Google availability returns an error", async () => {

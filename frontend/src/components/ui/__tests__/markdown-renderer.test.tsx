@@ -103,8 +103,9 @@ describe('MarkdownRenderer', () => {
 
   it('renders failed agent lookup as an inert fallback card', async () => {
     apiRequestMock.mockResolvedValue({ ok: false, statusText: 'Not found' })
-    render(<MarkdownRenderer content="[Unknown agent](agent://missing)" agentCardsEnabled />)
+    const { container } = render(<MarkdownRenderer content="[Unknown agent](agent://missing)" agentCardsEnabled />)
     expect(await screen.findByText('markdownRenderer.loadAgentDetailsFailed')).toBeInTheDocument()
+    expect(container.querySelector('a, button')).toBeNull()
   })
 
   it('retains snake-case filenames as the safe label for file records', () => {

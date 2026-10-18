@@ -211,6 +211,7 @@ export default defineConfig({
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/ci/dependency-security.test.ts",
+      "src/test-utils/widget-script.test.ts",
       "src/lib/websocket-auth.test.ts",
       "src/lib/connector-runtime-api.test.ts",
       "src/lib/files-disabled-presentation.test.ts",

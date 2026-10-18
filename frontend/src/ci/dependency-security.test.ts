@@ -27,8 +27,10 @@ describe("patched dependency resolution", () => {
       expect(lock.packages[`node_modules/${name}`].version).toBe("4.1.12")
     }
     expect(lock.packages["node_modules/vite"].version).toBe("7.3.7")
-    expect(manifest.dependencies.pptxgenjs).toBe("4.0.1")
     expect(Object.keys(lock.packages).some(location => location.endsWith("node_modules/tinypool"))).toBe(false)
+    for (const orphan of ["@bcoe/v8-coverage", "ast-v8-to-istanbul", "ast-v8-to-istanbul/node_modules/js-tokens"]) {
+      expect(lock.packages[`node_modules/${orphan}`]).toBeUndefined()
+    }
   })
 
   it("preserves Tailwind variant CSS across the selector-parser major override", async () => {

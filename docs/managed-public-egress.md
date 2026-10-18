@@ -1,93 +1,81 @@
 # Managed application outbound connections
 
-This follow-up tightens the managed HTTP clients, remote MCP sessions and media
-input paths used by the web application. It depends on the dependency closeout
-and the earlier media download and generic API changes. It does not install a
-new network service or change a running deployment.
+## What this PR changes
 
-## Connection boundaries
+This assets/A2A patch (#3195) ships these changes on current main:
 
-The public-only HTTPX, Requests, aiohttp and botocore transports validate all
-resolved addresses and use the validated addresses for the actual connection.
-Private, loopback, metadata, non-global and mixed DNS targets fail closed.
-Literal IPv6 and IPv4-mapped IPv6 are checked too. Logical HTTP Host and TLS
-SNI/certificate hostname verification remain intact.
+- Webpage fetches, remote SVG inspection, web-asset downloads and bounded
+  remote-input downloads route trusted proxy traffic through an owned local
+  public-network gate. It checks connect-time DNS and sends the upstream a
+  validated literal-IP CONNECT target. Redirects and mixed/private DNS cannot
+  make that upstream independently resolve an attacker-controlled hostname.
+- Gate connect/response timeouts follow the caller's timeout. Cancellation
+  and normal completion close the gate and accepted tunnels.
+- Serialized A2A entries cannot enable private-network access. Invalid entries
+  are skipped individually, with a credential-free warning, so valid public
+  A2A tools in the same list are retained.
 
-Managed direct clients ignore ambient proxies. Requests and aiohttp clients
-reject per-request proxy overrides. Browser/webpage and SVG downloads that use
-a configured upstream proxy go through the local public-network gate: the
-upstream receives a checked literal CONNECT destination rather than resolving
-the untrusted hostname independently. Closing or cancelling the operation also
-closes the gate and accepted tunnels.
+It does not deploy a new network service or modify running infrastructure.
 
-HTTPX and Requests redirects validate the next connection, strip all caller
-headers on cross-origin empty GET/HEAD redirects, and reject cross-origin body
-replays. aiohttp model clients reject cross-origin redirects. MCP HTTP clients
-stay on the configured origin, including negotiated SSE write URLs; legacy
-WebSocket sessions pin the connection, ignore environment proxies, and reject
-handshake redirects. Redirect chains are bounded.
+## Prerequisites and pending protections
 
-## Managed callers
+#3191 provides the general public-only HTTPX, Requests, aiohttp and Botocore
+transports. #3192 migrates managed MCP HTTP/SSE/WebSocket and OAuth refresh.
+#3193 migrates managed model SDKs, model catalogs, custom Zhipu search and
+OpenAI reference-image downloads. #3194 migrates Requests connectors, OAuth
+HTTP calls and skill registries. Those protections are not implemented by
+#3195 and must not be described as already shipped when only this PR is merged.
 
-- Default remote MCP SSE, streamable HTTP and WebSocket sessions. No private
-  MCP allowlist is introduced; existing private records and bindings are not
-  deleted, but will fail to connect after deployment.
-- OpenAI/Azure, Anthropic, Gemini and Zhipu managed chat clients and their
-  catalog readers; Gemini/OpenAI image clients; public model-list requests.
-- Xinference client discovery, auth probing, and returned synchronous or
-  asynchronous model handles. The async path retains its nonblocking,
-  explicitly configured key behavior and does not issue a synchronous probe.
-- ElevenLabs ASR, TTS, music and sound effects, including explicit ownership
-  and closing of injected HTTP clients.
-- Bedrock runtime connections, retaining AWS streaming connection classes,
-  configured timeouts and CA verification while disabling proxy bypasses.
-- Application Requests-based embedding/rerank clients, OAuth HTTP calls,
-  built-in SaaS connectors and skill registry requests.
-- Custom-endpoint Zhipu web search and serialized A2A tool configurations.
-  A caller-controlled `allow_private_networks` field cannot approve an A2A
-  internal destination.
-- OpenAI reference-image downloads join Gemini reference images and speech
-  JSON on the bounded public-input downloader. Provider credentials are not
-  attached to those downloads, and rejected references do not reach the billed
-  image-edit request.
+The prior media/generic-API and remote-input work is already on main. The
+bounded downloader already serves audio/Gemini inputs; the OpenAI reference
+image caller migration remains in #3193. This PR adds the proxy gate to the
+shared bounded downloader, not the pending model callers themselves.
 
-Configured private model endpoints on these managed paths are no longer
-supported by default. Public DNS names resolving to private/split-horizon
-addresses are rejected too. There is no fallback to an unrestricted client.
+Follow the split sequence and synchronize/retest after prerequisites land.
+Do not deploy an incomplete stack or treat this document as deployment evidence.
+Private model endpoint policy and any operator exceptions belong to the model
+PR, not caller-controlled A2A settings.
 
-## Scope outside the managed boundary
+## Trusted upstream requirements
 
-This is not an operating-system firewall and must not be represented as a
-universal egress sandbox. Python code executed by a user, stdio/third-party MCP
-programs, and arbitrary third-party SDK code can open their own sockets. An
-independent restricted outlet/deployment component was explicitly deferred for
-this round. Existing Docker/network settings are unchanged.
+Set XAGENT_TRUSTED_EGRESS_PROXY only for an operator-approved HTTP(S) proxy.
+The gate sends CONNECT <literal-ip>:<port> for **all** upstream fetches,
+including plain HTTP destinations on port 80. The upstream must permit CONNECT
+on the required destination ports and permit the checked IP destinations;
+hostname-only allowlists and SSL-port-only CONNECT policies need adjustment.
+Host and TLS SNI/certificate verification still use the logical destination.
 
-Trusted programmatic SDK entrypoints are not equivalent to serialized web tool
-settings. The legacy optional LangChain adapter and explicitly supplied custom
-client factories are not covered by the managed-client guarantee. The current
-web/RAG resolver uses the basic adapter by default; no application call site
-selects `use_langchain_adapter=True`. A future web exposure of that legacy
-adapter must first supply an equally guarded transport. A2A's direct Python
-constructor retains its trusted-code private-network option; serialized tool
-configs cannot set it.
+SOCKS upstreams are not supported by these gated fetchers and fail with an
+explicit error, without a direct-network fallback. Ambient/OS proxy discovery
+and NO_PROXY cannot bypass the selected gate. SSL_CERT_FILE/SSL_CERT_DIR remain
+supported for CA trust; TLS verification is not disabled.
 
-Deployment-owned database, Redis, Docker, registry and remote document-parser
-connections are not blanket-blocked: their destinations must remain trusted
-server configuration rather than caller/model-controlled URLs. Existing MCP
-OAuth discovery uses its separate pinned transport; the server-only
-`XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS` development bypass must remain disabled
-for CASA acceptance. No production configuration or database rows are changed.
+The gate provides connect-time pinning. Merely setting via_proxy=True on the
+bounded body helper does not: any other caller that bypasses the gate must use
+a trusted proxy enforcing its own public-only connect-time DNS policy.
 
-## Acceptance
+## Remaining boundary
 
-Regression tests exercise real client/SDK construction, actual pool targets,
-Host/SNI, DNS rebinding/mixed answers, literal bypasses, redirects and credential
-isolation. Socket destinations are mocked; no live metadata/internal service
-is contacted. Separate local-proxy tests exercise loopback sockets only.
+This is application-client hardening, not an operating-system firewall or
+universal egress sandbox. User Python code, stdio/third-party MCP programs and
+SDK paths not explicitly migrated can open independent sockets. The separate
+restricted-outlet/deployment architecture remains deferred. Database, Redis,
+Docker and parser-service destinations remain trusted deployment configuration.
 
-SaaS must pin the merged core and build/deploy it before these protections can
-be considered live. Verify the reported CASA URLs and redirect/DNS cases in
-that deployment. Retain the deferred arbitrary-code/network risk explicitly;
-merging this application patch alone is not evidence that all of CASA #15 or
-all possible outbound network access is closed.
+The optional LangChain adapter is not covered until explicitly migrated;
+its configurable resolver entrypoint must not be represented as guarded.
+A2A's direct Python constructor retains a trusted-code private-network option,
+but serialized web tool configurations cannot enable it. The separate MCP
+OAuth development private-host bypass must remain disabled for CASA acceptance.
+
+## Verification and acceptance
+
+Tests in this PR exercise the real webpage and bounded-input proxy paths,
+literal CONNECT destinations, DNS rebinding rejection, timeout propagation,
+cancellation, and a verified HTTPS tunnel preserving logical Host and TLS SNI.
+Only loopback test sockets are used; no live metadata/internal service is called.
+Broader transport/model guarantees require the tests in the prerequisite PRs.
+
+SaaS must pin merged core, rebuild/deploy and retest the reported CASA URLs.
+Retain the deferred arbitrary-code/network risk. Merging application changes
+alone does not fully close CASA #15.

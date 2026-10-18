@@ -129,7 +129,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
 
     async def _download(self, url: str) -> tuple[bytes, str, str]:
         proxy_url = get_trusted_proxy_url()
-        async with public_fetch_client(proxy_url) as client:
+        async with public_fetch_client(proxy_url, timeout=30) as client:
             response = await fetch_public_http_bytes(
                 client,
                 url,

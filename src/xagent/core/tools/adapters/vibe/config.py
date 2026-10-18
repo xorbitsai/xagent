@@ -521,8 +521,8 @@ class BaseToolConfig(ABC):
     def get_a2a_agent_configs(self) -> List[Dict[str, Any]]:
         """Get remote A2A agent tool configurations.
 
-        Private endpoints are rejected unless an entry explicitly sets
-        ``allow_private_networks`` to ``True``.
+        Serialized entries cannot authorize private-network access. Invalid
+        entries are skipped independently; valid public tools are retained.
         """
         return []
 

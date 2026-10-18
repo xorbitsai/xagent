@@ -31,17 +31,14 @@ async def download_public_input(
         raise ValueError("Public download limits must be positive and finite")
     # Import lazily: web_content owns the existing deployment proxy policy.
     from ..tools.core.web_content import (
-        build_isolated_httpx_client_kwargs,
         get_trusted_proxy_url,
+        public_fetch_client,
     )
 
     try:
         async with asyncio.timeout(timeout):
             proxy_url = get_trusted_proxy_url()
-            async with httpx.AsyncClient(
-                **build_isolated_httpx_client_kwargs(proxy_url),
-                follow_redirects=False,
-            ) as client:
+            async with public_fetch_client(proxy_url, timeout=timeout) as client:
                 return await fetch_public_http_bytes(
                     client,
                     url,

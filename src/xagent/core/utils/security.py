@@ -351,6 +351,9 @@ async def fetch_public_http_bytes(
     resource_name: str = "response body",
     require_non_empty: bool = False,
     via_proxy: bool = False,
+    allow_https_downgrade: bool = True,
+    require_identity_encoding: bool = False,
+    required_status_code: int | None = None,
 ) -> PublicHttpResponse:
     """Fetch a bounded HTTP body, validating and pinning every redirect hop.
 
@@ -369,7 +372,11 @@ async def fetch_public_http_bytes(
     resolution, so pinning to a client-resolved IP offers no real
     protection there anyway. In this mode we keep the original hostname as
     the connect target and rely on the upfront ``validate_public_http_url``
-    check alone to reject private-network targets before dispatch.
+    check to reject private-network targets before dispatch. The explicitly
+    trusted proxy must also enforce destination/DNS policy at connection time.
+
+    Input-download callers can forbid HTTPS downgrades, require a complete
+    HTTP 200 response and reject compressed bodies before HTTPX decompression.
     """
 
     logical_url = url
@@ -377,7 +384,9 @@ async def fetch_public_http_bytes(
     for redirect_count in range(PUBLIC_HTTP_MAX_REDIRECTS + 1):
         resolved_ips = await validate_public_http_url(logical_url)
         parsed = urlsplit(logical_url)
-        request_headers = dict(headers or {})
+        request_headers = httpx.Headers(headers)
+        if require_identity_encoding:
+            request_headers["Accept-Encoding"] = "identity"
         stream_extensions: dict[str, str] = {}
         if via_proxy:
             connect_url = logical_url
@@ -399,7 +408,14 @@ async def fetch_public_http_bytes(
                     raise ValueError(f"{display_name} redirect has no Location")
                 if redirect_count >= PUBLIC_HTTP_MAX_REDIRECTS:
                     raise ValueError(f"{display_name} exceeded redirect limit")
-                logical_url = urljoin(logical_url, location)
+                next_url = urljoin(logical_url, location)
+                if (
+                    not allow_https_downgrade
+                    and parsed.scheme == "https"
+                    and urlsplit(next_url).scheme == "http"
+                ):
+                    raise ValueError(f"{display_name} redirect downgrades HTTPS")
+                logical_url = next_url
                 continue
             if 300 <= response.status_code < 400:
                 raise ValueError(
@@ -407,6 +423,21 @@ async def fetch_public_http_bytes(
                     f"{response.status_code}"
                 )
             response.raise_for_status()
+            if (
+                required_status_code is not None
+                and response.status_code != required_status_code
+            ):
+                raise httpx.HTTPStatusError(
+                    f"{display_name} requires HTTP {required_status_code}",
+                    request=response.request,
+                    response=response,
+                )
+            if (
+                require_identity_encoding
+                and response.headers.get("content-encoding", "identity").strip().lower()
+                != "identity"
+            ):
+                raise ValueError(f"{display_name} uses unsupported content encoding")
             declared_length = response.headers.get("content-length")
             if declared_length is not None:
                 try:

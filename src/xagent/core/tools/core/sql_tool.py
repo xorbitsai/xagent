@@ -634,8 +634,8 @@ def _stream_export_to_parquet(
         Tuple of (exported_file_path, row_count, column_names)
     """
     try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        import pyarrow as pa  # type: ignore[import-not-found]
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
     except ImportError as err:
         raise ImportError(
             f"{err}\n"

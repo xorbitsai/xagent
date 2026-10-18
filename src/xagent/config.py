@@ -39,6 +39,7 @@ WEB_DIR = "XAGENT_WEB_DIR"
 FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
 IMAGE_DOWNLOAD_MAX_BYTES = "XAGENT_IMAGE_DOWNLOAD_MAX_BYTES"
 VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
+REMOTE_JSON_DOWNLOAD_MAX_BYTES = "XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
@@ -2623,6 +2624,18 @@ def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
             f"Invalid {variable} value: fractional byte counts are not supported"
         )
     return _parse_size_bytes(value, variable)
+
+
+def get_remote_json_download_max_bytes() -> int:
+    """Bound remote speech-batch JSON inputs; invalid limits fail closed."""
+    value = os.getenv(REMOTE_JSON_DOWNLOAD_MAX_BYTES)
+    if not value or not value.strip():
+        return 10 * 1024 * 1024
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {REMOTE_JSON_DOWNLOAD_MAX_BYTES} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, REMOTE_JSON_DOWNLOAD_MAX_BYTES)
 
 
 def get_max_upload_size_bytes() -> int:

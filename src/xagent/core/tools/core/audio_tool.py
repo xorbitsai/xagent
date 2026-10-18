@@ -15,9 +15,11 @@ from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
+from ....config import get_remote_json_download_max_bytes
 from ...file_ref import build_workspace_file_ref
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
+from ...utils.public_download import download_public_input
 from ...workspace import TaskWorkspace
 from .audio_tool_descriptions import (
     CLONE_TTS_VOICE_DESCRIPTION,
@@ -1433,68 +1435,21 @@ class AudioToolCore:
         if file_id is not None:
             try:
                 # Check if it's a URL
-                if file_id.startswith(("http://", "https://")):
-                    # Download JSON from URL
-                    import httpx
-
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        response = await client.get(file_id)
-                        response.raise_for_status()
-                        json_content = response.text
-                        data = json.loads(json_content)
-                    logger.info(f"Downloaded JSON data from URL: {file_id}")
+                if file_id.lower().startswith(("http://", "https://")):
+                    response = await download_public_input(
+                        file_id,
+                        timeout=30.0,
+                        max_bytes=get_remote_json_download_max_bytes(),
+                    )
+                    data = json.loads(response.content)
+                    logger.info("Downloaded public speech-batch JSON input")
 
                 elif self._workspace:
-                    # Try to resolve as file_id first
-                    file_path = self._workspace.resolve_file_id(file_id)
-                    if file_path and file_path.exists():
-                        with open(file_path, "r", encoding="utf-8") as f:
-                            data = json.load(f)
-                        logger.info(f"Read JSON data from file_id: {file_id}")
-                    else:
-                        # Try as file path
-                        try:
-                            # Use workspace path resolution with search
-                            resolved_path = self._workspace.resolve_path_with_search(
-                                file_id
-                            )
-                            if resolved_path.exists():
-                                with open(resolved_path, "r", encoding="utf-8") as f:
-                                    data = json.load(f)
-                                logger.info(
-                                    f"Read JSON data from file path: {resolved_path}"
-                                )
-                            else:
-                                return {
-                                    "success": False,
-                                    "error": f"File not found: {file_id}",
-                                    "results": [],
-                                    "total": 0,
-                                    "successful": 0,
-                                    "failed": 0,
-                                    "errors": [f"File not found: {file_id}"],
-                                }
-                        except ValueError:
-                            # resolve_path_with_search failed, try direct path
-                            file_path = Path(file_id)
-                            if not file_path.is_absolute():
-                                file_path = Path.cwd() / file_path
-                            if file_path.exists():
-                                with open(file_path, "r", encoding="utf-8") as f:
-                                    data = json.load(f)
-                                logger.info(
-                                    f"Read JSON data from direct path: {file_path}"
-                                )
-                            else:
-                                return {
-                                    "success": False,
-                                    "error": f"File not found: {file_id}",
-                                    "results": [],
-                                    "total": 0,
-                                    "successful": 0,
-                                    "failed": 0,
-                                    "errors": [f"File not found: {file_id}"],
-                                }
+                    # The resolver also handles registered IDs and authorized
+                    # external roots. Never bypass a workspace rejection.
+                    file_path = self._workspace.resolve_path_with_search(file_id)
+                    with file_path.open("r", encoding="utf-8") as source:
+                        data = json.load(source)
                 else:
                     # No workspace, try direct file path
                     file_path = Path(file_id)
@@ -1518,7 +1473,7 @@ class AudioToolCore:
             except Exception as e:
                 return {
                     "success": False,
-                    "error": f"Failed to read file {file_id}: {e}",
+                    "error": f"Failed to read speech-batch JSON input: {e}",
                     "results": [],
                     "total": 0,
                     "successful": 0,
@@ -1830,40 +1785,9 @@ class AudioToolCore:
 
             # Handle reference audio for voice cloning
             if ref_audio_id:
-                ref_audio_path = None
-
-                # Try to resolve as file_id first (if workspace available)
-                if self._workspace:
-                    try:
-                        resolved_path = self._workspace.resolve_file_id(ref_audio_id)
-                        if resolved_path and resolved_path.exists():
-                            ref_audio_path = resolved_path
-                    except Exception:
-                        pass  # Not a file_id, try as direct path
-
-                # If not found as file_id, try as direct file path
-                if not ref_audio_path:
-                    direct_path = Path(ref_audio_id)
-                    if direct_path.exists():
-                        ref_audio_path = direct_path
-                    elif direct_path.is_absolute():
-                        # Absolute path but doesn't exist
-                        logger.warning(
-                            f"Reference audio file not found: {ref_audio_id}"
-                        )
-                    else:
-                        # Relative path, try current directory
-                        resolved_cwd = Path.cwd() / direct_path
-                        if resolved_cwd.exists():
-                            ref_audio_path = resolved_cwd
-                        else:
-                            logger.warning(
-                                f"Reference audio file not found: {ref_audio_id}"
-                            )
-
-                # Pass reference audio path to TTS model
-                if ref_audio_path:
-                    kwargs["reference_audio"] = str(ref_audio_path)
+                # Share the single-synthesis authorization and provider-URL
+                # contract; a missing local reference must not silently vanish.
+                kwargs["reference_audio"] = self._resolve_audio_path(ref_audio_id)
 
             # Synthesize speech
             audio_data = await tts_model.synthesize(

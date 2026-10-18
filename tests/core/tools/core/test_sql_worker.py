@@ -10,9 +10,9 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from xagent.sql_worker import (
-    QueryRequest,
     SENSITIVE_ENVIRONMENT_SUFFIXES,
     SENSITIVE_PLATFORM_ENVIRONMENT_VARIABLES,
+    QueryRequest,
     app,
     assert_isolated_environment,
     execute_in_disposable_process,

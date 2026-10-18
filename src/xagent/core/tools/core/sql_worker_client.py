@@ -59,8 +59,8 @@ def _write_rows(
                 print(json.dumps(row, ensure_ascii=False, default=str), file=stream)
         return
     try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
+        import pyarrow as pa  # type: ignore[import-not-found]
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
     except ImportError as exc:
         raise ImportError(
             f"{exc}\npyarrow is required for Parquet export. Install it with: pip install pyarrow"

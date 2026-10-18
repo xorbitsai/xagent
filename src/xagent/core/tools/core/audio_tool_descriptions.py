@@ -184,7 +184,7 @@ Voice identifiers:
 
 Voice Cloning:
 - Use reference_audio in each segment to clone voices from reference audio files
-- Supports both workspace file IDs and direct file paths (absolute or relative)
+- Supports workspace file IDs and paths within the authorized workspace roots (absolute or relative); arbitrary host paths are not allowed when a workspace is active
 - ElevenLabs creates an Instant Voice Clone for each distinct reference audio file, reuses it within the task, and deletes it during task cleanup
 - Voice cloning quality depends on the reference audio quality
 - Not all models support voice cloning

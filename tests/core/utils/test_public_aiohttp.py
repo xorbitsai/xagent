@@ -1,5 +1,6 @@
 import socket
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import aiohttp
 import pytest
@@ -79,7 +80,9 @@ async def test_real_session_cannot_use_per_request_proxy():
 async def test_cross_origin_redirect_is_rejected_without_replaying_credentials():
     params = SimpleNamespace(
         url=URL("https://example.com/v1"),
-        response=SimpleNamespace(headers={"Location": "https://other.example/"}),
+        response=SimpleNamespace(
+            headers={"Location": "https://other.example/"}, release=Mock()
+        ),
     )
     with pytest.raises(ValueError, match="Cross-origin"):
         await _check_redirect(None, SimpleNamespace(), params)
@@ -92,3 +95,34 @@ async def test_cross_origin_redirect_is_rejected_without_replaying_credentials()
         await _check_redirect(None, context, params)
     with pytest.raises(ValueError, match="Too many"):
         await _check_redirect(None, context, params)
+    assert params.response.release.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_real_session_rejects_private_resolver_answers_before_socket(monkeypatch):
+    class Resolver(aiohttp.abc.AbstractResolver):
+        async def resolve(self, host, port, family=socket.AF_UNSPEC):
+            return [
+                {
+                    "hostname": host,
+                    "host": "10.0.0.1",
+                    "port": port,
+                    "family": socket.AF_INET,
+                    "proto": 0,
+                    "flags": 0,
+                }
+            ]
+
+        async def close(self):
+            pass
+
+    def no_socket(*args, **kwargs):
+        pytest.fail("Private DNS answer reached the socket connector")
+
+    monkeypatch.setattr("aiohappyeyeballs.start_connection", no_socket)
+    async with create_public_aiohttp_session() as session:
+        # Exercise the real session/request/connector path, not _resolve_host
+        # in isolation. The owned connector's resolver is the only seam.
+        session.connector._resolver = Resolver()
+        with pytest.raises(PrivateNetworkHostError):
+            await session.get("https://example.com/")

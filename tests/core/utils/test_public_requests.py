@@ -149,3 +149,89 @@ def test_stream_close_closes_session_without_global_monkeypatch(network, monkeyp
     response.close()
     close.assert_called_once()
     assert original_requests.Session is not requests.Session
+
+
+def test_dns_oserror_is_a_requests_connection_error(network):
+    dns, seen, _ = network
+    dns.side_effect = socket.gaierror("unavailable")
+    with pytest.raises(requests.ConnectionError) as error:
+        requests.get("https://example.com/")
+    assert error.value.request.url == "https://example.com/"
+    assert not seen
+
+
+@pytest.mark.parametrize("variable", ["REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"])
+def test_ca_environment_without_environment_proxy_or_netrc(monkeypatch, variable):
+    monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)
+    monkeypatch.delenv("CURL_CA_BUNDLE", raising=False)
+    monkeypatch.setenv(variable, "/operator/ca.pem")
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient.example:8080")
+    monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+    with requests.Session() as session:
+        settings = session.merge_environment_settings(
+            "https://example.com/", {}, None, None, None
+        )
+        assert settings["verify"] == "/operator/ca.pem"
+        assert not settings["proxies"]
+        assert session.trust_env is False
+        assert (
+            session.merge_environment_settings(
+                "https://example.com/", {}, None, False, None
+            )["verify"]
+            is False
+        )
+        assert (
+            session.merge_environment_settings(
+                "https://example.com/", {}, None, "/explicit.pem", None
+            )["verify"]
+            == "/explicit.pem"
+        )
+
+
+def test_address_fallback_does_not_resolve_twice_or_replay_writes(network, monkeypatch):
+    from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
+
+    dns, seen, _ = network
+    dns.return_value.append(
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))
+    )
+    original = __import__("urllib3").connectionpool.HTTPConnectionPool.urlopen
+    attempts = []
+
+    def urlopen(pool, method, url, **kwargs):
+        attempts.append((pool.host, kwargs["timeout"].connect_timeout))
+        if len(attempts) == 1:
+            raise MaxRetryError(pool, url, NewConnectionError(None, "unreachable"))
+        return original(pool, method, url, **kwargs)
+
+    monkeypatch.setattr("urllib3.connectionpool.HTTPConnectionPool.urlopen", urlopen)
+    requests.post("https://example.com/", data=b"secret", timeout=(2, 10))
+    assert [entry[0] for entry in attempts] == [PUBLIC_IP, "1.1.1.1"]
+    assert 0 < attempts[0][1] <= 1 and attempts[1][1] <= 2
+    assert dns.call_count == 1
+    assert len(seen) == 1
+    attempts.clear()
+
+    def failed_write(pool, *args, **kwargs):
+        attempts.append(pool.host)
+        raise ProtocolError("body may have been sent")
+
+    monkeypatch.setattr(
+        "urllib3.connectionpool.HTTPConnectionPool.urlopen", failed_write
+    )
+    with pytest.raises(requests.ConnectionError):
+        requests.post("https://example.com/", data=b"secret", timeout=2)
+    assert len(attempts) == 1
+
+
+def test_only_explicitly_trusted_proxy_is_usable(network, monkeypatch):
+    _, seen, _ = network
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
+    requests.get("https://example.com/")
+    assert seen[0][0].proxy.host == "proxy.example"
+    assert seen[0][0].host == "example.com"
+    with pytest.raises(ValueError, match="untrusted proxy"):
+        requests.get(
+            "https://example.com/", proxies={"https": "http://other.example:3128"}
+        )

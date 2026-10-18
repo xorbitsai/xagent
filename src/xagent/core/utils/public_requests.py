@@ -7,6 +7,9 @@ hostname checks still use the logical hostname. No global monkey-patching.
 
 from __future__ import annotations
 
+import os
+import time
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
@@ -25,6 +28,10 @@ from requests import (
 from requests import Timeout as Timeout
 from requests import exceptions as exceptions
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import ConnectTimeoutError, MaxRetryError, NewConnectionError
+from urllib3.util import Timeout as PoolTimeout
+
+from ...config import get_trusted_egress_proxy_enabled
 
 if TYPE_CHECKING:
     from requests.adapters import _HostParams, _PoolKwargs
@@ -33,15 +40,32 @@ from .security import public_http_destination, validate_public_http_url_sync
 
 
 class _PublicAdapter(HTTPAdapter):
+    def __init__(self) -> None:
+        super().__init__()
+        self._destination: ContextVar[tuple[str, bool] | None] = ContextVar(
+            "public_requests_destination", default=None
+        )
+
     def build_connection_pool_key_attributes(
         self, request: PreparedRequest, verify: Any, cert: Any = None
     ) -> tuple[_HostParams, _PoolKwargs]:
-        addresses = validate_public_http_url_sync(request.url or "")
+        destination = self._destination.get()
+        if destination is None:
+            try:
+                destination = (
+                    validate_public_http_url_sync(request.url or "")[0],
+                    False,
+                )
+            except OSError as exc:
+                raise ConnectionError(
+                    "Public API host could not be resolved", request=request
+                ) from exc
         parsed = urlsplit(request.url or "")
         host_params, pool_kwargs = super().build_connection_pool_key_attributes(
             request, verify, cert
         )
-        host_params["host"] = addresses[0]
+        if not destination[1]:
+            host_params["host"] = destination[0]
         if parsed.scheme == "https":
             # Requests' stubs omit these supported urllib3 HTTPS pool keys.
             tls_kwargs = cast(dict[str, Any], pool_kwargs)
@@ -60,8 +84,23 @@ class _PublicAdapter(HTTPAdapter):
     ) -> Response:
         if request.method == "CONNECT":
             raise ValueError("HTTP tunnels are not allowed")
-        if any((proxies or {}).values()):
-            raise ValueError("Public Requests clients cannot bypass policy via a proxy")
+        via_proxy = any((proxies or {}).values())
+        trusted_proxy = _trusted_proxy_url()
+        if via_proxy and any(
+            value != trusted_proxy for value in proxies.values() if value
+        ):
+            raise ValueError(
+                "Public Requests clients cannot bypass policy via an untrusted proxy"
+            )
+        started = time.monotonic()
+        try:
+            addresses = validate_public_http_url_sync(request.url or "")
+        except OSError as exc:
+            raise ConnectionError(
+                "Public API host could not be resolved", request=request
+            ) from exc
+        except ValueError as exc:
+            raise _requests.exceptions.InvalidURL(str(exc), request=request) from exc
         parsed = urlsplit(request.url or "")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         host = parsed.hostname or ""
@@ -74,14 +113,64 @@ class _PublicAdapter(HTTPAdapter):
         )
         request.headers.pop("Proxy-Authorization", None)
         request.headers.pop("Proxy-Connection", None)
-        return super().send(
-            request,
-            stream=stream,
-            timeout=timeout,
-            verify=verify,
-            cert=cert,
-            proxies=proxies,
+        budget = (
+            timeout
+            if isinstance(timeout, PoolTimeout)
+            else (
+                PoolTimeout(connect=timeout[0], read=timeout[1])
+                if isinstance(timeout, tuple)
+                else PoolTimeout.from_float(timeout)
+            )
         )
+        targets = addresses[:1] if via_proxy else addresses
+        for index, address in enumerate(targets):
+            attempt_timeout = budget
+            if isinstance(budget.connect_timeout, (int, float)):
+                remaining = budget.connect_timeout - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise ConnectTimeout(
+                        "Public API connect budget exhausted", request=request
+                    )
+                attempt_timeout = PoolTimeout(
+                    connect=remaining / (len(targets) - index), read=budget.read_timeout
+                )
+            token = self._destination.set((address, via_proxy))
+            try:
+                return super().send(
+                    request,
+                    stream=stream,
+                    timeout=cast(
+                        Any, attempt_timeout
+                    ),  # Requests supports urllib3 Timeout; its stubs omit it.
+                    verify=verify,
+                    cert=cert,
+                    proxies=proxies,
+                )
+            except ConnectionError as exc:
+                # Only urllib3's pre-connect failures are safe to retry. A
+                # generic ConnectionError may instead follow a body write.
+                reason = exc.args[0] if exc.args else None
+                if isinstance(reason, MaxRetryError):
+                    reason = reason.reason
+                if (
+                    not isinstance(reason, (NewConnectionError, ConnectTimeoutError))
+                    or index == len(targets) - 1
+                ):
+                    raise
+            finally:
+                self._destination.reset(token)
+        raise ConnectionError("Public API host did not resolve", request=request)
+
+
+def _trusted_proxy_url() -> str | None:
+    if not get_trusted_egress_proxy_enabled():
+        return None
+    return (
+        os.getenv("HTTPS_PROXY")
+        or os.getenv("https_proxy")
+        or os.getenv("HTTP_PROXY")
+        or os.getenv("http_proxy")
+    )
 
 
 class Session(_requests.Session):
@@ -90,9 +179,25 @@ class Session(_requests.Session):
     def __init__(self) -> None:
         super().__init__()
         self.trust_env = False
+        proxy = _trusted_proxy_url()
+        if proxy:
+            # The operator opt-in means this proxy enforces public-only DNS
+            # at connect time. NO_PROXY cannot bypass that boundary.
+            self.proxies = {"http": proxy, "https": proxy}
         self.max_redirects = 5
         self.mount("http://", _PublicAdapter())
         self.mount("https://", _PublicAdapter())
+
+    def merge_environment_settings(
+        self, url: str | bytes | None, proxies: Any, stream: Any, verify: Any, cert: Any
+    ) -> Any:
+        # Keep CA trust configuration without enabling ambient proxy or netrc
+        # credentials. Explicit verify paths / False and Session.verify win.
+        if verify in (None, True) and self.verify is True:
+            verify = (
+                os.getenv("REQUESTS_CA_BUNDLE") or os.getenv("CURL_CA_BUNDLE") or verify
+            )
+        return super().merge_environment_settings(url, proxies, stream, verify, cert)
 
     def prepare_request(self, request: Request) -> PreparedRequest:
         # Requests/urllib3 may normalize a zero port or URL userinfo before

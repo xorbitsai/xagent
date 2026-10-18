@@ -49,15 +49,19 @@ async def _check_redirect(session: Any, context: Any, params: Any) -> None:
     location = params.response.headers.get("Location")
     if not location:
         return
-    target = params.url.join(type(params.url)(urljoin(str(params.url), location)))
-    public_http_destination(str(target))
-    if target.origin() != params.url.origin():
-        # Model APIs carry custom credentials and often non-replayable bodies.
-        # Reject a changed origin instead of forwarding either to a new peer.
-        raise ValueError("Cross-origin model API redirects are not allowed")
-    context.public_redirects = getattr(context, "public_redirects", 0) + 1
-    if context.public_redirects > 5:
-        raise ValueError("Too many public API redirects")
+    try:
+        target = params.url.join(type(params.url)(urljoin(str(params.url), location)))
+        public_http_destination(str(target))
+        if target.origin() != params.url.origin():
+            # Model APIs carry custom credentials and non-replayable bodies.
+            raise ValueError("Cross-origin model API redirects are not allowed")
+        context.public_redirects = getattr(context, "public_redirects", 0) + 1
+        if context.public_redirects > 5:
+            raise ValueError("Too many public API redirects")
+    except BaseException:
+        # aiohttp invokes this hook before its own redirect-response release.
+        params.response.release()
+        raise
 
 
 def create_public_aiohttp_session(**kwargs: Any) -> aiohttp.ClientSession:

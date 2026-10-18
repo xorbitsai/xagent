@@ -6,6 +6,7 @@ from botocore.awsrequest import AWSPreparedRequest
 from urllib3.response import HTTPResponse
 
 from xagent.core.utils.public_botocore import PublicBotocoreSession
+from xagent.core.utils.public_http_transport import UnsafePublicHttpTarget
 
 
 @pytest.fixture
@@ -57,13 +58,14 @@ def test_real_aws_transport_pins_ip_and_preserves_signed_host_tls_and_streaming(
         "http://[::1]/",
         "http://192.168.1.1/",
         "https://example.com:0/",
+        "https://user:secret@example.com/",
     ],
 )
 def test_aws_transport_rejects_private_or_invalid_targets(url, network):
     _, seen = network
     session = PublicBotocoreSession(timeout=2)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(UnsafePublicHttpTarget):
             session.send(
                 AWSPreparedRequest(
                     method="POST", url=url, headers={}, body=b"{}", stream_output=False
@@ -79,7 +81,7 @@ def test_aws_transport_rejects_mixed_dns(network):
     records.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443)))
     session = PublicBotocoreSession(timeout=2)
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(UnsafePublicHttpTarget):
             session.send(
                 AWSPreparedRequest(
                     method="POST",
@@ -92,3 +94,82 @@ def test_aws_transport_rejects_mixed_dns(network):
     finally:
         session.close()
     assert not seen
+
+
+def test_public_ipv6_tls_names_and_constructor_options(network):
+    records, seen = network
+    records[:] = [
+        (
+            socket.AF_INET6,
+            socket.SOCK_STREAM,
+            6,
+            "",
+            ("2606:4700:4700::1111", 443, 0, 0),
+        )
+    ]
+    with_session = PublicBotocoreSession(
+        timeout=(2, 5), max_pool_connections=3, socket_options=[], proxies_config={}
+    )
+    try:
+        response = with_session.send(
+            AWSPreparedRequest(
+                method="GET",
+                url="https://[2606:4700:4700::1111]:8443/",
+                headers={},
+                body=None,
+                stream_output=True,
+            )
+        )
+        pool, kwargs = seen[0]
+        assert pool.host == "2606:4700:4700::1111"
+        assert pool.assert_hostname == "2606:4700:4700::1111"
+        assert pool.conn_kw["server_hostname"] == "2606:4700:4700::1111"
+        assert kwargs["headers"]["Host"] == "[2606:4700:4700::1111]:8443"
+        response.raw.close()
+    finally:
+        with_session.close()
+
+
+def test_aws_fallback_only_before_body_send(network, monkeypatch):
+    from urllib3.exceptions import NewConnectionError, ProtocolError
+
+    records, seen = network
+    records.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443)))
+    original = __import__("urllib3").connectionpool.HTTPConnectionPool.urlopen
+    attempts = []
+
+    def urlopen(pool, **kwargs):
+        attempts.append(pool.host)
+        if len(attempts) == 1:
+            raise NewConnectionError(None, "unreachable")
+        return original(pool, **kwargs)
+
+    monkeypatch.setattr("urllib3.connectionpool.HTTPConnectionPool.urlopen", urlopen)
+    session = PublicBotocoreSession(timeout=2)
+    request = AWSPreparedRequest(
+        method="POST",
+        url="https://example.com/",
+        headers={},
+        body=b"sensitive",
+        stream_output=True,
+    )
+    try:
+        session.send(request).raw.close()
+        assert attempts == ["93.184.216.34", "1.1.1.1"]
+        assert len(seen) == 1
+        attempts.clear()
+
+        def failed_write(pool, **kwargs):
+            attempts.append(pool.host)
+            raise ProtocolError("body may have been sent")
+
+        monkeypatch.setattr(
+            "urllib3.connectionpool.HTTPConnectionPool.urlopen", failed_write
+        )
+        from botocore.exceptions import ConnectionClosedError
+
+        with pytest.raises(ConnectionClosedError):
+            session.send(request)
+        assert len(attempts) == 1
+    finally:
+        session.close()

@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, cast
+from urllib.parse import urlparse
 
 import bcrypt
 
@@ -21,7 +22,7 @@ from ...core.utils import public_requests as requests
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import (
     BaseModel,
@@ -35,6 +36,7 @@ from pydantic import (
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.responses import JSONResponse
 
 from ...builtin_identity import owned_catalog_marker
 from ...config import (
@@ -130,6 +132,7 @@ from ..services.user_oauth import (
     scoped_user_oauth_query,
 )
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
+from ..utils.script_json import script_safe_json
 
 logger = logging.getLogger(__name__)
 
@@ -1776,6 +1779,11 @@ def is_valid_email(email: str) -> bool:
 
 def hash_auth_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def hash_password_reset_token(token: str) -> str:
+    """Preserve the invitation adapters' existing password-proof contract."""
+    return hash_auth_token(token)
 
 
 def generate_password_reset_token() -> str:
@@ -3854,6 +3862,7 @@ def _generic_oauth_login(
     resource_owner_key: str | None,
     actor_flow_nonce: str | None,
     account: str | None,
+    trusted_session_epoch: str | None = None,
 ) -> Any:
     """Build an ordinary or trusted actor provider authorization redirect."""
     if db is None:
@@ -3873,7 +3882,7 @@ def _generic_oauth_login(
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
     user_id = trusted_user_id
-    session_epoch: str | None = None
+    session_epoch: str | None = trusted_session_epoch
     if user_id is None and token:
         user = get_user_from_token(token, db)
         if user:
@@ -5684,7 +5693,9 @@ def generic_oauth_callback(
             try:
                 parsed = urlparse(redirect_url)
                 if parsed.scheme and parsed.netloc:
-                    target_origin = json.dumps(f"{parsed.scheme}://{parsed.netloc}")
+                    target_origin = script_safe_json(
+                        f"{parsed.scheme}://{parsed.netloc}"
+                    )
             except Exception:
                 pass
 
@@ -5696,8 +5707,8 @@ def generic_oauth_callback(
                 <script>
                     window.opener.postMessage({{
                         type: 'oauth-success',
-                        email: {json.dumps(email)},
-                        provider: {json.dumps(app_id or provider)}
+                        email: {script_safe_json(email)},
+                        provider: {script_safe_json(app_id or provider)}
                     }}, {target_origin});
                     window.close();
                 </script>
@@ -5730,7 +5741,6 @@ def generic_oauth_callback(
 # --- Unified OAuth Routes ---
 
 
-@auth_router.get("/{provider}/login")
 def oauth_login(
     provider: str,
     token: Optional[str] = None,
@@ -5739,7 +5749,7 @@ def oauth_login(
     account: Optional[str] = None,
     db: Session = Depends(get_db),
 ) -> Any:
-    """Unified entry point for OAuth login"""
+    """In-process adapter; never expose its token argument as an HTTP query."""
     from ..models.oauth_provider import OAuthProvider
 
     db_provider = (
@@ -5754,6 +5764,208 @@ def oauth_login(
     # But now everything can be routed through generic
     return generic_oauth_login(
         provider, token, app_id, redirect, db, db_provider, account=account
+    )
+
+
+class OAuthLaunchRequest(BaseModel):
+    """Connector options only; authentication belongs in the Bearer header."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    app_id: str | None = Field(default=None, max_length=255)
+    redirect: str | None = Field(default=None, max_length=4096)
+    account: str | None = Field(default=None, max_length=255)
+
+
+_OAUTH_LAUNCH_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+_OAUTH_LAUNCH_TTL_SECONDS = 30
+
+
+@auth_router.get("/{provider}/login")
+def redeem_oauth_launch(
+    provider: str,
+    request: Request,
+    ticket: str | None = None,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Redeem one short-lived proof in a top-level browser navigation.
+
+    Setting the state cookie here avoids depending on third-party cookies in
+    cross-site fetches (for example hitoby.ai calling cloud.xagent.co).
+    """
+    from ..services.oauth_launch import consume_oauth_launch_ticket
+
+    if "token" in request.query_params or "access_token" in request.query_params:
+        return JSONResponse(
+            {
+                "detail": "Start connector authorization with a Bearer-authenticated POST."
+            },
+            status_code=410,
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    try:
+        payload = verify_token(ticket) if ticket else None
+    except (TypeError, ValueError, OverflowError):
+        payload = None
+    if (
+        not payload
+        or payload.get("type") != "oauth_launch"
+        or payload.get("provider") != provider
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    user_id = payload.get("user_id")
+    if type(user_id) is not int or not 0 < user_id <= 2**31 - 1:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    user = db.get(User, user_id)
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    try:
+        options = OAuthLaunchRequest.model_validate(payload.get("options"))
+    except ValueError:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        ) from None
+    try:
+        consumed = consume_oauth_launch_ticket(db, payload)
+    except SQLAlchemyError:
+        raise HTTPException(
+            503, "Authorization temporarily unavailable", headers=_OAUTH_LAUNCH_HEADERS
+        ) from None
+    if not consumed:
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    # Ticket consumption commits before any later work. Re-read after that
+    # boundary so a simultaneous password change cannot restore the old epoch.
+    db.expire_all()
+    user = db.get(User, user_id)
+    if (
+        user is None
+        or user.username != payload.get("sub")
+        or not matches_user_session(user, payload)
+    ):
+        raise HTTPException(
+            401,
+            "Invalid or expired authorization ticket",
+            headers=_OAUTH_LAUNCH_HEADERS,
+        )
+    from ..models.oauth_provider import OAuthProvider
+
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if db_provider is None:
+        raise HTTPException(400, "Unsupported provider", headers=_OAUTH_LAUNCH_HEADERS)
+    response = _generic_oauth_login(
+        provider,
+        token=None,
+        app_id=options.app_id,
+        redirect=options.redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=int(user.id),
+        trusted_session_epoch=cast(str | None, user.session_epoch),
+        resource_owner_key=None,
+        actor_flow_nonce=None,
+        account=options.account,
+    )
+    response.headers.update(_OAUTH_LAUNCH_HEADERS)
+    return response
+
+
+@auth_router.post("/{provider}/login")
+def start_oauth_authorization(
+    provider: str,
+    request: Request,
+    payload: OAuthLaunchRequest | None = Body(default=None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Any:
+    """Issue a single-use navigation proof, never a reusable access credential."""
+    from ..models.oauth_provider import OAuthProvider
+
+    private_headers = _OAUTH_LAUNCH_HEADERS
+    if "token" in request.query_params or "access_token" in request.query_params:
+        raise HTTPException(
+            status_code=400,
+            detail="Login credentials must not be included in the URL.",
+            headers=private_headers,
+        )
+    # Existing connector manifests put the non-secret app/return options in
+    # the query. Accept those on POST too, without ambiguous body overrides.
+    payload = payload or OAuthLaunchRequest()
+    options = payload.model_dump()
+    for name in ("app_id", "redirect", "account"):
+        if name not in request.query_params:
+            continue
+        value = request.query_params[name]
+        if name in payload.model_fields_set and options[name] != value:
+            raise HTTPException(
+                400, "Conflicting authorization options", headers=private_headers
+            )
+        options[name] = value
+    try:
+        payload = OAuthLaunchRequest.model_validate(options)
+    except ValueError:
+        raise HTTPException(
+            400, "Invalid authorization options", headers=private_headers
+        ) from None
+    db_provider = (
+        db.query(OAuthProvider).filter(OAuthProvider.provider_name == provider).first()
+    )
+    if db_provider is None:
+        raise HTTPException(
+            status_code=400, detail="Unsupported provider", headers=private_headers
+        )
+    callback = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    if (
+        callback.scheme not in {"http", "https"}
+        or not callback.netloc
+        or callback.username
+        or callback.password
+    ):
+        raise HTTPException(
+            400, "Invalid OAuth callback configuration", headers=private_headers
+        )
+    callback_origin = f"{callback.scheme}://{callback.netloc}"
+    from urllib.parse import quote, urlencode
+
+    ticket = create_access_token(
+        {
+            **user_session_claims(user),
+            "type": "oauth_launch",
+            "provider": provider,
+            "jti": secrets.token_urlsafe(24),
+            "options": payload.model_dump(),
+        },
+        expires_delta=timedelta(seconds=_OAUTH_LAUNCH_TTL_SECONDS),
+    )
+    # Relative to the configured API base, resolved by the frontend. Do not
+    # trust arbitrary forwarded Host headers to choose a credential destination.
+    path = f"/api/auth/{quote(provider, safe='')}/login?{urlencode({'ticket': ticket})}"
+    return JSONResponse(
+        {"authorization_url": path, "callback_origin": callback_origin},
+        headers=private_headers,
     )
 
 

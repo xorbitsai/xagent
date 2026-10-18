@@ -1,9 +1,30 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from 'react'
+import katex from 'katex'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push: vi.fn() }),
+  usePathname: () => '/task',
+}))
+
+describe('KaTeX renderer trust boundary', () => {
+  it.each([
+    String.raw`\href{javascript:alert(1)}{click}`,
+    String.raw`\includegraphics{https://untrusted.invalid/image.png}`,
+  ])('does not inherit trusted rendering from the options prototype: %s', expression => {
+    // GHSA-238p-pmpm-9mq7: this is a renderer-options prototype, not a mutation
+    // of Object.prototype shared with other tests or the rendering framework.
+    const options = Object.create({ trust: true })
+    const html = katex.renderToString(expression, options)
+    const element = document.createElement('div')
+    element.innerHTML = html
+    expect(element.querySelector('a[href], img[src]')).toBeNull()
+  })
+})
 
 vi.mock('@/lib/utils', () => ({
   cn: (...classes: Array<string | undefined | false>) => classes.filter(Boolean).join(' '),
@@ -69,6 +90,22 @@ import {
 describe('MarkdownRenderer', () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+  })
+
+  it('loads an enabled agent card through the authenticated API boundary', async () => {
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => ({
+      name: 'Verified agent', description: 'Bounded agent details', status: 'draft',
+    }) })
+    render(<MarkdownRenderer content="[Read agent](agent://42)" agentCardsEnabled />)
+    expect(await screen.findByText('Verified agent')).toBeInTheDocument()
+    expect(apiRequestMock).toHaveBeenCalledWith('http://api.local/api/agents/42')
+  })
+
+  it('renders failed agent lookup as an inert fallback card', async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, statusText: 'Not found' })
+    const { container } = render(<MarkdownRenderer content="[Unknown agent](agent://missing)" agentCardsEnabled />)
+    expect(await screen.findByText('markdownRenderer.loadAgentDetailsFailed')).toBeInTheDocument()
+    expect(container.querySelector('a, button')).toBeNull()
   })
 
   it('retains snake-case filenames as the safe label for file records', () => {

@@ -291,7 +291,6 @@ describe("ConnectAppsField", () => {
       expect(openBuiltinOAuthPopupMock).toHaveBeenCalledWith({
         provider: "google",
         appId: "gmail",
-        token: "test-token",
       });
     });
     await waitFor(() => {
@@ -328,7 +327,6 @@ describe("ConnectAppsField", () => {
       expect(openBuiltinOAuthPopupMock).toHaveBeenCalledWith({
         provider: "google",
         appId: undefined,
-        token: "test-token",
       });
     });
   });
@@ -361,7 +359,6 @@ describe("ConnectAppsField", () => {
       expect(openBuiltinOAuthPopupMock).toHaveBeenCalledWith({
         provider: "meta",
         appId: "facebook",
-        token: "test-token",
       });
     });
   });

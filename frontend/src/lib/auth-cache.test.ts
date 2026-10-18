@@ -3,7 +3,7 @@ import {
   AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, AUTH_OIDC_INTENT_KEY, AUTH_REVOKED_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
   AUTH_TOKEN_UPDATED_EVENT, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, commitAuthSessionRefresh, compareAuthSession, createAuthSession,
   inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
-  takeOidcAuthLoginIntent,
+  takeOidcAuthLoginIntent, isAuthCacheUsable,
 } from "@/lib/auth-cache"
 
 const user = { id: "1", username: "alice", email: null, is_admin: false }
@@ -30,6 +30,14 @@ function authStorageSnapshot() {
   return Object.fromEntries(AUTH_OWNED_LOCAL_KEYS.map(key => [key, localStorage.getItem(key)]))
 }
 describe("auth cache lineage", () => {
+  it("checks cache usability at the default clock and the explicit refresh deadline", async () => {
+    await created()
+    const cache = current().cache
+    expect(isAuthCacheUsable(cache)).toBe(true)
+    expect(isAuthCacheUsable({ ...cache, refreshExpiresAt: Date.now() - 1 })).toBe(false)
+    expect(isAuthCacheUsable({ ...cache, refreshToken: null }, cache.timestamp + 1)).toBe(true)
+  })
+
   beforeEach(() => { localStorage.clear(); vi.restoreAllMocks(); installLock() })
   afterEach(() => vi.unstubAllGlobals())
   it.each([

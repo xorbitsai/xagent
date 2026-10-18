@@ -4,6 +4,7 @@ import type { Locale } from "@/i18n/translations"
 import { formatDisplayDate, formatTime, getTimeDuration, normalizeTimestampMs } from "./time-utils"
 
 const bigintValue = (globalThis as { BigInt: (value: number) => bigint }).BigInt(1)
+const NativeDateTimeFormat = Intl.DateTimeFormat
 
 const dateOptions = Object.freeze({
   year: "numeric",
@@ -59,7 +60,9 @@ describe("formatDisplayDate", () => {
     ["en", "en-US"],
     ["zh", "zh-CN"],
   ] as const)("uses %s locale with each caller option contract", (locale, expectedLocale) => {
-    const formatSpy = vi.spyOn(Intl, "DateTimeFormat")
+    const formatSpy = vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (...args: ConstructorParameters<typeof Intl.DateTimeFormat>) {
+      return new NativeDateTimeFormat(...args)
+    })
     const buildDate = formatDisplayDate("2024-05-06T07:08:09Z", locale, dateOptions)
     const homeDate = formatDisplayDate("2024-05-06T07:08:09Z", locale, homeDateOptions)
 
@@ -70,7 +73,9 @@ describe("formatDisplayDate", () => {
   })
 
   it("falls back to the locale tag itself for locales without an explicit mapping", () => {
-    const formatSpy = vi.spyOn(Intl, "DateTimeFormat")
+    const formatSpy = vi.spyOn(Intl, "DateTimeFormat").mockImplementation(function (...args: ConstructorParameters<typeof Intl.DateTimeFormat>) {
+      return new NativeDateTimeFormat(...args)
+    })
     const widenedLocale = "vi" as unknown as Locale
 
     const formatted = formatDisplayDate("2024-05-06T07:08:09Z", widenedLocale, dateOptions)

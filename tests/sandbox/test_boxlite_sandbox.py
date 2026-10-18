@@ -78,6 +78,36 @@ class TestBoxliteSandboxService:
     """Test BoxliteSandboxService service layer functionality"""
 
     @pytest.mark.asyncio(loop_scope="module")
+    async def test_isolated_guest_has_no_outbound_route(self, boxlite_service):
+        """Test the actual guest route, not only the SDK's NetworkSpec object."""
+        name = "test_isolated_guest_has_no_outbound_route"
+        service = boxlite_service
+        try:
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256, network_isolated=True),
+            )
+            # A numeric public destination avoids DNS as a false explanation
+            # for failure. Send no application data; a disabled guest network
+            # must fail locally with no route, not merely time out externally.
+            result = await sandbox.run_code(
+                """
+                import errno
+                import socket
+                with socket.socket() as connection:
+                    connection.settimeout(2)
+                    result = connection.connect_ex(("1.1.1.1", 443))
+                assert result in (errno.ENETUNREACH, errno.ENETDOWN), result
+                print("guest network is unreachable")
+                """
+            )
+            assert result.exit_code == 0, result.stderr
+            assert "guest network is unreachable" in result.stdout
+        finally:
+            await service.delete(name)
+
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_create_and_delete_sandbox(self, boxlite_service):
         """Test creating and deleting sandbox"""
         name = "test_create_and_delete_sandbox"
@@ -123,7 +153,7 @@ class TestBoxliteSandboxService:
             assert info.state == "running"
 
             # Check using native interface, can only check partial fields
-            raw_info = sandbox._box.info()
+            raw_info = await sandbox._box.info()
             assert raw_info.name == name
             assert raw_info.image == template.image
             assert raw_info.cpus == config.cpus
@@ -213,7 +243,7 @@ class TestBoxliteSandboxService:
             )
 
             # Write data
-            await sandbox1.write_file("data from first", "/root/data.txt")
+            await sandbox1.write_file("data from first", "/var/tmp/data.txt")
 
             # Stop
             await sandbox1.stop()
@@ -222,7 +252,7 @@ class TestBoxliteSandboxService:
             sandbox2 = await service.get_or_create(name)
 
             # Verify data still exists
-            content = await sandbox2.read_file("/root/data.txt")
+            content = await sandbox2.read_file("/var/tmp/data.txt")
             print(f"Read after reuse: {content}")
             assert content == "data from first"
 
@@ -413,7 +443,7 @@ class TestBoxliteSandboxService:
                 print(f"Task {task_id}: Command output = {result.stdout.strip()}")
 
                 # Write task-specific file
-                file_path = f"/root/task_{task_id}.txt"
+                file_path = f"/var/tmp/task_{task_id}.txt"
                 content = f"Task {task_id} data"
                 await sb.write_file(content, file_path, overwrite=True)
                 print(f"Task {task_id}: Wrote file {file_path}")
@@ -471,13 +501,21 @@ class TestBoxliteSandbox:
             )
 
             # Execute simple command
+            user = await sandbox.exec("id", "-u")
+            assert user.exit_code == 0
+            assert user.stdout.strip() != "0", "The sandbox image USER must be honored"
+            root_write = await sandbox.exec("test", "-w", "/root")
+            assert root_write.exit_code != 0
             msg = "hello word"
-            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > test.txt')
+            # The image's unprivileged USER cannot write to /home or /root.
+            # Exercise a writable guest directory without escalating to root.
+            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > /var/tmp/test.txt')
+            assert result.exit_code == 0, result.stderr
 
-            result = await sandbox.exec("sh", "-c", "ls | grep test.txt")
+            result = await sandbox.exec("sh", "-c", "ls /var/tmp | grep test.txt")
             print(f"Command output: {result.stdout.strip()}")
 
-            result = await sandbox.exec("cat", "test.txt")
+            result = await sandbox.exec("cat", "/var/tmp/test.txt")
             print(f"result: {result.stdout.strip()}")
             assert result.stdout.strip() == msg
 
@@ -611,18 +649,18 @@ class TestBoxliteSandbox:
 
             # Write file
             test_content = "Hello, this is a test file!"
-            await sandbox.write_file(test_content, "/root/test.txt")
+            await sandbox.write_file(test_content, "/var/tmp/test.txt")
             print("File write successful")
 
             # Read file
-            content = await sandbox.read_file("/root/test.txt")
+            content = await sandbox.read_file("/var/tmp/test.txt")
             print(f"Read content: {content}")
             assert content == test_content
 
             # Test overwrite protection
             try:
                 await sandbox.write_file(
-                    "new content", "/root/test.txt", overwrite=False
+                    "new content", "/var/tmp/test.txt", overwrite=False
                 )
                 assert False, "Should raise FileExistsError"
             except FileExistsError:
@@ -630,8 +668,8 @@ class TestBoxliteSandbox:
 
             # Overwrite file
             new_content = "Updated content"
-            await sandbox.write_file(new_content, "/root/test.txt", overwrite=True)
-            content = await sandbox.read_file("/root/test.txt")
+            await sandbox.write_file(new_content, "/var/tmp/test.txt", overwrite=True)
+            content = await sandbox.read_file("/var/tmp/test.txt")
             assert content == new_content
             print("File overwrite successful")
 
@@ -675,7 +713,7 @@ class TestBoxliteSandbox:
 
             try:
                 # Upload file
-                remote_path = "/root/uploaded.txt"
+                remote_path = "/var/tmp/uploaded.txt"
                 await sandbox.upload_file(local_upload_path, remote_path)
                 print(f"Upload file: {local_upload_path} -> {remote_path}")
 

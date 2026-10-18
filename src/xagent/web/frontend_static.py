@@ -22,6 +22,8 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from .browser_security import page_security_headers
+
 logger = logging.getLogger(__name__)
 
 _SHELL_TOKEN = "__shell__"
@@ -90,6 +92,15 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     resolved_root = dist_dir.resolve()
     backend_prefixes = _collect_backend_prefixes(app)
 
+    def _file_response(file: Path, *, status_code: int = 200) -> FileResponse:
+        headers = None
+        if file.suffix.lower() == ".html":
+            route = file.resolve().relative_to(resolved_root).as_posix()
+            headers = page_security_headers(
+                embeddable=route == "widget.html" or route.startswith("widget/")
+            )
+        return FileResponse(file, status_code=status_code, headers=headers)
+
     def _resolve(rel_path: str) -> Path | None:
         # Reject path traversal: the request path must stay within dist_dir.
         try:
@@ -133,7 +144,7 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     @app.get("/{full_path:path}", include_in_schema=False)
     async def serve_spa(full_path: str) -> Response:
         if full_path == "":
-            return FileResponse(dist_dir / "index.html")
+            return _file_response(dist_dir / "index.html")
 
         first_segment = full_path.split("/", 1)[0]
         if first_segment in backend_prefixes:
@@ -144,10 +155,10 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
 
         resolved = _resolve(full_path)
         if resolved is not None:
-            return FileResponse(resolved)
+            return _file_response(resolved)
 
         if not_found.is_file():
-            return FileResponse(not_found, status_code=404)
+            return _file_response(not_found, status_code=404)
         return JSONResponse({"detail": "Not Found"}, status_code=404)
 
     logger.info(

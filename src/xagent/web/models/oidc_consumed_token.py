@@ -6,8 +6,9 @@ from .database import Base
 class OidcConsumedToken(Base):  # type: ignore[no-any-unimported]
     """Consumed short-lived authentication proofs for replay protection.
 
-    Ordinary OAuth state digests use the ``oauth-state:`` namespace, distinct
-    from the random OIDC exchange IDs. Expiry bounds both sets of records.
+    Ordinary OAuth state digests use ``oauth-state:`` and short-lived connector
+    navigation IDs use ``oauth-launch:``, distinct from OIDC exchange IDs.
+    Each owner bounds retention and cleanup within its own namespace.
     """
 
     __tablename__ = "oidc_consumed_tokens"

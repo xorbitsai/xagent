@@ -152,6 +152,13 @@ DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
 DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
+SQL_WORKER_URL = "XAGENT_SQL_WORKER_URL"
+SQL_WORKER_TOKEN = "XAGENT_SQL_WORKER_TOKEN"
+SQL_WORKER_QUERY_TIMEOUT_SECONDS = "XAGENT_SQL_WORKER_QUERY_TIMEOUT_SECONDS"
+SQL_WORKER_MAX_ROWS = "XAGENT_SQL_WORKER_MAX_ROWS"
+SQL_WORKER_MAX_RESULT_BYTES = "XAGENT_SQL_WORKER_MAX_RESULT_BYTES"
+SQL_WORKER_MAX_QUERY_BYTES = "XAGENT_SQL_WORKER_MAX_QUERY_BYTES"
+SQL_WORKER_MAX_CONCURRENCY = "XAGENT_SQL_WORKER_MAX_CONCURRENCY"
 RUNTIME_TELEMETRY_ENABLED = "XAGENT_RUNTIME_TELEMETRY_ENABLED"
 OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = "XAGENT_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
 OTEL_EXPORT_INTERVAL_MILLISECONDS = "XAGENT_OTEL_EXPORT_INTERVAL_MILLISECONDS"
@@ -852,6 +859,51 @@ def get_email_confirmation_expire_minutes() -> int:
 def get_app_base_url() -> str | None:
     """Return the trusted frontend base URL used in email links."""
     return _normalized_env_url(APP_BASE_URL)
+
+
+def get_sql_worker_url() -> str | None:
+    """Return the internal SQL execution service URL, when isolation is enabled."""
+
+    return _reject_url_userinfo(
+        SQL_WORKER_URL, _normalized_http_env_url(SQL_WORKER_URL)
+    )
+
+
+def get_sql_worker_token() -> str | None:
+    """Return the shared bearer token for the internal SQL execution service."""
+
+    value = (os.getenv(SQL_WORKER_TOKEN) or "").strip()
+    return value or None
+
+
+def get_sql_worker_query_timeout_seconds() -> int:
+    """Return the hard wall-clock limit applied to one isolated SQL query."""
+
+    return _get_positive_int_env(SQL_WORKER_QUERY_TIMEOUT_SECONDS, 30)
+
+
+def get_sql_worker_max_rows() -> int:
+    """Return the maximum number of rows an isolated query may return."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_ROWS, 10_000)
+
+
+def get_sql_worker_max_result_bytes() -> int:
+    """Return the maximum serialized result size accepted from the SQL worker."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_RESULT_BYTES, 8 * 1024 * 1024)
+
+
+def get_sql_worker_max_query_bytes() -> int:
+    """Return the largest SQL statement accepted by the isolated worker."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_QUERY_BYTES, 1024 * 1024)
+
+
+def get_sql_worker_max_concurrency() -> int:
+    """Return the number of query subprocesses admitted by one SQL worker."""
+
+    return _get_positive_int_env(SQL_WORKER_MAX_CONCURRENCY, 4)
 
 
 def get_slack_client_id() -> str | None:

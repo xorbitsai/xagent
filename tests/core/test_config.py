@@ -4165,3 +4165,58 @@ def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
     monkeypatch.setenv("XAGENT_IMAGE_DOWNLOAD_MAX_BYTES", value)
     with pytest.raises(ValueError):
         config.get_media_download_max_bytes("image")
+
+
+def test_sql_worker_url_and_token_configuration(monkeypatch):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", " http://sql-worker:8090/ ")
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", " worker-secret ")
+    assert config.get_sql_worker_url() == "http://sql-worker:8090"
+    assert config.get_sql_worker_token() == "worker-secret"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "sql-worker:8090",
+        "ftp://sql-worker",
+        "http://sql-worker/path?token=secret",
+        "http://user:password@sql-worker:8090",
+    ],
+)
+def test_sql_worker_url_rejects_unsafe_values(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", value)
+    with pytest.raises(ValueError, match="XAGENT_SQL_WORKER_URL"):
+        config.get_sql_worker_url()
+
+
+@pytest.mark.parametrize(
+    "setting,getter,default",
+    [
+        (
+            "XAGENT_SQL_WORKER_QUERY_TIMEOUT_SECONDS",
+            config.get_sql_worker_query_timeout_seconds,
+            30,
+        ),
+        ("XAGENT_SQL_WORKER_MAX_ROWS", config.get_sql_worker_max_rows, 10_000),
+        (
+            "XAGENT_SQL_WORKER_MAX_RESULT_BYTES",
+            config.get_sql_worker_max_result_bytes,
+            8 * 1024 * 1024,
+        ),
+        (
+            "XAGENT_SQL_WORKER_MAX_QUERY_BYTES",
+            config.get_sql_worker_max_query_bytes,
+            1024 * 1024,
+        ),
+        (
+            "XAGENT_SQL_WORKER_MAX_CONCURRENCY",
+            config.get_sql_worker_max_concurrency,
+            4,
+        ),
+    ],
+)
+def test_sql_worker_limits(monkeypatch, setting, getter, default):
+    monkeypatch.delenv(setting, raising=False)
+    assert getter() == default
+    monkeypatch.setenv(setting, "7")
+    assert getter() == 7

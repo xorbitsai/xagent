@@ -34,8 +34,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import URL, create_engine, event, text
 from sqlalchemy.engine import CursorResult, Engine, Row, make_url
 
-from ....config import get_database_url
+from ....config import get_database_url, get_sql_worker_url
 from ...file_ref import build_workspace_file_ref
+from .sql_worker_client import execute_sql_query_remote
 
 if TYPE_CHECKING:
     from ...workspace import TaskWorkspace
@@ -270,7 +271,7 @@ class SQLQueryResult(BaseModel):
 
 
 def _get_connection_url(
-    connection_name: str, connection_url: Optional[str] = None
+    connection_name: str, connection_url: str | URL | None = None
 ) -> URL:
     """Get database connection URL from environment variable.
 
@@ -348,10 +349,47 @@ def execute_sql_query(
             - message: what happened
             - file_ref/file_id/download_url when output_file exports results
     """
-    # Get connection URL from environment
+    # Resolve and validate on the credential-owning Agent process before the
+    # value crosses the internal worker boundary. The worker repeats URL
+    # validation, but deliberately has no platform DATABASE_URL to compare.
+    url = _get_connection_url(connection_name, connection_url)
+    if get_sql_worker_url() is not None:
+        return execute_sql_query_remote(
+            connection_name=connection_name,
+            connection_url=url.render_as_string(hide_password=False),
+            query=query,
+            output_file=output_file,
+            workspace=workspace,
+        )
+    return _execute_sql_query_local(
+        connection_name,
+        query,
+        output_file,
+        workspace,
+        url,
+    )
+
+
+def _execute_sql_query_local(
+    connection_name: str,
+    query: str,
+    output_file: Optional[str] = None,
+    workspace: Optional["TaskWorkspace"] = None,
+    connection_url: str | URL | None = None,
+    *,
+    max_rows: int | None = None,
+    max_result_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Execute SQL in the current process.
+
+    Production Agent processes route through :func:`execute_sql_query` and an
+    isolated worker. This entry point exists for the worker subprocess and for
+    backwards-compatible local installations with no worker URL configured.
+    """
+
     url = _get_connection_url(connection_name, connection_url)
     stmt = text(query)
-    engine = create_engine(url)
+    engine = create_engine(url, hide_parameters=True)
     if _canonical_backend(url) == "sqlite" and isinstance(engine, Engine):
         event.listen(engine, "connect", _install_sqlite_authorizer)
 
@@ -432,19 +470,35 @@ def execute_sql_query(
 
             # Get column names from result
             if result.returns_rows:
-                rows = result.all()
+                if max_rows is None:
+                    rows = result.all()
+                else:
+                    rows = result.fetchmany(max_rows + 1)
+                    if len(rows) > max_rows:
+                        raise ValueError(
+                            f"SQL query returned more than the {max_rows} row limit"
+                        )
                 row_list = [_row_to_dict(row) for row in rows]
 
                 # Extract column names from first row
                 columns = list(row_list[0].keys()) if row_list else []
 
-                return SQLQueryResult(
+                payload = SQLQueryResult(
                     success=True,
                     rows=row_list,
                     row_count=len(row_list),
                     columns=columns,
                     message=f"Query executed successfully on '{connection_name}', returned {len(row_list)} row(s)",
                 ).model_dump()
+                if max_result_bytes is not None:
+                    encoded = json.dumps(
+                        payload, ensure_ascii=False, default=str
+                    ).encode("utf-8")
+                    if len(encoded) > max_result_bytes:
+                        raise ValueError(
+                            "SQL query result exceeded the configured byte limit"
+                        )
+                return payload
             else:
                 # For INSERT, UPDATE, DELETE operations
                 rowcount = result.rowcount if hasattr(result, "rowcount") else 0
@@ -580,8 +634,8 @@ def _stream_export_to_parquet(
         Tuple of (exported_file_path, row_count, column_names)
     """
     try:
-        import pyarrow as pa  # type: ignore[import-not-found]
-        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+        import pyarrow as pa
+        import pyarrow.parquet as pq
     except ImportError as err:
         raise ImportError(
             f"{err}\n"

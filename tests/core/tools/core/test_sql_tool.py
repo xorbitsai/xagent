@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.exc import DatabaseError
 
 from xagent.core.tools.core.sql_tool import (
+    _execute_sql_query_local,
     _get_connection_url,
     _row_to_dict,
     execute_sql_query,
@@ -286,6 +287,52 @@ class TestExecuteSqlQuery:
         # The function raises ValueError when connection not found
         with pytest.raises(ValueError, match="not found"):
             execute_sql_query("missing", "SELECT 1")
+
+    @patch("xagent.core.tools.core.sql_tool.execute_sql_query_remote")
+    @patch("xagent.core.tools.core.sql_tool.create_engine")
+    def test_configured_worker_prevents_local_execution(
+        self, mock_create_engine, mock_remote, monkeypatch
+    ):
+        monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")
+        monkeypatch.setenv("XAGENT_SQL_WORKER_URL", "http://sql-worker:8090")
+        mock_remote.return_value = {"success": True, "rows": []}
+
+        result = execute_sql_query("test", "SELECT 1")
+
+        assert result == {"success": True, "rows": []}
+        mock_create_engine.assert_not_called()
+        mock_remote.assert_called_once_with(
+            connection_name="test",
+            connection_url="sqlite:///:memory:",
+            query="SELECT 1",
+            output_file=None,
+            workspace=None,
+        )
+
+    def test_local_worker_row_limit_is_fail_closed(self, tmp_path):
+        db_path = tmp_path / "external.db"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("CREATE TABLE rows (value INTEGER)")
+            connection.executemany("INSERT INTO rows VALUES (?)", [(1,), (2,), (3,)])
+
+        with pytest.raises(ValueError, match="2 row limit"):
+            _execute_sql_query_local(
+                "test",
+                "SELECT value FROM rows ORDER BY value",
+                connection_url=f"sqlite:///{db_path}",
+                max_rows=2,
+                max_result_bytes=1024,
+            )
+
+    def test_local_worker_result_byte_limit_is_fail_closed(self):
+        with pytest.raises(ValueError, match="byte limit"):
+            _execute_sql_query_local(
+                "test",
+                "SELECT 'a long value' AS value",
+                connection_url="sqlite:///:memory:",
+                max_rows=10,
+                max_result_bytes=16,
+            )
 
     def test_sqlite_attach_is_rejected_by_authorizer(self, monkeypatch, tmp_path):
         monkeypatch.setenv("XAGENT_EXTERNAL_DB_TEST", "sqlite:///:memory:")

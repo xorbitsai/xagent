@@ -1,5 +1,6 @@
 """Connection-bound public-only HTTP policy for untrusted request URLs."""
 
+import time
 from collections.abc import Awaitable, Callable
 from urllib.parse import urlsplit
 
@@ -25,15 +26,22 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._via_proxy = proxy_url is not None
+        ssl_context = build_ca_bundle_ssl_context()
+        proxy = (
+            httpx.Proxy(proxy_url, ssl_context=ssl_context)
+            if proxy_url and httpx.URL(proxy_url).scheme == "https"
+            else proxy_url
+        )
         self._transport = httpx.AsyncHTTPTransport(
             trust_env=False,
             http2=False,
-            verify=build_ca_bundle_ssl_context(),
+            verify=ssl_context,
             limits=httpx.Limits(max_keepalive_connections=0),
-            proxy=proxy_url,
+            proxy=proxy,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        started = time.monotonic()
         if request.method.upper() == "CONNECT":
             raise UnsafePublicHttpTarget("HTTP tunnels are not allowed")
         try:
@@ -67,13 +75,24 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
         # An explicitly trusted proxy owns connect-time DNS enforcement, as
         # in the existing web fetchers. Direct connections stay IP-pinned.
         targets = [hostname] if self._via_proxy else addresses
+        connect_budget = extensions.get("timeout", {}).get("connect")
         for index, address in enumerate(targets):
+            attempt_extensions = dict(extensions)
+            if connect_budget is not None:
+                # DNS already consumed part of the whole-attempt budget.
+                # Reserve time for remaining IPs rather than allowing the
+                # first black-holed address to exhaust the outer deadline.
+                remaining = max(0.0, connect_budget - (time.monotonic() - started))
+                attempt_extensions["timeout"] = {
+                    **extensions["timeout"],
+                    "connect": remaining / (len(targets) - index),
+                }
             pinned = httpx.Request(
                 request.method,
                 request.url.copy_with(host=address),
                 headers=headers,
                 stream=request.stream,
-                extensions=extensions,
+                extensions=attempt_extensions,
             )
             try:
                 return await self._transport.handle_async_request(pinned)

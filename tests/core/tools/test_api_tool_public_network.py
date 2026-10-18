@@ -1,9 +1,11 @@
 """Exercise the real generic API client and policy transport with fake sockets."""
 
+import asyncio
 import socket
 import time
 from unittest.mock import Mock
 
+import anyio
 import httpx
 import pytest
 
@@ -65,6 +67,9 @@ async def test_unsafe_destinations_are_not_dispatched(url, network):
     assert result["success"] is False
     assert result["status_code"] == 0
     assert seen == []
+    assert ("Invalid URL" if url.startswith("file:") else "network policy") in result[
+        "error"
+    ]
 
 
 @pytest.mark.asyncio
@@ -237,11 +242,12 @@ async def test_cross_origin_303_can_follow_an_actually_bodyless_get(network):
 
 
 @pytest.mark.asyncio
-async def test_post_response_failure_is_not_retried(network):
+@pytest.mark.parametrize("method", ["POST", "PUT", "PATCH", "DELETE"])
+async def test_write_response_failure_is_not_retried(method, network):
     _, seen, replies, _ = network
     replies.append(httpx.ReadTimeout("reply lost"))
     result = await APIClientCore().call_api(
-        "https://example.com/", method="POST", body={"change": "once"}
+        "https://example.com/", method=method, body={"change": "once"}
     )
     assert result["success"] is False
     assert len(seen) == 1
@@ -410,6 +416,106 @@ async def test_explicitly_trusted_proxy_retains_logical_target(network, monkeypa
     assert result["success"]
     assert seen[0].url.host == "example.com"
     assert options[0]["proxy"] == "http://127.0.0.1:3128"
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+async def test_proxy_tls_uses_the_configured_ca_only_for_https(
+    scheme, network, monkeypatch
+):
+    _, _, _, options = network
+    context = Mock()
+    monkeypatch.setattr(
+        "xagent.core.utils.public_http_transport.build_ca_bundle_ssl_context",
+        lambda: context,
+    )
+    transport = PublicHttpTransport(proxy_url=f"{scheme}://proxy.test:3128")
+    proxy = options[-1]["proxy"]
+    assert options[-1]["verify"] is context
+    if scheme == "https":
+        assert isinstance(proxy, httpx.Proxy)
+        assert proxy.ssl_context is context
+    else:
+        assert proxy == "http://proxy.test:3128"
+    await transport.aclose()
+
+
+@pytest.mark.parametrize("method", ["GET", "POST"])
+async def test_same_host_https_downgrade_never_leaks_credentials_or_body(
+    method, network
+):
+    _, seen, replies, _ = network
+    replies.extend(
+        [
+            httpx.Response(307, headers={"Location": "http://example.com/insecure"}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    result = await APIClientCore().call_api(
+        "https://example.com/",
+        method=method,
+        body="private" if method == "POST" else None,
+        headers={"Authorization": "Bearer secret", "X-API-Key": "secret"},
+    )
+    if method == "POST":
+        assert not result["success"]
+        assert "network policy" in result["error"]
+        assert len(seen) == 1
+    else:
+        assert result["success"]
+        assert len(seen) == 2
+        assert "authorization" not in seen[1].headers
+        assert "x-api-key" not in seen[1].headers
+
+
+async def test_blackholed_first_address_falls_back_with_real_httpcore(monkeypatch):
+    """Use httpcore's actual AnyIO timeout, not an immediate injected exception."""
+    connected, bodies = [], []
+    original_connect = anyio.connect_tcp
+
+    async def resolve(_):
+        return [PUBLIC_IP, "1.1.1.1"]
+
+    async def serve(reader, writer):
+        try:
+            headers = await reader.readuntil(b"\r\n\r\n")
+            length = int(
+                next(
+                    line.split(b":", 1)[1]
+                    for line in headers.split(b"\r\n")
+                    if line.lower().startswith(b"content-length:")
+                )
+            )
+            bodies.append(await reader.readexactly(length))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    async def connect(*args, **kwargs):
+        connected.append(kwargs["remote_host"])
+        if len(connected) == 1:
+            await asyncio.sleep(10)  # Cancelled by httpcore's connect deadline.
+        return await original_connect(remote_host="127.0.0.1", remote_port=port)
+
+    monkeypatch.setattr(
+        "xagent.core.utils.public_http_transport.validate_public_http_url", resolve
+    )
+    monkeypatch.setattr(anyio, "connect_tcp", connect)
+    async with (
+        server,
+        httpx.AsyncClient(transport=PublicHttpTransport(), timeout=0.8) as client,
+    ):
+        async with asyncio.timeout(0.8):
+            response = await client.post("http://public.test/", content=b"one-write")
+    assert response.text == "OK"
+    assert connected == [PUBLIC_IP, "1.1.1.1"]
+    assert bodies == [b"one-write"]
 
 
 @pytest.mark.parametrize(

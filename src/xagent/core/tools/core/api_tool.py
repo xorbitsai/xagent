@@ -360,7 +360,8 @@ class APIClientCore:
 
         # HTTPX converts URL userinfo into Basic auth before transport dispatch,
         # so reject it before that normalization can hide the policy violation.
-        if urlparse(url).username is not None or urlparse(url).password is not None:
+        parsed_url = urlparse(url)
+        if parsed_url.username is not None or parsed_url.password is not None:
             return {
                 "success": False,
                 "status_code": 0,
@@ -429,9 +430,7 @@ class APIClientCore:
 
         # Attempt request with retries
         last_error = None
-        attempts_made = 0
         for attempt in range(retry_count + 1):
-            attempts_made += 1
             try:
                 result = await self._make_request(
                     url=url,
@@ -494,7 +493,7 @@ class APIClientCore:
             "status_code": 0,
             "headers": {},
             "body": None,
-            "error": f"Request failed after {attempts_made} attempts: {last_error}",
+            "error": f"Request failed after {attempt + 1} attempts: {last_error}",
         }
 
     async def _make_request(

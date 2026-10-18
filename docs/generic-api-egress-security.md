@@ -24,6 +24,8 @@ policies; production egress controls are still necessary.
   `XAGENT_TRUSTED_EGRESS_PROXY=1` opt-in permits the configured HTTP(S) proxy;
   every target is still checked locally, but the trusted proxy must enforce
   connect-time private-range restrictions because it performs its own DNS.
+  HTTPS proxies use the configured `SSL_CERT_FILE`/`SSL_CERT_DIR` CA bundle
+  for the proxy TLS hop as well as the destination TLS hop.
 - Reject URL userinfo, non-HTTP(S) URLs, port zero, and CONNECT tunnels.
 - Follow at most five redirects when redirects are enabled. A cross-origin hop
   is allowed only for a proven empty-body GET/HEAD. Even GET/HEAD bodies are
@@ -53,6 +55,9 @@ to a mixture of public and private IPs. It deliberately fails closed. It uses
 validated public addresses in order, falling back only for connect failures
 before the API body is sent, never for read/write failures. Network routing, NAT, and firewall policy cannot be
 proven safe by Python IP classification alone.
+The remaining connect budget is divided among untried addresses, including
+timeout failures, so a black-holed first address does not consume the entire
+attempt deadline. DNS time is charged to that same budget.
 
 ## Verification
 

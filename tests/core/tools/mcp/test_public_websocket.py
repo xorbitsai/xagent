@@ -30,7 +30,20 @@ async def test_invalid_websocket_destinations_never_connect(url, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_websocket_pins_ip_keeps_tls_name_and_preserves_protocol(monkeypatch):
+@pytest.mark.parametrize(
+    "configured_url, expected_url, hostname",
+    [
+        ("wss://example.com:8443/mcp", "wss://example.com:8443/mcp", "example.com"),
+        (
+            "wss://faß.example:8443/mcp",
+            "wss://xn--fa-hia.example:8443/mcp",
+            "xn--fa-hia.example",
+        ),
+    ],
+)
+async def test_websocket_pins_ip_keeps_tls_name_and_preserves_protocol(
+    monkeypatch, configured_url, expected_url, hostname
+):
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
@@ -59,17 +72,17 @@ async def test_websocket_pins_ip_keeps_tls_name_and_preserves_protocol(monkeypat
             pass
 
     monkeypatch.setattr(transport, "_NoRedirectConnect", FakeWebSocket)
-    async with transport.public_websocket_client("wss://example.com:8443/mcp") as (
+    async with transport.public_websocket_client(configured_url) as (
         read,
         _,
     ):
         message = await asyncio.wait_for(read.receive(), 1)
         assert message.message.root.id == 1
     url, kwargs = options[0]
-    assert url == "wss://example.com:8443/mcp"
+    assert url == expected_url
     assert kwargs["host"] == "93.184.216.34"
     assert kwargs["port"] == 8443
-    assert kwargs["server_hostname"] == "example.com"
+    assert kwargs["server_hostname"] == hostname
     assert kwargs["proxy"] is None
     assert kwargs["subprotocols"] == ["mcp"]
     assert closed == [True]

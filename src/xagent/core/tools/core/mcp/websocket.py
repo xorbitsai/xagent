@@ -16,9 +16,14 @@ from mcp.types import JSONRPCMessage
 from pydantic import ValidationError
 from websockets.asyncio.client import connect
 from websockets.typing import Subprotocol
+from yarl import URL
 
 from ....utils.public_network_proxy import PublicNetworkEgressProxy
-from ....utils.security import build_ca_bundle_ssl_context, validate_public_http_url
+from ....utils.security import (
+    build_ca_bundle_ssl_context,
+    public_http_destination,
+    validate_public_http_url,
+)
 from ..web_content import get_trusted_proxy_url
 
 
@@ -86,14 +91,18 @@ async def public_websocket_client(
     http_url = urlunsplit(
         parsed._replace(scheme="https" if parsed.scheme == "wss" else "http")
     )
+    hostname, port = public_http_destination(http_url)
+    # websockets uses stdlib IDNA2003 for an IRI, whereas our DNS validator
+    # uses IDNA/UTS46. Canonicalize before the handshake so Host, SNI, and
+    # proxy CONNECT all refer to the same checked name (e.g. faß != fass).
+    url = str(URL(url))
     addresses = await validate_public_http_url(http_url)
-    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
     read_writer, read_stream = anyio.create_memory_object_stream[
         SessionMessage | Exception
     ](0)
     write_stream, write_reader = anyio.create_memory_object_stream[SessionMessage](0)
     tls_kwargs: dict[str, Any] = (
-        {"ssl": build_ca_bundle_ssl_context(), "server_hostname": parsed.hostname}
+        {"ssl": build_ca_bundle_ssl_context(), "server_hostname": hostname}
         if parsed.scheme == "wss"
         else {}
     )

@@ -727,7 +727,10 @@ def test_sdk_file_input_tool_output_and_download(shared_app):
     downloaded = app.client.get(f"/api/files/download/{output_id}", headers=app.headers)
     assert downloaded.status_code == 200, downloaded.text
     assert downloaded.content == b"UNIQUE SHARED INPUT\n"
-    assert app.client.get(f"/api/files/download/{output_id}").status_code == 403
+    # Modern HTTPBearer reports missing credentials as 401, not forbidden.
+    denied = app.client.get(f"/api/files/download/{output_id}")
+    assert denied.status_code == 401
+    assert denied.headers["www-authenticate"] == "Bearer"
 
 
 @pytest.mark.parametrize("fault", ["web_exit", "worker_kill", "worker_sigterm"])

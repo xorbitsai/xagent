@@ -126,3 +126,16 @@ async def test_guest_network_policy_uses_native_box_options(
         assert options.advanced is None
     else:
         assert options.network is None
+
+
+@pytest.mark.asyncio
+async def test_isolated_guest_rejects_published_ports_before_creation(
+    service_and_runtime,
+):
+    service, runtime, _, metadata = service_and_runtime
+    with pytest.raises(ValueError, match="Published ports.*isolated"):
+        await service.get_or_create(
+            metadata.name,
+            config=SandboxConfig(network_isolated=True, ports=[(8080, 80)]),
+        )
+    runtime.get_or_create.assert_not_awaited()

@@ -1,79 +1,82 @@
 # CASA dependency remediation scope
 
-This round upgrades the compatible official fixes in the Python lockfile and
-retains dependencies without a compatible official remediation. It does not
-claim a clean vulnerability scan or certify a deployed image.
+The frozen Python graph includes compatible official security fixes and retains
+dependencies without a compatible official remediation. A lockfile is not a
+clean vulnerability scan or certification of a deployed image.
 
-## Changes
+## Dependency policy
 
-- Upgrade the resolved FastAPI/Starlette, MCP, LangChain, document-processing,
-  cryptography and other affected dependency chains. Raise the declared
-  runtime, optional-extra and sandbox/test-group security floors as well, so
-  wheel metadata does not continue advertising the old vulnerable direct
-  versions. Declare the directly imported LangChain Core and Starlette with
-  their tested floors instead of relying on permissive transitive bounds.
-- Remove unused test-only CopilotKit and LangGraph prebuilt declarations that
-  constrained the web framework and LangChain upgrades. Application features
-  do not import either package.
-- Import `BaseTool` directly from `langchain_core.tools`; remove the unused
-  top-level `langchain` dependency and the LangGraph runtime chain it pulled in.
-  This import is a dependency cleanup, not a claim that LangChain 1.x stopped
-  exporting `BaseTool`.
-- Keep the supported OpenAI 2.x and Xinference 2.x client contracts, and retain
-  SQLAlchemy 2.0.47 rather than introducing an unrelated database major change.
-- Align the type-checking MCP dependency with the runtime security floor.
-- Require wheel availability on Linux x86_64 and macOS ARM during resolution.
-  BoxLite 0.10.6 lacks a Linux/Python 3.12 wheel; select the complete official
-  0.10.7 release and check the frozen Linux installation plan too.
-- Support the BoxLite 0.10 async `SimpleBox.info()` / native `Box.info()` API.
-  Use `NetworkSpec` with inbound and outbound networking disabled for isolated
-  guests, not `SecurityOptions.network_enabled` (a host-side sandbox setting).
-  Bound BoxLite to `>=0.10.7,<0.11` and cover creation, reuse, metadata recovery
-  and native network-option construction with tests that do not require KVM.
-  These SDK contract tests do not replace a real KVM/VM isolation test.
-- Requests' floor follows the patched Docling Core requirement, not an adapter
-  introduced by another PR. Websockets remains at the original locked 16.0;
-  the temporary broad-refresh downgrade to 15.0.1 is not part of this graph.
+- Direct requirements, optional extras, sandbox groups and runtime sandbox
+  installers carry reviewed security floors. Direct imports such as LangChain
+  Core and Starlette have explicit requirements. The floor contract accepts
+  higher minimums and exact audited pins; it is not an advisory database.
+- `BaseTool` comes from `langchain_core.tools`. Unused top-level LangChain,
+  CopilotKit and LangGraph-prebuilt requirements are absent; application
+  features do not import them.
+- JSON repair is pinned to `0.64.0` to stabilize tool-argument repair behavior.
+  Updating that pin requires the malformed/streamed tool-argument regressions,
+  not just a successful dependency resolution.
+- OpenAI 2.x, Xinference 2.x and SQLAlchemy 2.0 contracts remain supported.
+- Resolution requires wheels on Linux x86_64 and macOS ARM. BoxLite is bounded
+  to `>=0.10.7,<0.11`; 0.10.6 lacks a Linux/Python 3.12 wheel.
+
+### Larger version transitions
+
+- Unstructured `0.27.28` is the reviewed security baseline, not a transitive
+  resolver requirement or a claim about the smallest fix. The old 0.18 line
+  predates the official [URL-partition SSRF fix in 0.24.0](https://github.com/Unstructured-IO/unstructured/security/advisories/GHSA-4mvj-m6j5-pmf7)
+  and [HTML-output XSS fix in 0.24.1](https://github.com/Unstructured-IO/unstructured/security/advisories/GHSA-v5mq-3xhg-98m9).
+  Its use still requires application-level input/output boundaries.
+- Wrapt `2.5.1` satisfies Unstructured 0.27.28's `>=2.1.1,<3.0.0` requirement;
+  the former 1.17 selection cannot satisfy that constraint. 2.5.1 is the locked
+  selection, not the minimum version required by Unstructured.
+- LangSmith `0.14.11` satisfies LangChain Core 1.6.12's `>=0.14.9,<1.0.0`
+  requirement; the former 0.3 selection cannot satisfy it.
+
+The exact dependency constraints can be reproduced from the published metadata:
+[Unstructured 0.27.28](https://pypi.org/pypi/unstructured/0.27.28/json),
+[LangChain Core 1.6.12](https://pypi.org/pypi/langchain-core/1.6.12/json).
 
 ## Lockfile scope
 
-The initial broad resolution changed 235 existing package names and produced
-6,285 added / 4,132 removed lockfile lines. The narrowed resolution starts from
-the original committed lock and targets the 45 security-affected packages
-that were upgraded in that initial candidate, retaining their previously
-audited fixed versions. Other original selections remain preferred unless the
-patched graph requires a compatible change. This is not a blanket upgrade.
-
-After removing the unused LangChain/LangGraph chain, the narrowed graph changes
-64 existing package names and produces 1,969 added / 1,360 removed lockfile
-lines. Mypy, Ruff, pre-commit, Google GenAI, boto3 and
-SQLAlchemy retain their original locked versions. The remaining changes also
-include required framework/parser/SDK dependency chains and platform wheel
-metadata; the lock is still generated and checked by uv, not edited by hand.
-These are package-name and generated-line counts, not vulnerability counts or
-a claim that every selected security release is the oldest possible fix.
-
-The four reviewed SDK pins in the mypy hook now match the narrowed runtime:
-Slack SDK 3.43.0, Google GenAI 1.66.0, ElevenLabs 2.56.0 and Google Auth 2.48.0.
-The hook deliberately retains NumPy 1.26.4 for Python 3.11 stub parsing; it is
-not the runtime's NumPy 2.4.6. That existing type-checker exception is not a
-runtime dependency downgrade.
+The lock is generated and checked by uv. Security upgrades include required
+framework/parser/SDK dependency chains and platform wheel metadata; unrelated
+tooling and SDK selections are not blanket-refreshed. The mypy hook has its
+own pinned SDK environment and uses NumPy 1.26.4 for Python 3.11 stub parsing,
+not the runtime's NumPy 2.4.6. That type-checker exception is not a runtime
+dependency downgrade.
 
 The declared floors cover the reviewed direct requirements, not a promise
 that every future independent pip resolution has a clean transitive graph.
 Use the frozen lock for the audited deployment graph; wheel consumers must
 audit their resolved environment as well. Retained findings below still apply.
 
-The all-extras/groups Python 3.12 audit retains exactly the same six affected
-package names and advisory IDs as the broader candidate, without advisory
-ignores. Linux/Python 3.12 frozen installation planning also passes; a dry run
-does not replace a Linux runtime/image test. Each changed graph still needs
-the normal CI and deployed acceptance checks below.
+Linux/Python 3.12 frozen installation planning does not replace a Linux
+runtime/image test. Frontend dependencies need their own audit; Python scans
+do not cover them.
 
-The separate frontend dependency work retains the existing braces chain:
-there is no official patched release in the reviewed advisory. It does not
-replace the library, add a local backport, delete functionality or suppress
-audit output.
+## Runtime acceptance and follow-ups
+
+BoxLite 0.10 metadata APIs are asynchronous. Isolated guests use `NetworkSpec`
+with inbound and outbound disabled, not host-side `SecurityOptions`.
+Published ports plus isolated guest networking fail before VM creation.
+Creation, reuse and metadata recovery have SDK contract tests, but those do
+not prove native VM execution, file transfer or network isolation. Compare
+the base and upgraded SDK with the same image digests on a working VM host;
+registry/network failures are not compatibility evidence. Deployment requires
+the native suite and an actual isolated-guest egress check to pass.
+
+BoxLite honors the sandbox image's non-root `USER`. Guest file operations must
+target an authorized writable directory or workspace mount, not `/root`.
+Standalone callers overriding the image working directory (including the
+shared `SandboxConfig` default `/home`) must provide a writable mount/directory
+for relative writes. Do not add a root-user fallback to restore root-only paths.
+
+MCP's `streamablehttp_client` remains a supported deprecated compatibility API
+in 1.30. Its migration to `streamable_http_client` is a tracked follow-up:
+preserve custom client-factory ownership, auth/headers, connect/read timeouts
+and cancellation/close semantics in transport tests before removing it. It
+is not a remaining security-floor exception.
 
 ## Retained findings
 

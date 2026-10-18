@@ -82,7 +82,7 @@ dependencies = [
   "google-cloud-pubsub>=2.21.0",
   # Utilities
   "docker>=7.1.0",
-  "json-repair>=0.60.1,<1",
+  "json-repair==0.64.0",  # Preserve audited tool-argument repair behavior
   "jsonschema>=4.25.1",
   "beartype>=0.18.5",
   "matplotlib>=3.5.0",
@@ -239,6 +239,7 @@ dev = [
 # Testing dependencies
 test = [
   "bashlex>=0.18",
+  "packaging>=25.0",
   "pytest>=9.1.1",
   "pytest-mock>=3.14.1",
   "pytest-cov>=6.2.1",
@@ -352,7 +353,6 @@ module = [
   "jieba",
   "json_repair",
   "langchain_core.*",
-  "langchain.*",
   "alembic",
   "alembic.*",
   "xinference",

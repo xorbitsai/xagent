@@ -1,9 +1,10 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { act, cleanup, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { IsolatedHtmlPreview, resolveHtmlPreviewRunnerUrl } from "./isolated-html-preview"
+import { resolveHtmlPreviewRunnerUrl } from "../../../html-preview-config.mjs"
+import { IsolatedHtmlPreview } from "./isolated-html-preview"
 
 const env = "NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN"
 const ready = { type: "xagent-html-preview-ready", version: 1 }
@@ -109,18 +110,28 @@ describe("IsolatedHtmlPreview", () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it.each(["timeout", "error"])("falls back safely on runner %s", failure => {
+  it("falls back safely when the runner does not become ready", () => {
     vi.stubEnv(env, "https://preview.example.test")
     render(<IsolatedHtmlPreview html="<p>fallback</p>" title="fallback" />)
     const oldFrame = screen.getByTitle("fallback")
-    if (failure === "timeout") act(() => vi.advanceTimersByTime(8_000))
-    else fireEvent.error(oldFrame)
+    const oldWindow = (oldFrame as HTMLIFrameElement).contentWindow!
+    const oldPost = vi.spyOn(oldWindow, "postMessage")
+    act(() => vi.advanceTimersByTime(8_000))
     const frame = screen.getByTitle("fallback")
     expect(frame).not.toBe(oldFrame)
     expect(frame).toHaveAttribute("srcdoc", "<p>fallback</p>")
     expect(frame).toHaveAttribute("sandbox", "allow-scripts")
     expect(frame).not.toHaveAttribute("src")
     expect(vi.getTimerCount()).toBe(0)
+    send(oldWindow)
+    expect(oldPost).not.toHaveBeenCalled()
+  })
+
+  it("uses srcdoc for auto mode on an unknown app host", () => {
+    dom.reconfigure({ url: "https://customer.example.test" })
+    vi.stubEnv(env, "auto")
+    render(<IsolatedHtmlPreview html="<p>fallback</p>" title="unknown" />)
+    expect(screen.getByTitle("unknown")).toHaveAttribute("srcdoc", "<p>fallback</p>")
   })
 
   it("uses a fresh browsing context and never delivers new HTML to an outgoing document", () => {

@@ -21,15 +21,25 @@ def _preview_origins() -> list[str]:
         url = urlsplit(configured)
         if url.username or url.password or not url.hostname:
             return []
-        host = url.hostname.encode("idna").decode("ascii").lower()
+        raw_host = url.hostname.lower()
+        if url.netloc.startswith("[") and ":" not in raw_host:
+            # Reject bracketed IPvFuture/hostname spellings; CSP would treat
+            # the de-bracketed value as an ordinary host source.
+            return []
         if url.scheme != "https" and not (
-            url.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"}
+            url.scheme == "http" and raw_host in {"localhost", "127.0.0.1", "::1"}
         ):
             return []
-        if ":" in host:
-            host = f"[{ipaddress.IPv6Address(host).compressed}]"
-        elif not re.fullmatch(r"[a-z0-9.-]+", host):
-            return []
+        if ":" in raw_host:
+            # Python 3.11 accepts scoped IPv6 addresses. A scope identifier is
+            # not a valid CSP host source and may contain CSP delimiters.
+            if not re.fullmatch(r"[0-9a-f:]+", raw_host):
+                return []
+            host = f"[{ipaddress.IPv6Address(raw_host).compressed}]"
+        else:
+            host = raw_host.encode("idna").decode("ascii")
+            if not re.fullmatch(r"[a-z0-9.-]+", host):
+                return []
         port = url.port
         suffix = (
             f":{port}"

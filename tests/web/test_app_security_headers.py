@@ -171,6 +171,9 @@ def test_production_middleware_and_frontend_mount_share_one_page_policy(
         ("http://preview.example.test", []),
         ("https://user:pass@preview.example.test", []),
         ("https://preview.example.test;evil", []),
+        ("https://[fe80::1%25x * y]", []),
+        ("https://[fe80::1%25a;script-src *]", []),
+        ("https://[v1.evil.example]", []),
         ("https://preview.example.test:invalid", []),
         ("https://preview.example.test/", ["https://preview.example.test"]),
         (

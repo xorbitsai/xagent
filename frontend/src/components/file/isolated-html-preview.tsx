@@ -3,8 +3,6 @@
 import React from "react"
 import { resolveHtmlPreviewRunnerUrl } from "../../../html-preview-config.mjs"
 
-export { resolveHtmlPreviewRunnerUrl } from "../../../html-preview-config.mjs"
-
 const PREVIEW_READY_MESSAGE = "xagent-html-preview-ready"
 const PREVIEW_RENDER_MESSAGE = "xagent-html-preview-render"
 const PREVIEW_PROTOCOL_VERSION = 1
@@ -25,36 +23,30 @@ function PreviewDocument({ html, title, className, runnerUrl }: IsolatedHtmlPrev
     if (!runnerUrl || failed) return
     const frame = iframeRef.current
     if (!frame) return
-    let active = true
-    let delivered = false
-    const onError = () => setFailed(true)
     const timer = window.setTimeout(() => setFailed(true), READY_TIMEOUT_MS)
     const onMessage = (event: MessageEvent<unknown>) => {
-      if (!active || delivered || event.source !== frame.contentWindow || event.origin !== "null") return
+      if (event.source !== frame.contentWindow || event.origin !== "null") return
       const data = event.data
       if (!data || typeof data !== "object"
         || (data as { type?: unknown }).type !== PREVIEW_READY_MESSAGE
         || (data as { version?: unknown }).version !== PREVIEW_PROTOCOL_VERSION) return
 
-      delivered = true
       window.clearTimeout(timer)
       window.removeEventListener("message", onMessage)
       setReady(true)
       // An opaque sandbox requires "*". Pin the exact, fresh frame window;
-      // never send credentials or deliver a second document to a used runner.
+      // deliver only once. Do not add ambient app credentials here; generated
+      // HTML may already contain file-scoped access tokens from its policy.
       frame.contentWindow?.postMessage({
         type: PREVIEW_RENDER_MESSAGE, version: PREVIEW_PROTOCOL_VERSION, html,
       }, "*")
     }
     window.addEventListener("message", onMessage)
-    frame.addEventListener("error", onError)
     // Register before navigating, so an immediately ready runner is not lost.
     frame.src = runnerUrl
     return () => {
-      active = false
       window.clearTimeout(timer)
       window.removeEventListener("message", onMessage)
-      frame.removeEventListener("error", onError)
     }
   }, [html, runnerUrl, failed])
 
@@ -73,11 +65,25 @@ function PreviewDocument({ html, title, className, runnerUrl }: IsolatedHtmlPrev
 
 export function IsolatedHtmlPreview(props: IsolatedHtmlPreviewProps) {
   const configured = process.env.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN?.trim()
-  const [browserOrigin, setBrowserOrigin] = React.useState<string>()
-  React.useEffect(() => setBrowserOrigin(window.location.origin), [])
-  const runnerUrl = resolveHtmlPreviewRunnerUrl(configured, browserOrigin)
-  if (!props.html || (configured === "auto" && !browserOrigin)) return null
+  const [browserContext, setBrowserContext] = React.useState<{
+    origin: string
+    embedded: boolean
+  }>()
+  React.useEffect(() => setBrowserContext({
+    origin: window.location.origin,
+    // The runner permits only the app origin in frame-ancestors. If the app
+    // itself is embedded, every ancestor must be allowed, so retain srcdoc.
+    embedded: window.top !== window.self,
+  }), [])
+  const runnerUrl = browserContext?.embedded
+    ? null
+    : resolveHtmlPreviewRunnerUrl(configured, browserContext?.origin)
+  const generation = React.useRef({ html: "", runnerUrl: null as string | null, key: 0 })
+  if (generation.current.html !== props.html || generation.current.runnerUrl !== runnerUrl) {
+    generation.current = { html: props.html, runnerUrl, key: generation.current.key + 1 }
+  }
+  if (!props.html || !browserContext) return null
   // A different document/config gets a new browsing context, not the previous
   // document's persistent WindowProxy. No hash or cache-busting URL is needed.
-  return <PreviewDocument key={JSON.stringify([runnerUrl, props.html])} {...props} runnerUrl={runnerUrl} />
+  return <PreviewDocument key={generation.current.key} {...props} runnerUrl={runnerUrl} />
 }

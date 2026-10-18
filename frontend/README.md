@@ -105,16 +105,21 @@ Real-time communication with the FastAPI backend for live updates.
   Set an HTTPS origin (HTTP is allowed only on localhost/127.0.0.1/[::1] for development)
   to load its `/render` runner; any configured path/query/fragment is discarded. Use `auto` for the XAgent SaaS
   mapping (`cloud.xagent.co` to `preview.xagent.co`, stage/dev to
-  `preview-stage.xagent.co` / `preview-dev.xagent.co`). Unset/invalid settings, load errors, or an 8-second ready timeout use
+  `preview-stage.xagent.co` / `preview-dev.xagent.co`). Unset/invalid settings or an 8-second ready timeout use
   the scripts-only opaque `srcDoc` fallback. The serving CSP must permit the
   runner in `frame-src`: Next includes the build setting; packaged/static
   serving needs the same variable at backend runtime (and custom proxies must
-  match). Docker accepts a build argument; official publish/nightly workflows
-  use the repository variable of the same name, defaulting to disabled.
+  match). Docker accepts a build argument. Nightly builds use the repository
+  variable of the same name, defaulting to disabled; the official PyPI wheel is
+  built with the runner disabled and needs a custom frontend build to enable it.
   Setting a runtime variable on an already-built frontend does not enable it.
   The separate runner is not shipped or deployed by this repository. It must
   implement the `/render` ready/render v1 protocol described in
   [HTML preview security](../docs/html-preview-security.md).
+  Embedded widget/share pages retain `srcDoc`, because the managed runner's
+  exact `frame-ancestors` policy cannot authorize an arbitrary outer customer
+  site. Static quoted `src`/`href` assets are rewritten; other relative URL
+  syntaxes and runtime-constructed URLs must be absolute or inlined.
 
 ### Backend Integration
 

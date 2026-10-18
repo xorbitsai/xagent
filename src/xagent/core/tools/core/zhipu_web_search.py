@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional, cast
 
 import httpx
 
-from ...model.public_http import create_public_model_async_client
+from ...utils.public_http_transport import create_public_async_client
+from .web_content import get_trusted_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,9 @@ class ZhipuWebSearchCore:
         }
 
         try:
-            async with create_public_model_async_client() as client:
+            async with create_public_async_client(
+                proxy_url=get_trusted_proxy_url()
+            ) as client:
                 response = await client.post(
                     url, json=payload, headers=headers, timeout=15
                 )

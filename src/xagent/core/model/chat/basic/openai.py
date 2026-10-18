@@ -2038,6 +2038,7 @@ class OpenAICompatibleLLM(BaseLLM):
             base_url=base_url if base_url != "https://api.openai.com/v1" else None,
             api_key=api_key,
             timeout=30.0,
+            max_retries=0,
         )
 
         try:

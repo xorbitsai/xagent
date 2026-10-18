@@ -7,6 +7,7 @@ from typing import Any
 import aiohttp
 import httpx
 
+from ...config import get_trusted_egress_proxy_enabled
 from ..tools.core.web_content import get_trusted_proxy_url
 from ..utils.public_aiohttp import create_public_aiohttp_session
 from ..utils.public_http_transport import (
@@ -18,18 +19,43 @@ from ..utils.public_http_transport import (
 from ..utils.security import PrivateNetworkHostError
 from .network_policy import ModelNetworkPolicy
 
+_PENDING_CLOSES: set[asyncio.Task[None]] = set()
+
+
+def get_model_proxy_url() -> str | None:
+    """Ignore ambient proxies unless the deployment explicitly opts in."""
+    return get_trusted_proxy_url() if get_trusted_egress_proxy_enabled() else None
+
+
+def close_async_client_on_error(client: httpx.AsyncClient) -> None:
+    async def close() -> None:
+        try:
+            await client.aclose()
+        except Exception:
+            # Cleanup must not replace the original constructor failure.
+            pass
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(close())
+    else:
+        task = loop.create_task(close())
+        _PENDING_CLOSES.add(task)
+        task.add_done_callback(_PENDING_CLOSES.discard)
+
 
 def create_public_model_async_client(**kwargs: Any) -> httpx.AsyncClient:
     kwargs.setdefault("follow_redirects", True)
     return create_public_async_client(
-        proxy_url=get_trusted_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
+        proxy_url=get_model_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
     )
 
 
 def create_public_model_sync_client(**kwargs: Any) -> httpx.Client:
     kwargs.setdefault("follow_redirects", True)
     return create_public_sync_client(
-        proxy_url=get_trusted_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
+        proxy_url=get_model_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
     )
 
 
@@ -37,7 +63,7 @@ def public_model_http_client_options(*, asynchronous: bool) -> dict[str, Any]:
     return {
         **public_http_client_options(
             asynchronous=asynchronous,
-            proxy_url=get_trusted_proxy_url(),
+            proxy_url=get_model_proxy_url(),
             _policy=ModelNetworkPolicy(),
         ),
         "follow_redirects": True,
@@ -46,7 +72,7 @@ def public_model_http_client_options(*, asynchronous: bool) -> dict[str, Any]:
 
 def create_public_model_aiohttp_session(**kwargs: Any) -> aiohttp.ClientSession:
     return create_public_aiohttp_session(
-        proxy_url=get_trusted_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
+        proxy_url=get_model_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
     )
 
 
@@ -59,12 +85,18 @@ def create_owned_async_sdk_client(
     except BaseException:
         # Construction is synchronous but close is asynchronous. Preserve
         # ownership even when a constructor rejects configuration before use.
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(http_client.aclose())
-        else:
-            loop.create_task(http_client.aclose())
+        close_async_client_on_error(http_client)
+        raise
+
+
+def create_owned_sync_sdk_client(
+    factory: Callable[..., Any], *, timeout: Any, **kwargs: Any
+) -> Any:
+    http_client = create_public_model_sync_client(timeout=timeout)
+    try:
+        return factory(http_client=http_client, timeout=timeout, **kwargs)
+    except BaseException:
+        http_client.close()
         raise
 
 

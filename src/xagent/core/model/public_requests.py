@@ -3,11 +3,8 @@
 from typing import Any
 
 from ..utils import public_requests as _requests
-from ..utils.public_requests import ConnectionError as ConnectionError
 from ..utils.public_requests import HTTPError as HTTPError
-from ..utils.public_requests import RequestException as RequestException
 from ..utils.public_requests import Response as Response
-from ..utils.public_requests import Timeout as Timeout
 from ..utils.public_requests import exceptions as exceptions
 from .network_policy import ModelNetworkPolicy
 

@@ -108,12 +108,13 @@ class TestNoNestedRetryBudget:
 
         assert captured["max_retries"] == 0
 
-    async def test_one_shot_model_listing_keeps_its_own_retries(self, monkeypatch):
-        """``list_available_models`` is not inside our wrapper.
-
-        It runs one request with no outer retry layer, so the SDK's budget is
-        the only resilience it has and must be left alone. Asserted on the
-        kwargs the constructor actually receives, not on the source text.
+    async def test_model_listing_does_not_retry_terminal_policy_denials(
+        self, monkeypatch
+    ):
+        """Catalog reads now use a guarded transport too. SDK connection-error
+        retrying would retry terminal policy denials, so the one-shot listing
+        deliberately disables it. Transient catalog failures reach the caller.
+        Assert the actual constructor argument, not the source text.
         """
         captured = self._captured_kwargs(
             monkeypatch, "xagent.core.model.chat.basic.openai.AsyncOpenAI"
@@ -122,7 +123,7 @@ class TestNoNestedRetryBudget:
         await OpenAICompatibleLLM.list_available_models("sk-test")
 
         assert captured, "the SDK client was never constructed"
-        assert "max_retries" not in captured
+        assert captured["max_retries"] == 0
 
 
 class TestTransientFaultsUnchanged:

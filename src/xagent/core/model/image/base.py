@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Awaitable, Callable, List, Optional
 
+from ..public_http import is_model_network_policy_error
+
 # NOT a claim that these providers edit across their lineup -- xinference defaults
 # to stable-diffusion-2-1 and raises unless the backend exposes image_to_image, and
 # openai's advertised DALL-E 3 cannot serve images.edit. It is the default both web
@@ -83,10 +85,10 @@ def invalid_response_from(
 
 
 def retry_image_call(e: Exception) -> bool:
-    """Retry anything except an already-billed response that cannot improve.
+    """Do not retry a policy refusal or an already-billed invalid response.
 
     Deliberately as permissive as ``create_retry_wrapper``'s own
-    ``lambda _: True`` default, minus one case. Gemini and DashScope flatten
+    ``lambda _: True`` default, except for those terminal failures. Providers flatten
     timeouts, network errors and 5xx into plain ``RuntimeError``, so a predicate
     narrow enough to name only transient types would stop retrying genuine
     transient failures -- a separate problem from this one, and not fixed by
@@ -100,10 +102,15 @@ def retry_image_call(e: Exception) -> bool:
     Retrying it multiplied both the provider bill and the recorded quantity by
     the retry count.
 
+    Network-policy denials (including wrapped SDK errors) are terminal and
+    happen before sending a billable request. Retrying cannot make them valid.
+
     Every retryable failure here is a genuinely separate billed call, so the
     per-attempt accounting the providers do stays correct.
     """
-    return not isinstance(e, InvalidImageResponseError)
+    return not isinstance(
+        e, InvalidImageResponseError
+    ) and not is_model_network_policy_error(e)
 
 
 def decode_billed_body(decode: Callable[[], Any], context: str) -> Any:

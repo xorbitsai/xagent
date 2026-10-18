@@ -991,22 +991,18 @@ def get_trusted_egress_proxy_enabled() -> bool:
     return _get_bool_env(TRUSTED_EGRESS_PROXY, False)
 
 
+def _csv_env(name: str) -> list[str]:
+    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
+
+
 def get_model_private_endpoints() -> list[str]:
     """Operator-only exact model origins, including scheme and port; default deny."""
-    return [
-        value.strip()
-        for value in os.getenv(MODEL_PRIVATE_ENDPOINTS, "").split(",")
-        if value.strip()
-    ]
+    return _csv_env(MODEL_PRIVATE_ENDPOINTS)
 
 
 def get_model_private_cidrs() -> list[str]:
     """Operator-only DNS address constraints for private model origins."""
-    return [
-        value.strip()
-        for value in os.getenv(MODEL_PRIVATE_CIDRS, "").split(",")
-        if value.strip()
-    ]
+    return _csv_env(MODEL_PRIVATE_CIDRS)
 
 
 def get_mcp_oauth_proxy_url() -> str | None:

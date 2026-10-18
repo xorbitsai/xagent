@@ -10,6 +10,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 import httpx
 
 from ...public_http import (
+    create_owned_sync_sdk_client,
     create_public_model_async_client,
     create_public_model_sync_client,
 )
@@ -152,8 +153,9 @@ class ZhipuLLM(BaseLLM):
                 raise RuntimeError(
                     "zai SDK is not installed. Please install it with: pip install zai-sdk"
                 )
-            self._client = ZhipuAiClient(
-                http_client=create_public_model_sync_client(timeout=self.timeout),
+            self._client = create_owned_sync_sdk_client(
+                ZhipuAiClient,
+                timeout=self.timeout,
                 api_key=self.api_key,
                 base_url=self.base_url,
                 # Retry policy lives in the shared RetryWrapper only. The zai

@@ -65,6 +65,16 @@ def _parts(url: str) -> tuple[str, str, int]:
 
 class ModelNetworkPolicy:
     def __init__(self) -> None:
+        try:
+            self._load_configuration()
+        except ValueError as exc:
+            # Invalid operator configuration is terminal too, not an SDK
+            # connection failure worth retrying. Do not echo configured URLs.
+            raise PrivateNetworkHostError(
+                "Invalid deployment model network policy configuration"
+            ) from exc
+
+    def _load_configuration(self) -> None:
         endpoints = get_model_private_endpoints()
         self.origins: frozenset[tuple[str, str, int]] = frozenset(
             _parts(url) for url in endpoints

@@ -15,7 +15,12 @@ class PublicXinferenceClient(RESTfulClient):  # type: ignore[no-any-unimported] 
     def __init__(self, base_url: str, api_key: str | None = None) -> None:
         self.session: Any = None
         ModelNetworkPolicy().destination(base_url)
-        super().__init__(base_url=base_url, api_key=api_key)
+        try:
+            super().__init__(base_url=base_url, api_key=api_key)
+        except BaseException:
+            if self.session is not None:
+                self.session.close()
+            raise
         if not isinstance(self.session, Session):
             self.close()
             raise RuntimeError("Unsupported Xinference SDK session contract")

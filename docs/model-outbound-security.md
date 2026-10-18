@@ -1,7 +1,9 @@
 # Managed model outbound policy
 
-This model migration (#3193) requires the transport API in #3191. It is not
-independently runnable before that prerequisite lands. No deployment is changed.
+This model migration (#3193) includes the missing policy/proxy API follow-up
+that was not present in #3191's squash merge. It is tested on this PR's own
+branch against merged main; no unmerged prerequisite is required. No deployment
+is changed.
 
 ## Operator-only private exceptions
 
@@ -36,6 +38,16 @@ not a substitute for the proxy policy. No ambient/OS proxy or per-request proxy
 override can silently disable the selected transport. Direct connections are
 pinned to checked addresses; normal TLS verification and CA settings remain.
 
+Upgrade note: all migrated model clients (HTTPX, aiohttp, Botocore and Requests)
+ignore untrusted ambient HTTP(S)_PROXY and connect directly when the trust switch
+is off. They do not fail construction merely because a corporate proxy is set,
+and they never implicitly trust it. Proxy-only deployments must explicitly set
+XAGENT_TRUSTED_EGRESS_PROXY=1 after checking the proxy's enforcement policy.
+NO_PROXY does not bypass that selected route. Web fetchers/MCP/tools can retain
+their stricter configured-but-untrusted proxy rejection policy; the model-only
+ignore behavior does not relax those callers. Zhipu web search uses a generic
+public client and does not receive private model exceptions.
+
 HTTPX-backed SDK clients follow redirects with a five-hop limit and the shared
 credential/body guard. Changed-origin body replay is refused. aiohttp model
 requests retain their stricter same-origin redirect policy. No model credentials
@@ -54,6 +66,10 @@ construction fails; OpenAI image exposes aclose/close. ElevenLabs retains explic
 ownership/cleanup, including constructor failure. Xinference SDK state and
 Botocore transport swapping are version-sensitive and have real-SDK contracts.
 Policy denials are non-retryable even if an SDK wraps them as connection errors.
+OpenAI model-catalog reads explicitly disable SDK retries too: unlike chat, this
+one-shot catalog path has no outer retry wrapper, so transient listing failures
+now return to the caller without SDK backoff. This avoids SDK connection-error
+retry logic retrying terminal destination-policy refusals.
 
 ## Explicitly deferred paths
 

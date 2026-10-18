@@ -6,13 +6,13 @@ import aiohttp
 import pytest
 import requests
 
+from xagent.core.model.public_requests import Session
 from xagent.core.model.public_xinference import (
     PublicAsyncXinferenceClient,
     PublicXinferenceClient,
 )
 from xagent.core.model.xinference_base import BaseXinferenceModel
 from xagent.core.utils.public_aiohttp import PublicTCPConnector
-from xagent.core.utils.public_requests import Session
 from xagent.core.utils.security import PrivateNetworkHostError
 
 MODEL_TYPES = [

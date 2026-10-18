@@ -4125,10 +4125,45 @@ class ConcurrentWaitingLLM:
         }
 
     async def wait_started(self, task: str) -> None:
-        await asyncio.wait_for(
-            self.started_by_task.setdefault(task, asyncio.Event()).wait(),
-            timeout=1,
-        )
+        await self.started_by_task.setdefault(task, asyncio.Event()).wait()
+
+
+async def _release_waiting_dag_after_all_steps_start(
+    run_task: asyncio.Task[dict[str, Any]],
+    llm: ConcurrentWaitingLLM,
+    step_ids: tuple[str, ...],
+    *,
+    timeout: float = 10,
+) -> dict[str, Any]:
+    """Synchronize on readiness, with one bounded fixture watchdog.
+
+    Startup can include cold imports/checkpoint work on a loaded worker; it
+    is not a one-second performance contract. Neither step may finish its
+    fake LLM call until every participant has reached the shared barrier.
+    """
+    started = asyncio.gather(
+        *(llm.wait_started(f"Ask {step_id}") for step_id in step_ids)
+    )
+    try:
+        async with asyncio.timeout(timeout):
+            done, _ = await asyncio.wait(
+                (run_task, started), return_when=asyncio.FIRST_COMPLETED
+            )
+            if run_task in done:
+                # Surface an early runner error, rather than masking it with
+                # a later readiness timeout or leaving an orphaned task.
+                await run_task
+                raise AssertionError(
+                    "DAG returned before all steps reached the barrier"
+                )
+            await started
+            llm.release.set()
+            return await run_task
+    finally:
+        for task in (run_task, started):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(run_task, started, return_exceptions=True)
 
 
 async def run_double_waiting_dag(
@@ -4158,11 +4193,76 @@ async def run_double_waiting_dag(
             runtime=runtime,
         )
     )
-    await llm.wait_started(f"Ask {first_step_id}")
-    await llm.wait_started(f"Ask {second_step_id}")
-    llm.release.set()
-    result = await asyncio.wait_for(run_task, timeout=1)
+    result = await _release_waiting_dag_after_all_steps_start(
+        run_task, llm, (first_step_id, second_step_id)
+    )
     return pattern, result, tracer
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["early-error", "stall"])
+async def test_waiting_dag_fixture_cleans_up_on_failure(failure: str) -> None:
+    waiters: list[asyncio.Task[Any]] = []
+    runner_exited = asyncio.Event()
+
+    class RecordingWaitingLLM(ConcurrentWaitingLLM):
+        async def wait_started(self, task: str) -> None:
+            waiter = asyncio.current_task()
+            assert waiter is not None
+            waiters.append(waiter)
+            await super().wait_started(task)
+
+    async def run() -> dict[str, Any]:
+        try:
+            if failure == "early-error":
+                await asyncio.sleep(0)
+                raise RuntimeError("fixture-run-failure")
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+        finally:
+            runner_exited.set()
+
+    llm = RecordingWaitingLLM()
+    run_task = asyncio.create_task(run())
+    error = RuntimeError if failure == "early-error" else TimeoutError
+    with pytest.raises(
+        error, match="fixture-run-failure" if failure == "early-error" else None
+    ):
+        await _release_waiting_dag_after_all_steps_start(
+            run_task, llm, ("a", "b"), timeout=0.05
+        )
+
+    assert runner_exited.is_set()
+    assert run_task.done()
+    assert waiters and all(waiter.done() for waiter in waiters)
+    assert not llm.release.is_set()
+
+
+@pytest.mark.asyncio
+async def test_double_waiting_fixture_allows_slow_llm_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Readiness is a barrier, not a one-second performance assertion."""
+    original_chat = ConcurrentWaitingLLM.chat
+
+    async def delayed_chat(self: ConcurrentWaitingLLM, **kwargs: Any) -> dict[str, Any]:
+        if not has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            await asyncio.sleep(1.1)
+        return await original_chat(self, **kwargs)
+
+    monkeypatch.setattr(ConcurrentWaitingLLM, "chat", delayed_chat)
+    pattern, result, _ = await run_double_waiting_dag(
+        first_step_id="ask_a", second_step_id="ask_b"
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert result["active_step_id"] == "ask_a"
+    assert result["clarification_superseded_step_ids"] == ["ask_b"]
+    assert {step.id: step.status for step in pattern.plan.steps} == {
+        "ask_a": "running",
+        "ask_b": "clarification_invalidated",
+    }
+    assert pattern.has_live_step_tasks() is False
 
 
 @pytest.mark.asyncio
@@ -4476,10 +4576,7 @@ async def run_triple_waiting_dag(
             runtime=runtime,
         )
     )
-    for step_id in step_ids:
-        await llm.wait_started(f"Ask {step_id}")
-    llm.release.set()
-    result = await asyncio.wait_for(run_task, timeout=1)
+    result = await _release_waiting_dag_after_all_steps_start(run_task, llm, step_ids)
     return pattern, result, tracer
 
 

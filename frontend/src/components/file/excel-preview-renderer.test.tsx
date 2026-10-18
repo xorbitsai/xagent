@@ -180,6 +180,22 @@ describe("ExcelPreviewRenderer formula results", () => {
 describe("ExcelPreviewRenderer HTML safety", () => {
   afterEach(cleanup)
 
+  it("loads the patched SheetJS release rather than the stale npm registry version", () => {
+    // CVE-2023-30533 requires >=0.19.3; CVE-2024-22363 requires >=0.20.2.
+    const [major, minor, patch] = XLSX.version.split(".").map(Number)
+    expect(major > 0 || minor > 20 || (minor === 20 && patch >= 2)).toBe(true)
+  })
+
+  it("preserves literal XML entity text in hyperlink targets", () => {
+    const target = 'https://example.com/report?a="x"&name=&quot;literal&quot;&page=2'
+    const content = workbookContent({ Links: {
+      A1: { t: "s", v: "Report", l: { Target: target } },
+      "!ref": "A1",
+    } })
+    render(preview(content))
+    expect(screen.getByRole("link", { name: "Report" })).toHaveAttribute("href", target)
+  })
+
   it.each([false, true])("sanitizes cell values from real XLSX bytes (cached formula=%s)", (cached) => {
     const values = [
       '\"><img src=x onerror=alert(1)>',

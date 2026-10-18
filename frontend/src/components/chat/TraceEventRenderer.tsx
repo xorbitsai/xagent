@@ -1087,6 +1087,10 @@ const CopyButton = ({
 }) => {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
+  const copiedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (copiedTimeoutRef.current !== null) clearTimeout(copiedTimeoutRef.current);
+  }, []);
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation();
     const text = filesDisabled
@@ -1094,7 +1098,11 @@ const CopyButton = ({
       : formatActionContent(value);
     navigator.clipboard.writeText(text);
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    if (copiedTimeoutRef.current !== null) clearTimeout(copiedTimeoutRef.current);
+    copiedTimeoutRef.current = setTimeout(() => {
+      copiedTimeoutRef.current = null;
+      setCopied(false);
+    }, 2000);
   };
   return (
     <button

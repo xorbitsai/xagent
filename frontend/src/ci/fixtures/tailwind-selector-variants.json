@@ -1,0 +1,22 @@
+[
+  "group-hover:block",
+  "group-focus-within:opacity-100",
+  "group-hover/card:scale-110",
+  "group-hover:space-x-2",
+  "peer-checked:block",
+  "peer-focus:border-red-500",
+  "peer-disabled:cursor-not-allowed",
+  "peer-checked/toggle:text-green-600",
+  "peer-checked:divide-x-2",
+  "group-[.is-open]:block",
+  "peer-[.is-dirty]:block",
+  "group-[:nth-of-type(3)_&]:block",
+  "peer-[:nth-of-type(3)_&]:text-red-500",
+  "[&>button]:hidden",
+  "[&>button]:space-y-2",
+  "[&:nth-child(2)]:text-red-500",
+  "hover:[&>svg]:block",
+  "group-hover:[&>svg]:opacity-100",
+  "group-hover:[&_a]:underline",
+  "group-hover:peer-checked:font-bold"
+]

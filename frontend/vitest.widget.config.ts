@@ -4,7 +4,7 @@ import baseConfig from "./vitest.config"
 const widgetConfig = mergeConfig(baseConfig, defineConfig({
   test: {
     coverage: {
-      provider: "v8",
+      provider: "istanbul",
       include: [
         "public/widget.js",
         "src/app/widget/chat/[[]token[]]/page-client.tsx",
@@ -170,9 +170,11 @@ export default defineConfig({
     // exercised by the widget, Session, and browser-auth contracts.
     include: [
       "src/app/layout.test.tsx",
+      "src/ci/browser-security.test.ts",
       "src/app/widget/chat/[token]/page-client.test.tsx",
       "src/app/settings/page.test.tsx",
       "src/components/chat/ChatInput.test.tsx",
+      "src/components/chat/FileChip.test.tsx",
       "src/components/chat/chat-input-public-file-access.test.tsx",
       "src/components/chat/ChatMessage.test.tsx",
       "src/components/chat/TraceEventRenderer.test.tsx",
@@ -208,6 +210,9 @@ export default defineConfig({
       "src/hooks/use-websocket.test.ts",
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
+      "src/ci/dependency-security.test.ts",
+      "src/test-utils/widget-script.test.ts",
+      "src/lib/websocket-auth.test.ts",
       "src/lib/connector-runtime-api.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
       "src/lib/remark-currency-safe-math.test.ts",

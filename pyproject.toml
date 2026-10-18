@@ -17,22 +17,24 @@ classifiers = [
 ]
 dependencies = [
   "pydantic >= 2.11.7",
-  "langchain-openai >= 0.3.27",
-  "langchain >= 0.3.26",
-  "langchain-community >= 0.3.21",
-  "openai >= 1.50.0",
+  "langchain-openai >= 1.1.14, <2",
+  "langchain-core >= 1.6.12, <2",
+  "langchain-community >= 0.4.2, <0.5",
+  "openai >= 2.26.0, <3",  # retain the supported HTTPX 1.x SDK API
   "anthropic >= 0.84.0",
   "google-genai >= 1.65.0",
   "elevenlabs >= 2.0.0",
-  "xinference-client >= 2.3.0",
+  "xinference-client >= 2.3.0, <3",  # retain the tested client/model session contract
   "zai-sdk>=0.0.4",
   "numexpr >= 2.11.0",
-  "aiohttp >= 3.12.14",
+  "aiohttp >= 3.14.5",
+  "yarl >= 1.22.0, < 2.0.0",  # Shared URL validation must match aiohttp normalization
   "tqdm >= 4.66.0",
   "beautifulsoup4 >= 4.12.3",
   "html2text >= 2025.4.15",
   "PyYAML >= 6.0.2",
-  "fastapi >= 0.35.0",
+  "fastapi >= 0.143.3",
+  "starlette >= 1.8.0",  # FastAPI's own lower bound still permits vulnerable releases
   "uvicorn >= 0.35.0",
   "websockets>=15.0.1",
   "httpx[socks] >= 0.27.2",
@@ -42,20 +44,20 @@ dependencies = [
   "opentelemetry-api >= 1.39.0, < 2.0.0",
   "opentelemetry-sdk >= 1.39.0, < 2.0.0",
   "opentelemetry-exporter-otlp-proto-http >= 1.39.0, < 2.0.0",
-  "python-dotenv >= 1.0.1",
-  "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
-  "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
-  "requests >= 2.32.0",
-  "idna >= 3.7",  # magento.py's non-ASCII MAGENTO_BASE_URL handling; currently only pulled in transitively via requests
+  "python-dotenv >= 1.2.4",
+  "mcp>=1.30.0,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
+  "asyncssh>=2.24.1",  # SSH MCP runner (production runtime, not just tests)
+  "requests >= 2.34.2",  # required by the patched Docling Core dependency graph
+  "idna >= 3.20",  # magento.py's non-ASCII MAGENTO_BASE_URL handling
   "python-dateutil >= 2.8.2",  # calendar.py's RRULE validation (utils.parse_rrule); currently only pulled in transitively
   "boto3 >= 1.34.59",  # Converse/ConverseStream plus AWS built-in MCP connectors
   "celery[redis]>=5.4.0,<6.0.0",
   "redis>=5.0.0",
-  "pillow >= 10.0.0",
+  "pillow >= 12.3.0",
   "defusedxml>=0.7.1",
   "python-docx>=1.1.0",  # Built-in Word MCP connector runtime
   "pypinyin>=0.53.0",
-  "cairosvg >= 2.7.1",
+  "cairosvg >= 2.9.1",
   # Bounded: the memory admission primitives depend on LanceDB table, metadata
   # and commit semantics that no major/minor bump is contracted to preserve.
   # See "LanceDB memory compatibility" in docs/deployment.md.
@@ -64,7 +66,7 @@ dependencies = [
   "jieba>=0.42.1",
   "pyarrow>=16.1.0",
   # Basic document processing (keep pypdf for basic PDF support)
-  "pypdf>=4.0.0",
+  "pypdf>=6.21.1",
   "tiktoken>=0.8.0",
   # Database ORM and migrations (core for web interface)
   "sqlalchemy>=2.0.0",
@@ -72,7 +74,7 @@ dependencies = [
   "greenlet>=3.0",
   "alembic>=1.13.0",
   "PyJWT[crypto]>=2.15.1,<3",
-  "cryptography>=3.0.0",
+  "cryptography>=50.0.2",
   "bcrypt>=4.0.0",
   # Rate limiting for public trigger callback and trigger CRUD endpoints
   "limits>=3.13.0",
@@ -80,7 +82,7 @@ dependencies = [
   "google-cloud-pubsub>=2.21.0",
   # Utilities
   "docker>=7.1.0",
-  "json-repair==0.35.0",
+  "json-repair==0.64.0",  # Preserve audited tool-argument repair behavior
   "jsonschema>=4.25.1",
   "beartype>=0.18.5",
   "matplotlib>=3.5.0",
@@ -91,10 +93,10 @@ dependencies = [
   # it's present regardless of platform (calendar/outlook conflict-check
   # timezone math needs real zone offsets, not just zone names).
   "tzdata>=2024.1",
-  "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-  "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
-  "filelock>=3.0.0",
-  "fsspec>=2024.0.0",
+  "boxlite>=0.10.7,<0.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "boxlite>=0.10.7,<0.11; sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "filelock>=3.32.7",
+  "fsspec>=2026.9.0",
   "cloudpickle>=3.0.0",
   "exa-py>=2.0.0",
   # Data science libraries (core for RAG and analysis)
@@ -129,7 +131,7 @@ router = [
 # document processing libraries(Non-AI)
 document-processing = [
   "pdfplumber>=0.10.0",
-  "unstructured>=0.15.0",
+  "unstructured>=0.27.28",
   # Keep unstructured from resolving to legacy numba releases that cannot build
   # on Python 3.12 after deepdoc-lib moved the environment to NumPy 2.x.
   "numba>=0.64.0",
@@ -142,7 +144,7 @@ document-processing = [
 ]
 
 # AI-related document processing
-ai-document = ["docling>=2.68.0"]
+ai-document = ["docling>=2.140.0"]
 
 # PostgreSQL driver (uses psycopg2-binary for convenience)
 # Note: For production, consider installing psycopg2 from source instead
@@ -165,7 +167,7 @@ milvus = ["pymilvus>=2.6.9,<3.0.0"]
 # Note: List packages directly since optional-dependencies doesn't support include-group
 all = [
   "bashlex>=0.18",
-  "unstructured>=0.15.0",
+  "unstructured>=0.27.28",
   "numba>=0.64.0",
   "typer>=0.9.0",            # Required by spacy CLI, used by unstructured
   "pymupdf>=1.23.0,<1.27.0",
@@ -173,7 +175,7 @@ all = [
   "openpyxl>=3.1.0",
   "python-pptx>=0.6.0",
   "pypdf2>=3.0.1",
-  "docling>=2.68.0",
+  "docling>=2.140.0",
   "psycopg2-binary>=2.9.0",
   "psycopg[binary]>=3.2.0",
   "greenlet>=3.0",
@@ -191,19 +193,19 @@ all = [
 # Python dependency set stays reproducible without inheriting the backend's larger set.
 sandbox = [
   "pydantic>=2.11.7",
-  "pydantic-settings",
+  "pydantic-settings>=2.16.0",
   "cloudpickle>=3.0.0",
-  "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
+  "mcp>=1.30.0,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "pandas>=1.3.0",
   "numpy>=1.21.0",
   "matplotlib>=3.5.0",
   "openpyxl>=3.1.0",
   "python-docx>=1.1.0",
-  "fsspec>=2024.0.0",
+  "fsspec>=2026.9.0",
 ]
 
 backend-image = [
-  "unstructured>=0.15.0",
+  "unstructured>=0.27.28",
   "numba>=0.64.0",
   "typer>=0.9.0",
   "pymupdf>=1.23.0,<1.27.0",
@@ -211,7 +213,7 @@ backend-image = [
   "openpyxl>=3.1.0",
   "python-pptx>=0.6.0",
   "pypdf2>=3.0.1",
-  "docling>=2.68.0",
+  "docling>=2.140.0",
   "psycopg2-binary>=2.9.0",
   "psycopg[binary]>=3.2.0",
   "playwright>=1.40.0",
@@ -237,7 +239,8 @@ dev = [
 # Testing dependencies
 test = [
   "bashlex>=0.18",
-  "pytest>=8.0",
+  "packaging>=25.0",
+  "pytest>=9.1.1",
   "pytest-mock>=3.14.1",
   "pytest-cov>=6.2.1",
   "pytest-asyncio>=0.24.0",
@@ -249,11 +252,9 @@ test = [
   "psycopg[binary]>=3.2.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
-  "copilotkit==0.1.69",
-  "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
   "python-docx>=1.1.0",
-  "asyncssh>=2.14.0",
+  "asyncssh>=2.24.1",
 ]
 
 # Static type checking
@@ -274,6 +275,13 @@ xagent-web = "xagent.web.__main__:main"
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# Require installable wheels for both development and Linux CI/deployment.
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
@@ -345,12 +353,12 @@ module = [
   "jieba",
   "json_repair",
   "langchain_core.*",
-  "langchain.*",
   "alembic",
   "alembic.*",
   "xinference",
   "xinference.*",
   "xinference_client",
+  "xinference_client.*",
   "aiogram",
   "aiogram.*",
   "lark_oapi",

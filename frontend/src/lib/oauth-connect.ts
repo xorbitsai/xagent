@@ -1,6 +1,7 @@
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { MCP_OAUTH_POPUP_WINDOW_NAME, parseMcpOAuthErrorMessage } from "@/lib/mcp-utils";
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch";
 
 /**
  * Opens the builtin-OAuth login popup for a connector app and resolves once
@@ -38,13 +39,12 @@ export function openBuiltinOAuthPopup(options: {
    * skips itself during that batch and needs its own app-scoped call), so
    * this is an opt-in per call, not a default. */
   appId?: string;
-  token: string | null | undefined;
   /** The account label for a provider declaring `oauth_account_input`
    * (lib/oauth-account.ts). Omit for every other provider: the backend
    * rejects the parameter there. */
   account?: string;
 }): Promise<OpenBuiltinOAuthPopupResult> {
-  const { provider, appId, token, account } = options;
+  const { provider, appId, account } = options;
   // The backend echoes this same value back as the postMessage's `provider`
   // field (auth.py: `provider: app_id or provider`) - matching against it
   // below is what lets a concurrent second connect's success message not
@@ -54,14 +54,11 @@ export function openBuiltinOAuthPopup(options: {
   return new Promise((resolve) => {
     const left = window.screenX + (window.outerWidth - POPUP_WIDTH) / 2;
     const top = window.screenY + (window.outerHeight - POPUP_HEIGHT) / 2;
-    const appIdParam = appId ? `&app_id=${encodeURIComponent(appId)}` : "";
-    const accountParam = account !== undefined ? `&account=${encodeURIComponent(account)}` : "";
-    const authUrl = `${getApiUrl()}/api/auth/${encodeURIComponent(provider)}/login?token=${encodeURIComponent(token || "")}${appIdParam}${accountParam}&redirect=${encodeURIComponent(window.location.href)}`;
-    const popup = window.open(
-      authUrl,
-      `${provider}OAuth`,
-      `width=${POPUP_WIDTH},height=${POPUP_HEIGHT},left=${left},top=${top},scrollbars=yes`
-    );
+    const popup = openOAuthAuthorizationPopup({
+      provider, appId, account,
+      name: `${provider}OAuth`,
+      features: `width=${POPUP_WIDTH},height=${POPUP_HEIGHT},left=${left},top=${top},scrollbars=yes`,
+    });
 
     if (!popup) {
       resolve({ success: false, popupBlocked: true });
@@ -87,7 +84,7 @@ export function openBuiltinOAuthPopup(options: {
     // listener, so without this provider/app_id check, one popup finishing
     // first would resolve every other pending call's promise as success too.
     const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === "oauth-success" && event.data?.provider === expectedProvider) {
+      if (isOAuthSuccessMessage(event, popup, expectedProvider)) {
         finish(true);
       }
     };
@@ -135,10 +132,8 @@ export async function openMcpOAuthPopup(options: {
   const left = window.screenX + (window.outerWidth - POPUP_WIDTH) / 2;
   const top = window.screenY + (window.outerHeight - POPUP_HEIGHT) / 2;
   // Opened on "about:blank" and navigated only after the connect POST
-  // resolves (rather than opening straight to the authorization URL, as
-  // openBuiltinOAuthPopup does) because this flow has to mint the OAuth
-  // client via Dynamic Client Registration server-side first - there is no
-  // fixed login URL to open synchronously the way the builtin flow has.
+  // resolves. Unlike the builtin launch-ticket POST, this flow first mints
+  // the OAuth client via Dynamic Client Registration server-side.
   const popup = window.open(
     "about:blank",
     MCP_OAUTH_POPUP_WINDOW_NAME,

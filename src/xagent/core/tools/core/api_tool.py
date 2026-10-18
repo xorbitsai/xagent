@@ -4,16 +4,27 @@ API Tool - HTTP Client for making arbitrary API calls
 Supports various HTTP methods, authentication, headers, and error handling.
 """
 
+import asyncio
 import base64
 import json
 import logging
-import os
 from typing import Any, Dict, Mapping, Optional, Union
 from urllib.parse import ParseResult, parse_qs, urlencode, urlparse
 
 import httpx
 
-from ...utils.security import host_matches_suffix, redact_url_credentials_for_logging
+from ....config import get_trusted_egress_proxy_enabled
+from ...utils.public_http_transport import (
+    PublicHttpTransport,
+    UnsafePublicHttpTarget,
+    public_api_redirect_guard,
+)
+from ...utils.security import (
+    host_matches_suffix,
+    redact_sensitive_text,
+    redact_url_credentials_for_logging,
+)
+from .web_content import get_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -199,8 +210,8 @@ def _sanitize_final_url(url: httpx.URL) -> str:
     ``_make_request`` reports the actual post-redirect response URL so the
     connector-domain hint can match the host that really answered - but the
     raw URL can itself carry a credential: an api_key_query auth_token gets
-    merged into the query string before the request is made, and a caller
-    can embed Basic-Auth userinfo directly (``user:pass@host``). The only
+    merged into the query string before the request is made. Userinfo is
+    rejected at dispatch, but stripped here defensively as well. The only
     thing any consumer of this value needs is which host answered, so
     everything else is dropped here rather than trusting every call site
     that ever reads this field to remember not to log or forward it whole.
@@ -220,8 +231,9 @@ def has_auth_credentials(
     url: str,
     headers: Optional[Mapping[str, str]],
 ) -> bool:
-    """Whether the actual outgoing request carries a recognizable credential
-    in its headers, merged URL query, or Basic-Auth userinfo.
+    """Recognize credentials for the connector hint, not permission to dispatch.
+
+    Includes legacy URL userinfo defensively, although dispatch rejects it.
 
     A name-shaped match alone isn't enough for the header/param cases - an
     empty value (e.g. {"Authorization": ""}) or a name that merely
@@ -254,11 +266,12 @@ def append_known_connector_domain_hint(
     hint = (
         f"This looks like a {connector_label} API endpoint, and this call "
         f"carried no credential in a form this tool recognizes "
-        f"(a credential-shaped header or query parameter, or Basic-Auth "
-        f"userinfo in the URL), which would explain a 401/403 here - if the "
+        f"(a credential-shaped header or query parameter), which would "
+        f"explain a 401/403 here - if the "
         f"dedicated {connector_label} connector tools cover this request, "
         "prefer those (they carry the account's own OAuth credential); "
-        "otherwise pass your own credential via one of those mechanisms."
+        "otherwise pass your own credential via the explicit authentication "
+        "fields or headers. URL-embedded credentials are not supported."
     )
     existing_error = (existing_error or "").strip()
     if not existing_error:
@@ -345,6 +358,18 @@ class APIClientCore:
                 ),
             }
 
+        # HTTPX converts URL userinfo into Basic auth before transport dispatch,
+        # so reject it before that normalization can hide the policy violation.
+        parsed_url = urlparse(url)
+        if parsed_url.username is not None or parsed_url.password is not None:
+            return {
+                "success": False,
+                "status_code": 0,
+                "headers": {},
+                "body": None,
+                "error": "Public API network policy: URL userinfo is not allowed",
+            }
+
         # Prepare request
         method = method.upper()
         timeout = timeout or self.default_timeout
@@ -398,8 +423,10 @@ class APIClientCore:
         # Prepare body
         request_body = self._prepare_body(body, request_headers)
 
-        # Get proxy configuration
-        proxy_url = self._get_proxy_url()
+        # Untrusted destinations must not bypass validation through an ambient
+        # proxy's independent DNS lookup. Configured connector clients are
+        # separate from this generic, model-facing API tool.
+        proxy_url = get_proxy_url() if get_trusted_egress_proxy_enabled() else None
 
         # Attempt request with retries
         last_error = None
@@ -431,15 +458,33 @@ class APIClientCore:
                 )
                 return result
 
+            except UnsafePublicHttpTarget as e:
+                return {
+                    "success": False,
+                    "status_code": 0,
+                    "headers": {},
+                    "body": None,
+                    "error": f"API network policy rejected the request: {redact_sensitive_text(str(e))}",
+                }
             except Exception as e:
-                last_error = e
+                last_error = redact_sensitive_text(str(e)) or (
+                    "API request timed out"
+                    if isinstance(e, TimeoutError)
+                    else type(e).__name__
+                )
+                # A timeout/read failure can happen after a write took effect.
+                # Do not duplicate POST/PATCH/etc. on the server, even for a
+                # connect failure: a prior redirect hop may already have
+                # accepted the original write before the next hop failed.
+                if method not in {"GET", "HEAD", "OPTIONS"}:
+                    break
                 if attempt < retry_count:
                     logger.warning(
-                        f"⚠️ API Call failed (attempt {attempt + 1}/{retry_count + 1}): {str(e)}"
+                        f"⚠️ API Call failed (attempt {attempt + 1}/{retry_count + 1}): {last_error}"
                     )
                 else:
                     logger.error(
-                        f"❌ API Call failed after {retry_count + 1} attempts: {str(e)}"
+                        f"❌ API Call failed after {retry_count + 1} attempts: {last_error}"
                     )
 
         # All retries failed
@@ -448,7 +493,7 @@ class APIClientCore:
             "status_code": 0,
             "headers": {},
             "body": None,
-            "error": f"Request failed after {retry_count + 1} attempts: {str(last_error)}",
+            "error": f"Request failed after {attempt + 1} attempts: {last_error}",
         }
 
     async def _make_request(
@@ -463,15 +508,18 @@ class APIClientCore:
         allow_redirects: bool,
     ) -> Dict[str, Any]:
         """Make the actual HTTP request with streaming to limit download size"""
-        client_kwargs: Dict[str, Any] = {"timeout": timeout}
-        if proxy_url:
-            client_kwargs["proxy"] = proxy_url
-            logger.debug(
-                "   Using proxy: "
-                f"{redact_url_credentials_for_logging(proxy_url, redact_all_query_values=True)}"
-            )
+        client_kwargs: Dict[str, Any] = {
+            "timeout": timeout,
+            "trust_env": False,
+            "transport": PublicHttpTransport(proxy_url=proxy_url),
+            "max_redirects": 5,
+            "event_hooks": {"request": [public_api_redirect_guard(url)]},
+        }
 
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        async with (
+            asyncio.timeout(timeout),
+            httpx.AsyncClient(**client_kwargs) as client,
+        ):
             # Use streaming to limit download size
             async with client.stream(
                 method=method,
@@ -586,8 +634,8 @@ class APIClientCore:
                     # Sanitized (see _sanitize_final_url) because the raw
                     # URL can carry a credential: an api_key_query
                     # auth_token is merged into the query string before the
-                    # request runs, and a caller can embed Basic-Auth
-                    # userinfo directly in the URL.
+                    # request runs. Also strip userinfo defensively, even
+                    # though the dispatch policy already rejects it.
                     "final_url": final_url,
                     "final_request_has_credential": final_request_has_credential,
                 }
@@ -602,6 +650,11 @@ class APIClientCore:
             if not result.netloc:
                 logger.error("❌ Invalid URL: missing network location")
                 return False
+            if not result.hostname:
+                return False
+            # Shape only. PublicHttpTransport reports specific network-policy
+            # errors (including userinfo/port zero) before any connection.
+            _ = result.port
             return True
         except Exception as e:
             logger.error(f"❌ URL parsing failed: {str(e)}")
@@ -701,12 +754,6 @@ class APIClientCore:
                 return content.decode(encoding, errors="ignore")
             except Exception:
                 return None
-
-    def _get_proxy_url(self) -> Optional[str]:
-        """Get proxy URL from environment variables"""
-        https_proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-        http_proxy = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
-        return https_proxy or http_proxy
 
 
 # Convenience function for direct usage

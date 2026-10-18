@@ -709,7 +709,7 @@ def auto_resume_commands(task_id: int) -> list[str]:
 def ws_url(app, task_id: int) -> str:
     return (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
+        + f"/ws/chat/{task_id}"
     )
 
 
@@ -750,7 +750,7 @@ def start_task(app, description: str = "e2e:gate") -> int:
     from websockets.sync.client import connect
 
     task_id = create_task(app, "Auto resume", description)
-    with connect(ws_url(app, task_id)) as ws:
+    with connect(ws_url(app, task_id), additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
         receive_event(ws, "execution_started")

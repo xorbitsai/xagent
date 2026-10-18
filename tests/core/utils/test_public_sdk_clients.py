@@ -23,6 +23,7 @@ async def test_real_client_follows_safe_redirect_without_re_resolving_at_connect
         ],
     )
     seen = []
+    options = []
 
     def handler(request):
         seen.append(request)
@@ -30,12 +31,12 @@ async def test_real_client_follows_safe_redirect_without_re_resolving_at_connect
             return httpx.Response(302, headers={"Location": "https://other.example/"})
         return httpx.Response(200, json={})
 
-    monkeypatch.setattr(
-        httpx, "HTTPTransport", lambda **kwargs: httpx.MockTransport(handler)
-    )
-    monkeypatch.setattr(
-        httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handler)
-    )
+    def transport(**kwargs):
+        options.append(kwargs)
+        return httpx.MockTransport(handler)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", transport)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
     if asynchronous:
         async with create_public_async_client(follow_redirects=True) as client:
             response = await client.get(
@@ -51,6 +52,11 @@ async def test_real_client_follows_safe_redirect_without_re_resolving_at_connect
     assert seen[1].headers["Host"] == "other.example"
     assert "X-Secret" not in seen[1].headers
     assert seen[1].extensions["sni_hostname"] == "other.example"
+    assert options[0]["trust_env"] is False
+    assert options[0]["http2"] is False
+    # Distinct logical hosts can resolve to the same IP. Do not reuse a TLS
+    # connection authenticated with the preceding host's SNI/certificate name.
+    assert options[0]["limits"].max_keepalive_connections == 0
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

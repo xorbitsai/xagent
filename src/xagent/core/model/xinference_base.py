@@ -68,7 +68,7 @@ class BaseXinferenceModel:
                 )
             except ImportError:
                 # Fallback to xinference_client package
-                from xinference_client.client.restful.async_restful_client import (  # type: ignore
+                from xinference_client.client.restful.async_restful_client import (
                     AsyncClient,
                 )
 

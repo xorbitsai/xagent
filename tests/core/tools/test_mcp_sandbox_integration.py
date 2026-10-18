@@ -65,7 +65,9 @@ class TestListToolsInSandbox:
             )
 
         requirements = mock_ensure_requirements.await_args.args[1]
-        assert requirements == [*SANDBOX_BASE_DEPENDENCIES, "mcp>=1.12.4,<2"]
+        # Keep the reviewed security floor and the SDK 2.x incompatibility
+        # guard explicit, independently of the installer's own constants.
+        assert requirements == [*SANDBOX_BASE_DEPENDENCIES, "mcp>=1.30.0,<2"]
 
     @pytest.mark.asyncio
     async def test_reads_result_file_and_builds_tools(self):

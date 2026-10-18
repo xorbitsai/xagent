@@ -13,6 +13,7 @@ from ...core.model.providers import (
     default_base_url_for_provider,
     get_supported_provider_metadata,
 )
+from ...core.utils.public_aiohttp import create_public_aiohttp_session
 from ...core.utils.security import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -182,7 +183,7 @@ async def fetch_xinference_video_models(
 
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     timeout = aiohttp.ClientTimeout(total=30.0)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with create_public_aiohttp_session(timeout=timeout) as session:
         async with session.get(
             f"{base_url.rstrip('/')}/v1/models", headers=headers
         ) as response:

@@ -11,6 +11,7 @@ from urllib.request import url2pathname
 
 import aiohttp
 
+from ...utils.public_aiohttp import create_public_aiohttp_session
 from .base import BaseVideoModel
 
 logger = logging.getLogger(__name__)
@@ -234,7 +235,7 @@ class XinferenceVideoModel(BaseVideoModel):
             timeout_obj = aiohttp.ClientTimeout(
                 total=min(REFERENCE_MEDIA_FETCH_TIMEOUT, timeout_value)
             )
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+            async with create_public_aiohttp_session(timeout=timeout_obj) as session:
                 async with session.get(media_text) as response:
                     if response.status != 200:
                         raise RuntimeError(
@@ -361,7 +362,7 @@ class XinferenceVideoModel(BaseVideoModel):
 
         try:
             timeout_obj = aiohttp.ClientTimeout(total=effective_timeout)
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+            async with create_public_aiohttp_session(timeout=timeout_obj) as session:
                 if first_frame_image_url and last_frame_image_url:
                     first_frame = await self._read_media_bytes(
                         first_frame_image_url,

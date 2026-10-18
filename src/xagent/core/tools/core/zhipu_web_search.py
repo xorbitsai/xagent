@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, cast
 
 import httpx
 
+from ...utils.public_http_transport import create_public_async_client
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,16 +94,8 @@ class ZhipuWebSearchCore:
             "Content-Type": "application/json",
         }
 
-        proxy_url = self._get_proxy_url()
-        if proxy_url:
-            logger.info("🌐 Using proxy: %s", proxy_url)
-
         try:
-            client_kwargs: Dict[str, Any] = {}
-            if proxy_url:
-                client_kwargs["proxy"] = proxy_url
-
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            async with create_public_async_client() as client:
                 response = await client.post(
                     url, json=payload, headers=headers, timeout=15
                 )

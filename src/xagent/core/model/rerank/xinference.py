@@ -15,8 +15,7 @@ import os
 from collections.abc import Sequence
 from typing import Any, Dict, List, Optional
 
-import requests
-
+from ...utils import public_requests as requests
 from .base import BaseRerank
 
 logger = logging.getLogger(__name__)
@@ -89,19 +88,7 @@ class XinferenceRerank(BaseRerank):
             ...     base_url="http://localhost:9997"
             ... )
         """
-        try:
-            from xinference_client import RESTfulClient as XinferenceClient
-        except ImportError:  # pragma: no cover - fallback
-            try:
-                from xinference.client.restful.restful_client import (
-                    RESTfulClient as XinferenceClient,
-                )
-            except ImportError:
-                logger.error(
-                    "Cannot import xinference_client. Install with "
-                    "`pip install xinference-client`."
-                )
-                return []
+        from ..public_xinference import PublicXinferenceClient as XinferenceClient
 
         client = XinferenceClient(base_url=base_url.rstrip("/"), api_key=api_key)
         try:

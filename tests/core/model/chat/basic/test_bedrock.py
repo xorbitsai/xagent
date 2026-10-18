@@ -928,7 +928,12 @@ def test_explicit_api_keys_are_instance_scoped_and_never_touch_environment(monke
 
     def fake_client(_service: str, **kwargs: Any):
         configs.append(kwargs["config"])
-        return SimpleNamespace(meta=SimpleNamespace(events=Events()))
+        return SimpleNamespace(
+            meta=SimpleNamespace(events=Events()),
+            _endpoint=SimpleNamespace(
+                http_session=SimpleNamespace(close=lambda: None, _verify=True)
+            ),
+        )
 
     monkeypatch.setattr(boto3, "client", fake_client)
     before = dict(os.environ)

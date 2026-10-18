@@ -239,12 +239,7 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
             >>> for model in models:
             ...     print(f"{model['id']}: {model['description']}")
         """
-        try:
-            from xinference_client import RESTfulClient as XinferenceClient
-        except ImportError:
-            from xinference.client.restful.restful_client import (
-                RESTfulClient as XinferenceClient,  # type: ignore
-            )
+        from ..public_xinference import PublicXinferenceClient as XinferenceClient
 
         client = XinferenceClient(base_url=base_url, api_key=api_key)
 

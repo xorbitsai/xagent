@@ -24,6 +24,7 @@ from botocore.exceptions import (
 )
 
 from ....runtime_performance import run_in_thread_with_telemetry
+from ....utils.public_botocore import PublicBotocoreSession
 from ....utils.security import redact_sensitive_text
 from ...providers import validate_bedrock_endpoint
 from ..error import matches_context_length_error
@@ -369,6 +370,11 @@ class BedrockLLM(BaseLLM):
             region_name=self.region_name,
             endpoint_url=self.endpoint_url,
             config=config,
+        )
+        previous_session = client._endpoint.http_session
+        previous_session.close()
+        client._endpoint.http_session = PublicBotocoreSession(
+            timeout=self.timeout, verify=previous_session._verify
         )
         if key_auth:
             api_key = self.api_key

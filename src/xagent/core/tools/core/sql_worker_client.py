@@ -114,7 +114,7 @@ def execute_sql_query_remote(
     resolved_output = _validate_output_file(output_file, workspace)
     timeout = get_sql_worker_query_timeout_seconds() + 5
     try:
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(timeout=timeout, trust_env=False) as client:
             response = client.post(
                 f"{worker_url}/v1/query",
                 headers={"Authorization": f"Bearer {token}"},
@@ -125,7 +125,10 @@ def execute_sql_query_remote(
                 },
             )
     except httpx.TimeoutException as exc:
-        raise SqlWorkerError("The isolated SQL query timed out") from exc
+        raise SqlWorkerError(
+            "The isolated SQL query timed out; its completion state is unknown "
+            "and it must not be retried automatically"
+        ) from exc
     except httpx.HTTPError as exc:
         raise SqlWorkerError("The isolated SQL worker is unavailable") from exc
     if response.status_code != 200:

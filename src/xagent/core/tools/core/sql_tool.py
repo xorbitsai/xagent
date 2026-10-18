@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import URL, create_engine, event, text
 from sqlalchemy.engine import CursorResult, Engine, Row, make_url
 
-from ....config import get_database_url, get_sql_worker_url
+from ....config import get_database_url, get_sql_worker_url, requires_secure_secrets
 from ...file_ref import build_workspace_file_ref
 from .sql_worker_client import execute_sql_query_remote
 
@@ -337,6 +337,9 @@ def execute_sql_query(
         output_file: Optional file path to export query results.
             Supported formats: .csv, .parquet, .json, .jsonl, .ndjson (relative to workspace output directory).
             When provided, query results are exported to file instead of being returned.
+            In isolated-worker mode the export is reconstructed from the bounded
+            JSON response, so it remains subject to the worker row/result-size
+            limits and Parquet values use JSON-compatible representations.
         workspace: Optional TaskWorkspace instance for file exports.
 
     Returns:
@@ -353,13 +356,19 @@ def execute_sql_query(
     # value crosses the internal worker boundary. The worker repeats URL
     # validation, but deliberately has no platform DATABASE_URL to compare.
     url = _get_connection_url(connection_name, connection_url)
-    if get_sql_worker_url() is not None:
+    worker_url = get_sql_worker_url()
+    if worker_url is not None:
         return execute_sql_query_remote(
             connection_name=connection_name,
             connection_url=url.render_as_string(hide_password=False),
             query=query,
             output_file=output_file,
             workspace=workspace,
+        )
+    if requires_secure_secrets():
+        logger.warning(
+            "SQL tool execution is running in-process because "
+            "XAGENT_SQL_WORKER_URL is not configured"
         )
     return _execute_sql_query_local(
         connection_name,
@@ -466,7 +475,12 @@ def _execute_sql_query_local(
                     )
 
             # Original behavior: return data in response
-            result = conn.execute(stmt)
+            execution_connection = (
+                conn.execution_options(stream_results=True)
+                if max_rows is not None
+                else conn
+            )
+            result = execution_connection.execute(stmt)
 
             # Get column names from result
             if result.returns_rows:

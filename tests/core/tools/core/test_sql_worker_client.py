@@ -11,10 +11,15 @@ from xagent.core.tools.core.sql_worker_client import (
 )
 
 
-def _client_with_transport(transport: httpx.MockTransport):
+def _client_with_transport(
+    transport: httpx.MockTransport,
+    seen_kwargs: dict[str, object] | None = None,
+):
     real_client = httpx.Client
 
     def client(*args, **kwargs):
+        if seen_kwargs is not None:
+            seen_kwargs.update(kwargs)
         return real_client(*args, transport=transport, **kwargs)
 
     return client
@@ -24,6 +29,7 @@ def test_remote_request_is_authenticated_and_credentials_stay_in_body(
     monkeypatch,
 ):
     seen: dict[str, object] = {}
+    client_kwargs: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
@@ -44,7 +50,7 @@ def test_remote_request_is_authenticated_and_credentials_stay_in_body(
     monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "shared-secret")
     monkeypatch.setattr(
         "xagent.core.tools.core.sql_worker_client.httpx.Client",
-        _client_with_transport(httpx.MockTransport(handler)),
+        _client_with_transport(httpx.MockTransport(handler), client_kwargs),
     )
     connection_url = "postgresql://user:password@customer.example/analytics"
 
@@ -61,6 +67,7 @@ def test_remote_request_is_authenticated_and_credentials_stay_in_body(
     assert "password" not in str(seen["url"])
     assert seen["authorization"] == "Bearer shared-secret"
     assert connection_url in str(seen["body"])
+    assert client_kwargs["trust_env"] is False
 
 
 def test_remote_error_does_not_expose_http_exception(monkeypatch):
@@ -78,6 +85,46 @@ def test_remote_error_does_not_expose_http_exception(monkeypatch):
         execute_sql_query_remote(
             connection_name="analytics",
             connection_url="postgresql://user:password@customer.example/data",
+            query="SELECT 1",
+            output_file=None,
+            workspace=None,
+        )
+
+
+def test_remote_timeout_reports_unknown_completion_state(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", "http://sql-worker:8090")
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "shared-secret")
+    monkeypatch.setattr(
+        "xagent.core.tools.core.sql_worker_client.httpx.Client",
+        _client_with_transport(httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SqlWorkerError, match="must not be retried automatically"):
+        execute_sql_query_remote(
+            connection_name="analytics",
+            connection_url="sqlite:///:memory:",
+            query="SELECT 1",
+            output_file=None,
+            workspace=None,
+        )
+
+
+def test_remote_non_200_uses_only_worker_safe_detail(monkeypatch):
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(400, json={"detail": "safe query error"})
+    )
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", "http://sql-worker:8090")
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "shared-secret")
+    monkeypatch.setattr(
+        "xagent.core.tools.core.sql_worker_client.httpx.Client",
+        _client_with_transport(transport),
+    )
+    with pytest.raises(SqlWorkerError, match="safe query error"):
+        execute_sql_query_remote(
+            connection_name="analytics",
+            connection_url="sqlite:///:memory:",
             query="SELECT 1",
             output_file=None,
             workspace=None,

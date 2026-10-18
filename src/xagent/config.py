@@ -155,6 +155,8 @@ DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
 DB_POOL_TIMEOUT_SECONDS = "XAGENT_DB_POOL_TIMEOUT_SECONDS"
 SQL_WORKER_URL = "XAGENT_SQL_WORKER_URL"
 SQL_WORKER_TOKEN = "XAGENT_SQL_WORKER_TOKEN"
+SQL_WORKER_HOST = "XAGENT_SQL_WORKER_HOST"
+SQL_WORKER_PORT = "XAGENT_SQL_WORKER_PORT"
 SQL_WORKER_QUERY_TIMEOUT_SECONDS = "XAGENT_SQL_WORKER_QUERY_TIMEOUT_SECONDS"
 SQL_WORKER_MAX_ROWS = "XAGENT_SQL_WORKER_MAX_ROWS"
 SQL_WORKER_MAX_RESULT_BYTES = "XAGENT_SQL_WORKER_MAX_RESULT_BYTES"
@@ -877,6 +879,24 @@ def get_sql_worker_token() -> str | None:
     return value or None
 
 
+def get_sql_worker_host() -> str:
+    """Return the interface address used by the standalone SQL worker."""
+
+    value = (os.getenv(SQL_WORKER_HOST) or "0.0.0.0").strip()
+    if not value or any(character.isspace() for character in value):
+        raise ValueError(f"Invalid {SQL_WORKER_HOST} value")
+    return value
+
+
+def get_sql_worker_port() -> int:
+    """Return the TCP port used by the standalone SQL worker."""
+
+    port = _get_positive_int_env(SQL_WORKER_PORT, 8090)
+    if port > 65535:
+        raise ValueError(f"Invalid {SQL_WORKER_PORT} value: {port}")
+    return port
+
+
 def get_sql_worker_query_timeout_seconds() -> int:
     """Return the hard wall-clock limit applied to one isolated SQL query."""
 
@@ -890,7 +910,7 @@ def get_sql_worker_max_rows() -> int:
 
 
 def get_sql_worker_max_result_bytes() -> int:
-    """Return the maximum serialized result size accepted from the SQL worker."""
+    """Return the maximum serialized result size produced by the SQL worker."""
 
     return _get_positive_int_env(SQL_WORKER_MAX_RESULT_BYTES, 8 * 1024 * 1024)
 

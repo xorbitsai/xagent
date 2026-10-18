@@ -11,20 +11,29 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import re
 import secrets
 import threading
+from base64 import b64encode
 from contextlib import asynccontextmanager
 from multiprocessing.connection import Connection
-from typing import Any, AsyncIterator, Mapping
+from pathlib import Path
+from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials
+from fastapi.security.utils import get_authorization_scheme_param
 from pydantic import BaseModel, Field, SecretStr
+from sqlalchemy.exc import DBAPIError
 
 from .config import (
+    get_sql_worker_host,
     get_sql_worker_max_concurrency,
     get_sql_worker_max_query_bytes,
     get_sql_worker_max_result_bytes,
     get_sql_worker_max_rows,
+    get_sql_worker_port,
     get_sql_worker_query_timeout_seconds,
     get_sql_worker_token,
 )
@@ -41,11 +50,16 @@ SENSITIVE_PLATFORM_ENVIRONMENT_VARIABLES = (
     "ENCRYPTION_KEY",
     "XAGENT_SECRET_ENCRYPTION_KEY",
     "XAGENT_JWT_SECRET",
+    "SECRET_KEY",
+    "XAGENT_ENCRYPTION_MIGRATION_KEY",
+    "XAGENT_TOOL_CREDENTIALS_MIGRATION_KEY",
+    "LANGFUSE_SECRET_KEY",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "GOOGLE_APPLICATION_CREDENTIALS",
     "DOCKER_HOST",
+    "DOCKER_SOCKET",
 )
 SENSITIVE_ENVIRONMENT_SUFFIXES = (
     "_API_KEY",
@@ -53,13 +67,20 @@ SENSITIVE_ENVIRONMENT_SUFFIXES = (
     "_PASSWORD",
     "_SECRET",
     "_TOKEN",
+    "_KEY",
 )
+DOCKER_SOCKET_PATH = Path("/var/run/docker.sock")
+MAX_CONNECTION_URL_CHARACTERS = 8 * 1024
+MAX_QUERY_CHARACTERS = 1024 * 1024
+CAPACITY_WAIT_SECONDS = 1.0
 
 
 class QueryRequest(BaseModel):
     connection_name: str = Field(min_length=1, max_length=128)
-    connection_url: SecretStr
-    query: str = Field(min_length=1)
+    connection_url: SecretStr = Field(
+        min_length=1, max_length=MAX_CONNECTION_URL_CHARACTERS
+    )
+    query: str = Field(min_length=1, max_length=MAX_QUERY_CHARACTERS)
 
 
 def assert_isolated_environment(
@@ -85,10 +106,26 @@ def assert_isolated_environment(
         )
 
 
+def _scrub_child_environment() -> None:
+    """Remove worker authentication and any defense-in-depth secret matches."""
+
+    for name in tuple(os.environ):
+        if (
+            name == "XAGENT_SQL_WORKER_TOKEN"
+            or name in SENSITIVE_PLATFORM_ENVIRONMENT_VARIABLES
+            or name.endswith(SENSITIVE_ENVIRONMENT_SUFFIXES)
+        ):
+            os.environ.pop(name, None)
+
+
 def validate_worker_configuration() -> None:
     """Validate the isolation boundary regardless of how ASGI is launched."""
 
     assert_isolated_environment()
+    if DOCKER_SOCKET_PATH.exists():
+        raise RuntimeError(
+            "SQL worker isolation violation; remove mounted /var/run/docker.sock"
+        )
     token = get_sql_worker_token()
     if token is None or len(token) < 32:
         raise RuntimeError(
@@ -97,6 +134,14 @@ def validate_worker_configuration() -> None:
 
 
 def _safe_worker_error(exc: BaseException) -> str:
+    if isinstance(exc, DBAPIError):
+        message = re.sub(
+            r"(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+@", r"\1***@", str(exc.orig)
+        )
+        message = " ".join(message.split())[:500]
+        return (
+            f"Database query failed: {message}" if message else "Database query failed"
+        )
     if isinstance(exc, ValueError):
         message = str(exc)
         safe_prefixes = (
@@ -123,6 +168,7 @@ def _query_child(
     max_result_bytes: int,
 ) -> None:
     try:
+        _scrub_child_environment()
         # Import in the disposable process. This keeps database drivers and
         # their native state out of the long-lived HTTP worker.
         from .core.tools.core.sql_tool import _execute_sql_query_local
@@ -134,11 +180,24 @@ def _query_child(
             max_rows=max_rows,
             max_result_bytes=max_result_bytes,
         )
-        pipe.send((True, result))
+        pipe.send((True, _json_safe(result)))
     except BaseException as exc:  # noqa: BLE001 - process boundary must settle
+        logger.warning("SQL query child failed: %s", type(exc).__name__)
         pipe.send((False, _safe_worker_error(exc)))
     finally:
         pipe.close()
+
+
+def _json_safe(value: Any) -> Any:
+    """Encode byte strings explicitly before FastAPI JSON serialization."""
+
+    if isinstance(value, bytes):
+        return "base64:" + b64encode(value).decode("ascii")
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def execute_in_disposable_process(request: QueryRequest) -> dict[str, Any]:
@@ -197,16 +256,19 @@ def execute_in_disposable_process(request: QueryRequest) -> dict[str, Any]:
     return payload
 
 
-def _authorize(authorization: str | None) -> None:
+def _authorize(
+    credentials: HTTPAuthorizationCredentials | None,
+) -> None:
     configured = get_sql_worker_token()
     if configured is None:
         raise HTTPException(status_code=503, detail="SQL worker is not configured")
-    scheme, separator, supplied = (authorization or "").partition(" ")
     if (
-        separator != " "
-        or scheme.lower() != "bearer"
-        or not supplied
-        or not secrets.compare_digest(supplied, configured)
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or not credentials.credentials
+        or not secrets.compare_digest(
+            credentials.credentials.encode("utf-8"), configured.encode("utf-8")
+        )
     ):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -227,18 +289,39 @@ app = FastAPI(
 _query_slots = threading.BoundedSemaphore(get_sql_worker_max_concurrency())
 
 
+@app.middleware("http")
+async def authenticate_query_before_body_parsing(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
+    """Reject unauthenticated query requests before reading their bodies."""
+
+    if request.url.path == "/v1/query":
+        scheme, token = get_authorization_scheme_param(
+            request.headers.get("Authorization")
+        )
+        credentials = (
+            HTTPAuthorizationCredentials(scheme=scheme, credentials=token)
+            if scheme and token
+            else None
+        )
+        try:
+            _authorize(credentials)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code, content={"detail": exc.detail}
+            )
+    return await call_next(request)
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/v1/query")
-def query(
-    request: QueryRequest,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    _authorize(authorization)
-    if not _query_slots.acquire(blocking=False):
+def query(request: QueryRequest) -> dict[str, Any]:
+    if not _query_slots.acquire(timeout=CAPACITY_WAIT_SECONDS):
         raise HTTPException(status_code=429, detail="SQL worker is at capacity")
     try:
         return execute_in_disposable_process(request)
@@ -247,11 +330,14 @@ def query(
 
 
 def main() -> None:
-    validate_worker_configuration()
     import uvicorn
 
-    port = int(os.getenv("XAGENT_SQL_WORKER_PORT", "8090"))
-    uvicorn.run(app, host="0.0.0.0", port=port, access_log=False)
+    uvicorn.run(
+        app,
+        host=get_sql_worker_host(),
+        port=get_sql_worker_port(),
+        access_log=False,
+    )
 
 
 if __name__ == "__main__":

@@ -4222,6 +4222,20 @@ def test_sql_worker_limits(monkeypatch, setting, getter, default):
     assert getter() == 7
 
 
+def test_sql_worker_host_and_port(monkeypatch):
+    monkeypatch.delenv("XAGENT_SQL_WORKER_HOST", raising=False)
+    monkeypatch.delenv("XAGENT_SQL_WORKER_PORT", raising=False)
+    assert config.get_sql_worker_host() == "0.0.0.0"
+    assert config.get_sql_worker_port() == 8090
+    monkeypatch.setenv("XAGENT_SQL_WORKER_HOST", "127.0.0.1")
+    monkeypatch.setenv("XAGENT_SQL_WORKER_PORT", "18090")
+    assert config.get_sql_worker_host() == "127.0.0.1"
+    assert config.get_sql_worker_port() == 18090
+    monkeypatch.setenv("XAGENT_SQL_WORKER_PORT", "70000")
+    with pytest.raises(ValueError, match="XAGENT_SQL_WORKER_PORT"):
+        config.get_sql_worker_port()
+
+
 def test_remote_json_download_size_default_and_override(monkeypatch):
     monkeypatch.delenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", raising=False)
     assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024

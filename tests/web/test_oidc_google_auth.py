@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -15,6 +16,32 @@ from xagent.web.api.auth import auth_router, set_registration_enabled
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
 from xagent.web.models.user_identity import UserIdentity
+
+
+def test_exchange_cleanup_preserves_connector_proof_namespaces(oidc_client):
+    from xagent.web.api import oidc_google
+    from xagent.web.models.oidc_consumed_token import OidcConsumedToken
+
+    _, SessionLocal = oidc_client
+    with SessionLocal() as db:
+        old = datetime.now(timezone.utc) - timedelta(minutes=5)
+        db.add_all(
+            [
+                OidcConsumedToken(token_id=key, expires_at=old)
+                for key in (
+                    "oauth-launch:old",
+                    "oauth-state:old",
+                    "expired-exchange",
+                )
+            ]
+        )
+        db.commit()
+        code = oidc_google._create_exchange_code(1, None)
+        assert oidc_google._consume_exchange_code(db, code) is not None
+        keys = {row.token_id for row in db.query(OidcConsumedToken)}
+        assert "oauth-launch:old" in keys
+        assert "oauth-state:old" in keys
+        assert "expired-exchange" not in keys
 
 
 @pytest.fixture()

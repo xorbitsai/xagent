@@ -31,6 +31,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { apiRequest } from "@/lib/api-wrapper"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
 import { toast } from "@/components/ui/sonner"
 import { Input } from "@/components/ui/input"
 import { Select } from "@/components/ui/select"
@@ -110,7 +111,7 @@ export function ConnectMcpDialog({
   onSuccess
 }: ConnectMcpDialogProps) {
   const { t } = useI18n()
-  const { token, inTeam } = useAuth()
+  const { inTeam } = useAuth()
   const { apps: officialApps } = useMcpApps()
   const { requestAccount, accountDialog } = useOAuthAccountStep()
   const [searchQuery, setSearchQuery] = useState("")
@@ -1073,13 +1074,11 @@ export function ConnectMcpDialog({
     const left = window.screenX + (window.outerWidth - width) / 2;
     const top = window.screenY + (window.outerHeight - height) / 2;
 
-    const accountParam = account !== undefined ? `&account=${encodeURIComponent(account)}` : ''
-    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ''}&app_id=${app.id}${accountParam}&redirect=${encodeURIComponent(window.location.href)}`;
-    const popup = window.open(
-      authUrl,
-      `${provider} OAuth`,
-      `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`
-    );
+    const popup = openOAuthAuthorizationPopup({
+      provider, appId: app.id, account,
+      name: `${provider} OAuth`,
+      features: `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`,
+    });
 
     if (!popup) {
       toast.error("Popup blocked. Please allow popups for this site to connect.");
@@ -1089,7 +1088,7 @@ export function ConnectMcpDialog({
 
     // Listen for the postMessage from the popup
     const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === 'oauth-success') {
+      if (isOAuthSuccessMessage(event, popup, app.id)) {
         clearAppLoading(app.id)
         window.removeEventListener('message', handleMessage)
         mcpOauthMessageListenersRef.current.delete(handleMessage)

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -193,6 +193,52 @@ describe("TraceEventRenderer", () => {
     cleanup()
     apiRequestMock.mockReset()
     vi.restoreAllMocks()
+  })
+
+  it.each(["expire", "unmount"])("cleans up the copy feedback timer on %s", (finish) => {
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout")
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout")
+    try {
+      const { unmount } = render(
+        <TraceEventRenderer events={[
+          { event_id: "start", event_type: "react_task_start", step_id: "copy-step", timestamp: 1000, data: {} },
+          { event_id: "tool", event_type: "tool_execution_start", step_id: "copy-step", timestamp: 2000,
+            data: { tool_name: "inspect_output", tool_args: { query: "copy feedback" } } },
+        ]} />,
+      )
+      const button = screen.getAllByTitle("traceEventRenderer.copy")[0]
+      const lastCopyTimer = () => {
+        const index = timeoutSpy.mock.calls.findLastIndex(([, delay]) => delay === 2000)
+        expect(index).toBeGreaterThanOrEqual(0)
+        return { handle: timeoutSpy.mock.results[index].value, callback: timeoutSpy.mock.calls[index][0] as () => void }
+      }
+
+      fireEvent.click(button)
+      const firstTimer = lastCopyTimer()
+      expect(button.querySelector("svg.text-green-500")).not.toBeNull()
+      fireEvent.click(button)
+      const secondTimer = lastCopyTimer()
+      expect(secondTimer.handle).not.toBe(firstTimer.handle)
+      expect(clearSpy).toHaveBeenCalledWith(firstTimer.handle)
+      expect(clipboardWriteTextMock).toHaveBeenCalledTimes(2)
+      expect(button.querySelector("svg.text-green-500")).not.toBeNull()
+
+      if (finish === "expire") {
+        // Invoke the captured two-second callback without wall-clock sleeps or
+        // fake timers that would also affect Framer Motion's shared scheduler.
+        clearTimeout(secondTimer.handle)
+        clearSpy.mockClear()
+        act(() => secondTimer.callback())
+        expect(button.querySelector("svg.text-green-500")).toBeNull()
+        unmount()
+        expect(clearSpy).not.toHaveBeenCalledWith(secondTimer.handle)
+      } else {
+        unmount()
+        expect(clearSpy).toHaveBeenCalledWith(secondTimer.handle)
+      }
+    } finally {
+      cleanup()
+    }
   })
 
   it("renders image artifacts inline from tool results", async () => {

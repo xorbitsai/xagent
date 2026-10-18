@@ -189,7 +189,7 @@ class MockWebSocket {
   onerror: ((event?: unknown) => void) | null = null
   onclose: (() => void) | null = null
 
-  constructor(_url: string) {
+  constructor(public url: string, public protocols?: string[]) {
     MockWebSocket.instances.push(this)
   }
 
@@ -370,6 +370,8 @@ describe("AgentBuilderChat", () => {
     fireEvent.click(screen.getByText("send-chat-input"))
 
     expect(MockWebSocket.instances).toHaveLength(1)
+    expect(new URL(MockWebSocket.instances[0].url).searchParams.has("token")).toBe(false)
+    expect(MockWebSocket.instances[0].protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.token"])
     MockWebSocket.instances[0].open()
 
     await waitFor(() => {

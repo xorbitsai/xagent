@@ -140,9 +140,10 @@ describe("ToolsPage reconnect for an account-hosted provider", () => {
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.accountStep.continue" }))
 
     expect(openSpy).toHaveBeenCalledTimes(1)
-    const url = new URL(openSpy.mock.calls[0][0] as string)
-    expect(url.searchParams.get("app_id")).toBe("zendesk")
-    expect(url.searchParams.get("account")).toBe("acme")
+    expect(openSpy.mock.calls[0][0]).toBe("about:blank")
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/auth/zendesk/login", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ app_id: "zendesk", account: "acme", redirect: window.location.origin }),
+    }))
   })
 
   it("reconnects directly when the catalog app declares no account input", async () => {
@@ -151,6 +152,8 @@ describe("ToolsPage reconnect for an account-hosted provider", () => {
 
     expect(screen.queryByLabelText("Zendesk subdomain")).not.toBeInTheDocument()
     expect(openSpy).toHaveBeenCalledTimes(1)
-    expect(new URL(openSpy.mock.calls[0][0] as string).searchParams.has("account")).toBe(false)
+    expect(openSpy.mock.calls[0][0]).toBe("about:blank")
+    const call = apiRequestMock.mock.calls.find(([url]) => url.endsWith("/api/auth/zendesk/login"))!
+    expect(JSON.parse(call[1].body).account).toBeUndefined()
   })
 })

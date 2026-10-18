@@ -4144,3 +4144,24 @@ def test_auth_rate_budget_configuration(monkeypatch, setting, getter, default):
     for invalid in ("", "0", "-1", "invalid"):
         monkeypatch.setenv(setting, invalid)
         assert getter() == default
+
+
+@pytest.mark.parametrize(
+    "kind,default", [("image", 64 * 1024 * 1024), ("video", 512 * 1024 * 1024)]
+)
+def test_media_download_size_defaults_and_overrides(monkeypatch, kind, default):
+    variable = f"XAGENT_{kind.upper()}_DOWNLOAD_MAX_BYTES"
+    monkeypatch.delenv(variable, raising=False)
+    assert config.get_media_download_max_bytes(kind) == default
+    monkeypatch.setenv(variable, "123")
+    assert config.get_media_download_max_bytes(kind) == 123
+    for blank in ("", "  ", "\t"):
+        monkeypatch.setenv(variable, blank)
+        assert config.get_media_download_max_bytes(kind) == default
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5"])
+def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
+    monkeypatch.setenv("XAGENT_IMAGE_DOWNLOAD_MAX_BYTES", value)
+    with pytest.raises(ValueError):
+        config.get_media_download_max_bytes("image")

@@ -1,7 +1,8 @@
 # Dependency security follow-up (CASA 5)
 
-This branch follows core PR #3180 and keeps its SheetJS/KaTeX patches. It does
-not remove `pptxgenjs`: Docker also uses that package for backend presentations.
+This migration follows merged core PRs #3180 and #3182 and keeps their
+SheetJS/KaTeX and parser patches. It retains `pptxgenjs`: Docker also uses that
+package for backend presentations.
 
 Verified changes:
 
@@ -12,9 +13,17 @@ Verified changes:
   override are removed. Override every `form-data` copy to 4.0.6
   (multipart CRLF injection), `image-size` to 2.0.3
   (image-parser loops), and `postcss-selector-parser` to 7.1.6 (CPU exhaustion).
-- The image-size/selector overrides cross their parents' declared major
-  ranges. Keep the real Node PPTX roundtrip, frontend build and full required
-  coverage lane as compatibility gates. Do not merely suppress audit findings.
+- `dependency-security.test.ts` compares Tailwind's generated variant CSS with
+  a reviewed baseline from Tailwind 3.4.19 / selector-parser 6.1.4. The 7.1.6
+  override produces identical CSS for all 20 fixture candidates: ordinary and
+  named groups/peers, chained states, arbitrary variants and compound spacing/
+  divider selectors. Keep this snapshot alongside the frontend build and full
+  required coverage lane; a build alone cannot reveal silent selector drift.
+- `pptxgenjs` 4.0.1 declares `image-size` but its shipped runtime does not import
+  it. The 2.0.3 override therefore has no runtime effect on that package; the
+  real PPTX/PNG roundtrip guards `pptxgenjs`/`jszip`, not `image-size` API
+  compatibility. A separate direct image-size assertion checks PNG dimensions.
+  The test's 20-second budget exceeds its child-process timeout.
 
 The lock was regenerated with npm 11.6.2 after npm 10.9.4 hit an internal
 `edgesOut` peer-resolution error during the Vitest 4 migration. Clean
@@ -25,6 +34,9 @@ The initial fresh audit found 20 affected package nodes (3 critical, 11 high,
 The Vitest 4 follow-up reduces it to 8 (0 critical, 8 high, 0 moderate).
 These are npm dependency-node counts, not counts of independent application
 exploits. This does not audit all Python, SaaS or Toby dependencies.
+
+Frontend development/testing requires Node.js `^20.19.0 || >=22.12.0` for
+Vite 7.3.7; Node 18 is no longer supported by this test toolchain.
 
 ## Test-toolchain compatibility
 

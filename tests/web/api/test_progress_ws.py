@@ -370,7 +370,7 @@ class TestProgressWebSocketAPI:
         # - token: str (query parameter, optional)
 
         # In a real test, we would:
-        # 1. Connect to ws://host:port/ws/progress/{task_id}?token={token}
+        # 1. Connect to ws://host:port/ws/progress/{task_id} with a Bearer header.
         # 2. Verify connection is accepted
         # 3. Send/receive messages
         # 4. Verify disconnection

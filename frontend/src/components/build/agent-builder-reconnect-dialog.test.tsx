@@ -177,6 +177,7 @@ function agentResponse() {
 function installApi() {
   apiRequestMock.mockImplementation((url: string) => {
     const json = (body: unknown) => Promise.resolve(new Response(JSON.stringify(body), { status: 200 }))
+    if (url.endsWith("/api/auth/zendesk/login")) return json({ authorization_url: "/api/auth/zendesk/login?ticket=proof", callback_origin: "http://api.local" })
     if (url.endsWith("/api/kb/collections")) return json({ collections: [] })
     if (url.endsWith("/api/skills/")) return json([])
     if (url.endsWith("/api/tools/available?include_usage=false")) return json({ tools: [] })
@@ -211,7 +212,7 @@ describe("AgentBuilder reconnect dialog", () => {
     serverStatus.current = "needs_reconnect"
     authUser.current = { id: "1", is_admin: false }
     ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = vi.fn()
-    openSpy = vi.spyOn(window, "open").mockReturnValue({ closed: false, close: vi.fn() } as unknown as Window)
+    openSpy = vi.spyOn(window, "open").mockReturnValue({ closed: false, close: vi.fn(), location: { replace: vi.fn() } } as unknown as Window)
   })
 
   afterEach(() => {
@@ -230,14 +231,14 @@ describe("AgentBuilder reconnect dialog", () => {
     fireEvent.click(dialog.getByRole("button", { name: RECONNECT }))
 
     expect(openSpy).toHaveBeenCalledTimes(1)
-    const loginUrl = new URL(String(openSpy.mock.calls[0][0]))
-    expect(loginUrl.pathname).toBe("/api/auth/zendesk/login")
-    expect(loginUrl.searchParams.get("app_id")).toBe("zendesk")
+    expect(openSpy.mock.calls[0][0]).toBe("about:blank")
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/auth/zendesk/login", expect.objectContaining({ method: "POST" })))
+    await waitFor(() => expect((openSpy.mock.results[0].value as Window).location.replace).toHaveBeenCalled())
 
     const callsBefore = serversCalls()
     serverStatus.current = "connected"
     act(() => {
-      window.dispatchEvent(new MessageEvent("message", { data: { type: "oauth-success" } }))
+      window.dispatchEvent(new MessageEvent("message", { source: openSpy.mock.results[0].value, origin: "http://api.local", data: { type: "oauth-success", provider: "zendesk" } }))
     })
 
     await waitFor(() => expect(screen.queryByText(BADGE)).not.toBeInTheDocument())

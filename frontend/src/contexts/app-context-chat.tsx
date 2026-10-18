@@ -2604,6 +2604,7 @@ export function AppProvider({
     (message: WebSocketMessage, owner: SessionMessageOwner) => void
   >(() => {})
   const mountedRef = useRef(false)
+  const onConnectTimeoutsRef = useRef(new Set<ReturnType<typeof setTimeout>>())
   const [stopState, setStopState] = useState<SessionStopState>("idle")
   const stopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Per task, not per connection: "the visitor asked to stop task N" stays
@@ -2766,6 +2767,8 @@ export function AppProvider({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      onConnectTimeoutsRef.current.forEach(timeout => clearTimeout(timeout))
+      onConnectTimeoutsRef.current.clear()
       resendWaitersRef.current.release(false)
       messageDeliveryCountRef.current = 0
       discardSessionPreAdoptionBuffer()
@@ -2922,13 +2925,23 @@ export function AppProvider({
     isHistoricalDataLoadingRef.current = true
     dispatch({ type: "SET_HISTORY_LOADING", payload: true })
 
+    // These callbacks belong to this provider and must not dispatch after it
+    // unmounts. Remove expired handles so reconnects cannot grow the set.
+    const scheduleOnConnect = (callback: () => void, delay: number) => {
+      const timeout = setTimeout(() => {
+        onConnectTimeoutsRef.current.delete(timeout)
+        callback()
+      }, delay)
+      onConnectTimeoutsRef.current.add(timeout)
+    }
+
     // Safety timeout: if no history arrives within 2 seconds, assume empty or done
-    setTimeout(() => {
+    scheduleOnConnect(() => {
       dispatch({ type: "SET_HISTORY_LOADING", payload: false })
     }, 2000)
 
     // Auto-execute PENDING tasks from Agent Builder
-    setTimeout(() => {
+    scheduleOnConnect(() => {
       if (pendingTaskToExecuteRef.current) {
         const hasUserMessages = stateRef.current.messages.some(m => m.role === 'user')
         console.log('🔍 onConnect - checking auto-execute:', {

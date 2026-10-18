@@ -23,9 +23,8 @@ export function createExcelSheetPreview(
 
   for (const [address, cell] of Object.entries(sheet)) {
     if (address.startsWith("!")) continue
-    // Format a copy before removing raw attribute values. SheetJS interpolates
-    // v/z/l.Target without escaping, so merely sanitizing its malformed HTML
-    // can lose cell text or table structure before the sanitizer sees it.
+    // Format a copy before dropping raw v/z attributes, preserving cell text
+    // and table structure. Link targets follow the export escaping path below.
     let html = ""
     if (cell.v != null) {
       // Rich-text runs can contain table markup. Keep them inline before
@@ -53,9 +52,10 @@ export function createExcelSheetPreview(
       h: html,
     }
     if (cell.l?.Target) {
-      // The XLSX reader leaves XML entities in link targets. Escape the HTML
-      // attribute delimiter without double-encoding query-string ampersands.
-      preview[address].l = { Target: cell.l.Target.replace(/"/g, "&quot;") }
+      // SheetJS 0.20.3 decodes XML entities on read and escapes HTML attributes
+      // on export. Keep the original target: pre-escaping would double-encode
+      // literal quotes/entities. DOMPurify below still rejects unsafe schemes.
+      preview[address].l = { Target: cell.l.Target }
     }
   }
 

@@ -12,6 +12,10 @@ const useAuthMock = vi.hoisted(() => vi.fn(() => ({ token: "token", inTeam: fals
 const translateMock = vi.hoisted(() => vi.fn((key: string) => key))
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
+vi.mock("@/lib/oauth-launch", async () => ({
+  openOAuthAuthorizationPopup: (await import("@/test/oauth-popup-double")).openOAuthPopupDouble,
+  isOAuthSuccessMessage: (await import("@/test/oauth-popup-double")).isOAuthSuccessMessageDouble,
+}))
 
 vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
@@ -943,7 +947,7 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
       await act(async () => {
         window.dispatchEvent(
-          Object.assign(new Event("message"), { data: { type: "oauth-success" } }),
+          Object.assign(new Event("message"), { source: popup, origin: "http://api.local", data: { type: "oauth-success", provider: "zoom" } }),
         )
       })
       expect(onSuccess).toHaveBeenCalledTimes(1)

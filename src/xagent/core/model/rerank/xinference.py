@@ -15,7 +15,7 @@ import os
 from collections.abc import Sequence
 from typing import Any, Dict, List, Optional
 
-from ...utils import public_requests as requests
+from .. import public_requests as requests
 from .base import BaseRerank
 
 logger = logging.getLogger(__name__)

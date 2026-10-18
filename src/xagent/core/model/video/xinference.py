@@ -11,7 +11,9 @@ from urllib.request import url2pathname
 
 import aiohttp
 
-from ...utils.public_aiohttp import create_public_aiohttp_session
+from ....config import get_media_download_max_bytes
+from ...utils.public_download import download_public_input
+from ..public_http import create_public_model_aiohttp_session
 from .base import BaseVideoModel
 
 logger = logging.getLogger(__name__)
@@ -232,16 +234,12 @@ class XinferenceVideoModel(BaseVideoModel):
             return await asyncio.to_thread(allowed_path.read_bytes)
         if parsed.scheme in {"http", "https"}:
             timeout_value = timeout if timeout is not None else self.timeout
-            timeout_obj = aiohttp.ClientTimeout(
-                total=min(REFERENCE_MEDIA_FETCH_TIMEOUT, timeout_value)
+            response = await download_public_input(
+                media_text,
+                max_bytes=get_media_download_max_bytes("image"),
+                timeout=min(REFERENCE_MEDIA_FETCH_TIMEOUT, timeout_value),
             )
-            async with create_public_aiohttp_session(timeout=timeout_obj) as session:
-                async with session.get(media_text) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to fetch reference media: HTTP {response.status}"
-                        )
-                    return await response.read()
+            return response.content
 
         if parsed.scheme:
             raise ValueError(
@@ -362,7 +360,9 @@ class XinferenceVideoModel(BaseVideoModel):
 
         try:
             timeout_obj = aiohttp.ClientTimeout(total=effective_timeout)
-            async with create_public_aiohttp_session(timeout=timeout_obj) as session:
+            async with create_public_model_aiohttp_session(
+                timeout=timeout_obj
+            ) as session:
                 if first_frame_image_url and last_frame_image_url:
                     first_frame = await self._read_media_bytes(
                         first_frame_image_url,

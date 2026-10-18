@@ -4183,3 +4183,12 @@ def test_remote_json_download_size_rejects_invalid_limits(monkeypatch, value):
     monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
     with pytest.raises(ValueError):
         config.get_remote_json_download_max_bytes()
+
+
+def test_private_model_config_is_default_empty_and_environment_only(monkeypatch):
+    assert config.get_model_private_endpoints() == []
+    assert config.get_model_private_cidrs() == []
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_ENDPOINTS", " http://localhost:9997, ")
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_CIDRS", " 127.0.0.1/32,::1/128 ")
+    assert config.get_model_private_endpoints() == ["http://localhost:9997"]
+    assert config.get_model_private_cidrs() == ["127.0.0.1/32", "::1/128"]

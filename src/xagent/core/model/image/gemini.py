@@ -19,9 +19,9 @@ import httpx
 
 from ....config import get_media_download_max_bytes
 from ...utils.public_download import download_public_input
-from ...utils.public_http_transport import create_public_async_client
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
 from ..chat.token_context import MediaCallType
+from ..public_http import create_public_model_async_client
 from .base import (
     BaseImageModel,
     InvalidImageResponseError,
@@ -423,7 +423,7 @@ class GeminiImageModel(BaseImageModel):
         try:
             # Make the async HTTP request
             timeout = httpx.Timeout(self.timeout, connect=10.0)
-            async with create_public_async_client(timeout=timeout) as client:
+            async with create_public_model_async_client(timeout=timeout) as client:
                 response = await client.post(
                     api_url,
                     json=request_body,
@@ -755,7 +755,7 @@ class GeminiImageModel(BaseImageModel):
 
         try:
             timeout = httpx.Timeout(self.timeout, connect=10.0)
-            async with create_public_async_client(timeout=timeout) as client:
+            async with create_public_model_async_client(timeout=timeout) as client:
                 response = await client.post(
                     api_url,
                     json=request_body,

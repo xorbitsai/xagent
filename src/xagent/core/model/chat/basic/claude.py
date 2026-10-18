@@ -16,7 +16,10 @@ else:
         Anthropic = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
-from ....utils.public_http_transport import create_public_async_client
+from ...public_http import (
+    create_owned_async_sdk_client,
+    create_public_model_async_client,
+)
 from ..error import is_retryable_http_status
 from ..exceptions import LLMRetryableError, LLMTimeoutError
 from ..stream_deadline import await_before_deadline
@@ -309,10 +312,9 @@ class ClaudeLLM(BaseLLM):
                     clean_base_url = clean_base_url[:-3]
                 client_kwargs["base_url"] = clean_base_url
 
-            client_kwargs["http_client"] = create_public_async_client(
-                timeout=self.timeout
+            self._client = create_owned_async_sdk_client(
+                AsyncAnthropic, **client_kwargs
             )
-            self._client = AsyncAnthropic(**client_kwargs)
 
     def _convert_messages_to_anthropic_format(
         self, messages: List[Dict[str, Any]]
@@ -1363,7 +1365,7 @@ class ClaudeLLM(BaseLLM):
         }
 
         try:
-            async with create_public_async_client(timeout=30.0) as client:
+            async with create_public_model_async_client(timeout=30.0) as client:
                 response = await client.get(url, headers=headers)
                 response.raise_for_status()
                 data = response.json()

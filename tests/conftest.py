@@ -508,6 +508,8 @@ def isolate_proxy_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "HTTPS_PROXY",
         "https_proxy",
         "XAGENT_TRUSTED_EGRESS_PROXY",
+        "XAGENT_MODEL_PRIVATE_ENDPOINTS",
+        "XAGENT_MODEL_PRIVATE_CIDRS",
     ):
         monkeypatch.delenv(name, raising=False)
 

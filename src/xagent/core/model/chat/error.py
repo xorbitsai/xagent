@@ -1,6 +1,7 @@
 import httpx
 import openai
 
+from ..public_http import is_model_network_policy_error
 from .exceptions import (
     LLMContextLengthError,
     LLMRetryableError,
@@ -85,6 +86,8 @@ def _provider_vetoed_retry(error: BaseException) -> bool:
 
 
 def retry_on(e: Exception) -> bool:
+    if is_model_network_policy_error(e):
+        return False
     if is_context_length_error(e):
         return False
 

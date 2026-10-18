@@ -1,6 +1,7 @@
 """Gemini LLM implementation using official Google Generative AI SDK."""
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -10,9 +11,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 from google import genai  # type: ignore[import-untyped,unused-ignore]
 from google.genai import errors as genai_errors
 
-from ....utils.public_http_transport import public_http_client_options
 from ....utils.security import redact_sensitive_text
 from ...providers import is_placeholder_api_key
+from ...public_http import public_model_http_client_options
 from ..error import is_context_length_error
 from ..exceptions import (
     LLMContextLengthError,
@@ -357,8 +358,10 @@ class GeminiLLM(BaseLLM):
                 # Prepare HTTP options for custom base URL if configured
                 http_options = genai.types.HttpOptions(
                     timeout=int(self.timeout * 1000),
-                    client_args=public_http_client_options(asynchronous=False),
-                    async_client_args=public_http_client_options(asynchronous=True),
+                    client_args=public_model_http_client_options(asynchronous=False),
+                    async_client_args=public_model_http_client_options(
+                        asynchronous=True
+                    ),
                 )
                 if self.base_url:
                     # Remove trailing version paths (/v1beta, /v1) as SDK adds them automatically
@@ -1172,8 +1175,8 @@ class GeminiLLM(BaseLLM):
             # Prepare HTTP options for custom base URL if configured
             http_options = genai.types.HttpOptions(
                 timeout=30000,
-                client_args=public_http_client_options(asynchronous=False),
-                async_client_args=public_http_client_options(asynchronous=True),
+                client_args=public_model_http_client_options(asynchronous=False),
+                async_client_args=public_model_http_client_options(asynchronous=True),
             )
             if base_url:
                 # Remove trailing version paths (/v1beta, /v1) as SDK adds them automatically
@@ -1221,7 +1224,16 @@ class GeminiLLM(BaseLLM):
 
     async def close(self) -> None:
         """Close the Gemini client and cleanup resources."""
-        self._client = None
+        client, self._client = self._client, None
+        if client is not None:
+            close_async = getattr(client.aio, "aclose", None)
+            if callable(close_async):
+                result = close_async()
+                if inspect.isawaitable(result):
+                    await result
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
     async def __aenter__(self) -> "GeminiLLM":
         """Async context manager entry."""

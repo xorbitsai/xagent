@@ -112,3 +112,20 @@ async def test_base_model_awaits_real_async_session_cleanup():
     await model.aclose()
     assert session.closed
     assert model._client is None
+
+
+def test_real_sync_client_close_closes_guarded_session(monkeypatch):
+    from unittest.mock import Mock
+
+    from xagent.core.model.public_requests import Session as ModelSession
+
+    response = requests.Response()
+    response.status_code = 200
+    response.json = lambda: {"auth": False}
+    monkeypatch.setattr(ModelSession, "get", lambda *args, **kwargs: response)
+    client = PublicXinferenceClient("https://xinference.example")
+    assert isinstance(client.session, ModelSession)
+    close = Mock(wraps=client.session.close)
+    monkeypatch.setattr(client.session, "close", close)
+    client.close()
+    close.assert_called_once()

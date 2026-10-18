@@ -24,8 +24,10 @@ from botocore.exceptions import (
 )
 
 from ....runtime_performance import run_in_thread_with_telemetry
+from ....tools.core.web_content import get_trusted_proxy_url
 from ....utils.public_botocore import PublicBotocoreSession
 from ....utils.security import redact_sensitive_text
+from ...network_policy import ModelNetworkPolicy
 from ...providers import validate_bedrock_endpoint
 from ..error import matches_context_length_error
 from ..exceptions import LLMContextLengthError, LLMRetryableError
@@ -372,10 +374,29 @@ class BedrockLLM(BaseLLM):
             config=config,
         )
         previous_session = client._endpoint.http_session
-        previous_session.close()
-        client._endpoint.http_session = PublicBotocoreSession(
-            timeout=self.timeout, verify=previous_session._verify
+        public_session = PublicBotocoreSession(
+            timeout=self.timeout,
+            verify=previous_session._verify,
+            proxy_url=get_trusted_proxy_url(),
+            _policy=ModelNetworkPolicy(),
+            max_pool_connections=getattr(previous_session, "_max_pool_connections", 10),
+            socket_options=getattr(previous_session, "_socket_options", None),
+            client_cert=(
+                getattr(previous_session, "_cert_file", None),
+                getattr(previous_session, "_key_file", None),
+            )
+            if getattr(previous_session, "_key_file", None)
+            else getattr(previous_session, "_cert_file", None),
+            proxies_config=getattr(
+                getattr(previous_session, "_proxy_config", None), "settings", None
+            ),
         )
+        try:
+            previous_session.close()
+        except BaseException:
+            public_session.close()
+            raise
+        client._endpoint.http_session = public_session
         if key_auth:
             api_key = self.api_key
             assert api_key is not None

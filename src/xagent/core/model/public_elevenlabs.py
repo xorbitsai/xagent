@@ -5,9 +5,9 @@ from typing import Any, Callable
 
 import httpx
 
-from ..utils.public_http_transport import (
-    create_public_async_client,
-    create_public_sync_client,
+from .public_http import (
+    create_public_model_async_client,
+    create_public_model_sync_client,
 )
 
 
@@ -15,9 +15,9 @@ def create_public_elevenlabs_client(
     factory: Callable[..., Any], *, asynchronous: bool, **kwargs: Any
 ) -> Any:
     http_client = (
-        create_public_async_client(timeout=60, follow_redirects=True)
+        create_public_model_async_client(timeout=60, follow_redirects=True)
         if asynchronous
-        else create_public_sync_client(timeout=60, follow_redirects=True)
+        else create_public_model_sync_client(timeout=60, follow_redirects=True)
     )
     try:
         client = factory(httpx_client=http_client, **kwargs)

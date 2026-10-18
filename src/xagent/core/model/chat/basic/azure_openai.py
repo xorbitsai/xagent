@@ -3,7 +3,7 @@ from typing import Any, List, Optional
 
 from openai import AsyncAzureOpenAI
 
-from ....utils.public_http_transport import create_public_async_client
+from ...public_http import create_owned_async_sdk_client
 from ..timeout_config import TimeoutConfig
 from .openai import OpenAILLM
 
@@ -135,8 +135,8 @@ class AzureOpenAILLM(OpenAILLM):
             client_class = (
                 _ApiKeyOnlyAsyncAzureOpenAI if self.api_key_only else AsyncAzureOpenAI
             )
-            self._client = client_class(
-                http_client=create_public_async_client(timeout=self.timeout),
+            self._client = create_owned_async_sdk_client(
+                client_class,
                 azure_endpoint=self.azure_endpoint,
                 api_version=self.api_version,
                 api_key=self.api_key,

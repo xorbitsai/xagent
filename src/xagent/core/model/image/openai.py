@@ -9,8 +9,8 @@ from openai import APIResponseValidationError, AsyncOpenAI
 
 from ....config import get_media_download_max_bytes
 from ...utils.public_download import download_public_input
-from ...utils.public_http_transport import create_public_async_client
 from ..chat.token_context import MediaCallType
+from ..public_http import create_owned_async_sdk_client
 from .base import (
     BaseImageModel,
     InvalidImageResponseError,
@@ -155,8 +155,8 @@ class OpenAIImageModel(BaseImageModel):
 
     def _ensure_client(self) -> None:
         if self._client is None:
-            self._client = AsyncOpenAI(
-                http_client=create_public_async_client(timeout=self.timeout),
+            self._client = create_owned_async_sdk_client(
+                AsyncOpenAI,
                 base_url=self.base_url
                 if self.base_url != "https://api.openai.com/v1"
                 else None,
@@ -168,6 +168,14 @@ class OpenAIImageModel(BaseImageModel):
                 # records. One retry layer, and it is the one that meters.
                 max_retries=0,
             )
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            client, self._client = self._client, None
+            await client.close()
+
+    async def close(self) -> None:
+        await self.aclose()
 
     def _normalize_size(self, size: Optional[str]) -> str:
         # Tolerates None because callers forward an unset size explicitly rather

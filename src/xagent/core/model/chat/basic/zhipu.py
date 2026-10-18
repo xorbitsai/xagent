@@ -9,9 +9,9 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 import httpx
 
-from ....utils.public_http_transport import (
-    create_public_async_client,
-    create_public_sync_client,
+from ...public_http import (
+    create_public_model_async_client,
+    create_public_model_sync_client,
 )
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
@@ -153,7 +153,7 @@ class ZhipuLLM(BaseLLM):
                     "zai SDK is not installed. Please install it with: pip install zai-sdk"
                 )
             self._client = ZhipuAiClient(
-                http_client=create_public_sync_client(timeout=self.timeout),
+                http_client=create_public_model_sync_client(timeout=self.timeout),
                 api_key=self.api_key,
                 base_url=self.base_url,
                 # Retry policy lives in the shared RetryWrapper only. The zai
@@ -1184,10 +1184,15 @@ class ZhipuLLM(BaseLLM):
         if not base_url:
             base_url = "https://open.bigmodel.cn/v1"
 
-        public_http = create_public_sync_client(timeout=30.0)
+        public_http = create_public_model_sync_client(timeout=30.0)
         try:
             # Create client instance
-            client = ZhipuAiClient(api_key=api_key, http_client=public_http)
+            client = ZhipuAiClient(
+                api_key=api_key,
+                base_url=base_url,
+                http_client=public_http,
+                max_retries=0,
+            )
 
             # Try to use SDK's models.list() method if available
             try:
@@ -1220,7 +1225,9 @@ class ZhipuLLM(BaseLLM):
                 url = base_url.rstrip("/") + "/models"
                 headers = {"Authorization": f"Bearer {api_key}"}
 
-                async with create_public_async_client(timeout=30.0) as http_client:
+                async with create_public_model_async_client(
+                    timeout=30.0
+                ) as http_client:
                     response = await http_client.get(url, headers=headers)
                     response.raise_for_status()
                     data = response.json()

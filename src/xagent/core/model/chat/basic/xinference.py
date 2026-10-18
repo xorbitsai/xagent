@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
+from ...public_http import is_model_network_policy_error
 from ...public_xinference import PublicAsyncXinferenceClient
 from ..exceptions import LLMTimeoutError
 from ..timeout_config import TimeoutConfig
@@ -847,6 +848,10 @@ class XinferenceLLM(BaseLLM):
                 return result
 
             except Exception as e:
+                if is_model_network_policy_error(e):
+                    raise ValueError(
+                        "Xinference endpoint is blocked by deployment network policy"
+                    ) from e
                 # Network or connection error
                 if attempt < max_retries - 1:
                     logger.warning(

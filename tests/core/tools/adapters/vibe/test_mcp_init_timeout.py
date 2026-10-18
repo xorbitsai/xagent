@@ -916,7 +916,9 @@ def test_transport_recorder_instrument_domain(monkeypatch, transport, custom_fac
         assert endpoint_url == connection["url"]
         return _FakeHttpxClient()
 
-    monkeypatch.setattr(mcp_adapter_module, "create_mcp_http_client", fake_default)
+    monkeypatch.setattr(
+        "xagent.core.tools.core.mcp.http.create_mcp_http_client", fake_default
+    )
 
     out = recorder.instrument(connection)
 

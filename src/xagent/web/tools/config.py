@@ -699,12 +699,7 @@ _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
 
 
 def _oauth_refresh_http_client() -> httpx.AsyncClient:
-    proxy = get_trusted_proxy_url()
-    return (
-        create_public_async_client(proxy_url=proxy)
-        if proxy
-        else create_public_async_client()
-    )
+    return create_public_async_client(proxy_url=get_trusted_proxy_url())
 
 
 async def _request_oauth_refresh_with_retries(
@@ -1142,8 +1137,9 @@ async def refresh_oauth_token_if_needed(
             # not a choice this codebase would otherwise make. No httpx/
             # httpcore request-logging middleware exists in this codebase
             # today (those loggers are pinned to WARNING) and the
-            # configured HTTPS proxy only sees a CONNECT tunnel, never this
-            # URL's query string -- reassess this note if either changes.
+            # explicitly trusted (XAGENT_TRUSTED_EGRESS_PROXY) proxy sees a
+            # CONNECT tunnel for HTTPS, never this URL's query string --
+            # reassess this note if either changes.
             post_kwargs["params"] = {
                 "grant_type": data.pop("grant_type"),
                 "refresh_token": data.pop("refresh_token"),

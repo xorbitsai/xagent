@@ -50,7 +50,6 @@ from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import (
     Connection,
     McpHttpClientFactory,
-    create_mcp_http_client,
     create_session,
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
@@ -3818,13 +3817,12 @@ class _TransportRecorder:
         """
         if connection.get("transport") not in _INSTRUMENTABLE_TRANSPORTS:
             return connection
-        from functools import partial
+        from ...core.mcp.http import mcp_http_client_factory
 
         build = cast(
             McpHttpClientFactory,
-            connection.get("httpx_client_factory")
-            or partial(
-                create_mcp_http_client, endpoint_url=str(connection.get("url", ""))
+            mcp_http_client_factory(
+                connection["url"], connection.get("httpx_client_factory")
             ),
         )
 

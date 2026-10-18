@@ -1,11 +1,25 @@
 """Connection-bound HTTP policy for configured remote MCP servers."""
 
+from __future__ import annotations
+
+from functools import partial
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 import httpx
 
 from ....utils.public_http_transport import PublicHttpTransport, UnsafePublicHttpTarget
 from ..web_content import get_trusted_proxy_url
+
+if TYPE_CHECKING:
+    from .sessions import McpHttpClientFactory
+
+
+def mcp_http_client_factory(
+    endpoint_url: str, custom: McpHttpClientFactory | None = None
+) -> McpHttpClientFactory:
+    """Bind the default factory once; preserve caller-owned custom factories."""
+    return custom or partial(create_mcp_http_client, endpoint_url=endpoint_url)
 
 
 def _origin(url: str) -> str:
@@ -56,6 +70,5 @@ def create_mcp_http_client(
         auth=auth,
         transport=MCPHttpTransport(endpoint_url),
         trust_env=False,
-        follow_redirects=True,
         max_redirects=5,
     )

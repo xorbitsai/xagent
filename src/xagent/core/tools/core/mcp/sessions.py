@@ -8,7 +8,6 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from mcp import ClientSession, StdioServerParameters
@@ -16,8 +15,6 @@ from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 from typing_extensions import NotRequired, TypedDict
-
-from .http import create_mcp_http_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -255,7 +252,9 @@ async def _create_sse_session(  # noqa: PLR0913
     Yields:
         An initialized ClientSession.
     """
-    # Create and store the connection
+    # Stdio runners intentionally do not install web-fetch dependencies.
+    from .http import mcp_http_client_factory
+
     async with (
         sse_client(
             url,
@@ -263,8 +262,7 @@ async def _create_sse_session(  # noqa: PLR0913
             timeout,
             sse_read_timeout,
             auth=auth,
-            httpx_client_factory=httpx_client_factory
-            or partial(create_mcp_http_client, endpoint_url=url),
+            httpx_client_factory=mcp_http_client_factory(url, httpx_client_factory),
         ) as (
             read,
             write,
@@ -302,7 +300,8 @@ async def _create_streamable_http_session(  # noqa: PLR0913
     Yields:
         An initialized ClientSession.
     """
-    # Create and store the connection
+    from .http import mcp_http_client_factory
+
     async with (
         streamablehttp_client(
             url,
@@ -311,8 +310,7 @@ async def _create_streamable_http_session(  # noqa: PLR0913
             sse_read_timeout,
             terminate_on_close,
             auth=auth,
-            httpx_client_factory=httpx_client_factory
-            or partial(create_mcp_http_client, endpoint_url=url),
+            httpx_client_factory=mcp_http_client_factory(url, httpx_client_factory),
         ) as (read, write, _),
         ClientSession(read, write, **(session_kwargs or {})) as session,
     ):

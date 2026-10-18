@@ -26,6 +26,8 @@ from ....utils.security import (
 )
 from ..web_content import get_trusted_proxy_url
 
+WEBSOCKET_CONNECT_TIMEOUT = 10.0
+
 
 class _NoRedirectConnect(connect):
     def process_redirect(self, exc: Exception) -> Exception | str:
@@ -36,43 +38,57 @@ class _NoRedirectConnect(connect):
 
 @asynccontextmanager
 async def _connect_public(
-    url: str, addresses: list[str], port: int, tls_kwargs: dict[str, Any]
+    url: str,
+    addresses: list[str],
+    port: int,
+    tls_kwargs: dict[str, Any],
+    *,
+    deadline: float | None = None,
 ) -> AsyncIterator[Any]:
+    if deadline is None:
+        deadline = anyio.current_time() + WEBSOCKET_CONNECT_TIMEOUT
     proxy = get_trusted_proxy_url()
     async with AsyncExitStack() as stack:
-        options: dict[str, Any] = {}
-        targets: list[str | None]
-        if proxy:
-            # Unlike websockets' host override, this gate also pins the
-            # upstream CONNECT target; the proxy cannot re-resolve a name.
-            gate = PublicNetworkEgressProxy(upstream_proxy_url=proxy)
-            stack.push_async_callback(gate.close)
-            options["proxy"] = await gate.start()
-            targets = [None]
-        else:
-            options["proxy"] = None
-            targets = list(addresses)
-        started = anyio.current_time()
-        for index, address in enumerate(targets):
-            remaining = 10.0 - (anyio.current_time() - started)
-            if remaining <= 0:
-                raise TimeoutError("MCP WebSocket connect budget exhausted")
-            if address is not None:
-                options.update(host=address, port=port)
-            try:
-                websocket = await stack.enter_async_context(
-                    _NoRedirectConnect(
-                        url,
-                        open_timeout=remaining / (len(targets) - index),
-                        subprotocols=[Subprotocol("mcp")],
-                        **options,
-                        **tls_kwargs,
-                    )
+        remaining = deadline - anyio.current_time()
+        if remaining <= 0:
+            raise TimeoutError("MCP WebSocket connect budget exhausted")
+        # Bound gate startup and all handshakes, but not the live session.
+        with anyio.fail_after(remaining):
+            options: dict[str, Any] = {}
+            targets: list[str | None]
+            if proxy:
+                # Reserve a per-address slice so a black-holed first IP
+                # cannot consume the whole upstream gate handshake budget.
+                gate = PublicNetworkEgressProxy(
+                    upstream_proxy_url=proxy,
+                    connect_timeout=remaining / max(1, len(addresses)),
                 )
-                break
-            except (OSError, TimeoutError):
-                if index == len(targets) - 1:
-                    raise
+                stack.push_async_callback(gate.close)
+                options["proxy"] = await gate.start()
+                targets = [None]
+            else:
+                options["proxy"] = None
+                targets = list(addresses)
+            for index, address in enumerate(targets):
+                remaining = deadline - anyio.current_time()
+                if remaining <= 0:
+                    raise TimeoutError("MCP WebSocket connect budget exhausted")
+                if address is not None:
+                    options.update(host=address, port=port)
+                try:
+                    websocket = await stack.enter_async_context(
+                        _NoRedirectConnect(
+                            url,
+                            open_timeout=remaining / (len(targets) - index),
+                            subprotocols=[Subprotocol("mcp")],
+                            **options,
+                            **tls_kwargs,
+                        )
+                    )
+                    break
+                except (OSError, TimeoutError):
+                    if index == len(targets) - 1:
+                        raise
         yield websocket
 
 
@@ -96,7 +112,9 @@ async def public_websocket_client(
     # uses IDNA/UTS46. Canonicalize before the handshake so Host, SNI, and
     # proxy CONNECT all refer to the same checked name (e.g. faß != fass).
     url = str(URL(url))
-    addresses = await validate_public_http_url(http_url)
+    deadline = anyio.current_time() + WEBSOCKET_CONNECT_TIMEOUT
+    with anyio.fail_after(WEBSOCKET_CONNECT_TIMEOUT):
+        addresses = await validate_public_http_url(http_url)
     read_writer, read_stream = anyio.create_memory_object_stream[
         SessionMessage | Exception
     ](0)
@@ -111,7 +129,9 @@ async def public_websocket_client(
         read_stream,
         write_stream,
         write_reader,
-        _connect_public(url, addresses, port, tls_kwargs) as websocket,
+        _connect_public(
+            url, addresses, port, tls_kwargs, deadline=deadline
+        ) as websocket,
     ):
 
         async def reader() -> None:

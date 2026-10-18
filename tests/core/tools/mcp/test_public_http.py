@@ -66,14 +66,31 @@ async def test_mcp_http_is_pinned_and_still_sends_credentials_to_configured_orig
         "https://other.example/messages",
         "http://example.com/messages",
         "https://example.com:8443/messages",
+        "http://example.com:443/messages",
     ],
 )
 async def test_mcp_cannot_replay_credentials_across_origins(target, network):
     seen, replies = network
     replies.append(httpx.Response(307, headers={"Location": target}))
     async with create_mcp_http_client(endpoint_url="https://example.com/mcp") as client:
+        # The SDK follows same-origin redirects itself. Exercise the real
+        # transport's binding when HTTPX is explicitly asked to follow too.
         with pytest.raises(UnsafePublicHttpTarget, match="origin"):
-            await client.post("https://example.com/mcp", content=b"secret")
+            await client.post(
+                "https://example.com/mcp", content=b"secret", follow_redirects=True
+            )
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_http_to_https_upgrade_is_not_an_origin_exception(network):
+    seen, replies = network
+    replies.append(httpx.Response(307, headers={"Location": "https://example.com/mcp"}))
+    async with create_mcp_http_client(endpoint_url="http://example.com/mcp") as client:
+        with pytest.raises(UnsafePublicHttpTarget, match="origin"):
+            await client.post(
+                "http://example.com/mcp", content=b"secret", follow_redirects=True
+            )
     assert len(seen) == 1
 
 

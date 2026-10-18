@@ -131,6 +131,8 @@ async def test_peer_eof_closes_incoming_stream_without_waiting_for_outer_exit(
 @pytest.mark.asyncio
 async def test_websocket_address_fallback_has_one_budget(monkeypatch):
     attempts = []
+    elapsed = [100.0]
+    monkeypatch.setattr(transport.anyio, "current_time", lambda: elapsed[0])
 
     class Connection:
         def __init__(self, url, **kwargs):
@@ -138,6 +140,7 @@ async def test_websocket_address_fallback_has_one_budget(monkeypatch):
 
         async def __aenter__(self):
             if len(attempts) == 1:
+                elapsed[0] += 4
                 raise OSError("unreachable")
             return self
 
@@ -151,7 +154,7 @@ async def test_websocket_address_fallback_has_one_budget(monkeypatch):
         pass
     assert [item["host"] for item in attempts] == ["2606:4700:4700::1111", "1.1.1.1"]
     assert 0 < attempts[0]["open_timeout"] <= 5
-    assert attempts[1]["open_timeout"] <= 10
+    assert attempts[1]["open_timeout"] == 6
 
 
 @pytest.mark.asyncio
@@ -164,6 +167,7 @@ async def test_trusted_websocket_proxy_uses_owned_gate_and_closes_it(monkeypatch
     class Gate:
         def __init__(self, **kwargs):
             assert kwargs["upstream_proxy_url"] == "http://trusted.example:3128"
+            assert 0 < kwargs["connect_timeout"] <= 5
 
         async def start(self):
             return "http://owned:password@127.0.0.1:1234"
@@ -183,8 +187,111 @@ async def test_trusted_websocket_proxy_uses_owned_gate_and_closes_it(monkeypatch
 
     monkeypatch.setattr(transport, "PublicNetworkEgressProxy", Gate)
     monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
-    async with transport._connect_public("wss://example.com/", ["1.1.1.1"], 443, {}):
+    async with transport._connect_public(
+        "wss://example.com/", ["1.1.1.1", "8.8.8.8"], 443, {}
+    ):
         assert not closed
     assert seen[0]["proxy"] == "http://owned:password@127.0.0.1:1234"
     assert "host" not in seen[0]
     assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_exhausted_connect_budget_does_not_try_another_address(monkeypatch):
+    elapsed = [100.0]
+    attempts = []
+    monkeypatch.setattr(transport.anyio, "current_time", lambda: elapsed[0])
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            attempts.append(kwargs)
+
+        async def __aenter__(self):
+            elapsed[0] += transport.WEBSOCKET_CONNECT_TIMEOUT
+            raise OSError("unreachable")
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
+    with pytest.raises(TimeoutError, match="budget exhausted"):
+        async with transport._connect_public(
+            "wss://example.com/", ["1.1.1.1", "8.8.8.8"], 443, {}
+        ):
+            pytest.fail("exhausted budget connected")
+    assert len(attempts) == 1
+
+
+@pytest.mark.asyncio
+async def test_dns_is_inside_websocket_connection_budget(monkeypatch):
+    monkeypatch.setattr(transport, "WEBSOCKET_CONNECT_TIMEOUT", 0.01)
+
+    async def slow_dns(url):
+        await asyncio.sleep(10)
+        pytest.fail("DNS was not cancelled")
+
+    monkeypatch.setattr(transport, "validate_public_http_url", slow_dns)
+    with pytest.raises(TimeoutError):
+        async with transport.public_websocket_client("wss://example.com/"):
+            pytest.fail("slow DNS connected")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["start", "connect"])
+async def test_proxy_gate_is_closed_when_handshake_fails(monkeypatch, failure):
+    monkeypatch.setattr(transport, "get_trusted_proxy_url", lambda: "http://proxy:3128")
+    closed = []
+
+    class Gate:
+        def __init__(self, **kwargs):
+            pass
+
+        async def start(self):
+            if failure == "start":
+                raise OSError("gate failed")
+            return "http://127.0.0.1:1234"
+
+        async def close(self):
+            closed.append(True)
+
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise OSError("handshake failed")
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(transport, "PublicNetworkEgressProxy", Gate)
+    monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
+    with pytest.raises(OSError, match="failed"):
+        async with transport._connect_public(
+            "wss://example.com/", ["1.1.1.1"], 443, {}
+        ):
+            pytest.fail("failed handshake connected")
+    assert closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_session_uses_guarded_websocket_factory(monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from xagent.core.tools.core.mcp import sessions
+
+    class Captured(Exception):
+        pass
+
+    @asynccontextmanager
+    async def guarded(url):
+        assert url == "wss://example.com/mcp"
+        raise Captured
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(transport, "public_websocket_client", guarded)
+    with pytest.raises(Captured):
+        async with sessions.create_session(
+            {"transport": "websocket", "url": "wss://example.com/mcp"}
+        ):
+            pytest.fail("unguarded WebSocket session")

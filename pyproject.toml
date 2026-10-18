@@ -17,14 +17,14 @@ classifiers = [
 ]
 dependencies = [
   "pydantic >= 2.11.7",
-  "langchain-openai >= 0.3.27",
+  "langchain-openai >= 1.1.14, <2",
   "langchain >= 0.3.26",
   "langchain-community >= 0.3.21",
-  "openai >= 1.50.0",
+  "openai >= 2.26.0, <3",  # retain the supported HTTPX 1.x SDK API
   "anthropic >= 0.84.0",
   "google-genai >= 1.65.0",
   "elevenlabs >= 2.0.0",
-  "xinference-client >= 2.3.0",
+  "xinference-client >= 2.3.0, <3",  # retain the tested client/model session contract
   "zai-sdk>=0.0.4",
   "numexpr >= 2.11.0",
   "aiohttp >= 3.12.14",
@@ -43,9 +43,9 @@ dependencies = [
   "opentelemetry-sdk >= 1.39.0, < 2.0.0",
   "opentelemetry-exporter-otlp-proto-http >= 1.39.0, < 2.0.0",
   "python-dotenv >= 1.0.1",
-  "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
+  "mcp>=1.30.0,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
-  "requests >= 2.32.0",
+  "requests >= 2.32.2",  # public-only adapter uses connection pool key hooks
   "idna >= 3.7",  # magento.py's non-ASCII MAGENTO_BASE_URL handling; currently only pulled in transitively via requests
   "python-dateutil >= 2.8.2",  # calendar.py's RRULE validation (utils.parse_rrule); currently only pulled in transitively
   "boto3 >= 1.34.59",  # Converse/ConverseStream plus AWS built-in MCP connectors
@@ -80,7 +80,7 @@ dependencies = [
   "google-cloud-pubsub>=2.21.0",
   # Utilities
   "docker>=7.1.0",
-  "json-repair==0.35.0",
+  "json-repair>=0.60.1,<1",
   "jsonschema>=4.25.1",
   "beartype>=0.18.5",
   "matplotlib>=3.5.0",
@@ -193,7 +193,7 @@ sandbox = [
   "pydantic>=2.11.7",
   "pydantic-settings",
   "cloudpickle>=3.0.0",
-  "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
+  "mcp>=1.30.0,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "pandas>=1.3.0",
   "numpy>=1.21.0",
   "matplotlib>=3.5.0",
@@ -249,8 +249,6 @@ test = [
   "psycopg[binary]>=3.2.0",
   "chromadb",
   "pymilvus>=2.6.9,<3.0.0",
-  "copilotkit==0.1.69",
-  "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
   "python-docx>=1.1.0",
   "asyncssh>=2.14.0",
@@ -274,6 +272,13 @@ xagent-web = "xagent.web.__main__:main"
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+# Require installable wheels for both development and Linux CI/deployment.
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cpu" }]
@@ -351,6 +356,7 @@ module = [
   "xinference",
   "xinference.*",
   "xinference_client",
+  "xinference_client.*",
   "aiogram",
   "aiogram.*",
   "lark_oapi",

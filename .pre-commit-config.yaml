@@ -60,7 +60,7 @@ repos:
           # `mcp.server.fastmcp`, renamed `streamablehttp_client` and
           # dropped `Server.list_tools`/`call_tool`, which fails the whole
           # run against code written for the locked 1.x API.
-          - mcp==1.19.0
+          - mcp==1.30.0
           - pandas-stubs
           - matplotlib-stubs
           - docker
@@ -68,6 +68,7 @@ repos:
           - playwright
           - nest-asyncio
           - anthropic
+          - openai>=2.26.0,<3
           - python-pptx
           - cloudpickle
           - exa-py

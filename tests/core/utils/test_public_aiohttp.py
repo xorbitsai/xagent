@@ -1,3 +1,4 @@
+import asyncio
 import socket
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -126,3 +127,45 @@ async def test_real_session_rejects_private_resolver_answers_before_socket(monke
         session.connector._resolver = Resolver()
         with pytest.raises(PrivateNetworkHostError):
             await session.get("https://example.com/")
+
+
+@pytest.mark.asyncio
+async def test_owned_aiohttp_proxy_does_not_allow_private_origin_or_overrides(
+    monkeypatch,
+):
+    original = socket.getaddrinfo
+
+    def resolve(host, port, *args, **kwargs):
+        if host == "public.example":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", port))]
+        return original(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    seen = []
+
+    async def serve(reader, writer):
+        try:
+            seen.append(await reader.readuntil(b"\r\n\r\n"))
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    try:
+        proxy = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+        async with create_public_aiohttp_session(proxy_url=proxy) as session:
+            async with session.get("http://public.example/") as response:
+                assert await response.text() == "ok"
+            with pytest.raises(PrivateNetworkHostError):
+                await session.get("http://169.254.169.254/")
+            with pytest.raises(ValueError, match="proxy"):
+                await session.get("http://public.example/", proxy="http://127.0.0.1:1")
+        assert len(seen) == 1
+        assert seen[0].startswith(b"GET http://public.example/")
+    finally:
+        server.close()
+        await server.wait_closed()

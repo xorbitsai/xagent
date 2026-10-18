@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .public_policy import HttpDestinationPolicy
 from .security import (
     build_ca_bundle_ssl_context,
     validate_public_http_url,
@@ -62,7 +63,13 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
     TLS SNI retain the validated logical hostname, never a caller override.
     """
 
-    def __init__(self, proxy_url: str | None = None) -> None:
+    def __init__(
+        self,
+        proxy_url: str | None = None,
+        *,
+        _policy: HttpDestinationPolicy | None = None,
+    ) -> None:
+        self._policy = _policy
         self._via_proxy = proxy_url is not None
         ssl_context = build_ca_bundle_ssl_context()
         proxy = (
@@ -79,6 +86,8 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
         )
 
     async def _resolve_addresses(self, url: str) -> list[str]:
+        if self._policy is not None:
+            return await self._policy.resolve(url)
         return await validate_public_http_url(url)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -126,22 +135,41 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
 class PublicSyncHttpTransport(httpx.BaseTransport):
     """Synchronous SDK counterpart with the same actual-connection policy."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        proxy_url: str | None = None,
+        *,
+        _policy: HttpDestinationPolicy | None = None,
+    ) -> None:
+        self._policy = _policy
+        self._via_proxy = proxy_url is not None
+        ssl_context = build_ca_bundle_ssl_context()
+        proxy = (
+            httpx.Proxy(proxy_url, ssl_context=ssl_context)
+            if proxy_url and httpx.URL(proxy_url).scheme == "https"
+            else proxy_url
+        )
         self._transport = httpx.HTTPTransport(
             trust_env=False,
             http2=False,
-            verify=build_ca_bundle_ssl_context(),
+            verify=ssl_context,
             # As in the async transport, pool keys use the pinned IP rather
             # than the logical TLS host. Never reuse across different names.
             limits=httpx.Limits(max_keepalive_connections=0),
+            proxy=proxy,
         )
+
+    def _resolve_addresses(self, url: str) -> list[str]:
+        if self._policy is not None:
+            return self._policy.resolve_sync(url)
+        return validate_public_http_url_sync(url)
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         started = time.monotonic()
         if request.method.upper() == "CONNECT":
             raise UnsafePublicHttpTarget("HTTP tunnels are not allowed")
         try:
-            addresses = validate_public_http_url_sync(str(request.url))
+            addresses = self._resolve_addresses(str(request.url))
         except ValueError as exc:
             raise UnsafePublicHttpTarget(str(exc)) from exc
         except OSError as exc:
@@ -149,18 +177,19 @@ class PublicSyncHttpTransport(httpx.BaseTransport):
                 "Public API host could not be resolved", request=request
             ) from exc
         connect_budget = request.extensions.get("timeout", {}).get("connect")
-        for index, address in enumerate(addresses):
+        targets = [request.url.host] if self._via_proxy else addresses
+        for index, address in enumerate(targets):
             pinned = _pin_request(request, [address])
             if connect_budget is not None:
                 remaining = max(0.0, connect_budget - (time.monotonic() - started))
                 pinned.extensions["timeout"] = {
                     **request.extensions["timeout"],
-                    "connect": remaining / (len(addresses) - index),
+                    "connect": remaining / (len(targets) - index),
                 }
             try:
                 return self._transport.handle_request(pinned)
             except (httpx.ConnectError, httpx.ConnectTimeout):
-                if index == len(addresses) - 1:
+                if index == len(targets) - 1:
                     raise
         raise httpx.ConnectError("Public API host did not resolve", request=request)
 
@@ -193,15 +222,16 @@ async def _async_redirect_guard(request: httpx.Request) -> None:
 
 
 def public_http_client_options(
-    *, asynchronous: bool, proxy_url: str | None = None
+    *,
+    asynchronous: bool,
+    proxy_url: str | None = None,
+    _policy: HttpDestinationPolicy | None = None,
 ) -> dict[str, Any]:
     """Transport options for SDKs that own and close their HTTPX clients."""
-    if proxy_url and not asynchronous:
-        raise ValueError("Synchronous public HTTPX clients do not support proxies")
     return {
-        "transport": PublicHttpTransport(proxy_url=proxy_url)
+        "transport": PublicHttpTransport(proxy_url=proxy_url, _policy=_policy)
         if asynchronous
-        else PublicSyncHttpTransport(),
+        else PublicSyncHttpTransport(proxy_url=proxy_url, _policy=_policy),
         "trust_env": False,
         "event_hooks": {
             "request": [_async_redirect_guard if asynchronous else _redirect_guard]
@@ -243,7 +273,11 @@ def _client_options(*, asynchronous: bool, kwargs: dict[str, Any]) -> dict[str, 
     guard = _async_redirect_guard if asynchronous else _redirect_guard
     hooks.setdefault("request", []).append(guard)
     proxy_url = kwargs.pop("proxy_url", None)
-    options = public_http_client_options(asynchronous=asynchronous, proxy_url=proxy_url)
+    options = public_http_client_options(
+        asynchronous=asynchronous,
+        proxy_url=proxy_url,
+        _policy=kwargs.pop("_policy", None),
+    )
     options.update(kwargs, event_hooks=hooks, max_redirects=max_redirects)
     return options
 

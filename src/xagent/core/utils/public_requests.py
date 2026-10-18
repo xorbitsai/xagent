@@ -36,6 +36,7 @@ from ...config import get_trusted_egress_proxy_enabled
 if TYPE_CHECKING:
     from requests.adapters import _HostParams, _PoolKwargs
 
+from .public_policy import HttpDestinationPolicy
 from .security import (
     build_ca_bundle_ssl_context,
     public_http_destination,
@@ -44,7 +45,8 @@ from .security import (
 
 
 class _PublicAdapter(HTTPAdapter):
-    def __init__(self) -> None:
+    def __init__(self, *, _policy: HttpDestinationPolicy | None = None) -> None:
+        self._policy = _policy
         super().__init__()
         self._destination: ContextVar[tuple[str, bool] | None] = ContextVar(
             "public_requests_destination", default=None
@@ -57,7 +59,7 @@ class _PublicAdapter(HTTPAdapter):
         if destination is None:
             try:
                 destination = (
-                    validate_public_http_url_sync(request.url or "")[0],
+                    self._resolve_addresses(request.url or "")[0],
                     False,
                 )
             except OSError as exc:
@@ -83,6 +85,13 @@ class _PublicAdapter(HTTPAdapter):
             tls_kwargs["assert_hostname"] = parsed.hostname
         return host_params, pool_kwargs
 
+    def _resolve_addresses(self, url: str) -> list[str]:
+        return (
+            self._policy.resolve_sync(url)
+            if self._policy is not None
+            else validate_public_http_url_sync(url)
+        )
+
     def send(
         self,
         request: PreparedRequest,
@@ -104,7 +113,7 @@ class _PublicAdapter(HTTPAdapter):
             )
         started = time.monotonic()
         try:
-            addresses = validate_public_http_url_sync(request.url or "")
+            addresses = self._resolve_addresses(request.url or "")
         except OSError as exc:
             raise ConnectionError(
                 "Public API host could not be resolved", request=request
@@ -186,8 +195,9 @@ def _trusted_proxy_url() -> str | None:
 class Session(_requests.Session):
     """Use the checked IP for each request, including every redirect."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, _policy: HttpDestinationPolicy | None = None) -> None:
         super().__init__()
+        self._policy = _policy
         self.trust_env = False
         proxy = _trusted_proxy_url()
         if proxy:
@@ -195,8 +205,8 @@ class Session(_requests.Session):
             # at connect time. NO_PROXY cannot bypass that boundary.
             self.proxies = {"http": proxy, "https": proxy}
         self.max_redirects = 5
-        self.mount("http://", _PublicAdapter())
-        self.mount("https://", _PublicAdapter())
+        self.mount("http://", _PublicAdapter(_policy=_policy))
+        self.mount("https://", _PublicAdapter(_policy=_policy))
 
     def merge_environment_settings(
         self, url: str | bytes | None, proxies: Any, stream: Any, verify: Any, cert: Any
@@ -212,7 +222,10 @@ class Session(_requests.Session):
     def prepare_request(self, request: Request) -> PreparedRequest:
         # Requests/urllib3 may normalize a zero port or URL userinfo before
         # the adapter sees it. Reject those inputs before normalization.
-        public_http_destination(request.url or "")
+        if self._policy is not None:
+            self._policy.destination(request.url or "")
+        else:
+            public_http_destination(request.url or "")
         return super().prepare_request(request)
 
     def rebuild_auth(
@@ -229,8 +242,14 @@ class Session(_requests.Session):
         prepared_request.headers["User-Agent"] = "Xagent-Public-Integration/1.0"
 
 
-def request(method: str, url: str, **kwargs: Any) -> Response:
-    session = Session()
+def request(
+    method: str,
+    url: str,
+    *,
+    _policy: HttpDestinationPolicy | None = None,
+    **kwargs: Any,
+) -> Response:
+    session = Session(_policy=_policy)
     try:
         response = session.request(method, url, **kwargs)
     except BaseException:

@@ -8,6 +8,10 @@ import type { AppIntegration } from "./types"
 const translateMock = vi.hoisted(() => (key: string) => key)
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+vi.mock("@/lib/oauth-launch", async () => ({
+  openOAuthAuthorizationPopup: (await import("@/test/oauth-popup-double")).openOAuthPopupDouble,
+  isOAuthSuccessMessage: (await import("@/test/oauth-popup-double")).isOAuthSuccessMessageDouble,
+}))
 
 vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
@@ -182,7 +186,7 @@ describe("OfficialMcpSettingsDialog account step", () => {
     submitAccount("acme")
 
     await act(async () => {
-      window.dispatchEvent(Object.assign(new Event("message"), { data: { type: "oauth-success" } }))
+      window.dispatchEvent(Object.assign(new Event("message"), { source: popup, origin: "http://api.local", data: { type: "oauth-success", provider: "zendesk" } }))
     })
     // The callback page closes itself right after posting success.
     popup.closed = true

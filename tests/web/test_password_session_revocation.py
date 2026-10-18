@@ -37,7 +37,7 @@ pytestmark = pytest.mark.usefixtures("test_db")
 def test_routed_websocket_requires_token_and_revokes_idle_session(
     monkeypatch, path, missing_token_code, authenticated
 ):
-    """Exercise FastAPI query binding, not just direct endpoint invocation."""
+    """Exercise real FastAPI handshake admission and live revocation."""
     auth_tests.setup_first_admin(password="old-password-123")
     tokens = auth._login_in_worker(
         auth.LoginRequest(username="administrator", password="old-password-123"),
@@ -70,8 +70,13 @@ def test_routed_websocket_requires_token_and_revokes_idle_session(
             broadcaster.connect.assert_not_awaited()
             return
         with client.websocket_connect(
-            f"{path}?token={tokens['access_token']}"
+            path,
+            subprotocols=[
+                "xagent-auth-v1",
+                f"xagent-auth-token.{tokens['access_token']}",
+            ],
         ) as socket:
+            assert socket.accepted_subprotocol == "xagent-auth-v1"
             _change_password_in_separate_session("change")
             # Starlette's public receive() has no timeout. Bound its underlying
             # ASGI receive so a missing monitor fails instead of hanging CI.

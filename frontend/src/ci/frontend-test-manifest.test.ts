@@ -21,9 +21,10 @@ const manifestCommand = "vitest run --config vitest.config.ts src/ci/frontend-te
 const pagesCommand =
   "vitest run --config vitest.config.ts src/components/pages src/ci/frontend-test-manifest.test.ts"
 const kbComponentsCommand = "vitest run --config vitest.config.ts src/components/kb"
+const filePreviewsCommand = "vitest run --config vitest.config.ts src/components/file"
 const appPagesCommand = "vitest run --config vitest.config.ts src/app"
 const homeBuildContractsCommand =
-  "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/background-jobs.test.ts src/lib/team-sharing-sanitizers.test.ts src/lib/oauth-account.test.ts src/lib/oauth-connect-account.test.ts"
+  "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/background-jobs.test.ts src/lib/team-sharing-sanitizers.test.ts src/lib/oauth-account.test.ts src/lib/oauth-connect-account.test.ts src/lib/oauth-connect.test.ts src/lib/oauth-launch.test.ts"
 const ciSummaryCondition =
   "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
 const frontendSummaryCheckCommand =
@@ -78,6 +79,7 @@ const requiredFrontendSteps = [
   { command: "npm run test:ci-manifest", requiresExplicitBash: true },
   { command: "npm run test:pages", requiresExplicitBash: true },
   { command: "npm run test:kb-components", requiresExplicitBash: false },
+  { command: "npm run test:file-previews", requiresExplicitBash: false },
   { command: "npm run test:app-pages", requiresExplicitBash: false },
   { command: "npm run test:home-build-contracts", requiresExplicitBash: false },
 ] as const
@@ -502,6 +504,17 @@ function assertSemanticWorkflowManifest(source: string) {
 }
 
 describe("frontend CI test manifest", () => {
+  it("requires the file preview security suite in CI", () => {
+    const source = removeWorkflowStepByCommand(
+      realWorkflowSource,
+      "frontend-build",
+      "npm run test:file-previews",
+      "file preview step removal",
+    )
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow(
+      "npm run test:file-previews must appear in exactly one frontend step",
+    )
+  })
   it.each([
     ["LF", realWorkflowSource],
     ["CRLF", realWorkflowSource.replace(/\r?\n/g, "\r\n")],
@@ -1520,6 +1533,7 @@ describe("frontend CI test manifest", () => {
     expect(packageJson.scripts["test:ci-manifest"]).toBe(manifestCommand)
     expect(packageJson.scripts["test:pages"]).toBe(pagesCommand)
     expect(packageJson.scripts["test:kb-components"]).toBe(kbComponentsCommand)
+    expect(packageJson.scripts["test:file-previews"]).toBe(filePreviewsCommand)
     expect(packageJson.scripts["test:app-pages"]).toBe(appPagesCommand)
     expect(packageJson.scripts["test:home-build-contracts"]).toBe(homeBuildContractsCommand)
     expect(packageJson.scripts["test:home-build-pages"]).toBeUndefined()

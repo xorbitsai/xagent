@@ -4155,9 +4155,12 @@ def test_media_download_size_defaults_and_overrides(monkeypatch, kind, default):
     assert config.get_media_download_max_bytes(kind) == default
     monkeypatch.setenv(variable, "123")
     assert config.get_media_download_max_bytes(kind) == 123
+    for blank in ("", "  ", "\t"):
+        monkeypatch.setenv(variable, blank)
+        assert config.get_media_download_max_bytes(kind) == default
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "", "invalid", "1.5"])
+@pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5"])
 def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
     monkeypatch.setenv("XAGENT_IMAGE_DOWNLOAD_MAX_BYTES", value)
     with pytest.raises(ValueError):

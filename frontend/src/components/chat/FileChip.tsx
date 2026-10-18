@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { FileTypeIcon } from "@/components/file/file-type-icon";
+import { escapeHtml as escapeChipHtml } from "@/lib/html-escape";
 
 // Base styles shared between React component and HTML string
 // Using the more detailed styles from ChatInput as the source of truth
@@ -76,7 +77,7 @@ export const createFileChipHTML = (path: string, fileId?: string, filename?: str
   const containerClass = cn(fileChipBaseClasses, "relative top-[-2px] mr-2 cursor-pointer hover:bg-secondary/90 file-chip-preview", className);
 
   return `
-    <span contenteditable="false" data-file-path="${path}" data-file-id="${fileId || ''}" data-filename="${displayFileName}" class="${containerClass}">
+    <span contenteditable="false" data-file-path="${escapeChipHtml(path)}" data-file-id="${escapeChipHtml(fileId || '')}" data-filename="${escapeChipHtml(displayFileName)}" class="${escapeChipHtml(containerClass)}">
       <span class="relative w-3.5 h-3.5 flex items-center justify-center">
         <span class="absolute inset-0 flex items-center justify-center transition-opacity group-hover:opacity-0">
           ${iconHtml}
@@ -85,7 +86,30 @@ export const createFileChipHTML = (path: string, fileId?: string, filename?: str
           ${deleteIconHtml}
         </button>
       </span>
-      <span class="text-[11px] font-medium text-foreground/70 truncate max-w-[200px]">${displayFileName}</span>
+      <span class="text-[11px] font-medium text-foreground/70 truncate max-w-[200px]">${escapeChipHtml(displayFileName)}</span>
     </span>&#8203;
   `.trim();
 };
+
+/** Parse raw message tokens before escaping; never reparse generated chip HTML. */
+export function renderFileMentionsHtml(source: string, legacyBackticks = false): string {
+  const tokens = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
+  const renderGap = (text: string): string => {
+    if (!legacyBackticks) return escapeChipHtml(text);
+    let html = "";
+    let offset = 0;
+    for (const match of text.matchAll(/`([^`]+)`/g)) {
+      html += escapeChipHtml(text.slice(offset, match.index)) + createFileChipHTML(match[1]);
+      offset = match.index! + match[0].length;
+    }
+    return html + escapeChipHtml(text.slice(offset));
+  };
+  let result = "";
+  let copied = 0;
+  for (const match of source.matchAll(tokens)) {
+    result += renderGap(source.slice(copied, match.index));
+    result += createFileChipHTML(match[2], match[2], match[1]);
+    copied = match.index! + match[0].length;
+  }
+  return result + renderGap(source.slice(copied));
+}

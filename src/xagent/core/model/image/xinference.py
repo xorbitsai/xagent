@@ -202,7 +202,9 @@ class XinferenceImageModel(BaseImageModel):
 
         # Extract parameters
         n = kwargs.pop("n", 1)
-        response_format = kwargs.pop("response_format", "url")
+        # Xinference's URL format can be a server-local path outside the task
+        # workspace. Inline data works for both local and remote model hosts.
+        response_format = kwargs.pop("response_format", "b64_json")
 
         try:
             # Call text_to_image
@@ -324,7 +326,7 @@ class XinferenceImageModel(BaseImageModel):
             )
         )
         kwargs.pop("aspect_ratio", None)
-        response_format = kwargs.pop("response_format", "url")
+        response_format = kwargs.pop("response_format", "b64_json")
 
         try:
             # For image editing, Xinference may have different methods

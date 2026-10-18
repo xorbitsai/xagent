@@ -642,17 +642,11 @@ class TestCredentialFreeLogging:
         assert "ordinary-value" not in result["error"]
 
     @pytest.mark.asyncio
-    async def test_adapter_hint_log_does_not_leak_url_embedded_credential(
+    async def test_adapter_rejects_url_userinfo_without_logging_credential(
         self, mock_httpbin: None, caplog: pytest.LogCaptureFixture
     ):
-        """The hint only fires when the ACTUAL final request carries no
-        credential - so the one realistic way to reach this log line with
-        a credential still sitting in api_args.url is a request that
-        started credentialed (Basic-Auth userinfo) and redirected
-        cross-origin to the connector host, where real httpx drops that
-        userinfo (it isn't part of the redirect target's own URL). The
-        hint correctly fires for the now-uncredentialed final request,
-        but the log line still names the caller's ORIGINAL url."""
+        """Legacy URL-userinfo calls now fail closed before dispatch; error
+        and diagnostic messages must still redact the rejected credential."""
         caplog.set_level("INFO")
         tool = APITool()
         result = await tool.run_json_async(
@@ -662,7 +656,9 @@ class TestCredentialFreeLogging:
             }
         )
 
-        assert "HubSpot" in result["error"]
+        assert result["success"] is False
+        assert result["status_code"] == 0
+        assert "leaked-secret" not in result["error"]
         assert "leaked-secret" not in caplog.text
 
 

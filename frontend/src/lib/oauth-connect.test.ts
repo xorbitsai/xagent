@@ -15,7 +15,7 @@ import { openBuiltinOAuthPopup, openMcpOAuthPopup } from "./oauth-connect";
 import { MCP_OAUTH_POPUP_WINDOW_NAME } from "@/lib/mcp-utils";
 
 function fakePopup(overrides: Partial<Window> = {}): Window {
-  return { closed: false, close: vi.fn(), ...overrides } as unknown as Window;
+  return { closed: false, close: vi.fn(), location: { replace: vi.fn() }, ...overrides } as unknown as Window;
 }
 
 function fakeMcpPopup(overrides: Partial<Window> = {}): Window {
@@ -39,6 +39,7 @@ function jsonResponse(data: unknown, init?: ResponseInit) {
 describe("openBuiltinOAuthPopup", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    apiRequestMock.mockReset().mockImplementation(async (url: string) => jsonResponse({ authorization_url: `${new URL(url).pathname}?ticket=short-proof`, callback_origin: "http://callback.local" }));
   });
 
   afterEach(() => {
@@ -46,17 +47,20 @@ describe("openBuiltinOAuthPopup", () => {
     vi.useRealTimers();
   });
 
-  it("opens the provider login URL with the app id and current page as redirect", async () => {
+  it("opens blank synchronously and POSTs app id and redirect without a query JWT", async () => {
     const popup = fakePopup();
     const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "tok123" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(windowOpenSpy).toHaveBeenCalledTimes(1);
     const [url] = windowOpenSpy.mock.calls[0];
-    expect(url).toBe(
-      `http://api.local/api/auth/google/login?token=tok123&app_id=gmail&redirect=${encodeURIComponent(window.location.href)}`
-    );
+    expect(url).toBe("about:blank");
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/auth/google/login", expect.objectContaining({
+      method: "POST", credentials: "include",
+      body: JSON.stringify({ app_id: "gmail", redirect: window.location.origin }),
+    }));
 
     // Settle via close, not leaving the poll timer/message listener dangling
     // for the rest of the file to (silently) inherit.
@@ -65,17 +69,16 @@ describe("openBuiltinOAuthPopup", () => {
     await pending;
   });
 
-  it("omits app_id from the login URL when no appId is given, for the bare batch-connect login", async () => {
+  it("omits app_id from the POST body for the bare batch-connect login", async () => {
     const popup = fakePopup();
     const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", token: "tok123" });
+    const pending = openBuiltinOAuthPopup({ provider: "google" });
+    await vi.advanceTimersByTimeAsync(0);
 
     const [url] = windowOpenSpy.mock.calls[0];
-    expect(url).toBe(
-      `http://api.local/api/auth/google/login?token=tok123&redirect=${encodeURIComponent(window.location.href)}`
-    );
-    expect(url).not.toContain("app_id");
+    expect(url).toBe("about:blank");
+    expect(JSON.parse(apiRequestMock.mock.calls[0][1].body)).toEqual({ redirect: window.location.origin });
 
     (popup as { closed: boolean }).closed = true;
     await vi.advanceTimersByTimeAsync(500);
@@ -85,19 +88,21 @@ describe("openBuiltinOAuthPopup", () => {
   it("resolves success:false immediately when the popup is blocked", async () => {
     vi.spyOn(window, "open").mockReturnValue(null);
 
-    const result = await openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const result = await openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
 
     expect(result).toEqual({ success: false, popupBlocked: true });
   });
 
   it("resolves success:true on an oauth-success postMessage for this call's own provider/app_id, and ignores unrelated messages", async () => {
-    vi.spyOn(window, "open").mockReturnValue(fakePopup());
+    const popup = fakePopup();
+    vi.spyOn(window, "open").mockReturnValue(popup);
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
 
     window.dispatchEvent(new MessageEvent("message", { data: { type: "something-else" } }));
     window.dispatchEvent(
-      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+      new MessageEvent("message", { source: popup, origin: "http://callback.local", data: { type: "oauth-success", provider: "gmail" } })
     );
 
     await expect(pending).resolves.toEqual({ success: true });
@@ -107,24 +112,27 @@ describe("openBuiltinOAuthPopup", () => {
     const popup = fakePopup();
     vi.spyOn(window, "open").mockReturnValue(popup);
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
     window.dispatchEvent(
-      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+      new MessageEvent("message", { source: popup, origin: "http://callback.local", data: { type: "oauth-success", provider: "gmail" } })
     );
     await pending;
 
     expect(popup.close).toHaveBeenCalledTimes(1);
   });
 
-  it("encodes provider, app id, and token in the login URL", async () => {
+  it("keeps the app id in JSON and never serializes the caller's token into a URL or body", async () => {
     const popup = fakePopup();
     const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "app id/weird", token: "tok en" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "app id/weird" });
+    await vi.advanceTimersByTimeAsync(0);
 
     const [url] = windowOpenSpy.mock.calls[0];
-    expect(url).toContain(`token=${encodeURIComponent("tok en")}`);
-    expect(url).toContain(`app_id=${encodeURIComponent("app id/weird")}`);
+    expect(url).toBe("about:blank");
+    expect(JSON.parse(apiRequestMock.mock.calls[0][1].body).app_id).toBe("app id/weird");
+    expect(JSON.stringify(apiRequestMock.mock.calls)).not.toContain("tok en");
 
     (popup as { closed: boolean }).closed = true;
     await vi.advanceTimersByTimeAsync(500);
@@ -135,16 +143,18 @@ describe("openBuiltinOAuthPopup", () => {
     // connect-apps-field.tsx's connectingKeys allows more than one of these
     // open at once (e.g. HubSpot and Gmail both in flight); each call's own
     // window "message" listener must ignore a sibling's success postMessage.
+    const gmailPopup = fakePopup();
     vi.spyOn(window, "open")
       .mockReturnValueOnce(fakePopup())
-      .mockReturnValueOnce(fakePopup());
+      .mockReturnValueOnce(gmailPopup);
 
-    const hubspotPending = openBuiltinOAuthPopup({ provider: "hubspot", token: "t" });
-    const gmailPending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const hubspotPending = openBuiltinOAuthPopup({ provider: "hubspot" });
+    const gmailPending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
 
     // Gmail's popup finishes first - must resolve only the gmail call.
     window.dispatchEvent(
-      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+      new MessageEvent("message", { source: gmailPopup, origin: "http://callback.local", data: { type: "oauth-success", provider: "gmail" } })
     );
     await expect(gmailPending).resolves.toEqual({ success: true });
 
@@ -156,7 +166,8 @@ describe("openBuiltinOAuthPopup", () => {
     const popup = fakePopup();
     vi.spyOn(window, "open").mockReturnValue(popup);
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
 
     (popup as { closed: boolean }).closed = true;
     await vi.advanceTimersByTimeAsync(500);
@@ -167,7 +178,8 @@ describe("openBuiltinOAuthPopup", () => {
   it("resolves success:false after the timeout even if the popup never closes", async () => {
     vi.spyOn(window, "open").mockReturnValue(fakePopup());
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
 
     await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
 
@@ -179,9 +191,10 @@ describe("openBuiltinOAuthPopup", () => {
     vi.spyOn(window, "open").mockReturnValue(popup);
     const removeEventListenerSpy = vi.spyOn(window, "removeEventListener");
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" });
+    await vi.advanceTimersByTimeAsync(0);
     window.dispatchEvent(
-      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+      new MessageEvent("message", { source: popup, origin: "http://callback.local", data: { type: "oauth-success", provider: "gmail" } })
     );
     await pending;
 

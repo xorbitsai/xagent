@@ -343,7 +343,6 @@ export function ConnectAppsField({
         const result = await openBuiltinOAuthPopup({
           provider: group.provider,
           appId,
-          token,
           account,
         });
         if (!isMountedRef.current) return;

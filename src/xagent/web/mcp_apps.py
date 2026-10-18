@@ -39,8 +39,9 @@ from .oauth_account_hosts import get_oauth_account_host
 # github: the github oauth_providers row's own default_scopes is
 # identity-only ("read:user") -- the functional "repo"/"user:email" scopes
 # live solely on the app row and are merged in only when generic_oauth_login
-# is called with app_id="github". A bare GET /api/auth/github/login (no
-# app_id) would otherwise request just "read:user", and the callback's bare
+# is called with app_id="github". A bare launch (POST /api/auth/github/login
+# followed by ticket GET, without app_id) would otherwise request just
+# "read:user", and the callback's bare
 # batch-connect branch would still activate the github app's UserMCPServer
 # against that under-scoped grant -- reporting "connected" while every
 # repo-scoped tool then fails. This is a no-op for the normal connect flow
@@ -52,7 +53,8 @@ from .oauth_account_hosts import get_oauth_account_host
 # oauth_providers row's own default_scopes is empty (there's no shared
 # identity scope to request; see the provider row's own comment), and every
 # functional sme-* scope this connector needs lives solely on the app row.
-# Without this entry, a bare GET /api/auth/myob/login would request NO
+# Without this entry, a bare launch (POST /api/auth/myob/login followed by
+# ticket GET) would request NO
 # scopes at all, yet the callback would still complete (MYOB's businessId
 # guard has nothing to do with scopes) and activate the app's UserMCPServer
 # against a grant with zero sme-* permissions.

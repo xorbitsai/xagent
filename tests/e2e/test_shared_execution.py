@@ -80,9 +80,9 @@ def test_websocket_execute_stream_and_reconnect(shared_app):
     task_id = response.json()["task_id"]
     url = (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
+        + f"/ws/chat/{task_id}"
     )
-    with connect(url) as ws:
+    with connect(url, additional_headers=app.headers) as ws:
         receive_event(ws, "trace_event")
         ws.send(json.dumps({"type": "execute_task"}))
         _, events = receive_event(ws, "task_completed")
@@ -102,11 +102,13 @@ def test_websocket_execute_stream_and_reconnect(shared_app):
         db.add(other)
         db.commit()
         foreign_token = build_access_token(username="other", user_id=other.id)
-    with connect(url.replace(app.token, foreign_token)) as foreign:
+    with connect(
+        url, additional_headers={"Authorization": f"Bearer {foreign_token}"}
+    ) as foreign:
         with pytest.raises(ConnectionClosedError) as denied:
             foreign.recv(timeout=10)
         assert denied.value.rcvd.code == 4003
-    with connect(url) as ws:
+    with connect(url, additional_headers=app.headers) as ws:
         _, history = receive_event(ws, "historical_data_complete")
         assert "Shared E2E answer" in json.dumps(history)
 
@@ -581,9 +583,14 @@ def test_workforce_manager_and_child_execute_in_worker(shared_app, interface):
             url = (
                 str(app.client.base_url).replace("http://", "ws://").rstrip("/")
                 + ws_path
-                + f"?token={token}"
+                + (f"?token={token}" if interface in {"widget", "share"} else "")
             )
-            with connect(url) as ws:
+            with connect(
+                url,
+                additional_headers=app.headers
+                if interface not in {"widget", "share"}
+                else None,
+            ) as ws:
                 receive_event(ws, "historical_data_complete")
                 ws.send(
                     json.dumps(
@@ -660,9 +667,9 @@ def test_websocket_pause_and_resume_with_two_workers(shared_app):
     task_id = response.json()["task_id"]
     url = (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
+        + f"/ws/chat/{task_id}"
     )
-    with connect(url) as ws:
+    with connect(url, additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
         receive_event(ws, "execution_started")
@@ -775,9 +782,9 @@ def test_host_loss_settles_without_duplicate_execution(shared_app, fault):
         (app.root / "model-release").touch()
         url = (
             str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-            + f"/ws/chat/{task_id}?token={app.token}"
+            + f"/ws/chat/{task_id}"
         )
-        with connect(url) as ws:
+        with connect(url, additional_headers=app.headers) as ws:
             receive_event(ws, "historical_data_complete")
             ws.send(json.dumps({"type": "resume_task", "command_id": "after-crash"}))
             receive_event(ws, "task_command_accepted")
@@ -917,9 +924,9 @@ def test_websocket_running_message_is_delivered_once(shared_app):
     task_id = response.json()["task_id"]
     url = (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
+        + f"/ws/chat/{task_id}"
     )
-    with connect(url) as ws:
+    with connect(url, additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
             json.dumps(

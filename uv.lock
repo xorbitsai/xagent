@@ -7905,6 +7905,7 @@ dependencies = [
     { name = "volcengine-python-sdk", extra = ["ark"] },
     { name = "websockets" },
     { name = "xinference-client" },
+    { name = "yarl" },
     { name = "zai-sdk" },
 ]
 
@@ -8200,6 +8201,7 @@ requires-dist = [
     { name = "xinference-client", specifier = ">=2.3.0" },
     { name = "xrouter-llm", marker = "extra == 'all'", specifier = ">=0.3.6" },
     { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.3.6" },
+    { name = "yarl", specifier = ">=1.22.0,<2.0.0" },
     { name = "zai-sdk", specifier = ">=0.0.4" },
 ]
 provides-extras = ["ai-document", "all", "browser", "chromadb", "command-path-guard", "document-processing", "duckdb", "milvus", "postgresql", "postgresql-async", "router", "waf-crawl"]

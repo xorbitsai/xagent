@@ -184,16 +184,15 @@ def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
         magento._base_url()
 
 
-def test_resolve_store_host_returns_hostname_port_and_first_valid_ip(monkeypatch):
+def test_resolve_store_host_returns_hostname_and_port(monkeypatch):
     monkeypatch.setattr(
         magento.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "2.2.2.2")
     )
 
-    hostname, port, pinned_ip = magento._resolve_store_host()
+    hostname, port = magento._resolve_store_host()
 
     assert hostname == "store.example.com"
     assert port is None
-    assert pinned_ip == "1.1.1.1"
 
 
 def test_resolve_store_host_idna_encodes_non_ascii_hostname(monkeypatch):
@@ -202,7 +201,7 @@ def test_resolve_store_host_idna_encodes_non_ascii_hostname(monkeypatch):
     # the same canonical host as the transport's Host/SNI and DNS policy.
     monkeypatch.setenv("MAGENTO_BASE_URL", "https://münchen.example.com")
 
-    hostname, _port, _pinned_ip = magento._resolve_store_host()
+    hostname, _port = magento._resolve_store_host()
 
     assert hostname == "xn--mnchen-3ya.example.com"
 
@@ -218,7 +217,7 @@ def test_resolve_store_host_idna_encodes_using_urllib3s_actual_encoder(monkeypat
     # ASCII-looking encoding of the host.
     monkeypatch.setenv("MAGENTO_BASE_URL", "https://faß.de")
 
-    hostname, _port, _pinned_ip = magento._resolve_store_host()
+    hostname, _port = magento._resolve_store_host()
 
     assert hostname == "xn--fa-hia.de"
 

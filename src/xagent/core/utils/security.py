@@ -291,20 +291,18 @@ def validate_public_http_url_shape(url: str) -> SplitResult:
     return parsed
 
 
-async def validate_public_http_url(url: str) -> list[str]:
-    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
+def public_http_destination(url: str) -> tuple[str, int]:
+    """Share normalized URL validation across synchronous and async transports."""
     parsed = validate_public_http_url_shape(url)
     hostname = parsed.hostname
     assert hostname is not None
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return hostname, port
 
-    addresses = await asyncio.to_thread(
-        socket.getaddrinfo,
-        hostname,
-        port,
-        socket.AF_UNSPEC,
-        socket.SOCK_STREAM,
-    )
+
+def _public_addresses(addresses: list[tuple], hostname: str) -> list[str]:
     if not addresses:
         raise ValueError(f"Host {hostname!r} did not resolve to an address")
     resolved: list[str] = []
@@ -313,6 +311,29 @@ async def validate_public_http_url(url: str) -> list[str]:
         reject_private_network_host(ip)
         resolved.append(ip)
     return resolved
+
+
+def validate_public_http_url_sync(url: str) -> list[str]:
+    """Resolve and validate every address used by synchronous SDK clients."""
+    hostname, port = public_http_destination(url)
+    return _public_addresses(
+        socket.getaddrinfo(hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM),
+        hostname,
+    )
+
+
+async def validate_public_http_url(url: str) -> list[str]:
+    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
+    hostname, port = public_http_destination(url)
+
+    addresses = await asyncio.to_thread(
+        socket.getaddrinfo,
+        hostname,
+        port,
+        socket.AF_UNSPEC,
+        socket.SOCK_STREAM,
+    )
+    return _public_addresses(addresses, hostname)
 
 
 def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:

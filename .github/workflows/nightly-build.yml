@@ -122,6 +122,8 @@ jobs:
         with:
           context: ./frontend
           file: docker/Dockerfile.frontend
+          build-args: |
+            NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${{ vars.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN }}
           platforms: ${{ env.PLATFORMS }}
           push: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
           tags: |
@@ -187,6 +189,8 @@ jobs:
         with:
           context: ./frontend
           file: docker/Dockerfile.frontend
+          build-args: |
+            NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${{ vars.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN }}
           platforms: ${{ env.PLATFORMS }}
           push: true
           tags: ${{ steps.meta-frontend-ghcr.outputs.tags }}

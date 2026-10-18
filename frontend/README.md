@@ -102,10 +102,19 @@ Real-time communication with the FastAPI backend for live updates.
 - `NEXT_PUBLIC_WS_URL`: WebSocket server URL
 - `NEXT_PUBLIC_API_URL`: HTTP API server URL
 - `NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN`: Optional isolated HTML preview origin.
-  Set an HTTPS origin to load its `/render` runner, or `auto` for the XAgent SaaS
-  mapping (`cloud.xagent.co` to `preview.xagent.co`, with matching dev/stage
-  hosts). When unset or invalid, previews retain the scripts-only opaque
-  `srcDoc` sandbox fallback.
+  Set an HTTPS origin (HTTP is allowed only on localhost/127.0.0.1/[::1] for development)
+  to load its `/render` runner; any configured path/query/fragment is discarded. Use `auto` for the XAgent SaaS
+  mapping (`cloud.xagent.co` to `preview.xagent.co`, stage/dev to
+  `preview-stage.xagent.co` / `preview-dev.xagent.co`). Unset/invalid settings, load errors, or an 8-second ready timeout use
+  the scripts-only opaque `srcDoc` fallback. The serving CSP must permit the
+  runner in `frame-src`: Next includes the build setting; packaged/static
+  serving needs the same variable at backend runtime (and custom proxies must
+  match). Docker accepts a build argument; official publish/nightly workflows
+  use the repository variable of the same name, defaulting to disabled.
+  Setting a runtime variable on an already-built frontend does not enable it.
+  The separate runner is not shipped or deployed by this repository. It must
+  implement the `/render` ready/render v1 protocol described in
+  [HTML preview security](../docs/html-preview-security.md).
 
 ### Backend Integration
 

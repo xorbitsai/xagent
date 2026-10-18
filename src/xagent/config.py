@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
+# Shared with the frontend build; runtime value is needed by packaged SPA CSP.
+HTML_PREVIEW_ORIGIN = "NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN"
 IMAGE_DOWNLOAD_MAX_BYTES = "XAGENT_IMAGE_DOWNLOAD_MAX_BYTES"
 VIDEO_DOWNLOAD_MAX_BYTES = "XAGENT_VIDEO_DOWNLOAD_MAX_BYTES"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
@@ -2510,6 +2512,11 @@ def get_uploads_dir() -> Path:
         # Default: web/uploads
         uploads_dir = get_web_dir() / "uploads"
     return _require_unambiguous_uploads_dir(uploads_dir)
+
+
+def get_html_preview_origin() -> str:
+    """Preview runner setting; match the value baked into the frontend build."""
+    return os.getenv(HTML_PREVIEW_ORIGIN, "").strip()
 
 
 def get_frontend_dist_dir() -> Path:

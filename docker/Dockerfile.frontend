@@ -20,6 +20,7 @@ WORKDIR /app
 # Default to empty string for relative paths (works behind reverse proxy)
 ARG NEXT_PUBLIC_API_URL=
 ARG NEXT_PUBLIC_WS_URL=
+ARG NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=
 
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY . .
@@ -27,6 +28,7 @@ COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
 ENV NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL}
+ENV NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN=${NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN}
 # This image serves the frontend via a Node server, so build the standalone
 # output rather than the default static export used by the pip/uvx deployment.
 ENV NEXT_OUTPUT=standalone

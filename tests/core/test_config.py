@@ -1311,6 +1311,22 @@ class TestGetWebDir:
         assert result == Path("/custom/web")
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, ""),
+        ("", ""),
+        (" auto ", "auto"),
+        (" https://preview.example.test/path ", "https://preview.example.test/path"),
+    ],
+)
+def test_get_html_preview_origin(monkeypatch, value, expected):
+    monkeypatch.delenv(config.HTML_PREVIEW_ORIGIN, raising=False)
+    if value is not None:
+        monkeypatch.setenv(config.HTML_PREVIEW_ORIGIN, value)
+    assert config.get_html_preview_origin() == expected
+
+
 class TestGetFrontendDistDir:
     """Test get_frontend_dist_dir() function."""
 

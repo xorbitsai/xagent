@@ -175,7 +175,11 @@ export function FileViewer({
   const blobMimeType = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf')
     ? 'application/pdf' : videoMimeType
   const [mediaObjectUrl, setMediaObjectUrl] = React.useState<string | null>(null)
-  const [htmlPreviewContent, setHtmlPreviewContent] = React.useState("")
+  const [preparedHtml, setPreparedHtml] = React.useState<{
+    content: typeof content; fileId: string; fileName: string; policy: typeof fileAccess; html: string
+  } | null>(null)
+  const htmlPreviewContent = preparedHtml?.content === content && preparedHtml.fileId === fileId
+    && preparedHtml.fileName === fileName && preparedHtml.policy === fileAccess ? preparedHtml.html : ""
 
   React.useEffect(() => {
     if (!blobMimeType || !base64Content) {
@@ -228,16 +232,19 @@ export function FileViewer({
       /(src|href)=["']([^"']+)["']/g,
       (match, attr, path) => {
         if (path.match(/^(https?:\/|data:|\/\/|#)/)) return match
+        // Root-relative API URLs must remain on the app/API origin when the
+        // HTML is delivered to a separate preview host (default API_URL="").
+        const absolute = (url: string) => new URL(url, window.location.origin).href
         if (path.startsWith("file:")) {
           const fileRef = path.replace(/^file:/, "")
-          return `${attr}="${fileAccess.inlinePreviewUrl(fileRef)}"`
+          return `${attr}="${absolute(fileAccess.inlinePreviewUrl(fileRef))}"`
         }
         if (path.startsWith("/api/files/public/preview/")) {
           const requestedFileId = path.slice("/api/files/public/preview/".length)
-          return `${attr}="${fileAccess.inlinePreviewUrl(requestedFileId)}"`
+          return `${attr}="${absolute(fileAccess.inlinePreviewUrl(requestedFileId))}"`
         }
 
-        return `${attr}="${fileAccess.relativePreviewUrl(fileId, path)}"`
+        return `${attr}="${absolute(fileAccess.relativePreviewUrl(fileId, path))}"`
       }
     )
     // srcDoc subresources do not inherit the iframe navigation's
@@ -248,7 +255,8 @@ export function FileViewer({
   React.useEffect(() => {
     // Keep the initial SSR/client render blank; prepare before assigning srcDoc.
     if (isHtmlFile(fileName) && viewMode === "preview") {
-      setHtmlPreviewContent(processHtmlContent(content || "", fileId))
+      setPreparedHtml({ content, fileId, fileName, policy: fileAccess,
+        html: content ? processHtmlContent(content, fileId) : "" })
     }
   }, [content, fileId, fileName, viewMode, processHtmlContent])
 

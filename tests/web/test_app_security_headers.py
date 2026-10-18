@@ -124,12 +124,16 @@ def test_public_html_preview_is_downloaded_instead_of_executed(tmp_path: Path) -
     assert 'filename="report.html"' in content_disposition
 
 
+@pytest.mark.parametrize(
+    "preview_origin", ["", "https://preview.example.test/path", "auto"]
+)
 def test_production_middleware_and_frontend_mount_share_one_page_policy(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, preview_origin
 ):
     # Exercise the actual middleware stack without starting background workers
     # or external services. Restore the production route table after this test.
     monkeypatch.setattr(app.router, "routes", list(app.router.routes))
+    monkeypatch.setenv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", preview_origin)
     monkeypatch.setattr(app, "middleware_stack", None)
     monkeypatch.setattr(
         app.state, "file_storage_startup_sync_task", None, raising=False
@@ -151,4 +155,50 @@ def test_production_middleware_and_frontend_mount_share_one_page_policy(
         ]
         assert response.headers.get("x-frame-options") == (
             None if embeddable else "DENY"
+        )
+        frame_policy = policies[0].split("frame-src ")[1].split(";")[0]
+        if preview_origin == "auto":
+            assert "https://preview.xagent.co" in frame_policy
+        elif preview_origin:
+            assert "https://preview.example.test" in frame_policy
+
+
+@pytest.mark.parametrize(
+    "configured, expected",
+    [
+        ("", []),
+        ("invalid", []),
+        ("http://preview.example.test", []),
+        ("https://user:pass@preview.example.test", []),
+        ("https://preview.example.test;evil", []),
+        ("https://preview.example.test:invalid", []),
+        ("https://preview.example.test/", ["https://preview.example.test"]),
+        (
+            " https://preview.example.test:443/path?q=1 ",
+            ["https://preview.example.test"],
+        ),
+        ("http://localhost:8787", ["http://localhost:8787"]),
+        ("http://127.0.0.1:8787/", ["http://127.0.0.1:8787"]),
+        ("http://[::1]:8787/path", ["http://[::1]:8787"]),
+        (
+            "auto",
+            [
+                "https://preview.xagent.co",
+                "https://preview-stage.xagent.co",
+                "https://preview-dev.xagent.co",
+            ],
+        ),
+    ],
+)
+def test_configured_runner_csp_is_a_narrow_origin_allowlist(
+    monkeypatch, configured, expected
+):
+    monkeypatch.setenv("NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN", configured)
+    for embeddable in [False, True]:
+        policy = page_security_headers(embeddable=embeddable)["Content-Security-Policy"]
+        frame_policy = next(
+            part for part in policy.split("; ") if part.startswith("frame-src ")
+        )
+        assert frame_policy == " ".join(
+            ["frame-src 'self' blob: https://docs.google.com", *expected]
         )

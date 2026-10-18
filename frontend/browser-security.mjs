@@ -1,7 +1,12 @@
 // Keep the independently served Next frontend covered too. srcDoc previews
 // inherit this policy: inline/HTTPS scripts are an explicit compatibility
 // exception, not a claim of strict CSP or full CASA #14 closure.
-export function browserSecurityHeaders({ embeddable = false, development = false } = {}) {
+import { htmlPreviewOrigins } from "./html-preview-config.mjs"
+
+export function browserSecurityHeaders({
+  embeddable = false, development = false,
+  previewOrigin = process.env.NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN,
+} = {}) {
   const directives = [
     "default-src 'self'",
     "base-uri 'none'",
@@ -13,7 +18,7 @@ export function browserSecurityHeaders({ embeddable = false, development = false
     `media-src 'self' data: blob: https:${development ? " http:" : ""}`,
     "font-src 'self' data: https:",
     `connect-src 'self' https: wss:${development ? " http: ws:" : ""}`,
-    "frame-src 'self' blob: https://docs.google.com",
+    ["frame-src 'self' blob: https://docs.google.com", ...htmlPreviewOrigins(previewOrigin)].join(" "),
     "worker-src 'self' blob:",
   ]
   if (!embeddable) directives.push("frame-ancestors 'none'")

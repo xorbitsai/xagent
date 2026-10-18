@@ -10,6 +10,7 @@ from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, TypeVar, cast
+from urllib.parse import parse_qs
 
 from fastapi import WebSocket
 from fastapi.responses import JSONResponse
@@ -24,6 +25,11 @@ from ..services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
+)
+from ..websocket_credentials import (
+    AUTH_PROTOCOL,
+    InvalidWebSocketCredentials,
+    websocket_header_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -52,6 +58,15 @@ class WebSocketPrincipal:
 
 class _WebSocketAuthenticationTerminated(Exception):
     """Authentication already sent a terminal transport response."""
+
+
+async def accept_authenticated_websocket(websocket: WebSocket) -> None:
+    """Negotiate only the fixed protocol, never the offered credential."""
+    scope = getattr(websocket, "scope", {})
+    if isinstance(scope, dict) and AUTH_PROTOCOL in scope.get("subprotocols", []):
+        await websocket.accept(subprotocol=AUTH_PROTOCOL)
+    else:
+        await websocket.accept()
 
 
 async def send_websocket_authentication_infrastructure_failure(
@@ -157,9 +172,29 @@ def revalidate_websocket_session(endpoint: _Endpoint) -> _Endpoint:
 
     @wraps(endpoint)
     async def guarded(*args: Any, **kwargs: Any) -> None:
-        arguments = signature.bind(*args, **kwargs).arguments
+        bound = signature.bind(*args, **kwargs)
+        arguments = bound.arguments
         websocket = arguments["websocket"]
         token = arguments.get("token")
+        scope = getattr(websocket, "scope", None)
+        if isinstance(scope, dict):
+            query = parse_qs(
+                scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True
+            )
+            # Reject the legacy URI contract even when a valid header is also
+            # present. Do not retain a credential-leaking fallback.
+            if {"token", "access_token"}.intersection(query):
+                await websocket.close(code=4001)
+                return
+            try:
+                header_token = websocket_header_token(scope)
+            except InvalidWebSocketCredentials:
+                await websocket.close(code=4001, reason="Authentication required")
+                return
+            if header_token is not None:
+                token = header_token
+                bound.arguments["token"] = token
+        args, kwargs = bound.args, bound.kwargs
         if not isinstance(token, str) or not token:
             await endpoint(*args, **kwargs)
             return

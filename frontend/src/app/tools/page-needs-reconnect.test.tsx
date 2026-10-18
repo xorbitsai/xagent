@@ -161,10 +161,10 @@ describe("ToolsPage needs_reconnect state", () => {
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.accountStep.continue" }))
 
     expect(openSpy).toHaveBeenCalledTimes(1)
-    const url = new URL(openSpy.mock.calls[0][0] as string)
-    expect(url.pathname).toBe("/api/auth/zendesk/login")
-    expect(url.searchParams.get("app_id")).toBe("zendesk")
-    expect(url.searchParams.get("account")).toBe("acme")
+    expect(openSpy.mock.calls[0][0]).toBe("about:blank")
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/auth/zendesk/login", expect.objectContaining({
+      method: "POST", body: JSON.stringify({ app_id: "zendesk", account: "acme", redirect: window.location.origin }),
+    }))
   })
 
   it("keeps Disconnect available while the connection needs a reconnect", async () => {

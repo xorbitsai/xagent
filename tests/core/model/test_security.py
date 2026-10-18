@@ -20,6 +20,29 @@ from xagent.core.utils.security import (
 )
 
 
+@pytest.mark.parametrize("scheme", ["ws", "wss", "http", "https"])
+def test_redact_navigation_tickets_and_websocket_credentials(scheme):
+    text = (
+        f"{scheme}://example/ws?ticket=private-launch-proof&token=private-access-token"
+    )
+    result = redact_sensitive_text(text)
+    assert "private-launch-proof" not in result
+    assert "private-access-token" not in result
+    # URL masking encodes the stars; assignment-only masking cannot satisfy
+    # this, so reverting URL_PATTERN to HTTP-only breaks ws/wss coverage.
+    assert f"{scheme}://example/ws?ticket=%2A%2A%2Aroof&token=" in result
+    assert "private-login-jwt" not in redact_sensitive_text(
+        "Sec-WebSocket-Protocol: xagent-auth-v1, xagent-auth-token.private-login-jwt"
+    )
+
+
+def test_non_url_support_ticket_identifiers_are_not_credentials():
+    assert (
+        redact_sensitive_text("support_ticket=42 ticket=123")
+        == "support_ticket=42 ticket=123"
+    )
+
+
 def test_reject_private_network_host_rejects_cgnat_range() -> None:
     with pytest.raises(PrivateNetworkHostError):
         reject_private_network_host("100.64.0.1")

@@ -393,7 +393,7 @@ class Runner:
                 record["persisted_model_ids"] = effective
                 async with session.ws_connect(
                     f"{self.ws_url}/ws/chat/{task_id}",
-                    params={"token": self.token},
+                    headers={"Authorization": f"Bearer {self.token}"},
                     max_msg_size=16 * 1024 * 1024,
                 ) as socket:
                     await socket.send_json({"type": "execute_task"})

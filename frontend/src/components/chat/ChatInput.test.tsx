@@ -88,6 +88,31 @@ const emptyJsonResponse = () =>
   })
 
 describe("ChatInput", () => {
+  it("highlights text without modifying matching file metadata attributes", () => {
+    const { container } = render(<ChatInput onSend={vi.fn()} inputValue="[A&B <Q>.txt](file:secret-id) secret-id"
+      onInputChange={vi.fn()} promptHighlightTerms={["secret-id"]} hideConfig />)
+    const editor = container.querySelector("[contenteditable]")!
+    const chip = editor.querySelector("[data-file-path]")!
+    expect(chip.getAttribute("data-file-path")).toBe("secret-id")
+    expect(chip.getAttribute("data-filename")).toBe("A&B <Q>.txt")
+    const highlight = editor.querySelector("[data-prompt-highlight]")!
+    expect(highlight.textContent).toBe("secret-id")
+    expect(chip.contains(highlight)).toBe(false)
+  })
+
+  it("keeps hostile file names and highlight terms inert in restored drafts", () => {
+    const payload = '<img src=x onerror="alert">'
+    const { container } = render(<ChatInput onSend={vi.fn()} inputValue={`[${payload}](file:id) ${payload}`}
+      onInputChange={vi.fn()} promptHighlightTerms={[payload]} hideConfig />)
+    const editor = container.querySelector("[contenteditable]")!
+    expect(editor.querySelector("img,script,iframe")).toBeNull()
+    expect(editor.querySelector("[data-file-path]")?.getAttribute("data-filename")).toBe(payload)
+    expect(editor.querySelector("[data-prompt-highlight]")?.textContent).toBe(payload)
+    for (const element of editor.querySelectorAll("*")) {
+      expect([...element.attributes].filter((attribute) => /^on/i.test(attribute.name))).toEqual([])
+    }
+  })
+
   beforeEach(() => {
     let generatedClientMessageId = 0
     vi.mocked(generateClientMessageId)

@@ -24,11 +24,13 @@ SENSITIVE_QUERY_KEYS = {
     "key",
     "access_token",
     "token",
+    "ticket",
     "password",
     "secret",
 }
 
-URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
+URL_PATTERN = re.compile(r"(?:https?|wss?)://[^\s\"'>]+")
+WEBSOCKET_CREDENTIAL_PATTERN = re.compile(r"xagent-auth-token\.[A-Za-z0-9._~-]+")
 # Every ``identifier=`` in the text; ``_is_credential_key`` decides which
 # identifiers name a secret. Only a credential's value is consumed
 # (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
@@ -503,7 +505,7 @@ def redact_sensitive_text(text: str) -> str:
     """Redact common key/token patterns from arbitrary text.
 
     Recognition is by keyword and shape, so it is not exhaustive: it covers
-    ``http(s)://`` URLs (``redact_url_credentials_for_logging``),
+    HTTP/WebSocket URLs (``redact_url_credentials_for_logging``),
     ``identifier=value`` assignments whose identifier ``_is_credential_key``
     accepts, and the header shapes in ``AUTH_HEADER_PATTERN`` and
     ``HEADER_KEY_PATTERNS``. Shapes it is known to miss are listed in
@@ -513,9 +515,10 @@ def redact_sensitive_text(text: str) -> str:
     if not text:
         return text
 
+    redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
     redacted = URL_PATTERN.sub(
         lambda match: redact_url_credentials_for_logging(match.group(0)),
-        text,
+        redacted,
     )
     redacted = _redact_assignments(redacted)
     redacted = AUTH_HEADER_PATTERN.sub(

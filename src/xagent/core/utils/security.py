@@ -6,7 +6,7 @@ import re
 import socket
 import ssl
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Callable, Mapping
 from urllib.parse import (
     SplitResult,
     parse_qsl,
@@ -261,7 +261,9 @@ def build_ca_bundle_ssl_context() -> ssl.SSLContext:
     return httpx.create_ssl_context(trust_env=True)
 
 
-def validate_public_http_url_shape(url: str) -> SplitResult:
+def validate_public_http_url_shape(
+    url: str, *, host_validator: Callable[[str], None] | None = None
+) -> SplitResult:
     """Validate the normalized host used by HTTP clients, without resolving DNS."""
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -281,7 +283,7 @@ def validate_public_http_url_shape(url: str) -> SplitResult:
             ipaddress.ip_address(host)
         except ValueError as exc:
             raise ValueError("url contains a non-canonical IP address") from exc
-    reject_private_network_host(host)
+    (host_validator or reject_private_network_host)(host)
     try:
         port = parsed.port
     except ValueError as exc:

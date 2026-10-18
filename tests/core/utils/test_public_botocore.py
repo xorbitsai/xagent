@@ -173,3 +173,36 @@ def test_aws_fallback_only_before_body_send(network, monkeypatch):
         assert len(attempts) == 1
     finally:
         session.close()
+
+
+def test_aws_operator_proxy_keeps_public_target_policy(network):
+    _, seen = network
+    session = PublicBotocoreSession(
+        timeout=2, proxy_url="http://operator-proxy.example:3128"
+    )
+    try:
+        response = session.send(
+            AWSPreparedRequest(
+                method="POST",
+                url="https://bedrock.example/",
+                headers={},
+                body=b"{}",
+                stream_output=True,
+            )
+        )
+        response.raw.close()
+        assert seen[0][0].proxy.host == "operator-proxy.example"
+        assert seen[0][0].host == "bedrock.example"
+        with pytest.raises(UnsafePublicHttpTarget):
+            session.send(
+                AWSPreparedRequest(
+                    method="POST",
+                    url="http://169.254.169.254/",
+                    headers={},
+                    body=b"{}",
+                    stream_output=True,
+                )
+            )
+        assert len(seen) == 1
+    finally:
+        session.close()

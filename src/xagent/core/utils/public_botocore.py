@@ -11,6 +11,7 @@ from urllib3 import PoolManager
 from urllib3.util import Timeout
 
 from .public_http_transport import UnsafePublicHttpTarget
+from .public_policy import HttpDestinationPolicy
 from .security import validate_public_http_url_sync
 
 
@@ -54,31 +55,44 @@ class PublicBotocoreSession(URLLib3Session):  # type: ignore[no-any-unimported] 
         socket_options: Any = None,
         client_cert: Any = None,
         proxies_config: Any = None,
+        *,
+        proxy_url: str | None = None,
+        _policy: HttpDestinationPolicy | None = None,
     ) -> None:
-        if any((proxies or {}).values()):
+        if any(value != proxy_url for value in (proxies or {}).values() if value):
             raise UnsafePublicHttpTarget(
-                "Public Botocore sessions do not support proxies"
+                "Public Botocore sessions cannot use an untrusted proxy"
             )
+        self._via_proxy = proxy_url is not None
+        self._policy = _policy
         super().__init__(
-            proxies={},
+            proxies={"http": proxy_url, "https": proxy_url} if proxy_url else {},
             timeout=timeout,
             verify=verify,
             max_pool_connections=max_pool_connections,
             socket_options=socket_options,
             client_cert=client_cert,
-            proxies_config=proxies_config,
+            proxies_config={
+                **(proxies_config or {}),
+                "proxy_use_forwarding_for_https": False,
+            },
         )
         self._manager.clear()
         self._manager = _PublicPoolManager(**self._get_pool_manager_kwargs())
         # Keep AWS's streaming/header connection classes, not urllib3 defaults.
         self._manager.pool_classes_by_scheme = self._pool_classes_by_scheme
 
+    def _resolve_addresses(self, url: str) -> list[str]:
+        if self._policy is not None:
+            return self._policy.resolve_sync(url)
+        return validate_public_http_url_sync(url)
+
     def send(self, request: Any) -> Any:
         started = time.monotonic()
         if request.method.upper() == "CONNECT":
             raise UnsafePublicHttpTarget("HTTP tunnels are not allowed")
         try:
-            addresses = validate_public_http_url_sync(request.url)
+            addresses = self._resolve_addresses(request.url)
         except ValueError as exc:
             # Outside botocore's catch-all: policy failures must not become
             # retryable HTTPClientError failures in the SDK retry handler.
@@ -100,7 +114,8 @@ class PublicBotocoreSession(URLLib3Session):  # type: ignore[no-any-unimported] 
             if isinstance(self._timeout, Timeout)
             else Timeout.from_float(self._timeout)
         )
-        for index, address in enumerate(addresses):
+        targets = addresses[:1] if self._via_proxy else addresses
+        for index, address in enumerate(targets):
             attempt_timeout = budget
             if isinstance(budget.connect_timeout, (int, float)):
                 remaining = budget.connect_timeout - (time.monotonic() - started)
@@ -109,14 +124,14 @@ class PublicBotocoreSession(URLLib3Session):  # type: ignore[no-any-unimported] 
                         endpoint_url=request.url, error="Connect budget exhausted"
                     )
                 attempt_timeout = Timeout(
-                    connect=remaining / (len(addresses) - index),
+                    connect=remaining / (len(targets) - index),
                     read=budget.read_timeout,
                 )
             token = self._manager.destination.set((address, attempt_timeout))
             try:
                 return super().send(request)
             except (EndpointConnectionError, ConnectTimeoutError):
-                if index == len(addresses) - 1:
+                if index == len(targets) - 1:
                     raise
             finally:
                 self._manager.destination.reset(token)

@@ -243,3 +243,45 @@ async def test_same_host_default_port_https_upgrade_retains_credentials(
                 "http://example.com/", content=b"secret", headers={"X-Key": "key"}
             )
     assert seen[1].headers["X-Key"] == "key"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_server_selected_proxy_stays_on_guarded_transport(
+    monkeypatch, asynchronous
+):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 443))],
+    )
+    options, seen = [], []
+
+    def transport(**kwargs):
+        options.append(kwargs)
+        return httpx.MockTransport(
+            lambda request: seen.append(request) or httpx.Response(200)
+        )
+
+    monkeypatch.setattr(httpx, "HTTPTransport", transport)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", transport)
+    factory = create_public_async_client if asynchronous else create_public_sync_client
+    client = factory(proxy_url="http://operator-proxy.example:3128")
+    try:
+        if asynchronous:
+            await client.get("https://example.com/")
+            with pytest.raises(UnsafePublicHttpTarget):
+                await client.get("https://127.0.0.1/")
+        else:
+            client.get("https://example.com/")
+            with pytest.raises(UnsafePublicHttpTarget):
+                client.get("https://127.0.0.1/")
+        assert options[0]["proxy"] == "http://operator-proxy.example:3128"
+        assert seen[0].url.host == "example.com"
+        assert seen[0].headers["Host"] == "example.com"
+        assert len(seen) == 1
+    finally:
+        if asynchronous:
+            await client.aclose()
+        else:
+            client.close()

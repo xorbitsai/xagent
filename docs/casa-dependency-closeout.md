@@ -7,18 +7,33 @@ claim a clean vulnerability scan or certify a deployed image.
 ## Changes
 
 - Upgrade the resolved FastAPI/Starlette, MCP, LangChain, document-processing,
-  cryptography and other affected dependency chains. Raise the MCP,
-  LangChain OpenAI and JSON repair floors to their selected security fixes.
+  cryptography and other affected dependency chains. Raise the declared
+  runtime, optional-extra and sandbox/test-group security floors as well, so
+  wheel metadata does not continue advertising the old vulnerable direct
+  versions. Declare the directly imported LangChain Core and Starlette with
+  their tested floors instead of relying on permissive transitive bounds.
 - Remove unused test-only CopilotKit and LangGraph prebuilt declarations that
   constrained the web framework and LangChain upgrades. Application features
   do not import either package.
-- Import `BaseTool` from `langchain_core.tools` for LangChain 1.x compatibility.
+- Import `BaseTool` directly from `langchain_core.tools`; remove the unused
+  top-level `langchain` dependency and the LangGraph runtime chain it pulled in.
+  This import is a dependency cleanup, not a claim that LangChain 1.x stopped
+  exporting `BaseTool`.
 - Keep the supported OpenAI 2.x and Xinference 2.x client contracts, and retain
   SQLAlchemy 2.0.47 rather than introducing an unrelated database major change.
 - Align the type-checking MCP dependency with the runtime security floor.
 - Require wheel availability on Linux x86_64 and macOS ARM during resolution.
   BoxLite 0.10.6 lacks a Linux/Python 3.12 wheel; select the complete official
   0.10.7 release and check the frozen Linux installation plan too.
+- Support the BoxLite 0.10 async `SimpleBox.info()` / native `Box.info()` API.
+  Use `NetworkSpec` with inbound and outbound networking disabled for isolated
+  guests, not `SecurityOptions.network_enabled` (a host-side sandbox setting).
+  Bound BoxLite to `>=0.10.7,<0.11` and cover creation, reuse, metadata recovery
+  and native network-option construction with tests that do not require KVM.
+  These SDK contract tests do not replace a real KVM/VM isolation test.
+- Requests' floor follows the patched Docling Core requirement, not an adapter
+  introduced by another PR. Websockets remains at the original locked 16.0;
+  the temporary broad-refresh downgrade to 15.0.1 is not part of this graph.
 
 ## Lockfile scope
 
@@ -29,13 +44,25 @@ that were upgraded in that initial candidate, retaining their previously
 audited fixed versions. Other original selections remain preferred unless the
 patched graph requires a compatible change. This is not a blanket upgrade.
 
-The narrowed graph changes 69 existing package names and produces 1,967 added /
-1,239 removed lockfile lines. Mypy, Ruff, pre-commit, Google GenAI, boto3 and
+After removing the unused LangChain/LangGraph chain, the narrowed graph changes
+64 existing package names and produces 1,969 added / 1,360 removed lockfile
+lines. Mypy, Ruff, pre-commit, Google GenAI, boto3 and
 SQLAlchemy retain their original locked versions. The remaining changes also
 include required framework/parser/SDK dependency chains and platform wheel
 metadata; the lock is still generated and checked by uv, not edited by hand.
 These are package-name and generated-line counts, not vulnerability counts or
 a claim that every selected security release is the oldest possible fix.
+
+The four reviewed SDK pins in the mypy hook now match the narrowed runtime:
+Slack SDK 3.43.0, Google GenAI 1.66.0, ElevenLabs 2.56.0 and Google Auth 2.48.0.
+The hook deliberately retains NumPy 1.26.4 for Python 3.11 stub parsing; it is
+not the runtime's NumPy 2.4.6. That existing type-checker exception is not a
+runtime dependency downgrade.
+
+The declared floors cover the reviewed direct requirements, not a promise
+that every future independent pip resolution has a clean transitive graph.
+Use the frozen lock for the audited deployment graph; wheel consumers must
+audit their resolved environment as well. Retained findings below still apply.
 
 The all-extras/groups Python 3.12 audit retains exactly the same six affected
 package names and advisory IDs as the broader candidate, without advisory

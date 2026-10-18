@@ -123,7 +123,7 @@ class TestBoxliteSandboxService:
             assert info.state == "running"
 
             # Check using native interface, can only check partial fields
-            raw_info = sandbox._box.info()
+            raw_info = await sandbox._box.info()
             assert raw_info.name == name
             assert raw_info.image == template.image
             assert raw_info.cpus == config.cpus

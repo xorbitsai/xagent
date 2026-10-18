@@ -9,8 +9,11 @@ URLs came from a model provider. The downloader now:
 - Returns validated DNS results directly to aiohttp's connection resolver.
   There is no independent hostname lookup after a safety preflight. DNS caching
   is disabled and the existing no-environment-proxy behavior is retained;
-  normal hostname TLS verification and
-  configured CA bundles remain in use.
+  normal hostname TLS verification remains enabled. Media TLS keeps aiohttp's
+  stdlib `ssl.create_default_context()` trust-store behavior, including platform
+  default CA paths and `SSL_CERT_FILE` / `SSL_CERT_DIR` overrides; it does not
+  switch to HTTPX's certifi-only defaults. The context is cached by those paths;
+  restart workers after replacing CA contents at an unchanged path.
 - Follows at most five redirects, checking every target before dispatch and
   refusing HTTPS-to-HTTP downgrades. Hosts are checked after IDNA/UTS46
   normalization. Ambiguous decimal/short IPv4 literals are rejected; other
@@ -36,9 +39,15 @@ unchanged, so this does not unilaterally remove legitimate private model access.
 Xinference image generation/editing now requests `b64_json` by default because
 its `url` response may contain a server-local filesystem path. Explicit URL
 responses must still satisfy the workspace/public-network result boundary.
+Xinference video results are still URL-based when supplied that way by the
+provider; private/co-located HTTP result servers are not exempt. Return inline
+base64/data content, a file inside the task workspace, or a public result URL.
+There is no private-network fallback or automatic video format conversion.
 When a provider succeeds but saving its result fails, image generation/editing
-returns `saved_to_workspace: false` and a redacted `download_error`; provider
-success alone does not mean a local artifact was created.
+and video generation return `saved_to_workspace: false` and a redacted,
+non-empty `download_error`. Missing-local-file and filename-bearing OS errors
+use path-free messages. Provider success alone does not mean a local artifact
+was created.
 
 This patch does not claim global SSRF closure. General-purpose HTTP tools,
 configured MCP/model connections, proxy-side DNS policies and worker egress

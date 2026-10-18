@@ -281,10 +281,11 @@ def validate_public_http_url_shape(url: str) -> SplitResult:
             raise ValueError("url contains a non-canonical IP address") from exc
     reject_private_network_host(host)
     try:
-        if parsed.port == 0:
-            raise ValueError("port zero")
+        port = parsed.port
     except ValueError as exc:
         raise ValueError("url contains an invalid port") from exc
+    if port == 0:
+        raise ValueError("url contains an invalid port")
     return parsed
 
 

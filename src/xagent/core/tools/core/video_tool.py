@@ -25,8 +25,11 @@ from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
-from ...utils.media_download import download_public_media, resolve_workspace_media_path
-from ...utils.security import redact_sensitive_text
+from ...utils.media_download import (
+    describe_media_download_error,
+    download_public_media,
+    resolve_workspace_media_path,
+)
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -531,7 +534,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                 )
                 if not await asyncio.to_thread(resolved_local_path.is_file):
                     raise RuntimeError(
-                        f"Local video path is not a file: {resolved_local_path}"
+                        "Local video path is not a file in the workspace"
                     )
                 resolved_save_path = await asyncio.to_thread(save_path.resolve)
                 if resolved_local_path != resolved_save_path:
@@ -554,7 +557,7 @@ The generated video URL is temporary on the provider side, so completed videos a
 
         except Exception as e:
             logger.warning(
-                "Failed to download video: %s", redact_sensitive_text(str(e))
+                "Failed to download video: %s", describe_media_download_error(e)
             )
             raise
 
@@ -712,6 +715,7 @@ The generated video URL is temporary on the provider side, so completed videos a
 
             video_url = result.get("video_url")
             video_path = None
+            download_error = None
             video_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
@@ -734,11 +738,14 @@ The generated video URL is temporary on the provider side, so completed videos a
                                 video_path
                             )
                 except Exception as e:
-                    logger.warning("Failed to download video to workspace: %s", e)
+                    download_error = describe_media_download_error(e)
+                    logger.warning(
+                        "Failed to download video to workspace: %s", download_error
+                    )
             elif video_url and not self._workspace:
                 logger.warning("No workspace available, video not saved locally")
 
-            return {
+            response = {
                 "success": True,
                 "task_id": result.get("task_id"),
                 "status": result.get("status"),
@@ -758,6 +765,9 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "saved_to_workspace": video_path is not None,
                 "raw_response": result.get("raw_response"),
             }
+            if download_error is not None:
+                response["download_error"] = download_error
+            return response
 
         except Exception as e:
             logger.error("Video generation failed: %s", e)

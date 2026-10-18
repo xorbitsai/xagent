@@ -98,8 +98,19 @@ async def test_configured_budget_reaches_result_download(
 
 
 @pytest.mark.parametrize("method", ["generate_image", "edit_image"])
+@pytest.mark.parametrize(
+    "failure,expected_error",
+    [
+        (ValueError("token=sensitive-provider-credential"), "token="),
+        (TimeoutError(), "TimeoutError"),
+        (
+            PermissionError(13, "Permission denied", "/private/server/media.png"),
+            "PermissionError",
+        ),
+    ],
+)
 async def test_failed_image_save_reports_redacted_download_error(
-    method, media_tools, monkeypatch
+    method, failure, expected_error, media_tools, monkeypatch
 ):
     image, _, workspace = media_tools
     model = Mock()
@@ -112,9 +123,8 @@ async def test_failed_image_save_reports_redacted_download_error(
     monkeypatch.setattr(image, "_get_edit_model", lambda _: model)
     workspace.auto_register_files = nullcontext
     monkeypatch.setattr(
-        image,
-        "_download_image",
-        AsyncMock(side_effect=ValueError("token=sensitive-provider-credential")),
+        "xagent.core.tools.core.image_tool.download_public_media",
+        AsyncMock(side_effect=failure),
     )
     kwargs = (
         {"image_url": "data:image/png;base64,aQ=="} if method == "edit_image" else {}
@@ -123,5 +133,75 @@ async def test_failed_image_save_reports_redacted_download_error(
     assert result["success"] is True  # Provider succeeded; saving did not.
     assert result["saved_to_workspace"] is False
     assert result["image_path"] is None
-    assert "token=" in result["download_error"]
+    assert expected_error in result["download_error"]
     assert "sensitive-provider-credential" not in result["download_error"]
+    assert "/private/server/" not in result["download_error"]
+
+
+@pytest.mark.parametrize("method", ["generate_image", "edit_image", "generate_video"])
+async def test_missing_local_media_error_does_not_disclose_absolute_workspace_path(
+    method,
+    media_tools,
+    monkeypatch,
+):
+    image, video, workspace = media_tools
+    source = workspace.workspace_dir / "missing-media"
+    model = Mock()
+    model.model_name = "fixture"
+    for name in ("generate_image", "edit_image", "generate_video"):
+        setattr(
+            model,
+            name,
+            AsyncMock(
+                return_value={"image_url": str(source), "video_url": str(source)}
+            ),
+        )
+    tool = video if method == "generate_video" else image
+    monkeypatch.setattr(tool, "_get_model", lambda _: model)
+    monkeypatch.setattr(image, "_get_edit_model", lambda _: model)
+    workspace.auto_register_files = nullcontext
+    kwargs = (
+        {"image_url": "data:image/png;base64,aQ=="} if method == "edit_image" else {}
+    )
+    result = await getattr(tool, method)(prompt="fixture", **kwargs)
+    assert result["success"] is True
+    assert result["saved_to_workspace"] is False
+    assert "not a file in the workspace" in result["download_error"]
+    assert str(workspace.workspace_dir) not in result["download_error"]
+    assert not list(workspace.output_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    "failure", [None, TimeoutError(), ValueError("token=sensitive-provider-credential")]
+)
+async def test_failed_video_result_save_reports_redacted_reason(
+    failure, media_tools, monkeypatch
+):
+    _, video, workspace = media_tools
+    model = Mock()
+    model.generate_video = AsyncMock(
+        return_value={"video_url": "http://10.0.0.1/video.mp4"}
+    )
+    monkeypatch.setattr(video, "_get_model", lambda _: model)
+    workspace.auto_register_files = nullcontext
+    if failure is not None:
+        monkeypatch.setattr(
+            "xagent.core.tools.core.video_tool.download_public_media",
+            AsyncMock(side_effect=failure),
+        )
+    session = Mock()
+    monkeypatch.setattr("aiohttp.ClientSession", session)
+    result = await video.generate_video(prompt="fixture")
+    assert result["success"] is True
+    assert result["saved_to_workspace"] is False
+    assert result["video_path"] is None
+    assert result["download_error"]
+    if failure is None:
+        assert "private network" in result["download_error"]
+    elif isinstance(failure, TimeoutError):
+        assert result["download_error"] == "TimeoutError"
+    else:
+        assert "token=" in result["download_error"]
+        assert "sensitive-provider-credential" not in result["download_error"]
+    session.assert_not_called()
+    assert not list(workspace.output_dir.iterdir())

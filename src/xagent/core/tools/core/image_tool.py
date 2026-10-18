@@ -18,8 +18,11 @@ from urllib import parse
 from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
-from ...utils.media_download import download_public_media, resolve_workspace_media_path
-from ...utils.security import redact_sensitive_text
+from ...utils.media_download import (
+    describe_media_download_error,
+    download_public_media,
+    resolve_workspace_media_path,
+)
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -633,7 +636,9 @@ Images are automatically saved to workspace.
                     self._workspace.workspace_dir,
                 )
                 if not await asyncio.to_thread(local_path.is_file):
-                    raise RuntimeError(f"Local image path is not a file: {local_path}")
+                    raise RuntimeError(
+                        "Local image path is not a file in the workspace"
+                    )
                 if local_path != await asyncio.to_thread(save_path.resolve):
                     await asyncio.to_thread(shutil.copyfile, local_path, save_path)
                 logger.info(f"Copied local image to: {save_path}")
@@ -652,7 +657,7 @@ Images are automatically saved to workspace.
 
         except Exception as e:
             logger.warning(
-                "Failed to download image: %s", redact_sensitive_text(str(e))
+                "Failed to download image: %s", describe_media_download_error(e)
             )
             raise
 
@@ -785,7 +790,7 @@ Images are automatically saved to workspace.
                                 image_path
                             )
                 except Exception as e:
-                    download_error = redact_sensitive_text(str(e))
+                    download_error = describe_media_download_error(e)
                     logger.warning(
                         "Failed to download image to workspace: %s", download_error
                     )
@@ -947,7 +952,7 @@ Images are automatically saved to workspace.
                                 image_path
                             )
                 except Exception as e:
-                    download_error = redact_sensitive_text(str(e))
+                    download_error = describe_media_download_error(e)
                     logger.warning(
                         "Failed to download edited image to workspace: %s",
                         download_error,

@@ -16,7 +16,7 @@ from aiohttp.resolver import ThreadedResolver
 
 from .security import (
     PUBLIC_HTTP_MAX_REDIRECTS,
-    build_ca_bundle_ssl_context,
+    redact_sensitive_text,
     reject_private_network_host,
     validate_public_http_url_shape,
 )
@@ -25,7 +25,16 @@ from .security import (
 @lru_cache(maxsize=1)
 def _media_ssl_context(_ca_file: str | None, _ca_dir: str | None) -> ssl.SSLContext:
     # The arguments invalidate the cache when the configured CA paths change.
-    return build_ca_bundle_ssl_context()
+    # Retain aiohttp's stdlib/platform default trust store and SSL_CERT_*
+    # behavior, rather than switching downloads to HTTPX's certifi defaults.
+    return ssl.create_default_context()
+
+
+def describe_media_download_error(error: Exception) -> str:
+    """Format a redacted cause, omitting filename-bearing OS error details."""
+    if isinstance(error, OSError) and (error.filename or error.filename2):
+        return f"Unable to save media in workspace ({type(error).__name__})"
+    return redact_sensitive_text(str(error) or type(error).__name__)
 
 
 def resolve_workspace_media_path(path: Path, workspace_root: Path) -> Path:
@@ -50,10 +59,6 @@ class PublicMediaResolver(ThreadedResolver):
         return addresses
 
 
-def _validate_media_url(url: str) -> None:
-    validate_public_http_url_shape(url)
-
-
 async def download_public_media(
     url: str,
     destination: Path,
@@ -69,7 +74,7 @@ async def download_public_media(
     """
     if max_bytes <= 0 or timeout <= 0 or not math.isfinite(timeout):
         raise ValueError("Media download limits must be positive")
-    _validate_media_url(url)
+    validate_public_http_url_shape(url)
     resolver = PublicMediaResolver()
     temporary: Path | None = None
     try:
@@ -89,7 +94,7 @@ async def download_public_media(
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as session:
                 for hop in range(PUBLIC_HTTP_MAX_REDIRECTS + 1):
-                    _validate_media_url(url)
+                    validate_public_http_url_shape(url)
                     async with session.get(url, allow_redirects=False) as response:
                         if response.status in {301, 302, 303, 307, 308}:
                             location = response.headers.get("Location")

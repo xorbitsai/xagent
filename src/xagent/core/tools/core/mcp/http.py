@@ -44,7 +44,8 @@ def _origin(url: str) -> str:
 class MCPHttpTransport(PublicHttpTransport):
     """Public-only, with every request bound to this MCP server's origin."""
 
-    max_keepalive_connections = 20
+    def connection_limits(self) -> httpx.Limits:
+        return httpx.Limits(max_keepalive_connections=20)
 
     def __init__(self, endpoint_url: str) -> None:
         self._origin = _origin(endpoint_url)

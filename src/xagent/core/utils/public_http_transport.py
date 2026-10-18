@@ -130,7 +130,7 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
         raise httpx.ConnectError("Public API host did not resolve", request=request)
 
     def connection_limits(self) -> httpx.Limits:
-        # Pinned-IP pool keys alone cannot distinguish logical TLS origins.
+        """Only origin-bound, server-owned subclasses may enable keep-alive."""
         return httpx.Limits(max_keepalive_connections=0)
 
     async def aclose(self) -> None:

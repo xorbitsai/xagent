@@ -752,7 +752,7 @@ async def test_concurrent_postgresql_actor_refresh_uses_one_rotating_token(
                 post_calls += 1
             return Response()
 
-    monkeypatch.setattr(web_tools_config.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(web_tools_config, "create_public_async_client", Client)
 
     def resolve():
         with factory() as db:

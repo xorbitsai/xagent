@@ -303,11 +303,6 @@ async def _create_streamable_http_session(  # noqa: PLR0913
         An initialized ClientSession.
     """
     # Create and store the connection
-    kwargs = {}
-    kwargs["httpx_client_factory"] = httpx_client_factory or partial(
-        create_mcp_http_client, endpoint_url=url
-    )
-
     async with (
         streamablehttp_client(
             url,
@@ -316,7 +311,8 @@ async def _create_streamable_http_session(  # noqa: PLR0913
             sse_read_timeout,
             terminate_on_close,
             auth=auth,
-            **kwargs,
+            httpx_client_factory=httpx_client_factory
+            or partial(create_mcp_http_client, endpoint_url=url),
         ) as (read, write, _),
         ClientSession(read, write, **(session_kwargs or {})) as session,
     ):

@@ -113,3 +113,65 @@ async def test_peer_eof_closes_incoming_stream_without_waiting_for_outer_exit(
     async with transport.public_websocket_client("wss://example.com/") as (read, _):
         with pytest.raises(anyio.EndOfStream):
             await asyncio.wait_for(read.receive(), 1)
+
+
+@pytest.mark.asyncio
+async def test_websocket_address_fallback_has_one_budget(monkeypatch):
+    attempts = []
+
+    class Connection:
+        def __init__(self, url, **kwargs):
+            attempts.append(kwargs)
+
+        async def __aenter__(self):
+            if len(attempts) == 1:
+                raise OSError("unreachable")
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
+    async with transport._connect_public(
+        "wss://example.com/", ["2606:4700:4700::1111", "1.1.1.1"], 443, {}
+    ):
+        pass
+    assert [item["host"] for item in attempts] == ["2606:4700:4700::1111", "1.1.1.1"]
+    assert 0 < attempts[0]["open_timeout"] <= 5
+    assert attempts[1]["open_timeout"] <= 10
+
+
+@pytest.mark.asyncio
+async def test_trusted_websocket_proxy_uses_owned_gate_and_closes_it(monkeypatch):
+    monkeypatch.setenv("HTTPS_PROXY", "http://trusted.example:3128")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    seen = []
+    closed = []
+
+    class Gate:
+        def __init__(self, **kwargs):
+            assert kwargs["upstream_proxy_url"] == "http://trusted.example:3128"
+
+        async def start(self):
+            return "http://owned:password@127.0.0.1:1234"
+
+        async def close(self):
+            closed.append(True)
+
+    class Connection:
+        def __init__(self, url, **kwargs):
+            seen.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    monkeypatch.setattr(transport, "PublicNetworkEgressProxy", Gate)
+    monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
+    async with transport._connect_public("wss://example.com/", ["1.1.1.1"], 443, {}):
+        assert not closed
+    assert seen[0]["proxy"] == "http://owned:password@127.0.0.1:1234"
+    assert "host" not in seen[0]
+    assert closed == [True]

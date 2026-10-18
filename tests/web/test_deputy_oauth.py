@@ -551,7 +551,7 @@ async def test_deputy_refresh_posts_to_stored_instance_url_with_scope_and_redire
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
@@ -630,7 +630,7 @@ async def test_deputy_refresh_scope_filters_empty_entries_in_default_scopes(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
@@ -679,7 +679,9 @@ async def test_deputy_refresh_without_instance_url_raises_permanent_and_skips_ne
                 "when instance_url is missing"
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", ExplodingAsyncClient())
+    monkeypatch.setattr(
+        tool_config, "create_public_async_client", ExplodingAsyncClient()
+    )
 
     # No instance_url on this account is a per-account data problem that no
     # retry can fix, so it's signalled as permanent (see
@@ -738,7 +740,7 @@ async def test_deputy_refresh_updates_instance_url_from_new_endpoint(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
@@ -796,7 +798,7 @@ async def test_deputy_refresh_keeps_prior_instance_url_when_endpoint_malformed(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     with caplog.at_level("WARNING"):
         assert (
@@ -855,7 +857,7 @@ async def test_deputy_refresh_returns_false_on_non_200_response(
         async def post(self, url, **kwargs):
             return MockResponse(status_code=401, text="invalid_grant")
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
@@ -920,7 +922,7 @@ async def test_non_deputy_refresh_still_posts_to_provider_token_url(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "google")

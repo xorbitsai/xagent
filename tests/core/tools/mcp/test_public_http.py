@@ -85,3 +85,68 @@ async def test_configured_idna_hostname_has_the_same_origin_as_httpx_request(net
     ) as client:
         await client.get("https://xn--bcher-kva.example/messages")
     assert seen[0].headers["Host"] == "xn--bcher-kva.example"
+
+
+@pytest.mark.asyncio
+async def test_hostname_resolving_to_private_is_blocked(network, monkeypatch):
+    seen, _ = network
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 443))],
+    )
+    async with create_mcp_http_client(endpoint_url="https://example.com/mcp") as client:
+        with pytest.raises(UnsafePublicHttpTarget):
+            await client.post("https://example.com/mcp", content=b"credentials")
+    assert not seen
+
+
+@pytest.mark.asyncio
+async def test_trusted_proxy_is_forwarded_but_untrusted_ambient_proxy_is_not(
+    network, monkeypatch
+):
+    from xagent.core.utils.security import PrivateNetworkHostError
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://trusted.example:3128")
+    with pytest.raises(PrivateNetworkHostError):
+        create_mcp_http_client(endpoint_url="https://example.com/mcp")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    options = []
+    monkeypatch.setattr(
+        httpx,
+        "AsyncHTTPTransport",
+        lambda **kwargs: options.append(kwargs)
+        or httpx.MockTransport(lambda request: httpx.Response(200)),
+    )
+    async with create_mcp_http_client(endpoint_url="https://example.com/mcp") as client:
+        await client.get("https://example.com/mcp")
+    assert options[0]["proxy"] == "http://trusted.example:3128"
+    assert options[0]["trust_env"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sse", "streamable_http"])
+async def test_default_session_factory_binds_configured_endpoint(monkeypatch, kind):
+    from contextlib import asynccontextmanager
+
+    from xagent.core.tools.core.mcp import sessions
+
+    class Captured(Exception):
+        pass
+
+    @asynccontextmanager
+    async def endpoint(*args, **kwargs):
+        factory = kwargs["httpx_client_factory"]
+        async with factory() as client:
+            assert client._transport._origin == "https://example.com:443"
+        raise Captured
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        sessions, "sse_client" if kind == "sse" else "streamablehttp_client", endpoint
+    )
+    with pytest.raises(Captured):
+        async with sessions.create_session(
+            {"transport": kind, "url": "https://example.com/mcp"}
+        ):
+            pytest.fail("Stub unexpectedly created a session")

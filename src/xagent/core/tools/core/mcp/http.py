@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from ....utils.public_http_transport import PublicHttpTransport, UnsafePublicHttpTarget
+from ..web_content import get_trusted_proxy_url
 
 
 def _origin(url: str) -> str:
@@ -29,13 +30,13 @@ def _origin(url: str) -> str:
 class MCPHttpTransport(PublicHttpTransport):
     """Public-only, with every request bound to this MCP server's origin."""
 
-    def __init__(self, endpoint_url: str | None = None) -> None:
-        self._origin = _origin(endpoint_url) if endpoint_url else None
-        super().__init__()
+    def __init__(self, endpoint_url: str) -> None:
+        self._origin = _origin(endpoint_url)
+        super().__init__(proxy_url=get_trusted_proxy_url())
 
     async def _resolve_addresses(self, url: str) -> list[str]:
         origin = _origin(url)
-        if self._origin is not None and origin != self._origin:
+        if origin != self._origin:
             raise UnsafePublicHttpTarget(
                 "MCP requests must remain on their configured origin"
             )
@@ -47,7 +48,7 @@ def create_mcp_http_client(
     timeout: httpx.Timeout | None = None,
     auth: httpx.Auth | None = None,
     *,
-    endpoint_url: str | None = None,
+    endpoint_url: str,
 ) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         headers=headers,

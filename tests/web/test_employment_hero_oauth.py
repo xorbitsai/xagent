@@ -909,7 +909,7 @@ async def test_employment_hero_refresh_sends_grant_type_and_refresh_token_as_que
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(
@@ -984,7 +984,7 @@ async def test_employment_hero_refresh_skips_query_rewrite_for_non_eh_token_url(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(

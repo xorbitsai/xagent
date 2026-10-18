@@ -5,7 +5,7 @@ stream protocol, but pin the socket and reject handshake redirects/proxies.
 """
 
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -17,7 +17,9 @@ from pydantic import ValidationError
 from websockets.asyncio.client import connect
 from websockets.typing import Subprotocol
 
+from ....utils.public_network_proxy import PublicNetworkEgressProxy
 from ....utils.security import build_ca_bundle_ssl_context, validate_public_http_url
+from ..web_content import get_trusted_proxy_url
 
 
 class _NoRedirectConnect(connect):
@@ -25,6 +27,48 @@ class _NoRedirectConnect(connect):
         # A new URI must never inherit the old socket override or credential
         # query. Operators must configure the actual final WebSocket URL.
         return exc
+
+
+@asynccontextmanager
+async def _connect_public(
+    url: str, addresses: list[str], port: int, tls_kwargs: dict[str, Any]
+) -> AsyncIterator[Any]:
+    proxy = get_trusted_proxy_url()
+    async with AsyncExitStack() as stack:
+        options: dict[str, Any] = {}
+        targets: list[str | None]
+        if proxy:
+            # Unlike websockets' host override, this gate also pins the
+            # upstream CONNECT target; the proxy cannot re-resolve a name.
+            gate = PublicNetworkEgressProxy(upstream_proxy_url=proxy)
+            stack.push_async_callback(gate.close)
+            options["proxy"] = await gate.start()
+            targets = [None]
+        else:
+            options["proxy"] = None
+            targets = list(addresses)
+        started = anyio.current_time()
+        for index, address in enumerate(targets):
+            remaining = 10.0 - (anyio.current_time() - started)
+            if remaining <= 0:
+                raise TimeoutError("MCP WebSocket connect budget exhausted")
+            if address is not None:
+                options.update(host=address, port=port)
+            try:
+                websocket = await stack.enter_async_context(
+                    _NoRedirectConnect(
+                        url,
+                        open_timeout=remaining / (len(targets) - index),
+                        subprotocols=[Subprotocol("mcp")],
+                        **options,
+                        **tls_kwargs,
+                    )
+                )
+                break
+            except (OSError, TimeoutError):
+                if index == len(targets) - 1:
+                    raise
+        yield websocket
 
 
 @asynccontextmanager
@@ -58,14 +102,7 @@ async def public_websocket_client(
         read_stream,
         write_stream,
         write_reader,
-        _NoRedirectConnect(
-            url,
-            host=addresses[0],
-            port=port,
-            proxy=None,
-            subprotocols=[Subprotocol("mcp")],
-            **tls_kwargs,
-        ) as websocket,
+        _connect_public(url, addresses, port, tls_kwargs) as websocket,
     ):
 
         async def reader() -> None:

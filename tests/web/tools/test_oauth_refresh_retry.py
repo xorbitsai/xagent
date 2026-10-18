@@ -130,6 +130,45 @@ class _FakeAsyncClient:
 
 
 @pytest.mark.asyncio
+async def test_real_refresh_client_rejects_private_token_url(
+    db_session, monkeypatch, sleep_delays
+):
+    db, user = db_session
+    account = _github_oauth_account(user)
+    db.add(account)
+    provider = db.query(OAuthProvider).filter_by(provider_name="github").one()
+    provider.token_url = "http://169.254.169.254/token"
+    db.commit()
+
+    def no_dispatch(request):
+        pytest.fail("Private token URL reached the inner transport")
+
+    monkeypatch.setattr(
+        httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(no_dispatch)
+    )
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, account, "github") is False
+    )
+    assert account.access_token == "old-token"
+    assert not sleep_delays
+
+
+def test_refresh_client_requires_trusted_proxy_opt_in(monkeypatch):
+    from xagent.core.utils.security import PrivateNetworkHostError
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://trusted.example:3128")
+    with pytest.raises(PrivateNetworkHostError):
+        tool_config._oauth_refresh_http_client()
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    seen = []
+    monkeypatch.setattr(
+        tool_config, "create_public_async_client", lambda **kwargs: seen.append(kwargs)
+    )
+    tool_config._oauth_refresh_http_client()
+    assert seen == [{"proxy_url": "http://trusted.example:3128"}]
+
+
+@pytest.mark.asyncio
 async def test_refresh_retries_transient_network_error_then_succeeds(
     db_session, monkeypatch, sleep_delays
 ):

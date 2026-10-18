@@ -3818,9 +3818,14 @@ class _TransportRecorder:
         """
         if connection.get("transport") not in _INSTRUMENTABLE_TRANSPORTS:
             return connection
+        from functools import partial
+
         build = cast(
             McpHttpClientFactory,
-            connection.get("httpx_client_factory") or create_mcp_http_client,
+            connection.get("httpx_client_factory")
+            or partial(
+                create_mcp_http_client, endpoint_url=str(connection.get("url", ""))
+            ),
         )
 
         def record(
@@ -3829,15 +3834,7 @@ class _TransportRecorder:
             auth: httpx.Auth | None = None,
         ) -> httpx.AsyncClient:
             self.raise_if_sealed()
-            if connection.get("httpx_client_factory") is None:
-                client = create_mcp_http_client(
-                    headers=headers,
-                    timeout=timeout,
-                    auth=auth,
-                    endpoint_url=str(connection.get("url", "")) or None,
-                )
-            else:
-                client = build(headers=headers, timeout=timeout, auth=auth)
+            client = build(headers=headers, timeout=timeout, auth=auth)
             self._clients.append(client)
             return client
 

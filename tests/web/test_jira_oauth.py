@@ -348,7 +348,7 @@ async def test_jira_expired_token_refresh_uses_json_body(db_session, monkeypatch
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "jira")

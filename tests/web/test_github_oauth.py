@@ -1066,7 +1066,7 @@ async def test_github_expired_token_refresh_sends_accept_json_header(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1140,7 +1140,7 @@ async def test_github_refresh_falls_back_to_env_credentials(db_session, monkeypa
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1205,7 +1205,7 @@ async def test_github_refresh_surfaces_failure_instead_of_raising_on_form_body(
         async def post(self, url, **kwargs):
             return FormBodyResponse()
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1267,7 +1267,7 @@ async def test_github_refresh_treats_bad_provider_credentials_as_transient(
         async def post(self, url, **kwargs):
             return BadCredentialsResponse()
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
@@ -1332,7 +1332,7 @@ async def test_github_refresh_deletes_connection_on_200_bad_refresh_token(
         async def post(self, url, **kwargs):
             return DeadRefreshTokenResponse()
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")

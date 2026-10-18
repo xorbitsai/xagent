@@ -17,6 +17,7 @@ from urllib.parse import (
 )
 
 import httpx
+from yarl import URL
 
 SENSITIVE_QUERY_KEYS = {
     "api_key",
@@ -260,21 +261,42 @@ def build_ca_bundle_ssl_context() -> ssl.SSLContext:
     return httpx.create_ssl_context(trust_env=True)
 
 
-async def validate_public_http_url(url: str) -> list[str]:
-    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
-
+def validate_public_http_url_shape(url: str) -> SplitResult:
+    """Validate the normalized host used by HTTP clients, without resolving DNS."""
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("url must be an absolute HTTP or HTTPS URL")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("url must not contain embedded credentials")
 
+    # aiohttp uses yarl's IDNA/UTS46 normalization before deciding whether to
+    # bypass its resolver for an IP literal. Validate that same spelling.
+    parsed = urlsplit(str(URL(url)))
     hostname = parsed.hostname
-    reject_private_network_host(hostname)
+    if not hostname:
+        raise ValueError("url must have a hostname")
+    host = hostname.rstrip(".")
+    if ":" in host or host.replace(".", "").isdigit():
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("url contains a non-canonical IP address") from exc
+    reject_private_network_host(host)
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        port = parsed.port
     except ValueError as exc:
         raise ValueError("url contains an invalid port") from exc
+    if port == 0:
+        raise ValueError("url contains an invalid port")
+    return parsed
+
+
+async def validate_public_http_url(url: str) -> list[str]:
+    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
+    parsed = validate_public_http_url_shape(url)
+    hostname = parsed.hostname
+    assert hostname is not None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
     addresses = await asyncio.to_thread(
         socket.getaddrinfo,
@@ -316,7 +338,7 @@ def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:
     return connect_url, host_header, hostname
 
 
-_MAX_REDIRECTS = 5
+PUBLIC_HTTP_MAX_REDIRECTS = 5
 
 
 async def fetch_public_http_bytes(
@@ -352,7 +374,7 @@ async def fetch_public_http_bytes(
 
     logical_url = url
     display_name = resource_name[:1].upper() + resource_name[1:]
-    for redirect_count in range(_MAX_REDIRECTS + 1):
+    for redirect_count in range(PUBLIC_HTTP_MAX_REDIRECTS + 1):
         resolved_ips = await validate_public_http_url(logical_url)
         parsed = urlsplit(logical_url)
         request_headers = dict(headers or {})
@@ -375,7 +397,7 @@ async def fetch_public_http_bytes(
                 location = response.headers.get("location")
                 if not location:
                     raise ValueError(f"{display_name} redirect has no Location")
-                if redirect_count >= _MAX_REDIRECTS:
+                if redirect_count >= PUBLIC_HTTP_MAX_REDIRECTS:
                     raise ValueError(f"{display_name} exceeded redirect limit")
                 logical_url = urljoin(logical_url, location)
                 continue

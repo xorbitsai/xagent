@@ -4,7 +4,7 @@ import os
 from typing import Any
 from urllib.parse import quote, urlparse
 
-import requests
+from ....core.utils import public_requests as requests
 
 GRAPH_BASE_URL = "https://graph.facebook.com/v25.0"
 DEFAULT_TIMEOUT_SECONDS = 30

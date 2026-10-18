@@ -6,12 +6,12 @@ from collections.abc import Iterator
 from typing import Annotated, Any
 from urllib.parse import quote, unquote, urlsplit
 
-import requests
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)

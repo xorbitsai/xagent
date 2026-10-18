@@ -5,9 +5,9 @@ import re
 import time
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
 from .utils import setup_proxy_env
 

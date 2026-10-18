@@ -66,9 +66,11 @@ def test_agent_chat_reply_and_followup(shared_app, interface):
     url = (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
         + ws_path
-        + f"?token={token}"
+        + (f"?token={token}" if interface != "owner" else "")
     )
-    with connect(url) as ws:
+    with connect(
+        url, additional_headers=app.headers if interface == "owner" else None
+    ) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
             json.dumps(
@@ -109,7 +111,9 @@ def test_agent_chat_reply_and_followup(shared_app, interface):
     assert any(
         "Continue the conversation" in json.dumps(call["messages"]) for call in calls
     )
-    with connect(url) as ws:
+    with connect(
+        url, additional_headers=app.headers if interface == "owner" else None
+    ) as ws:
         _, history = receive_event(ws, "historical_data_complete")
         assert "Continue the conversation" in json.dumps(history)
         assert "Shared E2E answer" in json.dumps(history)
@@ -184,9 +188,9 @@ def test_execution_modes_reach_final_result(shared_app, mode, route):
     task_id = response.json()["task_id"]
     url = (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
-        + f"/ws/chat/{task_id}?token={app.token}"
+        + f"/ws/chat/{task_id}"
     )
-    with connect(url) as ws:
+    with connect(url, additional_headers=app.headers) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(json.dumps({"type": "execute_task"}))
         _, events = receive_event(ws, "task_completed")
@@ -245,9 +249,11 @@ def test_chat_file_input_and_output(shared_app, interface):
     url = (
         str(app.client.base_url).replace("http://", "ws://").rstrip("/")
         + ws_path
-        + f"?token={token}"
+        + (f"?token={token}" if interface != "owner" else "")
     )
-    with connect(url) as ws:
+    with connect(
+        url, additional_headers=app.headers if interface == "owner" else None
+    ) as ws:
         receive_event(ws, "historical_data_complete")
         ws.send(
             json.dumps(

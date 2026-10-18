@@ -13,7 +13,10 @@ from xagent.web.app import (
     _blocked_upload_extension,
     _is_public_upload_path,
     _security_header_values,
+    app,
 )
+from xagent.web.browser_security import page_security_headers
+from xagent.web.frontend_static import mount_frontend
 
 
 @pytest.mark.parametrize(
@@ -77,8 +80,22 @@ def test_security_headers_harden_api_and_regular_pages() -> None:
 
     assert api["X-Frame-Options"] == "DENY"
     assert "frame-ancestors 'none'" in api["Content-Security-Policy"]
+    assert "script-src 'none'" in api["Content-Security-Policy"]
+    assert "unsafe-eval" not in api["Content-Security-Policy"]
     assert page["X-Frame-Options"] == "DENY"
     assert "Content-Security-Policy" not in page
+
+
+def test_widget_traversal_does_not_exempt_regular_page_headers():
+    assert _security_header_values("/widget/../tools.html")["X-Frame-Options"] == "DENY"
+
+
+def test_security_headers_preserve_inline_oauth_popup_feedback_without_eval():
+    policy = _security_header_values("/api/auth/google/callback")[
+        "Content-Security-Policy"
+    ]
+    assert "script-src 'self' 'unsafe-inline'" in policy
+    assert "unsafe-eval" not in policy
 
 
 def test_security_headers_only_exempt_file_preview_routes() -> None:
@@ -105,3 +122,33 @@ def test_public_html_preview_is_downloaded_instead_of_executed(tmp_path: Path) -
     content_disposition = response.headers["content-disposition"]
     assert content_disposition.startswith("attachment;")
     assert 'filename="report.html"' in content_disposition
+
+
+def test_production_middleware_and_frontend_mount_share_one_page_policy(
+    tmp_path, monkeypatch
+):
+    # Exercise the actual middleware stack without starting background workers
+    # or external services. Restore the production route table after this test.
+    monkeypatch.setattr(app.router, "routes", list(app.router.routes))
+    monkeypatch.setattr(app, "middleware_stack", None)
+    monkeypatch.setattr(
+        app.state, "file_storage_startup_sync_task", None, raising=False
+    )
+    monkeypatch.setattr(
+        app.state, "file_storage_startup_sync_error", None, raising=False
+    )
+    (tmp_path / "index.html").write_text("<html>home</html>")
+    (tmp_path / "widget").mkdir()
+    (tmp_path / "widget" / "__shell__.html").write_text("<html>widget</html>")
+    assert mount_frontend(app, tmp_path)
+    client = TestClient(app)
+    for path, embeddable in [("/", False), ("/widget/capability", True)]:
+        response = client.get(path)
+        assert response.status_code == 200
+        policies = response.headers.get_list("content-security-policy")
+        assert policies == [
+            page_security_headers(embeddable=embeddable)["Content-Security-Policy"]
+        ]
+        assert response.headers.get("x-frame-options") == (
+            None if embeddable else "DENY"
+        )

@@ -683,6 +683,41 @@ describe("AppProvider websocket message routing", () => {
     localStorage.clear()
   })
 
+  it.each([false, true])("clears pending connection callbacks on unmount (history expired: %s)", (expireHistory) => {
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout")
+    const clearSpy = vi.spyOn(globalThis, "clearTimeout")
+    try {
+      const { unmount } = render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
+      timeoutSpy.mockClear()
+      act(() => { webSocketOptions.current?.onConnect?.(1) })
+      expect(screen.getByTestId("history-loading")).toHaveTextContent("true")
+      const timers = timeoutSpy.mock.calls.flatMap(([callback, delay], index) =>
+        delay === 1000 || delay === 2000
+          ? [{ callback: callback as () => void, delay, handle: timeoutSpy.mock.results[index].value }]
+          : [],
+      )
+      expect(timers.map(({ delay }) => delay).sort()).toEqual([1000, 2000])
+      const historyTimer = timers.find(({ delay }) => delay === 2000)!
+      if (expireHistory) {
+        clearTimeout(historyTimer.handle)
+        act(() => historyTimer.callback())
+        expect(screen.getByTestId("history-loading")).toHaveTextContent("false")
+      }
+      clearSpy.mockClear()
+      unmount()
+      for (const timer of timers) {
+        if (expireHistory && timer === historyTimer) {
+          expect(clearSpy).not.toHaveBeenCalledWith(timer.handle)
+        } else {
+          expect(clearSpy).toHaveBeenCalledWith(timer.handle)
+        }
+      }
+    } finally {
+      cleanup()
+      vi.restoreAllMocks()
+    }
+  })
+
   it("retains the conversation storage version from task history for child navigation", () => {
     render(<AppProvider token="token"><SeedRunningTask /><StateProbe /></AppProvider>)
     act(() => { webSocketOptions.current?.onMessage?.(taskInfoMessage(1, { conversation_storage_version: 2 })) })

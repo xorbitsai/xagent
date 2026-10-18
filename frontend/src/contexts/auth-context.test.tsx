@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { AnonymousAuthProvider, AuthProvider, useAuth } from "@/contexts/auth-context"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
-import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT, clearStoredAuth } from "@/lib/auth-cache"
+import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT, clearStoredAuth, readAuthSessionSnapshot } from "@/lib/auth-cache"
 
 const toastError = vi.hoisted(() => vi.fn())
 const translate = vi.hoisted(() => vi.fn((key: string) => `translated:${key}`))
@@ -153,6 +153,46 @@ describe("AuthProvider storage synchronization", () => {
     vi.mocked(apiRequest).mockImplementation(
       async () => new Response(null, { status: 404 })
     )
+  })
+
+  it.each(["not_current", "invalid_response", "transport_failed"] as const)(
+    "does not discard a live session when refresh returns %s", async status => {
+      writeAuthCache({ id: "1", username: "alice" }, "current-token", "refresh-token")
+      vi.mocked(refreshStoredAccessToken).mockResolvedValue({ status, accessToken: null })
+      render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+      await screen.findByText("current-token")
+      fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+      await waitFor(() => expect(screen.getByTestId("refresh-result")).toHaveTextContent("false"))
+      expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("current-token")
+      expect(toastError).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(["refreshed", "advanced"] as const)(
+    "accepts %s only for the active session and exact access token", async status => {
+      writeAuthCache({ id: "1", username: "alice" }, "current-token", "refresh-token")
+      vi.mocked(refreshStoredAccessToken).mockResolvedValue({
+        status, accessToken: "current-token", session: readAuthSessionSnapshot(),
+      })
+      render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+      await screen.findByText("current-token")
+      fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+      await waitFor(() => expect(screen.getByTestId("refresh-result")).toHaveTextContent("true"))
+    },
+  )
+
+  it("rejects a refreshed token that does not match the current credential", async () => {
+    writeAuthCache({ id: "1", username: "alice" }, "current-token", "refresh-token")
+    vi.mocked(refreshStoredAccessToken).mockResolvedValue({
+      status: "advanced", accessToken: "stale-token", session: {
+        ...readAuthSessionSnapshot(), accessToken: "stale-token",
+      },
+    })
+    render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+    await screen.findByText("current-token")
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+    await waitFor(() => expect(screen.getByTestId("refresh-result")).toHaveTextContent("false"))
+    expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("current-token")
   })
 
   it("server-renders an empty loading projection when browser storage is unavailable", () => {

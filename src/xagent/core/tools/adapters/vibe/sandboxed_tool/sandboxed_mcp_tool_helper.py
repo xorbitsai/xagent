@@ -51,7 +51,7 @@ _MCP_SANDBOX_TIMEOUT_SECONDS = 60
 # (and every other sandboxed connector's) sandbox_list_tools failures once a
 # fresh sandbox picked up 2.0 from PyPI while the backend stayed on the 1.x
 # line.
-_MCP_SANDBOX_EXTRA_PACKAGES = ["mcp>=1.12.4,<2"]
+_MCP_SANDBOX_EXTRA_PACKAGES = ["mcp>=1.30.0,<2"]
 _MCP_SANDBOX_ENV = ["XAGENT_USER_ID"]
 _MCP_SANDBOX_CONFIG = SandboxConfig(
     packages=tuple(_MCP_SANDBOX_EXTRA_PACKAGES),

@@ -1,5 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { browserSecurityHeaders } from "./browser-security.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,6 +24,22 @@ const outputMode = isDev
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   ...(outputMode ? { output: outputMode } : {}),
+  // Exported pages receive the equivalent policy from FastAPI. Next headers
+  // only apply when the independent Node server actually serves the pages.
+  ...(outputMode !== "export" ? {
+    async headers() {
+      return [
+        {
+          source: "/:path((?!widget(?:/|$)).*)",
+          headers: browserSecurityHeaders({ development: isDev }),
+        },
+        {
+          source: "/widget/:path*",
+          headers: browserSecurityHeaders({ embeddable: true, development: isDev }),
+        },
+      ];
+    },
+  } : {}),
   images: { unoptimized: true },
   outputFileTracingRoot: __dirname,
   experimental: {

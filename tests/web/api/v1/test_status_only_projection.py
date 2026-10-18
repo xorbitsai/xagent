@@ -324,10 +324,14 @@ EXCLUDE = {
 
 
 def test_v1_routes_classified():
+    from fastapi.routing import iter_route_contexts
+
+    # Included routers are lazy in current FastAPI; enumerate effective routes
+    # with their prefixes instead of depending on the flattened internals.
     routes = {
         (method, route.path)
-        for route in app.routes
-        if getattr(route, "path", "").startswith("/v1")
+        for route in iter_route_contexts(app.routes)
+        if (route.path or "").startswith("/v1")
         for method in getattr(route, "methods", ())
     }
     assert routes == DERIVE | ALLOWLIST | EXCLUDE

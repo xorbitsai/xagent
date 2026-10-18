@@ -8,6 +8,7 @@ const apiRequest = vi.hoisted(() => vi.fn())
 const claimAuthLoginIntent = vi.hoisted(() => vi.fn())
 const claimOidcAuthLoginIntent = vi.hoisted(() => vi.fn())
 const createAuthSession = vi.hoisted(() => vi.fn())
+const translations = vi.hoisted(() => ({ t: (key: string) => key, tDynamic: (_key: string, fallback: string) => fallback }))
 const authMutationUnavailableTranslationKey = vi.hoisted(() => vi.fn((reason: string) => `login.alerts.${reason}`))
 
 vi.mock("@/components/auth/auth-form-card", () => ({
@@ -23,7 +24,7 @@ vi.mock("@/components/ui/input", () => ({
   Input: (props: React.InputHTMLAttributes<HTMLInputElement>) => <input {...props} />,
 }))
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key, tDynamic: (_key: string, fallback: string) => fallback }),
+  useI18n: () => translations,
 }))
 vi.mock("@/hooks/use-setup-status", () => ({
   useSetupStatus: () => ({ isLoading: false, registrationEnabled: false }),
@@ -61,6 +62,53 @@ function renderLogin() {
 }
 
 describe("LoginPage auth-session creation", () => {
+  it.each(["storage_unavailable", "coordination_unavailable", "operation_failed"])("shows an auth-unavailable redirect reason: %s", async reason => {
+    window.history.replaceState({}, "", `/login?auth_unavailable=${reason}`)
+    try {
+      render(<LoginPage />)
+      expect(await screen.findByText(`login.alerts.${reason}`)).toBeInTheDocument()
+    } finally { window.history.replaceState({}, "", "/") }
+  })
+
+  it("shows an OIDC redirect failure, then clears it when typing", async () => {
+    window.history.replaceState({}, "", "/login?oidc_error=invalid_state")
+    try {
+      render(<LoginPage />)
+      expect(await screen.findByText("login.alerts.google_failed")).toBeInTheDocument()
+      fireEvent.change(screen.getByPlaceholderText("login.form.username_placeholder"), { target: { value: "alice" } })
+      expect(screen.queryByText("login.alerts.google_failed")).not.toBeInTheDocument()
+    } finally { window.history.replaceState({}, "", "/") }
+  })
+
+  it("lets users reveal and hide the password without changing it", () => {
+    renderLogin()
+    const password = screen.getByPlaceholderText("login.form.password_placeholder")
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    expect(password).toHaveAttribute("type", "text")
+    fireEvent.click(screen.getByRole("button", { name: "Hide password" }))
+    expect(password).toHaveAttribute("type", "password")
+    expect(password).toHaveValue("secret")
+  })
+
+  it("does not navigate to Google when login coordination is unavailable", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ configured: true }))))
+    claimOidcAuthLoginIntent.mockResolvedValue({ status: "unavailable", reason: "coordination_unavailable" })
+    const navigation = captureNavigation()
+    try {
+      render(<LoginPage />)
+      fireEvent.click(await screen.findByRole("button", { name: /login.google.continue/ }))
+      expect(await screen.findByText("login.alerts.coordination_unavailable")).toBeInTheDocument()
+      expect(claimOidcAuthLoginIntent).toHaveBeenCalledOnce()
+      expect(navigation.targets).toEqual([])
+    } finally { navigation.restore() }
+  })
+
+  it("fails closed when checking Google availability returns an error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 503 })))
+    render(<LoginPage />)
+    expect(await screen.findByRole("button", { name: /login.google.unavailable/ })).toBeDisabled()
+  })
+
   it("explains why a password change requires signing in again", async () => {
     window.history.replaceState({}, "", "/login?password_changed=1")
     try {

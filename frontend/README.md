@@ -27,7 +27,7 @@ A modern React-based frontend for the xagent Agent system, built with Next.js, T
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20.19+ within the 20.x line, or 22.12+ (required by the Vite 7 test toolchain)
 - npm or yarn
 
 ### Installation

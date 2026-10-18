@@ -263,8 +263,9 @@ describe("ConversationLogsPage", () => {
 
   it("formats relative times with the app locale", async () => {
     const relativeTimeFormatMock = vi.fn(
-      (locale?: Intl.LocalesArgument, options?: Intl.RelativeTimeFormatOptions) =>
-        new NativeRelativeTimeFormat(locale, options)
+      function (locale?: Intl.LocalesArgument, options?: Intl.RelativeTimeFormatOptions) {
+        return new NativeRelativeTimeFormat(locale, options)
+      }
     )
     vi.stubGlobal("Intl", {
       ...Intl,

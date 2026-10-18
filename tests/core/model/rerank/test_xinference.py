@@ -83,7 +83,7 @@ class TestXinferenceRerankInit:
 class TestXinferenceRerankCompress:
     """End-to-end behaviour of ``compress``."""
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_reorders_documents(self, mock_post):
         """Documents are returned in the order the reranker requested."""
         client = XinferenceRerank(
@@ -119,7 +119,7 @@ class TestXinferenceRerankCompress:
         # No top_n => not in payload
         assert "top_n" not in payload
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_with_top_n(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",
@@ -144,7 +144,7 @@ class TestXinferenceRerankCompress:
         payload = mock_post.call_args.kwargs["json"]
         assert payload["top_n"] == 2
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_empty_documents_returns_empty(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",
@@ -154,7 +154,7 @@ class TestXinferenceRerankCompress:
         assert result == []
         mock_post.assert_not_called()
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_preserves_dropped_documents(self, mock_post):
         """Documents missing from the response are appended in original order."""
         client = XinferenceRerank(
@@ -177,7 +177,7 @@ class TestXinferenceRerankCompress:
 
         assert result == ["c", "a", "b", "d"]
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_http_error_raises(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",
@@ -192,7 +192,7 @@ class TestXinferenceRerankCompress:
         with pytest.raises(requests.HTTPError):
             client.compress(["a", "b"], "q")
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_invalid_json_raises_value_error(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",
@@ -207,7 +207,7 @@ class TestXinferenceRerankCompress:
         with pytest.raises(ValueError, match="non-JSON response"):
             client.compress(["a", "b"], "q")
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_missing_results_raises_value_error(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",
@@ -221,7 +221,7 @@ class TestXinferenceRerankCompress:
         with pytest.raises(ValueError, match="missing 'results'"):
             client.compress(["a", "b"], "q")
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_invalid_index_raises_value_error(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",
@@ -237,7 +237,7 @@ class TestXinferenceRerankCompress:
         with pytest.raises(ValueError, match="invalid 'index'"):
             client.compress(["a", "b"], "q")
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_skips_out_of_range_and_duplicate_indices(self, mock_post):
         client = XinferenceRerank(
             model="bge-reranker-base",

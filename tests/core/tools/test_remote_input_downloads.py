@@ -97,6 +97,10 @@ def network(monkeypatch):
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, 443)),
         ]
     )
+    # Model policies resolve synchronously inside a worker; input download
+    # policies resolve through to_thread directly. Keep both on the same fake
+    # DNS snapshot without bypassing either real destination policy.
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *args, **kwargs: dns.return_value)
     real_to_thread = asyncio.to_thread
 
     async def to_thread(function, *args, **kwargs):

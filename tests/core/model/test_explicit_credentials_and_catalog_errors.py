@@ -15,6 +15,7 @@ synthetic.
 """
 
 import contextvars
+import socket
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -75,8 +76,12 @@ def wire(monkeypatch):
         httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request
     )
     monkeypatch.setattr(
-        "xagent.core.utils.public_http_transport.validate_public_http_url",
-        AsyncMock(return_value=["93.184.216.34"]),
+        "xagent.core.model.network_policy.socket.getaddrinfo",
+        MagicMock(
+            return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
+            ]
+        ),
     )
     return SimpleNamespace(sent=sent, state=state)
 

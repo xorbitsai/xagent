@@ -43,7 +43,7 @@ class TestDashscopeRerank:
         response.json.return_value = {"results": [{"index": 0}]}
 
         with patch(
-            "xagent.core.utils.public_requests.post", return_value=response
+            "xagent.core.model.public_requests.post", return_value=response
         ) as post:
             client.compress(["doc"], "query")
             client.compress_with_scores(["doc"], "query")
@@ -63,7 +63,7 @@ class TestDashscopeRerank:
             ("gte-rerank-v2", False),  # Old format
         ],
     )
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_success(self, mock_post, model, is_new_format):
         """Test successful reranking (compress) for both formats."""
         query = "What is the capital of France?"
@@ -136,7 +136,7 @@ class TestDashscopeRerank:
             ("gte-rerank-v2", False),  # Old format
         ],
     )
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_with_top_n_and_instruct(self, mock_post, model, is_new_format):
         """Test successful reranking with top_n and instruct for both formats."""
         query = "Query"
@@ -199,7 +199,7 @@ class TestDashscopeRerank:
             assert json_payload["parameters"]["top_n"] == 2
             assert json_payload["parameters"]["instruct"] == "Be precise"
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_api_error(self, mock_post):
         """Test handling of API errors (non-2xx status)."""
         mock_response = Mock()
@@ -213,7 +213,7 @@ class TestDashscopeRerank:
         with pytest.raises(requests.HTTPError, match="400 Client Error"):
             client.compress(["Doc"], "Query")
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_compress_invalid_response_format(self, mock_post):
         """Test handling of invalid response format."""
         mock_response = Mock()
@@ -275,7 +275,7 @@ class TestDashscopeRerankEndpointRouting:
         assert client.url == "https://dashscope.aliyuncs.com/compatible-api/v1/reranks"
         assert client.is_new_format is True
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_qwen3_rerank_uses_compatible_url_in_request(self, mock_post):
         """End-to-end: the new model is called on /compatible-api/v1/reranks."""
         mock_response = Mock()
@@ -304,7 +304,7 @@ class TestDashscopeRerankEndpointRouting:
         # Result mapping
         assert result == ["a", "b"]
 
-    @patch("xagent.core.utils.public_requests.post")
+    @patch("xagent.core.model.public_requests.post")
     def test_empty_documents_skips_request(self, mock_post):
         client = DashscopeRerank(api_key="k", model="qwen3-rerank")
         result = client.compress([], "q")

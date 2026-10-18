@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from ....config import get_media_download_max_bytes
+from ...utils.public_download import download_public_input
 from ...utils.security import redact_sensitive_text, redact_url_credentials_for_logging
 from ..chat.token_context import MediaCallType
 from .base import (
@@ -664,29 +666,25 @@ class GeminiImageModel(BaseImageModel):
             elif img.startswith(("http://", "https://")):
                 # HTTP URL: download and encode
                 try:
-                    timeout = httpx.Timeout(60.0, connect=10.0)
-                    async with httpx.AsyncClient(timeout=timeout) as client:
-                        img_response = await client.get(img)
-                        if img_response.status_code == 200:
-                            image_bytes = img_response.content
-                            mime_type = img_response.headers.get(
-                                "content-type", "image/jpeg"
-                            )
-                            base64_data = base64.b64encode(image_bytes).decode("utf-8")
-                            parts.append(
-                                {
-                                    "inlineData": {
-                                        "mimeType": mime_type,
-                                        "data": base64_data,
-                                    }
-                                }
-                            )
-                        else:
-                            raise RuntimeError(
-                                f"Failed to download image: {img_response.status_code}"
-                            )
+                    img_response = await download_public_input(
+                        img,
+                        timeout=60.0,
+                        max_bytes=get_media_download_max_bytes("image"),
+                    )
+                    parts.append(
+                        {
+                            "inlineData": {
+                                "mimeType": img_response.content_type or "image/jpeg",
+                                "data": base64.b64encode(img_response.content).decode(
+                                    "utf-8"
+                                ),
+                            }
+                        }
+                    )
                 except Exception as e:
-                    raise RuntimeError(f"Failed to process image URL {img}: {e}") from e
+                    raise RuntimeError(
+                        f"Failed to process remote reference image: {e}"
+                    ) from None
             else:
                 # Local file path - read and encode
                 # Check if it's a valid file path

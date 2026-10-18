@@ -22,6 +22,7 @@ from ..auth_dependencies import get_current_user
 from ..models.user import User
 from .websocket_auth import (
     _WebSocketAuthenticationTerminated,
+    accept_authenticated_websocket,
     get_authenticated_user,
     revalidate_websocket_session,
 )
@@ -41,7 +42,10 @@ progress_ws_router = APIRouter()
 async def progress_websocket_endpoint(
     websocket: WebSocket,
     task_id: str,
-    token: str = Query(..., description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket endpoint for real-time progress monitoring."""
     try:
@@ -69,7 +73,7 @@ async def progress_websocket_endpoint(
             await websocket.close(code=1008)  # Policy Violation
             return
 
-        await websocket.accept()
+        await accept_authenticated_websocket(websocket)
         logger.info(
             f"Progress WebSocket connected for task {task_id} (user: {user.id})"
         )

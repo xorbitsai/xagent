@@ -21,15 +21,12 @@ from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
 from .utils import (
     clamp_limit,
     halve_dict_or_mark,
-    setup_proxy_env,
     success_with_capped_dict,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopify-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("shopify-mcp")
 

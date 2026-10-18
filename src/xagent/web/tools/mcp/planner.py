@@ -15,7 +15,6 @@ from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .utils import (
     require_clean_identifier,
-    setup_proxy_env,
     success_with_capped_dict,
     url_path_id,
 )
@@ -23,7 +22,6 @@ from .utils import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("planner-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("planner-mcp")
 

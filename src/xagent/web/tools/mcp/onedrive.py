@@ -20,12 +20,11 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from ....core.utils import public_requests as requests
-from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
+from .utils import allowed_dirs_from_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onedrive-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("onedrive-mcp")
 

@@ -11,15 +11,12 @@ from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
 from .utils import (
     require_clean_identifier,
-    setup_proxy_env,
     success_with_capped_dict,
     url_path_id,
 )
 
 logger = logging.getLogger("google-search-console-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("google-search-console-mcp")
 

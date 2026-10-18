@@ -22,13 +22,11 @@ from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import resolve_zoneinfo as _resolve_zoneinfo
-from .utils import setup_proxy_env
 from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("outlook-mcp")
 

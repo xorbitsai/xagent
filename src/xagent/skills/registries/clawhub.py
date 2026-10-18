@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, Optional, Tuple
 
-import requests
 from fastapi import HTTPException
 
 from xagent.skills.registries.base import (
@@ -18,6 +17,8 @@ from xagent.skills.registries.base import (
     MAX_DOWNLOAD_BYTES,
     SkillRegistry,
 )
+
+from ...core.utils import public_requests as requests
 
 logger = logging.getLogger(__name__)
 

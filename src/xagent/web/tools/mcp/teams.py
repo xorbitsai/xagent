@@ -7,12 +7,10 @@ from urllib.parse import quote
 from mcp.server.fastmcp import FastMCP
 
 from ....core.utils import public_requests as requests
-from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("teams-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("teams-mcp")
 

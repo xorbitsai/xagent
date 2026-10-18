@@ -9,13 +9,11 @@ from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
+from .utils import clamp_limit, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chartmogul-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("chartmogul-mcp")
 

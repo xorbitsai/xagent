@@ -22,15 +22,12 @@ from .utils import (
     clamp_limit,
     clamp_offset,
     require_clean_text,
-    setup_proxy_env,
     success_with_capped_dict,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("jira-mcp")
 

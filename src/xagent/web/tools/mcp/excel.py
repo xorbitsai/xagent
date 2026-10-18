@@ -12,12 +12,11 @@ from pydantic import Field
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
-from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
+from .utils import success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("excel-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("excel-mcp")
 

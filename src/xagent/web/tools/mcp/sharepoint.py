@@ -13,12 +13,11 @@ from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
 from ....core.utils import public_requests as requests
-from .utils import allowed_dirs_from_env, clamp_limit, setup_proxy_env, url_path_id
+from .utils import allowed_dirs_from_env, clamp_limit, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("sharepoint-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("sharepoint-mcp")
 

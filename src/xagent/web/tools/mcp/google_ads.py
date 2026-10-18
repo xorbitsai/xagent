@@ -7,13 +7,10 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ....core.utils import public_requests as requests
-from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-ads-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("google-ads-mcp")
 

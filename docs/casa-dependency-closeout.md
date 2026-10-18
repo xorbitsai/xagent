@@ -20,6 +20,29 @@ claim a clean vulnerability scan or certify a deployed image.
   BoxLite 0.10.6 lacks a Linux/Python 3.12 wheel; select the complete official
   0.10.7 release and check the frozen Linux installation plan too.
 
+## Lockfile scope
+
+The initial broad resolution changed 235 existing package names and produced
+6,285 added / 4,132 removed lockfile lines. The narrowed resolution starts from
+the original committed lock and targets the 45 security-affected packages
+that were upgraded in that initial candidate, retaining their previously
+audited fixed versions. Other original selections remain preferred unless the
+patched graph requires a compatible change. This is not a blanket upgrade.
+
+The narrowed graph changes 69 existing package names and produces 1,967 added /
+1,239 removed lockfile lines. Mypy, Ruff, pre-commit, Google GenAI, boto3 and
+SQLAlchemy retain their original locked versions. The remaining changes also
+include required framework/parser/SDK dependency chains and platform wheel
+metadata; the lock is still generated and checked by uv, not edited by hand.
+These are package-name and generated-line counts, not vulnerability counts or
+a claim that every selected security release is the oldest possible fix.
+
+The all-extras/groups Python 3.12 audit retains exactly the same six affected
+package names and advisory IDs as the broader candidate, without advisory
+ignores. Linux/Python 3.12 frozen installation planning also passes; a dry run
+does not replace a Linux runtime/image test. Each changed graph still needs
+the normal CI and deployed acceptance checks below.
+
 The separate frontend dependency work retains the existing braces chain:
 there is no official patched release in the reviewed advisory. It does not
 replace the library, add a local backport, delete functionality or suppress

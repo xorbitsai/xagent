@@ -101,6 +101,11 @@ Real-time communication with the FastAPI backend for live updates.
 
 - `NEXT_PUBLIC_WS_URL`: WebSocket server URL
 - `NEXT_PUBLIC_API_URL`: HTTP API server URL
+- `NEXT_PUBLIC_XAGENT_HTML_PREVIEW_ORIGIN`: Optional isolated HTML preview origin.
+  Set an HTTPS origin to load its `/render` runner, or `auto` for the XAgent SaaS
+  mapping (`cloud.xagent.co` to `preview.xagent.co`, with matching dev/stage
+  hosts). When unset or invalid, previews retain the scripts-only opaque
+  `srcDoc` sandbox fallback.
 
 ### Backend Integration
 

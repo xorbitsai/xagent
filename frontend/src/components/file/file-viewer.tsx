@@ -2,6 +2,7 @@ import React from "react"
 import { Loader2, XIcon } from "lucide-react"
 import { DocxPreviewRenderer } from "@/components/file/docx-preview-renderer"
 import { ExcelPreviewRenderer } from "@/components/file/excel-preview-renderer"
+import { IsolatedHtmlPreview } from "@/components/file/isolated-html-preview"
 import { PptxPreviewRenderer } from "@/components/file/pptx-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
@@ -358,14 +359,9 @@ export function FileViewer({
             {content || t('files.previewDialog.emptyContent')}
           </pre>
         ) : (
-          <iframe
-            srcDoc={htmlPreviewContent}
+          <IsolatedHtmlPreview
+            html={htmlPreviewContent}
             className="w-full h-full border-0"
-            // An opaque origin lets generated scripts run without accessing
-            // the app's DOM, cookies or localStorage. Never pair this with
-            // allow-same-origin: srcDoc otherwise inherits the app's origin.
-            sandbox="allow-scripts"
-            referrerPolicy="no-referrer"
             title={fileName}
           />
         )

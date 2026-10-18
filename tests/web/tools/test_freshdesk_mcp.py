@@ -327,8 +327,8 @@ def test_request_surfaces_rate_limit_retry_after(
 def test_request_redacts_credentials_from_transport_errors(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
-    """setup_proxy_env() exports whatever proxy the OS has configured, and a
-    ProxyError echoes that URL -- which can embed user:pass@ credentials.
+    """An explicitly trusted proxy URL may embed user:pass@ credentials,
+    which a ProxyError can echo. The connector must redact them.
     """
 
     def raise_proxy_error(**_: Any) -> None:
@@ -1283,10 +1283,9 @@ def test_email_create_does_not_require_a_name(
 def test_an_untrusted_ambient_proxy_is_refused(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):
-    """setup_proxy_env() promotes whatever proxy the OS has into the
-    environment. A proxy resolves the target host itself, bypassing the
-    private-network check _base_url() performs, so an untrusted one must stop
-    the request rather than silently carry the Basic credential.
+    """The trusted-proxy gate rejects an ambient proxy without opt-in. A proxy
+    performs independent DNS, so it must not silently carry Basic credentials
+    past the connector's own private-network preflight.
     """
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.internal:8080")
     monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)

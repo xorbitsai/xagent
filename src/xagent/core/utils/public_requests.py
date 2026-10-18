@@ -8,6 +8,7 @@ hostname checks still use the logical hostname. No global monkey-patching.
 from __future__ import annotations
 
 import os
+import ssl
 import time
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, cast
@@ -49,6 +50,22 @@ class _PublicAdapter(HTTPAdapter):
         self._destination: ContextVar[tuple[str, bool] | None] = ContextVar(
             "public_requests_destination", default=None
         )
+        self._cached_ca_context: (
+            tuple[tuple[str | None, str | None], ssl.SSLContext] | None
+        ) = None
+
+    def _ca_context(self, cert: Any) -> ssl.SSLContext:
+        # Never reuse contexts that urllib3 may mutate by loading a client
+        # certificate. No-cert upload chunks can safely share CA-only state.
+        if cert is not None:
+            return build_ca_bundle_ssl_context()
+        key = (os.getenv("SSL_CERT_FILE"), os.getenv("SSL_CERT_DIR"))
+        cached = self._cached_ca_context
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        context = build_ca_bundle_ssl_context()
+        self._cached_ca_context = (key, context)
+        return context
 
     def build_connection_pool_key_attributes(
         self, request: PreparedRequest, verify: Any, cert: Any = None
@@ -75,10 +92,9 @@ class _PublicAdapter(HTTPAdapter):
             tls_kwargs = cast(dict[str, Any], pool_kwargs)
             if verify is True:
                 # Preserve SSL_CERT_FILE/SSL_CERT_DIR as well as Requests'
-                # explicit CA-path handling. A fresh context also prevents
-                # client certificates loaded by urllib3 leaking to another
-                # request with different cert settings.
-                tls_kwargs["ssl_context"] = build_ca_bundle_ssl_context()
+                # explicit CA-path handling. Cache CA-only state for keep-alive,
+                # while client-cert contexts stay isolated per request.
+                tls_kwargs["ssl_context"] = self._ca_context(cert)
             tls_kwargs["server_hostname"] = parsed.hostname
             tls_kwargs["assert_hostname"] = parsed.hostname
         return host_params, pool_kwargs

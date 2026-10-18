@@ -105,6 +105,7 @@ from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
 from .auth_config import validate_auth_config
+from .browser_security import is_widget_page
 from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
@@ -1531,7 +1532,7 @@ app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
 def _security_header_values(path: str) -> dict[str, str]:
     """Return headers appropriate for an API, preview, upload, or SPA path."""
-    is_widget_page = path == "/widget" or path.startswith("/widget/")
+    widget_page = is_widget_page(path)
     is_upload = path == "/uploads" or path.startswith("/uploads/")
     is_api = path == "/api" or path.startswith("/api/")
     is_preview = path.startswith(("/api/files/preview/", "/api/files/public/preview/"))
@@ -1541,13 +1542,18 @@ def _security_header_values(path: str) -> dict[str, str]:
     }
     if is_api or is_upload:
         frame_ancestors = "'self'" if is_upload or is_preview else "'none'"
+        # OAuth callback pages run inline popup feedback. Other API/upload
+        # responses do not need scripts. Never enable eval for either path.
+        script_sources = (
+            "'self' 'unsafe-inline'" if path.startswith("/api/auth/") else "'none'"
+        )
         headers["Content-Security-Policy"] = (
             "default-src 'self'; base-uri 'self'; object-src 'none'; "
             f"frame-ancestors {frame_ancestors}; img-src 'self' data: blob: https:; "
             "font-src 'self' data: https:; style-src 'self' 'unsafe-inline' https:; "
-            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' https: wss:"
+            f"script-src {script_sources}; connect-src 'self' https: wss:; form-action 'none'"
         )
-    if not is_widget_page and not is_upload and not is_preview:
+    if not widget_page and not is_upload and not is_preview:
         headers["X-Frame-Options"] = "DENY"
     return headers
 

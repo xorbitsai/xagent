@@ -8,7 +8,8 @@ user's account identifier (a single DNS label) before the authorize
 redirect, and must keep using that same account for the token exchange,
 refresh, and API calls. The flow binds it like this:
 
-- ``/api/auth/{provider}/login?account=...`` validates the label, resolves
+- Bearer-authenticated ``POST /api/auth/{provider}/login`` accepts the account
+  option and issues a one-use ticket. Its navigation GET validates the label, resolves
   the composed host and rejects private-network addresses, then carries the
   label inside the signed OAuth state.
 - The callback reads the label only from that state -- never from the

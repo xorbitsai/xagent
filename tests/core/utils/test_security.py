@@ -1,15 +1,32 @@
 from __future__ import annotations
 
 import datetime
+import os
 import ssl
 from typing import Any
+from unittest.mock import Mock
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
-from xagent.core.utils import security
+from xagent.core.utils import media_download, security
+
+
+@pytest.mark.parametrize(
+    "host", ["127。0。0。1", "１２７．０．０．１", "127.0.0.1．", "169。254。169。254"]
+)
+def test_shared_url_shape_checks_the_normalized_ip(host):
+    with pytest.raises(security.PrivateNetworkHostError):
+        security.validate_public_http_url_shape(f"https://{host}/")
+
+
+def test_shared_url_shape_preserves_public_internationalized_hosts():
+    parsed = security.validate_public_http_url_shape("https://bücher.example/path")
+    assert parsed.hostname == "xn--bcher-kva.example"
+    assert parsed.path == "/path"
 
 
 def _generate_test_ca_pem() -> bytes:
@@ -36,6 +53,52 @@ def _generate_test_ca_pem() -> bytes:
         .sign(key, hashes.SHA256())
     )
     return cert.public_bytes(serialization.Encoding.PEM)
+
+
+@pytest.fixture
+def media_ssl_cache():
+    media_download._media_ssl_context.cache_clear()
+    yield
+    media_download._media_ssl_context.cache_clear()
+
+
+def test_media_tls_keeps_the_stdlib_default_trust_store(monkeypatch, media_ssl_cache):
+    context = Mock(spec=ssl.SSLContext)
+    create = Mock(return_value=context)
+    monkeypatch.setattr(media_download.ssl, "create_default_context", create)
+    assert media_download._media_ssl_context(None, None) is context
+    assert media_download._media_ssl_context(None, None) is context
+    create.assert_called_once_with()
+
+
+def test_media_tls_actually_loads_the_configured_ca_file(
+    tmp_path, monkeypatch, media_ssl_cache
+):
+    pem = _generate_test_ca_pem()
+    cert_file = tmp_path / "media-ca.pem"
+    cert_file.write_bytes(pem)
+    monkeypatch.setenv("SSL_CERT_FILE", str(cert_file))
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    context = media_download._media_ssl_context(str(cert_file), None)
+    assert ssl.PEM_cert_to_DER_cert(pem.decode()) in context.get_ca_certs(
+        binary_form=True
+    )
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname
+
+
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_media_tls_cache_refreshes_when_ca_paths_change(
+    variable, monkeypatch, media_ssl_cache
+):
+    create = Mock(side_effect=[Mock(spec=ssl.SSLContext), Mock(spec=ssl.SSLContext)])
+    monkeypatch.setattr(media_download.ssl, "create_default_context", create)
+    for value in ("first-path", "second-path"):
+        monkeypatch.setenv(variable, value)
+        media_download._media_ssl_context(
+            os.getenv("SSL_CERT_FILE"), os.getenv("SSL_CERT_DIR")
+        )
+    assert create.call_count == 2
 
 
 class TestBuildCaBundleSslContext:

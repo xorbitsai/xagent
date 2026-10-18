@@ -17,6 +17,7 @@ from urllib.parse import (
 )
 
 import httpx
+from yarl import URL
 
 SENSITIVE_QUERY_KEYS = {
     "api_key",
@@ -24,11 +25,13 @@ SENSITIVE_QUERY_KEYS = {
     "key",
     "access_token",
     "token",
+    "ticket",
     "password",
     "secret",
 }
 
-URL_PATTERN = re.compile(r"https?://[^\s\"'>]+")
+URL_PATTERN = re.compile(r"(?:https?|wss?)://[^\s\"'>]+")
+WEBSOCKET_CREDENTIAL_PATTERN = re.compile(r"xagent-auth-token\.[A-Za-z0-9._~-]+")
 # Every ``identifier=`` in the text; ``_is_credential_key`` decides which
 # identifiers name a secret. Only a credential's value is consumed
 # (``_ASSIGNMENT_VALUE_PATTERN``: up to ``&`` or whitespace). After any other
@@ -258,21 +261,42 @@ def build_ca_bundle_ssl_context() -> ssl.SSLContext:
     return httpx.create_ssl_context(trust_env=True)
 
 
-async def validate_public_http_url(url: str) -> list[str]:
-    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
-
+def validate_public_http_url_shape(url: str) -> SplitResult:
+    """Validate the normalized host used by HTTP clients, without resolving DNS."""
     parsed = urlsplit(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValueError("url must be an absolute HTTP or HTTPS URL")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("url must not contain embedded credentials")
 
+    # aiohttp uses yarl's IDNA/UTS46 normalization before deciding whether to
+    # bypass its resolver for an IP literal. Validate that same spelling.
+    parsed = urlsplit(str(URL(url)))
     hostname = parsed.hostname
-    reject_private_network_host(hostname)
+    if not hostname:
+        raise ValueError("url must have a hostname")
+    host = hostname.rstrip(".")
+    if ":" in host or host.replace(".", "").isdigit():
+        try:
+            ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("url contains a non-canonical IP address") from exc
+    reject_private_network_host(host)
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        port = parsed.port
     except ValueError as exc:
         raise ValueError("url contains an invalid port") from exc
+    if port == 0:
+        raise ValueError("url contains an invalid port")
+    return parsed
+
+
+async def validate_public_http_url(url: str) -> list[str]:
+    """Resolve an HTTP(S) URL, reject non-public targets, return validated IPs."""
+    parsed = validate_public_http_url_shape(url)
+    hostname = parsed.hostname
+    assert hostname is not None
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
 
     addresses = await asyncio.to_thread(
         socket.getaddrinfo,
@@ -314,7 +338,7 @@ def _pin_url_to_ip(parsed: SplitResult, ip: str) -> tuple[str, str, str]:
     return connect_url, host_header, hostname
 
 
-_MAX_REDIRECTS = 5
+PUBLIC_HTTP_MAX_REDIRECTS = 5
 
 
 async def fetch_public_http_bytes(
@@ -327,6 +351,9 @@ async def fetch_public_http_bytes(
     resource_name: str = "response body",
     require_non_empty: bool = False,
     via_proxy: bool = False,
+    allow_https_downgrade: bool = True,
+    require_identity_encoding: bool = False,
+    required_status_code: int | None = None,
 ) -> PublicHttpResponse:
     """Fetch a bounded HTTP body, validating and pinning every redirect hop.
 
@@ -345,15 +372,21 @@ async def fetch_public_http_bytes(
     resolution, so pinning to a client-resolved IP offers no real
     protection there anyway. In this mode we keep the original hostname as
     the connect target and rely on the upfront ``validate_public_http_url``
-    check alone to reject private-network targets before dispatch.
+    check to reject private-network targets before dispatch. The explicitly
+    trusted proxy must also enforce destination/DNS policy at connection time.
+
+    Input-download callers can forbid HTTPS downgrades, require a complete
+    HTTP 200 response and reject compressed bodies before HTTPX decompression.
     """
 
     logical_url = url
     display_name = resource_name[:1].upper() + resource_name[1:]
-    for redirect_count in range(_MAX_REDIRECTS + 1):
+    for redirect_count in range(PUBLIC_HTTP_MAX_REDIRECTS + 1):
         resolved_ips = await validate_public_http_url(logical_url)
         parsed = urlsplit(logical_url)
-        request_headers = dict(headers or {})
+        request_headers = httpx.Headers(headers)
+        if require_identity_encoding:
+            request_headers["Accept-Encoding"] = "identity"
         stream_extensions: dict[str, str] = {}
         if via_proxy:
             connect_url = logical_url
@@ -373,9 +406,16 @@ async def fetch_public_http_bytes(
                 location = response.headers.get("location")
                 if not location:
                     raise ValueError(f"{display_name} redirect has no Location")
-                if redirect_count >= _MAX_REDIRECTS:
+                if redirect_count >= PUBLIC_HTTP_MAX_REDIRECTS:
                     raise ValueError(f"{display_name} exceeded redirect limit")
-                logical_url = urljoin(logical_url, location)
+                next_url = urljoin(logical_url, location)
+                if (
+                    not allow_https_downgrade
+                    and parsed.scheme == "https"
+                    and urlsplit(next_url).scheme == "http"
+                ):
+                    raise ValueError(f"{display_name} redirect downgrades HTTPS")
+                logical_url = next_url
                 continue
             if 300 <= response.status_code < 400:
                 raise ValueError(
@@ -383,6 +423,21 @@ async def fetch_public_http_bytes(
                     f"{response.status_code}"
                 )
             response.raise_for_status()
+            if (
+                required_status_code is not None
+                and response.status_code != required_status_code
+            ):
+                raise httpx.HTTPStatusError(
+                    f"{display_name} requires HTTP {required_status_code}",
+                    request=response.request,
+                    response=response,
+                )
+            if (
+                require_identity_encoding
+                and response.headers.get("content-encoding", "identity").strip().lower()
+                != "identity"
+            ):
+                raise ValueError(f"{display_name} uses unsupported content encoding")
             declared_length = response.headers.get("content-length")
             if declared_length is not None:
                 try:
@@ -503,7 +558,7 @@ def redact_sensitive_text(text: str) -> str:
     """Redact common key/token patterns from arbitrary text.
 
     Recognition is by keyword and shape, so it is not exhaustive: it covers
-    ``http(s)://`` URLs (``redact_url_credentials_for_logging``),
+    HTTP/WebSocket URLs (``redact_url_credentials_for_logging``),
     ``identifier=value`` assignments whose identifier ``_is_credential_key``
     accepts, and the header shapes in ``AUTH_HEADER_PATTERN`` and
     ``HEADER_KEY_PATTERNS``. Shapes it is known to miss are listed in
@@ -513,9 +568,10 @@ def redact_sensitive_text(text: str) -> str:
     if not text:
         return text
 
+    redacted = WEBSOCKET_CREDENTIAL_PATTERN.sub("xagent-auth-token.[REDACTED]", text)
     redacted = URL_PATTERN.sub(
         lambda match: redact_url_credentials_for_logging(match.group(0)),
-        text,
+        redacted,
     )
     redacted = _redact_assignments(redacted)
     redacted = AUTH_HEADER_PATTERN.sub(

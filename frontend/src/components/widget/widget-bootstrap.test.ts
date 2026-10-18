@@ -1,16 +1,8 @@
-import { readFileSync } from "node:fs"
-import { resolve } from "node:path"
-import { pathToFileURL } from "node:url"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
-const widgetScript = readFileSync(
-  widgetScriptPath,
-  "utf8",
-)
-const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
+import { evaluateWidgetScript, widgetScript } from "@/test-utils/widget-script"
 
-function runWidget(attributes: Record<string, string>) {
+function runWidget(attributes: Record<string, string>, evaluate = evaluateWidgetScript) {
   const script = document.createElement("script")
   script.src = "https://chat.example/widget.js"
   for (const [name, value] of Object.entries(attributes)) {
@@ -22,7 +14,7 @@ function runWidget(attributes: Record<string, string>) {
     value: script,
   })
 
-  window.eval(`${widgetScript}\n//# sourceURL=${widgetScriptUrl}`)
+  evaluate()
 }
 
 describe("widget bootstrap", () => {
@@ -73,6 +65,15 @@ describe("widget bootstrap", () => {
     expect(document.querySelector(".xagent-widget-container")).toBeNull()
     expect(document.head.querySelector("style")).toBeNull()
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Missing data-widget-key"))
+  })
+
+  it("also boots the exact uninstrumented browser artifact", () => {
+    runWidget({ "data-token": "legacy-token" }, () => window.eval(widgetScript))
+    expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
+      "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed",
+    )
+    expect(document.querySelector(".xagent-widget-fab")).not.toBeNull()
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it("generates and persists a guest id for a first-time visitor", async () => {

@@ -3,10 +3,10 @@
 import os
 from typing import Any, Callable, Optional, Sequence, Union, cast
 
-from langchain.tools import BaseTool
 from langchain_community.chat_models import ChatZhipuAI
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_core.tools import BaseTool
 from langchain_openai import AzureChatOpenAI, ChatOpenAI
 
 from ...model import ChatModelConfig, ModelConfig

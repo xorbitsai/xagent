@@ -102,6 +102,7 @@ def _setup_edit_http_mock(mock_get):
     """Configure mock HTTP response for image download in edit tests."""
     mock_response = Mock()
     mock_response.status = 200
+    mock_response.headers = {}
 
     async def mock_iter_chunked(chunk_size):
         for chunk in [b"fake_edited_image_data"]:
@@ -177,6 +178,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response for image download
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -218,6 +220,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response for image download
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -314,6 +317,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -343,6 +347,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -372,6 +377,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -404,6 +410,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -551,6 +558,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response for image download
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):
@@ -648,6 +656,7 @@ class TestImageGenerationToolCore:
         # Mock HTTP response for image download
         mock_response = Mock()
         mock_response.status = 200
+        mock_response.headers = {}
 
         # Create async iterator for chunks
         async def mock_iter_chunked(chunk_size):

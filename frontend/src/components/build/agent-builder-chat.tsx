@@ -15,6 +15,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { websocketAuthProtocols } from "@/lib/websocket-auth"
 import {
   createClarificationSendFailure,
   type ClarificationSendMetadata,
@@ -276,8 +277,8 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         sendPayload(wsRef.current)
       } else {
         // Create new connection if none exists or it was closed
-        const wsUrl = getApiUrl().replace(/^http/, "ws") + `/ws/build/chat?token=${token}`
-        const ws = new WebSocket(wsUrl)
+        const wsUrl = getApiUrl().replace(/^http/, "ws") + "/ws/build/chat"
+        const ws = new WebSocket(wsUrl, token ? websocketAuthProtocols(token) : undefined)
         wsRef.current = ws
 
         ws.onopen = () => {

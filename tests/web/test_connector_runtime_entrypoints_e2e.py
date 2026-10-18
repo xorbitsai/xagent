@@ -2428,7 +2428,7 @@ def test_task_requirements_endpoint_requires_task_ownership_by_caller(
 def test_read_endpoints_reject_anonymous_and_widget_credentials(
     e2e_db: None, endpoint_kind: str
 ) -> None:
-    """No ``Authorization`` header is a bare 403
+    """No ``Authorization`` header is a Bearer-challenge 401
     (``HTTPBearer`` itself, ``auto_error=True``), and a well-formed widget
     guest token is a 401 ``"Invalid token type"`` -- the same two doors
     every other authenticated-only endpoint in this module is gated by
@@ -2460,7 +2460,8 @@ def test_read_endpoints_reject_anonymous_and_widget_credentials(
         url = f"/api/chat/task/{task_id}/connector-runtime-requirements"
 
     no_auth_response = client.get(url)
-    assert no_auth_response.status_code == 403, no_auth_response.text
+    assert no_auth_response.status_code == 401, no_auth_response.text
+    assert no_auth_response.headers["www-authenticate"] == "Bearer"
 
     widget_token = create_public_chat_access_token(
         {"guest_id": "anon-guard-guest", "widget_agent_id": agent_id}
@@ -2973,7 +2974,8 @@ def test_values_endpoint_requires_task_ownership_by_caller(e2e_db: None) -> None
     assert oversized_other_response.status_code == 404, oversized_other_response.text
 
     anon_response = client.post(_values_url(task_id), json=body)
-    assert anon_response.status_code == 403, anon_response.text
+    assert anon_response.status_code == 401, anon_response.text
+    assert anon_response.headers["www-authenticate"] == "Bearer"
 
     widget_token = create_public_chat_access_token(
         {"guest_id": "values-anon-guest", "widget_agent_id": 1}

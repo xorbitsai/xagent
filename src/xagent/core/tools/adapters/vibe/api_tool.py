@@ -86,7 +86,9 @@ class APITool(AbstractBaseTool):
         Supports GET, POST, PUT, DELETE, PATCH methods with custom headers, body, and authentication.
         Authentication types: 'bearer' (Bearer token), 'basic' (Basic auth), 'api_key' (X-API-Key header), 'api_key_query' (API key in query params).
         Returns parsed JSON response or text content with status code and headers.
-        Useful for integrating with external services, APIs, and webhooks.
+        Useful for integrating with public external services, APIs, and webhooks.
+        Private, loopback, metadata-service and credential-in-URL destinations are rejected.
+        Use auth_type/auth_token or headers for credentials, not URL userinfo.
         This tool has no stored credential for any external service. A 401/403 from a host with its own dedicated MCP connector (e.g. HubSpot, Slack, GitHub) comes back with a hint to use that connector's tools instead - pass your own credential via auth_type/auth_token, a header, or a query parameter if you have one."""
 
     @property

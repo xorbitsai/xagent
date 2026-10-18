@@ -1,6 +1,6 @@
 import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest"
 import type { ClarificationOnSend } from "@/components/chat/clarification-delivery"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -189,7 +189,7 @@ class MockWebSocket {
   onerror: ((event?: unknown) => void) | null = null
   onclose: (() => void) | null = null
 
-  constructor(_url: string) {
+  constructor(public url: string, public protocols?: string[]) {
     MockWebSocket.instances.push(this)
   }
 
@@ -370,6 +370,8 @@ describe("AgentBuilderChat", () => {
     fireEvent.click(screen.getByText("send-chat-input"))
 
     expect(MockWebSocket.instances).toHaveLength(1)
+    expect(new URL(MockWebSocket.instances[0].url).searchParams.has("token")).toBe(false)
+    expect(MockWebSocket.instances[0].protocols).toEqual(["xagent-auth-v1", "xagent-auth-token.token"])
     MockWebSocket.instances[0].open()
 
     await waitFor(() => {
@@ -389,7 +391,7 @@ describe("AgentBuilderChat", () => {
   })
 
   const emitAgentToolEnd = async (
-    onUpdateConfig: ReturnType<typeof vi.fn>,
+    onUpdateConfig: Mock<(config: Partial<AgentConfig>) => void>,
     toolParams: Record<string, unknown>,
     storedCategories: string[] | null,
   ) => {

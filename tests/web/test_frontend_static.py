@@ -4,6 +4,9 @@ Uses a synthetic export directory rather than a real Next.js build, so the
 route-resolution logic can be exercised without a Node toolchain.
 """
 
+import json
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
+from xagent.web.browser_security import page_security_headers
 from xagent.web.frontend_static import (
     _build_shell_patterns,
     _collect_backend_prefixes,
@@ -43,7 +47,68 @@ def dist_dir(tmp_path: Path) -> Path:
     # Hashed build asset.
     _write(d / "_next" / "static" / "chunks" / "main.js", "console.log(1)")
     _write(d / "favicon.ico", "icon-bytes")
+    _write(d / "widget" / "chat" / "__shell__.html", "<html>widget</html>")
     return d
+
+
+@pytest.mark.parametrize(
+    "path", ["/", "/tools", "/tools.html", "/agent/123", "/unknown"]
+)
+def test_spa_html_has_enforced_baseline_csp(dist_dir, path):
+    response = TestClient(_app_with_backend_routes(dist_dir)).get(path)
+    policy = response.headers["content-security-policy"]
+    assert "object-src 'none'" in policy
+    assert "base-uri 'none'" in policy
+    assert "form-action 'self'" in policy
+    assert "frame-ancestors 'none'" in policy
+    assert "unsafe-eval" not in policy
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+def test_spa_widget_keeps_embedding_but_not_unsafe_eval(dist_dir):
+    response = TestClient(_app_with_backend_routes(dist_dir)).get("/widget/chat/token")
+    policy = response.headers["content-security-policy"]
+    assert "frame-ancestors" not in policy
+    assert "x-frame-options" not in response.headers
+    assert "unsafe-eval" not in policy
+    assert "object-src 'none'" in policy
+
+
+def test_widget_traversal_cannot_make_regular_pages_embeddable(dist_dir):
+    response = TestClient(_app_with_backend_routes(dist_dir)).get(
+        "/widget/..%2Ftools.html"
+    )
+    assert response.status_code == 200
+    assert response.text == "<html>tools</html>"
+    assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
+    assert response.headers["x-frame-options"] == "DENY"
+
+
+@pytest.mark.parametrize("embeddable", [False, True])
+def test_packaged_and_next_production_policies_match(embeddable):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is required for cross-runtime policy parity")
+    result = subprocess.run(
+        [
+            node,
+            "--input-type=module",
+            "-e",
+            "import {browserSecurityHeaders} from './browser-security.mjs';"
+            f"console.log(JSON.stringify(Object.fromEntries(browserSecurityHeaders({{embeddable: {str(embeddable).lower()}}}).map(x=>[x.key,x.value]))))",
+        ],
+        cwd=Path(__file__).resolve().parents[2] / "frontend",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert json.loads(result.stdout) == page_security_headers(embeddable=embeddable)
+
+
+def test_spa_rsc_and_javascript_are_not_treated_as_html(dist_dir):
+    client = TestClient(_app_with_backend_routes(dist_dir))
+    for path in ("/login.txt", "/_next/static/chunks/main.js"):
+        assert "content-security-policy" not in client.get(path).headers
 
 
 def _app_with_backend_routes(dist: Path) -> FastAPI:

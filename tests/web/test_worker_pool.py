@@ -119,10 +119,14 @@ def test_web_child_signals_after_startup_and_only_serves_web(monkeypatch):
         assert config.get_channel_ingress_enabled()
         assert kwargs == dict(host="127.0.0.1", port=8123, log_level=None, workers=1)
         assert not reader.poll()
-        asyncio.run(application.router.startup())
-        assert order == ["database and admission"]
-        assert reader.poll()
-        assert reader.recv_bytes() == b""
+
+        async def run_lifespan():
+            async with application.router.lifespan_context(application):
+                assert order == ["database and admission"]
+                assert reader.poll()
+                assert reader.recv_bytes() == b""
+
+        asyncio.run(run_lifespan())
 
     monkeypatch.setattr(web_main.uvicorn, "run", serve)
     monkeypatch.setattr(worker_pool, "setup_logging", Mock())

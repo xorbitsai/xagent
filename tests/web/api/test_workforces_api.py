@@ -234,7 +234,8 @@ class _VisibleAgentPolicy(WorkforcePolicy):
 
 def test_workforce_endpoints_require_authentication() -> None:
     response = client.get("/api/workforces")
-    assert response.status_code == 403
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
 
 
 def test_agent_options_use_workforce_policy_and_only_published_agents() -> None:

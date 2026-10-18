@@ -97,7 +97,8 @@ async def target():
         return web.json_response({"status": "completed"})
 
     async def socket(request):
-        assert request.query["token"] == "secret-test-token"
+        assert "token" not in request.query
+        assert request.headers["Authorization"] == "Bearer secret-test-token"
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         state["commands"].append(await ws.receive_json())

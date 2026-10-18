@@ -1,0 +1,72 @@
+.group:focus-within .group-focus-within\:opacity-100 {
+    opacity: 1
+}
+.group:hover .group-hover\:block {
+    display: block
+}
+.group\/card:hover .group-hover\/card\:scale-110 {
+    --tw-scale-x: 1.1;
+    --tw-scale-y: 1.1;
+    transform: translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))
+}
+.group:hover .group-hover\:space-x-2 > :not([hidden]) ~ :not([hidden]) {
+    --tw-space-x-reverse: 0;
+    margin-right: calc(0.5rem * var(--tw-space-x-reverse));
+    margin-left: calc(0.5rem * calc(1 - var(--tw-space-x-reverse)))
+}
+.group.is-open .group-\[\.is-open\]\:block {
+    display: block
+}
+:nth-of-type(3) .group .group-\[\:nth-of-type\(3\)_\&\]\:block {
+    display: block
+}
+.peer:checked ~ .peer-checked\:block {
+    display: block
+}
+.peer:checked ~ .peer-checked\:divide-x-2 > :not([hidden]) ~ :not([hidden]) {
+    --tw-divide-x-reverse: 0;
+    border-right-width: calc(2px * var(--tw-divide-x-reverse));
+    border-left-width: calc(2px * calc(1 - var(--tw-divide-x-reverse)))
+}
+.peer\/toggle:checked ~ .peer-checked\/toggle\:text-green-600 {
+    --tw-text-opacity: 1;
+    color: rgb(22 163 74 / var(--tw-text-opacity, 1))
+}
+.group:hover .peer:checked ~ .group-hover\:peer-checked\:font-bold {
+    font-weight: 700
+}
+.peer:focus ~ .peer-focus\:border-red-500 {
+    --tw-border-opacity: 1;
+    border-color: rgb(239 68 68 / var(--tw-border-opacity, 1))
+}
+.peer:disabled ~ .peer-disabled\:cursor-not-allowed {
+    cursor: not-allowed
+}
+.peer.is-dirty ~ .peer-\[\.is-dirty\]\:block {
+    display: block
+}
+:nth-of-type(3) .peer ~ .peer-\[\:nth-of-type\(3\)_\&\]\:text-red-500 {
+    --tw-text-opacity: 1;
+    color: rgb(239 68 68 / var(--tw-text-opacity, 1))
+}
+.\[\&\:nth-child\(2\)\]\:text-red-500:nth-child(2) {
+    --tw-text-opacity: 1;
+    color: rgb(239 68 68 / var(--tw-text-opacity, 1))
+}
+.\[\&\>button\]\:hidden>button {
+    display: none
+}
+.\[\&\>button\]\:space-y-2>button > :not([hidden]) ~ :not([hidden]) {
+    --tw-space-y-reverse: 0;
+    margin-top: calc(0.5rem * calc(1 - var(--tw-space-y-reverse)));
+    margin-bottom: calc(0.5rem * var(--tw-space-y-reverse))
+}
+.hover\:\[\&\>svg\]\:block>svg:hover {
+    display: block
+}
+.group:hover .group-hover\:\[\&\>svg\]\:opacity-100>svg {
+    opacity: 1
+}
+.group:hover .group-hover\:\[\&_a\]\:underline a {
+    text-decoration-line: underline
+}

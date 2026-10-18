@@ -48,15 +48,15 @@ SANDBOX_DISTRIBUTION_IMPORTS = {
 }
 SANDBOX_DIRECT_REQUIREMENTS = {
     "pydantic": "pydantic>=2.11.7",
-    "pydantic-settings": "pydantic-settings",
+    "pydantic-settings": "pydantic-settings>=2.16.0",
     "cloudpickle": "cloudpickle>=3.0.0",
-    "mcp": "mcp>=1.12.4,<2",
+    "mcp": "mcp>=1.30.0,<2",
     "pandas": "pandas>=1.3.0",
     "numpy": "numpy>=1.21.0",
     "matplotlib": "matplotlib>=3.5.0",
     "openpyxl": "openpyxl>=3.1.0",
     "python-docx": "python-docx>=1.1.0",
-    "fsspec": "fsspec>=2024.0.0",
+    "fsspec": "fsspec>=2026.9.0",
 }
 
 
@@ -183,20 +183,26 @@ def test_pytorch_cpu_index_is_project_configured_for_uv_sync() -> None:
 
 
 def test_boxlite_is_not_declared_for_linux_aarch64() -> None:
-    pyproject = read_repo_file("pyproject.toml")
-
-    assert (
-        "\"boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'\""
-        in pyproject
-    )
-    assert (
-        "\"boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'\""
-        in pyproject
-    )
-    assert (
-        "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'aarch64'"
-        not in pyproject
-    )
+    project = tomllib.loads(read_repo_file("pyproject.toml"))
+    requirements = [Requirement(item) for item in project["project"]["dependencies"]]
+    boxlite = [req for req in requirements if canonicalize_name(req.name) == "boxlite"]
+    assert boxlite
+    for platform, machine, available in [
+        ("linux", "x86_64", True),
+        ("darwin", "arm64", True),
+        ("linux", "aarch64", False),
+        ("win32", "AMD64", False),
+    ]:
+        assert (
+            any(
+                req.marker is None
+                or req.marker.evaluate(
+                    {"sys_platform": platform, "platform_machine": machine}
+                )
+                for req in boxlite
+            )
+            is available
+        )
 
 
 def test_publish_script_derives_package_version_from_valid_tags() -> None:

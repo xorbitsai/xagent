@@ -1,14 +1,8 @@
-import { readFileSync } from "node:fs"
-import { resolve } from "node:path"
-import { pathToFileURL } from "node:url"
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { useWidgetSession } from "./use-widget-session"
-
-const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
-const widgetScript = readFileSync(widgetScriptPath, "utf8")
-const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
+import { evaluateWidgetScript } from "@/test-utils/widget-script"
 
 export const HOST = "https://chat.example"
 export const GRANT = "eyJhbGciOiJIUzI1NiJ9.grant-one.sig"
@@ -25,7 +19,7 @@ function runWidget(attributes: Record<string, string>) {
   }
   document.body.appendChild(script)
   Object.defineProperty(document, "currentScript", { configurable: true, value: script })
-  window.eval(`${widgetScript}\n//# sourceURL=${widgetScriptUrl}`)
+  evaluateWidgetScript()
   return script
 }
 
@@ -718,7 +712,7 @@ describe("widget session mode", () => {
     const newId = post.mock.calls.at(-1)?.[0].session_delivery_id
     expect(newId).not.toBe(oldId)
 
-    for (const session_delivery_id of [undefined, " ", 1, true, {}, []]) {
+    for (const session_delivery_id of [undefined, null, "", " ", 1, true, {}, []]) {
       fromIframe("session_connection_open", { session_delivery_id })
     }
     fromIframe("session_connection_open", { session_delivery_id: oldId })
@@ -817,6 +811,43 @@ describe("widget session mode", () => {
     }))
 
     expect(post).not.toHaveBeenCalled()
+  })
+
+  it("keeps malformed and late lifecycle callbacks inert across a live controller's teardown", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const frame = iframeEl()!
+    const frameWindow = frame.contentWindow!
+    const post = spyOnIframePostMessage(frame)
+    await flushAsync()
+
+    for (const data of [null, false, {}, { xagent: false, v: 1 }, { xagent: true, v: 2 }]) {
+      window.dispatchEvent(new MessageEvent("message", { data, origin: HOST, source: frameWindow }))
+    }
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "session_update" }), HOST)
+    post.mockClear()
+    firePageHide(false)
+    firePageShow(false)
+    firePageShow(true)
+    expect(post).not.toHaveBeenCalled()
+
+    // Browser events may already be queued when the observer disconnects.
+    // Keep the real registered callbacks to exercise that race, without
+    // exposing or mutating the controller's private state.
+    const queued = windowListeners.filter(([type]) => ["pageshow", "pagehide", "message"].includes(type))
+    frame.remove()
+    await flushAsync()
+    for (const [type, listener] of queued) {
+      const event = type === "message"
+        ? new MessageEvent(type, { data: { xagent: true, v: 1, type: "ready" }, origin: HOST, source: frameWindow })
+        : Object.assign(new Event(type), { persisted: true })
+      if (typeof listener === "function") listener.call(window, event)
+      else listener.handleEvent(event)
+    }
+    expect(post).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledOnce()
   })
 
   it("goes terminal and tells the frame when the grant is rejected outright", async () => {

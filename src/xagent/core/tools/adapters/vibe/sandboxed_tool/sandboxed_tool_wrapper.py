@@ -47,7 +47,7 @@ _TOOL_RUNNER_PATH = (
 
 SANDBOX_BASE_DEPENDENCIES = [
     "pydantic>=2.0.0",
-    "pydantic-settings",
+    "pydantic-settings>=2.16.0",
     "cloudpickle>=3.0.0",
 ]
 

@@ -37,12 +37,11 @@ repos:
           # errors across the existing codebase.
           - sqlalchemy==2.0.47
           - uvicorn
-          - langchain
           - langchain-core
           - langchain-openai
           - langchain-community
           - numexpr
-          # Pin to the project's resolved numpy (uv.lock). Unpinned, the mypy
+          # Type-check with numpy 1.x for Python 3.11 parsing. Unpinned, the mypy
           # hook env pulls the latest numpy, whose newer stubs use PEP 695
           # `type` syntax that fails under python_version = 3.11 and aborts the
           # whole mypy run before it reaches project code.
@@ -60,7 +59,7 @@ repos:
           # `mcp.server.fastmcp`, renamed `streamablehttp_client` and
           # dropped `Server.list_tools`/`call_tool`, which fails the whole
           # run against code written for the locked 1.x API.
-          - mcp==1.19.0
+          - mcp==1.30.0
           - pandas-stubs
           - matplotlib-stubs
           - docker
@@ -68,6 +67,7 @@ repos:
           - playwright
           - nest-asyncio
           - anthropic
+          - openai>=2.26.0,<3
           - python-pptx
           - cloudpickle
           - exa-py
@@ -85,7 +85,6 @@ repos:
           # import-untyped under disallow_any_unimported.
           - google-auth==2.48.0
           - google-api-core==2.25.2
-          - google-genai==1.66.0
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

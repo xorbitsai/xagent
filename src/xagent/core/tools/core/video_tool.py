@@ -18,13 +18,18 @@ from typing import Annotated, Any, Dict, Optional, TypeAlias
 from urllib import parse
 from urllib.request import url2pathname
 
-import aiohttp
 from pydantic import Field
 
+from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
 from ...model.video.xinference import XinferenceVideoModel
+from ...utils.media_download import (
+    describe_media_download_error,
+    download_public_media,
+    resolve_workspace_media_path,
+)
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -417,18 +422,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         if not self._workspace:
             raise ValueError("No workspace available for local file access")
 
-        workspace_root = self._workspace.workspace_dir.resolve()
-        expanded_path = path.expanduser()
-        if expanded_path.is_absolute():
-            resolved_path = expanded_path.resolve()
-        else:
-            resolved_path = (workspace_root / expanded_path).resolve()
-        if resolved_path == workspace_root or resolved_path.is_relative_to(
-            workspace_root
-        ):
-            return resolved_path
-
-        raise ValueError("Access denied: local path is outside the workspace")
+        return resolve_workspace_media_path(path, self._workspace.workspace_dir)
 
     async def _ark_image_ref_to_data_url(self, image_ref: str) -> str:
         image_ref = str(image_ref).strip()
@@ -540,7 +534,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                 )
                 if not await asyncio.to_thread(resolved_local_path.is_file):
                     raise RuntimeError(
-                        f"Local video path is not a file: {resolved_local_path}"
+                        "Local video path is not a file in the workspace"
                     )
                 resolved_save_path = await asyncio.to_thread(save_path.resolve)
                 if resolved_local_path != resolved_save_path:
@@ -550,23 +544,21 @@ The generated video URL is temporary on the provider side, so completed videos a
                 logger.info("Copied local video to: %s", save_path)
                 return str(save_path)
 
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                async with session.get(video_url) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to download video: HTTP {response.status}"
-                        )
-
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(1024 * 1024):
-                            await asyncio.to_thread(f.write, chunk)
+            await download_public_media(
+                video_url,
+                save_path,
+                timeout=timeout,
+                max_bytes=get_media_download_max_bytes("video"),
+                media_kind="video",
+            )
 
             logger.info("Downloaded video to: %s", save_path)
             return str(save_path)
 
         except Exception as e:
-            logger.warning("Failed to download video from %s: %s", video_url, e)
+            logger.warning(
+                "Failed to download video: %s", describe_media_download_error(e)
+            )
             raise
 
     async def generate_video(
@@ -723,6 +715,7 @@ The generated video URL is temporary on the provider side, so completed videos a
 
             video_url = result.get("video_url")
             video_path = None
+            download_error = None
             video_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
@@ -745,11 +738,14 @@ The generated video URL is temporary on the provider side, so completed videos a
                                 video_path
                             )
                 except Exception as e:
-                    logger.warning("Failed to download video to workspace: %s", e)
+                    download_error = describe_media_download_error(e)
+                    logger.warning(
+                        "Failed to download video to workspace: %s", download_error
+                    )
             elif video_url and not self._workspace:
                 logger.warning("No workspace available, video not saved locally")
 
-            return {
+            response = {
                 "success": True,
                 "task_id": result.get("task_id"),
                 "status": result.get("status"),
@@ -769,6 +765,9 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "saved_to_workspace": video_path is not None,
                 "raw_response": result.get("raw_response"),
             }
+            if download_error is not None:
+                response["download_error"] = download_error
+            return response
 
         except Exception as e:
             logger.error("Video generation failed: %s", e)

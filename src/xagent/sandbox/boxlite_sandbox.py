@@ -349,6 +349,10 @@ async def _create_or_reuse_box(  # type: ignore[no-any-unimported]
     runtime: boxlite.Boxlite,
 ) -> SimpleBox:
     """Create a new Box."""
+    if config.ports and config.network_isolated:
+        raise ValueError(
+            "Published ports cannot be combined with isolated guest networking"
+        )
     # Build SimpleBox parameters
     kwargs: dict = {
         "image": template.image,
@@ -374,9 +378,12 @@ async def _create_or_reuse_box(  # type: ignore[no-any-unimported]
         kwargs["ports"] = config.ports
 
     if config.network_isolated:
-        sec = boxlite.SecurityOptions()
-        sec.network_enabled = False
-        kwargs["advanced"] = sec
+        # SecurityOptions.network_enabled controls the host-side sandbox, not
+        # guest networking. BoxLite 0.10 requires an explicit guest policy.
+        kwargs["network"] = boxlite.NetworkSpec(
+            outbound=boxlite.OutboundNetworkSpec(mode="disabled"),
+            inbound=boxlite.InboundNetworkSpec(mode="disabled"),
+        )
 
     # Create SimpleBox
     box = SimpleBox(**kwargs)
@@ -433,7 +440,7 @@ class BoxliteSandboxService(SandboxService):
                 info = self._store.get_info(name)
                 if not info:
                     # DB data lost, read from boxlite
-                    info = _get_info_from_box_info(raw_box.info())
+                    info = _get_info_from_box_info(await raw_box.info())
             else:
                 # Box doesn't exist, create new one
                 tpl = template or SandboxTemplate(
@@ -449,7 +456,7 @@ class BoxliteSandboxService(SandboxService):
 
             # Update created_at if this is a new box
             if box.created:
-                info.created_at = box.info().created_at
+                info.created_at = (await box.info()).created_at
                 self._store.add_info(name, info)
 
             # Update state

@@ -9,6 +9,10 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 const connectStartApp = vi.hoisted(() => ({ current: null as Record<string, unknown> | null }))
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
+vi.mock("@/lib/oauth-launch", async () => ({
+  openOAuthAuthorizationPopup: (await import("@/test/oauth-popup-double")).openOAuthPopupDouble,
+  isOAuthSuccessMessage: (await import("@/test/oauth-popup-double")).isOAuthSuccessMessageDouble,
+}))
 
 vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
@@ -171,7 +175,7 @@ describe("ConnectMcpDialog account step", () => {
     submitAccount("acme")
 
     await act(async () => {
-      window.dispatchEvent(Object.assign(new Event("message"), { data: { type: "oauth-success" } }))
+      window.dispatchEvent(Object.assign(new Event("message"), { source: popup, origin: "http://api.local", data: { type: "oauth-success", provider: "zendesk" } }))
     })
     popup.closed = true
     await act(async () => {

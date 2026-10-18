@@ -5,12 +5,13 @@ vi.mock("@/lib/utils", async () => {
   return { ...actual, getApiUrl: () => "http://api.local" }
 })
 
-vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+const apiRequestMock = vi.hoisted(() => vi.fn())
+vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 
 import { openBuiltinOAuthPopup } from "./oauth-connect"
 
 function fakePopup(): Window {
-  return { closed: false, close: vi.fn() } as unknown as Window
+  return { closed: false, close: vi.fn(), location: { replace: vi.fn() } } as unknown as Window
 }
 
 async function settle(popup: Window, pending: Promise<unknown>) {
@@ -22,6 +23,7 @@ async function settle(popup: Window, pending: Promise<unknown>) {
 describe("openBuiltinOAuthPopup account parameter", () => {
   beforeEach(() => {
     vi.useFakeTimers()
+    apiRequestMock.mockReset().mockImplementation(async () => new Response(JSON.stringify({ authorization_url: "/api/auth/zendesk/login?ticket=short-proof", callback_origin: "http://callback.local" })))
   })
 
   afterEach(() => {
@@ -29,17 +31,15 @@ describe("openBuiltinOAuthPopup account parameter", () => {
     vi.useRealTimers()
   })
 
-  it("passes the account label to the login URL", async () => {
+  it("passes the account label in the authenticated POST body", async () => {
     const popup = fakePopup()
     const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup)
 
-    const pending = openBuiltinOAuthPopup({ provider: "zendesk", appId: "zendesk", token: "t", account: "acme" })
+    const pending = openBuiltinOAuthPopup({ provider: "zendesk", appId: "zendesk", account: "acme" })
 
-    const url = new URL(windowOpenSpy.mock.calls[0][0] as string)
-    expect(url.pathname).toBe("/api/auth/zendesk/login")
-    expect(url.searchParams.get("account")).toBe("acme")
-    expect(url.searchParams.get("app_id")).toBe("zendesk")
-    expect(url.searchParams.get("redirect")).toBe(window.location.href)
+    expect(windowOpenSpy.mock.calls[0][0]).toBe("about:blank")
+    expect(apiRequestMock.mock.calls[0][0]).toBe("http://api.local/api/auth/zendesk/login")
+    expect(JSON.parse(apiRequestMock.mock.calls[0][1].body)).toEqual({ account: "acme", app_id: "zendesk", redirect: window.location.origin })
     await settle(popup, pending)
   })
 
@@ -47,23 +47,21 @@ describe("openBuiltinOAuthPopup account parameter", () => {
     const popup = fakePopup()
     const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup)
 
-    const pending = openBuiltinOAuthPopup({ provider: "zendesk", token: "t", account: "acme" })
+    const pending = openBuiltinOAuthPopup({ provider: "zendesk", account: "acme" })
 
-    const url = new URL(windowOpenSpy.mock.calls[0][0] as string)
-    expect(url.searchParams.get("account")).toBe("acme")
-    expect(url.searchParams.has("app_id")).toBe(false)
+    expect(windowOpenSpy.mock.calls[0][0]).toBe("about:blank")
+    expect(JSON.parse(apiRequestMock.mock.calls[0][1].body)).toEqual({ account: "acme", redirect: window.location.origin })
     await settle(popup, pending)
   })
 
-  it("leaves the login URL unchanged when no account is given", async () => {
+  it("omits the account when none is given", async () => {
     const popup = fakePopup()
     const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup)
 
-    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" })
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail" })
 
-    expect(windowOpenSpy.mock.calls[0][0]).toBe(
-      `http://api.local/api/auth/google/login?token=t&app_id=gmail&redirect=${encodeURIComponent(window.location.href)}`,
-    )
+    expect(windowOpenSpy.mock.calls[0][0]).toBe("about:blank")
+    expect(JSON.parse(apiRequestMock.mock.calls[0][1].body)).toEqual({ app_id: "gmail", redirect: window.location.origin })
     await settle(popup, pending)
   })
 })

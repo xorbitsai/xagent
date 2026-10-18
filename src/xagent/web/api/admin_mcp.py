@@ -247,7 +247,7 @@ def _validate_public_mcp_app_values(
         model.model_validate(values)
     except ValidationError:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=422,
             detail="Invalid MCP app configuration",
         ) from None
 

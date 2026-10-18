@@ -5,6 +5,7 @@ This module provides image generation capabilities using pre-configured image mo
 passed from the web layer.
 """
 
+import asyncio
 import base64
 import logging
 import os
@@ -14,10 +15,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import parse
 
-import aiohttp
-
+from ....config import get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref
 from ...model.image.base import BaseImageModel
+from ...utils.media_download import (
+    describe_media_download_error,
+    download_public_media,
+    resolve_workspace_media_path,
+)
 from ...workspace import TaskWorkspace
 
 logger = logging.getLogger(__name__)
@@ -621,35 +626,39 @@ Images are automatically saved to workspace.
                 parsed = parse.urlparse(image_url)
                 if parsed.scheme == "file":
                     local_path = Path(parse.unquote(parsed.path))
-            elif os.path.isabs(image_url) or os.path.exists(image_url):
+            elif not parse.urlparse(image_url).scheme:
                 local_path = Path(image_url)
 
             if local_path is not None:
-                if not local_path.is_file():
-                    raise RuntimeError(f"Local image path is not a file: {local_path}")
-                shutil.copyfile(local_path, save_path)
+                local_path = await asyncio.to_thread(
+                    resolve_workspace_media_path,
+                    local_path,
+                    self._workspace.workspace_dir,
+                )
+                if not await asyncio.to_thread(local_path.is_file):
+                    raise RuntimeError(
+                        "Local image path is not a file in the workspace"
+                    )
+                if local_path != await asyncio.to_thread(save_path.resolve):
+                    await asyncio.to_thread(shutil.copyfile, local_path, save_path)
                 logger.info(f"Copied local image to: {save_path}")
                 return str(save_path)
 
-            # Download the image with configurable timeout
-            timeout_obj = aiohttp.ClientTimeout(total=timeout)
-            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-                async with session.get(image_url) as response:
-                    if response.status != 200:
-                        raise RuntimeError(
-                            f"Failed to download image: HTTP {response.status}"
-                        )
-
-                    # Save the image
-                    with open(save_path, "wb") as f:
-                        async for chunk in response.content.iter_chunked(8192):
-                            f.write(chunk)
+            await download_public_media(
+                image_url,
+                save_path,
+                timeout=timeout,
+                max_bytes=get_media_download_max_bytes("image"),
+                media_kind="image",
+            )
 
             logger.info(f"Downloaded image to: {save_path}")
             return str(save_path)
 
         except Exception as e:
-            logger.warning(f"Failed to download image from {image_url}: {e}")
+            logger.warning(
+                "Failed to download image: %s", describe_media_download_error(e)
+            )
             raise
 
     async def generate_image(
@@ -757,6 +766,7 @@ Images are automatically saved to workspace.
 
             image_url = result.get("image_url")
             image_path = None
+            download_error = None
             image_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
@@ -780,7 +790,10 @@ Images are automatically saved to workspace.
                                 image_path
                             )
                 except Exception as e:
-                    logger.warning(f"Failed to download image to workspace: {e}")
+                    download_error = describe_media_download_error(e)
+                    logger.warning(
+                        "Failed to download image to workspace: %s", download_error
+                    )
                     # Continue execution even if download fails
             elif image_url and not self._workspace:
                 logger.warning("No workspace available, image not saved locally")
@@ -797,6 +810,8 @@ Images are automatically saved to workspace.
                 "model_used": actual_model_id,
                 "saved_to_workspace": image_path is not None,
             }
+            if download_error is not None:
+                response["download_error"] = download_error
             return response
 
         except Exception as e:
@@ -909,6 +924,7 @@ Images are automatically saved to workspace.
 
             edited_image_url = result.get("image_url")
             image_path = None
+            download_error = None
             image_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
@@ -936,12 +952,16 @@ Images are automatically saved to workspace.
                                 image_path
                             )
                 except Exception as e:
-                    logger.warning(f"Failed to download edited image to workspace: {e}")
+                    download_error = describe_media_download_error(e)
+                    logger.warning(
+                        "Failed to download edited image to workspace: %s",
+                        download_error,
+                    )
                     # Continue execution even if download fails
             elif edited_image_url and not self._workspace:
                 logger.warning("No workspace available, edited image not saved locally")
 
-            return {
+            response = {
                 "success": True,
                 "image_path": image_path,
                 "file_id": image_file_id,
@@ -953,6 +973,9 @@ Images are automatically saved to workspace.
                 "model_used": actual_model_id,
                 "saved_to_workspace": image_path is not None,
             }
+            if download_error is not None:
+                response["download_error"] = download_error
+            return response
 
         except Exception as e:
             logger.error(f"Image editing failed: {e}")

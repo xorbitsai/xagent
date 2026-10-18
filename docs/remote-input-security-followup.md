@@ -29,9 +29,11 @@ errors omit raw URLs, redirect Locations and third-party response text.
   configured model API request gets the model credential. A rejected reference
   never reaches that potentially billed model call.
 
-These restrictions deliberately do not apply to configured model API endpoints:
-legitimate private model services retain their previous configuration behavior.
-Gemini data URLs and trusted SDK local-file inputs are not changed here.
+The initial input-download patch did not restrict configured model endpoints.
+The subsequent managed-client changes now reject private model and MCP
+destinations by default; see [managed public egress](managed-public-egress.md)
+for the current policy and compatibility impact. Gemini data URLs and trusted
+SDK local-file inputs are not changed here.
 
 ## Workspace authorization
 
@@ -55,13 +57,11 @@ no live internal or metadata endpoints are used. It also covers streaming and
 declared size limits, decoding, deadlines, cancellation, preserved configured
 model requests, and workspace path/symlink rejection.
 
-This patch is based on #3183 and is complementary to #3186's generic API policy.
-It does not change production infrastructure, pin the SaaS core version, or
-complete CASA item 15. Configured MCP/model destinations, other SDK/provider
-URL consumers, and sandbox egress still require scoped policies and deployment
-acceptance. In particular, existing fetch paths configured with an explicit
-outbound proxy need the proxy to enforce destination/DNS policy at connection
-time; preflight DNS validation by the application is not sufficient against
-rebinding through a separately resolving proxy. A universal production egress
-policy must account for authorized private integrations, not add a
-model-controlled allow-private flag.
+The updated branch incorporates #3183, #3186's generic API policy, and the
+dependency changes in #3185. Merge those parent PRs first. Managed MCP/model
+clients and proxy-backed fetches now use connection-level public destination
+checks, as described in [managed public egress](managed-public-egress.md).
+This does not change production infrastructure, pin the final SaaS core
+version, or complete CASA item 15. Arbitrary user code and third-party programs
+are outside the managed-client boundary; independent network isolation was
+deferred. Build, deployment and acceptance testing are still required.

@@ -3,6 +3,8 @@
 import ast
 import asyncio
 import ipaddress
+import json
+import os
 import socket
 import subprocess
 import sys
@@ -155,14 +157,28 @@ async def test_untrusted_proxy_rejects_search_and_reference_download_without_dis
     wire.assert_not_awaited()
 
 
-def test_model_policy_import_does_not_load_web_scraping_dependencies():
+@pytest.mark.parametrize("with_pythonpath", [False, True])
+def test_model_policy_import_does_not_load_web_scraping_dependencies(
+    tmp_path, with_pythonpath
+):
+    # -S intentionally bypasses site/.pth/editable setup. Explicitly pass the
+    # tested checkout and the parent's dependency paths rather than relying on
+    # a developer PYTHONPATH (which is absent in CI). Use an unrelated cwd too.
+    source = str(Path(__file__).resolve().parents[3] / "src")
+    environment = os.environ.copy()
+    if with_pythonpath:
+        environment["PYTHONPATH"] = str(tmp_path / "unrelated")
+    else:
+        environment.pop("PYTHONPATH", None)
     result = subprocess.run(
         [
             sys.executable,
             "-S",
             "-c",
             """
-import importlib.abc, sys
+import sys, json
+sys.path[:] = json.loads(sys.argv[1])
+import importlib.abc
 class BlockTools(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname in {"html2text", "bs4", "xagent.core.tools.core.web_content"}:
@@ -172,7 +188,10 @@ from xagent.core.model.public_http import create_public_model_sync_client
 with create_public_model_sync_client():
     pass
 """,
+            json.dumps([source, *[path for path in sys.path if path]]),
         ],
+        cwd=tmp_path,
+        env=environment,
         capture_output=True,
         text=True,
         timeout=30,

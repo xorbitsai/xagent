@@ -91,9 +91,14 @@ async def test_duplicate_wakes_apply_once_and_hold_owner_through_receipt(
         assert row.status == "completed" and row.result == {"applied": True}
 
 
-async def test_defer_uses_retry_time_without_a_command_lease(host):
+async def test_defer_uses_retry_time_without_a_command_lease(host, monkeypatch):
     factory, _, _ = host
     cid = enqueue(host)
+    # CI database round trips can consume the whole one-second defer window.
+    # Control the command clock, not the lease/heartbeat clock, so this checks
+    # eligibility rather than assuming dispatch itself finishes within 1s.
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(transport, "_utc_now", lambda: now)
 
     async def defer(command):
         raise transport.TaskCommandDeferred("busy")
@@ -104,9 +109,12 @@ async def test_defer_uses_retry_time_without_a_command_lease(host):
         row = db.get(TaskExecutionCommand, cid)
         assert row.status == "pending" and row.attempt_count == row.defer_count == 1
         assert row.retry_available_at is not None
+        due = row.retry_available_at
+        if due.tzinfo is None:  # SQLite omits timezone information.
+            due = due.replace(tzinfo=timezone.utc)
+        assert due == now + timedelta(seconds=1)
         assert row.claim_expires_at is None and row.claimed_by is None
-        row.retry_available_at = datetime.now(timezone.utc) - timedelta(seconds=1)
-        db.commit()
+    now += timedelta(seconds=1)
     assert await transport.dispatch_one_task_command(defer)
     with factory() as db:
         assert db.get(TaskExecutionCommand, cid).attempt_count == 2

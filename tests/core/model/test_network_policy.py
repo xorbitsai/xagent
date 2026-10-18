@@ -230,6 +230,68 @@ def test_requests_model_policy_is_scoped_and_pins_approved_dns(monkeypatch):
     assert seen == ["127.0.0.1"]
 
 
+def test_private_xinference_default_can_be_explicitly_approved(monkeypatch):
+    import io
+
+    from urllib3.response import HTTPResponse
+
+    from xagent.core.model.public_xinference import PublicXinferenceClient
+
+    approve(monkeypatch, "http://localhost:9997")
+    answers(monkeypatch, ["127.0.0.1"])
+    seen = []
+
+    def urlopen(pool, *args, **kwargs):
+        seen.append(pool.host)
+        return HTTPResponse(
+            body=io.BytesIO(b'{"auth": false}'), status=200, preload_content=False
+        )
+
+    monkeypatch.setattr("urllib3.connectionpool.HTTPConnectionPool.urlopen", urlopen)
+    client = PublicXinferenceClient("http://localhost:9997")
+    try:
+        assert seen == ["127.0.0.1"]
+    finally:
+        client.close()
+
+
+def test_private_bedrock_session_uses_same_operator_policy(monkeypatch):
+    import io
+
+    from botocore.awsrequest import AWSPreparedRequest
+    from urllib3.response import HTTPResponse
+
+    from xagent.core.utils.public_botocore import PublicBotocoreSession
+    from xagent.core.utils.public_http_transport import UnsafePublicHttpTarget
+
+    approve(monkeypatch)
+    answers(monkeypatch, ["127.0.0.1"])
+    seen = []
+
+    def urlopen(pool, **kwargs):
+        seen.append(pool.host)
+        return HTTPResponse(body=io.BytesIO(b"{}"), status=200, preload_content=False)
+
+    monkeypatch.setattr("urllib3.connectionpool.HTTPConnectionPool.urlopen", urlopen)
+    request = AWSPreparedRequest(
+        method="POST",
+        url="http://inference.example:9997/",
+        headers={},
+        body=b"{}",
+        stream_output=True,
+    )
+    session = PublicBotocoreSession(timeout=1, _policy=ModelNetworkPolicy())
+    generic = PublicBotocoreSession(timeout=1)
+    try:
+        session.send(request).raw.close()
+        with pytest.raises(UnsafePublicHttpTarget):
+            generic.send(request)
+        assert seen == ["127.0.0.1"]
+    finally:
+        session.close()
+        generic.close()
+
+
 @pytest.mark.asyncio
 async def test_video_reference_download_is_bounded_and_has_no_model_credentials(
     monkeypatch,

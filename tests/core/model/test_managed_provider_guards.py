@@ -63,7 +63,9 @@ async def test_real_provider_rejects_private_base_before_inner_transport(
                 assert not model._client._api_client._use_aiohttp()
                 await model._client.aio.models.list()
             elif provider == "zhipu":
-                model._client.models.list()
+                model._client.chat.completions.create(
+                    model="test", messages=[{"role": "user", "content": "test"}]
+                )
             else:
                 await model._client.models.list()
         except Exception as error:

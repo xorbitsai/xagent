@@ -127,6 +127,10 @@ class ModelNetworkPolicy:
 
     def resolve_sync(self, url: str) -> list[str]:
         host, port = self.destination(url)
+        # Preserve a caller's DNS root label: dropping it can make the resolver
+        # search unrelated deployment domains for an otherwise exact origin.
+        parsed = validate_public_http_url_shape(url, host_validator=lambda host: None)
+        host = str(parsed.hostname)
         addresses = [
             str(record[4][0])
             for record in socket.getaddrinfo(

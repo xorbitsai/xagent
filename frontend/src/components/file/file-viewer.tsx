@@ -182,20 +182,40 @@ export function FileViewer({
       return
     }
 
+    let active = true
     let objectUrl: string | null = null
-    try {
-      // Decode locally: fetch(data:) is blocked by the page's connect-src.
-      const decoded = atob(base64Content.replace(/\s/g, ""))
-      const bytes = new Uint8Array(decoded.length)
-      for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i)
-      objectUrl = URL.createObjectURL(new Blob([bytes], { type: blobMimeType }))
-      setMediaObjectUrl(objectUrl)
-    } catch (error) {
-      console.error("Media preview decode error:", error)
-      setMediaObjectUrl(null)
+    setMediaObjectUrl(null)
+    async function decode() {
+      try {
+        // Decode locally: fetch(data:) is blocked by connect-src. Keep chunks
+        // aligned to base64 quanta and yield so large previews don't monopolize
+        // the UI thread or allocate one huge intermediate binary string.
+        const source = base64Content!.replace(/\s/g, "")
+        const parts: BlobPart[] = []
+        const chunkSize = 64 * 1024
+        for (let offset = 0; offset < source.length; offset += chunkSize) {
+          if (!active) return
+          const decoded = atob(source.slice(offset, offset + chunkSize))
+          const bytes = new Uint8Array(decoded.length)
+          for (let i = 0; i < decoded.length; i++) bytes[i] = decoded.charCodeAt(i)
+          parts.push(bytes)
+          if (offset + chunkSize < source.length) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 0))
+          }
+        }
+        if (!active) return
+        objectUrl = URL.createObjectURL(new Blob(parts, { type: blobMimeType! }))
+        setMediaObjectUrl(objectUrl)
+      } catch (error) {
+        if (!active) return
+        console.error("Media preview decode error:", error)
+        setMediaObjectUrl(null)
+      }
     }
+    void decode()
 
     return () => {
+      active = false
       if (objectUrl) {
         URL.revokeObjectURL(objectUrl)
       }

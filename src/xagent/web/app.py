@@ -105,6 +105,7 @@ from .api.websocket import ws_router
 from .api.widget import widget_router
 from .api.workforces import router as workforces_router
 from .auth_config import validate_auth_config
+from .browser_security import is_widget_page
 from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
@@ -1531,8 +1532,6 @@ app.add_middleware(FileStorageStartupSyncGateMiddleware)
 
 def _security_header_values(path: str) -> dict[str, str]:
     """Return headers appropriate for an API, preview, upload, or SPA path."""
-    from .browser_security import is_widget_page
-
     widget_page = is_widget_page(path)
     is_upload = path == "/uploads" or path.startswith("/uploads/")
     is_api = path == "/api" or path.startswith("/api/")

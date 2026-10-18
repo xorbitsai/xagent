@@ -25,6 +25,7 @@ import { useApp } from "@/contexts/app-context-chat"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { renderFileMentionsHtml } from "@/components/chat/FileChip"
+import { escapeHtml } from "@/lib/html-escape"
 import { readSendDisposition, readSendErrorCode, readSendReason } from "@/components/chat/clarification-delivery"
 import { clientErrorTranslationKey } from "@/lib/client-errors"
 import type { TranslationKey } from "@/i18n/translations"
@@ -512,12 +513,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const [isInstructionsFocused, setIsInstructionsFocused] = useState(false)
   const lastInstructionsRef = useRef(instructions)
   const normalizeLineBreaks = (value: string) => value.replace(/\r\n|\r|\u2028|\u2029/g, "\n")
-  const escapeHtml = (value: string) =>
-    value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-
   const serializeInstructionsContent = (editor: HTMLElement) => {
     const clone = editor.cloneNode(true) as HTMLElement;
     const chips = clone.querySelectorAll('[data-file-path]');

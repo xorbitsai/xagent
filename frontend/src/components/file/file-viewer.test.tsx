@@ -182,6 +182,30 @@ describe("FileViewer PDF preview", () => {
     view.unmount()
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-4")
   })
+
+  it("decodes large previews in bounded chunks and yields between them", async () => {
+    const decode = vi.spyOn(globalThis, "atob")
+    try {
+      render(<FileViewer fileName="large.pdf" fileId="pdf-id"
+        content={"QUJD".repeat(32768)} mimeType="application/pdf" isLoading={false}
+        error={null} viewMode="preview" />)
+      expect(URL.createObjectURL).not.toHaveBeenCalled()
+      await waitFor(() => expect(screen.getByTitle("large.pdf")).toHaveAttribute("src", "blob:mock-98304"))
+      expect(Math.max(...decode.mock.calls.map(([value]) => value.length))).toBeLessThanOrEqual(65536)
+    } finally { decode.mockRestore() }
+  })
+
+  it("does not publish an object URL after a chunked decode is cancelled", async () => {
+    vi.useFakeTimers()
+    try {
+      const view = render(<FileViewer fileName="large.pdf" fileId="pdf-id"
+        content={"QUJD".repeat(32768)} mimeType="application/pdf" isLoading={false}
+        error={null} viewMode="preview" />)
+      view.unmount()
+      await vi.runAllTimersAsync()
+      expect(URL.createObjectURL).not.toHaveBeenCalled()
+    } finally { vi.useRealTimers() }
+  })
 })
 
 describe("FileViewer video preview", () => {

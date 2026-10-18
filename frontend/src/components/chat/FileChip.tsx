@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { FileTypeIcon } from "@/components/file/file-type-icon";
+import { escapeHtml as escapeChipHtml } from "@/lib/html-escape";
 
 // Base styles shared between React component and HTML string
 // Using the more detailed styles from ChatInput as the source of truth
@@ -90,24 +91,25 @@ export const createFileChipHTML = (path: string, fileId?: string, filename?: str
   `.trim();
 };
 
-function escapeChipHtml(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-}
-
 /** Parse raw message tokens before escaping; never reparse generated chip HTML. */
 export function renderFileMentionsHtml(source: string, legacyBackticks = false): string {
-  const tokens = legacyBackticks
-    ? /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)|`([^`]+)`/g
-    : /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
+  const tokens = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
+  const renderGap = (text: string): string => {
+    if (!legacyBackticks) return escapeChipHtml(text);
+    let html = "";
+    let offset = 0;
+    for (const match of text.matchAll(/`([^`]+)`/g)) {
+      html += escapeChipHtml(text.slice(offset, match.index)) + createFileChipHTML(match[1]);
+      offset = match.index! + match[0].length;
+    }
+    return html + escapeChipHtml(text.slice(offset));
+  };
   let result = "";
   let copied = 0;
   for (const match of source.matchAll(tokens)) {
-    result += escapeChipHtml(source.slice(copied, match.index));
-    result += match[3] !== undefined
-      ? createFileChipHTML(match[3])
-      : createFileChipHTML(match[2], match[2], match[1]);
+    result += renderGap(source.slice(copied, match.index));
+    result += createFileChipHTML(match[2], match[2], match[1]);
     copied = match.index! + match[0].length;
   }
-  return result + escapeChipHtml(source.slice(copied));
+  return result + renderGap(source.slice(copied));
 }

@@ -50,6 +50,17 @@ describe("file chip HTML boundary", () => {
     expectInert(root)
   })
 
+  it("prioritizes canonical links even after a stray backtick", () => {
+    const root = fragment(renderFileMentionsHtml('don`t forget [report.pdf](file:abc) and `npm i`', true))
+    const chips = root.querySelectorAll("[data-file-path]")
+    expect(chips).toHaveLength(2)
+    expect(chips[0].getAttribute("data-file-path")).toBe("abc")
+    expect(chips[0].getAttribute("data-filename")).toBe("report.pdf")
+    expect(chips[1].getAttribute("data-file-path")).toBe("npm i")
+    expect(root.textContent).toContain('don`t forget ')
+    expectInert(root)
+  })
+
   it("does not interpret legacy backticks in builder instructions", () => {
     const root = fragment(renderFileMentionsHtml('use `<img src=x onerror=alert(1)>`'))
     expect(root.querySelector("[data-file-path]")).toBeNull()

@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useId, useMemo } from "react";
 import { renderFileMentionsHtml } from "./FileChip";
+import { escapeHtml } from "@/lib/html-escape";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -184,14 +185,6 @@ export function ChatInput({
     });
     return () => window.cancelAnimationFrame(frameId);
   }, [autoFocus]);
-
-  const escapeHtml = (value: string) =>
-    value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;")
-      .replace(/'/g, "&#39;");
 
   const applyPromptHighlights = (html: string, highlightTerms: string[]) => {
     if (!highlightTerms.length) return html;

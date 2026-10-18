@@ -34,6 +34,11 @@ for static Next output. Do not solve this by enabling `allow-same-origin`, by
 globally restoring eval, or by silently breaking interactive previews. The
 current policy can also intentionally block nested third-party iframes and
 generated eval-based code; staging must inventory any legitimate uses.
+Production intentionally blocks HTTP images/media (including mixed-content
+assets), `<base>`-dependent relative preview URLs, and eval-based in-DOM
+framework builds such as Alpine/Vue. Use HTTPS assets, explicit resource URLs,
+and CSP-compatible precompiled framework builds; these are compatibility
+changes, not a guarantee that every generated preview continues to work.
 
 Release acceptance must use real browsers (not jsdom) to open PDF and video
 previews and the Google Drive Picker under the enforced production policy.

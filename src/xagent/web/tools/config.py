@@ -699,7 +699,12 @@ _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
 
 
 def _oauth_refresh_http_client() -> httpx.AsyncClient:
-    return create_public_async_client(proxy_url=get_trusted_proxy_url())
+    proxy = get_trusted_proxy_url()
+    return (
+        create_public_async_client(proxy_url=proxy)
+        if proxy
+        else create_public_async_client()
+    )
 
 
 async def _request_oauth_refresh_with_retries(

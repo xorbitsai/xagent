@@ -160,6 +160,27 @@ def test_dns_oserror_is_a_requests_connection_error(network):
     assert not seen
 
 
+def test_requests_default_verification_uses_ca_context_without_overriding_explicit_verify(
+    network, monkeypatch
+):
+    import certifi
+
+    from xagent.core.utils.security import build_ca_bundle_ssl_context
+
+    _, seen, _ = network
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    context = build_ca_bundle_ssl_context()
+    build = Mock(return_value=context)
+    monkeypatch.setattr(requests, "build_ca_bundle_ssl_context", build)
+    requests.get("https://example.com/")
+    assert seen[0][0].conn_kw["ssl_context"] is context
+    build.assert_called_once()
+    build.reset_mock()
+    requests.get("https://example.com/", verify=False)
+    requests.get("https://example.com/", verify=certifi.where())
+    build.assert_not_called()
+
+
 @pytest.mark.parametrize("variable", ["REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"])
 def test_ca_environment_without_environment_proxy_or_netrc(monkeypatch, variable):
     monkeypatch.delenv("REQUESTS_CA_BUNDLE", raising=False)

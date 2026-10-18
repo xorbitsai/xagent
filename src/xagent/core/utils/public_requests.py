@@ -36,7 +36,11 @@ from ...config import get_trusted_egress_proxy_enabled
 if TYPE_CHECKING:
     from requests.adapters import _HostParams, _PoolKwargs
 
-from .security import public_http_destination, validate_public_http_url_sync
+from .security import (
+    build_ca_bundle_ssl_context,
+    public_http_destination,
+    validate_public_http_url_sync,
+)
 
 
 class _PublicAdapter(HTTPAdapter):
@@ -69,6 +73,12 @@ class _PublicAdapter(HTTPAdapter):
         if parsed.scheme == "https":
             # Requests' stubs omit these supported urllib3 HTTPS pool keys.
             tls_kwargs = cast(dict[str, Any], pool_kwargs)
+            if verify is True:
+                # Preserve SSL_CERT_FILE/SSL_CERT_DIR as well as Requests'
+                # explicit CA-path handling. A fresh context also prevents
+                # client certificates loaded by urllib3 leaking to another
+                # request with different cert settings.
+                tls_kwargs["ssl_context"] = build_ca_bundle_ssl_context()
             tls_kwargs["server_hostname"] = parsed.hostname
             tls_kwargs["assert_hostname"] = parsed.hostname
         return host_params, pool_kwargs

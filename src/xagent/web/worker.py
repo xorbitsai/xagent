@@ -82,6 +82,9 @@ async def run_worker(
     stop: asyncio.Event | None = None,
 ) -> None:
     validate_encryption_config()
+    from ..core.model.network_policy import ModelNetworkPolicy
+
+    ModelNetworkPolicy()
     validate_task_execution_host_config()
     if not get_shared_task_execution_enabled() or get_task_execution_role() != "worker":
         raise ValueError(

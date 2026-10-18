@@ -23,12 +23,17 @@ _METADATA_HOSTS = frozenset(
 _METADATA_IPS = frozenset(
     {"169.254.169.254", "100.100.100.200", "168.63.129.16", "fd00:ec2::254"}
 )
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
 
 
 def _address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
     address = ipaddress.ip_address(value)
     if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
         return address.ipv4_mapped
+    if isinstance(address, ipaddress.IPv6Address) and address in _NAT64:
+        # Classify the embedded destination but retain the original IPv6 for
+        # connections. Only the well-known /96 has this unambiguous layout.
+        return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
     return address
 
 
@@ -65,48 +70,45 @@ def _parts(url: str) -> tuple[str, str, int]:
 
 class ModelNetworkPolicy:
     def __init__(self) -> None:
+        variable = "XAGENT_MODEL_PRIVATE_ENDPOINTS"
         try:
-            self._load_configuration()
-        except ValueError as exc:
+            endpoints = get_model_private_endpoints()
+            origins = set()
+            for url in endpoints:
+                origin = _parts(url)
+                parsed = urlsplit(url)
+                if (
+                    "*" in str(parsed.hostname)
+                    or parsed.path not in {"", "/"}
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    raise ValueError("Private model endpoints must be exact origins")
+                origins.add(origin)
+            self.origins = frozenset(origins)
+            variable = "XAGENT_MODEL_PRIVATE_CIDRS"
+            self.networks = tuple(
+                ipaddress.ip_network(value) for value in get_model_private_cidrs()
+            )
+            for network in self.networks:
+                if network.is_global or _hard_deny(network.network_address):
+                    raise ValueError("Private model CIDRs must be safe private ranges")
+        except ValueError:
             # Invalid operator configuration is terminal too, not an SDK
             # connection failure worth retrying. Do not echo configured URLs.
             raise PrivateNetworkHostError(
-                "Invalid deployment model network policy configuration"
-            ) from exc
-
-    def _load_configuration(self) -> None:
-        endpoints = get_model_private_endpoints()
-        self.origins: frozenset[tuple[str, str, int]] = frozenset(
-            _parts(url) for url in endpoints
-        )
-        for url in endpoints:
-            parsed = urlsplit(url)
-            if (
-                "*" in str(parsed.hostname)
-                or parsed.path not in {"", "/"}
-                or parsed.query
-                or parsed.fragment
-            ):
-                raise ValueError(
-                    "Private model endpoints must be exact origins, without path/query/fragment"
-                )
-        self.networks = tuple(
-            ipaddress.ip_network(value) for value in get_model_private_cidrs()
-        )
-        for network in self.networks:
-            if network.is_global or _hard_deny(network.network_address):
-                raise ValueError(
-                    "Private model CIDRs must be private/loopback ranges, not metadata or unsafe ranges"
-                )
+                f"Invalid deployment model network policy configuration: {variable}"
+            ) from None
 
     def destination(self, url: str) -> tuple[str, int]:
-        origin = _parts(url)
-        if origin not in self.origins:
-            reject_private_network_host(origin[1])
+        return self._destination(_parts(url))
+
+    def _destination(self, origin: tuple[str, str, int]) -> tuple[str, int]:
         try:
             literal = _address(origin[1])
         except ValueError:
-            pass
+            if origin not in self.origins:
+                reject_private_network_host(origin[1])
         else:
             self._validate_addresses(origin in self.origins, [str(literal)])
         return origin[1], origin[2]
@@ -132,14 +134,16 @@ class ModelNetworkPolicy:
                 )
 
     def validate_resolved(self, url: str, addresses: list[str]) -> None:
-        self.destination(url)
-        self._validate_addresses(_parts(url) in self.origins, addresses)
+        origin = _parts(url)
+        self._destination(origin)
+        self._validate_addresses(origin in self.origins, addresses)
 
     def resolve_sync(self, url: str) -> list[str]:
-        host, port = self.destination(url)
+        origin = _parts(url)
+        host, port = self._destination(origin)
         # Preserve a caller's DNS root label: dropping it can make the resolver
         # search unrelated deployment domains for an otherwise exact origin.
-        parsed = validate_public_http_url_shape(url, host_validator=lambda host: None)
+        parsed = urlsplit(url)
         host = str(parsed.hostname)
         addresses = [
             str(record[4][0])
@@ -147,7 +151,7 @@ class ModelNetworkPolicy:
                 host, port, socket.AF_UNSPEC, socket.SOCK_STREAM
             )
         ]
-        self._validate_addresses(_parts(url) in self.origins, addresses)
+        self._validate_addresses(origin in self.origins, addresses)
         return addresses
 
     async def resolve(self, url: str) -> list[str]:

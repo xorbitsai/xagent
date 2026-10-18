@@ -1,9 +1,18 @@
 # Managed model outbound policy
 
-This model migration (#3193) includes the missing policy/proxy API follow-up
-that was not present in #3191's squash merge. It is tested on this PR's own
-branch against merged main; no unmerged prerequisite is required. No deployment
-is changed.
+## Upgrade notes
+
+Managed model clients now refuse localhost, LAN/Docker and private cloud
+endpoints by default, including previously saved configurations. Before
+upgrading a deployment using those endpoints, configure BOTH private-origin
+and private-address settings below. Invalid entries fail web/worker startup
+and client construction with the relevant environment variable name.
+
+Public model calls ignore untrusted ambient proxies; Zhipu web search and
+third-party reference downloads instead reject a configured but untrusted
+HTTP(S) proxy. These features no longer implicitly trust a corporate proxy.
+Proxy-only deployments must audit the proxy's destination enforcement and
+explicitly enable XAGENT_TRUSTED_EGRESS_PROXY before using it.
 
 ## Operator-only private exceptions
 
@@ -22,6 +31,13 @@ link-local, multicast, unspecified and reserved addresses remain forbidden,
 including IPv4-mapped spellings and the IPv6 AWS metadata address. Invalid
 operator configuration fails closed. Do not use broad CIDRs without reviewing
 what model users would be able to reach.
+
+Dual-stack localhost commonly resolves to BOTH 127.0.0.1 and ::1. Approve
+both address ranges (as above), or use an exact literal origin for just one
+family; approving only 127.0.0.1/32 does not permit an ::1 DNS answer.
+Well-known DNS64/NAT64 addresses in 64:ff9b::/96 are classified by their embedded
+IPv4 destination, while connections retain IPv6. Metadata and unsafe embedded
+IPv4 destinations remain forbidden. Other translation prefixes are not inferred.
 
 These settings are read only from process environment through config.py.
 Serialized model/tool parameters cannot enable exceptions. They apply only to
@@ -43,15 +59,25 @@ ignore untrusted ambient HTTP(S)_PROXY and connect directly when the trust switc
 is off. They do not fail construction merely because a corporate proxy is set,
 and they never implicitly trust it. Proxy-only deployments must explicitly set
 XAGENT_TRUSTED_EGRESS_PROXY=1 after checking the proxy's enforcement policy.
-NO_PROXY does not bypass that selected route. Web fetchers/MCP/tools can retain
-their stricter configured-but-untrusted proxy rejection policy; the model-only
-ignore behavior does not relax those callers. Zhipu web search uses a generic
-public client and does not receive private model exceptions.
+NO_PROXY does not bypass that selected route, even for an approved local model.
+A deployment combining a corporate proxy with localhost/Xinference must use a
+trusted proxy that can reach and authorize that model origin, or run those
+clients in a separate process without the proxy enabled. No implicit direct
+private-network bypass is added. Web fetchers/MCP/tools retain their stricter
+configured-but-untrusted proxy rejection policy. Zhipu web search and reference
+downloads do not receive private model exceptions.
 
 HTTPX-backed SDK clients follow redirects with a five-hop limit and the shared
 credential/body guard. Changed-origin body replay is refused. aiohttp model
 requests retain their stricter same-origin redirect policy. No model credentials
 are attached to third-party reference input downloads.
+
+HTTPX model clients pool connections in separate scheme/host/port buckets, so
+different TLS names sharing an IP cannot reuse one another's connection. Each
+request still validates every current DNS answer before accessing its pool.
+There are at most 16 pooled origins per client; additional origins use an
+unpooled fallback until the client closes. Generic multi-origin transports
+remain unpooled. HTTP/2 remains disabled.
 
 ## Timeouts and ownership
 

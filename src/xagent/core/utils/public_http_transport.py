@@ -1,8 +1,9 @@
 """Connection-bound public-only HTTP policy for untrusted request URLs."""
 
+import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -81,7 +82,7 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
             trust_env=False,
             http2=False,
             verify=ssl_context,
-            limits=httpx.Limits(max_keepalive_connections=0),
+            limits=self.connection_limits(),
             proxy=proxy,
         )
 
@@ -128,6 +129,10 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
                     raise
         raise httpx.ConnectError("Public API host did not resolve", request=request)
 
+    def connection_limits(self) -> httpx.Limits:
+        # Pinned-IP pool keys alone cannot distinguish logical TLS origins.
+        return httpx.Limits(max_keepalive_connections=0)
+
     async def aclose(self) -> None:
         await self._transport.aclose()
 
@@ -155,7 +160,7 @@ class PublicSyncHttpTransport(httpx.BaseTransport):
             verify=ssl_context,
             # As in the async transport, pool keys use the pinned IP rather
             # than the logical TLS host. Never reuse across different names.
-            limits=httpx.Limits(max_keepalive_connections=0),
+            limits=self.connection_limits(),
             proxy=proxy,
         )
 
@@ -193,8 +198,100 @@ class PublicSyncHttpTransport(httpx.BaseTransport):
                     raise
         raise httpx.ConnectError("Public API host did not resolve", request=request)
 
+    def connection_limits(self) -> httpx.Limits:
+        return httpx.Limits(max_keepalive_connections=0)
+
     def close(self) -> None:
         self._transport.close()
+
+
+class _PooledOriginHttpTransport(PublicHttpTransport):
+    """Used only behind a dispatcher with a separate instance per origin."""
+
+    def connection_limits(self) -> httpx.Limits:
+        return httpx.Limits(max_keepalive_connections=20)
+
+
+class _PooledOriginSyncHttpTransport(PublicSyncHttpTransport):
+    def connection_limits(self) -> httpx.Limits:
+        return httpx.Limits(max_keepalive_connections=20)
+
+
+class _OriginPools:
+    """Separate pinned-IP pools by logical scheme/host/port, with bounded growth.
+
+    Each child still checks the current DNS answers on every request. Unknown
+    origins beyond the cap use a non-keep-alive fallback rather than evicting
+    a transport that may own a live streaming response.
+    """
+
+    def __init__(
+        self, proxy_url: str | None, policy: HttpDestinationPolicy | None
+    ) -> None:
+        self._proxy_url = proxy_url
+        self._via_proxy = proxy_url is not None
+        self._policy = policy
+        self._pools: dict[tuple[str, str, int], Any] = {}
+        self._fallback: Any = None
+        self._pool_lock = threading.Lock()
+
+    def _for_request(self, request: httpx.Request, *, asynchronous: bool) -> Any:
+        # Sync SDK clients may be called by multiple threads. Publish only one
+        # pool per origin, without leaking a losing constructor's transport.
+        with self._pool_lock:
+            return self._get_or_create(request, asynchronous=asynchronous)
+
+    def _get_or_create(self, request: httpx.Request, *, asynchronous: bool) -> Any:
+        origin = _http_origin(request.url)
+        if origin not in self._pools:
+            if len(self._pools) >= 16:
+                if self._fallback is None:
+                    factory = (
+                        PublicHttpTransport if asynchronous else PublicSyncHttpTransport
+                    )
+                    self._fallback = factory(
+                        proxy_url=self._proxy_url, _policy=self._policy
+                    )
+                return self._fallback
+            factory = (
+                _PooledOriginHttpTransport
+                if asynchronous
+                else _PooledOriginSyncHttpTransport
+            )
+            self._pools[origin] = factory(
+                proxy_url=self._proxy_url, _policy=self._policy
+            )
+        return self._pools[origin]
+
+    def _all_transports(self) -> list[Any]:
+        return [
+            *self._pools.values(),
+            *([self._fallback] if self._fallback is not None else []),
+        ]
+
+
+class OriginPooledHttpTransport(_OriginPools, httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        transport = cast(
+            PublicHttpTransport, self._for_request(request, asynchronous=True)
+        )
+        return await transport.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        for transport in self._all_transports():
+            await transport.aclose()
+
+
+class OriginPooledSyncHttpTransport(_OriginPools, httpx.BaseTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        transport = cast(
+            PublicSyncHttpTransport, self._for_request(request, asynchronous=False)
+        )
+        return transport.handle_request(request)
+
+    def close(self) -> None:
+        for transport in self._all_transports():
+            transport.close()
 
 
 def _redirect_guard(request: httpx.Request) -> None:
@@ -226,12 +323,23 @@ def public_http_client_options(
     asynchronous: bool,
     proxy_url: str | None = None,
     _policy: HttpDestinationPolicy | None = None,
+    _pool_by_origin: bool = False,
 ) -> dict[str, Any]:
     """Transport options for SDKs that own and close their HTTPX clients."""
+    if _pool_by_origin:
+        transport: httpx.AsyncBaseTransport | httpx.BaseTransport = (
+            OriginPooledHttpTransport(proxy_url, _policy)
+            if asynchronous
+            else OriginPooledSyncHttpTransport(proxy_url, _policy)
+        )
+    else:
+        transport = (
+            PublicHttpTransport(proxy_url=proxy_url, _policy=_policy)
+            if asynchronous
+            else PublicSyncHttpTransport(proxy_url=proxy_url, _policy=_policy)
+        )
     return {
-        "transport": PublicHttpTransport(proxy_url=proxy_url, _policy=_policy)
-        if asynchronous
-        else PublicSyncHttpTransport(proxy_url=proxy_url, _policy=_policy),
+        "transport": transport,
         "trust_env": False,
         "event_hooks": {
             "request": [_async_redirect_guard if asynchronous else _redirect_guard]
@@ -277,6 +385,7 @@ def _client_options(*, asynchronous: bool, kwargs: dict[str, Any]) -> dict[str, 
         asynchronous=asynchronous,
         proxy_url=proxy_url,
         _policy=kwargs.pop("_policy", None),
+        _pool_by_origin=kwargs.pop("_pool_by_origin", False),
     )
     options.update(kwargs, event_hooks=hooks, max_redirects=max_redirects)
     return options

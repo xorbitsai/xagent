@@ -384,11 +384,11 @@ class TestZhipuLLM:
     @pytest.mark.asyncio
     async def test_list_available_models_with_default_base_url(self, mocker):
         """Test listing available models using default base URL (official API)."""
-        # The zai SDK method may not exist or work as expected, so we test
-        # the HTTP fallback path by making the SDK method raise AttributeError
-        mock_client = MagicMock()
-        mock_client.models.list.side_effect = AttributeError("no such method")
-        mocker.patch("zai.ZhipuAiClient", return_value=mock_client)
+        # Catalogs use HTTP directly; constructing an unused SDK is a regression.
+        sdk = mocker.patch(
+            "xagent.core.model.chat.basic.zhipu.ZhipuAiClient",
+            side_effect=AssertionError("unused SDK"),
+        )
 
         # Mock httpx response for HTTP fallback
         mock_response = mocker.MagicMock()
@@ -425,15 +425,16 @@ class TestZhipuLLM:
         assert models[0]["id"] == "glm-4-flash"
         assert models[1]["id"] == "glm-4"
 
-        # Verify the HTTP API was called (fallback from SDK)
+        # Verify the guarded HTTP catalog endpoint was called directly.
         mock_async_client.get.assert_called_once()
         call_args = mock_async_client.get.call_args
         assert "open.bigmodel.cn/v1/models" in call_args[0][0]
+        sdk.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_list_available_models_with_custom_base_url(self, mocker):
         """Test listing available models using custom base URL."""
-        # Mock httpx response for fallback
+        # Mock the HTTP catalog response.
         mock_response = mocker.MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
@@ -454,7 +455,7 @@ class TestZhipuLLM:
 
         mocker.patch("httpx.AsyncClient", return_value=mock_async_client)
 
-        # Call with custom base_url - should fallback to HTTP
+        # Call the custom HTTP catalog endpoint.
         custom_base_url = "https://custom-proxy.com/v1"
         models = await ZhipuLLM.list_available_models(
             "test-api-key", base_url=custom_base_url
@@ -487,11 +488,6 @@ class TestZhipuLLM:
         mock_async_client.get.side_effect = error
         mock_async_client.__aenter__.return_value = mock_async_client
         mock_async_client.__aexit__.return_value = None
-
-        # Mock zai to raise AttributeError (no models.list method)
-        mock_client = MagicMock()
-        mock_client.models.list.side_effect = AttributeError("no such method")
-        mocker.patch("zai.ZhipuAiClient", return_value=mock_client)
 
         # Patch httpx module (top-level import, not in zhipu module)
         mocker.patch("httpx.AsyncClient", return_value=mock_async_client)

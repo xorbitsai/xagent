@@ -6,15 +6,14 @@ Provides common functionality for ASR, TTS, and other Xinference-based models.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from inspect import isawaitable
 from typing import Any, Optional, Protocol
 
+from ..utils.async_cleanup import finish_async_cleanup
 from .public_xinference import PublicAsyncXinferenceClient
 
 logger = logging.getLogger(__name__)
-_PENDING_CLOSES: set[asyncio.Task[None]] = set()
 
 
 async def _finish_closes(pending: list[Any]) -> None:
@@ -85,14 +84,7 @@ class BaseXinferenceModel:
         pending = self._start_closes()
         if not pending:
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            asyncio.run(_finish_closes(pending))
-        else:
-            task = loop.create_task(_finish_closes(pending))
-            _PENDING_CLOSES.add(task)
-            task.add_done_callback(_PENDING_CLOSES.discard)
+        finish_async_cleanup(_finish_closes(pending))
 
     def _start_closes(self) -> list[Any]:
         resources = [self._model_handle, self._client]

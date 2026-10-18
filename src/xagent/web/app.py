@@ -1864,6 +1864,9 @@ async def startup_event() -> None:
     from ..config import get_task_execution_role, validate_task_execution_host_config
 
     validate_auth_config()
+    from ..core.model.network_policy import ModelNetworkPolicy
+
+    ModelNetworkPolicy()  # Fail before admitting work if operator policy is invalid.
     from .services.auth_attempts import validate_auth_attempt_storage
 
     await asyncio.to_thread(validate_auth_attempt_storage)

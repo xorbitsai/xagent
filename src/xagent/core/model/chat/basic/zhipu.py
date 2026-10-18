@@ -12,7 +12,6 @@ import httpx
 from ...public_http import (
     create_owned_sync_sdk_client,
     create_public_model_async_client,
-    create_public_model_sync_client,
 )
 from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMTimeoutError
@@ -1177,82 +1176,29 @@ class ZhipuLLM(BaseLLM):
             ...     base_url="https://my-proxy.com/v1"
             ... )
         """
-        if ZhipuAiClient is None:
-            raise ImportError(
-                "zai SDK is not installed. Please install it with: pip install zai"
-            )
-
         # Use official Zhipu API if base_url not provided
         if not base_url:
             base_url = "https://open.bigmodel.cn/v1"
 
-        public_http = create_public_model_sync_client(timeout=30.0)
         try:
-            # Create client instance
-            client = ZhipuAiClient(
-                api_key=api_key,
-                base_url=base_url,
-                http_client=public_http,
-                max_retries=0,
-            )
-
-            # Try to use SDK's models.list() method if available
-            try:
-                # zai SDK should have a models.list() method
-                models_response = await asyncio.to_thread(
-                    getattr(client, "models").list
-                )
-
-                models = []
-                for model in models_response.data:
-                    models.append(
-                        {
-                            "id": model.id,
-                            "created": getattr(model, "created", None),
-                            "owned_by": "zhipu",
-                        }
-                    )
-
-                # Sort by created date (newest first)
-                models.sort(
-                    key=lambda x: (
-                        (x.get("created") or 0) if x.get("created") is not None else 0
-                    ),
-                    reverse=True,
-                )
-                return models
-
-            except AttributeError:
-                # If SDK doesn't have models.list(), use OpenAI-compatible endpoint
-                url = base_url.rstrip("/") + "/models"
-                headers = {"Authorization": f"Bearer {api_key}"}
-
-                async with create_public_model_async_client(
-                    timeout=30.0
-                ) as http_client:
-                    response = await http_client.get(url, headers=headers)
-                    response.raise_for_status()
-                    data = response.json()
-
-                    models = []
-                    for model in data.get("data", []):
-                        models.append(
-                            {
-                                "id": model.get("id"),
-                                "created": model.get("created"),
-                                "owned_by": "zhipu",
-                            }
-                        )
-
-                    models.sort(
-                        key=lambda x: (
-                            (x.get("created") or 0)
-                            if x.get("created") is not None
-                            else 0
-                        ),
-                        reverse=True,
-                    )
-                    return models
+            # The pinned zai SDK has no model catalog API. Use the guarded
+            # OpenAI-compatible endpoint without constructing an unused SDK.
+            url = base_url.rstrip("/") + "/models"
+            headers = {"Authorization": f"Bearer {api_key}"}
+            async with create_public_model_async_client(timeout=30.0) as http_client:
+                response = await http_client.get(url, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+            models = [
+                {
+                    "id": model.get("id"),
+                    "created": model.get("created"),
+                    "owned_by": "zhipu",
+                }
+                for model in data.get("data", [])
+            ]
+            models.sort(key=lambda model: model.get("created") or 0, reverse=True)
+            return models
 
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error fetching Zhipu models: {e.response.status_code}")
@@ -1264,5 +1210,3 @@ class ZhipuLLM(BaseLLM):
             if raise_on_error:
                 raise
             return []
-        finally:
-            public_http.close()

@@ -27,8 +27,9 @@ async def test_real_provider_rejects_private_base_before_inner_transport(
     def transport(**kwargs):
         options.append(kwargs)
         return httpx.MockTransport(
-            lambda request: seen.append(request)
-            or httpx.Response(200, json={"data": []})
+            lambda request: (
+                seen.append(request) or httpx.Response(200, json={"data": []})
+            )
         )
 
     monkeypatch.setattr(httpx, "HTTPTransport", transport)
@@ -71,7 +72,6 @@ async def test_real_provider_rejects_private_base_before_inner_transport(
         )
         assert sdk_http.follow_redirects is True
         expected_proxy = "http://operator-proxy.example:3128" if via_proxy else None
-        assert options and all(item["proxy"] == expected_proxy for item in options)
         if provider == "zhipu":
             assert sdk_http.timeout.connect == model.timeout
         try:
@@ -90,6 +90,7 @@ async def test_real_provider_rejects_private_base_before_inner_transport(
         else:
             pytest.fail("SDK request escaped the destination policy")
         assert not seen
+        assert options and all(item["proxy"] == expected_proxy for item in options)
     finally:
         await model.close()
 
@@ -166,7 +167,9 @@ def test_bedrock_real_sdk_swap_and_private_refusal(monkeypatch):
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
-    model = BedrockLLM("test", endpoint_url="http://127.0.0.1:9997", timeout=7)
+    model = BedrockLLM(
+        "test", region_name="us-east-1", endpoint_url="http://127.0.0.1:9997", timeout=7
+    )
     sdk = model._build_client()
     try:
         session = sdk._endpoint.http_session

@@ -859,8 +859,9 @@ class GeminiLLM(BaseLLM):
 
             # Both limits are deadlines on the wait itself, not checks made
             # when a chunk arrives: a check on arrival never runs for a stream
-            # that stays silent, and without a configured ``base_url`` the SDK
-            # client has no HTTP timeout to bound it either (#3058). With tools
+            # that stays silent. The configured HTTP timeout applies to both
+            # official and custom endpoints, but is not a first-token deadline.
+            # With tools
             # (AFC is disabled in ``_build_gemini_tool_config``) the SDK sends
             # the request and waits for the response headers inside
             # ``generate_content_stream(...)``; without tools it sends the

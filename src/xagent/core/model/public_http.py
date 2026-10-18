@@ -1,6 +1,5 @@
 """Operator proxy policy and ownership for managed model SDK clients."""
 
-import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -8,7 +7,9 @@ import aiohttp
 import httpx
 
 from ...config import get_trusted_egress_proxy_enabled
-from ..tools.core.web_content import get_trusted_proxy_url
+from ..utils.async_cleanup import _PENDING_CLOSES as _PENDING_CLOSES
+from ..utils.async_cleanup import finish_async_cleanup
+from ..utils.egress_proxy import get_trusted_proxy_url
 from ..utils.public_aiohttp import create_public_aiohttp_session
 from ..utils.public_http_transport import (
     UnsafePublicHttpTarget,
@@ -18,8 +19,6 @@ from ..utils.public_http_transport import (
 )
 from ..utils.security import PrivateNetworkHostError
 from .network_policy import ModelNetworkPolicy
-
-_PENDING_CLOSES: set[asyncio.Task[None]] = set()
 
 
 def get_model_proxy_url() -> str | None:
@@ -35,27 +34,26 @@ def close_async_client_on_error(client: httpx.AsyncClient) -> None:
             # Cleanup must not replace the original constructor failure.
             pass
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        asyncio.run(close())
-    else:
-        task = loop.create_task(close())
-        _PENDING_CLOSES.add(task)
-        task.add_done_callback(_PENDING_CLOSES.discard)
+    finish_async_cleanup(close())
 
 
 def create_public_model_async_client(**kwargs: Any) -> httpx.AsyncClient:
     kwargs.setdefault("follow_redirects", True)
     return create_public_async_client(
-        proxy_url=get_model_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
+        proxy_url=get_model_proxy_url(),
+        _policy=ModelNetworkPolicy(),
+        _pool_by_origin=True,
+        **kwargs,
     )
 
 
 def create_public_model_sync_client(**kwargs: Any) -> httpx.Client:
     kwargs.setdefault("follow_redirects", True)
     return create_public_sync_client(
-        proxy_url=get_model_proxy_url(), _policy=ModelNetworkPolicy(), **kwargs
+        proxy_url=get_model_proxy_url(),
+        _policy=ModelNetworkPolicy(),
+        _pool_by_origin=True,
+        **kwargs,
     )
 
 
@@ -65,6 +63,7 @@ def public_model_http_client_options(*, asynchronous: bool) -> dict[str, Any]:
             asynchronous=asynchronous,
             proxy_url=get_model_proxy_url(),
             _policy=ModelNetworkPolicy(),
+            _pool_by_origin=True,
         ),
         "follow_redirects": True,
     }

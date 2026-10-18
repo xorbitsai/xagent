@@ -97,7 +97,9 @@ async def test_untrusted_ambient_proxy_is_ignored_by_every_model_transport(monke
     monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
-    sdk = BedrockLLM("test", endpoint_url="https://bedrock.example")._build_client()
+    sdk = BedrockLLM(
+        "test", region_name="us-east-1", endpoint_url="https://bedrock.example"
+    )._build_client()
     try:
         assert sdk._endpoint.http_session._via_proxy is False
     finally:
@@ -213,9 +215,7 @@ def test_xinference_failed_auth_probe_closes_guarded_session(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "provider", ["openai", "claude", "zhipu_fallback", "zhipu_sdk"]
-)
+@pytest.mark.parametrize("provider", ["openai", "claude", "zhipu"])
 async def test_catalog_clients_refuse_private_endpoints_without_dispatch(
     monkeypatch, provider
 ):
@@ -223,8 +223,9 @@ async def test_catalog_clients_refuse_private_endpoints_without_dispatch(
 
     def transport(**kwargs):
         return httpx.MockTransport(
-            lambda request: seen.append(request)
-            or httpx.Response(200, json={"data": []})
+            lambda request: (
+                seen.append(request) or httpx.Response(200, json={"data": []})
+            )
         )
 
     monkeypatch.setattr(httpx, "HTTPTransport", transport)
@@ -248,16 +249,11 @@ async def test_catalog_clients_refuse_private_endpoints_without_dispatch(
     else:
         from xagent.core.model.chat.basic import zhipu
 
-        if provider == "zhipu_sdk":
-
-            def factory(**kwargs):
-                return SimpleNamespace(
-                    models=SimpleNamespace(
-                        list=lambda: kwargs["http_client"].get(url + "/models")
-                    )
-                )
-
-            monkeypatch.setattr(zhipu, "ZhipuAiClient", factory)
+        monkeypatch.setattr(
+            zhipu,
+            "ZhipuAiClient",
+            Mock(side_effect=AssertionError("catalog constructed SDK")),
+        )
         fetch = zhipu.ZhipuLLM.list_available_models
     with pytest.raises(Exception) as error:
         await fetch("key", base_url=url, raise_on_error=True)

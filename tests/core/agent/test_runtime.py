@@ -2350,12 +2350,24 @@ class TestGuardedCompactionBudgetLadder:
     @pytest.fixture
     def provider(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         state: dict[str, Any] = {"mode": "429", "budget_limit": 1500, "seen": []}
+        import socket
+
+        # The real guarded transport resolves and pins URLs before the mocked
+        # wire. One deterministic DNS answer keeps address fallback separate
+        # from the outer retry-cycle contract being tested here.
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda host, port, *args, **kwargs: [
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))
+            ],
+        )
 
         async def handle_async_request(self: Any, request: httpx.Request) -> Any:
             body = json.loads((await request.aread()) or b"{}")
             budget = body.get("max_tokens") or body.get("max_completion_tokens")
             state["seen"].append(budget)
-            claude = request.url.host == "api.anthropic.com"
+            claude = request.headers["Host"] == "api.anthropic.com"
             mode = state["mode"]
             if mode == "connect":
                 raise httpx.ConnectError("connection refused", request=request)

@@ -6,25 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
-# Handle optional xinference dependency
 try:
-    import xinference.client.restful.async_restful_client  # noqa: F401
-
-    _ASYNC_CLIENT_PATH = "xinference.client.restful.async_restful_client.AsyncClient"
+    import xinference_client  # noqa: F401
 except ImportError:
-    try:
-        import xinference_client.client.restful.async_restful_client  # noqa: F401
-
-        _ASYNC_CLIENT_PATH = (
-            "xagent.core.model.xinference_base.PublicAsyncXinferenceClient"
-        )
-    except ImportError:
-        pytest.skip(
-            "Neither xinference nor xinference_client is installed",
-            allow_module_level=True,
-        )
+    pytest.skip("xinference_client is not installed", allow_module_level=True)
 
 from xagent.core.model.asr import ASRResult, ASRSegment, XinferenceASR
+
+_ASYNC_CLIENT_PATH = "xagent.core.model.xinference_base.PublicAsyncXinferenceClient"
 
 
 class TestXinferenceASR:

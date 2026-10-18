@@ -38,8 +38,8 @@ def test_sync_sdk_auth_probe_and_every_handle_use_public_sessions(
         calls.append(url)
         response = requests.Response()
         response.status_code = 200
-        response.json = (
-            lambda: {"auth": True}
+        response.json = lambda: (
+            {"auth": True}
             if url.endswith("/auth")
             else {"model_type": model_type, "model_ability": [ability]}
         )
@@ -112,6 +112,73 @@ async def test_base_model_awaits_real_async_session_cleanup():
     await model.aclose()
     assert session.closed
     assert model._client is None
+
+
+@pytest.mark.asyncio
+async def test_real_async_discovery_and_handle_guard_dns_before_socket(monkeypatch):
+    import asyncio
+    import json
+
+    seen = []
+
+    async def serve(reader, writer):
+        try:
+            seen.append(await reader.readuntil(b"\r\n\r\n"))
+            body = json.dumps({"model_type": "embedding"}).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                + str(len(body)).encode()
+                + b"\r\n\r\n"
+                + body
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    class Resolver(aiohttp.abc.AbstractResolver):
+        answer = "127.0.0.1"
+
+        async def resolve(self, host, port, family=0):
+            import socket
+
+            return [
+                {
+                    "hostname": host,
+                    "host": self.answer,
+                    "port": port,
+                    "family": socket.AF_INET,
+                    "proto": 0,
+                    "flags": 0,
+                }
+            ]
+
+        async def close(self):
+            pass
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    origin = f"http://xinference.example:{server.sockets[0].getsockname()[1]}"
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_ENDPOINTS", origin)
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_CIDRS", "127.0.0.1/32")
+    resolver = Resolver()
+    async with server:
+        client = PublicAsyncXinferenceClient(origin, api_key="key")
+        client.session.connector._resolver = resolver
+        handle = None
+        try:
+            handle = await client.get_model("embedding")
+            assert len(seen) == 1 and b"Authorization: Bearer key" in seen[0]
+            handle.session.connector._resolver = resolver
+            resolver.answer = "10.0.0.1"
+            with pytest.raises(PrivateNetworkHostError):
+                await handle.session.get(origin + "/v1/embeddings")
+            with pytest.raises(PrivateNetworkHostError):
+                await client.get_model("refused")
+            assert len(seen) == 1
+        finally:
+            if handle is not None:
+                await handle.close()
+            await client.close()
 
 
 def test_real_sync_client_close_closes_guarded_session(monkeypatch):

@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp.abc import ResolveResult
 from yarl import URL
 
+from .public_http_transport import UnsafePublicHttpTarget
 from .public_policy import HttpDestinationPolicy
 from .security import (
     build_ca_bundle_ssl_context,
@@ -124,10 +125,12 @@ async def _check_redirect(
         )
         if target.origin() != params.url.origin():
             # Model APIs carry custom credentials and non-replayable bodies.
-            raise ValueError("Cross-origin model API redirects are not allowed")
+            raise UnsafePublicHttpTarget(
+                "Cross-origin model API redirects are not allowed"
+            )
         context.public_redirects = getattr(context, "public_redirects", 0) + 1
         if context.public_redirects > 5:
-            raise ValueError("Too many public API redirects")
+            raise UnsafePublicHttpTarget("Too many public API redirects")
     except BaseException:
         # aiohttp invokes this hook before its own redirect-response release.
         params.response.release()

@@ -78,6 +78,7 @@ async def download(url, destination):
         "http://169.254.43518/latest/meta-data/",
         "http://127.1./a",
         "http://169.254.169.254/latest/meta-data/",
+        "http://169。254。169。254/latest/meta-data/",
         "http://[::1]/a",
         "http://[::ffff:127.0.0.1]/a",
         "http://10.0.0.1/a",

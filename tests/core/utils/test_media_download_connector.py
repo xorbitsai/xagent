@@ -7,6 +7,19 @@ from aiohttp import web
 
 from xagent.core.utils.media_download import PublicMediaResolver, download_public_media
 
+UNSAFE_HOSTS = [
+    "2130706433",
+    "127.1",
+    "0",
+    "127.0.0.1",
+    "127。0。0。1",
+    "127．0．0．1",
+    "１２７．０．０．１",
+    "127.0.0.1．",
+    "0x7f.1",
+    "0177.0.0.1",
+]
+
 
 @pytest.fixture
 async def media_server():
@@ -16,7 +29,9 @@ async def media_server():
     async def handle(request):
         paths.append(request.path)
         if request.path == "/redirect":
-            raise web.HTTPFound(redirect["location"])
+            # Preserve Unicode in the wire header; HTTPFound normalizes it
+            # before the client can exercise its own URL normalization.
+            return web.Response(status=302, headers={"Location": redirect["location"]})
         return web.Response(body=b"must not be downloaded")
 
     app = web.Application()
@@ -32,9 +47,7 @@ async def media_server():
         await runner.cleanup()
 
 
-@pytest.mark.parametrize(
-    "host", ["2130706433", "127.1", "0", "127.0.0.1", "private.test"]
-)
+@pytest.mark.parametrize("host", [*UNSAFE_HOSTS, "private.test"])
 async def test_real_connector_never_contacts_private_host(
     host, media_server, tmp_path, monkeypatch
 ):
@@ -60,7 +73,7 @@ async def test_real_connector_never_contacts_private_host(
     assert not list(tmp_path.glob(".media-*"))
 
 
-@pytest.mark.parametrize("host", ["2130706433", "127.1", "0", "127.0.0.1"])
+@pytest.mark.parametrize("host", UNSAFE_HOSTS)
 async def test_real_connector_redirect_never_contacts_private_target(
     host, media_server, tmp_path, monkeypatch
 ):

@@ -15,7 +15,12 @@ async def test_xinference_defaults_to_inline_data_and_honors_explicit_format(
 ):
     model = XinferenceImageModel(model_name="sd", abilities=["generate", "edit"])
     monkeypatch.setattr(model, "_ensure_client", lambda: None)
-    call = Mock(return_value={"data": [{"b64_json": "aW1hZ2U="}]})
+    payload = (
+        {"url": "https://example.com/image.png"}
+        if explicit
+        else {"b64_json": "aW1hZ2U="}
+    )
+    call = Mock(return_value={"data": [payload]})
     monkeypatch.setattr(
         model, "_model_handle", SimpleNamespace(text_to_image=call, image_to_image=call)
     )
@@ -27,4 +32,8 @@ async def test_xinference_defaults_to_inline_data_and_honors_explicit_format(
             image_url="fixture.png", prompt="fixture", **kwargs
         )
     assert call.call_args.kwargs["response_format"] == (explicit or "b64_json")
-    assert result["image_url"] == "data:image/png;base64,aW1hZ2U="
+    assert result["image_url"] == (
+        "https://example.com/image.png"
+        if explicit
+        else "data:image/png;base64,aW1hZ2U="
+    )

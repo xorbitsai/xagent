@@ -4,12 +4,27 @@ import datetime
 import ssl
 from typing import Any
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from xagent.core.utils import security
+
+
+@pytest.mark.parametrize(
+    "host", ["127。0。0。1", "１２７．０．０．１", "127.0.0.1．", "169。254。169。254"]
+)
+def test_shared_url_shape_checks_the_normalized_ip(host):
+    with pytest.raises(security.PrivateNetworkHostError):
+        security.validate_public_http_url_shape(f"https://{host}/")
+
+
+def test_shared_url_shape_preserves_public_internationalized_hosts():
+    parsed = security.validate_public_http_url_shape("https://bücher.example/path")
+    assert parsed.hostname == "xn--bcher-kva.example"
+    assert parsed.path == "/path"
 
 
 def _generate_test_ca_pem() -> bytes:

@@ -2564,7 +2564,7 @@ def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
     )
     default = 64 * 1024 * 1024 if media_kind == "image" else 512 * 1024 * 1024
     value = os.getenv(variable)
-    if value is None:
+    if not value or not value.strip():
         return default
     if "." in value and value.strip().replace(".", "", 1).isdigit():
         raise ValueError(

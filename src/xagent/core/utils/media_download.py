@@ -1,7 +1,6 @@
 """Bounded, public-network-only downloads of untrusted provider media URLs."""
 
 import asyncio
-import ipaddress
 import math
 import os
 import socket
@@ -16,9 +15,10 @@ from aiohttp.abc import ResolveResult
 from aiohttp.resolver import ThreadedResolver
 
 from .security import (
-    _MAX_REDIRECTS,
+    PUBLIC_HTTP_MAX_REDIRECTS,
     build_ca_bundle_ssl_context,
     reject_private_network_host,
+    validate_public_http_url_shape,
 )
 
 
@@ -51,24 +51,7 @@ class PublicMediaResolver(ThreadedResolver):
 
 
 def _validate_media_url(url: str) -> None:
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("Media URL must be an absolute HTTP or HTTPS URL")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("Media URL must not contain embedded credentials")
-    # aiohttp bypasses its resolver for IP literals, so check them here too.
-    host = parsed.hostname.rstrip(".")
-    # aiohttp skips its resolver for decimal/shortened IPv4 spellings too.
-    # The socket layer may interpret them as private addresses; never let
-    # these ambiguous literals reach a connect without resolver validation.
-    if ":" in host or host.replace(".", "").isdigit():
-        try:
-            ipaddress.ip_address(host)
-        except ValueError as exc:
-            raise ValueError("Media URL contains a non-canonical IP address") from exc
-    reject_private_network_host(host)
-    if parsed.port == 0:
-        raise ValueError("Media URL contains an invalid port")
+    validate_public_http_url_shape(url)
 
 
 async def download_public_media(
@@ -105,12 +88,12 @@ async def download_public_media(
                 trust_env=False,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as session:
-                for hop in range(_MAX_REDIRECTS + 1):
+                for hop in range(PUBLIC_HTTP_MAX_REDIRECTS + 1):
                     _validate_media_url(url)
                     async with session.get(url, allow_redirects=False) as response:
                         if response.status in {301, 302, 303, 307, 308}:
                             location = response.headers.get("Location")
-                            if not location or hop == _MAX_REDIRECTS:
+                            if not location or hop == PUBLIC_HTTP_MAX_REDIRECTS:
                                 raise ValueError("Invalid or excessive media redirects")
                             target = urljoin(url, location)
                             if (

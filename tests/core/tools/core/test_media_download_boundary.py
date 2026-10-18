@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -94,3 +95,33 @@ async def test_configured_budget_reaches_result_download(
     method = image._download_image if kind == "image" else video._download_video
     await method("https://example.com/result")
     assert downloader.await_args.kwargs["max_bytes"] == 1024
+
+
+@pytest.mark.parametrize("method", ["generate_image", "edit_image"])
+async def test_failed_image_save_reports_redacted_download_error(
+    method, media_tools, monkeypatch
+):
+    image, _, workspace = media_tools
+    model = Mock()
+    model.model_name = "fixture"
+    model.generate_image = AsyncMock(
+        return_value={"image_url": "http://10.0.0.1/image"}
+    )
+    model.edit_image = AsyncMock(return_value={"image_url": "http://10.0.0.1/image"})
+    monkeypatch.setattr(image, "_get_model", lambda _: model)
+    monkeypatch.setattr(image, "_get_edit_model", lambda _: model)
+    workspace.auto_register_files = nullcontext
+    monkeypatch.setattr(
+        image,
+        "_download_image",
+        AsyncMock(side_effect=ValueError("token=sensitive-provider-credential")),
+    )
+    kwargs = (
+        {"image_url": "data:image/png;base64,aQ=="} if method == "edit_image" else {}
+    )
+    result = await getattr(image, method)(prompt="fixture", **kwargs)
+    assert result["success"] is True  # Provider succeeded; saving did not.
+    assert result["saved_to_workspace"] is False
+    assert result["image_path"] is None
+    assert "token=" in result["download_error"]
+    assert "sensitive-provider-credential" not in result["download_error"]

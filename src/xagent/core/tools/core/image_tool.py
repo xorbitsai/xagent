@@ -761,6 +761,7 @@ Images are automatically saved to workspace.
 
             image_url = result.get("image_url")
             image_path = None
+            download_error = None
             image_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
@@ -784,7 +785,10 @@ Images are automatically saved to workspace.
                                 image_path
                             )
                 except Exception as e:
-                    logger.warning(f"Failed to download image to workspace: {e}")
+                    download_error = redact_sensitive_text(str(e))
+                    logger.warning(
+                        "Failed to download image to workspace: %s", download_error
+                    )
                     # Continue execution even if download fails
             elif image_url and not self._workspace:
                 logger.warning("No workspace available, image not saved locally")
@@ -801,6 +805,8 @@ Images are automatically saved to workspace.
                 "model_used": actual_model_id,
                 "saved_to_workspace": image_path is not None,
             }
+            if download_error is not None:
+                response["download_error"] = download_error
             return response
 
         except Exception as e:
@@ -913,6 +919,7 @@ Images are automatically saved to workspace.
 
             edited_image_url = result.get("image_url")
             image_path = None
+            download_error = None
             image_file_id: Optional[str] = None
             file_ref: Optional[dict[str, Any]] = None
 
@@ -940,12 +947,16 @@ Images are automatically saved to workspace.
                                 image_path
                             )
                 except Exception as e:
-                    logger.warning(f"Failed to download edited image to workspace: {e}")
+                    download_error = redact_sensitive_text(str(e))
+                    logger.warning(
+                        "Failed to download edited image to workspace: %s",
+                        download_error,
+                    )
                     # Continue execution even if download fails
             elif edited_image_url and not self._workspace:
                 logger.warning("No workspace available, edited image not saved locally")
 
-            return {
+            response = {
                 "success": True,
                 "image_path": image_path,
                 "file_id": image_file_id,
@@ -957,6 +968,9 @@ Images are automatically saved to workspace.
                 "model_used": actual_model_id,
                 "saved_to_workspace": image_path is not None,
             }
+            if download_error is not None:
+                response["download_error"] = download_error
+            return response
 
         except Exception as e:
             logger.error(f"Image editing failed: {e}")

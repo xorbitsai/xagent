@@ -64,6 +64,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
 from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
+from ...core.utils.public_http_transport import create_public_async_client
 from ..services.actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
@@ -955,7 +956,7 @@ async def refresh_oauth_token_if_needed(
         normalized_provider = provider_name.lower()
 
         if normalized_provider == "meta":
-            async with httpx.AsyncClient() as client:
+            async with create_public_async_client() as client:
                 response = await _request_oauth_refresh_with_retries(
                     lambda: client.get(
                         provider_config.token_url,
@@ -1145,7 +1146,7 @@ async def refresh_oauth_token_if_needed(
             headers["Content-Type"] = "application/json"
             body_kwarg = {"json": data}
 
-        async with httpx.AsyncClient() as client:
+        async with create_public_async_client() as client:
             response = await _request_oauth_refresh_with_retries(
                 lambda: client.post(
                     refresh_token_url,

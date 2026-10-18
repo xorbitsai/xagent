@@ -3829,7 +3829,15 @@ class _TransportRecorder:
             auth: httpx.Auth | None = None,
         ) -> httpx.AsyncClient:
             self.raise_if_sealed()
-            client = build(headers=headers, timeout=timeout, auth=auth)
+            if connection.get("httpx_client_factory") is None:
+                client = create_mcp_http_client(
+                    headers=headers,
+                    timeout=timeout,
+                    auth=auth,
+                    endpoint_url=str(connection.get("url", "")) or None,
+                )
+            else:
+                client = build(headers=headers, timeout=timeout, auth=auth)
             self._clients.append(client)
             return client
 

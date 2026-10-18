@@ -911,8 +911,9 @@ def test_transport_recorder_instrument_domain(monkeypatch, transport, custom_fac
 
     default_calls = {"n": 0}
 
-    def fake_default(headers=None, timeout=None, auth=None):
+    def fake_default(headers=None, timeout=None, auth=None, *, endpoint_url=None):
         default_calls["n"] += 1
+        assert endpoint_url == connection["url"]
         return _FakeHttpxClient()
 
     monkeypatch.setattr(mcp_adapter_module, "create_mcp_http_client", fake_default)

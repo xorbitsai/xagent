@@ -8,14 +8,16 @@ from __future__ import annotations
 import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
+from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared._httpx_utils import create_mcp_http_client
 from typing_extensions import NotRequired, TypedDict
+
+from .http import create_mcp_http_client
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -261,7 +263,8 @@ async def _create_sse_session(  # noqa: PLR0913
             timeout,
             sse_read_timeout,
             auth=auth,
-            httpx_client_factory=httpx_client_factory or create_mcp_http_client,
+            httpx_client_factory=httpx_client_factory
+            or partial(create_mcp_http_client, endpoint_url=url),
         ) as (
             read,
             write,
@@ -301,8 +304,9 @@ async def _create_streamable_http_session(  # noqa: PLR0913
     """
     # Create and store the connection
     kwargs = {}
-    if httpx_client_factory is not None:
-        kwargs["httpx_client_factory"] = httpx_client_factory
+    kwargs["httpx_client_factory"] = httpx_client_factory or partial(
+        create_mcp_http_client, endpoint_url=url
+    )
 
     async with (
         streamablehttp_client(
@@ -339,7 +343,7 @@ async def _create_websocket_session(
         ImportError: If websockets package is not installed.
     """
     try:
-        from mcp.client.websocket import websocket_client
+        from .websocket import public_websocket_client
     except ImportError:
         msg = (
             "Could not import websocket_client. "
@@ -349,7 +353,7 @@ async def _create_websocket_session(
         raise ImportError(msg) from None
 
     async with (
-        websocket_client(url) as (read, write),
+        public_websocket_client(url) as (read, write),
         ClientSession(read, write, **(session_kwargs or {})) as session,
     ):
         yield session

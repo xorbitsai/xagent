@@ -53,6 +53,16 @@ class ObservedStream(httpx.AsyncByteStream):
 
 @pytest.fixture
 def network(monkeypatch):
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "XAGENT_TRUSTED_EGRESS_PROXY",
+    ):
+        monkeypatch.delenv(name, raising=False)
     dns = AsyncMock(
         return_value=[
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", (PUBLIC_IP, 443)),
@@ -120,12 +130,8 @@ async def test_mixed_dns_answers_fail_closed(network):
 
 
 @pytest.mark.asyncio
-async def test_real_download_pins_ip_host_and_sni_without_ambient_proxy(
-    network, monkeypatch
-):
+async def test_real_download_pins_ip_host_and_sni_without_ambient_proxy(network):
     dns, seen, replies, options = network
-    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
-    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:3128")
     replies.append(httpx.Response(200, json={"segments": []}))
     result = await download_public_input(
         "https://example.com:8443/input", timeout=1, max_bytes=100
@@ -138,6 +144,51 @@ async def test_real_download_pins_ip_host_and_sni_without_ambient_proxy(
     assert seen[0].extensions["sni_hostname"] == "example.com"
     assert options and all(item["trust_env"] is False for item in options)
     assert all(item.get("proxy") is None for item in options)
+    assert seen[0].headers["accept-encoding"] == "identity"
+
+
+@pytest.mark.asyncio
+async def test_untrusted_ambient_proxy_fails_before_dispatch(network, monkeypatch):
+    dns, seen, _, options = network
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy-user:proxy-secret@127.0.0.1:3128")
+    with pytest.raises(PublicDownloadError, match="policy") as caught:
+        await download_public_input("https://example.com/", timeout=1, max_bytes=100)
+    assert "proxy-secret" not in str(caught.value)
+    assert not seen and not options
+    dns.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_explicit_trusted_proxy_preserves_hostname_and_validates_redirects(
+    network, monkeypatch
+):
+    dns, seen, replies, options = network
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+    monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    replies.extend(
+        [
+            httpx.Response(302, headers={"Location": "https://example.net/next"}),
+            httpx.Response(302, headers={"Location": "https://127.0.0.1/private"}),
+        ]
+    )
+    with pytest.raises(PublicDownloadError):
+        await download_public_input("https://example.com/", timeout=1, max_bytes=100)
+    assert dns.await_count == 2
+    assert [request.url.host for request in seen] == ["example.com", "example.net"]
+    assert any(item.get("proxy") is not None for item in options)
+    assert all(item["trust_env"] is False for item in options)
+    assert all("sni_hostname" not in request.extensions for request in seen)
+
+
+@pytest.mark.asyncio
+async def test_https_redirect_cannot_downgrade_to_public_http(network):
+    _, seen, replies, _ = network
+    replies.append(
+        httpx.Response(302, headers={"Location": "http://example.net/input"})
+    )
+    with pytest.raises(PublicDownloadError):
+        await download_public_input("https://example.com/", timeout=1, max_bytes=100)
+    assert len(seen) == 1
 
 
 @pytest.mark.asyncio
@@ -217,15 +268,55 @@ async def test_declared_size_is_rejected_without_reading_body(network):
 @pytest.mark.parametrize("encoded", [False, True])
 async def test_streamed_decoded_size_is_bounded_and_response_closed(encoded, network):
     _, _, replies, _ = network
-    payload = b"x" * 100
-    stream = ObservedStream([gzip.compress(payload) if encoded else payload])
+    payload = b"x" * 100000
+    compressed = gzip.compress(payload)
+    assert len(compressed) < 1000 < len(payload)
+    stream = ObservedStream([compressed if encoded else payload])
     replies.append(
         httpx.Response(
             200, headers={"Content-Encoding": "gzip"} if encoded else {}, stream=stream
         )
     )
     with pytest.raises(PublicDownloadError):
-        await download_public_input("https://example.com/", timeout=1, max_bytes=10)
+        await download_public_input("https://example.com/", timeout=1, max_bytes=1000)
+    assert stream.read_count == (0 if encoded else 1)
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_shared_downloader_decoded_limit_is_not_only_a_wire_length_limit(network):
+    _, _, replies, _ = network
+    compressed = gzip.compress(b"x" * 100000)
+    assert len(compressed) < 1000
+    stream = ObservedStream([compressed])
+    replies.append(
+        httpx.Response(
+            200,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Length": str(len(compressed)),
+            },
+            stream=stream,
+        )
+    )
+    async with httpx.AsyncClient(trust_env=False) as client:
+        with pytest.raises(ValueError, match="maximum size"):
+            await security.fetch_public_http_bytes(
+                client, "https://example.com/", timeout=1, max_content_bytes=1000
+            )
+    assert stream.read_count == 1
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [201, 204, 206])
+async def test_non_200_success_status_is_rejected_before_read(status, network):
+    _, _, replies, _ = network
+    stream = ObservedStream([b"partial-or-unexpected"])
+    replies.append(httpx.Response(status, stream=stream))
+    with pytest.raises(PublicDownloadError, match=f"HTTP {status}"):
+        await download_public_input("https://example.com/", timeout=1, max_bytes=100)
+    assert stream.read_count == 0
     assert stream.closed
 
 
@@ -315,6 +406,12 @@ async def test_audio_json_cannot_fall_back_to_a_host_file(tmp_path, use_symlink)
         tts_models={"fake": tts}, workspace=workspace
     ).synthesize_speech_json(file_id=str(target))
     assert result["success"] is False
+    assert any(
+        "workspace" in error.lower()
+        or "outside" in error.lower()
+        or "access" in error.lower()
+        for error in result.get("errors", [str(result.get("error", ""))])
+    )
     assert "must-not-be-read" not in json.dumps(result)
     assert tts.calls == []
 
@@ -345,7 +442,59 @@ async def test_batch_voice_reference_cannot_bypass_workspace(tmp_path):
         json_data={"segments": [{"text": "hello", "reference_audio": str(secret)}]}
     )
     assert result["success"] is False
+    assert any(
+        "workspace" in error.lower()
+        or "outside" in error.lower()
+        or "access" in error.lower()
+        for error in result["errors"]
+    )
     assert tts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_relative_json_and_voice_reference_reach_tts(tmp_path):
+    workspace = TaskWorkspace("audio-relative", base_dir=str(tmp_path))
+    reference = workspace.input_dir / "voice.wav"
+    reference.write_bytes(b"authorized-voice")
+    source = workspace.input_dir / "batch.json"
+    source.write_text(
+        json.dumps(
+            {"segments": [{"text": "authorized", "reference_audio": "input/voice.wav"}]}
+        )
+    )
+    tts = FakeTTS()
+    result = await AudioToolCore(
+        tts_models={"fake": tts}, workspace=workspace
+    ).synthesize_speech_json(file_id="input/batch.json")
+    assert result["success"] is True, result
+    assert tts.calls[0]["reference_audio"] == str(reference)
+
+
+@pytest.mark.asyncio
+async def test_batch_preserves_provider_reference_url(tmp_path):
+    workspace = TaskWorkspace("audio-provider-reference", base_dir=str(tmp_path))
+    tts = FakeTTS()
+    reference = "https://provider.example/reference.wav"
+    result = await AudioToolCore(
+        tts_models={"fake": tts}, workspace=workspace
+    ).synthesize_speech_json(
+        json_data={"segments": [{"text": "hello", "reference_audio": reference}]}
+    )
+    assert result["success"] is True, result
+    assert tts.calls[0]["reference_audio"] == reference
+
+
+@pytest.mark.asyncio
+async def test_gemini_partial_reference_does_not_reach_billed_model_call(network):
+    _, seen, replies, _ = network
+    stream = ObservedStream([b"partial-image"])
+    replies.append(httpx.Response(206, stream=stream))
+    model = GeminiImageModel(model_name="gemini-3-pro-image", api_key="provider-secret")
+    with pytest.raises(RuntimeError, match="HTTP 206"):
+        await model.edit_image("https://example.com/reference", "edit")
+    assert len(seen) == 1
+    assert stream.read_count == 0
+    assert stream.closed
 
 
 @pytest.mark.asyncio

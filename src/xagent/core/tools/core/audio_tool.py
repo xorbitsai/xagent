@@ -1785,36 +1785,9 @@ class AudioToolCore:
 
             # Handle reference audio for voice cloning
             if ref_audio_id:
-                ref_audio_path = None
-
-                if self._workspace:
-                    # Batch voice references need the same authorization gate
-                    # as single synthesis, not a raw host-path fallback.
-                    ref_audio_path = self._workspace.resolve_path_with_search(
-                        ref_audio_id
-                    )
-                else:
-                    direct_path = Path(ref_audio_id)
-                    if direct_path.exists():
-                        ref_audio_path = direct_path
-                    elif direct_path.is_absolute():
-                        # Absolute path but doesn't exist
-                        logger.warning(
-                            f"Reference audio file not found: {ref_audio_id}"
-                        )
-                    else:
-                        # Relative path, try current directory
-                        resolved_cwd = Path.cwd() / direct_path
-                        if resolved_cwd.exists():
-                            ref_audio_path = resolved_cwd
-                        else:
-                            logger.warning(
-                                f"Reference audio file not found: {ref_audio_id}"
-                            )
-
-                # Pass reference audio path to TTS model
-                if ref_audio_path:
-                    kwargs["reference_audio"] = str(ref_audio_path)
+                # Share the single-synthesis authorization and provider-URL
+                # contract; a missing local reference must not silently vanish.
+                kwargs["reference_audio"] = self._resolve_audio_path(ref_audio_id)
 
             # Synthesize speech
             audio_data = await tts_model.synthesize(

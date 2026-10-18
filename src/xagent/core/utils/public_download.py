@@ -5,11 +5,7 @@ import math
 
 import httpx
 
-from .security import (
-    PublicHttpResponse,
-    build_ca_bundle_ssl_context,
-    fetch_public_http_bytes,
-)
+from .security import PublicHttpResponse, fetch_public_http_bytes
 
 
 class PublicDownloadError(ValueError):
@@ -19,9 +15,9 @@ class PublicDownloadError(ValueError):
 async def download_public_input(
     url: str, *, max_bytes: int, timeout: float
 ) -> PublicHttpResponse:
-    """Use the shared DNS-pinning downloader without proxy/DNS bypasses.
+    """Use DNS pinning or an explicitly trusted policy-enforcing egress proxy.
 
-    The deadline includes DNS, every redirect and streaming the decoded body.
+    The deadline includes DNS, every redirect and streaming the identity body.
     No caller/model API credentials are attached. Errors deliberately omit
     raw URLs, redirect Locations and third-party response text.
     """
@@ -33,11 +29,17 @@ async def download_public_input(
         or not math.isfinite(timeout)
     ):
         raise ValueError("Public download limits must be positive and finite")
+    # Import lazily: web_content owns the existing deployment proxy policy.
+    from ..tools.core.web_content import (
+        build_isolated_httpx_client_kwargs,
+        get_trusted_proxy_url,
+    )
+
     try:
         async with asyncio.timeout(timeout):
+            proxy_url = get_trusted_proxy_url()
             async with httpx.AsyncClient(
-                trust_env=False,
-                verify=build_ca_bundle_ssl_context(),
+                **build_isolated_httpx_client_kwargs(proxy_url),
                 follow_redirects=False,
             ) as client:
                 return await fetch_public_http_bytes(
@@ -47,6 +49,10 @@ async def download_public_input(
                     timeout=timeout,
                     resource_name="remote input",
                     require_non_empty=True,
+                    via_proxy=bool(proxy_url),
+                    allow_https_downgrade=False,
+                    require_identity_encoding=True,
+                    required_status_code=200,
                 )
     except (TimeoutError, httpx.TimeoutException):
         raise PublicDownloadError("Remote input download timed out") from None

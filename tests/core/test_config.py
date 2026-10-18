@@ -4170,11 +4170,15 @@ def test_media_download_size_rejects_invalid_limits(monkeypatch, value):
 def test_remote_json_download_size_default_and_override(monkeypatch):
     monkeypatch.delenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", raising=False)
     assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024
-    monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", "123")
-    assert config.get_remote_json_download_max_bytes() == 123
+    for value in ("", " "):
+        monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
+        assert config.get_remote_json_download_max_bytes() == 10 * 1024 * 1024
+    for value, expected in (("123", 123), ("2K", 2048), ("1.5M", 1572864)):
+        monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
+        assert config.get_remote_json_download_max_bytes() == expected
 
 
-@pytest.mark.parametrize("value", ["0", "-1", "", "invalid", "1.5"])
+@pytest.mark.parametrize("value", ["0", "-1", "invalid", "1.5", "nan", "inf"])
 def test_remote_json_download_size_rejects_invalid_limits(monkeypatch, value):
     monkeypatch.setenv("XAGENT_REMOTE_JSON_DOWNLOAD_MAX_BYTES", value)
     with pytest.raises(ValueError):

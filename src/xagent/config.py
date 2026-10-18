@@ -2577,12 +2577,13 @@ def get_media_download_max_bytes(media_kind: Literal["image", "video"]) -> int:
 def get_remote_json_download_max_bytes() -> int:
     """Bound remote speech-batch JSON inputs; invalid limits fail closed."""
     value = os.getenv(REMOTE_JSON_DOWNLOAD_MAX_BYTES)
-    if value is None:
+    if not value or not value.strip():
         return 10 * 1024 * 1024
-    limit = int(value)
-    if limit <= 0:
-        raise ValueError(f"{REMOTE_JSON_DOWNLOAD_MAX_BYTES} must be positive bytes")
-    return limit
+    if "." in value and value.strip().replace(".", "", 1).isdigit():
+        raise ValueError(
+            f"Invalid {REMOTE_JSON_DOWNLOAD_MAX_BYTES} value: fractional byte counts are not supported"
+        )
+    return _parse_size_bytes(value, REMOTE_JSON_DOWNLOAD_MAX_BYTES)
 
 
 def get_max_upload_size_bytes() -> int:

@@ -16,6 +16,9 @@ claim a clean vulnerability scan or certify a deployed image.
 - Keep the supported OpenAI 2.x and Xinference 2.x client contracts, and retain
   SQLAlchemy 2.0.47 rather than introducing an unrelated database major change.
 - Align the type-checking MCP dependency with the runtime security floor.
+- Require wheel availability on Linux x86_64 and macOS ARM during resolution.
+  BoxLite 0.10.6 lacks a Linux/Python 3.12 wheel; select the complete official
+  0.10.7 release and check the frozen Linux installation plan too.
 
 The separate frontend dependency work retains the existing braces chain:
 there is no official patched release in the reviewed advisory. It does not

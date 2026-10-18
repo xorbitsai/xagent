@@ -77,8 +77,8 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-def _resolve_store_host() -> tuple[str, int | None, str]:
-    """Validate MAGENTO_BASE_URL and resolve it to a single non-private IP.
+def _resolve_store_host() -> tuple[str, int | None]:
+    """Validate MAGENTO_BASE_URL and all its resolved addresses.
 
     Unlike Shopify/Zendesk (always a "*.myshopify.com"/"*.zendesk.com"
     subdomain), Magento/Adobe Commerce is commonly self-hosted at an
@@ -90,7 +90,7 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     defense here, not just defense-in-depth, since (again unlike PostHog)
     there is no small fixed-hostname allowlist to lean on first.
 
-    Returns (hostname, port, public_ip) for configuration validation. The
+    Returns (hostname, port) for configuration validation. The
     public Requests adapter independently validates and pins its actual socket
     destination from one DNS snapshot per request; no global patch is needed.
     """
@@ -141,21 +141,18 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     except OSError as exc:
         raise ValueError(f"MAGENTO_BASE_URL could not be resolved: {exc}") from exc
 
-    pinned_ip: str | None = None
     try:
         for *_, sockaddr in resolved:
             ip = str(sockaddr[0])
             reject_private_network_host(ip)
-            if pinned_ip is None:
-                pinned_ip = ip
     except PrivateNetworkHostError as exc:
         raise ValueError(f"MAGENTO_BASE_URL is not allowed: {exc}") from exc
-    if pinned_ip is None:
+    if not resolved:
         raise ValueError(
             "MAGENTO_BASE_URL could not be resolved: no addresses returned"
         )
 
-    return hostname, port, pinned_ip
+    return hostname, port
 
 
 def _format_origin(hostname: str, port: int | None) -> str:
@@ -173,13 +170,10 @@ def _format_origin(hostname: str, port: int | None) -> str:
 
 
 def _base_url() -> str:
-    """Validate MAGENTO_BASE_URL and return the store's bare origin (scheme
-    + host[:port]). `_request()` does not call this -- it calls
-    `_resolve_store_host()` directly so a single logical request resolves
-    DNS exactly once and can pin its connection to the address it
-    validated (see `_resolve_store_host`'s docstring); this function exists
-    for its own standalone validation/error-message behavior only."""
-    hostname, port, _pinned_ip = _resolve_store_host()
+    """Validate the store origin. The public adapter separately validates and
+    pins connection-time DNS, rather than reusing this preflight snapshot.
+    """
+    hostname, port = _resolve_store_host()
     return _format_origin(hostname, port)
 
 
@@ -390,7 +384,7 @@ def _request(
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
     # Validate store configuration; the adapter owns connection-time pinning.
-    hostname, port, _ = _resolve_store_host()
+    hostname, port = _resolve_store_host()
     origin = _format_origin(hostname, port)
     url = f"{origin}{store_path_prefix}{path}"
     try:
@@ -412,8 +406,7 @@ def _request(
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient
-        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
-        # URL, which may carry embedded credentials.
+        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials.
         raise RuntimeError(redact_sensitive_text(str(exc))) from exc
 
     if 300 <= response.status_code < 400:

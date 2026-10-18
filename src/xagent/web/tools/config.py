@@ -3884,8 +3884,24 @@ class WebToolConfig(BaseToolConfig):
                     "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
                     "https_proxy": os.environ.get("https_proxy", ""),
                     "http_proxy": os.environ.get("http_proxy", ""),
+                    # Trust is operator-owned: never inherit an app's mapping
+                    # for this switch without the process environment value.
+                    "XAGENT_TRUSTED_EGRESS_PROXY": os.environ.get(
+                        "XAGENT_TRUSTED_EGRESS_PROXY", ""
+                    ),
                 }
             )
+            for env_key in (
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+            ):
+                # Also remove a launch mapping when the operator left it
+                # unset; TLS policy belongs to the deployment, not the app.
+                env.pop(env_key, None)
+                if env_key in os.environ:
+                    env[env_key] = os.environ[env_key]
             allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
             if allowed_file_dir_paths:
                 # JSON preserves commas inside directory names. The shared

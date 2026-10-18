@@ -218,9 +218,8 @@ def _request(
         except requests.RequestException as exc:
             # A connection/timeout/proxy failure's message can itself embed
             # sensitive data -- e.g. a ProxyError echoing the ambient
-            # HTTPS_PROXY URL, which may carry embedded user:pass@
-            # credentials (setup_proxy_env() exports whatever the OS has
-            # configured) -- matches posthog.py's identical fix for the
+            # explicitly trusted proxy URL, which may embed user:pass@
+            # credentials -- matches posthog.py's identical fix for the
             # same shared proxy-env exposure surface. Also bounded in
             # length the same way an HTTP-level error body is below, since
             # the redacted text is still unstructured and can be long.

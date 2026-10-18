@@ -79,6 +79,67 @@ def test_transport_config_forwards_empty_string_static_env_value(monkeypatch):
     assert transport_config["env"]["GOOGLE_ADS_DEVELOPER_TOKEN"] == ""
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_stdio_transport_forwards_operator_proxy_and_ca_policy(monkeypatch, enabled):
+    values = {
+        "HTTPS_PROXY": "http://proxy.example:3128",
+        "HTTP_PROXY": "http://proxy.example:3128",
+        "https_proxy": "http://lower.example:3128",
+        "http_proxy": "http://lower.example:3128",
+        "REQUESTS_CA_BUNDLE": "/certs/requests.pem",
+        "CURL_CA_BUNDLE": "/certs/curl.pem",
+        "SSL_CERT_FILE": "/certs/ssl.pem",
+        "SSL_CERT_DIR": "/certs",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    if enabled:
+        monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
+    else:
+        monkeypatch.delenv("XAGENT_TRUSTED_EGRESS_PROXY", raising=False)
+    config = WebToolConfig(
+        db=None, request=None
+    )._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="LinkedIn"),
+        app_info={
+            "launch_config": {
+                "command": "python",
+                "args": [],
+                "env_mapping": {
+                    "LINKEDIN_ACCESS_TOKEN": "access_token",
+                    "XAGENT_TRUSTED_EGRESS_PROXY": "access_token",
+                },
+            }
+        },
+        access_token="caller-token-must-not-enable-proxy-trust",
+    )
+    assert config["env"]["XAGENT_TRUSTED_EGRESS_PROXY"] == ("1" if enabled else "")
+    for key, value in values.items():
+        assert config["env"][key] == value
+
+
+def test_stdio_transport_does_not_create_ca_configuration_from_token_mapping(
+    monkeypatch,
+):
+    ca_keys = ("REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "SSL_CERT_FILE", "SSL_CERT_DIR")
+    for key in ca_keys:
+        monkeypatch.delenv(key, raising=False)
+    config = WebToolConfig(
+        db=None, request=None
+    )._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Example"),
+        app_info={
+            "launch_config": {
+                "command": "python",
+                "args": [],
+                "env_mapping": {key: "access_token" for key in ca_keys},
+            }
+        },
+        access_token="not-a-CA-path",
+    )
+    assert all(key not in config["env"] for key in ca_keys)
+
+
 def test_transport_config_omits_static_env_when_host_var_missing(monkeypatch):
     monkeypatch.delenv("GOOGLE_ADS_DEVELOPER_TOKEN", raising=False)
 

@@ -242,20 +242,6 @@ def test_resolve_store_host_raises_clear_error_when_idna_package_missing(monkeyp
         magento._resolve_store_host()
 
 
-def test_request_does_not_monkeypatch_global_urllib3_connection(monkeypatch):
-    import urllib3.util.connection
-
-    original = urllib3.util.connection.create_connection
-
-    def make_request(**kwargs):
-        assert urllib3.util.connection.create_connection is original
-        return MockResponse(json_data={"ok": True})
-
-    monkeypatch.setattr(magento, "_make_request", make_request)
-    magento._request("GET", "/products/abc")
-    assert urllib3.util.connection.create_connection is original
-
-
 def test_api_base_url_defaults_to_v1(monkeypatch):
     assert magento._api_base_url() == "https://store.example.com/rest/V1"
 

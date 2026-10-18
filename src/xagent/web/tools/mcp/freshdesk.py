@@ -282,8 +282,7 @@ def _send(
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient HTTPS_PROXY
-        # URL, which may carry embedded user:pass@ credentials
-        # URL, which may carry embedded credentials.
+        # URL, which may carry embedded user:pass@ credentials.
         raise RuntimeError(
             f"Freshdesk request failed: {truncate_error_text(_sanitize_exception_text(exc))}"
         ) from exc

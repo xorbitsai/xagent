@@ -62,6 +62,10 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
     TLS SNI retain the validated logical hostname, never a caller override.
     """
 
+    # Generic clients may visit different hostnames sharing an IP. Only a
+    # server-owned single-origin subclass may opt into connection reuse.
+    max_keepalive_connections = 0
+
     def __init__(self, proxy_url: str | None = None) -> None:
         self._via_proxy = proxy_url is not None
         ssl_context = build_ca_bundle_ssl_context()
@@ -74,7 +78,9 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
             trust_env=False,
             http2=False,
             verify=ssl_context,
-            limits=httpx.Limits(max_keepalive_connections=0),
+            limits=httpx.Limits(
+                max_keepalive_connections=self.max_keepalive_connections
+            ),
             proxy=proxy,
         )
 

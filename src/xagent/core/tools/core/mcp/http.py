@@ -44,17 +44,21 @@ def _origin(url: str) -> str:
 class MCPHttpTransport(PublicHttpTransport):
     """Public-only, with every request bound to this MCP server's origin."""
 
+    max_keepalive_connections = 20
+
     def __init__(self, endpoint_url: str) -> None:
         self._origin = _origin(endpoint_url)
         super().__init__(proxy_url=get_trusted_proxy_url())
 
-    async def _resolve_addresses(self, url: str) -> list[str]:
-        origin = _origin(url)
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        # Bind at HTTPX's public transport entrypoint, not an implementation
+        # detail of the shared DNS resolver. A resolver refactor cannot drop it.
+        origin = _origin(str(request.url))
         if origin != self._origin:
             raise UnsafePublicHttpTarget(
                 "MCP requests must remain on their configured origin"
             )
-        return await super()._resolve_addresses(url)
+        return await super().handle_async_request(request)
 
 
 def create_mcp_http_client(

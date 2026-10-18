@@ -18,10 +18,19 @@ this default transport. A future private MCP allowlist needs a separate design;
 do not disable validation or use the OAuth development flag as a runtime bypass.
 
 `XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS` is a development-only exception for MCP
-OAuth discovery/token exchange and MCP OAuth grant refresh (including runtime
-refresh). It does not relax MCP transport endpoints or integration OAuth refresh.
-Keep it disabled in production. A successful local OAuth connection test is not
-evidence that a private runtime MCP endpoint is supported.
+OAuth discovery/token exchange, MCP OAuth grant refresh (including runtime
+refresh), and the custom OAuth transport used by the MCP connection-test API.
+That test transport can accept private endpoints and does not bind requests to
+one origin. Passing the test is not evidence of runtime compatibility. The flag
+does not relax the default managed MCP sessions or integration OAuth refresh.
+Keep it disabled in production.
+
+Single-origin MCP HTTP clients reuse connections to the checked IP. DNS is still
+validated for every request; changed origins, private answers and changed DNS
+addresses cannot reuse a connection as authorization. Origin binding runs at
+HTTPX's public transport entrypoint, independently of the internal DNS hook.
+Generic multi-origin clients retain disabled keep-alive to prevent cross-host
+TLS identity reuse on a shared IP.
 
 Trusted HTTP(S) egress proxies require `XAGENT_TRUSTED_EGRESS_PROXY`. WebSocket
 uses an owned local gate and literal-IP CONNECT targets. DNS, gate startup and

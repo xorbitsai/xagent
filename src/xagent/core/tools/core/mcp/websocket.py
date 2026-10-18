@@ -43,10 +43,8 @@ async def _connect_public(
     port: int,
     tls_kwargs: dict[str, Any],
     *,
-    deadline: float | None = None,
+    deadline: float,
 ) -> AsyncIterator[Any]:
-    if deadline is None:
-        deadline = anyio.current_time() + WEBSOCKET_CONNECT_TIMEOUT
     proxy = get_trusted_proxy_url()
     async with AsyncExitStack() as stack:
         remaining = deadline - anyio.current_time()

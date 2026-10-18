@@ -334,17 +334,17 @@ async def _create_websocket_session(
         An initialized ClientSession.
 
     Raises:
-        ImportError: If websockets package is not installed.
+        ImportError: If a WebSocket transport dependency cannot be imported.
     """
     try:
         from .websocket import public_websocket_client
-    except ImportError:
+    except ImportError as exc:
         msg = (
-            "Could not import websocket_client. "
-            "To use Websocket connections, please install the required dependency: "
-            "'pip install mcp[ws]' or 'pip install websockets'"
+            "Could not import the MCP WebSocket transport dependency "
+            f"{exc.name or 'or module'}. Install the project's transport dependencies; "
+            "for websockets use 'pip install mcp[ws]' or 'pip install websockets'."
         )
-        raise ImportError(msg) from None
+        raise ImportError(msg) from exc
 
     async with (
         public_websocket_client(url) as (read, write),

@@ -3,6 +3,9 @@ import socket
 
 import anyio
 import pytest
+from websockets.datastructures import Headers
+from websockets.exceptions import InvalidStatus
+from websockets.http11 import Response
 
 from xagent.core.tools.core.mcp import websocket as transport
 from xagent.core.utils.security import PrivateNetworkHostError
@@ -88,9 +91,15 @@ async def test_websocket_pins_ip_keeps_tls_name_and_preserves_protocol(
     assert closed == [True]
 
 
-def test_handshake_redirect_is_never_followed():
-    error = RuntimeError("redirect to private host")
-    assert transport._NoRedirectConnect.process_redirect(None, error) is error
+@pytest.mark.asyncio
+async def test_handshake_redirect_is_never_followed():
+    target = "wss://10.0.0.1/private"
+    error = InvalidStatus(Response(302, "Found", Headers({"Location": target})))
+    # This is a real redirect the library would otherwise follow, not an
+    # unrelated error its default method already returns unchanged.
+    assert transport.connect("wss://example.com/").process_redirect(error) == target
+    guarded = transport._NoRedirectConnect("wss://example.com/")
+    assert guarded.process_redirect(error) is error
 
 
 @pytest.mark.asyncio
@@ -149,7 +158,11 @@ async def test_websocket_address_fallback_has_one_budget(monkeypatch):
 
     monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
     async with transport._connect_public(
-        "wss://example.com/", ["2606:4700:4700::1111", "1.1.1.1"], 443, {}
+        "wss://example.com/",
+        ["2606:4700:4700::1111", "1.1.1.1"],
+        443,
+        {},
+        deadline=110.0,
     ):
         pass
     assert [item["host"] for item in attempts] == ["2606:4700:4700::1111", "1.1.1.1"]
@@ -188,7 +201,11 @@ async def test_trusted_websocket_proxy_uses_owned_gate_and_closes_it(monkeypatch
     monkeypatch.setattr(transport, "PublicNetworkEgressProxy", Gate)
     monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
     async with transport._connect_public(
-        "wss://example.com/", ["1.1.1.1", "8.8.8.8"], 443, {}
+        "wss://example.com/",
+        ["1.1.1.1", "8.8.8.8"],
+        443,
+        {},
+        deadline=anyio.current_time() + transport.WEBSOCKET_CONNECT_TIMEOUT,
     ):
         assert not closed
     assert seen[0]["proxy"] == "http://owned:password@127.0.0.1:1234"
@@ -216,7 +233,7 @@ async def test_exhausted_connect_budget_does_not_try_another_address(monkeypatch
     monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
     with pytest.raises(TimeoutError, match="budget exhausted"):
         async with transport._connect_public(
-            "wss://example.com/", ["1.1.1.1", "8.8.8.8"], 443, {}
+            "wss://example.com/", ["1.1.1.1", "8.8.8.8"], 443, {}, deadline=110.0
         ):
             pytest.fail("exhausted budget connected")
     assert len(attempts) == 1
@@ -268,7 +285,11 @@ async def test_proxy_gate_is_closed_when_handshake_fails(monkeypatch, failure):
     monkeypatch.setattr(transport, "_NoRedirectConnect", Connection)
     with pytest.raises(OSError, match="failed"):
         async with transport._connect_public(
-            "wss://example.com/", ["1.1.1.1"], 443, {}
+            "wss://example.com/",
+            ["1.1.1.1"],
+            443,
+            {},
+            deadline=anyio.current_time() + transport.WEBSOCKET_CONNECT_TIMEOUT,
         ):
             pytest.fail("failed handshake connected")
     assert closed == [True]
@@ -295,3 +316,31 @@ async def test_session_uses_guarded_websocket_factory(monkeypatch):
             {"transport": "websocket", "url": "wss://example.com/mcp"}
         ):
             pytest.fail("unguarded WebSocket session")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["websockets", "yarl", "html2text"])
+async def test_session_import_failure_identifies_actual_dependency(
+    monkeypatch, missing
+):
+    import builtins
+
+    from xagent.core.tools.core.mcp import sessions
+
+    original = builtins.__import__
+    failure = ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+
+    def import_module(name, globals=None, locals=None, fromlist=(), level=0):
+        if (
+            name == "websocket"
+            and level == 1
+            and globals.get("__package__") == sessions.__package__
+        ):
+            raise failure
+        return original(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_module)
+    with pytest.raises(ImportError, match=missing) as error:
+        async with sessions._create_websocket_session(url="wss://example.com/"):
+            pytest.fail("missing transport dependency was ignored")
+    assert error.value.__cause__ is failure

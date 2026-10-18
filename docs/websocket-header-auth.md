@@ -14,6 +14,9 @@ new WebSocket(urlWithoutCredentials, [
 ```
 
 Non-browser clients may instead send one `Authorization: Bearer ...` header.
+Other Authorization schemes (such as gateway Basic authentication) and empty
+headers are not application login credentials. They do not authenticate a user
+or conflict with the browser carrier; malformed Bearer credentials are rejected.
 Combining the two carriers or supplying duplicate/malformed login credentials
 is rejected. The server does not select or echo the credential subprotocol.
 This is a header carrier for the existing access JWT, **not** a newly minted,
@@ -25,8 +28,10 @@ delete credentials already retained in historical logs.
 
 Existing user/purpose/signature/session-generation checks, task ownership,
 five-second idle revocation polling and per-message revalidation still apply.
-Changing a header credential also changes the hook's in-memory login identity,
+Changing an explicit `token` prop changes the hook's in-memory login identity,
 so uploads and retries are not reused across explicit login identities.
+An auth-context refresh for the same user/session intentionally retains that
+identity while using the refreshed credential for subsequent connections.
 
 Public widget/share capabilities and the SaaS external client/session protocols
 retain their separate, purpose-scoped admission contracts. They are not ordinary
@@ -41,12 +46,10 @@ an HTTP 403 failed handshake (typically browser close 1006), not a delivered
 WebSocket close reason. There is no authenticated legacy fallback.
 Proxies must forward `Sec-WebSocket-Protocol` unchanged on upgrade requests.
 
-Before deploying the new core into SaaS, include the corresponding middleware
-update in SaaS #1855. It must inspect the offered login credential for initial
+Integrations with additional authentication middleware must inspect the offered
+login credential for initial
 MFA admission, per-frame checks and idle revocation. The core upgrade, SaaS
 authentication adapters and MFA changes require combined release acceptance.
 
-This closes the private WebSocket **URL-carrier** gap in CASA #7, not overall
-CASA compliance, the public capability protocols, historical-log cleanup or a
-requirement for one-use WebSocket capabilities. OAuth navigation is handled
-separately by core #3178 and SaaS #1858. No live deployment is performed here.
+This addresses only the private WebSocket URL carrier, not public capability
+protocols, historical-log cleanup, one-use capabilities or OAuth navigation.

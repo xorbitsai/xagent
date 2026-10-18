@@ -53,8 +53,44 @@ def test_every_private_route_uses_the_shared_header_guard(monkeypatch, path, leg
     "headers, expected",
     [
         ([], None),
+        ([("authorization", "Basic gateway")], None),
+        ([("authorization", "")], None),
         ([("authorization", "Bearer abc.def.ghi")], "abc.def.ghi"),
         ([("authorization", "bearer abc.def.ghi")], "abc.def.ghi"),
+        (
+            [
+                ("authorization", "Bearer abc.def.ghi"),
+                ("sec-websocket-protocol", "unrelated"),
+            ],
+            "abc.def.ghi",
+        ),
+        (
+            [
+                ("sec-websocket-protocol", "xagent-auth-v1"),
+                ("sec-websocket-protocol", "xagent-auth-token.abc.def.ghi"),
+            ],
+            "abc.def.ghi",
+        ),
+        (
+            [
+                ("authorization", "Basic gateway"),
+                (
+                    "sec-websocket-protocol",
+                    "xagent-auth-v1, xagent-auth-token.abc.def.ghi",
+                ),
+            ],
+            "abc.def.ghi",
+        ),
+        (
+            [
+                ("authorization", ""),
+                (
+                    "sec-websocket-protocol",
+                    "xagent-auth-v1, xagent-auth-token.abc.def.ghi",
+                ),
+            ],
+            "abc.def.ghi",
+        ),
         (
             [
                 (
@@ -82,7 +118,7 @@ def test_header_credential_parsing(headers, expected):
 @pytest.mark.parametrize(
     "headers",
     [
-        [("authorization", "Basic secret")],
+        [("authorization", "Bearer")],
         [("authorization", "Bearer ")],
         [("authorization", "Bearer a b")],
         [("authorization", "Bearer one"), ("authorization", "Bearer two")],
@@ -171,6 +207,7 @@ def test_guard_injects_header_credentials_without_echoing_them(
     "query",
     [
         "token=secret",
+        "token",
         "token=",
         "access_token=secret",
         "t%6fken=secret",

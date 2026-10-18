@@ -2982,7 +2982,10 @@ async def _run_chat_heartbeat(websocket: WebSocket, task_id: int) -> None:
 async def websocket_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
-    token: Optional[str] = Query(None, description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket unified endpoint - handle chat, execution status, and DAG intervention"""
     # Verify user identity
@@ -3325,7 +3328,10 @@ async def handle_resume_task(
 @revalidate_websocket_session
 async def websocket_builder_chat_endpoint(
     websocket: WebSocket,
-    token: Optional[str] = Query(None, description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket endpoint for AI Agent Builder Assistant chat."""
     try:
@@ -3797,7 +3803,10 @@ clarification questions as plain assistant text.
 @revalidate_websocket_session
 async def websocket_build_preview_endpoint(
     websocket: WebSocket,
-    token: Optional[str] = Query(None, description="Authentication token"),
+    token: Optional[str] = Query(
+        None,
+        description="Internal: populated from handshake headers; query value is rejected",
+    ),
 ) -> None:
     """WebSocket endpoint for build page agent preview using normal task execution."""
     # Verify user identity

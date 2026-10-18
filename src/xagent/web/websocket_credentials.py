@@ -22,7 +22,13 @@ def websocket_header_token(scope: Scope) -> str | None:
     (for example public widget sessions) are not login credentials.
     """
     headers = Headers(scope=scope)
-    authorization = headers.getlist("authorization")
+    # Gateways may attach a separate HTTP authentication scheme. Only Bearer
+    # is an application login carrier; malformed Bearer values still fail.
+    authorization = [
+        value
+        for value in headers.getlist("authorization")
+        if value.split(maxsplit=1) and value.split(maxsplit=1)[0].lower() == "bearer"
+    ]
     protocols = [
         value.strip()
         for header in headers.getlist("sec-websocket-protocol")

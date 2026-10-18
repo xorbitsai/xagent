@@ -11,15 +11,21 @@ from xagent.core.model.public_http import is_model_network_policy_error
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("via_proxy", [False, True])
 @pytest.mark.parametrize(
     "provider", ["openai", "azure", "claude", "gemini", "zhipu", "openai_image"]
 )
 async def test_real_provider_rejects_private_base_before_inner_transport(
-    monkeypatch, provider
+    monkeypatch, provider, via_proxy
 ):
     seen = []
+    options = []
+    if via_proxy:
+        monkeypatch.setenv("HTTPS_PROXY", "http://operator-proxy.example:3128")
+        monkeypatch.setenv("XAGENT_TRUSTED_EGRESS_PROXY", "1")
 
     def transport(**kwargs):
+        options.append(kwargs)
         return httpx.MockTransport(
             lambda request: seen.append(request)
             or httpx.Response(200, json={"data": []})
@@ -58,6 +64,16 @@ async def test_real_provider_rejects_private_base_before_inner_transport(
         model = OpenAIImageModel(api_key="key", base_url="http://127.0.0.1:9997/v1")
     model._ensure_client()
     try:
+        sdk_http = (
+            model._client._api_client._async_httpx_client
+            if provider == "gemini"
+            else model._client._client
+        )
+        assert sdk_http.follow_redirects is True
+        expected_proxy = "http://operator-proxy.example:3128" if via_proxy else None
+        assert options and all(item["proxy"] == expected_proxy for item in options)
+        if provider == "zhipu":
+            assert sdk_http.timeout.connect == model.timeout
         try:
             if provider == "gemini":
                 assert not model._client._api_client._use_aiohttp()

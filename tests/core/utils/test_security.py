@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import socket
 import ssl
 from typing import Any
 from unittest.mock import Mock
@@ -27,6 +28,51 @@ def test_shared_url_shape_preserves_public_internationalized_hosts():
     parsed = security.validate_public_http_url_shape("https://bücher.example/path")
     assert parsed.hostname == "xn--bcher-kva.example"
     assert parsed.path == "/path"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://127。0。0。1/",
+        "https://１２７．０．０．１/",
+        "https://169。254。169。254/",
+        "https://example.com:0/",
+        "https://user:secret@example.com/",
+    ],
+)
+async def test_sync_and_async_dns_keep_shape_rejections(url, asynchronous, monkeypatch):
+    def unexpected_dns(*args):
+        pytest.fail("invalid URL reached DNS")
+
+    monkeypatch.setattr(socket, "getaddrinfo", unexpected_dns)
+    with pytest.raises(ValueError):
+        if asynchronous:
+            await security.validate_public_http_url(url)
+        else:
+            security.validate_public_http_url_sync(url)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_sync_and_async_dns_use_normalized_hostname(asynchronous, monkeypatch):
+    dns = Mock(
+        return_value=[
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 8443))
+        ]
+    )
+    monkeypatch.setattr(socket, "getaddrinfo", dns)
+    url = "https://bücher.example:8443/path"
+    addresses = (
+        await security.validate_public_http_url(url)
+        if asynchronous
+        else security.validate_public_http_url_sync(url)
+    )
+    assert addresses == ["93.184.216.34"]
+    dns.assert_called_once_with(
+        "xn--bcher-kva.example", 8443, socket.AF_UNSPEC, socket.SOCK_STREAM
+    )
 
 
 def _generate_test_ca_pem() -> bytes:

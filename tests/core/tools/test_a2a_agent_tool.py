@@ -221,7 +221,24 @@ async def test_create_a2a_agent_tools_from_tool_config() -> None:
     assert tools[0].name == "a2a_remote_researcher"
     assert tools[0].metadata.category == "agent"
     assert tools[0].description == "Use for remote research tasks."
-    assert tools[0]._allow_private_networks is True
+    assert tools[0]._allow_private_networks is False
+
+
+@pytest.mark.asyncio
+async def test_serialized_a2a_config_cannot_approve_private_networks() -> None:
+    config = ToolConfig(
+        {
+            "a2a_agent_configs": [
+                {
+                    "name": "Untrusted",
+                    "endpoint_url": "http://169.254.169.254/",
+                    "allow_private_networks": True,
+                }
+            ]
+        }
+    )
+    with pytest.raises(ValueError):
+        await create_a2a_agent_tools(config)
 
 
 @pytest.mark.asyncio

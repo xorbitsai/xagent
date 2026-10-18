@@ -323,9 +323,7 @@ async def test_download_disables_trust_env_but_honors_explicit_proxy(
             "xagent.core.tools.adapters.vibe.download_web_asset.get_trusted_proxy_url",
             return_value="http://trusted-proxy.internal:8080",
         ),
-        patch(
-            "xagent.core.tools.adapters.vibe.download_web_asset.httpx.AsyncClient"
-        ) as async_client,
+        patch("xagent.core.tools.core.web_content.httpx.AsyncClient") as async_client,
     ):
         client = async_client.return_value.__aenter__.return_value
         client.stream = Mock(return_value=_ResponseContext(response))
@@ -334,6 +332,10 @@ async def test_download_disables_trust_env_but_honors_explicit_proxy(
     assert result["success"] is True
     async_client.assert_called_once()
     client_kwargs = async_client.call_args.kwargs
-    assert client_kwargs["proxy"] == "http://trusted-proxy.internal:8080"
+    # The corporate proxy is behind the local pinning gate, not handed an
+    # independently resolving hostname by the HTTP client.
+    assert client_kwargs["proxy"].startswith("http://")
+    assert "@127.0.0.1:" in client_kwargs["proxy"]
+    assert "trusted-proxy.internal" not in client_kwargs["proxy"]
     assert client_kwargs["trust_env"] is False
     assert isinstance(client_kwargs["verify"], ssl.SSLContext)

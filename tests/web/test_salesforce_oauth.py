@@ -698,7 +698,7 @@ async def test_salesforce_refresh_updates_instance_url(db_session, monkeypatch):
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "salesforce")
@@ -771,7 +771,7 @@ async def test_salesforce_refresh_keeps_prior_instance_url_when_response_is_malf
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "salesforce")

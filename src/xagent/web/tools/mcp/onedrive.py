@@ -16,16 +16,15 @@ from typing import Annotated, Any
 from urllib.parse import quote
 from uuid import uuid4
 
-import requests
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from .utils import allowed_dirs_from_env, setup_proxy_env, url_path_id
+from ....core.utils import public_requests as requests
+from .utils import allowed_dirs_from_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("onedrive-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("onedrive-mcp")
 

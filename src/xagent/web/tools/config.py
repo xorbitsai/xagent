@@ -64,6 +64,8 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
 from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
+from ...core.tools.core.web_content import get_trusted_proxy_url
+from ...core.utils.public_http_transport import create_public_async_client
 from ..services.actor_mcp_runtime import (
     ActorMCPStdioSessionIdentity,
     resolve_actor_mcp_stdio_configs,
@@ -681,8 +683,8 @@ OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
 _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
-    # A proxy-handshake failure (e.g. an env-configured egress proxy,
-    # trust_env=True is httpx's default) means the request never reached
+    # A handshake failure at an explicitly trusted egress proxy means the
+    # request never reached
     # the actual token endpoint either -- same "never transmitted"
     # guarantee as ConnectError, just one hop earlier.
     httpx.ProxyError,
@@ -694,6 +696,15 @@ _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
     # a cold start.
     httpx.PoolTimeout,
 )
+
+
+def _oauth_refresh_http_client() -> httpx.AsyncClient:
+    proxy = get_trusted_proxy_url()
+    return (
+        create_public_async_client(proxy_url=proxy)
+        if proxy
+        else create_public_async_client()
+    )
 
 
 async def _request_oauth_refresh_with_retries(
@@ -955,7 +966,7 @@ async def refresh_oauth_token_if_needed(
         normalized_provider = provider_name.lower()
 
         if normalized_provider == "meta":
-            async with httpx.AsyncClient() as client:
+            async with _oauth_refresh_http_client() as client:
                 response = await _request_oauth_refresh_with_retries(
                     lambda: client.get(
                         provider_config.token_url,
@@ -1131,8 +1142,9 @@ async def refresh_oauth_token_if_needed(
             # not a choice this codebase would otherwise make. No httpx/
             # httpcore request-logging middleware exists in this codebase
             # today (those loggers are pinned to WARNING) and the
-            # configured HTTPS proxy only sees a CONNECT tunnel, never this
-            # URL's query string -- reassess this note if either changes.
+            # explicitly trusted (XAGENT_TRUSTED_EGRESS_PROXY) proxy sees a
+            # CONNECT tunnel for HTTPS, never this URL's query string --
+            # reassess this note if either changes.
             post_kwargs["params"] = {
                 "grant_type": data.pop("grant_type"),
                 "refresh_token": data.pop("refresh_token"),
@@ -1145,7 +1157,7 @@ async def refresh_oauth_token_if_needed(
             headers["Content-Type"] = "application/json"
             body_kwarg = {"json": data}
 
-        async with httpx.AsyncClient() as client:
+        async with _oauth_refresh_http_client() as client:
             response = await _request_oauth_refresh_with_retries(
                 lambda: client.post(
                     refresh_token_url,
@@ -3884,8 +3896,24 @@ class WebToolConfig(BaseToolConfig):
                     "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
                     "https_proxy": os.environ.get("https_proxy", ""),
                     "http_proxy": os.environ.get("http_proxy", ""),
+                    # Trust is operator-owned: never inherit an app's mapping
+                    # for this switch without the process environment value.
+                    "XAGENT_TRUSTED_EGRESS_PROXY": os.environ.get(
+                        "XAGENT_TRUSTED_EGRESS_PROXY", ""
+                    ),
                 }
             )
+            for env_key in (
+                "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+            ):
+                # Also remove a launch mapping when the operator left it
+                # unset; TLS policy belongs to the deployment, not the app.
+                env.pop(env_key, None)
+                if env_key in os.environ:
+                    env[env_key] = os.environ[env_key]
             allowed_file_dir_paths = self._mcp_file_allowed_dir_paths()
             if allowed_file_dir_paths:
                 # JSON preserves commas inside directory names. The shared

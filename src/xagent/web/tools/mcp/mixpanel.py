@@ -6,19 +6,17 @@ from datetime import date, datetime
 from os import environ
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
+from .utils import clamp_limit, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mixpanel-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("mixpanel-mcp")
 
@@ -282,8 +280,7 @@ def _request(
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient
-        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
-        # (setup_proxy_env() exports whatever the OS has configured).
+        # explicitly trusted proxy URL, which may embed user:pass@ credentials.
         raise RuntimeError(redact_sensitive_text(str(exc))) from exc
 
     if 300 <= response.status_code < 400:

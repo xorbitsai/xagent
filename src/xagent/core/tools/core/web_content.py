@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import html2text
 import httpx
@@ -13,6 +16,7 @@ from bs4 import BeautifulSoup
 
 from ...utils.egress_proxy import get_proxy_url as get_proxy_url
 from ...utils.egress_proxy import get_trusted_proxy_url as get_trusted_proxy_url
+from ...utils.public_network_proxy import PublicNetworkEgressProxy
 from ...utils.security import PrivateNetworkHostError, fetch_public_http_bytes
 
 logger = logging.getLogger(__name__)
@@ -131,6 +135,46 @@ def build_isolated_httpx_client_kwargs(proxy_url: str | None) -> dict[str, Any]:
     return client_kwargs
 
 
+@asynccontextmanager
+async def public_fetch_client(
+    proxy_url: str | None,
+    *,
+    timeout: float = 10.0,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Keep public-IP pinning even when a corporate proxy resolves targets.
+
+    A trusted upstream still must CONNECT to the literal address selected by
+    our local gate. The HTTP client keeps the logical hostname for TLS SNI.
+    Never hand the unvalidated hostname directly to a separately resolving
+    upstream proxy. The gate and every accepted tunnel share this lifetime.
+    """
+    if timeout <= 0 or not math.isfinite(timeout):
+        raise ValueError("Public fetch timeout must be positive and finite")
+    if proxy_url and urlsplit(proxy_url).scheme not in {"http", "https"}:
+        raise ValueError(
+            "Public fetches require an HTTP(S) upstream proxy; SOCKS is not supported"
+        )
+    gate = (
+        PublicNetworkEgressProxy(
+            upstream_proxy_url=proxy_url,
+            connect_timeout=timeout,
+            response_timeout=timeout,
+        )
+        if proxy_url
+        else None
+    )
+    try:
+        guarded_proxy = await gate.start() if gate else None
+        async with httpx.AsyncClient(
+            **build_isolated_httpx_client_kwargs(guarded_proxy),
+            timeout=timeout,
+        ) as client:
+            yield client
+    finally:
+        if gate is not None:
+            await gate.close()
+
+
 class WebContentFetcher:
     """Fetch webpages and convert readable HTML content to markdown."""
 
@@ -153,11 +197,7 @@ class WebContentFetcher:
 
         headers = {"User-Agent": DEFAULT_USER_AGENT}
         try:
-            if self._proxy_url:
-                logger.info("Using proxy for webpage fetch: %s", self._proxy_url)
-            client_kwargs = build_isolated_httpx_client_kwargs(self._proxy_url)
-
-            async with httpx.AsyncClient(**client_kwargs) as client:
+            async with public_fetch_client(self._proxy_url) as client:
                 response = await fetch_public_http_bytes(
                     client,
                     url,

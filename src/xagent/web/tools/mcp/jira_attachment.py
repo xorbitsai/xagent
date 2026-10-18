@@ -10,8 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-import requests
-
+from ....core.utils import public_requests as requests
 from .utils import allowed_dirs_from_env
 
 logger = logging.getLogger("jira-mcp")

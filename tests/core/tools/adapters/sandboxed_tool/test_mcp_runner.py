@@ -2,12 +2,48 @@
 
 import base64
 import json
+import os
+import subprocess
+import sys
+import textwrap
 from unittest.mock import AsyncMock, patch
 
 from xagent.core.tools.adapters.vibe.sandboxed_tool.mcp_runner import (
     _load_connection,
     main,
 )
+
+
+def test_stdio_runner_imports_without_web_fetch_dependencies():
+    script = textwrap.dedent(
+        """
+        import sys
+
+        class BlockWebDependencies:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.')[0] in {'html2text', 'bs4', 'yarl'}:
+                    raise ModuleNotFoundError(fullname)
+                return None
+
+        sys.meta_path.insert(0, BlockWebDependencies())
+        from xagent.core.tools.adapters.vibe.sandboxed_tool.mcp_runner import (
+            _load_connection,
+        )
+        assert callable(_load_connection)
+        assert 'xagent.core.tools.core.mcp.http' not in sys.modules
+        assert 'xagent.core.tools.core.web_content' not in sys.modules
+        print('stdio runner imported')
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", script],
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, sys.path))},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "stdio runner imported" in result.stdout
 
 
 class _FakeTool:

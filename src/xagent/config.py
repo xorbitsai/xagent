@@ -89,6 +89,9 @@ TASK_AUTO_RESUME_MODEL_OUTPUT_MAX_NO_PROGRESS = (
 )
 # Shared task command dispatcher.
 DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS"
+DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS = (
+    "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS"
+)
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
@@ -665,6 +668,14 @@ def get_dispatcher_max_inflight_per_process() -> int:
     """Get the per-process cap on executions the dispatcher admits (default 80)."""
 
     return _get_positive_int_env(DISPATCHER_MAX_INFLIGHT_PER_PROCESS, 80)
+
+
+def get_dispatcher_interactive_reserve_per_process() -> int:
+    """Get the slots per process kept for interactive commands (default 0)."""
+
+    return _get_positive_int_env(
+        DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS, 0, minimum=0
+    )
 
 
 def get_uploaded_file_recovery_interval_seconds() -> int:

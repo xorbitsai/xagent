@@ -12,20 +12,18 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from .utils import clamp_limit as _clamp_limit
 from .utils import require_clean_identifier as _require_clean_identifier
-from .utils import setup_proxy_env
 from .utils import success_with_capped_dict as _success_with_capped_dict
 from .utils import url_path_id as _url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hubspot-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("hubspot-mcp")
 

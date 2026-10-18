@@ -3633,8 +3633,15 @@ def _insert_command(db, task_id: int, kind: TaskCommandKind, identity: str) -> i
     return int(row.id)
 
 
+def _front_fields(
+    candidate: task_command_transport_module.CommandCandidate | None,
+) -> tuple[int, int, TaskCommandKind] | None:
+    """The command id, task id and kind of a scan result."""
+    return None if candidate is None else tuple(candidate[:3])  # type: ignore[return-value]
+
+
 def _claim_candidate() -> tuple[int, int, TaskCommandKind] | None:
-    return task_command_transport_module._find_command_candidate(None)
+    return _front_fields(task_command_transport_module._find_command_candidate(None))
 
 
 def test_reply_first_claim_order_prefers_a_newer_reply_over_an_older_start(
@@ -3724,7 +3731,10 @@ def test_reply_first_claim_order_puts_a_reply_ahead_of_an_older_control_command(
 def test_reply_first_claim_order_is_not_used_while_the_cap_is_closed(
     shared_dispatch_db, reply_task_is_active: bool
 ) -> None:
-    from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
+    from xagent.web.services.task_dispatch_cap import (
+        DispatchCapSnapshot,
+        DispatchPolicy,
+    )
 
     db = shared_dispatch_db
     user, start_task = _create_running_task(db)
@@ -3739,9 +3749,14 @@ def test_reply_first_claim_order_is_not_used_while_the_cap_is_closed(
     active = {int(start_task.id)} | (
         {int(reply_task.id)} if reply_task_is_active else set()
     )
-    closed = DispatchCapSnapshot(len(active), frozenset(active))
+    closed = DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=len(active), interactive_reserve=0),
+        active_ids=frozenset(active),
+    )
 
-    assert task_command_transport_module._find_command_candidate(None, (), closed) == (
+    assert _front_fields(
+        task_command_transport_module._find_command_candidate(None, (), closed)
+    ) == (
         older_start,
         int(start_task.id),
         TaskCommandKind.START,
@@ -3760,8 +3775,10 @@ def test_reply_first_claim_order_falls_back_past_a_reply_on_a_busy_task(
     start = _insert_command(db, int(start_task.id), TaskCommandKind.START, "start")
     _insert_command(db, int(busy_task.id), TaskCommandKind.RESUME_INPUT, "reply")
 
-    assert task_command_transport_module._find_command_candidate(
-        None, (int(busy_task.id),)
+    assert _front_fields(
+        task_command_transport_module._find_command_candidate(
+            None, (int(busy_task.id),)
+        )
     ) == (start, int(start_task.id), TaskCommandKind.START)
 
 
@@ -3806,7 +3823,7 @@ def test_find_command_candidate_with_an_explicit_id_skips_the_reply_lookup(
     finally:
         event.remove(engine, "before_cursor_execute", record)
 
-    assert found == (reply, int(task.id), TaskCommandKind.RESUME_INPUT)
+    assert _front_fields(found) == (reply, int(task.id), TaskCommandKind.RESUME_INPUT)
     # One statement, and the reply-only kind filter is not among its values.
     assert len(parameters) == 1
     assert TaskCommandKind.RESUME_INPUT.value not in parameters[0]

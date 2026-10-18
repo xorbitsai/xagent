@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 from urllib.parse import quote
 
-import requests
 from mcp.server.fastmcp import FastMCP
 from pptx import Presentation
 from pptx.oxml.ns import qn
@@ -20,12 +19,12 @@ from pydantic import Field
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.file_analysis import iter_pptx_shapes
-from .utils import setup_proxy_env, url_path_id
+from ....core.utils import public_requests as requests
+from .utils import url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("powerpoint-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("powerpoint-mcp")
 

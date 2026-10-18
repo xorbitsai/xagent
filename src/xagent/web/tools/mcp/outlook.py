@@ -6,11 +6,11 @@ from datetime import timezone as dt_timezone
 from typing import Any, cast
 from urllib.parse import quote, unquote, urlsplit
 
-import requests
 from dateutil import parser as _date_parser
 from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from .outlook_recurrence import build_graph_recurrence
 from .utils import InsufficientScopeError
 from .utils import conflict_response as _conflict_response
@@ -22,13 +22,11 @@ from .utils import normalize_addresses as _normalize_addresses
 from .utils import offset_datetime_string as _offset_datetime_string
 from .utils import reject_reversed_window as _reject_reversed_window
 from .utils import resolve_zoneinfo as _resolve_zoneinfo
-from .utils import setup_proxy_env
 from .utils import window_delta_segments as _window_delta_segments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("outlook-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("outlook-mcp")
 

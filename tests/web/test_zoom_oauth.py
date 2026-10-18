@@ -264,7 +264,7 @@ async def test_zoom_expired_token_refresh_uses_http_basic_auth(db_session, monke
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "zoom")
@@ -343,7 +343,7 @@ async def test_zoom_expired_token_refresh_uses_http_basic_auth_with_capitalized_
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "Zoom")
@@ -413,7 +413,7 @@ async def test_generic_provider_refresh_sends_client_id_and_secret_in_body(
                 status_code=200,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "google")

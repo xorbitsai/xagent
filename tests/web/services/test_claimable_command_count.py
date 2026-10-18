@@ -13,7 +13,7 @@ from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionT
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
-from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot
+from xagent.web.services.task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
 
 engine = engine_fixture
 task_id = task_id_fixture
@@ -194,7 +194,10 @@ def test_count_ignores_the_process_dispatch_cap(factory, task_id, monkeypatch):
     ids = seed(factory, task_id)
     # A closed cap: this process already runs as many executions as it may,
     # none of them for a seeded task.
-    closed = DispatchCapSnapshot(limit=1, active_ids=frozenset({-1}))
+    closed = DispatchCapSnapshot(
+        policy=DispatchPolicy(limit=1, interactive_reserve=0),
+        active_ids=frozenset({-1}),
+    )
     assert closed.closed
     monkeypatch.setattr(transport, "build_dispatch_cap_snapshot", lambda: closed)
 

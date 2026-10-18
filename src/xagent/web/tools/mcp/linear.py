@@ -5,17 +5,14 @@ import re
 import time
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
-from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("linear-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("linear-mcp")
 

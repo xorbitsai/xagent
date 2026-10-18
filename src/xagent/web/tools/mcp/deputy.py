@@ -4,18 +4,16 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
 from ....config import get_tool_max_output_length
-from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
+from ....core.utils import public_requests as requests
+from .utils import success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("deputy-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("deputy-mcp")
 

@@ -313,18 +313,26 @@ def create_a2a_agent_tools_from_configs(
             request_timeout_seconds = float(str(timeout_seconds))
         except (TypeError, ValueError):
             request_timeout_seconds = 60.0
-        tool = A2AAgentTool(
-            name=raw_name,
-            description=_optional_str(item.get("description")),
-            endpoint_url=_optional_str(item.get("endpoint_url")),
-            agent_card_url=_optional_str(item.get("agent_card_url")),
-            headers=item.get("headers")
-            if isinstance(item.get("headers"), dict)
-            else {},
-            auth_token=_optional_str(item.get("auth_token")),
-            timeout_seconds=request_timeout_seconds,
-            allow_private_networks=item.get("allow_private_networks") is True,
-        )
+        try:
+            tool = A2AAgentTool(
+                name=raw_name,
+                description=_optional_str(item.get("description")),
+                endpoint_url=_optional_str(item.get("endpoint_url")),
+                agent_card_url=_optional_str(item.get("agent_card_url")),
+                headers=item.get("headers")
+                if isinstance(item.get("headers"), dict)
+                else {},
+                auth_token=_optional_str(item.get("auth_token")),
+                timeout_seconds=request_timeout_seconds,
+                # Serialized tool configs are caller-controlled, not deployment
+                # policy. They must not turn off the actual-connection guard.
+                allow_private_networks=False,
+            )
+        except (ValueError, TypeError):
+            # Do not log the serialized name/URL or exception: configurations
+            # may contain credentials, including in otherwise-invalid URLs.
+            logger.warning("Skipping invalid serialized A2A tool configuration")
+            continue
         tools.append(tool)
     return tools
 

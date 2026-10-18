@@ -4530,6 +4530,38 @@ def test_respond_returns_accepted_when_the_dispatcher_notify_fails(
     assert after["ir_response_payload"] == {"env": "prod"}
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [("internal", "interactive"), ("sdk", "batch")],
+)
+def test_respond_stages_a_resume_with_the_upstream_dispatch_class(
+    _respond_db, source: str, expected: str
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    db = _respond_db()
+    try:
+        db.query(Task).filter(Task.id == task_id).update({Task.source: source})
+        db.commit()
+    finally:
+        db.close()
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=_owning_principal(user_id),
+        envelope=_respond_envelope(idempotency_key=f"class-{source}"),
+    )
+
+    assert isinstance(outcome, svc.RespondAccepted)
+    db = _respond_db()
+    try:
+        row = db.get(TaskExecutionCommand, outcome.receipt.command_db_id)
+        assert (row.kind, row.dispatch_class) == ("resume", expected)
+    finally:
+        db.close()
+
+
 def test_respond_receipt_fields_do_not_touch_the_session_after_commit(
     _respond_db,
 ) -> None:

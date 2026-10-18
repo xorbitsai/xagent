@@ -7,11 +7,11 @@ from collections.abc import Callable
 from os import environ
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils import public_requests as requests
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -21,15 +21,12 @@ from ...utils.graphql_errors import truncate_error_text
 from .utils import (
     clamp_limit,
     resolve_id_from_url,
-    setup_proxy_env,
     url_path_id,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("zendesk-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("zendesk-mcp")
 
@@ -428,8 +425,8 @@ def _request(
     # addresses this process itself resolves. get_trusted_proxy_url()
     # raises unless the proxy is explicitly marked trusted to enforce its
     # own private-range egress policy (XAGENT_TRUSTED_EGRESS_PROXY=1),
-    # rather than silently trusting whatever setup_proxy_env() promoted
-    # from the OS. Paired with the module session's trust_env=False, "no
+    # rather than silently trusting ambient or OS-native proxies.
+    # Paired with the module session's trust_env=False, "no
     # proxy" here is an actual guarantee for the call, not just for the env
     # vars this function reads.
     try:

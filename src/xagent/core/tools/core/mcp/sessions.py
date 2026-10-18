@@ -14,7 +14,6 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
-from mcp.shared._httpx_utils import create_mcp_http_client
 from typing_extensions import NotRequired, TypedDict
 
 if TYPE_CHECKING:
@@ -253,7 +252,9 @@ async def _create_sse_session(  # noqa: PLR0913
     Yields:
         An initialized ClientSession.
     """
-    # Create and store the connection
+    # Stdio runners intentionally do not install web-fetch dependencies.
+    from .http import mcp_http_client_factory
+
     async with (
         sse_client(
             url,
@@ -261,7 +262,7 @@ async def _create_sse_session(  # noqa: PLR0913
             timeout,
             sse_read_timeout,
             auth=auth,
-            httpx_client_factory=httpx_client_factory or create_mcp_http_client,
+            httpx_client_factory=mcp_http_client_factory(url, httpx_client_factory),
         ) as (
             read,
             write,
@@ -299,10 +300,7 @@ async def _create_streamable_http_session(  # noqa: PLR0913
     Yields:
         An initialized ClientSession.
     """
-    # Create and store the connection
-    kwargs = {}
-    if httpx_client_factory is not None:
-        kwargs["httpx_client_factory"] = httpx_client_factory
+    from .http import mcp_http_client_factory
 
     async with (
         streamablehttp_client(
@@ -312,7 +310,7 @@ async def _create_streamable_http_session(  # noqa: PLR0913
             sse_read_timeout,
             terminate_on_close,
             auth=auth,
-            **kwargs,
+            httpx_client_factory=mcp_http_client_factory(url, httpx_client_factory),
         ) as (read, write, _),
         ClientSession(read, write, **(session_kwargs or {})) as session,
     ):
@@ -336,20 +334,20 @@ async def _create_websocket_session(
         An initialized ClientSession.
 
     Raises:
-        ImportError: If websockets package is not installed.
+        ImportError: If a WebSocket transport dependency cannot be imported.
     """
     try:
-        from mcp.client.websocket import websocket_client
-    except ImportError:
+        from .websocket import public_websocket_client
+    except ImportError as exc:
         msg = (
-            "Could not import websocket_client. "
-            "To use Websocket connections, please install the required dependency: "
-            "'pip install mcp[ws]' or 'pip install websockets'"
+            "Could not import the MCP WebSocket transport dependency "
+            f"{exc.name or 'or module'}. Install the project's transport dependencies; "
+            "for websockets use 'pip install mcp[ws]' or 'pip install websockets'."
         )
-        raise ImportError(msg) from None
+        raise ImportError(msg) from exc
 
     async with (
-        websocket_client(url) as (read, write),
+        public_websocket_client(url) as (read, write),
         ClientSession(read, write, **(session_kwargs or {})) as session,
     ):
         yield session

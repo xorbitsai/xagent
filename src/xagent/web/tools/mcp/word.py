@@ -10,7 +10,6 @@ from typing import Any
 from urllib.parse import quote
 from xml.etree.ElementTree import ParseError
 
-import requests
 from defusedxml import ElementTree as DefusedElementTree
 from defusedxml.common import DefusedXmlException
 from docx import Document
@@ -21,12 +20,12 @@ from docx.text.run import Run
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import clamp_limit, clamp_offset, setup_proxy_env, url_path_id
+from ....core.utils import public_requests as requests
+from .utils import clamp_limit, clamp_offset, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("word-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("word-mcp")
 

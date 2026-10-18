@@ -3,16 +3,14 @@ import logging
 import os
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict, url_path_id
+from ....core.utils import public_requests as requests
+from .utils import clamp_limit, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("employment-hero-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("employment-hero-mcp")
 

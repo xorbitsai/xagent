@@ -184,27 +184,24 @@ def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
         magento._base_url()
 
 
-def test_resolve_store_host_returns_hostname_port_and_first_valid_ip(monkeypatch):
+def test_resolve_store_host_returns_hostname_and_port(monkeypatch):
     monkeypatch.setattr(
         magento.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "2.2.2.2")
     )
 
-    hostname, port, pinned_ip = magento._resolve_store_host()
+    hostname, port = magento._resolve_store_host()
 
     assert hostname == "store.example.com"
     assert port is None
-    assert pinned_ip == "1.1.1.1"
 
 
 def test_resolve_store_host_idna_encodes_non_ascii_hostname(monkeypatch):
     # urllib3's own URL parsing IDNA-encodes a non-ASCII host to punycode
-    # before it ever reaches the connection pool -- if `hostname` here
-    # stayed raw Unicode, _pinned_dns's `host == hostname` comparison would
-    # never match the punycode `host` urllib3 actually dials, silently
-    # skipping the pinning defense for exactly this input.
+    # before it reaches the public adapter. Store configuration must use
+    # the same canonical host as the transport's Host/SNI and DNS policy.
     monkeypatch.setenv("MAGENTO_BASE_URL", "https://münchen.example.com")
 
-    hostname, _port, _pinned_ip = magento._resolve_store_host()
+    hostname, _port = magento._resolve_store_host()
 
     assert hostname == "xn--mnchen-3ya.example.com"
 
@@ -220,7 +217,7 @@ def test_resolve_store_host_idna_encodes_using_urllib3s_actual_encoder(monkeypat
     # ASCII-looking encoding of the host.
     monkeypatch.setenv("MAGENTO_BASE_URL", "https://faß.de")
 
-    hostname, _port, _pinned_ip = magento._resolve_store_host()
+    hostname, _port = magento._resolve_store_host()
 
     assert hostname == "xn--fa-hia.de"
 
@@ -242,82 +239,6 @@ def test_resolve_store_host_raises_clear_error_when_idna_package_missing(monkeyp
 
     with pytest.raises(ValueError, match="'idna' package is not installed"):
         magento._resolve_store_host()
-
-
-def test_pinned_dns_redirects_matching_host_to_pinned_ip(monkeypatch):
-    calls = []
-
-    def _fake_create_connection(address, *args, **kwargs):
-        calls.append(address)
-        return "sentinel-socket"
-
-    monkeypatch.setattr(
-        magento.urllib3_connection, "create_connection", _fake_create_connection
-    )
-
-    with magento._pinned_dns("store.example.com", "9.9.9.9"):
-        result = magento.urllib3_connection.create_connection(
-            ("store.example.com", 443)
-        )
-
-    assert result == "sentinel-socket"
-    assert calls == [("9.9.9.9", 443)]
-
-
-def test_pinned_dns_leaves_other_hosts_untouched(monkeypatch):
-    calls = []
-
-    def _fake_create_connection(address, *args, **kwargs):
-        calls.append(address)
-        return "sentinel-socket"
-
-    monkeypatch.setattr(
-        magento.urllib3_connection, "create_connection", _fake_create_connection
-    )
-
-    with magento._pinned_dns("store.example.com", "9.9.9.9"):
-        magento.urllib3_connection.create_connection(("other-host.example.com", 443))
-
-    assert calls == [("other-host.example.com", 443)]
-
-
-def test_pinned_dns_restores_original_function_on_exit(monkeypatch):
-    original = magento.urllib3_connection.create_connection
-
-    with magento._pinned_dns("store.example.com", "9.9.9.9"):
-        assert magento.urllib3_connection.create_connection is not original
-
-    assert magento.urllib3_connection.create_connection is original
-
-
-def test_pinned_dns_restores_original_function_on_exception(monkeypatch):
-    original = magento.urllib3_connection.create_connection
-
-    with pytest.raises(RuntimeError):
-        with magento._pinned_dns("store.example.com", "9.9.9.9"):
-            raise RuntimeError("boom")
-
-    assert magento.urllib3_connection.create_connection is original
-
-
-def test_request_pins_connection_to_validated_ip(monkeypatch):
-    # End-to-end: _request() must pin the same IP _resolve_store_host()
-    # validated, not let requests/urllib3 re-resolve independently.
-    connect_calls = []
-
-    def _fake_create_connection(address, *args, **kwargs):
-        connect_calls.append(address)
-        raise OSError("no real network in tests")
-
-    monkeypatch.setattr(
-        magento.urllib3_connection, "create_connection", _fake_create_connection
-    )
-
-    with pytest.raises(RuntimeError):
-        magento._request("GET", "/products/abc")
-
-    assert connect_calls
-    assert all(addr[0] == "1.1.1.1" for addr in connect_calls)
 
 
 def test_api_base_url_defaults_to_v1(monkeypatch):
@@ -718,27 +639,6 @@ def test_make_request_reapplies_ca_bundle_env_var(monkeypatch):
     )
 
     assert captured["verify"] == "/etc/ssl/internal-ca.pem"
-
-
-def test_request_pins_dns_within_a_lock(monkeypatch):
-    # _pinned_dns serializes its global urllib3 monkeypatch through
-    # _PINNED_DNS_LOCK so two overlapping calls can never race on it --
-    # confirm the lock is actually held (not just present/unused) while
-    # the block that patches/restores create_connection runs.
-    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
-    monkeypatch.setattr(magento, "_make_request", mock_request)
-    held_during_call = {}
-
-    def _check_locked(*args, **kwargs):
-        held_during_call["locked"] = magento._PINNED_DNS_LOCK.locked()
-        return mock_request.return_value
-
-    mock_request.side_effect = _check_locked
-
-    magento._request("GET", "/products/abc")
-
-    assert held_during_call["locked"] is True
-    assert not magento._PINNED_DNS_LOCK.locked()
 
 
 @pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])

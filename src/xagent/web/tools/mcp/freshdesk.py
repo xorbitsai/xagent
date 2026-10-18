@@ -23,24 +23,22 @@ import re
 import socket
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils import public_requests as requests
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
     reject_private_network_host,
 )
 from ...utils.graphql_errors import truncate_error_text
-from .utils import clamp_limit, setup_proxy_env, success_with_capped_dict
+from .utils import clamp_limit, success_with_capped_dict
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("freshdesk-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("freshdesk-mcp")
 
@@ -284,8 +282,7 @@ def _send(
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient HTTPS_PROXY
-        # URL, which may carry embedded user:pass@ credentials
-        # (setup_proxy_env() exports whatever the OS has configured).
+        # URL, which may carry embedded user:pass@ credentials.
         raise RuntimeError(
             f"Freshdesk request failed: {truncate_error_text(_sanitize_exception_text(exc))}"
         ) from exc

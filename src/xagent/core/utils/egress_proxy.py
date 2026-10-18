@@ -16,7 +16,12 @@ def get_proxy_url() -> str | None:
 
 
 def get_trusted_proxy_url() -> str | None:
-    """Require explicit trust: proxies own connect-time DNS/egress checks."""
+    """Require explicit operator trust, not a socket-destination authorization.
+
+    Gated fetchers use public_fetch_client to keep upstream CONNECT targets
+    IP-pinned. Callers forwarding logical hosts still require the trusted
+    proxy to enforce connect-time DNS/egress policy.
+    """
     proxy_url = get_proxy_url()
     if proxy_url and not get_trusted_egress_proxy_enabled():
         raise PrivateNetworkHostError(

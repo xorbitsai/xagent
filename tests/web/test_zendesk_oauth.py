@@ -347,7 +347,7 @@ def _fake_token_endpoint(monkeypatch, data: dict, status_code: int = 200) -> lis
             posted.append((url, kwargs))
             return _ProviderResponse(data, status_code)
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
     return posted
 
 

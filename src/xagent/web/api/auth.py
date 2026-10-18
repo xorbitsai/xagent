@@ -16,7 +16,8 @@ from typing import Annotated, Any, Dict, List, Literal, NamedTuple, Optional, ca
 from urllib.parse import urlparse
 
 import bcrypt
-import requests
+
+from ...core.utils import public_requests as requests
 
 # Relax token scope verification as Google might add extra scopes (like openid)
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"

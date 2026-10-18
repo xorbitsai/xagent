@@ -6,10 +6,10 @@ import time
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils import public_requests as requests
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -17,13 +17,10 @@ from ....core.utils.security import (
 )
 from .utils import clamp_limit
 from .utils import clamp_offset as _clamp_offset
-from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("posthog-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("posthog-mcp")
 
@@ -241,8 +238,7 @@ def _request(
     # web_content.py's fetch_web_content: get_trusted_proxy_url() raises
     # unless the proxy is explicitly marked trusted to enforce its own
     # private-range egress policy (XAGENT_TRUSTED_EGRESS_PROXY=1), rather
-    # than silently trusting every ambient proxy setup_proxy_env() promotes
-    # from the OS's own settings. The result is then passed to
+    # than silently trusting every ambient or OS-native proxy. Passed to
     # `_make_request()` (see above), which issues the call on a
     # trust_env=False Session -- disabling every ambient/OS-native proxy
     # source, not just the env vars this function checks -- so "no proxy"

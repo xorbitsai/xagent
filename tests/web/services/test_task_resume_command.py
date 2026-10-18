@@ -760,7 +760,7 @@ async def test_capacity_blocked_reply_is_acknowledged_as_queued_without_waiting(
         request.addfinalizer(lambda: admission.set_task_admission_hook(None))
     else:
         admission.set_command_classifier(
-            lambda db, command: admission.CommandClassification(
+            lambda db, command, view: admission.CommandClassification(
                 admission=hook(db, command)
             ),
             admission_enabled=True,

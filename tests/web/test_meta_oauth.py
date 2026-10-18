@@ -1058,7 +1058,7 @@ async def test_meta_expired_token_refresh_uses_fb_exchange_token(
                 }
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
 
     assert (
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "meta")
@@ -1138,7 +1138,7 @@ async def test_meta_refresh_with_revoked_session_raises_permanent(
                 status_code=400,
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", RevokedAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", RevokedAsyncClient)
 
     with pytest.raises(tool_config._OAuthRefreshPermanentlyInvalid):
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "meta")

@@ -7,19 +7,17 @@ from decimal import Decimal
 from typing import Any, Callable, Iterator, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import requests
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel
 
 from ....config import get_tool_max_output_length
-from .utils import clamp_limit, clamp_offset, setup_proxy_env, url_path_id
+from ....core.utils import public_requests as requests
+from .utils import clamp_limit, clamp_offset, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("xero-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("xero-mcp")
 

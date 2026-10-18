@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Mapping, Type
 from urllib.parse import unquote, urlsplit
 
-import httpx
 from PIL import Image
 from pydantic import BaseModel, Field
 
@@ -18,8 +17,8 @@ from ....workspace import TaskWorkspace
 from ...core.web_content import (
     DEFAULT_MAX_CONTENT_BYTES,
     DEFAULT_USER_AGENT,
-    build_isolated_httpx_client_kwargs,
     get_trusted_proxy_url,
+    public_fetch_client,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
@@ -130,9 +129,7 @@ class DownloadWebAssetTool(AbstractBaseTool):
 
     async def _download(self, url: str) -> tuple[bytes, str, str]:
         proxy_url = get_trusted_proxy_url()
-        client_kwargs = build_isolated_httpx_client_kwargs(proxy_url)
-
-        async with httpx.AsyncClient(**client_kwargs) as client:
+        async with public_fetch_client(proxy_url, timeout=30) as client:
             response = await fetch_public_http_bytes(
                 client,
                 url,

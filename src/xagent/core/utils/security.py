@@ -390,13 +390,13 @@ async def fetch_public_http_bytes(
     proxy rather than connecting directly. httpcore's CONNECT tunnel path
     ignores the ``sni_hostname`` extension and derives TLS SNI from the
     request's remote origin, so rewriting the URL to the pinned IP would
-    send that IP as SNI and break SNI-strict servers. The proxy — not this
-    process — performs the actual outbound connection and its own DNS
-    resolution, so pinning to a client-resolved IP offers no real
-    protection there anyway. In this mode we keep the original hostname as
-    the connect target and rely on the upfront ``validate_public_http_url``
-    check to reject private-network targets before dispatch. The explicitly
-    trusted proxy must also enforce destination/DNS policy at connection time.
+    send that IP as SNI and break SNI-strict servers. Keep the logical URL
+    for TLS, and pair this mode with ``public_fetch_client``: its owned gate
+    independently validates connect-time DNS and sends only a literal-IP
+    CONNECT to the trusted upstream, closing the rebinding window. This body
+    helper alone only performs preflight validation. A caller using a proxy
+    without that gate must require public-only connect-time DNS enforcement
+    by the proxy itself.
 
     Input-download callers can forbid HTTPS downgrades, require a complete
     HTTP 200 response and reject compressed bodies before HTTPX decompression.

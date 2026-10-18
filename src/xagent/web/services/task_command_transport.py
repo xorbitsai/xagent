@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, cast
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, cast
 
 from sqlalchemy import and_, exists, false, or_, select, true
 from sqlalchemy.exc import IntegrityError
@@ -57,8 +57,10 @@ from .task_command_terminal_events import (
 from .task_dispatch_cap import (
     CAP_OVERTAKING_CONTROL_KINDS,
     CONTROL_KINDS,
+    DISPATCH_CLASS_INTERACTIVE,
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
+    DispatchClass,
     build_dispatch_cap_snapshot,
 )
 from .task_execution_host import consumes_task_commands
@@ -492,7 +494,9 @@ def stage_task_command(
        the unique constraint to reject it.
     6. Add and flush the new row last, so any remaining IntegrityError is
        attributable to the command insert itself. Classification runs once per
-       new execution command, after the row is flushed.
+       new execution command, after the row is flushed. The deployment
+       classifier's dispatch class is written to the row in the same
+       transaction, before the admission ticket is staged.
 
     Caller obligations:
 
@@ -537,6 +541,8 @@ def stage_task_command(
             Task.run_id,
             Task.state_version,
             Task.user_id,
+            Task.source,
+            Task.channel_name,
             User.id.label("task_owner_row_id"),
             User.actor_subject.label("task_owner_subject"),
         )
@@ -635,15 +641,50 @@ def stage_task_command(
             },
         )
     from .task_execution_admission import (
+        TaskClassificationView,
         classify_command_no_commit,
         stage_task_admission,
     )
 
-    classification = (
-        classify_command_no_commit(db, command)
-        if command.kind in EXECUTION_OPENING_KINDS
-        else None
-    )
+    classification = None
+    if command.kind in EXECUTION_OPENING_KINDS:
+        # A background command is one the system stages itself (``reserved``).
+        # A classifier may use the class of the task's previous command, so it
+        # is read for every background command and for no other. The row just
+        # flushed is excluded: it exists with the default class.
+        previous_dispatch_class: DispatchClass | None = None
+        if reserved:
+            previous_dispatch_class = cast(
+                "DispatchClass | None",
+                db.execute(
+                    select(TaskExecutionCommand.dispatch_class)
+                    .where(
+                        TaskExecutionCommand.task_id == resolved_task_id,
+                        TaskExecutionCommand.kind.in_(EXECUTION_OPENING_KINDS),
+                        TaskExecutionCommand.id != command.id,
+                    )
+                    .order_by(TaskExecutionCommand.id.desc())
+                    .limit(1)
+                ).scalar_one_or_none(),
+            )
+        classification = classify_command_no_commit(
+            db,
+            command,
+            TaskClassificationView(
+                task_id=resolved_task_id,
+                source=snapshot.source,
+                channel_name=snapshot.channel_name,
+                owner_user_id=int(snapshot.user_id),
+                background=reserved,
+                previous_dispatch_class=previous_dispatch_class,
+            ),
+        )
+        if classification.dispatch_class != command.dispatch_class:
+            command.dispatch_class = classification.dispatch_class  # type: ignore[assignment]
+            # The session does not autoflush; write the class before anything
+            # else in the acceptance transaction can read the row, whatever the
+            # caller does next.
+            db.flush()
     stage_task_admission(
         db, command, classification.admission if classification else None
     )
@@ -1715,11 +1756,20 @@ def _dispatcher_candidate_query(
     return query
 
 
+class CommandCandidate(NamedTuple):
+    """The command a dispatch scan picked and what its slot decision needs."""
+
+    id: int
+    task_id: int
+    kind: TaskCommandKind
+    interactive: bool
+
+
 def _find_command_candidate(
     command_db_id: int | None,
     busy_task_ids: tuple[int, ...] = (),
     cap: DispatchCapSnapshot | None = None,
-) -> tuple[int, int, TaskCommandKind] | None:
+) -> CommandCandidate | None:
     from ..models.database import get_session_local
 
     runner_id = get_runner_id()
@@ -1754,8 +1804,13 @@ def _find_command_candidate(
             row = first_candidate(TaskCommandKind.RESUME_INPUT)
         if row is None:
             row = first_candidate()
-        return (
-            (int(row.id), int(row.task_id), TaskCommandKind(row.kind)) if row else None
+        if row is None:
+            return None
+        return CommandCandidate(
+            int(row.id),
+            int(row.task_id),
+            TaskCommandKind(row.kind),
+            row.dispatch_class == DISPATCH_CLASS_INTERACTIVE,
         )
 
 
@@ -1842,18 +1897,20 @@ async def dispatch_one_task_command(
         )
         if candidate is None:
             return False
-        selected_id, task_id, kind = candidate
+        selected_id, task_id, kind, interactive = candidate
         reservation = None
         if kind.value in EXECUTION_OPENING_KINDS:
             reservation = background_task_manager.reserve_dispatch_slot(
-                task_id, limit=cap.limit
+                task_id, policy=cap.policy, interactive=interactive
             )
             if reservation is None:
-                # The cap filled after the snapshot. An execution end signals
-                # the dispatcher, which retries then. Releasing another
-                # attempt's reservation signals nothing, so when the slot was
-                # held by an attempt that ends without starting an execution,
-                # the retry waits for the idle interval or the next notify.
+                # The cap filled after the snapshot, or this process is on its
+                # batch line and the candidate is a batch command. An execution
+                # end signals the dispatcher, which retries then. Releasing
+                # another attempt's reservation signals nothing, so when the
+                # slot was held by an attempt that ends without starting an
+                # execution, the retry waits for the idle interval or the next
+                # notify.
                 return False
         try:
             coordinator = await registry.ensure(task_id)

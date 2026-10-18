@@ -638,11 +638,12 @@ class TaskCoordinator:
     ) -> str:
         """Release the lease unless the task still has work for this owner.
 
-        ``held_by_cap`` is the snapshot of a process at its dispatch cap that
-        holds no slot for this task. Its pending execution-opening commands
-        would wait here for a free slot, so they do not keep the lease and any
-        process with room may claim them. Not applied to a RUNNING task, whose
-        orphaned row keeps the busy/recover handling.
+        ``held_by_cap`` is the snapshot of a process that will not start a new
+        execution for this task: at its dispatch cap, or at its batch line
+        (checked as for a batch command). Its pending execution-opening
+        commands would wait here for a free slot, so they do not keep the lease
+        and any process with room may claim them. Not applied to a RUNNING
+        task, whose orphaned row keeps the busy/recover handling.
         """
         assert self.lease is not None
         with self._registry.session_factory() as db, db.begin():
@@ -690,8 +691,8 @@ class TaskCoordinator:
                 return "recover"
         if held and held_by_cap is not None:
             logger.info(
-                "Task %s lease released by runner %s at its dispatch cap "
-                "(limit=%s, active=%s); %s queued execution command(s) left "
+                "Task %s lease released by runner %s at its dispatch cap or batch "
+                "line (limit=%s, active=%s); %s queued execution command(s) left "
                 "for a process with a free slot",
                 self.task_id,
                 self.lease.runner_id,
@@ -715,7 +716,9 @@ class TaskCoordinator:
                         # Built on the loop: the snapshot reads the execution
                         # registry and records the cap state for gate_held_s.
                         cap = build_dispatch_cap_snapshot()
-                        held_by_cap = None if cap.admits(self.task_id) else cap
+                        held_by_cap = (
+                            None if cap.admits(self.task_id, interactive=False) else cap
+                        )
                         outcome = await run_db_io_cancellation_safe(
                             functools.partial(
                                 self._release_if_idle, held_by_cap=held_by_cap

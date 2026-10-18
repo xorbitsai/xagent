@@ -48,6 +48,7 @@ def add_command(
     status: str = "pending",
     attempts: int = 0,
     retry_available_at: datetime | None = None,
+    dispatch_class: str = "batch",
 ) -> int:
     host._identity += 1
     with host.factory() as db:
@@ -59,6 +60,7 @@ def add_command(
             status=status,
             attempt_count=attempts,
             retry_available_at=retry_available_at,
+            dispatch_class=dispatch_class,
         )
         db.add(row)
         db.commit()
@@ -247,7 +249,7 @@ async def test_idle_check_releases_lease_when_cap_closed(
     cap_lines = [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()]
     assert cap_lines == (
         [
-            f"Task {target} lease released by runner worker at its dispatch cap "
+            f"Task {target} lease released by runner worker at its dispatch cap or batch line "
             f"(limit=1, active=1); {logged} queued execution command(s) left for "
             "a process with a free slot"
         ]
@@ -297,7 +299,7 @@ async def test_idle_check_releases_handed_back_start(
     assert outcomes[0] == "released"
     assert lease_runner(host, target) is None
     assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == [
-        f"Task {target} lease released by runner worker at its dispatch cap "
+        f"Task {target} lease released by runner worker at its dispatch cap or batch line "
         "(limit=1, active=1); 1 queued execution command(s) left for a process "
         "with a free slot"
     ]
@@ -342,7 +344,7 @@ async def test_idle_check_releases_lease_once_cap_closes(
     assert lease_runner(host, target) is None
     assert other_runner_candidate(host, start) == start
     assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == [
-        f"Task {target} lease released by runner worker at its dispatch cap "
+        f"Task {target} lease released by runner worker at its dispatch cap or batch line "
         "(limit=2, active=2); 1 queued execution command(s) left for a process "
         "with a free slot"
     ]
@@ -394,3 +396,44 @@ async def test_full_process_hands_held_start_to_other_runners(
     # Not evidence of the fix (it also holds before it): the neighbour keeps
     # its normal place behind the bucket head.
     assert other_runner_candidate(host, started[neighbour]) is None
+
+
+async def test_batch_line_releases_an_idle_task_that_this_process_can_still_start(
+    cap_host: CapHost,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """On the batch line the idle check releases a task as for a batch command.
+
+    The task's queued command is interactive and this process could still start
+    it, so releasing is coarser than necessary; the released command stays
+    claimable here and anywhere else with room.
+    """
+
+    host = cap_host
+    set_limit(monkeypatch, 3)
+    monkeypatch.setenv("XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS", "1")
+    for _ in range(2):
+        host.live(host.new_task())
+    target = host.new_task()
+    start = add_command(host, target, "start", dispatch_class="interactive")
+    outcomes = record_idle_outcomes(monkeypatch)
+    caplog.set_level(logging.INFO, logger=runtime.logger.name)
+
+    coordinator = await host.registry.ensure(target)
+    assert coordinator is not None
+    coordinator._ensure_idle_check()
+    await eventually(lambda: outcomes)
+
+    assert outcomes[0] == "released"
+    assert lease_runner(host, target) is None
+    assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == [
+        f"Task {target} lease released by runner worker at its dispatch cap or "
+        "batch line (limit=3, active=2); 1 queued execution command(s) left for "
+        "a process with a free slot"
+    ]
+    assert other_runner_candidate(host, start) == start
+    assert await asyncio.wait_for(
+        transport.dispatch_one_task_command(host.handler), DB_PROGRESS_TIMEOUT
+    )
+    assert host.claimed == [(target, transport.TaskCommandKind.START)]

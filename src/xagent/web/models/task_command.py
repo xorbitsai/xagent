@@ -93,6 +93,13 @@ class TaskExecutionCommand(Base):  # type: ignore
     claim_expires_at = Column(DateTime(timezone=True), nullable=True)
     # Earliest retry time; independent of task ownership and never renewed.
     retry_available_at = Column(DateTime(timezone=True), nullable=True)
+    # What the deployment classifier decided for this command at acceptance:
+    # "interactive" or "batch". Existing rows and control commands read
+    # "batch", meaning not classified. Set by stage_task_command in the
+    # acceptance transaction; never updated after it commits.
+    dispatch_class = Column(
+        String(16), nullable=False, server_default="batch", default="batch"
+    )
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     defer_count = Column(Integer, nullable=False, default=0, server_default="0")

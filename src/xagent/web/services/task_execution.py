@@ -99,7 +99,7 @@ from .task_auto_recovery import (
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
 )
-from .task_dispatch_cap import DispatchCapSnapshot
+from .task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
 from .task_events import DeliveryNotifier, publish_task_event
 from .task_execution_event_writer import (
     FactWitness,
@@ -4765,7 +4765,7 @@ class BackgroundTaskManager:
         # Zeroed by ``drain_gate_held_seconds`` and by ``start_accepting``;
         # ``shutdown`` keeps the total for the final line.
         self._cap_clock: Callable[[], float] = _running_loop_time
-        self._cap_last_limit: int | None = None
+        self._cap_last_policy: DispatchPolicy | None = None
         self._cap_closed_since: float | None = None
         self._cap_closed_total = 0.0
 
@@ -4802,29 +4802,39 @@ class BackgroundTaskManager:
             self._cap_closed_since = None
 
     def _observe_current_cap_state(self, now: float) -> None:
-        limit = self._cap_last_limit
-        if limit is None:
+        policy = self._cap_last_policy
+        if policy is None:
             return
         self._record_cap_state(
-            DispatchCapSnapshot(limit, self._active_task_ids()).closed, now
+            DispatchCapSnapshot(
+                policy=policy, active_ids=self._active_task_ids()
+            ).closed,
+            now,
         )
 
-    def dispatch_cap_snapshot(self, limit: int) -> DispatchCapSnapshot:
-        snapshot = DispatchCapSnapshot(limit, self._active_task_ids())
-        self._cap_last_limit = limit
+    def dispatch_cap_snapshot(self, policy: DispatchPolicy) -> DispatchCapSnapshot:
+        snapshot = DispatchCapSnapshot(
+            policy=policy, active_ids=self._active_task_ids()
+        )
+        self._cap_last_policy = policy
         self._record_cap_state(snapshot.closed, self._cap_clock())
         return snapshot
 
     def reserve_dispatch_slot(
-        self, task_id: int, *, limit: int
+        self, task_id: int, *, policy: DispatchPolicy, interactive: bool
     ) -> DispatchReservation | None:
-        """Take a slot for ``task_id`` unless the cap is full for it.
+        """Take a slot for ``task_id`` unless the policy keeps it from this command.
 
-        Reads the active set and adds the token with no await in between, so
-        concurrent dispatch attempts cannot both take the last slot.
+        ``interactive`` is the class of the command that wants the slot; a
+        batch command is refused from the batch line on, an interactive one
+        only at the limit. Reads the active set and adds the token with no
+        await in between, so concurrent dispatch attempts cannot both take
+        the last slot.
         """
 
-        if not self.dispatch_cap_snapshot(limit).admits(task_id):
+        if not self.dispatch_cap_snapshot(policy).admits(
+            task_id, interactive=interactive
+        ):
             return None
         self._dispatch_reservations[task_id] += 1
         return DispatchReservation(task_id)
@@ -4859,7 +4869,7 @@ class BackgroundTaskManager:
         self._shutdown_lock = asyncio.Lock()
         self._shutting_down = False
         self.drain_window_counts()
-        self._cap_last_limit = None
+        self._cap_last_policy = None
         self._cap_closed_since = None
         self._cap_closed_total = 0.0
 

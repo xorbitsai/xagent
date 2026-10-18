@@ -28,6 +28,7 @@ held task, including the waiter's own; it is display only (#2700).
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
@@ -49,6 +50,12 @@ from .task_admission_pacing import (
     startup_eligible,
 )
 from .task_coordinator_service import TaskLease
+from .task_dispatch_cap import (
+    DISPATCH_CLASS_BATCH,
+    DISPATCH_CLASS_INTERACTIVE,
+    DISPATCH_CLASSES,
+    DispatchClass,
+)
 
 if TYPE_CHECKING:
     from .task_command_transport import ClaimedTaskCommand, SettledTaskCommand
@@ -86,16 +93,83 @@ class CommandClassification:
     """What a deployment decided for one new execution command at acceptance."""
 
     admission: AdmissionPolicy | None = None
+    dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
+
+    def __post_init__(self) -> None:
+        if self.dispatch_class not in DISPATCH_CLASSES:
+            raise ValueError(f"Unknown dispatch class: {self.dispatch_class!r}")
 
 
-CommandClassifier = Callable[[Session, TaskExecutionCommand], CommandClassification]
+@dataclass(frozen=True, kw_only=True)
+class TaskClassificationView:
+    """What a classifier may know about the task a new command belongs to.
+
+    ``background`` is true for a command the system stages on its own (the
+    automatic resume sweeper) rather than one a caller asked for.
+    ``previous_dispatch_class`` is the class of the task's latest earlier
+    execution-opening command, or None when there is none. It is read for
+    every background command and is None for any other command.
+    """
+
+    task_id: int
+    source: str | None
+    channel_name: str | None
+    owner_user_id: int
+    background: bool
+    previous_dispatch_class: DispatchClass | None
+
+
+CommandClassifier = Callable[
+    [Session, TaskExecutionCommand, TaskClassificationView], CommandClassification
+]
 AdmissionHook = Callable[[Session, TaskExecutionCommand], AdmissionPolicy | None]
+
+_UPSTREAM_INTERACTIVE_SOURCES = frozenset({"internal", "widget", "shared_link"})
+_UPSTREAM_BATCH_SOURCES = frozenset({"sdk", "trigger", "a2a"})
+
+
+def upstream_source_class(source: str | None) -> DispatchClass | None:
+    """The class the upstream rule gives a task source, or None if unrecognized.
+
+    A missing source (None or the empty string) means ``internal``, as it does
+    for ``normalize_interaction_origin`` and automatic recovery. Any other match
+    is exact: no stripping and no case folding.
+    """
+    if not source:
+        return DISPATCH_CLASS_INTERACTIVE
+    if source in _UPSTREAM_INTERACTIVE_SOURCES:
+        return DISPATCH_CLASS_INTERACTIVE
+    if source in _UPSTREAM_BATCH_SOURCES:
+        return DISPATCH_CLASS_BATCH
+    return None
+
+
+def upstream_dispatch_class(view: TaskClassificationView, kind: str) -> DispatchClass:
+    """The upstream default class of one execution-opening command.
+
+    A background command follows its task source; a source the rule does not
+    recognize keeps the interactive class of the task's previous command, and
+    is batch otherwise. Any other command is interactive when it answers a
+    waiting task and otherwise follows its task source, batch if unrecognized.
+    """
+    if view.background:
+        by_source = upstream_source_class(view.source)
+        if by_source is not None:
+            return by_source
+        if view.previous_dispatch_class == DISPATCH_CLASS_INTERACTIVE:
+            return DISPATCH_CLASS_INTERACTIVE
+        return DISPATCH_CLASS_BATCH
+    if kind == "resume_input":
+        return DISPATCH_CLASS_INTERACTIVE
+    return upstream_source_class(view.source) or DISPATCH_CLASS_BATCH
 
 
 def upstream_command_classifier(
-    db: Session, command: TaskExecutionCommand
+    db: Session, command: TaskExecutionCommand, view: TaskClassificationView
 ) -> CommandClassification:
-    return CommandClassification()
+    return CommandClassification(
+        dispatch_class=upstream_dispatch_class(view, str(command.kind))
+    )
 
 
 @dataclass(frozen=True)
@@ -115,12 +189,30 @@ def _describe(classifier: CommandClassifier) -> str:
     return getattr(classifier, "__qualname__", None) or repr(classifier)
 
 
+def describe_installed_classifier() -> tuple[str, bool]:
+    """The installed classifier's name and whether it declared admission."""
+    installed = _installed
+    return _describe(installed.classifier), installed.admission_enabled
+
+
 def _install(
     classifier: CommandClassifier, admission_enabled: bool, *, legacy: bool
 ) -> None:
     global _installed
     if not callable(classifier):
         raise TypeError("command classifier must be callable")
+    try:
+        # What is called is the callable itself, not a function it wraps.
+        signature = inspect.signature(classifier, follow_wrapped=False)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        try:
+            signature.bind(None, None, None)
+        except TypeError:
+            raise TypeError(
+                "command classifier must accept (db, command, view)"
+            ) from None
     if not isinstance(admission_enabled, bool):
         raise TypeError("admission_enabled must be a bool")
     _installed = _InstalledClassifier(classifier, admission_enabled, legacy)
@@ -142,7 +234,11 @@ def set_command_classifier(
     The classifier runs inside the acceptance transaction: it must not commit
     or roll back, and must not do slow I/O, because under SQLite that
     transaction holds the database-wide writer lock.
-    Construct every field of its return value by keyword.
+    It receives the session, the flushed command and a read-only view of its
+    task. Construct every field of its return value by keyword; the
+    ``dispatch_class`` field defaults to batch, so a classifier that only sets
+    ``admission`` makes every command batch. To keep the upstream class it can
+    return ``dispatch_class=upstream_dispatch_class(view, command.kind)``.
     ``admission_enabled`` (a ``bool``) declares whether it may return an
     admission policy.
     """
@@ -162,7 +258,7 @@ def set_task_admission_hook(hook: AdmissionHook | None) -> None:
     ``None`` clears a classifier installed through this function; a classifier
     installed with ``set_command_classifier`` is left in place. Otherwise the
     hook is called with ``(db, command)`` and its policy is staged as the
-    ticket.
+    ticket; the command's dispatch class follows the upstream rule.
     """
     if hook is None:
         if _installed.legacy:
@@ -171,9 +267,12 @@ def set_task_admission_hook(hook: AdmissionHook | None) -> None:
 
     @functools.wraps(hook)
     def legacy_admission_hook(
-        db: Session, command: TaskExecutionCommand
+        db: Session, command: TaskExecutionCommand, view: TaskClassificationView
     ) -> CommandClassification:
-        return CommandClassification(admission=hook(db, command))
+        return CommandClassification(
+            dispatch_class=upstream_dispatch_class(view, str(command.kind)),
+            admission=hook(db, command),
+        )
 
     _install(legacy_admission_hook, True, legacy=True)
 
@@ -184,17 +283,18 @@ def admission_enabled() -> bool:
 
 
 def classify_command_no_commit(
-    db: Session, command: TaskExecutionCommand
+    db: Session, command: TaskExecutionCommand, view: TaskClassificationView
 ) -> CommandClassification:
     """Run the installed classifier for one new execution command, exactly once.
 
+    The classifier receives the session, the flushed command and ``view``.
     Classifier exceptions propagate to the acceptance transaction unchanged.
     A result of the wrong type, or an admission policy from a classifier that
     declared ``admission_enabled=False``, is rejected before its admission
     ticket is staged; the caller's rollback discards the flushed command row.
     """
     installed = _installed
-    result = installed.classifier(db, command)
+    result = installed.classifier(db, command, view)
     if not isinstance(result, CommandClassification):
         raise TypeError("command classifier must return CommandClassification")
     if not installed.admission_enabled and result.admission is not None:

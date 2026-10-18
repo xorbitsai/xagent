@@ -508,6 +508,38 @@ def test_due_row_is_dispatched_as_one_fenced_resume_command(factory, notified):
     assert "total_resumes" not in str(message)
 
 
+@pytest.mark.parametrize(
+    ("source", "previous", "expected"),
+    [
+        pytest.param("sdk", "interactive", "batch", id="sdk-ignores-previous"),
+        pytest.param("future_unknown", "interactive", "interactive", id="inherits"),
+    ],
+)
+def test_auto_resume_command_gets_the_upstream_dispatch_class(
+    factory, notified, source, previous, expected
+):
+    now = utc_now()
+    with factory() as db:
+        task_id = _seed(db, now, source=source)
+        if previous is not None:
+            db.add(
+                TaskExecutionCommand(
+                    task_id=task_id,
+                    command_id="earlier-start",
+                    kind="start",
+                    payload={},
+                    status="completed",
+                    dispatch_class=previous,
+                )
+            )
+        db.commit()
+
+    assert run_auto_resume_tick(now=now).staged_commands == 1
+
+    resume = [c for c in _commands(factory, task_id) if c.kind == "resume"]
+    assert [c.dispatch_class for c in resume] == [expected]
+
+
 def test_dispatch_does_not_require_an_empty_runner(factory, notified):
     # A PAUSED task may hold an idle shared coordinator's owner lease.
     now = utc_now()
@@ -1174,7 +1206,7 @@ def _team_admission(
         )
     else:
         task_execution_admission.set_command_classifier(
-            lambda db, command: task_execution_admission.CommandClassification(
+            lambda db, command, view: task_execution_admission.CommandClassification(
                 admission=classify(db, command)
             ),
             admission_enabled=True,

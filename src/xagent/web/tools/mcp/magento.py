@@ -1,21 +1,18 @@
-import contextlib
 import json
 import logging
 import math
 import re
 import socket
-import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from os import environ
 from typing import Any
 from urllib.parse import urlsplit
 
-import requests
-import urllib3.util.connection as urllib3_connection
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
 from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils import public_requests as requests
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -25,7 +22,6 @@ from ...utils.graphql_errors import truncate_error_text
 from .utils import (
     clamp_limit,
     require_clean_identifier,
-    setup_proxy_env,
     success_with_capped_dict,
     url_path_id,
 )
@@ -33,8 +29,6 @@ from .utils import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("magento-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("magento-mcp")
 
@@ -49,9 +43,6 @@ _MAX_CATEGORY_SUMMARY_DEPTH = 50
 _PRODUCT_STATUSES = frozenset({1, 2})  # 1 = Enabled, 2 = Disabled
 _PRODUCT_VISIBILITIES = frozenset({1, 2, 3, 4})  # Not Visible/Catalog/Search/Both
 _STORE_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
-# Serializes _pinned_dns's global urllib3 monkeypatch -- see that function's
-# docstring for why two overlapping calls could otherwise race.
-_PINNED_DNS_LOCK = threading.Lock()
 
 
 def _success(**payload: Any) -> str:
@@ -86,8 +77,8 @@ def _headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-def _resolve_store_host() -> tuple[str, int | None, str]:
-    """Validate MAGENTO_BASE_URL and resolve it to a single non-private IP.
+def _resolve_store_host() -> tuple[str, int | None]:
+    """Validate MAGENTO_BASE_URL and all its resolved addresses.
 
     Unlike Shopify/Zendesk (always a "*.myshopify.com"/"*.zendesk.com"
     subdomain), Magento/Adobe Commerce is commonly self-hosted at an
@@ -99,14 +90,9 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     defense here, not just defense-in-depth, since (again unlike PostHog)
     there is no small fixed-hostname allowlist to lean on first.
 
-    Returns (hostname, port, pinned_ip). `_request()` pins its actual TCP
-    connection to `pinned_ip` (see `_pinned_dns` below) instead of letting
-    `requests`/urllib3 re-resolve the hostname independently right before
-    connecting: without that, the address validated here and the address
-    actually connected to a moment later could differ -- a DNS-rebinding
-    TOCTOU where an attacker-controlled, low-TTL DNS record answers with a
-    public IP for this check and a private one (e.g. 127.0.0.1 or a cloud
-    metadata endpoint) for the real connection, defeating this whole check.
+    Returns (hostname, port) for configuration validation. The
+    public Requests adapter independently validates and pins its actual socket
+    destination from one DNS snapshot per request; no global patch is needed.
     """
     raw = environ.get("MAGENTO_BASE_URL", "").strip()
     if not raw:
@@ -127,25 +113,7 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     if not hostname:
         raise ValueError("MAGENTO_BASE_URL must include a hostname")
     try:
-        # IDNA-encoded (punycode) up front, matching what urllib3's own URL
-        # parsing (`_normalize_host`/`_idna_encode`) does to the host it
-        # actually connects to -- without this, a non-ASCII hostname would
-        # leave `hostname` (used below for the pinning comparison) as raw
-        # Unicode while the real connection's `self.host` is punycode, so
-        # `_pinned_dns`'s `host == hostname` check would never match and
-        # silently skip pinning for exactly this input.
-        #
-        # This must go through the third-party `idna` package the same way
-        # urllib3 does (IDNA2008/UTS46, strict + std3_rules) -- NOT Python's
-        # stdlib `str.encode("idna")` codec, which implements the older
-        # IDNA2003 and disagrees with urllib3 on real hostnames (verified:
-        # "faß.de".encode("idna") -> "fass.de", a different, unrelated
-        # domain, while urllib3's own encoder produces "xn--fa-hia.de").
-        # Using the stdlib codec here wouldn't just skip pinning -- DNS,
-        # the Host header, and TLS SNI would all consistently target the
-        # wrong domain instead. urllib3 itself only reaches for `idna` when
-        # the host isn't already ASCII (see `_idna_encode`), so mirror that
-        # exactly rather than unconditionally re-encoding an ASCII host.
+        # Match urllib3's IDNA2008 normalization used by the public adapter.
         if not hostname.isascii():
             import idna
 
@@ -173,21 +141,18 @@ def _resolve_store_host() -> tuple[str, int | None, str]:
     except OSError as exc:
         raise ValueError(f"MAGENTO_BASE_URL could not be resolved: {exc}") from exc
 
-    pinned_ip: str | None = None
     try:
         for *_, sockaddr in resolved:
             ip = str(sockaddr[0])
             reject_private_network_host(ip)
-            if pinned_ip is None:
-                pinned_ip = ip
     except PrivateNetworkHostError as exc:
         raise ValueError(f"MAGENTO_BASE_URL is not allowed: {exc}") from exc
-    if pinned_ip is None:
+    if not resolved:
         raise ValueError(
             "MAGENTO_BASE_URL could not be resolved: no addresses returned"
         )
 
-    return hostname, port, pinned_ip
+    return hostname, port
 
 
 def _format_origin(hostname: str, port: int | None) -> str:
@@ -205,13 +170,10 @@ def _format_origin(hostname: str, port: int | None) -> str:
 
 
 def _base_url() -> str:
-    """Validate MAGENTO_BASE_URL and return the store's bare origin (scheme
-    + host[:port]). `_request()` does not call this -- it calls
-    `_resolve_store_host()` directly so a single logical request resolves
-    DNS exactly once and can pin its connection to the address it
-    validated (see `_resolve_store_host`'s docstring); this function exists
-    for its own standalone validation/error-message behavior only."""
-    hostname, port, _pinned_ip = _resolve_store_host()
+    """Validate the store origin. The public adapter separately validates and
+    pins connection-time DNS, rather than reusing this preflight snapshot.
+    """
+    hostname, port = _resolve_store_host()
     return _format_origin(hostname, port)
 
 
@@ -249,70 +211,6 @@ def _store_path_prefix() -> str:
 
 def _api_base_url() -> str:
     return f"{_base_url()}{_store_path_prefix()}"
-
-
-@contextlib.contextmanager
-def _pinned_dns(hostname: str, pinned_ip: str) -> Iterator[None]:
-    """Force any connection to `hostname` made inside this block to dial
-    `pinned_ip` directly, without a second DNS lookup -- closes the
-    TOCTOU/DNS-rebinding window between `_resolve_store_host()`'s
-    validation and the connection `requests` would otherwise make on its
-    own (urllib3's `HTTPConnection._new_conn()` calls
-    `urllib3.util.connection.create_connection()`, which does its own
-    independent `socket.getaddrinfo()`).
-
-    This only repoints the TCP connect address: the Host header and TLS
-    SNI/certificate-hostname verification are untouched, since urllib3
-    reads those from `self.host` (still `hostname`, because the request
-    URL itself is never rewritten to the IP) completely separately from
-    the address `create_connection()` dials -- confirmed directly against
-    the installed urllib3's `connection.py` (`HTTPSConnection.connect()`
-    sets `server_hostname = self.host` independently of `_new_conn()`).
-
-    Scoped to this one call (patched in, restored in `finally`) rather than
-    a permanent global patch: `urllib3.util.connection.create_connection` is
-    process-global state, so two overlapping calls patching/restoring it
-    concurrently could in principle race. That doesn't happen today only
-    because the MCP SDK invokes this synchronous, non-async tool function
-    directly on its single event-loop thread -- the `_make_request()` call
-    inside fully blocks that thread for the call's duration, so no other
-    tool invocation's `_pinned_dns` block can interleave with it. If this
-    connector ever moves to an async HTTP client, that property no longer
-    holds. Rather than leave that invariant unenforced, `_PINNED_DNS_LOCK`
-    below serializes the whole block (not just the patch/restore) so a
-    second overlapping call always waits instead of racing, whether or not
-    that invariant keeps holding in the future.
-
-    The lock has to span the full `yield` (the actual network call), not
-    just the patch-in/patch-out lines: `hostname` is the same value for
-    every call in this process (there is exactly one `MAGENTO_BASE_URL`),
-    so a second call's `pinned_ip` can differ from this one's only if DNS
-    re-resolved to a different address between calls. Releasing the lock
-    before the network call would let that second call repatch
-    `create_connection` to *its* `pinned_ip` while this call's connection
-    is still being established, silently redirecting this call's request
-    to the wrong address -- a worse bug than the one the lock exists to
-    prevent. The cost is that this does fully serialize concurrent Magento
-    calls if the single-thread invariant above ever stops holding; that
-    trade (correctness over throughput for a security-sensitive pin) is
-    intentional, not an oversight to "optimize" away.
-    """
-    with _PINNED_DNS_LOCK:
-        original_create_connection = urllib3_connection.create_connection
-
-        def _pinned_create_connection(
-            address: tuple[str, int], *args: Any, **kwargs: Any
-        ) -> Any:
-            host, port = address
-            if host == hostname:
-                address = (pinned_ip, port)
-            return original_create_connection(address, *args, **kwargs)
-
-        urllib3_connection.create_connection = _pinned_create_connection
-        try:
-            yield
-        finally:
-            urllib3_connection.create_connection = original_create_connection
 
 
 def _make_request(**kwargs: Any) -> requests.Response:
@@ -480,52 +378,35 @@ def _request(
     headers = _headers()
     store_path_prefix = _store_path_prefix()
 
-    # An ambient HTTP(S) proxy makes the *proxy* perform DNS resolution and
-    # the actual outbound TCP connection, not this process -- urllib3's
-    # connection pool dials the proxy's own address in that case, never the
-    # target's, so _pinned_dns below (which only intercepts a connection
-    # this process itself dials) would silently never match and pinning
-    # would have no effect, reopening the exact DNS-rebinding TOCTOU window
-    # it exists to close. Mirrors web_content.py's fetch_web_content:
-    # get_trusted_proxy_url() raises unless the proxy is explicitly marked
-    # trusted to enforce its own private-range egress policy
-    # (XAGENT_TRUSTED_EGRESS_PROXY=1), rather than silently trusting every
-    # ambient proxy setup_proxy_env() promotes from the OS's own settings.
-    # The result is then passed to `_make_request()` (see below), which
-    # issues the call on a trust_env=False Session -- disabling every
-    # ambient/OS-native proxy source, not just the env vars this function
-    # checks -- so "no proxy" here is an actual guarantee for this call.
+    # Only an explicitly trusted proxy may perform connect-time DNS. Direct
+    # sockets are pinned by the public Requests adapter, not a global patch.
     proxy_url = get_trusted_proxy_url()
     proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {}
 
-    # Resolved once here (not via _api_base_url()/_base_url()) so this
-    # single request gets exactly one DNS lookup, and the connection below
-    # can be pinned to the same address that lookup validated.
-    hostname, port, pinned_ip = _resolve_store_host()
+    # Validate store configuration; the adapter owns connection-time pinning.
+    hostname, port = _resolve_store_host()
     origin = _format_origin(hostname, port)
     url = f"{origin}{store_path_prefix}{path}"
     try:
-        with _pinned_dns(hostname, pinned_ip):
-            response = _make_request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=params,
-                json=json_data,
-                timeout=DEFAULT_TIMEOUT_SECONDS,
-                proxies=proxies,
-                # A redirect response is never followed with the Bearer header
-                # still attached: a self-hosted store redirecting an API call
-                # (e.g. an http->https or www-canonicalization rule misapplied
-                # to /rest/) is either a misconfiguration or a host trying to
-                # relay the credential elsewhere.
-                allow_redirects=False,
-            )
+        response = _make_request(
+            method=method,
+            url=url,
+            headers=headers,
+            params=params,
+            json=json_data,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            proxies=proxies,
+            # A redirect response is never followed with the Bearer header
+            # still attached: a self-hosted store redirecting an API call
+            # (e.g. an http->https or www-canonicalization rule misapplied
+            # to /rest/) is either a misconfiguration or a host trying to
+            # relay the credential elsewhere.
+            allow_redirects=False,
+        )
     except requests.RequestException as exc:
         # A connection/timeout/proxy failure's message can itself embed
         # sensitive data -- e.g. a ProxyError echoing the ambient
-        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
-        # (setup_proxy_env() exports whatever the OS has configured).
+        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials.
         raise RuntimeError(redact_sensitive_text(str(exc))) from exc
 
     if 300 <= response.status_code < 400:

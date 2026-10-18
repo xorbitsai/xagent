@@ -6,18 +6,15 @@ import uuid
 from typing import Any
 from urllib.parse import quote
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
-from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("stripe-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("stripe-mcp")
 
@@ -221,9 +218,8 @@ def _request(
         except requests.RequestException as exc:
             # A connection/timeout/proxy failure's message can itself embed
             # sensitive data -- e.g. a ProxyError echoing the ambient
-            # HTTPS_PROXY URL, which may carry embedded user:pass@
-            # credentials (setup_proxy_env() exports whatever the OS has
-            # configured) -- matches posthog.py's identical fix for the
+            # explicitly trusted proxy URL, which may embed user:pass@
+            # credentials -- matches posthog.py's identical fix for the
             # same shared proxy-env exposure surface. Also bounded in
             # length the same way an HTTP-level error body is below, since
             # the redacted text is still unstructured and can be long.

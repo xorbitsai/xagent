@@ -74,8 +74,10 @@ are still registered. `gate_held_s` is the number of seconds in the minute that 
 process was at `XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCESS`. While a process is at
 the cap it does not claim commands that would start a new execution there. A process that is full with
 nothing queued also reports it, so read it together with `inflight` and
-`started_1m`. The line is not logged when `XAGENT_LOG_LEVEL` is above
-`INFO`.
+`started_1m`. `gate_held_s` counts only the time at the full limit: with
+`XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS` above 0, batch commands are
+held from `limit - reserve` active tasks, and that time is not counted. The
+line is not logged when `XAGENT_LOG_LEVEL` is above `INFO`.
 
 ## Configuration and upgrade
 

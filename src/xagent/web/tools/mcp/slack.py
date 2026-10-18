@@ -7,16 +7,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import allowed_dirs_from_env, setup_proxy_env
+from ....core.utils import public_requests as requests
+from .utils import allowed_dirs_from_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("slack-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("slack-mcp")
 

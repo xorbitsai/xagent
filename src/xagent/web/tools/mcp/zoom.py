@@ -6,20 +6,18 @@ import urllib.parse
 from datetime import UTC
 from typing import Any
 
-import requests
 from dateutil import parser as _date_parser
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from ....config import get_zoom_meeting_write_enabled
-from .utils import offset_datetime_string, resolve_zoneinfo, setup_proxy_env
+from ....core.utils import public_requests as requests
+from .utils import offset_datetime_string, resolve_zoneinfo
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("zoom-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("zoom-mcp")
 

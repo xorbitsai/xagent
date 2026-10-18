@@ -38,8 +38,11 @@ Locations and third-party response text.
   configured model API request gets the model credential. A rejected reference
   never reaches that potentially billed model call.
 
-These restrictions deliberately do not apply to configured model API endpoints:
-legitimate private model services retain their previous configuration behavior.
+The input-download policy is separate from configured model API requests.
+The managed MCP/model client migrations in #3192/#3193 reject private endpoints
+on their covered paths once merged and deployed; see
+[managed public egress](managed-public-egress.md) for the complete-stack policy
+and compatibility impact. This input helper alone does not enforce that policy.
 Gemini data URLs and trusted SDK local-file inputs are not changed here.
 
 ## Workspace authorization
@@ -68,10 +71,13 @@ declared size limits, decoding, deadlines, cancellation, preserved configured
 model requests, rejection before compressed-body reads, HTTP 206 rejection,
 authorized workspace-relative paths and workspace path/symlink rejection.
 
-The input policy does not change production infrastructure, pin the SaaS core version, or
-complete CASA item 15. Configured MCP/model destinations, other SDK/provider
-URL consumers, and sandbox egress still require scoped policies and deployment
-acceptance. In particular, existing fetch paths configured with an explicit
+The input policy does not change production infrastructure, pin the SaaS core
+version, or complete CASA item 15. The managed MCP/model, connector and asset
+migrations are separate PRs; their connection-level checks and remaining limits
+are documented in [managed public egress](managed-public-egress.md). Each
+migration still requires merge, deployment and acceptance. Arbitrary user code,
+third-party programs and independent sandbox egress remain outside that boundary.
+In particular, existing fetch paths configured with an explicit
 outbound proxy need the proxy to enforce destination/DNS policy at connection
 time; preflight DNS validation by the application is not sufficient against
 rebinding through a separately resolving proxy. A universal production egress

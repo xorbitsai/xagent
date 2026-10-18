@@ -1200,7 +1200,7 @@ async def test_concurrent_actor_refresh_keeps_rotated_credential(
                 await asyncio.sleep(0.01)
             return Response(400)
 
-    monkeypatch.setattr(web_tools_config.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(web_tools_config, "create_public_async_client", Client)
 
     first, second = await asyncio.gather(
         _config(db_session, policy=_policy()).get_mcp_server_configs(),

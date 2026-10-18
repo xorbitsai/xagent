@@ -42,7 +42,10 @@ Field meanings:
   numbered at least the limit, so its dispatcher did not claim commands that
   would start a new execution here. It is time at the cap, not time work waited:
   a process running exactly the limit with nothing queued reports the whole
-  window. Checked at each dispatch attempt and at the flush, so each change
+  window. Counts only the time at the full limit: with an interactive reserve
+  (``XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS``) batch commands are held
+  from ``limit - reserve`` active tasks, and that time is not counted. Checked
+  at each dispatch attempt and at the flush, so each change
   is late by at most the gap between attempts (0.5 s while the dispatcher is
   idle). Always ``0.0`` in a process that does not dispatch task commands.
 - ``loop_lag_max_ms`` / ``loop_lag_samples``: largest event-loop scheduling

@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .jira_attachment import (
@@ -22,15 +22,12 @@ from .utils import (
     clamp_limit,
     clamp_offset,
     require_clean_text,
-    setup_proxy_env,
     success_with_capped_dict,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("jira-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("jira-mcp")
 

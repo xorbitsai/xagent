@@ -4,15 +4,13 @@ import os
 from typing import Any
 from urllib.parse import quote
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from ....core.utils import public_requests as requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("teams-mcp")
 
-setup_proxy_env()
 
 mcp = FastMCP("teams-mcp")
 

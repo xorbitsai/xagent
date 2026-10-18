@@ -5,11 +5,12 @@ import os
 import urllib.parse
 from pathlib import Path
 
-import requests
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
+from ....core.tools.core.web_content import get_trusted_proxy_url
+from ....core.utils import public_requests as requests
 from .utils import allowed_dirs_from_env
 
 app = Server("linkedin-mcp")
@@ -219,8 +220,6 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             )
         ]
 
-    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
     headers = {
         "Authorization": f"Bearer {token}",
         "X-Restli-Protocol-Version": "2.0.0",
@@ -230,6 +229,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     }
 
     try:
+        proxy = get_trusted_proxy_url()
+        proxies = {"http": proxy, "https": proxy} if proxy else None
         if name == "get_profile":
             r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
             r.raise_for_status()

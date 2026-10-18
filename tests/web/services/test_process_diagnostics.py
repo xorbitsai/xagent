@@ -12,7 +12,10 @@ from types import ModuleType
 import pytest
 
 from xagent.web.services import process_diagnostics
+from xagent.web.services.task_dispatch_cap import DispatchPolicy
 from xagent.web.services.task_execution import BackgroundTaskManager
+
+ONE_SLOT = DispatchPolicy(limit=1, interactive_reserve=0)
 
 LOGGER = process_diagnostics.__name__
 MANAGER_LOGGER = "xagent.web.services.task_execution"
@@ -465,12 +468,12 @@ def _gate_probe(manager, monkeypatch, *, window_started_at: float = 0.0):
     def close(at: float) -> None:
         clock.now = at
         manager._live_executions[1] = {object()}  # type: ignore[assignment]
-        manager.dispatch_cap_snapshot(1)
+        manager.dispatch_cap_snapshot(ONE_SLOT)
 
     def open_(at: float) -> None:
         clock.now = at
         manager._live_executions.pop(1, None)
-        manager.dispatch_cap_snapshot(1)
+        manager.dispatch_cap_snapshot(ONE_SLOT)
 
     def drain(at: float) -> float:
         return process_diagnostics.drain_execution_counters(now=at).gate_held_s
@@ -528,7 +531,7 @@ async def test_gate_held_counts_a_full_process_with_nothing_queued(
     try:
         manager.register_task(1, running)
         clock.now = 0.0
-        manager.dispatch_cap_snapshot(1)
+        manager.dispatch_cap_snapshot(ONE_SLOT)
         assert drain(60) == 60.0
     finally:
         running.cancel()
@@ -542,8 +545,10 @@ async def test_gate_held_after_shutdown_and_new_lifespan(manager, monkeypatch, r
     clock.now = 0.0
     # A reservation outlives cancellation, so only the observation that
     # follows shutdown's clearing of the tables can end the interval at 4.0.
-    assert manager.reserve_dispatch_slot(1, limit=1) is not None
-    manager.dispatch_cap_snapshot(1)
+    assert (
+        manager.reserve_dispatch_slot(1, policy=ONE_SLOT, interactive=False) is not None
+    )
+    manager.dispatch_cap_snapshot(ONE_SLOT)
     clock.now = 4.0
     await manager.shutdown()
 

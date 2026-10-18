@@ -256,3 +256,60 @@ def test_only_explicitly_trusted_proxy_is_usable(network, monkeypatch):
         requests.get(
             "https://example.com/", proxies={"https": "http://other.example:3128"}
         )
+
+
+def test_upload_chunks_reuse_ca_context_and_connection_pool(network, monkeypatch):
+    import ssl
+
+    _, seen, _ = network
+    build = Mock(side_effect=lambda: ssl.create_default_context())
+    monkeypatch.setattr(requests, "build_ca_bundle_ssl_context", build)
+    with requests.Session() as session:
+        for chunk in (b"one", b"two", b"three"):
+            session.put("https://upload.example/chunks", data=chunk)
+    assert build.call_count == 1
+    assert len(seen) == 3
+    assert seen[0][0] is seen[1][0] is seen[2][0]
+
+
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_ca_context_cache_respects_env_and_client_certificate_isolation(
+    network, monkeypatch, variable
+):
+    import ssl
+
+    adapter = requests._PublicAdapter()
+    first, second = ssl.create_default_context(), ssl.create_default_context()
+    certificates = [ssl.create_default_context(), ssl.create_default_context()]
+    build = Mock(side_effect=[first, second])
+    monkeypatch.setattr(requests, "build_ca_bundle_ssl_context", build)
+    monkeypatch.setenv(variable, "/operator/first")
+    assert adapter._ca_context(None) is first
+    assert adapter._ca_context(None) is first
+    monkeypatch.setenv(variable, "/operator/second")
+    assert adapter._ca_context(None) is second
+    assert build.call_count == 2
+    build.side_effect = certificates
+    assert adapter._ca_context(("client.pem", "key.pem")) is certificates[0]
+    assert adapter._ca_context(("client.pem", "key.pem")) is certificates[1]
+    # Explicit client-cert contexts never pollute the cached CA-only context.
+    assert adapter._ca_context(None) is second
+
+
+def test_real_adapter_never_shares_client_cert_context_with_ca_cache(network, tmp_path):
+    _, seen, _ = network
+    cert, key = tmp_path / "client.pem", tmp_path / "key.pem"
+    # The fake wire stops before TLS; real pool construction and Requests'
+    # certificate-file existence checks are retained.
+    cert.write_text("test client certificate")
+    key.write_text("test private key placeholder")
+    with requests.Session() as session:
+        session.get("https://upload.example/chunk")
+        session.get("https://upload.example/chunk", cert=(str(cert), str(key)))
+        session.get("https://upload.example/chunk", cert=(str(cert), str(key)))
+        session.get("https://upload.example/chunk")
+    contexts = [pool.conn_kw["ssl_context"] for pool, *_ in seen]
+    assert seen[0][0] is seen[3][0]
+    assert contexts[0] is contexts[3]
+    assert contexts[1] is not contexts[0]
+    assert contexts[2] is not contexts[0] and contexts[2] is not contexts[1]

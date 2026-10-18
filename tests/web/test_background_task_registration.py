@@ -2,8 +2,11 @@ import asyncio
 
 import pytest
 
+from xagent.web.services.task_dispatch_cap import DispatchPolicy
 from xagent.web.services.task_execution import BackgroundTaskManager
 from xagent.web.services.task_lease_service import run_while_task_lease_owned
+
+FIVE_SLOTS = DispatchPolicy(limit=5, interactive_reserve=0)
 
 
 @pytest.mark.asyncio
@@ -202,14 +205,16 @@ async def test_cap_snapshot_counts_union_of_task_ids(
     for task_id in tokens:
         manager._dispatch_reservations[task_id] += 1
 
-    snapshot = manager.dispatch_cap_snapshot(3)
+    snapshot = manager.dispatch_cap_snapshot(
+        DispatchPolicy(limit=3, interactive_reserve=0)
+    )
 
     assert snapshot.limit == 3
     assert snapshot.active_ids == frozenset(active)
     assert snapshot.closed is closed
     for task_id in active:
-        assert snapshot.admits(task_id)
-    assert snapshot.admits(99) is (not closed)
+        assert snapshot.admits(task_id, interactive=False)
+    assert snapshot.admits(99, interactive=False) is (not closed)
 
 
 @pytest.mark.asyncio
@@ -219,7 +224,9 @@ async def test_dispatch_reservations_follow_manager_lifespan(state):
     handle = asyncio.create_task(asyncio.Event().wait())
     try:
         if state == "token":
-            token = manager.reserve_dispatch_slot(1, limit=5)
+            token = manager.reserve_dispatch_slot(
+                1, policy=FIVE_SLOTS, interactive=False
+            )
             with pytest.raises(RuntimeError, match="still owns background work"):
                 manager.start_accepting()
             manager.release_dispatch_slot(token)
@@ -242,7 +249,9 @@ async def test_dispatch_reservations_follow_manager_lifespan(state):
                 manager.start_accepting()
         else:
             manager.register_task(2, handle)
-            token = manager.reserve_dispatch_slot(1, limit=5)
+            token = manager.reserve_dispatch_slot(
+                1, policy=FIVE_SLOTS, interactive=False
+            )
             await manager.shutdown()
             assert manager._live_executions == {}
             assert not manager._dispatch_reservations

@@ -23,6 +23,7 @@ from sqlalchemy.exc import OperationalError
 from tests.web.services.test_dispatch_cap import (  # noqa: F401
     CapHost,
     cap_host,
+    policy_of,
     set_limit,
 )
 from xagent.web.models.agent import Agent
@@ -325,17 +326,23 @@ async def test_control_overtake_matrix(
         await hold_cap(host)
     elif cap_state == "closed_task_active":
         host.live(task_id)
-    cap = host.manager.dispatch_cap_snapshot(1)
+    cap = host.manager.dispatch_cap_snapshot(policy_of(1))
     assert cap.closed is (cap_state != "open")
 
     layer1 = transport._find_command_candidate(None, (), cap)
     layer2 = transport._find_command_candidate(control_id, (), cap)
 
-    control_candidate = (control_id, task_id, TaskCommandKind(control))
-    held_candidate = (held_id, task_id, TaskCommandKind(held_kind))
+    control_candidate = transport.CommandCandidate(
+        control_id, task_id, TaskCommandKind(control), False
+    )
+    held_candidate = transport.CommandCandidate(
+        held_id, task_id, TaskCommandKind(held_kind), False
+    )
     if order in ("pause_between", "cancel_between"):
         # Only the earlier control is claimable; the later one waits behind it.
-        assert layer1 == (first_id, task_id, TaskCommandKind(order.split("_")[0]))
+        assert layer1 == transport.CommandCandidate(
+            first_id, task_id, TaskCommandKind(order.split("_")[0]), False
+        )
         assert layer2 is None
     elif order == "control_first" or cap_state == "closed_task_inactive":
         assert layer1 == control_candidate
@@ -356,19 +363,19 @@ async def test_claim_update_honours_cancel_overtake(
     task_id = host.new_task(status=TaskStatus.PENDING)
     start_id = enqueue(host, task_id, "start")
     cancel_id = enqueue(host, task_id, "cancel")
-    cap = host.manager.dispatch_cap_snapshot(1)
+    cap = host.manager.dispatch_cap_snapshot(policy_of(1))
     assert cap.closed
     coordinator = await host.registry.ensure(task_id)
     assert coordinator is not None
     if variant == "cap_reopened":
         finish.set()
         await host.held[-1]
-        assert not host.manager.dispatch_cap_snapshot(1).closed
+        assert not host.manager.dispatch_cap_snapshot(policy_of(1)).closed
     if variant == "task_became_active":
         # Started outside the queue after the snapshot; the claim still
         # decides by the snapshot it was given.
         host.live(task_id)
-        assert task_id in host.manager.dispatch_cap_snapshot(1).active_ids
+        assert task_id in host.manager.dispatch_cap_snapshot(policy_of(1)).active_ids
     if variant == "claimed_between":
         real_query = transport._claimable_query
 
@@ -456,7 +463,7 @@ async def test_control_does_not_overtake_claimed_rows(
     held_id = enqueue(host, task_id, kind, **fields)
     control_id = enqueue(host, task_id, control)
     before = state(host, held_id)
-    cap = host.manager.dispatch_cap_snapshot(1)
+    cap = host.manager.dispatch_cap_snapshot(policy_of(1))
 
     assert transport._find_command_candidate(control_id, (), cap) is None
     assert await run(control_id) is False

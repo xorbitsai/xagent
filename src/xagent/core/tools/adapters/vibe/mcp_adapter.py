@@ -49,8 +49,8 @@ from ....file_ref import (
 from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import (
     Connection,
-    McpHttpClientFactory,
-    create_mcp_http_client,
+    SSEConnection,
+    StreamableHttpConnection,
     create_session,
 )
 from ...core.mcp.tools import load_mcp_tools, raw_annotations_for
@@ -3818,9 +3818,11 @@ class _TransportRecorder:
         """
         if connection.get("transport") not in _INSTRUMENTABLE_TRANSPORTS:
             return connection
-        build = cast(
-            McpHttpClientFactory,
-            connection.get("httpx_client_factory") or create_mcp_http_client,
+        from ...core.mcp.http import mcp_http_client_factory
+
+        http_connection = cast(SSEConnection | StreamableHttpConnection, connection)
+        build = mcp_http_client_factory(
+            http_connection["url"], http_connection.get("httpx_client_factory")
         )
 
         def record(

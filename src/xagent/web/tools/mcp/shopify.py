@@ -8,10 +8,10 @@ from collections.abc import Callable
 from os import environ
 from typing import Any, NoReturn
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from ....core.utils.security import (
     PrivateNetworkHostError,
     redact_sensitive_text,
@@ -21,15 +21,12 @@ from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
 from .utils import (
     clamp_limit,
     halve_dict_or_mark,
-    setup_proxy_env,
     success_with_capped_dict,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("shopify-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("shopify-mcp")
 

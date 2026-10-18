@@ -917,7 +917,7 @@ def _fake_async_client(monkeypatch, response_data: dict | None = None) -> list:
                 or {"access_token": "new-access", "refresh_token": "new-refresh"}
             )
 
-    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(tool_config, "create_public_async_client", FakeAsyncClient)
     return posted
 
 

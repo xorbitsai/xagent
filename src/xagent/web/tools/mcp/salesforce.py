@@ -4,14 +4,13 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from ....core.utils import public_requests as requests
 from .utils import (
     clamp_limit,
     clamp_offset,
-    setup_proxy_env,
     success_with_capped_dict,
     url_path_id,
 )
@@ -19,8 +18,6 @@ from .utils import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("salesforce-mcp")
 
-# Ensure standard proxy environment variables are set to prevent hanging requests
-setup_proxy_env()
 
 mcp = FastMCP("salesforce-mcp")
 

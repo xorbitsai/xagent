@@ -49,7 +49,6 @@ from ....file_ref import (
 from ....utils.security import redact_sensitive_text
 from ...core.mcp.sessions import (
     Connection,
-    McpHttpClientFactory,
     SSEConnection,
     StreamableHttpConnection,
     create_session,

@@ -1,9 +1,25 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from 'react'
+import katex from 'katex'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+
+describe('KaTeX renderer trust boundary', () => {
+  it.each([
+    String.raw`\href{javascript:alert(1)}{click}`,
+    String.raw`\includegraphics{https://untrusted.invalid/image.png}`,
+  ])('does not inherit trusted rendering from the options prototype: %s', expression => {
+    // GHSA-238p-pmpm-9mq7: this is a renderer-options prototype, not a mutation
+    // of Object.prototype shared with other tests or the rendering framework.
+    const options = Object.create({ trust: true })
+    const html = katex.renderToString(expression, options)
+    const element = document.createElement('div')
+    element.innerHTML = html
+    expect(element.querySelector('a[href], img[src]')).toBeNull()
+  })
+})
 
 vi.mock('@/lib/utils', () => ({
   cn: (...classes: Array<string | undefined | false>) => classes.filter(Boolean).join(' '),

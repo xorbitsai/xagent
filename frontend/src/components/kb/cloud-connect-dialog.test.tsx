@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -171,6 +171,29 @@ describe("CloudConnectDialog", () => {
       }),
     ])
     expect(onOpenChange).toHaveBeenCalledWith(false)
+  })
+
+  it("accepts completion only from the launched popup, configured callback and selected app", async () => {
+    const popup = { closed: false, close: vi.fn(), location: { replace: vi.fn() } } as unknown as Window
+    const open = vi.spyOn(window, "open").mockReturnValue(popup)
+    const existing = apiRequestMock.getMockImplementation()!
+    apiRequestMock.mockImplementation((url: string) => url.endsWith("/api/auth/google/login")
+      ? Promise.resolve(jsonResponse({ authorization_url: "/api/auth/google/login?ticket=proof", callback_origin: "https://callback.example" }))
+      : existing(url))
+    render(<CloudConnectDialog open onOpenChange={vi.fn()} onConfirm={vi.fn()}
+      provider={{ id: "google-drive", name: "Google Drive", hasDrives: false, authPath: "google", logo: "drive" }} />)
+    fireEvent.click(await screen.findByTestId("select-add_new"))
+    await waitFor(() => expect(popup.location.replace).toHaveBeenCalled())
+    const count = () => apiRequestMock.mock.calls.filter(([url]) => url.includes("/api/cloud/accounts?")).length
+    const before = count()
+    const valid = { source: popup, origin: "https://callback.example", data: { type: "oauth-success", provider: "google-drive", email: "new@example.com" } }
+    for (const change of [{ source: window }, { origin: "https://attacker.example" }, { data: { ...valid.data, provider: "other" } }]) {
+      await act(async () => { window.dispatchEvent(new MessageEvent("message", { ...valid, ...change })) })
+      expect(count()).toBe(before)
+    }
+    await act(async () => { window.dispatchEvent(new MessageEvent("message", valid)) })
+    expect(count()).toBe(before + 1)
+    open.mockRestore()
   })
 
   it("prevents selecting more than five files", async () => {

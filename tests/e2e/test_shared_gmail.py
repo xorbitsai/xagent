@@ -14,7 +14,8 @@ from unittest.mock import Mock
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwt
+
+from xagent.web import jwt_codec as jwt
 
 pytestmark = pytest.mark.e2e
 

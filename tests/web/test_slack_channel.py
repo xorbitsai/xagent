@@ -16,7 +16,6 @@ from starlette.requests import Request
 from xagent.web.api.auth import verify_token
 from xagent.web.api.channel import (
     SLACK_OAUTH_SCOPES,
-    _script_safe_json,
     create_user_channel,
     slack_oauth_callback,
     start_slack_oauth,
@@ -710,13 +709,6 @@ async def test_oauth_claim_released_when_token_exchange_fails(
         flow_state = db.query(SlackOAuthFlowState).one()
         assert flow_state.consumed_at is None
     engine.dispose()
-
-
-def test_script_safe_json_neutralizes_script_breakout() -> None:
-    encoded = _script_safe_json({"message": "</script><script>alert(1)</script>"})
-    assert "<" not in encoded
-    assert ">" not in encoded
-    assert "\\u003c" in encoded
 
 
 @pytest.mark.asyncio

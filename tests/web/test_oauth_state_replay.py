@@ -1,4 +1,6 @@
 import hashlib
+import json
+import re
 from datetime import timedelta
 from unittest.mock import Mock
 from urllib.parse import urlencode
@@ -34,7 +36,7 @@ def db_session(tmp_path):
 
 
 @pytest.fixture
-def callback_client(db_session):
+def configured_provider(db_session):
     db, _ = db_session
     db.add(
         OAuthProvider(
@@ -47,6 +49,11 @@ def callback_client(db_session):
         )
     )
     db.commit()
+
+
+@pytest.fixture
+def callback_client(db_session, configured_provider):
+    db, _ = db_session
     app = FastAPI()
     app.include_router(auth.auth_router)
     app.dependency_overrides[auth.get_db] = lambda: db
@@ -74,7 +81,7 @@ def _callback(state, nonce="browser-secret", *, error=True):
     )
 
 
-def _state(session_epoch=None):
+def _state(session_epoch=None, **extra_claims):
     return auth.create_access_token(
         {
             "type": "oauth_state",
@@ -82,9 +89,66 @@ def _state(session_epoch=None):
             "user_id": 1,
             "session_epoch": session_epoch,
             "browser_nonce_hash": hashlib.sha256(b"browser-secret").hexdigest(),
+            **extra_claims,
         },
         expires_delta=timedelta(minutes=10),
     )
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "alice@example.com",
+        "</script><script>window.injected=true</script>",
+        '</ScRiPt><img src=x onerror="alert(1)">',
+        "<!--<script>\u2028\u2029中文&",
+    ],
+)
+@pytest.mark.parametrize("field", ["email", "app_id"])
+def test_success_callback_keeps_provider_identity_inert(
+    configured_provider, db_session, monkeypatch, email, field
+):
+    db, _ = db_session
+    provider = db.query(OAuthProvider).filter_by(provider_name="custom").one()
+    provider.userinfo_url = "https://provider.example/me"
+    db.commit()
+    identity_email = email if field == "email" else "alice@example.com"
+    claims = {"app_id": email} if field == "app_id" else {}
+    # Exercise the third JSON expression (postMessage target origin), too.
+    claims["redirect"] = "https://ui<&>.example/path"
+    monkeypatch.setattr(
+        auth.requests,
+        "post",
+        Mock(return_value=Mock(status_code=200, json=lambda: {"access_token": "test"})),
+    )
+    monkeypatch.setattr(
+        auth.requests,
+        "get",
+        Mock(
+            return_value=Mock(
+                status_code=200, json=lambda: {"id": "1", "email": identity_email}
+            )
+        ),
+    )
+    monkeypatch.setattr(auth, "_run_post_commit_oauth_side_effects", Mock())
+    response = auth.generic_oauth_callback(
+        "custom", _callback(_state(**claims), error=False), db, provider
+    )
+    assert response.status_code == 200
+    body = response.body.decode()
+    assert body.lower().count("<script>") == 1
+    assert body.lower().count("</script>") == 1
+    assert "<img" not in body
+    encoded_email = re.search(r"email: (.*),\n", body)
+    assert encoded_email is not None
+    assert json.loads(encoded_email.group(1)) == identity_email
+    encoded_provider = re.search(r"provider: (.*)\n", body)
+    assert encoded_provider is not None
+    assert json.loads(encoded_provider.group(1)) == (
+        email if field == "app_id" else "custom"
+    )
+    assert '"https://ui\\u003c\\u0026\\u003e.example"' in body
+    assert db.query(UserOAuth).one().email == identity_email
 
 
 @pytest.mark.parametrize("initial_epoch", [None, "current-generation"])
@@ -131,13 +195,20 @@ def test_denied_provider_flow_is_consumed_and_cannot_be_replayed(
     db.close()
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     alternate_bits = state[:-1] + alphabet[alphabet.index(state[-1]) ^ 1]
-    for variant in (state, state + "=", alternate_bits):
-        assert auth.verify_token(variant) is not None
+    # PyJWT accepts canonical signatures with optional padding, but rejects
+    # nonzero unused base64url bits before the durable replay check.
+    for variant, valid_encoding in (
+        (state, True),
+        (state + "=", True),
+        (alternate_bits, False),
+    ):
+        assert (auth.verify_token(variant) is not None) is valid_encoding
         replay = auth.generic_oauth_callback(
             "custom", _callback(variant, error=False), db, None
         )
         assert replay.status_code == 400
         assert b"Invalid or expired state" in replay.body
+    assert db.query(OidcConsumedToken).count() == 1
     post.assert_not_called()
 
 

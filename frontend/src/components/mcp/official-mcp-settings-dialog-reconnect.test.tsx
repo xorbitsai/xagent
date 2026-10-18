@@ -13,6 +13,10 @@ import type { AppIntegration } from "./types"
 // same app-scoped login.
 
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+vi.mock("@/lib/oauth-launch", async () => ({
+  openOAuthAuthorizationPopup: (await import("@/test/oauth-popup-double")).openOAuthPopupDouble,
+  isOAuthSuccessMessage: (await import("@/test/oauth-popup-double")).isOAuthSuccessMessageDouble,
+}))
 
 vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")

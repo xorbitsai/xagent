@@ -15,11 +15,12 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
-from jose import JWTError, jwt
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+from ..jwt_codec import JWTError
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.deployment import DeploymentOwnerType

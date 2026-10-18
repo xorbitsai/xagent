@@ -136,7 +136,7 @@ _SHARE_ENTITY_TYPES = ("user", "group")
 # Same shape as api/auth.py's EMAIL_PATTERN, kept as its own local copy
 # rather than imported: this module runs as its own subprocess per MCP tool
 # call (see get_drive_service's callers), and auth.py is a ~3800-line
-# FastAPI router with heavy top-level imports (fastapi, jose, and an
+# FastAPI router with heavy top-level imports (fastapi, PyJWT, and an
 # import-time os.environ mutation) -- pulling that whole module in for one
 # regex would add real per-call import cost and an unwarranted dependency
 # from a connector tool onto the web API layer. "a@b" (no dot in the

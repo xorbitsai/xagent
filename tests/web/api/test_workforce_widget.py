@@ -913,8 +913,7 @@ def test_widget_auth_accepts_legacy_agent_ticket_without_owner_type() -> None:
     resolve them as agent tickets."""
     from datetime import datetime, timedelta, timezone
 
-    from jose import jwt
-
+    from xagent.web import jwt_codec as jwt
     from xagent.web.api.widget import EMBED_TICKET_TYPE
     from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 

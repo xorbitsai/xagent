@@ -45,6 +45,10 @@ Join [Telegram](https://t.me/+2_-SAVLtuJNkNWFl) | [Discord](https://discord.gg/R
 
 ## Quick Start
 
+Building the frontend from source (including Docker builds) requires HTTPS
+access to both the npm registry and `cdn.sheetjs.com` for the integrity-pinned
+SheetJS release. See [dependency upgrade notes](docs/sheetjs-security-upgrade.md).
+
 ### Run on your machine
 
 The published package bundles the web UI — no Docker or Node required (Python 3.11+):

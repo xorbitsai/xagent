@@ -21,7 +21,6 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 from cryptography.fernet import Fernet
-from jose import jwt
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -30,6 +29,7 @@ from tests.shared.oauth_browser_fixture import (
     generic_oauth_callback,
 )
 from xagent.core.utils.encryption import encrypt_value
+from xagent.web import jwt_codec as jwt
 from xagent.web import mcp_apps
 from xagent.web.api import auth as auth_api
 from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState

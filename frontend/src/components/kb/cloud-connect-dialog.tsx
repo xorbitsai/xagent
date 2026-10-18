@@ -7,7 +7,6 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Select } from "@/components/ui/select"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useI18n } from "@/contexts/i18n-context"
-import { useAuth } from "@/contexts/auth-context"
 import {
   Check,
   ChevronRight,
@@ -22,6 +21,7 @@ import {
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+import { isOAuthSuccessMessage, openOAuthAuthorizationPopup } from "@/lib/oauth-launch"
 import {
   loadGooglePicker,
   sanitizeGooglePickerDocuments,
@@ -78,7 +78,6 @@ export function CloudConnectDialog({
   onPickerOpenChange,
 }: CloudConnectDialogProps) {
   const { t } = useI18n()
-  const { token } = useAuth()
 
   // Internal state
   const [cloudUser, setCloudUser] = useState<string | undefined>()
@@ -99,6 +98,7 @@ export function CloudConnectDialog({
   const [pickerConfigured, setPickerConfigured] = useState<boolean | null>(null)
   const [isPickerOpen, setIsPickerOpen] = useState(false)
   const pickerOpenRef = useRef(false)
+  const oauthPopupRef = useRef<Window | null>(null)
   const selectedFilesRef = useRef<CloudFile[]>([])
 
   const setPickerOpen = useCallback((isOpen: boolean) => {
@@ -155,18 +155,21 @@ export function CloudConnectDialog({
 
   // Handle OAuth login
   const handleAuth = () => {
+    if (!provider) return
     const width = 500
     const height = 600
     const left = window.screen.width / 2 - width / 2
     const top = window.screen.height / 2 - height / 2
 
-    const authUrl = `${getApiUrl()}/api/auth/${provider?.authPath}/login?app_id=${provider?.id}&token=${token || ''}`
-
-    window.open(
-      authUrl,
-      `${provider?.name} Auth`,
-      `width=${width},height=${height},left=${left},top=${top}`
-    )
+    oauthPopupRef.current?.close()
+    oauthPopupRef.current = openOAuthAuthorizationPopup({
+      provider: provider.authPath, appId: provider.id,
+      name: `${provider.name} Auth`,
+      features: `width=${width},height=${height},left=${left},top=${top}`,
+    })
+    if (!oauthPopupRef.current) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.")
+    }
   }
 
   const openGooglePicker = async () => {
@@ -273,7 +276,8 @@ export function CloudConnectDialog({
 
   useEffect(() => {
     const messageHandler = async (event: MessageEvent) => {
-      if (event.data?.type === "oauth-success") {
+      if (provider && isOAuthSuccessMessage(event, oauthPopupRef.current, provider.id)) {
+        oauthPopupRef.current = null
         await fetchAccounts()
         setCloudUser(event.data.email)
         toast.success(t("kb.dialog.cloudConnect.auth.success"))
@@ -282,7 +286,7 @@ export function CloudConnectDialog({
 
     window.addEventListener("message", messageHandler)
     return () => window.removeEventListener("message", messageHandler)
-  }, [fetchAccounts, t])
+  }, [fetchAccounts, t, provider])
 
   // Toggle selection
   const toggleSelection = (file: CloudFile) => {
@@ -305,6 +309,8 @@ export function CloudConnectDialog({
 
   // Reset state when provider changes
   useEffect(() => {
+    oauthPopupRef.current?.close()
+    oauthPopupRef.current = null
     setCloudUser(undefined)
     setSelectedDrive("")
     setCurrentPath([])

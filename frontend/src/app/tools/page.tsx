@@ -124,6 +124,7 @@ interface SqlConnectionItem {
   name: string
   source: 'db' | 'env' | 'none'
   masked: string
+  error?: string
 }
 
 type SqlDbType = 'postgresql' | 'mysql' | 'mariadb' | 'mssql' | 'sqlite'
@@ -1320,6 +1321,7 @@ function ToolsPageContent() {
                             <div className="rounded-md border border-border/70 bg-muted/30 px-3 py-2">
                               <p className="break-all text-xs leading-relaxed text-foreground/80">{item.masked || '--'}</p>
                             </div>
+                            {item.error ? <p role="alert" className="text-xs text-destructive">{item.error}</p> : null}
                           </div>
                         </CardContent>
                       </Card>

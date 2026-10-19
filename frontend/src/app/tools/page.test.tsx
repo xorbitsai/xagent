@@ -140,6 +140,32 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+it("shows the migration reason for a retired SQL connection without hiding its record", async () => {
+  installApiMock()
+  const fallback = apiRequestMock.getMockImplementation()!
+  const reason = "File-backed SQLite is retired; migrate to PostgreSQL or MySQL."
+  apiRequestMock.mockImplementation(async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/api/tools/available")) {
+      return jsonResponse({ tools: [{
+        name: "execute_sql_query", description: "SQL", type: "builtin", category: "database",
+        enabled: true, requires_configuration: true,
+      }] })
+    }
+    if (url.endsWith("/api/tools/sql-connections")) {
+      return jsonResponse({ connections: [{
+        name: "legacy", source: "db", masked: "sqlite:///old.db", configured: false, error: reason,
+      }] })
+    }
+    return fallback(url, init)
+  })
+  await renderPage()
+  fireEvent.click(screen.getByRole("button", { name: "tools.database.manageConnections" }))
+  const dialog = within(await screen.findByRole("dialog"))
+  expect(dialog.getByRole("alert")).toHaveTextContent(reason)
+  expect(dialog.getByText("legacy")).toBeInTheDocument()
+  expect(dialog.getByText("sqlite:///old.db")).toBeInTheDocument()
+})
+
 describe("ToolsPage official settings dialog ownership badge (#1623)", () => {
   it("shows the matching three-way label when the server carries a real sharing status", async () => {
     // is_owner: true, not false: the card's own (unrelated, untouched)

@@ -28,7 +28,7 @@ import os
 import re
 import sqlite3
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 from urllib.parse import unquote, urlsplit
 
 from pydantic import BaseModel, Field
@@ -49,6 +49,27 @@ SQLITE_URI_UNSUPPORTED_ERROR = "SQLite URI mode is not supported"
 _OPAQUE_TARGET_QUERY_KEYS = frozenset(
     {"service", "odbc_connect", "dsn", "read_default_file", "read_default_group"}
 )
+_external_database_url_policy: Callable[[URL], None] | None = None
+
+
+def set_external_database_url_policy(policy: Callable[[URL], None] | None) -> None:
+    """Register an application deployment's SQL URL policy (standalone: none).
+
+    The same policy is checked before saving a connection and before runtime
+    execution, including already persisted and environment-provided URLs.
+    """
+    global _external_database_url_policy
+    _external_database_url_policy = policy
+
+
+def validate_external_database_url_policy(candidate: str | URL) -> None:
+    """Apply only the deployment policy, also when reporting saved connections."""
+    if _external_database_url_policy is not None:
+        try:
+            parsed = make_url(candidate)
+        except Exception as exc:
+            raise ValueError("Invalid SQLAlchemy connection URL") from exc
+        _external_database_url_policy(parsed)
 
 
 def _canonical_backend(url: URL) -> str:
@@ -204,6 +225,7 @@ def validate_external_database_url(candidate: str | URL) -> URL:
         parsed = make_url(candidate)
     except Exception as exc:
         raise ValueError("Invalid SQLAlchemy connection URL") from exc
+    validate_external_database_url_policy(parsed)
     if _canonical_backend(parsed) == "sqlite" and (
         _query_values(parsed, "uri")
         or (parsed.database or "").strip().lower().startswith("file:")

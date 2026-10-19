@@ -14,7 +14,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from ...config import get_tool_credentials_encryption_key
-from ...core.tools.core.sql_tool import validate_external_database_url
+from ...core.tools.core.sql_tool import (
+    validate_external_database_url,
+    validate_external_database_url_policy,
+)
 from ...core.utils.encryption import ToolCredentialUnreadableError
 from ..init_tool_configs import get_default_tool_configs
 from ..models.tool_config import ToolConfig, UserToolConfig
@@ -490,14 +493,20 @@ def list_sql_connections(db: Session, user_id: int | None) -> list[dict[str, Any
             masked = _sql_url_mask(env_value)
             source = "env" if env_value else "none"
 
-        output.append(
-            {
-                "name": name,
-                "source": source,
-                "masked": masked,
-                "configured": bool(masked),
-            }
-        )
+        item = {
+            "name": name,
+            "source": source,
+            "masked": masked,
+            "configured": bool(masked),
+        }
+        if masked:
+            try:
+                validate_external_database_url_policy(masked)
+            except ValueError as exc:
+                # Keep the stored credential removable/migratable; never
+                # delete it or present a retired URL as a healthy connection.
+                item.update({"configured": False, "error": str(exc)})
+        output.append(item)
 
     return output
 

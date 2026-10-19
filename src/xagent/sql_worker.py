@@ -37,7 +37,7 @@ from .config import (
     get_sql_worker_query_timeout_seconds,
     get_sql_worker_token,
 )
-from .core.tools.core.sql_result import normalize_sql_result
+from .core.tools.core.sql_result import normalize_sql_result, serialize_sql_result
 
 logger = logging.getLogger(__name__)
 
@@ -314,11 +314,16 @@ def health() -> dict[str, str]:
 
 
 @app.post("/v1/query")
-def query(request: QueryRequest) -> dict[str, Any]:
+def query(request: QueryRequest) -> Response:
     if not _query_slots.acquire(timeout=CAPACITY_WAIT_SECONDS):
         raise HTTPException(status_code=429, detail="SQL worker is at capacity")
     try:
-        return execute_in_disposable_process(request)
+        # Send exactly the encoding measured in the disposable executor, not
+        # a second framework renderer with different float/scalar semantics.
+        return Response(
+            content=serialize_sql_result(execute_in_disposable_process(request)),
+            media_type="application/json",
+        )
     finally:
         _query_slots.release()
 

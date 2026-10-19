@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
+from contextlib import nullcontext
 from datetime import UTC
 
 import pytest
@@ -11,6 +13,8 @@ from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
 
+from xagent.core.tools.core.sql_worker_client import execute_sql_query_remote
+from xagent.core.workspace import TaskWorkspace
 from xagent.sql_worker import (
     SENSITIVE_ENVIRONMENT_SUFFIXES,
     SENSITIVE_PLATFORM_ENVIRONMENT_VARIABLES,
@@ -110,9 +114,7 @@ def test_result_limit_matches_the_actual_json_response():
     from datetime import datetime
     from decimal import Decimal
 
-    from fastapi.responses import JSONResponse
-
-    from xagent.core.tools.core.sql_result import bound_sql_result
+    from xagent.core.tools.core.sql_result import bound_sql_result, serialize_sql_result
 
     payload = {
         "rows": [
@@ -125,10 +127,105 @@ def test_result_limit_matches_the_actual_json_response():
         ]
     }
     normalized = _json_safe(payload)
-    size = len(JSONResponse(normalized).body)
+    size = len(serialize_sql_result(normalized))
     assert bound_sql_result(payload, size) == normalized
     with pytest.raises(ValueError, match="byte limit"):
         bound_sql_result(payload, size - 1)
+
+
+def test_buffer_normalization_preserves_sql_scalars_and_column_names():
+    from datetime import timedelta
+    from decimal import Decimal
+
+    payload = {
+        "rows": [
+            {
+                "_salary": Decimal("9007199254740993.01"),
+                "duration": timedelta(days=1, hours=2),
+            }
+        ]
+    }
+    assert _json_safe(payload) == payload
+
+
+@pytest.mark.parametrize("query", ["SELECT 1e999 AS value", "SELECT -1e999 AS value"])
+def test_nonfinite_sqlite_values_use_the_endpoint_null_policy(monkeypatch, query):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "x" * 32)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={
+                "connection_name": "external",
+                "connection_url": "sqlite:///:memory:",
+                "query": query,
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["rows"] == [{"value": None}]
+
+
+def test_worker_limit_matches_actual_endpoint_bytes_at_the_boundary(monkeypatch):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "x" * 32)
+    monkeypatch.setenv("XAGENT_SQL_WORKER_MAX_RESULT_BYTES", "4096")
+    with TestClient(app) as client:
+
+        def run():
+            return client.post(
+                "/v1/query",
+                headers={"Authorization": f"Bearer {'x' * 32}"},
+                json={
+                    "connection_name": "external",
+                    "connection_url": "sqlite:///:memory:",
+                    "query": "SELECT 0.00001 AS value",
+                },
+            )
+
+        initial = run()
+        assert initial.status_code == 200
+        size = len(initial.content)
+        monkeypatch.setenv("XAGENT_SQL_WORKER_MAX_RESULT_BYTES", str(size))
+        exact = run()
+        assert exact.status_code == 200
+        assert exact.content == initial.content
+        monkeypatch.setenv("XAGENT_SQL_WORKER_MAX_RESULT_BYTES", str(size - 1))
+        assert run().status_code == 400
+
+
+def test_sa_prefixed_columns_survive_worker_http_and_remote_export(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "x" * 32)
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", "http://sql-worker:8090")
+    workspace = TaskWorkspace("salary-export", base_dir=str(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={
+                "connection_name": "external",
+                "connection_url": "sqlite:///:memory:",
+                "query": 'SELECT 42 AS "_salary"',
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["rows"] == [{"_salary": 42}]
+        assert response.json()["columns"] == ["_salary"]
+        monkeypatch.setattr(
+            "xagent.core.tools.core.sql_worker_client.httpx.Client",
+            lambda **_: nullcontext(client),
+        )
+        result = execute_sql_query_remote(
+            connection_name="external",
+            connection_url="sqlite:///:memory:",
+            query='SELECT 42 AS "_salary"',
+            output_file="salary.jsonl",
+            workspace=workspace,
+        )
+    assert result["success"] is True
+    assert json.loads(
+        workspace.resolve_write_path("salary.jsonl", default_dir="output").read_text()
+    ) == {"_salary": 42}
 
 
 @pytest.mark.parametrize("size,limit", [(3000, 4096), (7_340_032, 8_388_608)])

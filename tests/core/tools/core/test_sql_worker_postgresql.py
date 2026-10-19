@@ -153,3 +153,64 @@ def test_postgresql_bytea_survives_worker_pipe_http_and_remote_export(
     assert result["success"] is True
     exported = workspace.resolve_write_path("binary.jsonl", default_dir="output")
     assert json.loads(exported.read_text()) == {"payload": "base64:/wA="}
+
+
+def test_postgresql_scalar_precision_and_nonfinite_values_survive_http_and_export(
+    worker_database, monkeypatch, tmp_path
+):
+    import math
+    from datetime import timedelta
+    from decimal import Decimal
+
+    engine, url = worker_database
+    query = """SELECT 9007199254740993.01::numeric AS amount,
+                      INTERVAL '1 day 2 hours' AS duration,
+                      'NaN'::double precision AS nan,
+                      'Infinity'::double precision AS positive,
+                      '-Infinity'::double precision AS negative,
+                      42 AS "_salary"
+    """
+    with engine.connect() as connection:
+        raw = connection.execute(text(query)).mappings().one()
+        assert raw["amount"] == Decimal("9007199254740993.01")
+        assert raw["duration"] == timedelta(days=1, hours=2)
+        assert math.isnan(raw["nan"])
+        assert math.isinf(raw["positive"]) and math.isinf(raw["negative"])
+    expected = {
+        "amount": "9007199254740993.01",
+        "duration": "P1DT2H",
+        "nan": None,
+        "positive": None,
+        "negative": None,
+        "_salary": 42,
+    }
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", "http://sql-worker:8090")
+    workspace = TaskWorkspace("scalar-export", base_dir=str(tmp_path))
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={"connection_name": "external", "connection_url": url, "query": query},
+        )
+        assert response.status_code == 200
+        assert response.json()["rows"] == [expected]
+        monkeypatch.setattr(
+            "xagent.core.tools.core.sql_worker_client.httpx.Client",
+            lambda **_: nullcontext(client),
+        )
+        result = execute_sql_query_remote(
+            connection_name="external",
+            connection_url=url,
+            query=query,
+            output_file="scalars.jsonl",
+            workspace=workspace,
+        )
+    assert result["success"] is True
+    assert (
+        json.loads(
+            workspace.resolve_write_path(
+                "scalars.jsonl", default_dir="output"
+            ).read_text()
+        )
+        == expected
+    )

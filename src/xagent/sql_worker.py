@@ -14,11 +14,11 @@ import os
 import re
 import secrets
 import threading
-from base64 import b64encode
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Mapping
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -37,6 +37,7 @@ from .config import (
     get_sql_worker_query_timeout_seconds,
     get_sql_worker_token,
 )
+from .core.tools.core.sql_result import normalize_sql_result
 
 logger = logging.getLogger(__name__)
 
@@ -189,15 +190,8 @@ def _query_child(
 
 
 def _json_safe(value: Any) -> Any:
-    """Encode byte strings explicitly before FastAPI JSON serialization."""
-
-    if isinstance(value, bytes):
-        return "base64:" + b64encode(value).decode("ascii")
-    if isinstance(value, dict):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    return value
+    """Use the same normalized representation as the executor byte ceiling."""
+    return normalize_sql_result(value)
 
 
 def execute_in_disposable_process(request: QueryRequest) -> dict[str, Any]:

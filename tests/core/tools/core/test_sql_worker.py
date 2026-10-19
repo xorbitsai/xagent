@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import UTC
 
 import pytest
 from fastapi import HTTPException
@@ -30,11 +31,11 @@ def _remove_ambient_platform_secrets(monkeypatch, tmp_path):
         "xagent.sql_worker.DOCKER_SOCKET_PATH", tmp_path / "docker.sock"
     )
     for variable in tuple(os.environ):
-        if variable in SENSITIVE_PLATFORM_ENVIRONMENT_VARIABLES or variable.endswith(
-            SENSITIVE_ENVIRONMENT_SUFFIXES
+        if variable != "XAGENT_SQL_WORKER_TOKEN" and (
+            variable in SENSITIVE_PLATFORM_ENVIRONMENT_VARIABLES
+            or variable.endswith(SENSITIVE_ENVIRONMENT_SUFFIXES)
         ):
-            if variable != "XAGENT_SQL_WORKER_TOKEN":
-                monkeypatch.delenv(variable, raising=False)
+            monkeypatch.delenv(variable, raising=False)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +96,60 @@ def test_child_environment_drops_worker_and_secret_values(monkeypatch):
 
 def test_binary_values_are_encoded_for_json():
     assert _json_safe({"value": b"\xff\x00"}) == {"value": "base64:/wA="}
+
+
+@pytest.mark.parametrize("buffer", [bytes, bytearray, memoryview])
+def test_binary_buffers_are_normalized_before_the_process_pipe(buffer):
+    import pickle
+
+    payload = _json_safe({"rows": [{"payload": buffer(b"\xff\x00")}]})
+    assert pickle.loads(pickle.dumps(payload)) == {"rows": [{"payload": "base64:/wA="}]}
+
+
+def test_result_limit_matches_the_actual_json_response():
+    from datetime import datetime
+    from decimal import Decimal
+
+    from fastapi.responses import JSONResponse
+
+    from xagent.core.tools.core.sql_result import bound_sql_result
+
+    payload = {
+        "rows": [
+            {
+                "binary": memoryview(b"\xff\x00"),
+                "text": "你好",
+                "time": datetime(2026, 1, 1, tzinfo=UTC),
+                "amount": Decimal("1.25"),
+            }
+        ]
+    }
+    normalized = _json_safe(payload)
+    size = len(JSONResponse(normalized).body)
+    assert bound_sql_result(payload, size) == normalized
+    with pytest.raises(ValueError, match="byte limit"):
+        bound_sql_result(payload, size - 1)
+
+
+@pytest.mark.parametrize("size,limit", [(3000, 4096), (7_340_032, 8_388_608)])
+def test_binary_result_limit_applies_after_base64_encoding(monkeypatch, size, limit):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "x" * 32)
+    monkeypatch.setenv("XAGENT_SQL_WORKER_MAX_RESULT_BYTES", str(limit))
+    monkeypatch.setenv("XAGENT_SQL_WORKER_QUERY_TIMEOUT_SECONDS", "30")
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={
+                "connection_name": "external",
+                "connection_url": "sqlite:///:memory:",
+                "query": f"SELECT CAST(replace(hex(zeroblob({size // 2})), '0', 'a') AS BLOB) AS payload",
+            },
+        )
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "SQL query result exceeded the configured byte limit"
+    }
 
 
 def test_query_endpoint_requires_bearer_token(monkeypatch):

@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.exc import DatabaseError
 
 from xagent.core.tools.core.sql_tool import (
+    _can_stream_query,
     _execute_sql_query_local,
     _get_connection_url,
     _row_to_dict,
@@ -20,6 +21,37 @@ from xagent.core.tools.core.sql_tool import (
 )
 from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
 from xagent.web.services.tool_credentials import set_sql_connection
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "SELECT 1",
+        "select 1;",
+        "WITH q AS (SELECT 1) SELECT * FROM q",
+        "VALUES (1)",
+    ],
+)
+def test_read_queries_remain_eligible_for_server_side_cursors(query):
+    assert _can_stream_query(query)
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "INSERT INTO metrics VALUES (42)",
+        "UPDATE metrics SET value=1",
+        "DELETE FROM metrics",
+        "CREATE TABLE metrics (value int)",
+        "SELECT 42 INTO metrics",
+        "SELECT 1; INSERT INTO metrics VALUES (42)",
+        "WITH q AS (DELETE FROM metrics RETURNING *) SELECT * FROM q",
+        "WITH q AS (SELECT 1) INSERT INTO metrics SELECT * FROM q RETURNING *",
+        "/* user statement */ UPDATE metrics SET value=1",
+    ],
+)
+def test_other_queries_use_normal_cursors_without_rejection_or_retry(query):
+    assert not _can_stream_query(query)
 
 
 class TestGetConnectionUrl:
@@ -596,15 +628,16 @@ class TestExecuteSqlQuery:
         mock_workspace.resolve_path.return_value = "/tmp/test.parquet"
 
         # Mock pyarrow import to fail
-        with patch.dict("sys.modules", {"pyarrow": None}):
-            # The function should raise ImportError when trying to import pyarrow
-            with pytest.raises(ImportError, match="pyarrow"):
-                execute_sql_query(
-                    "test",
-                    "SELECT * FROM users",
-                    output_file="test.parquet",
-                    workspace=mock_workspace,
-                )
+        with (
+            patch.dict("sys.modules", {"pyarrow": None}),
+            pytest.raises(ImportError, match="pyarrow"),
+        ):
+            execute_sql_query(
+                "test",
+                "SELECT * FROM users",
+                output_file="test.parquet",
+                workspace=mock_workspace,
+            )
 
     @patch("xagent.core.tools.core.sql_tool.create_engine")
     def test_execute_sql_query_with_empty_parquet_export(

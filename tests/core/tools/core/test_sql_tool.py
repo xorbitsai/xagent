@@ -310,6 +310,36 @@ class TestRowToDict:
 class TestExecuteSqlQuery:
     """Test SQL query execution."""
 
+    @pytest.mark.parametrize("max_rows", [None, 10])
+    @pytest.mark.parametrize("where", ["", "WHERE 1 = 0"])
+    def test_select_columns_come_from_cursor_metadata(self, max_rows, where):
+        result = _execute_sql_query_local(
+            "test",
+            f"SELECT 1 AS id, 'test' AS name {where}",
+            connection_url="sqlite:///:memory:",
+            max_rows=max_rows,
+            max_result_bytes=4096,
+        )
+
+        assert result["success"] is True
+        assert result["columns"] == ["id", "name"]
+        assert result["rows"] == ([] if where else [{"id": 1, "name": "test"}])
+        assert result["row_count"] == (0 if where else 1)
+
+    def test_model_facing_description_explains_worker_export_limits(self):
+        from xagent.core.tools.adapters.vibe.sql_tool import SqlQueryTool
+
+        tools = {tool.name: tool for tool in SqlQueryTool().get_tools()}
+        description = " ".join(tools["execute_sql_query"].description.split())
+
+        assert (
+            "worker exports remain subject to row and serialized-result byte limits"
+            in description
+        )
+        assert "Local execution streams exports" in description
+        assert "LIMIT, filters, or pagination" in description
+        assert "avoid response size limits" not in description
+
     def test_execute_sql_query_no_connection(self, monkeypatch):
         """Test error when connection not found."""
         # Clear any existing XAGENT_EXTERNAL_DB_* variables
@@ -392,6 +422,7 @@ class TestExecuteSqlQuery:
         # Mock result
         mock_result = MagicMock()
         mock_result.returns_rows = True
+        mock_result.keys.return_value = ["id", "name"]
         mock_row = Mock()
         mock_row._mapping = {"id": 1, "name": "test"}
         mock_result.all.return_value = [mock_row]
@@ -400,6 +431,7 @@ class TestExecuteSqlQuery:
         result = execute_sql_query("test", "SELECT * FROM users")
         assert result["success"] is True
         assert result["row_count"] == 1
+        assert result["columns"] == ["id", "name"]
         assert len(result["rows"]) == 1
         assert result["rows"][0] == {"id": 1, "name": "test"}
 

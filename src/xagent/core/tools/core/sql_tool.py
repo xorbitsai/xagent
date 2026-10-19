@@ -503,6 +503,9 @@ def _execute_sql_query_local(
 
             # Get column names from result
             if result.returns_rows:
+                # Cursor metadata exists even when the query returns no rows.
+                # Keep it for the response and worker-side export handoff.
+                columns = list(result.keys())
                 if max_rows is None:
                     rows = result.all()
                 else:
@@ -512,9 +515,6 @@ def _execute_sql_query_local(
                             f"SQL query returned more than the {max_rows} row limit"
                         )
                 row_list = [_row_to_dict(row) for row in rows]
-
-                # Extract column names from first row
-                columns = list(row_list[0].keys()) if row_list else []
 
                 payload = SQLQueryResult(
                     success=True,

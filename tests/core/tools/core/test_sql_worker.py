@@ -228,6 +228,58 @@ def test_sa_prefixed_columns_survive_worker_http_and_remote_export(
     ) == {"_salary": 42}
 
 
+@pytest.mark.parametrize("suffix", [".parquet", ".csv"])
+def test_empty_select_preserves_columns_through_worker_and_remote_export(
+    monkeypatch, tmp_path, suffix
+):
+    monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "x" * 32)
+    monkeypatch.setenv("XAGENT_SQL_WORKER_URL", "http://sql-worker:8090")
+    workspace = TaskWorkspace("empty-export", base_dir=str(tmp_path))
+    query = "SELECT 1 AS id, 'test' AS name WHERE 1 = 0"
+    output_file = f"empty{suffix}"
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/query",
+            headers={"Authorization": f"Bearer {'x' * 32}"},
+            json={
+                "connection_name": "external",
+                "connection_url": "sqlite:///:memory:",
+                "query": query,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["rows"] == []
+        assert response.json()["columns"] == ["id", "name"]
+        assert response.json()["row_count"] == 0
+        monkeypatch.setattr(
+            "xagent.core.tools.core.sql_worker_client.httpx.Client",
+            lambda **_: nullcontext(client),
+        )
+        result = execute_sql_query_remote(
+            connection_name="external",
+            connection_url="sqlite:///:memory:",
+            query=query,
+            output_file=output_file,
+            workspace=workspace,
+        )
+
+    assert result["success"] is True
+    assert result["columns"] == ["id", "name"]
+    assert result["row_count"] == 0
+    assert result["rows"] == []
+    assert result["file_id"]
+    assert result["relative_path"] == f"output/{output_file}"
+    exported = workspace.output_dir / output_file
+    if suffix == ".parquet":
+        import pyarrow.parquet as pq
+
+        table = pq.read_table(exported)
+        assert table.column_names == ["id", "name"]
+        assert table.num_rows == 0
+    else:
+        assert exported.read_text().splitlines() == ["id,name"]
+
+
 @pytest.mark.parametrize("size,limit", [(3000, 4096), (7_340_032, 8_388_608)])
 def test_binary_result_limit_applies_after_base64_encoding(monkeypatch, size, limit):
     monkeypatch.setenv("XAGENT_SQL_WORKER_TOKEN", "x" * 32)

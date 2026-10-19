@@ -111,7 +111,10 @@ class SqlQueryTool:
                                 Use syntax matching the database type.
                             output_file: (OPTIONAL) Export results to file instead of returning them.
                                 Supported: .csv, .parquet, .json, .jsonl, .ndjson (relative to workspace).
-                                Use for large datasets to avoid response size limits.
+                                Local execution streams exports to files. Isolated worker exports remain
+                                subject to row and serialized-result byte limits before a file is created.
+                                Use LIMIT, filters, or pagination for large worker results;
+                                output_file does not bypass these limits.
                                 output/tool-results/ is reserved for the engine and refuses writes.
 
                         Returns:

@@ -224,6 +224,9 @@ export function ConnectAppsField({
   }, []);
 
   const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
+  const visibleRows = interaction.group_by_provider
+    ? rows.filter((row) => row.kind !== "oauth" || row.app.id === row.group.apps[0]?.id)
+    : rows;
   // Recomputed on every render (not memoized against rows, which doesn't
   // change when just an app's is_connected flips) - the footer's "not
   // connected yet" copy plus a Skip button, alongside a card whose every row
@@ -444,19 +447,21 @@ export function ConnectAppsField({
         </div>
       )}
 
-      {/* One row per app, not per provider - a "Google" row that also
-          covers Calendar used to fold both into one merged row; that read
-          as the two being one connector rather than two, so each app gets
-          its own row/icon/name now. Clicking either one's button still
-          finishes both in a single sign-in via handleConnectOAuth's bare
-          login above; only the display stopped merging, not the mechanism. */}
+      {/* First-chat onboarding groups OAuth apps by provider, with each
+          app named underneath. Existing cards retain one row per app.
+          Both presentations use the same authorization flow. */}
       <div className="mt-3 overflow-hidden rounded-xl border">
-        {rows.map((row, index) => {
+        {visibleRows.map((row, index) => {
           const { app } = row;
+          const grouped = interaction.group_by_provider && row.kind === "oauth";
+          const connected = grouped ? row.group.apps.every((item) => !!item.is_connected) : !!app.is_connected;
+          const displayName = grouped
+            ? PROVIDER_DISPLAY_NAMES[row.group.provider] || capitalize(row.group.provider)
+            : app.name;
           const rowClassName = cn(
             "flex items-center gap-3 p-3",
             index > 0 && "border-t",
-            app.is_connected && "bg-green-50 dark:bg-green-950/20"
+            connected && "bg-green-50 dark:bg-green-950/20"
           );
 
           if (row.kind === "manual") {
@@ -511,11 +516,12 @@ export function ConnectAppsField({
 
           return (
             <div key={app.id} className={rowClassName}>
-              <RowIcon url={app.icon} fallbackName={app.name} connected={!!app.is_connected} />
+              <RowIcon url={grouped ? undefined : app.icon} fallbackName={displayName} connected={connected} />
               <div className="min-w-0 flex-1">
-                <div className="text-[13px] font-semibold text-foreground">{app.name}</div>
+                <div className="text-[13px] font-semibold text-foreground">{displayName}</div>
+                {grouped && <div className="text-xs text-muted-foreground">{row.group.apps.map((item) => item.name).join(" · ")}</div>}
               </div>
-              {app.is_connected ? (
+              {connected ? (
                 <ConnectedBadge label={t("chatPage.clarification.connectApps.connected")} />
               ) : (
                 <Button
@@ -526,7 +532,7 @@ export function ConnectAppsField({
                 >
                   {isConnecting
                     ? t("chatPage.clarification.connectApps.connecting")
-                    : t("chatPage.clarification.connectApps.continueWith", { provider: app.name })}
+                    : t("chatPage.clarification.connectApps.continueWith", { provider: displayName })}
                 </Button>
               )}
             </div>

@@ -7,6 +7,7 @@ import {
   canRunAgent,
   findRunnableAgentById,
   getAgentChatHref,
+  getAgentTaskHref,
 } from "./agent-ui-access"
 
 describe("agent-ui-access", () => {
@@ -27,7 +28,7 @@ describe("agent-ui-access", () => {
     expect(getAgentChatHref(agent)).toBe("/task?agent=42")
   })
 
-  it("keeps owner chat on the dedicated agent page", () => {
+  it("uses the shared task composer for editable owner agents too", () => {
     const agent = {
       id: 7,
       status: "published",
@@ -37,7 +38,8 @@ describe("agent-ui-access", () => {
 
     expect(canRunAgent(agent)).toBe(true)
     expect(canEditAgent(agent)).toBe(true)
-    expect(getAgentChatHref(agent)).toBe("/agent/7")
+    expect(getAgentChatHref(agent)).toBe("/task?agent=7")
+    expect(getAgentTaskHref("agent/id with spaces")).toBe("/task?agent=agent%2Fid%20with%20spaces")
   })
 
   it("only resolves runnable agents from query parameters", () => {

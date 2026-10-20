@@ -1,14 +1,13 @@
 import { describe, expect, it } from "vitest"
 
-import { getNavigationGroupsForUser } from "./sidebar-navigation"
+import { composeSidebarNavigation, getNavigationGroupsForUser, getUserMenuItemsForUser } from "./sidebar-navigation"
 
 describe("sidebar navigation", () => {
-  it("exposes Conversation Logs under the More resource menu", () => {
+  it("preserves Conversation Logs inside Builder with its own icon", () => {
     const groups = getNavigationGroupsForUser({ is_admin: false })
-    const resources = groups.find((group) => group.titleKey === "nav.sections.resources")
-    const more = resources?.items.find((item) => item.href === "__resources_more__")
+    const builder = groups.find((group) => group.id === "builder")
 
-    expect(more?.children).toEqual(
+    expect(builder?.items).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           name: "Conversation Logs",
@@ -18,42 +17,60 @@ describe("sidebar navigation", () => {
       ])
     )
 
-    const channels = more?.children?.find((item) => item.href === "/channels")
-    const conversationLogs = more?.children?.find(
+    const channels = builder?.items.find((item) => item.href === "/channels")
+    const conversationLogs = builder?.items.find(
       (item) => item.href === "/conversation-logs"
     )
     expect(conversationLogs?.icon).not.toBe(channels?.icon)
   })
 
-  it("collapses Resources by default and gives each built-in group a stable id", () => {
+  it("places advanced features under one collapsed Builder group in design order", () => {
     const groups = getNavigationGroupsForUser({ is_admin: false })
-    const agentDevelopment = groups.find((group) => group.titleKey === "nav.sections.agentDevelopment")
-    const resources = groups.find((group) => group.titleKey === "nav.sections.resources")
-
-    expect(agentDevelopment?.id).toBe("agent-development")
-    expect(agentDevelopment?.defaultCollapsed).toBeFalsy()
-    expect(resources?.id).toBe("resources")
-    expect(resources?.defaultCollapsed).toBe(true)
+    expect(groups).toHaveLength(1)
+    expect(groups[0]).toMatchObject({
+      id: "builder", titleKey: "nav.builder", defaultCollapsed: true,
+      descriptionKey: "nav.builderDescription",
+    })
+    expect(groups[0].items.slice(0, 5).map((item) => item.href)).toEqual([
+      "/workforces?view=teammates", "/kb", "/models", "/api-keys", "/memory",
+    ])
+    expect(groups[0].items[0].nameKey).toBe("nav.teammates")
   })
 
-  it("renames the build/templates nav entries to My Team/Add teammates", () => {
-    const groups = getNavigationGroupsForUser({ is_admin: false })
-    const agentDevelopment = groups.find((group) => group.titleKey === "nav.sections.agentDevelopment")
-
-    expect(agentDevelopment?.items.find((item) => item.href === "/build")).toEqual(
-      expect.objectContaining({ name: "My Team", nameKey: "nav.myTeam" })
-    )
-    expect(agentDevelopment?.items.find((item) => item.href === "/templates")).toEqual(
-      expect.objectContaining({ name: "Add teammates", nameKey: "nav.addTeammates" })
-    )
+  it("puts common actions on the first level without duplicating them in Builder", () => {
+    const topLevelRoutes = getUserMenuItemsForUser().map((item) => item.href)
+    expect(topLevelRoutes).toEqual(["/tools", "/skill-hub", "/files", "/settings"])
+    expect(getNavigationGroupsForUser()[0].items.some((item) => topLevelRoutes.includes(item.href))).toBe(false)
   })
 
-  it("keeps the admin-only routes free of trailing slashes so active-route matching works", () => {
-    const groups = getNavigationGroupsForUser({ is_admin: true })
-    const resources = groups.find((group) => group.titleKey === "nav.sections.resources")
-    const more = resources?.items.find((item) => item.href === "__resources_more__")
+  it("exposes administrative routes only to administrators", () => {
+    const items = getNavigationGroupsForUser({ is_admin: true })[0].items
+    expect(items.find((item) => item.name === "User Management")?.href).toBe("/users")
+    expect(items.find((item) => item.name === "Public MCP Apps")?.href).toBe("/admin-mcp")
+    for (const user of [undefined, null, { is_admin: false }]) {
+      expect(getNavigationGroupsForUser(user)[0].items.some((item) => ["/users", "/admin-mcp"].includes(item.href))).toBe(false)
+    }
+  })
 
-    expect(more?.children?.find((item) => item.name === "User Management")?.href).toBe("/users")
-    expect(more?.children?.find((item) => item.name === "Public MCP Apps")?.href).toBe("/admin-mcp")
+  it("preserves legacy groups and skips empty contributions without mutating inputs", () => {
+    const base = getNavigationGroupsForUser()
+    const common = getUserMenuItemsForUser()
+    const snapshot = base[0].items.slice()
+    const item = snapshot[0]
+    const extra = [
+      { id: "legacy", title: "Legacy", items: [item] },
+      { id: "empty", title: "Empty", items: [] },
+    ]
+    const result = composeSidebarNavigation(base, common, extra)
+    expect(result.groups.map((group) => group.id)).toEqual(["builder", "legacy"])
+    expect(result.userItems).toEqual(common)
+    expect(base[0].items).toEqual(snapshot)
+    expect(result.groups[0].items).not.toBe(base[0].items)
+    expect(result.groups[1].items).not.toBe(extra[0].items)
+  })
+
+  it("keeps a Builder contribution accessible if the host has no Builder group", () => {
+    const contribution = { id: "ai", title: "AI", placement: "builder" as const, items: getUserMenuItemsForUser() }
+    expect(composeSidebarNavigation([], [], [contribution]).groups).toEqual([contribution])
   })
 })

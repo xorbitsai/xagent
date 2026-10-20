@@ -7,7 +7,7 @@ from typing import Any, Dict, List, NoReturn, Optional, Sequence, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -32,6 +32,7 @@ from ..models.database import (
 )
 from ..models.model import Model as DBModel
 from ..models.task import AgentType, Task, TaskStatus, TraceEvent
+from ..models.task_execution_event import TaskExecutionEvent
 from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
@@ -851,6 +852,7 @@ async def get_tasks(
     page: int = 1,
     per_page: int = 10,
     search: Optional[str] = None,
+    agent_id: Optional[int] = None,
     agent_type: Optional[str] = None,
     exclude_agent_type: Optional[str] = None,
     execution_mode: Optional[str] = None,
@@ -876,9 +878,54 @@ async def get_tasks(
             if not include_hidden:
                 query = query.filter(Task.is_visible.is_(True))
 
+            if agent_id is not None:
+                query = query.filter(Task.agent_id == agent_id)
+
             # Apply search filter if provided
-            if search:
-                query = query.filter(Task.title.ilike(f"%{search}%"))
+            keyword = (search or "").strip()
+            if keyword:
+                # Literal substring search: '%' and '_' in user input are not
+                # SQL wildcards. Keep the user/visibility scope above intact.
+                escaped = (
+                    keyword.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                pattern = f"%{escaped}%"
+                legacy_messages = select(TaskChatMessage.task_id).where(
+                    TaskChatMessage.role.in_(["user", "assistant"]),
+                    TaskChatMessage.content.ilike(pattern, escape="\\"),
+                )
+                canonical_messages = select(TaskExecutionEvent.task_id).where(
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.kind.in_(
+                        ["input_accepted", "assistant_message"]
+                    ),
+                    TaskExecutionEvent.payload["content"]
+                    .as_string()
+                    .ilike(pattern, escape="\\"),
+                )
+                query = query.filter(
+                    or_(
+                        Task.title.ilike(pattern, escape="\\"),
+                        Task.description.ilike(pattern, escape="\\"),
+                        Task.input.ilike(pattern, escape="\\"),
+                        Task.output.ilike(pattern, escape="\\"),
+                        Task.agent_id.in_(
+                            select(Agent.id).where(
+                                Agent.name.ilike(pattern, escape="\\")
+                            )
+                        ),
+                        and_(
+                            Task.conversation_storage_version == 1,
+                            Task.id.in_(legacy_messages),
+                        ),
+                        and_(
+                            Task.conversation_storage_version == 2,
+                            Task.id.in_(canonical_messages),
+                        ),
+                    )
+                )
 
             # Apply agent type filter if provided
             if agent_type:
@@ -929,8 +976,13 @@ async def get_tasks(
 
             # Apply pagination
             offset = (page - 1) * per_page
+            ordering = (
+                func.coalesce(Task.updated_at, Task.created_at).desc()
+                if agent_id is not None
+                else Task.created_at.desc()
+            )
             query = (
-                query.order_by(Task.created_at.desc()).offset(offset).limit(per_page)
+                query.order_by(ordering, Task.id.desc()).offset(offset).limit(per_page)
             )
             tasks_query = query.all()
 

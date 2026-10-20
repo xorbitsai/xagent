@@ -7,6 +7,11 @@ const toastErrorMock = vi.hoisted(() => vi.fn());
 const routerPushMock = vi.hoisted(() => vi.fn());
 const paramsMock = vi.hoisted(() => ({ value: { id: "sales-email-lead-response-agent" } }));
 const hireAgentFromTemplateMock = vi.hoisted(() => vi.fn());
+const dispatchMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@/contexts/app-context-chat", () => ({
+  useApp: () => ({ dispatch: dispatchMock }),
+}));
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -93,6 +98,7 @@ beforeEach(() => {
   toastErrorMock.mockReset();
   routerPushMock.mockReset();
   hireAgentFromTemplateMock.mockReset();
+  dispatchMock.mockReset();
   paramsMock.value = { id: "sales-email-lead-response-agent" };
 });
 
@@ -162,7 +168,7 @@ describe("TemplateDetailPage", () => {
     });
   });
 
-  it("hires the agent and navigates to the newly seeded task on success", async () => {
+  it("refreshes the sidebar after hiring and before navigating to the seeded task", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate()));
     hireAgentFromTemplateMock.mockResolvedValueOnce({ taskId: 99, agentId: 5, created: true });
 
@@ -178,6 +184,9 @@ describe("TemplateDetailPage", () => {
     await waitFor(() => {
       expect(routerPushMock).toHaveBeenCalledWith("/task/99");
     });
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(dispatchMock).toHaveBeenCalledWith({ type: "TRIGGER_TASK_UPDATE" });
+    expect(dispatchMock.mock.invocationCallOrder[0]).toBeLessThan(routerPushMock.mock.invocationCallOrder[0]);
     expect(hireAgentFromTemplateMock).toHaveBeenCalledWith({
       templateId: "sales-email-lead-response-agent",
       persona: expect.objectContaining({ name: "Leo" }),
@@ -211,9 +220,11 @@ describe("TemplateDetailPage", () => {
     );
 
     await waitFor(() => {
-      expect(routerPushMock).toHaveBeenCalledWith("/agent/77");
+      expect(routerPushMock).toHaveBeenCalledWith("/task?agent=77");
     });
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled();
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(dispatchMock).toHaveBeenCalledWith({ type: "TRIGGER_TASK_UPDATE" });
   });
 
   it("proceeds with hiring when the pre-hire freshness recheck itself fails, rather than blocking the action", async () => {
@@ -265,12 +276,15 @@ describe("TemplateDetailPage", () => {
     await waitFor(() => {
       expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1);
     });
+    expect(dispatchMock).not.toHaveBeenCalled();
 
     resolveHire({ taskId: 99, agentId: 5, created: true });
     await waitFor(() => {
       expect(routerPushMock).toHaveBeenCalledWith("/task/99");
     });
     expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1);
+    expect(dispatchMock).toHaveBeenCalledTimes(1);
+    expect(dispatchMock).toHaveBeenCalledWith({ type: "TRIGGER_TASK_UPDATE" });
   });
 
   it("does not navigate or toast when hiring resolves after unmount", async () => {
@@ -300,6 +314,7 @@ describe("TemplateDetailPage", () => {
 
     expect(routerPushMock).not.toHaveBeenCalledWith(expect.stringContaining("/task/"));
     expect(toastErrorMock).not.toHaveBeenCalled();
+    expect(dispatchMock).not.toHaveBeenCalled();
   });
 
   it("toasts and re-enables the button when hiring fails", async () => {
@@ -321,6 +336,7 @@ describe("TemplateDetailPage", () => {
       );
     });
     expect(routerPushMock).not.toHaveBeenCalledWith(expect.stringContaining("/task/"));
+    expect(dispatchMock).not.toHaveBeenCalled();
     expect(
       screen.getByRole("button", { name: 'templates.marketplace.hire:{"name":"Leo"}' })
     ).not.toBeDisabled();
@@ -338,7 +354,7 @@ describe("TemplateDetailPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "templates.marketplace.chat" }));
 
-    expect(routerPushMock).toHaveBeenCalledWith("/agent/5");
+    expect(routerPushMock).toHaveBeenCalledWith("/task?agent=5");
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled();
   });
 

@@ -15,6 +15,7 @@ import { LibraryTemplateCard } from "@/components/templates/library-template-car
 import { categoryLabel as sharedCategoryLabel, normalizeCategoryKey, orderCategoriesWithPreferred } from "@/lib/template-categories";
 import { TOOL_CATEGORY_I18N_KEYS, capitalize } from "@/lib/tool-category-labels";
 import type { TranslationKey } from "@/i18n/translations";
+import { getAgentTaskHref } from "@/lib/agent-ui-access";
 
 interface CategorySection {
   id: string;
@@ -112,7 +113,7 @@ function TemplatesPageContent() {
     // must go straight to that chat, not one more hop through the detail
     // page's own hired-aware redirect.
     if (template.hired && template.hired_agent_id) {
-      router.push(`/agent/${template.hired_agent_id}`);
+      router.push(getAgentTaskHref(template.hired_agent_id));
       return;
     }
     router.push(`/templates/${encodeURIComponent(template.id)}`);
@@ -305,7 +306,21 @@ function TemplatesPageContent() {
       />
 
       <div className="px-6 py-6 md:px-8">
-      {/* Segmented category + type filters */}
+        <button
+          type="button"
+          onClick={() => router.push("/build?create=true")}
+          className="mb-5 flex w-full items-center gap-3 rounded-2xl border border-[#d8ddfb] bg-[#f8f9ff] px-4 py-3 text-left transition-colors hover:border-[#aeb8f7] hover:bg-[#f2f4ff]"
+        >
+          <span className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-white text-[#2536e0] shadow-sm">
+            <span className="text-lg">✦</span>
+          </span>
+          <span className="min-w-0 flex-1">
+            <b className="block text-sm font-semibold">{t("templates.marketplace.buildOwn")}</b>
+            <span className="block truncate text-xs text-muted-foreground">{t("templates.marketplace.buildOwnDescription")}</span>
+          </span>
+          <span className="rounded-full bg-[#2536e0] px-4 py-2 text-xs font-semibold text-white">{t("templates.marketplace.describeIt")}</span>
+        </button>
+        {/* Segmented category + type filters */}
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
           <SegmentedTabs

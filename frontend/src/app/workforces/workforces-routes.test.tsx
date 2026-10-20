@@ -365,13 +365,20 @@ describe("workforce route entry points", () => {
     vi.useRealTimers()
   })
 
-  it("adds the visible sidebar entry for workforces", () => {
+  it("uses one My Team sidebar entry for teammates and workforces", () => {
     const agentDevelopment = getNavigationGroupsForUser(null)[0]
 
     expect(agentDevelopment.items).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          href: "/workforces",
+          href: "/workforces?view=teammates",
+          nameKey: "nav.teammates",
+        }),
+      ]),
+    )
+    expect(agentDevelopment.items).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
           nameKey: "nav.workforces",
         }),
       ]),

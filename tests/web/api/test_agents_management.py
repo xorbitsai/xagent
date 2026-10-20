@@ -1063,6 +1063,38 @@ def test_list_agents_includes_owned_agents_and_policy_visible_agents() -> None:
     assert items_by_id[shared_draft_id]["readonly"] is True
 
 
+def test_list_agents_search_preserves_access_scope() -> None:
+    _admin_headers()
+    headers = _register_second_user()
+    bob_id = _user_id("bob")
+    admin_id = _user_id("admin")
+    owned_id = _create_agent_row(user_id=bob_id, name="Needle owned")
+    shared_id = _create_agent_row(user_id=admin_id, name="Needle shared")
+    _create_agent_row(user_id=admin_id, name="Needle private")
+    _create_agent_row(user_id=bob_id, name="Unrelated")
+    description_id = _create_agent_row(user_id=bob_id, name="Description match")
+    db = _direct_db_session()
+    try:
+        db.get(Agent, description_id).description = "Handles needle requests"
+        db.commit()
+    finally:
+        db.close()
+    set_workforce_policy(_VisibleAgentPolicy({shared_id}))
+
+    response = client.get(
+        "/api/agents", params={"search": "  NEEDLE  "}, headers=headers
+    )
+    assert response.status_code == 200, response.text
+    assert {item["id"] for item in response.json()} == {
+        owned_id,
+        shared_id,
+        description_id,
+    }
+    empty = client.get("/api/agents", params={"search": "%"}, headers=headers)
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+
 def test_list_agents_response_carries_suggested_prompts_through_owner_and_policy_rows() -> (
     None
 ):

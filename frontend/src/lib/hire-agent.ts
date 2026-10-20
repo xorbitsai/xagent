@@ -74,6 +74,78 @@ export interface HireAgentResult {
   created: boolean;
 }
 
+export interface SeededAgentTaskResult {
+  taskId: number;
+  agentId: number;
+}
+
+/** Optional first-run overview; text comes from the selected real template,
+ * not a simulated model response. Existing Hire callers keep their intro. */
+export interface TeammateWelcome {
+  description: string;
+  openingMessage: string;
+  prompt: string;
+}
+
+/**
+ * Start the first conversation for an agent that already exists. This is
+ * intentionally shared with the marketplace Hire flow so opening a teammate
+ * from the sidebar produces the exact same welcome message and app-connection
+ * card as opening them immediately after hiring.
+ */
+export async function createSeededAgentTask({
+  agentId,
+  persona,
+  strings,
+  connections = [],
+  welcome,
+}: {
+  agentId: number;
+  persona: PersonaInfo;
+  strings: HireMessageStrings;
+  connections?: ConnectionInfo[];
+  welcome?: TeammateWelcome;
+}): Promise<SeededAgentTaskResult> {
+  if (!Number.isInteger(agentId) || agentId <= 0) {
+    throw new Error("Cannot create seeded task: invalid agent id");
+  }
+
+  const title = persona.role ? `${persona.name} — ${persona.role}` : persona.name;
+  const connectAppsInteraction = buildConnectAppsInteraction(connections, strings.connectAppsLabel);
+  const interactions = [
+    ...(welcome ? [{
+      type: "teammate_summary",
+      field: "teammate_summary",
+      label: persona.role || persona.name,
+      description: welcome.description,
+      placeholder: welcome.prompt,
+      apps: connections.map((connection) => connection.name.trim()).filter(Boolean),
+    }] : []),
+    ...(connectAppsInteraction ? [{ ...connectAppsInteraction, ...(welcome ? { group_by_provider: true } : {}) }] : []),
+  ];
+  const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      title,
+      agent_id: agentId,
+      seed_assistant_message: welcome?.openingMessage || buildSeedAssistantMessage(persona, strings),
+      ...(interactions.length ? { seed_interactions: interactions } : {}),
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to create task for agent (${response.status})`);
+  }
+
+  const body = await response.json();
+  const taskId = Number(body?.task_id);
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    throw new Error("Malformed task create response: missing task_id");
+  }
+
+  return { taskId, agentId };
+}
+
 /**
  * Hire a marketplace persona: resolve (get-or-create) the user's
  * quick-access agent for this template under the persona's display name,
@@ -87,19 +159,21 @@ export interface HireAgentResult {
  * seeded task on top of the existing agent (resolve reuses the agent, but
  * task/create always creates a new task) - callers must only invoke this
  * from the "not yet hired" path and route straight to the agent's chat
- * (e.g. `/agent/{hired_agent_id}`) once `template.hired` is true.
+ * (e.g. `/task?agent={hired_agent_id}`) once `template.hired` is true.
  */
 export async function hireAgentFromTemplate({
   templateId,
   persona,
   strings,
   connections = [],
+  welcome,
   abortIfIdentityChanged,
 }: {
   templateId: string;
   persona: PersonaInfo;
   strings: HireMessageStrings;
   connections?: ConnectionInfo[];
+  welcome?: TeammateWelcome;
   /** Checked once, between resolve and task/create - a PR review finding
    * caught that this function itself makes 2 independent network calls,
    * each authenticated with whatever session apiRequest finds live at the
@@ -121,27 +195,13 @@ export async function hireAgentFromTemplate({
     throw new Error("Aborted: authenticated identity changed mid-hire");
   }
 
-  const title = persona.role ? `${persona.name} — ${persona.role}` : persona.name;
-  const connectAppsInteraction = buildConnectAppsInteraction(connections, strings.connectAppsLabel);
-  const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title,
-      agent_id: agentId,
-      seed_assistant_message: buildSeedAssistantMessage(persona, strings),
-      ...(connectAppsInteraction ? { seed_interactions: [connectAppsInteraction] } : {}),
-    }),
+  const { taskId } = await createSeededAgentTask({
+    agentId,
+    persona,
+    strings,
+    connections,
+    welcome,
   });
-  if (!response.ok) {
-    throw new Error(`Failed to create task for hired agent (${response.status})`);
-  }
-
-  const body = await response.json();
-  const taskId = Number(body?.task_id);
-  if (!Number.isInteger(taskId) || taskId <= 0) {
-    throw new Error("Malformed task create response: missing task_id");
-  }
 
   return { taskId, agentId, created };
 }

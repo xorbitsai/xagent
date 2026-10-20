@@ -789,10 +789,12 @@ async def create_agent(
 async def list_agents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    search: Optional[str] = None,
 ) -> List[AgentListItem]:
     """List agents visible to the current user."""
     try:
         store = AgentStore(db)
+        keyword = (search or "").strip().casefold()
         items = [
             _serialize_agent_list_item(store, item)
             for item in list_accessible_agents(
@@ -800,6 +802,9 @@ async def list_agents(
                 current_user,
                 purpose="agent_list",
             )
+            if not keyword
+            or keyword in (item.agent.name or "").casefold()
+            or keyword in (item.agent.description or "").casefold()
         ]
         return [AgentListItem.model_validate(item) for item in items]
 

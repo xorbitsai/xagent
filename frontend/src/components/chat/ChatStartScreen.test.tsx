@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const chatInputProps = vi.hoisted(() => ({
@@ -186,22 +186,36 @@ describe("ChatStartScreen agents section", () => {
     expect(container.querySelectorAll("img")).toHaveLength(1)
   })
 
-  it("does not show a right-edge fade when the pill row does not overflow", () => {
-    renderScreen([{ id: 7, name: "Maya" }])
-
-    expect(screen.queryByTestId("team-strip")?.nextSibling).toBeNull()
-  })
-
-  it("shows the right-edge fade once the pill row actually has scrollable overflow", () => {
+  it("centers a small team inside a single scrollable row", () => {
     renderScreen([{ id: 7, name: "Maya" }])
 
     const strip = screen.getByTestId("team-strip")
-    Object.defineProperty(strip, "scrollWidth", { configurable: true, value: 800 })
-    Object.defineProperty(strip, "clientWidth", { configurable: true, value: 400 })
-    Object.defineProperty(strip, "scrollLeft", { configurable: true, value: 0 })
-    fireEvent.scroll(strip)
+    expect(strip).toHaveClass("overflow-x-auto")
+    expect(strip).toHaveAttribute("tabindex", "0")
+    expect(strip.firstElementChild).toHaveClass("w-max", "min-w-full", "flex-nowrap", "justify-center")
+    expect(strip.nextSibling).toBeNull()
+  })
 
-    expect(strip.nextSibling).not.toBeNull()
+  it("renders every teammate in one horizontally scrollable row and keeps the first and last selectable", () => {
+    const agents = Array.from({ length: 30 }, (_, index) => ({
+      id: index + 1,
+      name: index === 0 ? "Kevin" : `Teammate ${index + 1}`,
+    }))
+    const onAgentClick = vi.fn()
+    render(
+      <ChatStartScreen title="My team" agents={agents} onAgentClick={onAgentClick} onSend={vi.fn()} />
+    )
+
+    const strip = screen.getByTestId("team-strip")
+    expect(strip).toHaveClass("overflow-x-auto")
+    expect(strip.firstElementChild).toHaveClass("w-max", "min-w-full", "flex-nowrap")
+    expect(strip.firstElementChild).not.toHaveClass("flex-wrap")
+    expect(within(strip).getAllByRole("button")).toHaveLength(30)
+    expect(strip.nextSibling).toBeNull()
+    fireEvent.click(within(strip).getByRole("button", { name: "Kevin" }))
+    fireEvent.click(within(strip).getByRole("button", { name: "Teammate 30" }))
+    expect(onAgentClick).toHaveBeenNthCalledWith(1, agents[0])
+    expect(onAgentClick).toHaveBeenNthCalledWith(2, agents[29])
   })
 
   it("still forwards selectedAgents to ChatInput (it drives ChatInput's own no-model-selected guard)", () => {

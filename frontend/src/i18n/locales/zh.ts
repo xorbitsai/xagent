@@ -1,4 +1,17 @@
 const zh = {
+  agentProfile: {
+    title: "{name} 的资料",
+    subtitle: "基本资料与配置",
+    name: "姓名",
+    status: "状态",
+    description: "描述",
+    rules: "常驻规则",
+    readOnly: "你只有该员工的查看权限。",
+    loadFailed: "无法加载员工资料，请重试。",
+    saveFailed: "保存失败，请重试。",
+    saved: "员工资料已保存",
+    saving: "保存中…",
+  },
   taskCompletion: {
     completed: "已完成",
     partial: "部分完成，请查看回复中尚未完成的部分。",
@@ -117,6 +130,13 @@ const zh = {
     },
   },
   nav: {
+    builder: "构建器",
+    builderDescription: "知识库、模型、API 密钥、记忆及更多",
+    teammates: "团队成员",
+    knowledge: "知识库",
+    toolsAndApps: "工具与应用",
+    skills: "技能",
+    skillsDescription: "已安装的技能与注册源",
     home: "首页",
     settings: "系统设置",
     dashboard: "仪表盘",
@@ -274,9 +294,18 @@ const zh = {
   },
   chatPage: {
     page: {
-      emptyTitle: "描述您的目标，{appName} 将处理剩下的工作",
+      emptyTitle: "您想做什么？",
       emptyDescription: "自动将您的想法转化为可运行的智能体。只需描述您需要什么即可开始",
       startWith: "你可以从这里开始",
+      startConversationFailed: "无法开始此会话，请重试。",
+      quickActions: {
+        draft: "起草帖子",
+        draftPrompt: "根据我的笔记起草一篇社交媒体帖子。",
+        plan: "规划今天",
+        planPrompt: "帮我安排今天的工作并确定优先级。",
+        build: "构建智能体",
+        buildPrompt: "帮我为这项工作构建一个可复用的智能体。",
+      },
     },
     sections: {
       startingPrompts: "快捷指令",
@@ -1736,11 +1765,26 @@ const zh = {
     },
   },
   onboarding: {
+    firstChat: {
+      greeting: "你好——我是 {name}，你的{role}。",
+      summary: "员工工作摘要",
+      workingFrom: "工作依据",
+      inputs: "你在聊天中提供的需求、消息和文件。",
+      youGet: "提供的结果",
+      dataAccess: "数据访问",
+      accessApps: "可选应用：{apps}。实际访问取决于已有连接和该员工的工具权限。",
+      accessFiles: "你提供的消息和上传文件。此模板不要求连接应用。",
+      runsAs: "运行配置",
+      composerModel: "使用下方输入框选择的模型和运行模式。",
+      prompt: "先从哪项工作开始？请描述需求、粘贴材料或上传文件。需要时，可以在下方连接应用。",
+    },
     skip: "跳过设置",
     saving: "保存中…",
     continue: "继续",
     rail: {
       label: "设置进度",
+      need: "你的需求",
+      team: "你的团队",
       aboutYou: "关于你",
       goals: "目标",
       myTeam: "我的团队",
@@ -1770,6 +1814,12 @@ const zh = {
       product: "产品与工程",
       other: "其他",
     },
+    need: {
+      greeting: "{name}，你好——有哪些事情",
+      title: "可以交给我们来做？",
+      subtitle: "可以多选。我会为每项需求匹配员工，让第一位员工在聊天中等你。",
+      skip: "跳过——查看所有员工",
+    },
     goals: {
       titleLine1: "有哪些事情",
       titleLine2: "可以交给我来做？",
@@ -1792,6 +1842,14 @@ const zh = {
     },
     team: {
       title: "认识一下你的 AI 团队。",
+      voice: "语气",
+      voicePreview: "{voice}语气示例",
+      connectNext: "{name} 可以在聊天中连接 {apps}。你也可以稍后再连接。",
+      noAccounts: "{name} 无需连接账号即可开始。",
+      reviewNote: "先提供一段需求或一个文件。检查结果后，再要求员工发送、发布或执行修改。",
+      teammate: "你的员工",
+      loadFailed: "无法加载员工，请重试。",
+      empty: "暂时没有可推荐的员工，你可以前往目录查看。",
       subtitleBase: "根据你选的内容匹配。选一个开始吧",
       subtitleEnd: "。",
       subtitleExtraOne: "——还有一个匹配项在模板库中等着你。",
@@ -1889,6 +1947,9 @@ const zh = {
     marketplace: {
       pageTitle: "添加队友",
       pageSubtitle: "选择你想要完成的工作，队友会自动配置好。每一位都会先起草再行动。",
+      buildOwn: "构建自己的队友",
+      buildOwnDescription: "用一句话描述工作，Xagent 会预填配置。",
+      describeIt: "描述需求",
       meet: "认识 {name}",
       hire: "雇佣 {name}",
       hiring: "雇佣中…",
@@ -1915,6 +1976,12 @@ const zh = {
     }
   },
   sidebar: {
+    search: {
+      conversations: "聊天记录",
+      failed: "搜索失败，请重试。",
+      empty: "没有找到匹配的员工或聊天记录。",
+      loadMore: "加载更多",
+    },
     tasks: {
       empty: "暂无任务",
       viewAll: "查看全部",
@@ -2626,6 +2693,12 @@ const zh = {
       success: {
         configSaved: "配置保存成功",
       },
+    },
+  },
+  teamPage: {
+    tabs: {
+      teammates: "队友",
+      workforces: "工作组",
     },
   },
   builds: {

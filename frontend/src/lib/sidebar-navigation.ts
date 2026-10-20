@@ -3,22 +3,19 @@ import type { TranslationKey } from "@/i18n/translations"
 import {
     Activity,
     FileText,
-    Sparkles,
+    Code2,
     Settings,
     Wrench,
     Users,
     Brain,
     Server,
-    Layers,
     Library,
     MessageSquare,
     Bot,
     Box,
     ClipboardList,
-    LayoutTemplate,
     Globe,
     Key,
-    MoreHorizontal,
 } from "lucide-react"
 
 interface SidebarUser {
@@ -33,11 +30,14 @@ export interface NavigationItem {
     children?: NavigationItem[]
     showTasks?: boolean
     nameKey?: TranslationKey
+    descriptionKey?: TranslationKey
 }
 
 export interface NavigationGroup {
     title: string
     titleKey?: TranslationKey
+    descriptionKey?: TranslationKey
+    icon?: ComponentType<SVGProps<SVGSVGElement>>
     items: NavigationItem[]
     /** Whether this group's items are hidden behind a collapse toggle by default. */
     defaultCollapsed?: boolean
@@ -47,23 +47,52 @@ export interface NavigationGroup {
      * doesn't collide with a built-in group's identity. Falls back to `title` when unset.
      */
     id?: string
+    /**
+     * Host-provided placement: workspace adds a first-level group before
+     * Settings; builder appends its items to the shared Builder group.
+     * Omit to preserve the legacy standalone-group behavior.
+     */
+    placement?: "workspace" | "builder"
+}
+
+export type ExtraNavResolver<User = unknown> = NavigationGroup[] | ((user: User) => NavigationGroup[])
+
+/** Compose host configuration without copying the sidebar or mutating its inputs. */
+export function composeSidebarNavigation(
+    baseGroups: NavigationGroup[],
+    baseUserItems: NavigationItem[],
+    extraGroups: NavigationGroup[],
+): { groups: NavigationGroup[]; userItems: NavigationItem[] } {
+    const groups = baseGroups.map((group) => ({ ...group, items: [...group.items] }))
+    const userItems = [...baseUserItems]
+    for (const group of extraGroups) {
+        if (group.items.length === 0) continue
+        if (group.placement === "builder") {
+            const builder = groups.find((candidate) => candidate.id === "builder")
+            if (builder) {
+                builder.items.push(...group.items)
+                continue
+            }
+        }
+        if (group.placement === "workspace") {
+            const entry: NavigationItem = {
+                name: group.title,
+                nameKey: group.titleKey,
+                descriptionKey: group.descriptionKey,
+                href: `__workspace_${group.id ?? group.title}__`,
+                icon: group.icon ?? Users,
+                children: [...group.items],
+            }
+            const settingsIndex = userItems.findIndex((item) => item.href === "/settings")
+            userItems.splice(settingsIndex < 0 ? userItems.length : settingsIndex, 0, entry)
+        } else {
+            groups.push({ ...group, items: [...group.items] })
+        }
+    }
+    return { groups, userItems }
 }
 
 const baseMoreResourceItems: NavigationItem[] = [
-    {
-        name: "Tools",
-        nameKey: "nav.tools",
-        href: "/tools",
-        icon: Wrench,
-        color: "text-blue-400"
-    },
-    {
-        name: "Files",
-        nameKey: "nav.files",
-        href: "/files",
-        icon: FileText,
-        color: "text-blue-400"
-    },
     {
         name: "Channels",
         nameKey: "nav.channels",
@@ -112,49 +141,23 @@ const getMoreResourceItemsForUser = (user?: SidebarUser | null): NavigationItem[
 
 export const getNavigationGroupsForUser = (user?: SidebarUser | null): NavigationGroup[] => [
     {
-        id: "agent-development",
-        title: "Agent Development",
-        titleKey: "nav.sections.agentDevelopment",
+        id: "builder",
+        title: "Builder",
+        titleKey: "nav.builder",
+        descriptionKey: "nav.builderDescription",
+        icon: Code2,
+        defaultCollapsed: true,
         items: [
             {
-                name: "Task",
-                nameKey: "nav.task",
-                href: "/task",
-                icon: Sparkles,
-                color: "text-blue-500"
-            },
-            {
-                name: "My Team",
-                nameKey: "nav.myTeam",
-                href: "/build",
+                name: "Teammates",
+                nameKey: "nav.teammates",
+                href: "/workforces?view=teammates",
                 icon: Bot,
                 color: "text-yellow-400"
             },
             {
-                name: "Add teammates",
-                nameKey: "nav.addTeammates",
-                href: "/templates",
-                icon: LayoutTemplate,
-                color: "text-purple-400"
-            },
-            {
-                name: "Workforces",
-                nameKey: "nav.workforces",
-                href: "/workforces",
-                icon: Layers,
-                color: "text-cyan-500"
-            },
-        ]
-    },
-    {
-        id: "resources",
-        title: "Resources",
-        titleKey: "nav.sections.resources",
-        defaultCollapsed: true,
-        items: [
-            {
-                name: "Knowledge Base",
-                nameKey: "nav.knowledgeBase",
+                name: "Knowledge",
+                nameKey: "nav.knowledge",
                 href: "/kb",
                 icon: Globe,
                 color: "text-gray-500"
@@ -167,20 +170,6 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
                 color: "text-gray-500"
             },
             {
-                name: "Memory",
-                nameKey: "nav.memory",
-                href: "/memory",
-                icon: Brain,
-                color: "text-gray-500"
-            },
-            {
-                name: "Skill Hub",
-                nameKey: "nav.skillHub",
-                href: "/skill-hub",
-                icon: Library,
-                color: "text-emerald-400"
-            },
-            {
                 name: "API Keys",
                 nameKey: "nav.apiKeys",
                 href: "/api-keys",
@@ -188,18 +177,37 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
                 color: "text-gray-500"
             },
             {
-                name: "More",
-                nameKey: "nav.more",
-                href: "__resources_more__",
-                icon: MoreHorizontal,
-                color: "text-gray-500",
-                children: getMoreResourceItemsForUser(user)
-            }
+                name: "Memory",
+                nameKey: "nav.memory",
+                href: "/memory",
+                icon: Brain,
+                color: "text-gray-500"
+            },
+            ...getMoreResourceItemsForUser(user),
         ]
     }
 ]
 
 const baseUserMenuItems: NavigationItem[] = [
+    {
+        name: "Tools and apps",
+        nameKey: "nav.toolsAndApps",
+        href: "/tools",
+        icon: Wrench,
+    },
+    {
+        name: "Skills",
+        nameKey: "nav.skills",
+        descriptionKey: "nav.skillsDescription",
+        href: "/skill-hub",
+        icon: Library,
+    },
+    {
+        name: "Files",
+        nameKey: "nav.files",
+        href: "/files",
+        icon: FileText,
+    },
     {
         name: "Settings",
         nameKey: "nav.settings",

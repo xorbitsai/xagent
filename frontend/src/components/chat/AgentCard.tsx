@@ -4,6 +4,7 @@ import React from "react";
 import { Bot, ChevronRight } from "lucide-react";
 import { useRouter, usePathname } from "next/navigation";
 import { cn } from "@/lib/utils";
+import { getAgentTaskHref } from "@/lib/agent-ui-access";
 
 // Base styles for agent card
 export const agentCardBaseClasses =
@@ -21,7 +22,7 @@ export interface AgentCardProps {
 /**
  * AgentCard component for displaying created agents in a card format.
  * Shows agent name, status badge, and optional description.
- * Automatically navigates to /agent/[id] when clicked.
+ * Published agents open in the shared task composer when clicked.
  */
 export function AgentCard({
   agentId,
@@ -41,7 +42,7 @@ export function AgentCard({
     } else {
       // Default: navigate based on agent status
       // DRAFT agents go to builder (edit), PUBLISHED agents go to chat
-      const targetUrl = status === 'draft' ? `/build/${agentId}` : `/agent/${agentId}`;
+      const targetUrl = status === 'draft' ? `/build/${agentId}` : getAgentTaskHref(agentId);
 
       // If we are already on the target URL, do nothing to prevent reloading the page
       // and losing the current chat history or unsaved form changes
@@ -101,11 +102,12 @@ export function AgentCard({
 
 /**
  * Compact version of AgentCard for inline display
- * Also navigates to /agent/[id] when clicked.
+ * Also opens the shared task composer when clicked.
  */
 export interface AgentChipProps {
   agentId: string;
   agentName: string;
+  status?: "draft" | "published";
   className?: string;
   onClick?: () => void;
 }
@@ -113,6 +115,7 @@ export interface AgentChipProps {
 export function AgentChip({
   agentId,
   agentName,
+  status = "published",
   className,
   onClick,
 }: AgentChipProps) {
@@ -123,13 +126,7 @@ export function AgentChip({
       // Use custom onClick if provided
       onClick();
     } else {
-      // Default: navigate based on agent status
-      // DRAFT agents go to builder (edit), PUBLISHED agents go to chat
-      if (status === 'draft') {
-        router.push(`/build/${agentId}`);
-      } else {
-        router.push(`/agent/${agentId}`);
-      }
+      router.push(status === "draft" ? `/build/${agentId}` : getAgentTaskHref(agentId));
     }
   };
 

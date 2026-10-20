@@ -5,7 +5,24 @@ import {
   joinWithAnd,
   recommendedTemplates,
   reorderGoalsByWork,
+  inferWorkFromGoals,
 } from "./onboarding-data"
+
+describe("inferWorkFromGoals", () => {
+  it("uses the most selected function without asking a business question", () => {
+    expect(inferWorkFromGoals(["social", "blog", "meetings"])).toBe("marketing")
+    expect(inferWorkFromGoals(["meetings", "leads", "inbox"])).toBe("sales")
+  })
+  it("breaks ties by catalog order, not click order", () => {
+    expect(inferWorkFromGoals(["meetings", "social"])).toBe("marketing")
+    expect(inferWorkFromGoals(["social", "meetings"])).toBe("marketing")
+  })
+  it("ignores unknown and duplicate goals and handles clearing the selection", () => {
+    expect(inferWorkFromGoals(["social", "social", "meetings", "leads"])).toBe("sales")
+    expect(inferWorkFromGoals(["unknown"])).toBe("")
+    expect(inferWorkFromGoals([])).toBe("")
+  })
+})
 
 describe("reorderGoalsByWork", () => {
   it("brings goals matching the selected work type to the front, preserving relative order within each bucket", () => {

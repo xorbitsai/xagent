@@ -21,6 +21,7 @@ import {
 } from "@/contexts/file-access-context"
 import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
 import { FIRST_GATE_CLEARED_MESSAGE_KEY, isConnectorRuntimeDialogTriggerCode, shouldHoldFirstMessage } from "@/lib/connector-runtime-api"
+import { getAgentTaskHref } from "@/lib/agent-ui-access"
 
 interface WebSocketMessage {
   type: string
@@ -363,9 +364,11 @@ const acceptTaskControlVersion = (
 }
 
 export interface Interaction {
-  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards" | "connect_apps";
+  type: "select_one" | "select_multiple" | "text_input" | "file_upload" | "confirm" | "number_input" | "action_cards" | "connect_apps" | "teammate_summary";
   field: string;
   label: string;
+  /** Read-only first-run overview seeded from the hired template. */
+  description?: string;
   options?: Array<{ label: string; value: string; description?: string; action_type?: string }>;
   placeholder?: string;
   multiline?: boolean;
@@ -379,6 +382,8 @@ export interface Interaction {
    * useMcpApps()'s McpApp.name) to group by OAuth provider and render as
    * connect cards - e.g. ["Gmail", "Google Calendar", "HubSpot"]. */
   apps?: string[];
+  /** First-run cards group builtin OAuth apps under their shared provider. */
+  group_by_provider?: boolean;
 }
 import {
   useWebSocket,
@@ -617,7 +622,7 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       const field = seenFields.has(baseField) ? `${baseField}_${index}` : baseField
       seenFields.add(field)
       if (
-        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards", "connect_apps"].includes(type) ||
+        !["select_one", "select_multiple", "text_input", "file_upload", "confirm", "number_input", "action_cards", "connect_apps", "teammate_summary"].includes(type) ||
         typeof field !== "string" ||
         !field.trim()
       ) {
@@ -647,6 +652,7 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
           }))
       }
 
+      if (typeof item.description === "string") normalized.description = item.description
       if (typeof item.placeholder === "string") normalized.placeholder = item.placeholder
       if (typeof item.properties?.placeholder === "string") normalized.placeholder = item.properties.placeholder
       if (typeof item.multiline === "boolean") normalized.multiline = item.multiline
@@ -659,6 +665,7 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       }
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
+      if (typeof item.group_by_provider === "boolean") normalized.group_by_provider = item.group_by_provider
       if (Array.isArray(item.apps)) {
         normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
       }
@@ -5161,7 +5168,7 @@ export function AppProvider({
                       filesDisabled={options?.filesDisabled}
                       agentCardsEnabled={agentCardsEnabled}
                       onFileClick={options?.filesDisabled ? undefined : openFilePreview}
-                      onAgentClick={(agentId) => router.push(`/agent/${agentId}`)}
+                      onAgentClick={(agentId) => router.push(getAgentTaskHref(agentId))}
                     />
                   </div>
                 </div>

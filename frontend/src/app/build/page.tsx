@@ -50,6 +50,7 @@ import {
   BuildAgentCardExtension,
   BuildPageExtensionProvider,
 } from "@/lib/build-page-extension"
+import { MyTeamTabs } from "@/components/team/my-team-tabs"
 
 type StatusTab = "all" | "enabled" | "drafts"
 
@@ -532,7 +533,6 @@ function BuildsPageContent() {
       {/* Header */}
       <PageHeader
         title={t("builds.list.header.title")}
-        description={t("builds.list.header.description")}
         actions={
           <>
             <SearchInput
@@ -551,6 +551,7 @@ function BuildsPageContent() {
 
       {/* Main Content */}
       <div className="flex-1 px-4 md:px-6 py-6 space-y-6 overflow-auto">
+        <MyTeamTabs active="teammates" teammateCount={agents.length} />
         {/* Loading State */}
         {loading ? (
           <div className="flex items-center justify-center h-[400px]">

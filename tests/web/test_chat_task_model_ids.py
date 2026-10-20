@@ -1180,6 +1180,147 @@ def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
         db.close()
 
 
+def test_task_search_matches_messages_before_pagination_and_preserves_scope(
+    test_db, user1_headers
+):
+    from uuid import uuid4
+
+    from xagent.web.models.agent import Agent
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.task_execution_event import TaskExecutionEvent
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        admin = db.query(User).filter(User.username == "admin").one()
+        agent = Agent(user_id=user.id, name="Needle employee", instructions="Test")
+        db.add(agent)
+        db.flush()
+        fixtures = [
+            ("needle title", {}),
+            ("description match", {"description": "needle description"}),
+            ("input match", {"input": "needle input"}),
+            ("output match", {"output": "needle output"}),
+            ("employee match", {"agent_id": agent.id}),
+            ("legacy message", {"conversation_storage_version": 1}),
+            ("canonical message", {"conversation_storage_version": 2}),
+            ("needle hidden", {"is_visible": False}),
+            ("needle foreign", {"user_id": admin.id}),
+            ("unmatched", {}),
+            ("stale projection", {"conversation_storage_version": 2}),
+        ]
+        rows = {}
+        for title, values in fixtures:
+            task = Task(
+                **{
+                    "user_id": user.id,
+                    "title": title,
+                    "status": TaskStatus.COMPLETED,
+                    **values,
+                }
+            )
+            db.add(task)
+            db.flush()
+            rows[title] = task
+        for title in ("legacy message", "stale projection"):
+            for _ in range(2):
+                db.add(
+                    TaskChatMessage(
+                        task_id=rows[title].id,
+                        user_id=user.id,
+                        role="user",
+                        content="needle 100% done",
+                        message_type="user",
+                    )
+                )
+        db.add(
+            TaskExecutionEvent(
+                event_id=str(uuid4()),
+                task_id=rows["canonical message"].id,
+                sequence=1,
+                scope_id="root",
+                idempotency_key="input:test",
+                kind="input_accepted",
+                payload_version=1,
+                payload={"content": "Needle canonical"},
+                occurred_at=datetime.now(UTC),
+            )
+        )
+        db.commit()
+
+        first = client.get(
+            "/api/chat/tasks",
+            params={"search": "  NEEDLE  ", "per_page": 2},
+            headers=user1_headers,
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["pagination"]["total_count"] == 7
+        assert first.json()["pagination"]["has_next"] is True
+        all_results = client.get(
+            "/api/chat/tasks",
+            params={"search": "needle", "per_page": 40},
+            headers=user1_headers,
+        )
+        assert {task["title"] for task in all_results.json()["tasks"]} == {
+            title for title, _ in fixtures[:7]
+        }
+        literal = client.get(
+            "/api/chat/tasks", params={"search": "%"}, headers=user1_headers
+        )
+        assert [task["title"] for task in literal.json()["tasks"]] == ["legacy message"]
+    finally:
+        db.close()
+
+
+def test_agent_conversation_lookup_uses_latest_activity_and_preserves_scope(
+    test_db, user1_headers
+):
+    from xagent.web.models.agent import Agent
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter_by(username="user1").one()
+        admin = db.query(User).filter_by(username="admin").one()
+        agent = Agent(user_id=user.id, name="Teammate", instructions="Test")
+        other_agent = Agent(user_id=user.id, name="Other teammate", instructions="Test")
+        db.add_all([agent, other_agent])
+        db.flush()
+        for title, agent_id, owner_id, visible, created, updated in [
+            ("resumed old chat", agent.id, user.id, True, 1, 10),
+            ("newer creation", agent.id, user.id, True, 5, 6),
+            ("hidden", agent.id, user.id, False, 11, 11),
+            ("foreign", agent.id, admin.id, True, 12, 12),
+            ("different teammate", other_agent.id, user.id, True, 13, 13),
+        ]:
+            db.add(
+                Task(
+                    user_id=owner_id,
+                    agent_id=agent_id,
+                    title=title,
+                    is_visible=visible,
+                    created_at=datetime(2026, 10, created, tzinfo=UTC),
+                    updated_at=datetime(2026, 10, updated, tzinfo=UTC),
+                )
+            )
+        db.commit()
+        response = client.get(
+            "/api/chat/tasks",
+            params={"agent_id": agent.id, "per_page": 1},
+            headers=user1_headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["pagination"]["total_count"] == 2
+        assert [task["title"] for task in response.json()["tasks"]] == [
+            "resumed old chat"
+        ]
+    finally:
+        db.close()
+
+
 def test_get_tasks_returns_channel_type(test_db, user1_headers):
     from xagent.web.models.database import get_db
     from xagent.web.models.task import Task, TaskStatus
@@ -2280,8 +2421,9 @@ def test_task_create_seeds_assistant_message(test_db, user1_headers):
         db.close()
 
 
+@pytest.mark.parametrize("include_summary", [False, True])
 def test_task_create_seeds_interactions_alongside_the_assistant_message(
-    test_db, user1_headers
+    test_db, user1_headers, include_summary
 ):
     """`seed_interactions` should ride along on the seeded assistant message's
     row - the AI Team Marketplace's "connect your apps" card is delivered
@@ -2295,12 +2437,26 @@ def test_task_create_seeds_interactions_alongside_the_assistant_message(
         "label": "Connect your apps",
         "apps": ["Gmail", "Google Calendar"],
     }
+    interactions = [connect_apps_interaction]
+    if include_summary:
+        connect_apps_interaction["group_by_provider"] = True
+        interactions.insert(
+            0,
+            {
+                "type": "teammate_summary",
+                "field": "teammate_summary",
+                "label": "Email Lead Response Agent",
+                "description": "Draft replies to inbound leads.",
+                "placeholder": "What should we work on first?",
+                "apps": ["Gmail", "Google Calendar"],
+            },
+        )
     resp = client.post(
         "/api/chat/task/create",
         json={
             "title": "Hire Leo",
             "seed_assistant_message": "Hi — I'm Leo.",
-            "seed_interactions": [connect_apps_interaction],
+            "seed_interactions": interactions,
         },
         headers=user1_headers,
     )
@@ -2310,7 +2466,7 @@ def test_task_create_seeds_interactions_alongside_the_assistant_message(
     db = next(get_db())
     try:
         message = db.query(TaskChatMessage).filter_by(task_id=task_id).one()
-        assert message.interactions == [connect_apps_interaction]
+        assert message.interactions == interactions
         user1_id = db.query(User).filter_by(username="user1").one().id
     finally:
         db.close()
@@ -2336,7 +2492,7 @@ def test_task_create_seeds_interactions_alongside_the_assistant_message(
     replayed = agent_events[0]
     assert replayed["source"] == "chat_history"
     assert replayed["expect_response"] is False
-    assert replayed["metadata"] == {"interactions": [connect_apps_interaction]}
+    assert replayed["metadata"] == {"interactions": interactions}
 
 
 def test_task_create_ignores_seed_interactions_without_a_seed_message(

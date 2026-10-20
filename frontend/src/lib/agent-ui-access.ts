@@ -20,8 +20,11 @@ export const canDeleteAgent = (agent: AgentUiAccess) =>
 
 export const canRunAgent = (agent: AgentUiAccess) => isPublishedAgent(agent);
 
+export const getAgentTaskHref = (agentId: number | string) =>
+  `/task?agent=${encodeURIComponent(String(agentId))}`;
+
 export const getAgentChatHref = (agent: AgentUiAccess) =>
-  canEditAgent(agent) ? `/agent/${agent.id}` : `/task?agent=${encodeURIComponent(String(agent.id))}`;
+  getAgentTaskHref(agent.id);
 
 export const findRunnableAgentById = <T extends AgentUiAccess>(
   agents: T[],

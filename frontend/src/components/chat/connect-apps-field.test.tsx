@@ -103,6 +103,39 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ConnectAppsField", () => {
+  it("groups first-run OAuth apps by provider while keeping all requested app names visible", async () => {
+    mcpAppsMock.apps = [
+      makeApp({ id: "facebook", name: "Facebook Pages", provider: "meta", auth_type: "builtin_oauth" }),
+      makeApp({ id: "instagram", name: "Instagram", provider: "meta", auth_type: "builtin_oauth" }),
+    ];
+    openBuiltinOAuthPopupMock.mockResolvedValue({ ok: true });
+    render(<ConnectAppsField interaction={{
+      ...LEO_INTERACTION, apps: ["Facebook Pages", "Instagram"], group_by_provider: true,
+    }} onSkip={vi.fn()} />);
+    expect(screen.getByText("Meta")).toBeInTheDocument();
+    expect(screen.getByText("Facebook Pages · Instagram")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /provider":"Instagram/ })).not.toBeInTheDocument();
+    fireEvent.click(continueButton("Meta"));
+    await waitFor(() => expect(openBuiltinOAuthPopupMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("only marks a provider connected once all its requested apps are connected", () => {
+    mcpAppsMock.apps = [
+      makeApp({ is_connected: true }),
+      makeApp({ id: "google-calendar", name: "Google Calendar", is_connected: false }),
+    ];
+    const interaction: Interaction = {
+      ...LEO_INTERACTION, apps: ["Gmail", "Google Calendar"], group_by_provider: true,
+    };
+    const { rerender } = render(<ConnectAppsField interaction={interaction} onSkip={vi.fn()} />);
+    expect(continueButton("Google")).toBeEnabled();
+    expect(screen.queryByText("chatPage.clarification.connectApps.connected")).not.toBeInTheDocument();
+    mcpAppsMock.apps = mcpAppsMock.apps.map((app) => ({ ...app, is_connected: true }));
+    rerender(<ConnectAppsField interaction={interaction} onSkip={vi.fn()} />);
+    expect(screen.getByText("chatPage.clarification.connectApps.connected")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /continueWith/ })).not.toBeInTheDocument();
+  });
+
   it("renders one row per app, not merged by provider, in the interaction's own order", () => {
     mcpAppsMock.apps = [
       makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot" }),

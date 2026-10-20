@@ -1,10 +1,9 @@
-import React, { useEffect, useRef, useState } from "react";
+import React from "react";
 import { Sparkles } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
-import { getBrandingFromEnv } from "@/lib/branding";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface PromptCard {
@@ -115,7 +114,6 @@ export function ChatStartScreen({
   inputMinHeightClass,
 }: ChatStartScreenProps) {
   const { t } = useI18n();
-  const branding = getBrandingFromEnv();
   const enabledFiles = filesDisabled ? [] : files;
 
   const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
@@ -134,36 +132,8 @@ export function ChatStartScreen({
   // and the header falls back to the plain title/description below.
   const leadAgent = agents && agents.length > 0 ? selectedAgents[0] : undefined;
 
-  // The right-edge fade only earns its place when there's actually
-  // something past the edge to scroll to - otherwise it's a gradient
-  // fading into nothing over the last, fully-visible pill.
-  const teamStripRef = useRef<HTMLDivElement>(null);
-  const [teamStripHasMore, setTeamStripHasMore] = useState(false);
-  useEffect(() => {
-    const strip = teamStripRef.current;
-    if (!strip) {
-      setTeamStripHasMore(false);
-      return;
-    }
-    const sync = () => {
-      setTeamStripHasMore(strip.scrollWidth - strip.scrollLeft - strip.clientWidth > 8);
-    };
-    sync();
-    strip.addEventListener("scroll", sync);
-    // A ResizeObserver on the strip itself catches every way its available
-    // width can change (window resize, but also a sidebar toggling or any
-    // other local layout shift) - a window `resize` listener alone would
-    // miss the ones that aren't the window itself resizing.
-    const observer = new ResizeObserver(sync);
-    observer.observe(strip);
-    return () => {
-      strip.removeEventListener("scroll", sync);
-      observer.disconnect();
-    };
-  }, [agents]);
-
   return (
-    <div className="flex flex-col items-center justify-start min-h-[80vh] pt-10 pb-16 px-6 text-center">
+    <div className="flex min-h-full flex-col items-center justify-center px-6 py-10 text-center">
       {leadAgent ? (
         <div className="w-full max-w-[680px] mx-auto flex items-center gap-4 mb-6 text-left">
           <PersonaAvatar
@@ -184,7 +154,12 @@ export function ChatStartScreen({
         </div>
       ) : (
         <>
-          <h2 className="text-[26px] font-extrabold mb-2 bg-gradient-to-r from-[hsl(234_62%_45%)] to-[hsl(234_62%_60%)] bg-clip-text text-transparent leading-[1.2] tracking-tight">
+          {icon && (
+            <div className="mb-4 grid h-9 min-w-9 place-items-center text-[#2536e0]">
+              {typeof icon === "string" ? <img src={icon} alt="" className="h-8 w-8 object-contain" /> : icon}
+            </div>
+          )}
+          <h2 className="mb-2 text-[26px] font-bold leading-[1.2] tracking-[-0.025em] text-foreground">
             {title}
           </h2>
           {description && (
@@ -193,7 +168,7 @@ export function ChatStartScreen({
         </>
       )}
 
-      <div className="w-full max-w-[680px] mx-auto space-y-6">
+      <div className="mx-auto w-full max-w-[700px] space-y-5">
         <div>
           <ChatInput
             onSend={(msg, config) => onSend(msg, enabledFiles, config)}
@@ -222,15 +197,31 @@ export function ChatStartScreen({
         </div>
 
         {prompts && prompts.length > 0 && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] px-1">
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>{t("chatPage.sections.startingPrompts")}</span>
-            </div>
-            <div className={`grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4`}>
+          <div className={agents ? "flex flex-wrap items-center justify-center gap-2" : "space-y-3"}>
+            {!agents && (
+              <div className="flex items-center gap-2 px-1 text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                <Sparkles className="h-3.5 w-3.5" />
+                <span>{t("chatPage.sections.startingPrompts")}</span>
+              </div>
+            )}
+            <div className={agents ? "contents" : "grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3"}>
               {prompts.map((item, index) => {
                 const isString = typeof item === 'string';
                 const promptText = isString ? item : item.prompt;
+
+                if (agents) {
+                  return (
+                    <button
+                      key={index}
+                      type="button"
+                      onClick={() => handlePromptClick(promptText, isString ? undefined : item.promptHighlights)}
+                      className="inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-[#2536e0]"
+                    >
+                      {!isString && item.icon ? <item.icon className="h-3.5 w-3.5" /> : <Sparkles className="h-3.5 w-3.5" />}
+                      {isString ? promptText : item.title}
+                    </button>
+                  );
+                }
 
                 if (isString) {
                   return (
@@ -274,24 +265,20 @@ export function ChatStartScreen({
             </button>
           </div>
         ) : agents && agents.length > 0 && (
-          <div className="space-y-2.5 text-left">
-            <p className="text-xs text-muted-foreground px-1">
-              <b className="font-semibold text-foreground/85">
-                {t("chatPage.sections.assignToTeammateLead")}
-              </b>
-              {t("chatPage.sections.assignToTeammateHint", { appName: branding.appName })}
+          <div className="space-y-1 text-center">
+            <p className="text-[11.5px] text-muted-foreground">
+              <b className="font-medium text-foreground/70">Talk to...</b>
+              <span className="sr-only">{t("chatPage.sections.assignToTeammate")}</span>
             </p>
-            <div className="relative">
-              <div
-                ref={teamStripRef}
-                data-testid="team-strip"
-                role="group"
-                aria-label={t("chatPage.sections.assignToTeammate")}
-                className="flex items-center gap-2 overflow-x-auto p-1 pr-8 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
-              >
-                <span className="shrink-0 text-[11px] font-bold uppercase tracking-[0.07em] text-muted-foreground/80 whitespace-nowrap">
-                  {t("chatPage.sections.assignToTeammate")}
-                </span>
+            <div
+              data-testid="team-strip"
+              role="group"
+              aria-label={t("chatPage.sections.assignToTeammate")}
+              tabIndex={0}
+              className="relative overflow-x-auto"
+            >
+              {/* Center short lists without centering overflow off the left edge. */}
+              <div className="flex w-max min-w-full flex-nowrap items-start justify-center gap-1 p-1">
                 <TooltipProvider delayDuration={200}>
                   {agents.map((agent) => {
                     const isSelected = selectedAgents.some(
@@ -304,25 +291,23 @@ export function ChatStartScreen({
                         type="button"
                         aria-pressed={isSelected}
                         onClick={() => onAgentClick?.(agent)}
-                        className={`shrink-0 flex items-center gap-[7px] rounded-full border pl-[3px] pr-3 py-[3px] transition-all whitespace-nowrap ${
+                        className={`flex shrink-0 flex-col items-center gap-1 rounded-2xl border px-2.5 py-2 transition-all ${
                           isSelected
-                            ? "border-primary/40 bg-primary/[0.06] shadow-[0_4px_14px_hsl(var(--primary)/0.11)]"
-                            : "border-border bg-background hover:border-primary/30 hover:bg-primary/[0.04] hover:-translate-y-px"
+                            ? "border-[#cfd5fb] bg-[#eef1fe]"
+                            : "border-transparent bg-transparent hover:-translate-y-0.5 hover:bg-muted"
                         }`}
                       >
                         <PersonaAvatar
                           persona={{ name: agent.name, avatar: avatarUrl }}
-                          sizeClassName="h-[27px] w-[27px]"
+                          sizeClassName="h-[34px] w-[34px]"
                           textClassName="text-[11px]"
                           className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}
                           decorative
                         />
-                        <b className={`text-[12.5px] font-semibold ${isSelected ? "text-primary" : "text-foreground"}`}>
+                        <b className={`max-w-[72px] truncate text-[11.5px] font-medium ${isSelected ? "text-primary" : "text-foreground"}`}>
                           {agent.name}
                         </b>
-                        {agent.specialty && (
-                          <span className="text-[11.5px] text-muted-foreground">{agent.specialty}</span>
-                        )}
+                        {agent.specialty && <span className="sr-only">{agent.specialty}</span>}
                       </button>
                     );
 
@@ -342,13 +327,6 @@ export function ChatStartScreen({
                   })}
                 </TooltipProvider>
               </div>
-              {/* Fades the right edge so a horizontally-clipped pill reads as
-                  "more to scroll" rather than an abruptly truncated name -
-                  only when there's actually more past the edge, or it's a
-                  gradient fading into nothing over a fully-visible pill. */}
-              {teamStripHasMore && (
-                <div className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent" />
-              )}
             </div>
           </div>
         )}

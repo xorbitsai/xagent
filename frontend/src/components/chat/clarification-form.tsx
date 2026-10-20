@@ -14,6 +14,7 @@ import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
+import { TeammateSummary } from "./teammate-summary"
 import { canDeferClarification, CLARIFICATION_PAGE_SIZE, suggestedClarificationValue } from "./clarification-guidance"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import { clientErrorTranslationKey, type ClientErrorCode } from "@/lib/client-errors"
@@ -72,7 +73,18 @@ const isFileActionSelection = (
 // switch below instead of falling through to its "unsupported type" case.
 const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
-export function ClarificationForm({
+export function ClarificationForm(props: ClarificationFormProps) {
+  const summaries = props.interactions.filter((interaction) => interaction.type === "teammate_summary")
+  const fields = props.interactions.filter((interaction) => interaction.type !== "teammate_summary")
+  return (
+    <div className="space-y-4">
+      {summaries.map((interaction, index) => <TeammateSummary key={`${interaction.field}-${index}`} interaction={interaction} />)}
+      {fields.length > 0 && <ClarificationFields {...props} interactions={fields} />}
+    </div>
+  )
+}
+
+function ClarificationFields({
   interactions,
   messageId,
   requestId,

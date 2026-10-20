@@ -12,7 +12,7 @@ export interface UserPreferences {
   execution_budget_tokens?: number | null;
   execution_budget_soft_percent?: number | null;
   onboarded?: boolean;
-  department?: string;
+  department?: string | null;
   // null is this endpoint's merge-PATCH "clear this field" signal (see
   // buildPreferencesPayload in page.tsx) - not the same as omitting the key.
   industry?: string | null;

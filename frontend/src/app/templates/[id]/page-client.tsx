@@ -6,18 +6,21 @@ import { ArrowLeft, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "@/contexts/i18n-context";
+import { useApp } from "@/contexts/app-context-chat";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { TOOL_CATEGORY_I18N_KEYS, capitalize } from "@/lib/tool-category-labels";
 import type { TemplateDetail } from "@/types/template";
+import { getAgentTaskHref } from "@/lib/agent-ui-access";
 
 type LoadStatus = "loading" | "not_found" | "error" | "ready";
 
 export default function TemplateDetailPage() {
   const params = useParams();
   const router = useRouter();
+  const { dispatch } = useApp();
   const { t, tDynamic, locale } = useI18n();
   const id = Array.isArray(params.id) ? params.id[0] : params.id;
 
@@ -98,7 +101,7 @@ export default function TemplateDetailPage() {
     if (!template || !persona || hiringRef.current) return;
 
     if (template.hired && template.hired_agent_id) {
-      router.push(`/agent/${template.hired_agent_id}`);
+      router.push(getAgentTaskHref(template.hired_agent_id));
       return;
     }
 
@@ -121,7 +124,10 @@ export default function TemplateDetailPage() {
         if (freshCheck.ok) {
           const freshTemplate = (await freshCheck.json()) as TemplateDetail;
           if (freshTemplate.hired && freshTemplate.hired_agent_id) {
-            if (isMountedRef.current) router.push(`/agent/${freshTemplate.hired_agent_id}`);
+            if (isMountedRef.current) {
+              dispatch({ type: "TRIGGER_TASK_UPDATE" });
+              router.push(getAgentTaskHref(freshTemplate.hired_agent_id));
+            }
             return;
           }
         }
@@ -141,6 +147,8 @@ export default function TemplateDetailPage() {
         connections: template.connections,
       });
       if (!isMountedRef.current) return;
+      // The persistent sidebar needs an explicit refresh after a new hire.
+      dispatch({ type: "TRIGGER_TASK_UPDATE" });
       router.push(`/task/${result.taskId}`);
     } catch {
       if (!isMountedRef.current) return;

@@ -1,9 +1,10 @@
 "use client"
 
 import React, { Suspense, useCallback, useEffect, useRef, useState } from "react"
-import { ArrowLeft, Loader2, PanelRight } from "lucide-react"
-import { useParams, useRouter } from "next/navigation"
+import { Loader2, PanelRight } from "lucide-react"
+import { useParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
+import { AgentChatHeader } from "@/components/chat/agent-chat-header"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { TaskAgentExecutionDrawer } from "@/components/task/task-agent-execution-drawer"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
@@ -11,7 +12,7 @@ import { ProgressPanel, type ProgressStepView } from "@/components/task/progress
 import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import { useConnectorRuntimeDialogActions, type SessionCheckCause } from "@/contexts/connector-runtime-dialog-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { cn, getApiUrl } from "@/lib/utils"
+import { cn } from "@/lib/utils"
 
 export interface SessionCheckWatch {
   viewed: number | null // the task this view checks; null while no view is on
@@ -48,7 +49,6 @@ function TaskDetailContent() {
   const { openSessionCheck } = useConnectorRuntimeDialogActions()
   const { t } = useI18n()
   const params = useParams()
-  const router = useRouter()
   const taskIdFromUrl = params.id
   const [progressPanelOpen, setProgressPanelOpen] = useState(false)
   const [agentExecution, setAgentExecution] = useState<{ taskId: number; selection: AgentExecutionSummary } | null>(null)
@@ -236,39 +236,13 @@ function TaskDetailContent() {
   return (
     <div className="h-full flex flex-col md:flex-row bg-background">
       <div className="flex-1 min-w-0 min-h-0 flex flex-col">
-        {(state.currentTask?.agentId || state.dagExecution) && (
-          <div className="flex-none flex items-center justify-between gap-3 px-4 py-3 bg-background/95 backdrop-blur z-50 sticky top-0">
-            <div className="flex items-center gap-3 min-w-0">
-              {state.currentTask?.agentId && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="rounded-full hover:bg-muted flex-shrink-0"
-                  onClick={() => {
-                    const agentId = state.currentTask?.agentId
-                    router.push(agentId ? `/agent/${agentId}` : "/task")
-                  }}
-                  title={t("common.back")}
-                >
-                  <ArrowLeft className="w-5 h-5" />
-                </Button>
-              )}
-              {(state.currentTask?.agentName || state.currentTask?.agentLogoUrl) && (
-                <div className="flex items-center gap-3 overflow-hidden">
-                  {state.currentTask?.agentLogoUrl ? (
-                    <img
-                      src={state.currentTask.agentLogoUrl.startsWith('http') ? state.currentTask.agentLogoUrl : `${getApiUrl()}${state.currentTask.agentLogoUrl}`}
-                      alt={state.currentTask.agentName || t("agent.logo")}
-                      className="w-8 h-8 object-cover rounded-sm flex-shrink-0"
-                    />
-                  ) : null}
-                  {state.currentTask?.agentName ? (
-                    <span className="text-lg font-bold text-foreground truncate">{state.currentTask.agentName}</span>
-                  ) : null}
-                </div>
-              )}
-            </div>
-            {state.dagExecution && (
+        {state.currentTask?.agentId ? (
+          <AgentChatHeader
+            agentId={state.currentTask.agentId}
+            name={state.currentTask.agentName}
+            logoUrl={state.currentTask.agentLogoUrl}
+            showBack
+            rightSlot={state.dagExecution ? (
               <Button
                 variant="ghost"
                 size="icon"
@@ -279,9 +253,22 @@ function TaskDetailContent() {
               >
                 <PanelRight className="w-5 h-5" />
               </Button>
-            )}
+            ) : null}
+          />
+        ) : state.dagExecution ? (
+          <div className="flex h-[62px] shrink-0 items-center justify-end border-b border-border px-4">
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn("rounded-full flex-shrink-0", progressPanelOpen ? "bg-muted text-primary" : "hover:bg-muted")}
+              onClick={() => (progressPanelOpen ? handleCollapseProgressPanel() : setProgressPanelOpen(true))}
+              title={progressPanelOpen ? t("chatPage.progressPanel.collapse") : t("chatPage.progressPanel.toggleTooltip")}
+              aria-pressed={progressPanelOpen}
+            >
+              <PanelRight className="w-5 h-5" />
+            </Button>
           </div>
-        )}
+        ) : null}
         <div className="flex-1 min-h-0 relative">
           <TaskConversationPanel mode="page" onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
             if (state.taskId) {

@@ -8,6 +8,7 @@ const dispatchMock = vi.hoisted(() => vi.fn())
 const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => ({ value: new URLSearchParams() }))
 const localeMock = vi.hoisted(() => ({ value: "en" }))
+const taskUpdate = vi.hoisted(() => ({ value: 0 }))
 
 interface MockAgent {
   id: number | string
@@ -63,7 +64,7 @@ vi.mock("@/components/file/file-preview-dialog", () => ({
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     sendMessage: sendMessageMock,
-    state: { isProcessing: false, filePreview: { isOpen: false } },
+    state: { isProcessing: false, filePreview: { isOpen: false }, lastTaskUpdate: taskUpdate.value },
     dispatch: dispatchMock,
     closeFilePreview: closeFilePreviewMock,
   }),
@@ -123,6 +124,7 @@ const KEVIN = { id: 2, name: "Kevin", status: "published", suggested_prompts: []
 const DRAFT_AGENT = { id: 3, name: "Draft Only", status: "draft", suggested_prompts: ["Should not appear"] }
 
 beforeEach(() => {
+  taskUpdate.value = 0
   apiRequestMock.mockReset()
   // Picking an agent triggers a second, best-effort GET /api/agents/{id}
   // fetch for its execution config - default it to a benign 404 so tests
@@ -139,6 +141,39 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe("TaskHomePage agents", () => {
+  it("refreshes newly hired teammates without a remount and preserves the typed draft", async () => {
+    let list = [VERA]
+    apiRequestMock.mockImplementation(async (url: string) =>
+      url.endsWith("/api/agents") ? jsonResponse(list) : jsonResponse([]))
+    const { rerender } = render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+    act(() => chatStartScreenProps.current?.onInputChange?.("My unsent draft"))
+
+    list = [KEVIN, VERA]
+    taskUpdate.value++
+    rerender(<TaskHomePage />)
+    await screen.findByText("pick-Kevin")
+    expect(screen.getByTestId("composer")).toHaveValue("My unsent draft")
+    expect(dispatchMock.mock.calls.filter(([action]) => action.type === "RESET_STATE")).toHaveLength(1)
+  })
+
+  it("ignores an older agent response after a newer update has loaded", async () => {
+    let resolveOld!: (response: Response) => void
+    let requests = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (!url.endsWith("/api/agents")) return Promise.resolve(jsonResponse([]))
+      requests++
+      if (requests === 1) return new Promise<Response>((resolve) => { resolveOld = resolve })
+      return Promise.resolve(jsonResponse([KEVIN, VERA]))
+    })
+    const { rerender } = render(<TaskHomePage />)
+    taskUpdate.value++
+    rerender(<TaskHomePage />)
+    await screen.findByText("pick-Kevin")
+    await act(async () => resolveOld(jsonResponse([VERA])))
+    expect(screen.getByText("pick-Kevin")).toBeInTheDocument()
+  })
+
   it("fetches agents once and forwards only the published ones", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN, DRAFT_AGENT]))
 

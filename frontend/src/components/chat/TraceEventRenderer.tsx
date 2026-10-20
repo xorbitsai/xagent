@@ -36,6 +36,7 @@ import {
   isStoppedTraceProcessStatus,
   resolveTraceProcessStatus,
 } from '@/lib/trace-process-status';
+import { getAgentTaskHref } from '@/lib/agent-ui-access';
 
 // Types
 interface ToolArgs {
@@ -1973,7 +1974,7 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
 
 
   const handleAgentClick = useCallback((agentId: string, agentName: string) => {
-    router.push(`/agent/${agentId}`);
+    router.push(getAgentTaskHref(agentId));
   }, [router]);
 
   const skillSelection = useMemo(() => {

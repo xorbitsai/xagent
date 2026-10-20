@@ -35,6 +35,7 @@ vi.mock("@/lib/template-agent-resolution", async () => {
 import {
   buildConnectAppsInteraction,
   buildSeedAssistantMessage,
+  createSeededAgentTask,
   hireAgentFromTemplate,
 } from "./hire-agent";
 
@@ -128,10 +129,71 @@ describe("buildConnectAppsInteraction", () => {
   });
 });
 
+describe("createSeededAgentTask", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset();
+  });
+
+  it("creates the first conversation for an existing agent with the welcome content", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ task_id: 91 }));
+
+    const result = await createSeededAgentTask({
+      agentId: 42,
+      persona: LEO_PERSONA,
+      strings: STRINGS,
+      connections: [{ name: "Gmail" }],
+    });
+
+    expect(result).toEqual({ taskId: 91, agentId: 42 });
+    const [url, init] = apiRequestMock.mock.calls[0];
+    expect(url).toBe("http://api.local/api/chat/task/create");
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.agent_id).toBe(42);
+    expect(body.seed_assistant_message).toContain("A few things before I start:");
+    expect(body.seed_interactions).toEqual([
+      {
+        type: "connect_apps",
+        field: "connect_apps",
+        label: "Connect your apps",
+        apps: ["Gmail"],
+      },
+    ]);
+  });
+});
+
 describe("hireAgentFromTemplate", () => {
   beforeEach(() => {
     apiRequestMock.mockReset();
     resolveAgentForTemplateMock.mockReset();
+  });
+
+  it.each([{ connections: [] }, { connections: [{ name: "Gmail" }] }])("persists the onboarding summary and only relevant app connections: %j", async ({ connections }) => {
+    resolveAgentForTemplateMock.mockResolvedValueOnce({ agent: { id: 42 }, created: true });
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ task_id: 7 }));
+    await hireAgentFromTemplate({
+      templateId: "sales-email-lead-response-agent",
+      persona: LEO_PERSONA,
+      strings: STRINGS,
+      connections,
+      welcome: {
+        openingMessage: "Hi, I'm Leo.",
+        description: "Draft a reply for each inbound lead.",
+        prompt: "Share an enquiry.",
+      },
+    });
+    const body = JSON.parse(apiRequestMock.mock.calls[0][1].body);
+    expect(body.seed_assistant_message).toBe("Hi, I'm Leo.");
+    expect(body.seed_interactions[0]).toEqual({
+      type: "teammate_summary",
+      field: "teammate_summary",
+      label: LEO_PERSONA.role,
+      description: "Draft a reply for each inbound lead.",
+      placeholder: "Share an enquiry.",
+      apps: connections.map((connection) => connection.name),
+    });
+    expect(body.seed_interactions).toHaveLength(connections.length ? 2 : 1);
+    if (connections.length) expect(body.seed_interactions[1].type).toBe("connect_apps");
+    expect(body).not.toHaveProperty("message");
   });
 
   it("resolves under the persona name, then creates a task seeded with the opening message", async () => {
@@ -221,7 +283,7 @@ describe("hireAgentFromTemplate", () => {
         persona: LEO_PERSONA,
         strings: STRINGS,
       })
-    ).rejects.toThrow("Failed to create task for hired agent (500)");
+    ).rejects.toThrow("Failed to create task for agent (500)");
   });
 
   it("throws on a malformed task/create response body", async () => {

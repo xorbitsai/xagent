@@ -2,6 +2,19 @@ import { describe, expect, it } from "vitest"
 import { normalizeInteractions } from "./app-context-chat"
 
 describe("normalizeInteractions", () => {
+  it("preserves a persisted first-chat summary, with only well-formed display fields", () => {
+    expect(normalizeInteractions([{
+      type: "teammate_summary", field: "teammate_summary", label: "Social posts",
+      description: "Draft platform-native posts.", placeholder: "Share a brief.", apps: ["Instagram", null],
+    }])).toEqual([{
+      type: "teammate_summary", field: "teammate_summary", label: "Social posts",
+      description: "Draft platform-native posts.", placeholder: "Share a brief.", apps: ["Instagram"],
+    }])
+    const [malformed] = normalizeInteractions([{
+      type: "teammate_summary", field: "teammate_summary", description: { unsafe: true },
+    }])
+    expect(malformed).not.toHaveProperty("description")
+  })
   it.each(["weekly", 0, false, null])("preserves the canonical suggested value %s", defaultValue => {
     const [result] = normalizeInteractions([
       { type: "text_input", field: "choice", label: "Choice", default_value: defaultValue },

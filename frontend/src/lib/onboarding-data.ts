@@ -57,17 +57,28 @@ export const ONBOARDING_GOALS: OnboardingGoal[] = [
   { id: "blog", labelKey: "onboarding.goal.blog", templateId: "marketing-content-agent", fn: "marketing" },
 ];
 
-/** Shown on the My team step when nobody picked a goal (the reference UI's
- * "Not sure yet — show me everyone" path still recommends a starting three,
- * rather than showing nothing) - Maya, Ellie and Kevin, matching
- * onboarding.html's own fallback exactly. */
+/** Infer the department from selected jobs instead of asking another question.
+ * Ties follow catalog order, so toggling the same goals in a different order
+ * does not change the saved department. */
+export function inferWorkFromGoals(selectedGoalIds: string[]): OnboardingWorkId | "" {
+  const counts = new Map<OnboardingWorkId, number>();
+  for (const goal of ONBOARDING_GOALS) {
+    if (selectedGoalIds.includes(goal.id)) {
+      counts.set(goal.fn, (counts.get(goal.fn) ?? 0) + 1);
+    }
+  }
+  return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
+}
+
+/** Fallback recommendations when selected goals have no available persona.
+ * Skipping the needs step opens the catalogue directly. */
 export const ONBOARDING_FALLBACK_TEMPLATE_IDS = [
   "marketing-social-media-content-manager",
   "support-inbox-manager",
   "sales-meeting-agent",
 ];
 
-/** The 5 voice options the Launch step offers - ids match
+/** The 5 inline voice options on the team step - ids match
  * VALID_USER_VOICES/apply_user_voice on the backend (src/xagent/web/api/auth.py,
  * src/xagent/web/api/agents.py) exactly; a mismatch here would let someone
  * pick a voice this frontend can display but the backend would 422 on save. */

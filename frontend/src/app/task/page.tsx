@@ -1,7 +1,8 @@
 "use client";
 
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { Bot } from "lucide-react";
+import Image from "next/image";
+import { Bot, CalendarDays, PenLine } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ChatStartScreen, AgentCard } from "@/components/chat/ChatStartScreen";
@@ -78,7 +79,8 @@ function TaskHomePageContent() {
     dispatch({ type: "RESET_STATE" });
   }, [dispatch]);
 
-  // Fetch agents on mount (and again on retry) - a failure here must not
+  // Refresh alongside the sidebar after hires/profile updates and on retry.
+  // A failure here must not
   // just silently render zero teammates, since that reads identically to
   // "no published agents exist" and gives the user nothing to act on.
   useEffect(() => {
@@ -115,7 +117,7 @@ function TaskHomePageContent() {
     return () => {
       cancelled = true;
     };
-  }, [agentsRetryToken]);
+  }, [agentsRetryToken, state.lastTaskUpdate]);
 
   const handleRetryAgents = () => {
     setAgentsRetryToken((token) => token + 1);
@@ -436,11 +438,15 @@ function TaskHomePageContent() {
   return (
     <div className="h-full bg-background flex flex-col overflow-hidden">
       <div className="flex-1 overflow-y-auto">
-        <main className="container max-w-4xl mx-auto px-4 py-8">
+        <main className="container h-full max-w-4xl mx-auto px-4 py-8">
           <ChatStartScreen
             title={t("chatPage.page.emptyTitle", { appName: branding.appName })}
-            description={t("chatPage.page.emptyDescription")}
-            icon={<Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
+            icon={<Image src={branding.logoPath} alt="" width={32} height={32} className="h-8 w-8 rounded-lg object-contain" unoptimized />}
+            prompts={[
+              { icon: PenLine, title: t("chatPage.page.quickActions.draft"), prompt: t("chatPage.page.quickActions.draftPrompt") },
+              { icon: CalendarDays, title: t("chatPage.page.quickActions.plan"), prompt: t("chatPage.page.quickActions.planPrompt") },
+              { icon: Bot, title: t("chatPage.page.quickActions.build"), prompt: t("chatPage.page.quickActions.buildPrompt") },
+            ]}
             agents={teammates}
             agentsError={agentsError}
             onRetryAgents={handleRetryAgents}
@@ -459,7 +465,7 @@ function TaskHomePageContent() {
             taskConfig={selectedAgents.length > 0 ? selectedAgentConfig : undefined}
             showModeToggle={true}
             autoFocus={true}
-            inputMinHeightClass="min-h-[200px]"
+            inputMinHeightClass="min-h-[88px]"
           />
         </main>
       </div>

@@ -3,58 +3,59 @@
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { cn } from "@/lib/utils"
-import { SearchInput } from "@/components/ui/search-input"
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
-import { getApiUrl } from "@/lib/utils"
-import { apiRequest } from "@/lib/api-wrapper"
-import { useAuth } from "@/contexts/auth-context"
-import { useApp } from "@/contexts/app-context-chat"
-import { ConfirmDialog } from "@/components/ui/confirm-dialog"
-import { getBrandingFromEnv } from "@/lib/branding"
-import { getChannelTooltip, getCompactChannelName } from "@/lib/channel-display"
-import { userDisplayLabel } from "@/lib/user-display"
-import { toast } from "@/components/ui/sonner"
-import extraNav from "@/lib/extra-nav"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
+  Bot,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsUpDown,
+  Clock3,
+  FileText,
+  Hash,
+  Loader2,
+  LogOut,
+  Plus,
+  Radio,
+  RotateCcw,
+  Search,
+  Send,
+  Settings2,
+  Sparkles,
+  Wrench,
+  X,
+} from "lucide-react"
+
+import { apiRequest } from "@/lib/api-wrapper"
+import {
+  type AgentTrigger,
+  listOwnerTriggers,
+  updateOwnerTrigger,
+} from "@/lib/agent-triggers-api"
+import { getBrandingFromEnv } from "@/lib/branding"
+import { getCompactChannelName, getChannelTooltip } from "@/lib/channel-display"
+import extraNav from "@/lib/extra-nav"
+import { categoryLabel } from "@/lib/template-categories"
+import { createSeededAgentTask } from "@/lib/hire-agent"
+import { getAgentTaskHref } from "@/lib/agent-ui-access"
+import {
+  composeSidebarNavigation,
   getNavigationGroupsForUser,
   getUserMenuItemsForUser,
-  type NavigationItem,
   type NavigationGroup,
+  type NavigationItem,
 } from "@/lib/sidebar-navigation"
-import {
-  FileText,
-  LogOut,
-  X,
-  ChevronDown,
-  ChevronRight,
-  ChevronLeft,
-  MessageSquare,
-  Loader2,
-  Trash2,
-  CheckCircle2,
-  XCircle,
-  PauseCircle,
-  Info,
-  Tag,
-  Github,
-  Star,
-  MoreHorizontal,
-  Edit2,
-  Search,
-  Radio,
-  Send,
-  Hash,
-  ChevronsUpDown,
-} from "lucide-react"
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-} from "@/components/ui/dialog"
-import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
-
-import { useI18n } from "@/contexts/i18n-context"
+import { userDisplayLabel } from "@/lib/user-display"
+import { cn, getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
+import { useAuth } from "@/contexts/auth-context"
+import { useApp } from "@/contexts/app-context-chat"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
+import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
+import { Switch } from "@/components/ui/switch"
+import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { toast } from "@/components/ui/sonner"
+import type { Template } from "@/types/template"
 
 export {
   getNavigationGroupsForUser,
@@ -66,28 +67,50 @@ export type {
 }
 
 interface Task {
-  task_id: string
+  task_id: string | number
   title: string
   status: "completed" | "running" | "failed" | "pending" | "paused" | "waiting_for_user"
   created_at: string | number
+  updated_at?: string | number
   description?: string
   agent_id?: number
+  agent_name?: string
   agent_logo_url?: string
-  channel_id?: number
   channel_name?: string
   channel_type?: string
 }
 
-interface VersionInfo {
-  version: string
-  display_version?: string
-  commit?: string
-  build_time?: string
-  latest_version?: string | null
-  is_latest?: boolean | null
+interface AgentSummary {
+  id: number
+  name: string
+  description?: string | null
+  logo_url?: string | null
+  template_id?: string | null
+  status?: string
+  readonly?: boolean
+  can_edit?: boolean
 }
 
-const TASKS_PER_PAGE = 10
+interface TemplateSummary {
+  id: string
+  name: string
+  description: string
+  category?: string
+  featured?: boolean
+  persona?: { name?: string; avatar?: string | null; role?: string }
+  hired?: boolean
+  hired_agent_id?: number | null
+  type?: string
+}
+
+interface SidebarProps {
+  isCollapsible?: boolean
+  className?: string
+  allowCollapse?: boolean
+  profileSubtitle?: string
+}
+
+const TASKS_PER_PAGE = 40
 
 const CHANNEL_ICON_PATHS: Record<string, string> = {
   feishu: "/icons/channels/feishu.svg",
@@ -96,1105 +119,697 @@ const CHANNEL_ICON_PATHS: Record<string, string> = {
 function ChannelTypeIcon({ channelType }: { channelType?: string }) {
   const normalizedType = channelType?.trim().toLowerCase()
   if (!normalizedType) return null
-
   if (normalizedType === "telegram") {
-    return <Send className="h-3 w-3 flex-shrink-0 text-[#229ED9]" aria-hidden="true" />
+    return <Send className="h-3 w-3 shrink-0 text-[#229ED9]" aria-hidden="true" />
   }
   if (normalizedType === "slack") {
-    return <Hash className="h-3 w-3 flex-shrink-0 text-[#4A154B]" aria-hidden="true" />
+    return <Hash className="h-3 w-3 shrink-0 text-[#4A154B]" aria-hidden="true" />
   }
-
   const iconPath = CHANNEL_ICON_PATHS[normalizedType]
   if (iconPath) {
-    return (
-      <Image
-        src={iconPath}
-        alt=""
-        width={12}
-        height={12}
-        className="h-3 w-3 flex-shrink-0"
-        unoptimized
-        aria-hidden="true"
-      />
-    )
+    return <Image src={iconPath} alt="" width={12} height={12} className="h-3 w-3 shrink-0" unoptimized aria-hidden="true" />
   }
-  return <Radio className="h-3 w-3 flex-shrink-0" aria-hidden="true" />
+  return <Radio className="h-3 w-3 shrink-0" aria-hidden="true" />
 }
 
-function formatStars(stars: number): string {
-  if (stars >= 1000000) return `${(stars / 1000000).toFixed(1)}M`
-  if (stars >= 1000) return `${(stars / 1000).toFixed(1)}k`
-  return String(stars)
+function compactTime(value: string | number): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ""
+  const now = new Date()
+  if (date.toDateString() === now.toDateString()) {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  }
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  if (date.toDateString() === yesterday.toDateString()) return "Yesterday"
+  return date.toLocaleDateString([], { month: "short", day: "numeric" })
 }
 
-interface SidebarProps {
-  isCollapsible?: boolean
-  className?: string
-  allowCollapse?: boolean
-  /**
-   * Secondary line under the signed-in user, supplied by the hosting app.
-   *
-   * Core stays deployment-agnostic: it renders whatever text it is given
-   * (for example a region name) and shows nothing when it is absent.
-   */
-  profileSubtitle?: string
+function taskPresence(status?: Task["status"]) {
+  if (status === "running" || status === "pending") return { dot: "bg-[#6477f4]", ring: "ring-[#aeb8ff]", label: "Working" }
+  if (status === "paused" || status === "waiting_for_user") return { dot: "bg-[#efaa36]", ring: "ring-[#f6cb82]", label: "Waiting" }
+  if (status === "completed") return { dot: "bg-[#2eb67d]", ring: "ring-[#9cdec4]", label: "Done" }
+  if (status === "failed") return { dot: "bg-[#dc5a5a]", ring: "ring-[#efadad]", label: "Needs attention" }
+  return { dot: "bg-[#a8a8b2]", ring: "ring-transparent", label: "Available" }
+}
+
+function SectionMenu({
+  group,
+  pathname,
+  t,
+  onNavigate,
+}: {
+  group: NavigationGroup
+  pathname: string
+  t: Translate
+  onNavigate?: () => void
+}) {
+  const ownsActiveRoute = group.items.some((item) => isNavigationItemActive(item, pathname))
+  const [collapsedOverride, setCollapsedOverride] = useState<boolean | null>(null)
+  const collapsed = collapsedOverride ?? Boolean(group.defaultCollapsed && !ownsActiveRoute)
+  const title = group.titleKey ? t(group.titleKey) : group.title
+  const contentId = React.useId()
+
+  return (
+    <div className="px-2 py-1">
+      <button
+        type="button"
+        aria-label={title}
+        aria-expanded={!collapsed}
+        aria-controls={contentId}
+        onClick={() => setCollapsedOverride(!collapsed)}
+        className={cn("flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[12px] hover:bg-accent", !collapsed && "bg-muted/70")}
+      >
+        {group.icon && <group.icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
+        <span className="min-w-0 flex-1">
+          <span className="block font-medium">{title}</span>
+          {group.descriptionKey && <span className="mt-0.5 block text-[10px] leading-relaxed text-muted-foreground">{t(group.descriptionKey)}</span>}
+        </span>
+        {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+      </button>
+      {!collapsed && (
+        <div id={contentId} className="ml-3 mt-1 space-y-0.5 border-l border-border/60 pl-2">
+          {group.items.map((item) => <WorkspaceMenuItem key={item.href} item={item} pathname={pathname} t={t} onNavigate={onNavigate} />)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function isNavigationItemActive(item: NavigationItem, pathname: string): boolean {
+  if (item.children?.length) return item.children.some((child) => isNavigationItemActive(child, pathname))
+  const itemPath = item.href.split("?")[0]
+  return pathname === itemPath || pathname.startsWith(`${itemPath}/`)
+}
+
+function WorkspaceMenuItem({ item, pathname, t, onNavigate }: {
+  item: NavigationItem
+  pathname: string
+  t: Translate
+  onNavigate?: () => void
+}) {
+  if (item.children?.length) {
+    return <SectionMenu group={{ title: item.name, titleKey: item.nameKey, descriptionKey: item.descriptionKey, icon: item.icon, items: item.children, defaultCollapsed: true }} pathname={pathname} t={t} onNavigate={onNavigate} />
+  }
+  const active = isNavigationItemActive(item, pathname)
+  return (
+    <Link href={item.href} onClick={onNavigate} aria-current={active ? "page" : undefined}
+      className={cn("flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[12px] transition-colors", active ? "bg-[#eef1fe] font-semibold text-[#2536e0]" : "text-foreground hover:bg-accent")}>
+      <item.icon className={cn("h-3.5 w-3.5 shrink-0", !active && "text-muted-foreground")} />
+      <span className="min-w-0">
+        <span className="block">{item.nameKey ? t(item.nameKey) : item.name}</span>
+        {item.descriptionKey && <span className="mt-0.5 block text-[10px] leading-relaxed text-muted-foreground">{t(item.descriptionKey)}</span>}
+      </span>
+    </Link>
+  )
+}
+
+function TeammatePickerDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const router = useRouter()
+  const { locale } = useI18n()
+  const [templates, setTemplates] = useState<TemplateSummary[]>([])
+  const [loading, setLoading] = useState(false)
+  const [category, setCategory] = useState("All")
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    setLoading(true)
+    apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`)
+      .then(async (response) => response.ok ? response.json() : [])
+      .then((data: unknown) => {
+        if (!cancelled) setTemplates(Array.isArray(data) ? data.filter((item): item is TemplateSummary => Boolean(item && typeof item === "object" && "id" in item && "name" in item)) : [])
+      })
+      .catch(() => { if (!cancelled) setTemplates([]) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [locale, open])
+
+  const agentTemplates = templates.filter((template) => (template.type || "agent") === "agent")
+  const categories = ["All", ...Array.from(new Set(agentTemplates.map((template) => template.category).filter(Boolean) as string[]))]
+  const visibleTemplates = agentTemplates.filter((template) => category === "All" || template.category === category).slice(0, 7)
+
+  const go = (href: string) => {
+    onOpenChange(false)
+    router.push(href)
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[min(520px,calc(100vw-24px))] max-w-none gap-0 overflow-hidden rounded-[20px] border-border bg-background p-0 shadow-2xl">
+        <div className="border-b border-border px-5 pb-4 pt-5">
+          <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-muted-foreground">XAGENT</div>
+          <DialogTitle className="mt-1 text-xl font-semibold tracking-tight">Add a teammate</DialogTitle>
+          <p className="mt-1 text-sm text-muted-foreground">Pick the job you want done and the teammate arrives configured.</p>
+        </div>
+        <div className="max-h-[62vh] overflow-y-auto p-4">
+          <div className="flex items-center gap-3 rounded-2xl border border-[#d9defb] bg-[#f7f8ff] p-3">
+            <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white text-[#2536e0] shadow-sm"><Sparkles className="h-4 w-4" /></span>
+            <div className="min-w-0 flex-1">
+              <b className="block text-sm font-semibold">Build your own teammate</b>
+              <span className="block text-xs text-muted-foreground">Describe the job, or configure one field by field.</span>
+            </div>
+            <button onClick={() => go("/build?create=true")} className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#2536e0] px-4 text-xs font-semibold text-white hover:bg-[#1e2fdb]">
+              <Sparkles className="h-3.5 w-3.5" /> Build
+            </button>
+          </div>
+
+          <div className="my-4 flex gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+            {categories.slice(0, 7).map((item) => (
+              <button key={item} onClick={() => setCategory(item)} className={cn("rounded-full px-3 py-1.5 text-xs font-medium", category === item ? "bg-[#eef1fe] text-[#2536e0]" : "text-muted-foreground hover:bg-accent")}>{item}</button>
+            ))}
+          </div>
+
+          {loading ? (
+            <div className="grid place-items-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+          ) : (
+            <div className="space-y-1">
+              {visibleTemplates.map((template) => {
+                const target = template.hired && template.hired_agent_id ? getAgentTaskHref(template.hired_agent_id) : `/templates/${encodeURIComponent(template.id)}`
+                return (
+                  <button key={template.id} onClick={() => go(target)} className="group flex w-full items-center gap-3 rounded-xl px-2.5 py-2.5 text-left hover:bg-accent">
+                    <PersonaAvatar persona={{ name: template.persona?.name || template.name, avatar: template.persona?.avatar }} sizeClassName="h-9 w-9" textClassName="text-xs" decorative />
+                    <span className="min-w-0 flex-1">
+                      <b className="flex items-center gap-2 text-[13px] font-semibold"><span className="truncate">{template.persona?.name || template.name}</span>{template.featured && <span className="rounded-full bg-[#eef1fe] px-2 py-0.5 text-[8px] font-bold uppercase tracking-wide text-[#2536e0]">Featured</span>}</b>
+                      <span className="mt-0.5 block truncate text-xs text-muted-foreground">{template.persona?.role || template.description}</span>
+                    </span>
+                    <ChevronRight className="h-4 w-4 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+                  </button>
+                )
+              })}
+            </div>
+          )}
+        </div>
+        <div className="border-t border-border p-3">
+          <button onClick={() => go("/templates")} className="flex h-9 w-full items-center justify-center gap-2 rounded-full border border-border text-xs font-semibold hover:bg-accent">See all teammates <ChevronRight className="h-3.5 w-3.5" /></button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function RoutinesDialog({
+  open,
+  onOpenChange,
+  agents,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  agents: AgentSummary[]
+}) {
+  const [items, setItems] = useState<Array<{ agent: AgentSummary; trigger: AgentTrigger }>>([])
+  const [loading, setLoading] = useState(false)
+  const [busyId, setBusyId] = useState<number | null>(null)
+
+  const load = useCallback(async () => {
+    if (!open) return
+    setLoading(true)
+    const results = await Promise.allSettled(
+      agents.filter((agent) => agent.status === "published").map(async (agent) => ({
+        agent,
+        triggers: await listOwnerTriggers({ kind: "agent", id: agent.id }),
+      })),
+    )
+    const next = results.flatMap((result) => result.status === "fulfilled"
+      ? result.value.triggers.filter((trigger) => trigger.type === "scheduled").map((trigger) => ({ agent: result.value.agent, trigger }))
+      : [])
+    setItems(next)
+    setLoading(false)
+  }, [agents, open])
+
+  useEffect(() => { void load() }, [load])
+
+  const toggle = async (entry: { agent: AgentSummary; trigger: AgentTrigger }) => {
+    setBusyId(entry.trigger.id)
+    try {
+      const updated = await updateOwnerTrigger({ kind: "agent", id: entry.agent.id }, entry.trigger.id, { enabled: !entry.trigger.enabled })
+      setItems((current) => current.map((item) => item.trigger.id === updated.id && item.agent.id === entry.agent.id ? { ...item, trigger: updated } : item))
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not update recurring job")
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="w-[min(500px,calc(100vw-24px))] max-w-none gap-0 overflow-hidden rounded-[20px] p-0">
+        <div className="border-b border-border px-5 pb-4 pt-5">
+          <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-muted-foreground">XAGENT</div>
+          <DialogTitle className="mt-1 text-xl font-semibold">Recurring jobs</DialogTitle>
+          <p className="mt-1 text-sm text-muted-foreground">Standing work, and the switch that stops it.</p>
+        </div>
+        <div className="max-h-[62vh] overflow-y-auto p-4">
+          {loading ? (
+            <div className="grid place-items-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+          ) : items.length === 0 ? (
+            <div className="rounded-2xl border border-dashed border-border px-6 py-10 text-center">
+              <Clock3 className="mx-auto h-6 w-6 text-muted-foreground" />
+              <p className="mt-3 text-sm font-medium">Nothing runs on a schedule yet.</p>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Ask a teammate to do something every morning and it will appear here.</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {items.map((entry) => (
+                <div key={`${entry.agent.id}:${entry.trigger.id}`} className="flex items-center gap-3 rounded-xl border border-border p-3">
+                  <PersonaAvatar persona={{ name: entry.agent.name, avatar: resolveAgentLogoUrl(entry.agent.logo_url ?? null, getApiUrl()) }} sizeClassName="h-9 w-9" textClassName="text-xs" decorative />
+                  <div className="min-w-0 flex-1">
+                    <b className="block truncate text-sm font-semibold">{entry.trigger.name}</b>
+                    <span className="block truncate text-xs text-muted-foreground">{entry.agent.name}{entry.trigger.next_run_at ? ` · ${new Date(entry.trigger.next_run_at).toLocaleString()}` : ""}</span>
+                  </div>
+                  {busyId === entry.trigger.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Switch checked={entry.trigger.enabled} onCheckedChange={() => void toggle(entry)} aria-label={`Toggle ${entry.trigger.name}`} />}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 export function Sidebar({ className, allowCollapse = true, profileSubtitle }: SidebarProps) {
   const pathname = usePathname()
   const router = useRouter()
   const { user, logout } = useAuth()
-  const branding = getBrandingFromEnv()
-  const { t } = useI18n()
   const { state } = useApp()
+  const { locale, t } = useI18n()
+  const branding = getBrandingFromEnv()
   const userLabel = userDisplayLabel(user, t("sidebar.user.defaultName"))
   const subtitle = profileSubtitle?.trim() || null
-  // The collapsed rail has no room for the identity lines: they become the
-  // profile button's tooltip and accessible name there.
   const profileLabel = subtitle ? `${userLabel} · ${subtitle}` : userLabel
-  const githubUrl = process.env.NEXT_PUBLIC_GITHUB_URL || "https://github.com/xorbitsai/xagent"
-  const normalizedGithubUrl = githubUrl.replace(/\.git$/, "").replace(/\/$/, "")
-  const githubRepoDisplay = normalizedGithubUrl.replace(/^https?:\/\/github\.com\//i, "")
-  const licenseUrl = `${normalizedGithubUrl}/blob/main/LICENSE`
-  const navigationGroups = useMemo(() => {
+  const { groups: navigationGroups, userItems: userMenuItems } = useMemo(() => {
     const extra = typeof extraNav === "function" ? extraNav(user) : extraNav
-    return [...getNavigationGroupsForUser(user), ...extra]
+    return composeSidebarNavigation(getNavigationGroupsForUser(user), getUserMenuItemsForUser(user), extra)
   }, [user])
-  const [githubStars, setGithubStars] = useState<number | null>(null)
 
-  const [taskToDelete, setTaskToDelete] = useState<string | null>(null)
-  const [isDeletingTask, setIsDeletingTask] = useState(false)
-
-  const confirmDeleteTask = async () => {
-    if (!taskToDelete) return
-    const taskId = taskToDelete
-    setIsDeletingTask(true)
-
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/chat/task/${taskId}`, {
-        method: 'DELETE',
-        headers: {}
-      })
-
-      if (response.ok) {
-        setTasks(prev => prev.filter(task => String(task.task_id) !== String(taskId)))
-
-        // Clean up refs and state
-        taskStatusRef.current.delete(String(taskId))
-        setUnreadTasks(prev => {
-          if (!prev.has(String(taskId))) return prev
-          const next = new Set(prev)
-          next.delete(String(taskId))
-          return next
-        })
-
-        if (String(getCurrentTaskId()) === String(taskId)) {
-          router.push('/task')
-        }
-        setTaskToDelete(null)
-      } else {
-        toast.error(t('common.deleteFailed'))
-      }
-    } catch (error) {
-      console.error('Failed to delete task:', error)
-      toast.error(t('common.deleteFailed'))
-    } finally {
-      setIsDeletingTask(false)
-    }
-  }
-
-  const deleteTask = (taskId: string, e: React.MouseEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setTaskToDelete(taskId)
-  }
-
-  const startRenaming = (task: Task) => {
-    setEditingTaskId(String(task.task_id))
-    setEditingTitle(task.title || "Untitled Task")
-  }
-
-  const submitRename = async (taskId: string) => {
-    const trimmedTitle = editingTitle.trim()
-    const task = tasks.find(t => String(t.task_id) === String(taskId))
-
-    // Do not call API if title is empty or unchanged
-    if (!trimmedTitle || (task && task.title === trimmedTitle)) {
-      setEditingTaskId(null)
-      return
-    }
-
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/chat/task/${taskId}`, {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ title: trimmedTitle })
-      })
-
-      if (response.ok) {
-        setTasks(prev => prev.map(t =>
-          String(t.task_id) === String(taskId)
-            ? { ...t, title: trimmedTitle }
-            : t
-        ))
-      }
-    } catch (error) {
-      console.error('Failed to rename task:', error)
-    } finally {
-      setEditingTaskId(null)
-    }
-  }
-
-  const cancelRename = () => {
-    setEditingTaskId(null)
-    setEditingTitle("")
-  }
-
-  const [isExpanded, setIsExpanded] = useState(false)
-  const [expandedMenus, setExpandedMenus] = useState<string[]>(["/agent"]) // Use href as a stable key
-  const [groupCollapseOverrides, setGroupCollapseOverrides] = useState<Record<string, boolean>>({})
-  // Flip from the collapsed state currently rendered (which may come from the default,
-  // an active-route auto-expand, or a previous toggle) so a click always changes what
-  // the user sees — recomputing from defaultCollapsed here would make the first click
-  // a no-op whenever the group was auto-expanded by the active route.
-  const toggleGroupCollapse = (key: string, currentCollapsed: boolean) => {
-    setGroupCollapseOverrides(prev => ({
-      ...prev,
-      [key]: !currentCollapsed,
-    }))
-  }
-  const [showUserMenu, setShowUserMenu] = useState(false)
-  const [isAboutOpen, setIsAboutOpen] = useState(false)
-  const sidebarRef = useRef<HTMLDivElement | null>(null)
-  const contentScrollRef = useRef<HTMLDivElement | null>(null)
-  const userMenuRef = useRef<HTMLDivElement | null>(null)
-
-  // Handle click outside for user menu
-  useEffect(() => {
-    const handleClickOutsideUserMenu = (event: MouseEvent | TouchEvent) => {
-      if (userMenuRef.current && !userMenuRef.current.contains(event.target as Node)) {
-        setShowUserMenu(false)
-      }
-    }
-
-    if (showUserMenu) {
-      document.addEventListener('mousedown', handleClickOutsideUserMenu)
-      document.addEventListener('touchstart', handleClickOutsideUserMenu)
-    }
-
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutsideUserMenu)
-      document.removeEventListener('touchstart', handleClickOutsideUserMenu)
-    }
-  }, [showUserMenu])
-
-  // Get currently selected task ID (parsed from path, supports /task/[id] format)
-  const getCurrentTaskId = useCallback(() => {
-    // Match /task/[id] pattern
-    const match = pathname.match(/^\/task\/([^/]+)\/?$/);
-    if (match) {
-      return match[1];
-    }
-    return null;
-  }, [pathname])
-
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [view, setView] = useState<"team" | "recent">("team")
+  const [search, setSearch] = useState("")
+  const searchQuery = search.trim()
+  const [searchPage, setSearchPage] = useState(1)
+  const [searchAttempt, setSearchAttempt] = useState(0)
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState(false)
+  const [searchResults, setSearchResults] = useState<{
+    query: string; agents: AgentSummary[]; tasks: Task[]; hasNext: boolean
+  }>({ query: "", agents: [], tasks: [], hasNext: false })
+  const [startOpen, setStartOpen] = useState(false)
+  const [userMenuOpen, setUserMenuOpen] = useState(false)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const [routinesOpen, setRoutinesOpen] = useState(false)
+  const [agents, setAgents] = useState<AgentSummary[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
-  const [unreadTasks, setUnreadTasks] = useState<Set<string>>(new Set())
-  const taskStatusRef = useRef<Map<string, string>>(new Map())
-  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null)
-  const [isLoadingTasks, setIsLoadingTasks] = useState(false)
-  const [isHistoryExpanded, setIsHistoryExpanded] = useState(true)
-  const [page, setPage] = useState(1)
-  const [hasMore, setHasMore] = useState(true)
-  const [isLoadingMore, setIsLoadingMore] = useState(false)
-  const pathnameRef = useRef(pathname)
-  const pageRef = useRef(page)
-  const displayVersion = versionInfo?.display_version || "unknown"
+  const [taskPage, setTaskPage] = useState(1)
+  const [tasksHasNext, setTasksHasNext] = useState(false)
+  const [loadingMoreTasks, setLoadingMoreTasks] = useState(false)
+  const loadingMoreTasksRef = useRef(false)
+  const [templatesById, setTemplatesById] = useState<Record<string, Template>>({})
+  const [openingAgentId, setOpeningAgentId] = useState<number | null>(null)
+  const [loading, setLoading] = useState(true)
+  const userMenuRef = useRef<HTMLDivElement>(null)
+  const openingAgentRef = useRef<number | null>(null)
 
-  // Search state
-  const [searchQuery, setSearchQuery] = useState("")
-  const searchRef = useRef("")
-  const [isSearchFocused, setIsSearchFocused] = useState(false)
-  const [isSearchVisible, setIsSearchVisible] = useState(false)
-
-  // Rename state
-  const [editingTaskId, setEditingTaskId] = useState<string | null>(null)
-  const [editingTitle, setEditingTitle] = useState("")
-
-  // Loading state ref for polling interval
-  const loadingRef = useRef({ isLoadingTasks, isLoadingMore })
-  loadingRef.current = { isLoadingTasks, isLoadingMore }
-
+  const workspaceVersion = useRef(0)
   useEffect(() => {
-    pathnameRef.current = pathname
-  }, [pathname])
-
-  useEffect(() => {
-    pageRef.current = page
-  }, [page])
-
-  useEffect(() => {
-    let isCancelled = false
-
-    const loadVersion = async () => {
-      try {
-        const response = await fetch(`${getApiUrl()}/api/system/version`, {
-          method: "GET",
-          cache: "no-store",
-        })
-
-        if (!response.ok) {
-          throw new Error(`Failed to load version: ${response.status}`)
-        }
-
-        const data = (await response.json()) as VersionInfo
-        if (!isCancelled) {
-          setVersionInfo({
-            version: data.version || "unknown",
-            display_version: data.display_version || "unknown",
-            commit: data.commit || "",
-            build_time: data.build_time || "",
-            latest_version: data.latest_version ?? null,
-            is_latest: data.is_latest ?? null,
-          })
-        }
-      } catch {
-        if (!isCancelled) {
-          setVersionInfo({
-            version: "unknown",
-            display_version: "unknown",
-            commit: "",
-            build_time: "",
-            latest_version: null,
-            is_latest: null,
-          })
+    const version = ++workspaceVersion.current
+    const current = () => version === workspaceVersion.current
+    setLoading(true)
+    setTaskPage(1)
+    setTasksHasNext(false)
+    loadingMoreTasksRef.current = false
+    setLoadingMoreTasks(false)
+    void (async () => {
+      const [agentResult, taskResult, templateResult] = await Promise.allSettled([
+        apiRequest(`${getApiUrl()}/api/agents`),
+        apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=${TASKS_PER_PAGE}`),
+        apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`),
+      ])
+      if (agentResult.status === "fulfilled" && agentResult.value.ok) {
+        const data = await agentResult.value.json().catch(() => [])
+        if (current()) setAgents(Array.isArray(data) ? data : [])
+      }
+      if (taskResult.status === "fulfilled" && taskResult.value.ok) {
+        const data = await taskResult.value.json().catch(() => ({ tasks: [] }))
+        if (current()) {
+          setTasks(Array.isArray(data) ? data : Array.isArray(data?.tasks) ? data.tasks : [])
+          setTasksHasNext(Boolean(data?.pagination?.has_next))
         }
       }
-    }
+      if (templateResult.status === "fulfilled" && templateResult.value.ok) {
+        const data: unknown = await templateResult.value.json().catch(() => [])
+        const nextTemplates: Record<string, Template> = {}
+        for (const template of Array.isArray(data) ? data : []) {
+          if (template && typeof template === "object" && "id" in template && typeof template.id === "string") {
+            nextTemplates[template.id] = template as Template
+          }
+        }
+        if (current()) setTemplatesById(nextTemplates)
+      }
+      if (current()) setLoading(false)
+    })()
+    return () => { workspaceVersion.current += 1 }
+  }, [locale, user?.id, state.lastTaskUpdate])
 
-    void loadVersion()
-
-    return () => {
-      isCancelled = true
+  const loadMoreTasks = async () => {
+    if (loadingMoreTasksRef.current || !tasksHasNext) return
+    const version = workspaceVersion.current
+    loadingMoreTasksRef.current = true
+    setLoadingMoreTasks(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=${taskPage + 1}&per_page=${TASKS_PER_PAGE}`)
+      if (!response.ok) throw new Error("Could not load conversations")
+      const data = await response.json()
+      if (!Array.isArray(data?.tasks)) throw new Error("Invalid conversations")
+      if (version !== workspaceVersion.current) return
+      setTasks((previous) => Array.from(new Map(
+        [...previous, ...data.tasks].map((task: Task) => [String(task.task_id), task]),
+      ).values()))
+      setTaskPage((page) => page + 1)
+      setTasksHasNext(Boolean(data.pagination?.has_next))
+    } catch {
+      if (version === workspaceVersion.current) toast.error(t("sidebar.search.failed"))
+    } finally {
+      if (version === workspaceVersion.current) {
+        loadingMoreTasksRef.current = false
+        setLoadingMoreTasks(false)
+      }
     }
-  }, [])
+  }
 
   useEffect(() => {
-    if (!isAboutOpen) return
-
-    const match = githubRepoDisplay.match(/^([^/]+)\/([^/]+)$/)
-    if (!match) {
-      setGithubStars(null)
+    if (!searchQuery) {
+      setSearching(false)
+      setSearchError(false)
+      setSearchResults({ query: "", agents: [], tasks: [], hasNext: false })
       return
     }
-
+    let current = true
     const controller = new AbortController()
-    const [, owner, repo] = match
-
-    const loadStars = async () => {
+    setSearching(true)
+    setSearchError(false)
+    const timer = setTimeout(async () => {
       try {
-        const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
-          method: "GET",
-          headers: { Accept: "application/vnd.github+json" },
-          signal: controller.signal,
+        const agentParams = new URLSearchParams({ search: searchQuery })
+        const taskParams = new URLSearchParams({
+          search: searchQuery, page: String(searchPage), per_page: String(TASKS_PER_PAGE),
         })
-        if (!response.ok) {
-          setGithubStars(null)
-          return
-        }
-        const data = (await response.json()) as { stargazers_count?: number }
-        setGithubStars(typeof data.stargazers_count === "number" ? data.stargazers_count : null)
+        const responses = await Promise.all([
+          apiRequest(`${getApiUrl()}/api/agents?${agentParams}`, { signal: controller.signal }),
+          apiRequest(`${getApiUrl()}/api/chat/tasks?${taskParams}`, { signal: controller.signal }),
+        ])
+        if (responses.some((response) => !response.ok)) throw new Error("Search failed")
+        const [matchedAgents, matchedTasks] = await Promise.all(responses.map((response) => response.json()))
+        if (!Array.isArray(matchedAgents) || !Array.isArray(matchedTasks?.tasks)) throw new Error("Invalid search results")
+        if (!current) return
+        setSearchResults((previous) => ({
+          query: searchQuery,
+          agents: matchedAgents,
+          tasks: searchPage > 1 && previous.query === searchQuery
+            ? Array.from(new Map([...previous.tasks, ...matchedTasks.tasks].map((task: Task) => [String(task.task_id), task])).values())
+            : matchedTasks.tasks,
+          hasNext: Boolean(matchedTasks.pagination?.has_next),
+        }))
       } catch {
-        if (!controller.signal.aborted) {
-          setGithubStars(null)
-        }
+        if (current) setSearchError(true)
+      } finally {
+        if (current) setSearching(false)
       }
-    }
-
-    void loadStars()
-
+    }, searchPage === 1 ? 250 : 0)
     return () => {
+      current = false
+      clearTimeout(timer)
       controller.abort()
     }
-  }, [githubRepoDisplay, isAboutOpen])
+  }, [searchQuery, searchPage, searchAttempt, state.lastTaskUpdate])
 
-  // Load task list
-  const loadTasks = useCallback(async (pageNum = 1, isAppending = false, isPolling = false) => {
-    if (isAppending) {
-      setIsLoadingMore(true)
-    } else if (!isPolling) {
-      setIsLoadingTasks(true)
+  const changeSearch = (value: string) => {
+    setSearch(value)
+    setSearchPage(1)
+  }
+
+  useEffect(() => {
+    const close = (event: MouseEvent | TouchEvent) => {
+      if (userMenuRef.current && !userMenuRef.current.contains(event.target as Node)) setUserMenuOpen(false)
     }
-
-    try {
-      const searchParam = searchRef.current ? `&search=${encodeURIComponent(searchRef.current)}` : ''
-      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=${pageNum}&per_page=${TASKS_PER_PAGE}${searchParam}`)
-      if (response.ok) {
-        const data = await response.json()
-        // Handle new API response format {tasks: [...], pagination: {...}}
-        const newTasks = data.tasks || (Array.isArray(data) ? data : [])
-
-        // Update task status ref and check for unread completed tasks
-        const currentUnreadUpdates = new Set<string>()
-        const match = pathnameRef.current.match(/^\/task\/([^/]+)\/?$/)
-        const currentTaskId = match ? match[1] : null
-
-        newTasks.forEach((task: Task) => {
-          const stringTaskId = String(task.task_id)
-          const prevStatus = taskStatusRef.current.get(stringTaskId)
-          // If task completed and wasn't completed before (and we have a previous record)
-          if (task.status === 'completed' && prevStatus && prevStatus !== 'completed') {
-            // Only mark as unread if we are not currently on this task page
-            if (String(currentTaskId) !== stringTaskId) {
-              currentUnreadUpdates.add(stringTaskId)
-            }
-          }
-          taskStatusRef.current.set(stringTaskId, task.status)
-        })
-
-        if (currentUnreadUpdates.size > 0) {
-          setUnreadTasks(prev => {
-            const next = new Set(prev)
-            currentUnreadUpdates.forEach(id => next.add(id))
-            return next
-          })
-        }
-
-        const totalPages = data.pagination?.total_pages || 1
-        const loadedPage = isPolling ? Math.min(pageRef.current, totalPages) : pageNum
-
-        if (isPolling) {
-          setTasks(prev => {
-            const newTaskIds = new Set(newTasks.map((t: Task) => String(t.task_id)))
-            const remainingTasks = prev
-              .slice(Math.min(TASKS_PER_PAGE, prev.length))
-              .filter(t => !newTaskIds.has(String(t.task_id)))
-
-            // Polling only refreshes page 1, so replace that slice and trim retained pages
-            // to the current loaded page when the server reports fewer total pages.
-            return [...newTasks, ...remainingTasks].slice(0, loadedPage * TASKS_PER_PAGE)
-          })
-        } else if (isAppending) {
-          setTasks(prev => [...prev, ...newTasks])
-        } else {
-          setTasks(newTasks)
-        }
-
-        // Update pagination status
-        if (isPolling) {
-          // Polling always refreshes page 1, so keep the user's loaded page state intact.
-          setHasMore(loadedPage < totalPages)
-
-          if (loadedPage !== pageRef.current) {
-            setPage(loadedPage)
-          }
-        } else {
-          setHasMore(pageNum < totalPages)
-          setPage(pageNum)
-        }
-      }
-    } catch (error) {
-      console.error('Failed to load tasks:', error)
-    } finally {
-      setIsLoadingTasks(false)
-      setIsLoadingMore(false)
+    document.addEventListener("mousedown", close)
+    document.addEventListener("touchstart", close)
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setUserMenuOpen(false)
+    }
+    document.addEventListener("keydown", closeOnEscape)
+    return () => {
+      document.removeEventListener("mousedown", close)
+      document.removeEventListener("touchstart", close)
+      document.removeEventListener("keydown", closeOnEscape)
     }
   }, [])
 
-  // Poll for task updates
-  useEffect(() => {
-    const interval = setInterval(() => {
-      // Only poll if window is visible and not already loading
-      if (document.visibilityState === 'visible' && !loadingRef.current.isLoadingTasks && !loadingRef.current.isLoadingMore) {
-        loadTasks(1, false, true)
+  const activeTaskId = pathname.match(/^\/task\/([^/]+)\/?$/)?.[1] ?? null
+  const isAgentBuilderPage = pathname === "/agent" || pathname.startsWith("/agent/new")
+  const shouldCollapse = allowCollapse && (isAgentBuilderPage || !sidebarOpen)
+
+  const latestTaskByAgent = useMemo(() => {
+    const map = new Map<number, Task>()
+    for (const task of tasks) {
+      if (!task.agent_id) continue
+      const existing = map.get(task.agent_id)
+      const activityAt = new Date(task.updated_at ?? task.created_at).getTime()
+      const existingActivityAt = existing ? new Date(existing.updated_at ?? existing.created_at).getTime() : Number.NEGATIVE_INFINITY
+      if (!existing || activityAt > existingActivityAt) map.set(task.agent_id, task)
+    }
+    return map
+  }, [tasks])
+
+  const agentsById = useMemo(
+    () => new Map(agents.map((agent) => [agent.id, agent])),
+    [agents],
+  )
+
+  const getAgentAvatar = useCallback((agent: AgentSummary): string | null => {
+    const uploadedLogo = resolveAgentLogoUrl(agent.logo_url ?? null, getApiUrl())
+    if (uploadedLogo) return uploadedLogo
+    const template = agent.template_id ? templatesById[agent.template_id] : undefined
+    return template?.persona?.avatar ?? null
+  }, [templatesById])
+
+  const getAgentCategory = useCallback((agent: AgentSummary) => {
+    const template = agent.template_id ? templatesById[agent.template_id] : undefined
+    return categoryLabel(t, template?.category ?? "general")
+  }, [t, templatesById])
+
+  const openFirstConversation = useCallback(async (agent: AgentSummary) => {
+    const template = agent.template_id ? templatesById[agent.template_id] : undefined
+    if (openingAgentRef.current !== null) return
+
+    openingAgentRef.current = agent.id
+    setOpeningAgentId(agent.id)
+    try {
+      // The sidebar only loads a page of recent tasks. A missing task there
+      // does not mean this teammate has never chatted. Resolve server-side
+      // before creating an intro, including when an older chat was resumed.
+      const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?agent_id=${agent.id}&page=1&per_page=1`)
+      if (!response.ok) throw new Error("Could not load teammate conversations")
+      const data = await response.json()
+      if (!Array.isArray(data?.tasks)) throw new Error("Invalid teammate conversations")
+      const latest = data.tasks[0] as Task | undefined
+      if (latest) {
+        router.push(`/task/${latest.task_id}`)
+        return
       }
-    }, 30000) // Poll every 30 seconds
-
-    return () => clearInterval(interval)
-  }, [loadTasks])
-
-  // Clear unread status when entering a task page
-  useEffect(() => {
-    const currentTaskId = getCurrentTaskId()
-    if (currentTaskId) {
-      setUnreadTasks(prev => {
-        if (!prev.has(String(currentTaskId))) return prev
-
-        const next = new Set(prev)
-        next.delete(String(currentTaskId))
-        return next
+      if (!template?.persona) {
+        router.push(getAgentTaskHref(agent.id))
+        return
+      }
+      const result = await createSeededAgentTask({
+        agentId: agent.id,
+        persona: template.persona,
+        connections: template.connections,
+        strings: {
+          beforeWeStart: t("templates.marketplace.beforeWeStart"),
+          closingNote: t("templates.marketplace.hireClosingNote"),
+          connectAppsLabel: t("chatPage.clarification.connectApps.title"),
+        },
       })
+      const fullTitle = template.persona.role
+        ? `${template.persona.name} — ${template.persona.role}`
+        : template.persona.name
+      const title = fullTitle.length > 50 ? `${fullTitle.slice(0, 50)}...` : fullTitle
+      const createdAt = new Date().toISOString()
+      setTasks((current) => [{
+        task_id: result.taskId,
+        title,
+        status: "pending",
+        created_at: createdAt,
+        updated_at: createdAt,
+        agent_id: agent.id,
+        agent_name: agent.name,
+        agent_logo_url: agent.logo_url ?? undefined,
+      }, ...current])
+      router.push(`/task/${result.taskId}`)
+    } catch {
+      toast.error(t("chatPage.page.startConversationFailed"))
+    } finally {
+      openingAgentRef.current = null
+      setOpeningAgentId(null)
     }
-  }, [pathname, getCurrentTaskId])
+  }, [router, t, templatesById])
 
-  // Monitor task list changes, if content is not enough to fill the container and there is more data, automatically load the next page
-  useEffect(() => {
-    if (!contentScrollRef.current || !isHistoryExpanded) return
+  const hasSearchResults = searchResults.query === searchQuery
+  const visibleAgents = (searchQuery ? hasSearchResults ? searchResults.agents : [] : agents)
+    .filter((agent) => agent.status === "published")
+  const visibleTasks = searchQuery ? hasSearchResults ? searchResults.tasks : [] : tasks
 
-    const { scrollHeight, clientHeight } = contentScrollRef.current
-    const isVisible = contentScrollRef.current.getClientRects().length > 0
-    if (!isVisible || clientHeight <= 0) return
-
-    // If content height is less than or equal to container height (plus a buffer), and there is more data, and not loading
-    if (scrollHeight <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
-      // Use setTimeout to avoid continuous state updates in one render cycle
-      const timer = setTimeout(() => {
-        loadTasks(page + 1, true)
-      }, 100)
-      return () => clearTimeout(timer)
-    }
-    // groupCollapseOverrides and pathname aren't read above — they're re-measure triggers:
-    // toggling a group, or navigating to/from a route that auto-expands/collapses a group,
-    // changes contentScrollRef's scrollHeight, so this effect must re-run to re-check the fill.
-  }, [tasks, hasMore, isLoadingMore, isLoadingTasks, page, loadTasks, isHistoryExpanded, groupCollapseOverrides, pathname])
-
-  useEffect(() => {
-    if (isHistoryExpanded) {
-      loadTasks(1, false)
-    }
-  }, [isHistoryExpanded, loadTasks, state.lastTaskUpdate])
-
-  // Debounce search query
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      if (searchRef.current !== searchQuery) {
-        searchRef.current = searchQuery
-
-        // Auto-expand when searching
-        if (searchQuery && !isHistoryExpanded) {
-          setIsHistoryExpanded(true)
-        } else if (isHistoryExpanded) {
-          loadTasks(1, false)
-        }
-      }
-    }, 500)
-    return () => clearTimeout(timer)
-  }, [searchQuery, loadTasks, isHistoryExpanded])
-
-  const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
-    if (!isHistoryExpanded) return
-
-    const { scrollTop, scrollHeight, clientHeight } = e.currentTarget
-    if (clientHeight <= 0) return
-
-    if (scrollHeight - scrollTop <= clientHeight + 20 && hasMore && !isLoadingMore && !isLoadingTasks) {
-      loadTasks(page + 1, true)
-    }
-  }
-
-  // Sidebar is hidden by default on Agent pages, but kept visible on Vibe and Build pages, and shown on other pages
-  // For agent pages, sidebar is only shown when isExpanded is true
-  // Build page no longer automatically hides
-  // /agent/[id] page does not auto-collapse (for agent chat)
-  const isAgentChatPage = pathname.match(/^\/agent\/\d+$/)
-  const isAgentPage = (pathname.startsWith('/agent') && !pathname.startsWith('/agent/vibe') && !isAgentChatPage)
-  const shouldShowSidebar = !isAgentPage || isExpanded || !allowCollapse
-
-  // Allow user to manually collapse the sidebar
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true)
-
-  // When in collapsible state and expanded, click outside sidebar to automatically collapse
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent | TouchEvent) => {
-      if (!sidebarRef.current) return
-      // Only process when in collapsible page and currently expanded
-      if (isAgentPage && shouldShowSidebar && isExpanded) {
-        if (!sidebarRef.current.contains(event.target as Node)) {
-          setIsExpanded(false)
-        }
-      }
-    }
-
-    document.addEventListener('mousedown', handleClickOutside)
-    document.addEventListener('touchstart', handleClickOutside)
-
-    return () => {
-      document.removeEventListener('mousedown', handleClickOutside)
-      document.removeEventListener('touchstart', handleClickOutside)
-    }
-  }, [isAgentPage, shouldShowSidebar, isExpanded])
-
-  const toggleMenu = (menuName: string) => {
-    setExpandedMenus(prev =>
-      prev.includes(menuName)
-        ? prev.filter(name => name !== menuName)
-        : [...prev, menuName]
-    )
-  }
-
-  const isMenuExpanded = (menuName: string) => {
-    return expandedMenus.includes(menuName)
-  }
-
-  const isPathActive = (href: string) => {
-    if (href === "/") {
-      return pathname === "/"
-    }
-    return pathname === href || pathname.startsWith(`${href}/`)
-  }
-
-  const isItemActive = (item: NavigationItem) => {
-    if (item.children?.length) {
-      return item.children.some((child: NavigationItem) => isPathActive(child.href))
-    }
-    return isPathActive(item.href)
-  }
-
-  if (allowCollapse && ((isAgentPage && !shouldShowSidebar) || !isSidebarOpen)) {
+  if (shouldCollapse) {
     return (
-      <div className="flex flex-col items-center justify-start py-3 w-[54px] bg-secondary border-r border-border shrink-0 h-full relative">
-        <Link href="/task" className="flex items-center justify-center mb-6">
-          <img
-            src={branding.logoPath}
-            alt={branding.logoAlt}
-            className="h-7 w-7 rounded-lg"
-          />
+      <aside className={cn("relative flex h-full w-[58px] shrink-0 flex-col items-center border-r border-border bg-[#f8f8fa] py-3", className)}>
+        <Link href="/task" className="grid h-9 w-9 place-items-center rounded-xl hover:bg-white">
+          <Image src={branding.logoPath} alt={branding.logoAlt} width={28} height={28} className="h-7 w-7 rounded-lg object-contain" />
         </Link>
-        <button
-          onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-          className="absolute -right-3 top-5 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
-        >
-          <ChevronRight className="h-4 w-4" />
-        </button>
-        <div className="flex flex-col gap-1 w-full px-1.5">
-          {navigationGroups.map((group) => (
-            group.items.map((item: NavigationItem) => {
-              const isActive = isItemActive(item)
-              const hasChildren = item.children && item.children.length > 0
-
-              if (hasChildren) {
-                return (
-                  <button
-                    key={item.name}
-                    type="button"
-                    title={item.nameKey ? t(item.nameKey) : item.name}
-                    onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-                    className={cn(
-                      "flex w-full items-center justify-center p-2 rounded-[7px] transition-colors",
-                      isActive ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground hover:bg-accent hover:text-foreground"
-                    )}
-                  >
-                    <item.icon className="h-4 w-4" />
-                  </button>
-                )
-              }
-
-              return (
-                <Link
-                  key={item.name}
-                  href={item.href}
-                  title={item.nameKey ? t(item.nameKey) : item.name}
-                  className={cn(
-                    "flex items-center justify-center p-2 rounded-[7px] transition-colors",
-                    isActive ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground hover:bg-accent hover:text-foreground"
-                  )}
-                >
-                  <item.icon className="h-4 w-4" />
-                </Link>
-              )
-            })
-          ))}
+        <button onClick={() => setSidebarOpen(true)} className="mt-3 grid h-9 w-9 place-items-center rounded-xl text-muted-foreground hover:bg-white hover:text-foreground" aria-label="Open navigation"><ChevronRight className="h-4 w-4" /></button>
+        <div className="mt-auto">
+          <button onClick={() => setSidebarOpen(true)} aria-label={profileLabel} title={profileLabel} className="grid h-9 w-9 place-items-center rounded-full bg-[#2536e0] text-xs font-semibold uppercase text-white">{userLabel.charAt(0)}</button>
         </div>
-        <div className="mt-auto w-full px-1.5 border-t border-border pt-3">
-          <button
-            onClick={() => isAgentPage ? setIsExpanded(true) : setIsSidebarOpen(true)}
-            className="flex items-center justify-center w-full p-2 hover:bg-accent rounded-[7px] transition-colors"
-            aria-label={profileLabel}
-            title={profileLabel}
-          >
-            <div className="h-7 w-7 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
-              {userLabel.charAt(0)}
-            </div>
-          </button>
-        </div>
-      </div>
+      </aside>
     )
   }
 
   return (
-    <div ref={sidebarRef} className={cn(
-      "flex flex-col bg-secondary border-r border-border transition-all duration-300 shrink-0",
-      isAgentPage ? "h-full" : "h-full",
-      shouldShowSidebar ? "w-60" : "w-0",
-      className
-    )}>
-      {/* Logo */}
-      <div className="flex h-[90px] items-center justify-between px-4 relative">
-        <Link href="/" className="flex items-center gap-2.5">
-          <img
-            src={branding.logoPath}
-            alt={branding.logoAlt}
-            className="h-12 w-12 rounded-lg"
-          />
-          <h1 className="text-[32px] font-bold tracking-tight" style={{ color: "#2745A6" }}>{branding.appName}</h1>
-        </Link>
-        {allowCollapse && (
-          <button
-            onClick={() => isAgentPage ? setIsExpanded(false) : setIsSidebarOpen(false)}
-            className="absolute -right-3 top-4 bg-card border border-border rounded-full p-0.5 text-muted-foreground hover:text-foreground hover:bg-muted transition-colors z-50 shadow-sm"
-          >
-            <ChevronLeft className="h-4 w-4" />
-          </button>
-        )}
-      </div>
-
-      {/* Navigation */}
-      <div
-        ref={contentScrollRef}
-        onScroll={handleScroll}
-        className="flex-1 flex flex-col min-h-0 overflow-y-auto px-[10px]"
-      >
-        {/* Sticky Navigation Groups */}
-        <nav
-          className="z-10 bg-transparent py-1"
-        >
-          {/* Groups */}
-          {navigationGroups.map((group, groupIndex) => {
-            // Groups without a stable `id` (e.g. extra-nav overlays) fall back to `title` —
-            // matches the pre-`id` behavior for anything that hasn't opted in yet.
-            const groupKey = group.id ?? group.title
-            // An active route overrides only the *default* collapsed state, so the current
-            // page is never hidden inside a collapsed group on first load — but an explicit
-            // user toggle always wins over that, so the group can still be collapsed manually.
-            const isGroupCollapsed = groupKey in groupCollapseOverrides
-              ? groupCollapseOverrides[groupKey]
-              : !!group.defaultCollapsed && !group.items.some(isItemActive)
-            return (
-              <div key={groupKey} className={cn("mb-4", groupIndex === 0 && "mt-0")}>
-                <button
-                  type="button"
-                  aria-expanded={!isGroupCollapsed}
-                  className="w-full px-2 py-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between text-left cursor-pointer select-none rounded transition-colors hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  onClick={() => toggleGroupCollapse(groupKey, isGroupCollapsed)}
-                >
-                  <span>{group.titleKey ? t(group.titleKey) : group.title}</span>
-                  {isGroupCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-                </button>
-                {!isGroupCollapsed && (
-                  <div className="space-y-0.5">
-                    {group.items.map((item: NavigationItem) => {
-                      const isActive = isItemActive(item)
-                      const hasChildren = item.children && item.children.length > 0
-                      const isExpanded = isMenuExpanded(item.href)
-
-                      const activeStyle = "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))] font-semibold rounded-[7px]"
-                      const inactiveStyle = "text-muted-foreground hover:bg-accent hover:text-foreground rounded-[7px]"
-
-                      if (hasChildren) {
-                        return (
-                          <Popover key={item.name} open={isExpanded} onOpenChange={() => toggleMenu(item.href)}>
-                            <PopoverTrigger asChild>
-                              <button
-                                className={cn(
-                                  "group flex items-center justify-between px-2.5 py-2 text-[13.5px] transition-colors relative w-full",
-                                  isActive ? activeStyle : inactiveStyle
-                                )}
-                              >
-                                <div className="flex items-center gap-2.5">
-                                  <item.icon className={cn("h-4 w-4", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
-                                  {item.nameKey ? t(item.nameKey) : item.name}
-                                </div>
-                                <ChevronRight className="h-3 w-3 opacity-50" />
-                              </button>
-                            </PopoverTrigger>
-                            {item.children && (
-                              <PopoverContent
-                                side="right"
-                                align="start"
-                                sideOffset={8}
-                                className="w-56 rounded-xl border border-border bg-popover p-2 shadow-lg"
-                              >
-                                <div className="space-y-0.5">
-                                  {item.children.map((child: NavigationItem) => {
-                                    const isChildActive = pathname === child.href
-                                    return (
-                                      <Link
-                                        key={child.href}
-                                        href={child.href}
-                                        onClick={() => toggleMenu(item.href)}
-                                        className={cn(
-                                          "flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13.5px] font-medium transition-colors",
-                                          isChildActive
-                                            ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
-                                            : "text-foreground hover:bg-accent"
-                                        )}
-                                      >
-                                        <child.icon className="h-4 w-4 text-muted-foreground" />
-                                        {child.nameKey ? t(child.nameKey) : child.name}
-                                      </Link>
-                                    )
-                                  })}
-                                </div>
-                              </PopoverContent>
-                            )}
-                          </Popover>
-                        )
-                      }
-
-                      return (
-                        <Link
-                          key={item.name}
-                          href={item.href}
-                          className={cn(
-                            "group flex items-center px-2.5 py-2 text-[13.5px] font-medium transition-colors",
-                            isActive ? activeStyle : inactiveStyle
-                          )}
-                        >
-                          <item.icon className={cn("h-4 w-4 mr-2.5", isActive ? "text-[hsl(var(--sidebar-active-text))]" : "text-muted-foreground")} />
-                          {item.nameKey ? t(item.nameKey) : item.name}
-                        </Link>
-                      )
-                    })}
-                  </div>
-                )}
-              </div>
-            )
-          })}
-        </nav>
-
-        {/* History Section */}
-        <div className="flex flex-col overflow-hidden shrink-0 border-t border-border pt-1 pb-4">
-          <div
-            className="px-2 pt-4 pb-1.5 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] flex items-center justify-between h-8 shrink-0"
-          >
-            {(isSearchVisible || isSearchFocused || searchQuery) ? (
-              <div className="flex-1 relative mr-2 h-full flex items-center">
-                <SearchInput
-                  placeholder={t('nav.search')}
-                  value={searchQuery}
-                  onChange={setSearchQuery}
-                  onFocus={() => setIsSearchFocused(true)}
-                  onBlur={() => {
-                    setIsSearchFocused(false)
-                    setIsSearchVisible(false)
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Escape') {
-                      setSearchQuery('')
-                      setIsSearchVisible(false)
-                      setIsSearchFocused(false)
-                      e.currentTarget.blur()
-                    }
-                  }}
-                  containerClassName="w-full h-7"
-                  className="h-7 text-[12px] text-foreground bg-transparent border-border focus:border-primary [&::-webkit-search-cancel-button]:hidden"
-                  autoFocus
-                />
-                <button
-                  className={cn(
-                    "absolute right-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 p-1 rounded-full transition-colors",
-                    !searchQuery && "opacity-0 pointer-events-none"
-                  )}
-                  onMouseDown={(e) => {
-                    // Prevent the default behavior to avoid triggering the input’s blur event
-                    e.preventDefault()
-                  }}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    setSearchQuery('')
-                    setIsSearchVisible(false)
-                    setIsSearchFocused(false)
-                  }}
-                >
-                  <X className="h-3 w-3" />
-                </button>
-              </div>
-            ) : (
-              <div className="flex-1 flex items-center min-w-0 mr-2">
-                <span className="truncate">{t('nav.history')}</span>
-                <div
-                  className="cursor-pointer p-1 hover:bg-accent rounded transition-colors text-muted-foreground hover:text-foreground flex-shrink-0"
-                  onClick={() => setIsSearchVisible(true)}
-                >
-                  <Search className="h-3 w-3" />
-                </div>
-              </div>
-            )}
-            <div
-              className="cursor-pointer p-1 -mr-1 hover:bg-accent rounded transition-colors ml-1"
-              onClick={() => setIsHistoryExpanded(!isHistoryExpanded)}
-            >
-              {isHistoryExpanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-            </div>
-          </div>
-
-          {isHistoryExpanded && (
-            <div
-              className="space-y-1"
-            >
-              {isLoadingTasks ? (
-                <div className="flex items-center justify-center py-4">
-                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-                </div>
-              ) : tasks.length > 0 ? (
-                <>
-                  {tasks.map(task => {
-                    const currentTaskId = getCurrentTaskId();
-                    const compactChannelName = task.channel_name
-                      ? getCompactChannelName(task.channel_name, task.channel_type)
-                      : null
-                    return (
-                      <Link
-                        key={task.task_id}
-                        href={`/task/${task.task_id}`}
-                        title={task.title}
-                        className={cn(
-                          "group flex items-center px-2.5 py-[5px] text-[12.5px] font-medium transition-colors truncate relative pr-8 rounded-[7px]",
-                          String(currentTaskId) === String(task.task_id)
-                            ? "bg-primary/[0.09] text-[hsl(var(--sidebar-active-text))]"
-                            : "text-muted-foreground hover:bg-accent hover:text-foreground"
-                        )}
-                      >
-                        <div className="relative h-4 w-4 mr-3 flex-shrink-0">
-                          {task.agent_id && task.agent_logo_url ? (
-                            <img
-                              src={`${getApiUrl()}${task.agent_logo_url}`}
-                              alt="Agent Logo"
-                              className="h-4 w-4 absolute inset-0 transition-opacity duration-200 group-hover:opacity-0 rounded-full object-cover"
-                            />
-                          ) : (
-                            <MessageSquare className={cn(
-                              "h-4 w-4 absolute inset-0 transition-opacity duration-200 group-hover:opacity-0",
-                              String(currentTaskId) === String(task.task_id) ? "text-accent-foreground" : "text-gray-500"
-                            )} />
-                          )}
-                          <div className="absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex items-center justify-center">
-                            {task.status === 'running' && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
-                            {task.status === 'completed' && <CheckCircle2 className="h-4 w-4 text-green-500" />}
-                            {task.status === 'failed' && <XCircle className="h-4 w-4 text-red-500" />}
-                            {(task.status === 'paused' || task.status === 'waiting_for_user') && <PauseCircle className="h-4 w-4 text-yellow-500" />}
-                            {task.status === 'pending' && <Loader2 className="h-4 w-4 animate-spin text-gray-400" />}
-                          </div>
-                        </div>
-                        {editingTaskId === String(task.task_id) ? (
-                          <div className="flex-1 mr-2" onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
-                            <input
-                              type="text"
-                              value={editingTitle}
-                              onChange={(e) => setEditingTitle(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter') submitRename(String(task.task_id));
-                                if (e.key === 'Escape') cancelRename();
-                              }}
-                              onBlur={() => submitRename(String(task.task_id))}
-                              autoFocus
-                              className="w-full bg-transparent border-b border-primary outline-none text-sm text-foreground"
-                            />
-                          </div>
-                        ) : (
-                          <span className="truncate flex-1 text-left flex items-center gap-2">
-                            <span className="truncate">{task.title || "Untitled Task"}</span>
-                            {task.channel_name && compactChannelName && (
-                              <span
-                                className="inline-flex max-w-[88px] flex-shrink-0 items-center gap-1 rounded border border-border/50 bg-accent/50 px-1.5 text-[10px] text-muted-foreground"
-                                title={getChannelTooltip(task.channel_name, task.channel_type)}
-                                aria-label={getChannelTooltip(task.channel_name, task.channel_type)}
-                              >
-                                <ChannelTypeIcon channelType={task.channel_type} />
-                                <span className="truncate">{compactChannelName}</span>
-                              </span>
-                            )}
-                          </span>
-                        )}
-                        {unreadTasks.has(String(task.task_id)) && (
-                          <div className="absolute right-4 top-1/2 -translate-y-1/2 h-2 w-2 rounded-full bg-primary group-hover:opacity-0 transition-opacity" />
-                        )}
-                        <div className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity" onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
-                          <Popover>
-                            <PopoverTrigger asChild>
-                              <MoreHorizontal className="text-muted-foreground/60 h-4 w-4 hover:text-foreground" />
-                            </PopoverTrigger>
-                            <PopoverContent align="end" className="w-32 p-1" onClick={(e) => { e.preventDefault(); e.stopPropagation(); }}>
-                              <div className="flex flex-col">
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    startRenaming(task);
-                                  }}
-                                  className="flex w-full items-center px-2 py-1.5 text-sm hover:bg-accent rounded-sm transition-colors text-left"
-                                >
-                                  <Edit2 className="h-3.5 w-3.5 mr-2" />
-                                  {t('common.rename')}
-                                </button>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    deleteTask(String(task.task_id), e);
-                                  }}
-                                  className="flex w-full items-center px-2 py-1.5 text-sm text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 rounded-sm transition-colors text-left"
-                                >
-                                  <Trash2 className="h-3.5 w-3.5 mr-2" />
-                                  {t('common.delete')}
-                                </button>
-                              </div>
-                            </PopoverContent>
-                          </Popover>
-                        </div>
-                      </Link>
-                    )
-                  })}
-                  {isLoadingMore && (
-                    <div className="flex items-center justify-center py-2">
-                      <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="px-4 py-2 text-sm text-muted-foreground">
-                  {t('common.noData')}
-                </div>
-              )}
-            </div>
-          )}
+    <>
+      <aside className={cn("flex h-full w-[270px] shrink-0 flex-col border-r border-[#ececf1] bg-[#f8f8fa] text-[#1a1a1f]", className)}>
+        <div className="flex h-14 items-center gap-1 px-3">
+          <Link href="/task" className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-2 py-1.5 hover:bg-white">
+            <Image src={branding.logoPath} alt={branding.logoAlt} width={24} height={24} className="h-6 w-6 rounded-md object-contain" />
+            <span className="truncate text-sm font-bold tracking-tight">{branding.appName}</span>
+          </Link>
+          <Popover open={startOpen} onOpenChange={setStartOpen}>
+            <PopoverTrigger asChild>
+              <button aria-label="Start something new" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-[#2536e0]"><Plus className="h-4 w-4" /></button>
+            </PopoverTrigger>
+            <PopoverContent align="end" sideOffset={8} className="w-56 rounded-2xl p-1.5 shadow-xl">
+              <button onClick={() => { setStartOpen(false); router.push("/task") }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-accent"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#eef1fe] text-[#2536e0]"><Sparkles className="h-4 w-4" /></span><b className="text-sm font-semibold">New task</b><ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" /></button>
+              <div className="my-1 h-px bg-border" />
+              <button onClick={() => { setStartOpen(false); setPickerOpen(true) }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-accent"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#f4efff] text-[#7657d8]"><Bot className="h-4 w-4" /></span><b className="text-sm font-semibold">Add a teammate</b><ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" /></button>
+            </PopoverContent>
+          </Popover>
+          {allowCollapse && <button onClick={() => setSidebarOpen(false)} aria-label="Close navigation" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-foreground"><ChevronLeft className="h-4 w-4" /></button>}
         </div>
-      </div>
 
-      {/* User Profile */}
-      <div className="px-[10px] py-3 border-t border-border relative mt-auto shrink-0" ref={userMenuRef}>
-        {showUserMenu && (
-          <div className="absolute bottom-full left-4 right-4 mb-2 bg-popover border border-border rounded-lg shadow-lg overflow-hidden animate-in fade-in zoom-in-95 duration-200 z-50">
-            <div className="py-1">
-              {getUserMenuItemsForUser(user).map((item: NavigationItem) => (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className="flex items-center px-4 py-2 text-sm text-foreground hover:bg-accent transition-colors"
-                  onClick={() => setShowUserMenu(false)}
-                >
-                  <item.icon className="h-4 w-4 mr-3 text-muted-foreground" />
-                  {item.nameKey ? t(item.nameKey) : item.name}
-                </Link>
-              ))}
-              <button
-                onClick={() => {
-                  setShowUserMenu(false)
-                  setIsAboutOpen(true)
-                }}
-                className="flex w-full items-center px-4 py-2 text-sm text-foreground hover:bg-accent transition-colors text-left"
-              >
-                <Info className="h-4 w-4 mr-3 text-muted-foreground" />
-                {t("sidebar.about.menu")}
-              </button>
-              <div className="h-px bg-border my-1 mx-2" />
-              <button
-                onClick={() => {
-                  void (async () => {
-                    const loggedOut = await logout()
-                    if (loggedOut) setShowUserMenu(false)
-                    else toast.error(t("sidebar.user.logoutFailed"))
-                  })()
-                }}
-                className="flex w-full items-center px-4 py-2 text-sm hover:bg-red-50 dark:hover:bg-red-900/10 transition-colors text-left"
-              >
-                <LogOut className="h-4 w-4 mr-3" />
-                {t('sidebar.user.logoutTitle')}
-              </button>
-            </div>
+        <div className="px-3 pb-2">
+          <label className="relative block">
+            <span className="sr-only">Search your team and conversations</span>
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input value={search} onChange={(event) => changeSearch(event.target.value)} type="search" placeholder="Search teammates and messages" className="h-9 w-full rounded-xl border border-[#e7e7ec] bg-white pl-9 pr-8 text-xs outline-none transition-shadow placeholder:text-[#9a9aa5] focus:border-[#b9c1f7] focus:ring-4 focus:ring-[#2536e0]/[0.07] [&::-webkit-search-cancel-button]:appearance-none" />
+            {search && <button onClick={() => changeSearch("")} aria-label="Clear search" className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground hover:bg-accent"><X className="h-3 w-3" /></button>}
+          </label>
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col px-2.5">
+          <div className="flex items-center px-2 pb-2 pt-2">
+            <h2 className="flex-1 text-[10.5px] font-bold uppercase tracking-[0.08em] text-[#6b6b76]">{view === "team" ? "Your team" : "Recent"}</h2>
+            <button onClick={() => router.push("/workforces?view=teammates")} aria-label="Manage my team" title="Manage my team" className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-[#2536e0]"><Settings2 className="h-3.5 w-3.5" /></button>
+            <button onClick={() => setView(view === "team" ? "recent" : "team")} aria-label={view === "team" ? "Show recent conversations" : "Show my team"} className="ml-1 inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium text-muted-foreground hover:bg-white hover:text-foreground">{view === "team" ? <Clock3 className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}{view === "team" ? "Recent" : "Team"}</button>
           </div>
-        )}
-        <button
-          onClick={() => setShowUserMenu(!showUserMenu)}
-          className="flex w-full items-center gap-2.5 hover:bg-accent px-2 py-2 rounded-[7px] transition-colors text-left"
-        >
-          <div className="h-8 w-8 rounded-full bg-primary flex items-center justify-center text-xs font-semibold text-white uppercase shrink-0">
-            {userLabel.charAt(0)}
-          </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-[13px] font-semibold text-foreground truncate">{userLabel}</p>
-            {subtitle && (
-              <p className="text-[11px] text-muted-foreground truncate">{subtitle}</p>
+
+          <div className="min-h-0 flex-1 overflow-y-auto pb-3 [scrollbar-width:thin]">
+            {(searchQuery ? searching && searchPage === 1 : loading) ? <div role="status" aria-label={t("common.loading")} className="grid place-items-center py-10"><Loader2 className="h-4 w-4 animate-spin text-muted-foreground" /></div> : <>
+            {searchQuery && searchError && <div role="alert" className="px-3 py-4 text-center text-xs text-muted-foreground"><p>{t("sidebar.search.failed")}</p><button onClick={() => setSearchAttempt((attempt) => attempt + 1)} className="mt-2 text-primary">{t("common.retry")}</button></div>}
+            {(view === "team" || searchQuery) && (
+              <div className="space-y-0.5">
+                {searchQuery && visibleAgents.length > 0 && <p className="px-3 py-2 text-xs text-muted-foreground">{t("teamPage.tabs.teammates")}</p>}
+                {visibleAgents.map((agent) => {
+                  const task = latestTaskByAgent.get(agent.id)
+                  const presence = taskPresence(task?.status)
+                  const active = String(task?.task_id) === activeTaskId
+                  const destination = task ? `/task/${task.task_id}` : getAgentTaskHref(agent.id)
+                  const isOpening = openingAgentId === agent.id
+                  return (
+                    <Link
+                      key={agent.id}
+                      href={destination}
+                      aria-busy={isOpening || undefined}
+                      onClick={(event) => {
+                        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return
+                        event.preventDefault()
+                        void openFirstConversation(agent)
+                      }}
+                      className={cn("group flex items-start gap-2.5 rounded-xl px-2.5 py-2 transition-colors", active ? "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]" : "hover:bg-[#f0f0f3]", isOpening && "pointer-events-none opacity-70")}
+                    >
+                      <span className={cn("relative mt-0.5 rounded-full ring-1 ring-offset-2 ring-offset-[#f8f8fa]", presence.ring)}>
+                        <PersonaAvatar persona={{ name: agent.name, avatar: getAgentAvatar(agent) }} sizeClassName="h-8 w-8" textClassName="text-[11px]" decorative />
+                        <i className={cn("absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#f8f8fa]", presence.dot)} />
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-baseline gap-1.5"><b className="max-w-[48%] shrink-0 truncate text-[13px] font-semibold">{agent.name}</b><small className="min-w-0 truncate text-[10.5px] text-muted-foreground">{getAgentCategory(agent)}</small>{isOpening ? <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-muted-foreground" /> : task && <time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.updated_at ?? task.created_at)}</time>}</span>
+                        <span className="mt-0.5 block truncate text-[11.5px] leading-4 text-muted-foreground">{task?.title || "Just joined — ready for your first job"}</span>
+                      </span>
+                    </Link>
+                  )
+                })}
+              </div>
             )}
+            {(view === "recent" || searchQuery) && (
+              <div className="space-y-0.5">
+                {searchQuery && visibleTasks.length > 0 && <p className="px-3 py-2 text-xs text-muted-foreground">{t("sidebar.search.conversations")}</p>}
+                {visibleTasks.map((task) => {
+                  const active = String(task.task_id) === activeTaskId
+                  const compactChannelName = task.channel_name ? getCompactChannelName(task.channel_name, task.channel_type) : null
+                  const taskAgent = task.agent_id ? agentsById.get(task.agent_id) : undefined
+                  const taskAvatar = task.agent_logo_url
+                    ? resolveAgentLogoUrl(task.agent_logo_url, getApiUrl())
+                    : taskAgent
+                      ? getAgentAvatar(taskAgent)
+                      : branding.logoPath
+                  return (
+                    <Link key={task.task_id} href={`/task/${task.task_id}`} className={cn("flex items-start gap-2.5 rounded-xl px-2.5 py-2 hover:bg-[#f0f0f3]", active && "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]")}>
+                      <PersonaAvatar persona={{ name: task.agent_name || branding.appName, avatar: taskAvatar }} sizeClassName="h-7 w-7" textClassName="text-[10px]" decorative />
+                      <span className="min-w-0 flex-1"><span className="flex items-center gap-2"><b className="truncate text-xs font-semibold">{task.title || "Untitled task"}</b><time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.created_at)}</time></span><span className="mt-0.5 flex items-center gap-1.5 truncate text-[10.5px] text-muted-foreground">{task.agent_name || branding.appName}{compactChannelName && <span title={getChannelTooltip(task.channel_name!, task.channel_type)} className="inline-flex items-center gap-1 rounded border border-border px-1"><ChannelTypeIcon channelType={task.channel_type} />{compactChannelName}</span>}</span></span>
+                    </Link>
+                  )
+                })}
+                {!searchQuery && visibleTasks.length === 0 && <p className="px-3 py-8 text-center text-xs text-muted-foreground">No conversations yet.</p>}
+                {!searchQuery && tasksHasNext && <button disabled={loadingMoreTasks} onClick={() => void loadMoreTasks()} className="w-full px-3 py-3 text-xs text-primary disabled:opacity-50">{loadingMoreTasks ? t("common.loading") : t("sidebar.search.loadMore")}</button>}
+                {searchQuery && hasSearchResults && searchResults.hasNext && !searchError && <button disabled={searching} onClick={() => setSearchPage((page) => page + 1)} className="w-full px-3 py-3 text-xs text-primary disabled:opacity-50">{searching ? t("common.loading") : t("sidebar.search.loadMore")}</button>}
+              </div>
+            )}
+            {searchQuery && !searchError && !searching && hasSearchResults && visibleAgents.length === 0 && visibleTasks.length === 0 && <p role="status" className="px-3 py-8 text-center text-xs text-muted-foreground">{t("sidebar.search.empty")}</p>}
+            </>}
           </div>
-          <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-        </button>
-      </div>
+        </div>
 
-      <Dialog open={isAboutOpen} onOpenChange={setIsAboutOpen}>
-        <DialogContent className="w-[min(760px,calc(100%-2rem))] max-w-none p-0 overflow-hidden">
-          <DialogTitle className="sr-only">{t("sidebar.about.title")}</DialogTitle>
-          <div className="grid grid-cols-10 min-h-[240px]">
-            <div className="col-span-3 border-r border-border flex flex-col items-center justify-center px-6 py-8 text-center">
-              <img
-                src={branding.logoPath}
-                alt={branding.logoAlt}
-                className="h-14 w-14"
-              />
-              <div className="mt-3 text-base font-medium text-foreground">{branding.appName}</div>
-            </div>
-            <div className="col-span-7 px-8 py-8 flex flex-col justify-center gap-4">
-              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
-                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
-                  <Tag className="h-4 w-4" />
-                </span>
-                <span className="inline-flex max-w-full items-center gap-1.5 whitespace-nowrap leading-7">
-                  <span>{t("sidebar.about.version")}: {displayVersion}</span>
-                  <span
-                    className={cn(
-                      "inline-block h-2 w-2 rounded-full",
-                      versionInfo?.is_latest === true
-                        ? "bg-green-500"
-                        : versionInfo?.is_latest === false
-                          ? "bg-yellow-400"
-                          : "bg-gray-400"
-                    )}
-                    title={
-                      versionInfo?.is_latest === true
-                        ? t("sidebar.about.versionLatest")
-                        : versionInfo?.is_latest === false
-                          ? t("sidebar.about.versionUpdateAvailable")
-                          : t("sidebar.about.versionStatusUnknown")
-                    }
-                  />
-                </span>
-              </div>
-              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
-                <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-accent text-accent-foreground">
-                  <Github className="h-4 w-4" />
-                </span>
-                <span className="leading-7">
-                  {t("sidebar.about.github")}:{" "}
-                  <a
-                    href={githubUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-500 hover:underline break-all"
-                  >
-                    {githubRepoDisplay}
-                  </a>
-                </span>
-              </div>
-              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
-                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
-                  <Star className="h-4 w-4" />
-                </span>
-                <span className="leading-7">{t("sidebar.about.stars")}: {githubStars === null ? "--" : formatStars(githubStars)}</span>
-              </div>
-              <div className="flex min-h-7 items-center gap-3 text-sm text-foreground">
-                <span className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-accent text-accent-foreground">
-                  <FileText className="h-4 w-4" />
-                </span>
-                <a
-                  href={licenseUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="leading-7 text-blue-500 hover:underline"
-                >
-                  {t("sidebar.about.license")}
-                </a>
-              </div>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
+        <div className="border-t border-[#ececf1] px-2.5 py-2">
+          <Link href="/files" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/files") && "bg-white text-[#2536e0]")}><FileText className="h-4 w-4" /> Files</Link>
+          <Link href="/tools" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/tools") && "bg-white text-[#2536e0]")}><Wrench className="h-4 w-4" /> Tools and apps</Link>
+          <button onClick={() => setRoutinesOpen(true)} className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground"><RotateCcw className="h-4 w-4" /> Recurring jobs</button>
+        </div>
 
-      <ConfirmDialog
-        isOpen={!!taskToDelete}
-        onOpenChange={(open) => !open && setTaskToDelete(null)}
-        onConfirm={confirmDeleteTask}
-        isLoading={isDeletingTask}
-      />
-    </div >
+        <div ref={userMenuRef} className="relative border-t border-[#ececf1] p-2.5">
+          {userMenuOpen && <div data-testid="workspace-menu" className="absolute bottom-[calc(100%+8px)] left-2 right-2 z-50 max-h-[70vh] overflow-y-auto rounded-2xl border border-border bg-popover py-2 shadow-2xl">
+            <div className="flex items-center gap-3 px-4 py-3"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-[#2536e0] text-xs font-semibold uppercase text-white">{userLabel.charAt(0)}</span><span className="min-w-0"><b className="block truncate text-sm font-semibold">{userLabel}</b>{subtitle && <small className="block truncate text-xs text-muted-foreground">{subtitle}</small>}</span></div>
+            <div className="mx-3 my-1 h-px bg-border" />
+            <div className="space-y-0.5 px-2">
+              {userMenuItems.map((item) => <WorkspaceMenuItem key={item.href} item={item} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
+            </div>
+            {navigationGroups.map((group) => <SectionMenu key={`${group.id ?? group.title}:${pathname}`} group={group} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
+            <div className="mx-3 my-1 h-px bg-border" />
+            <button onClick={() => void (async () => { if (await logout()) setUserMenuOpen(false); else toast.error(t("sidebar.user.logoutFailed")) })()} className="mx-2 flex w-[calc(100%-16px)] items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-red-600 hover:bg-red-50"><LogOut className="h-4 w-4" />{t("sidebar.user.logoutTitle")}</button>
+          </div>}
+          <button onClick={() => setUserMenuOpen((open) => !open)} aria-expanded={userMenuOpen} aria-label={profileLabel} className="flex w-full items-center gap-2.5 rounded-xl px-2 py-2 text-left hover:bg-white">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-full bg-[#2536e0] text-xs font-semibold uppercase text-white">{userLabel.charAt(0)}</span>
+            <span className="min-w-0 flex-1"><b className="block truncate text-[13px] font-semibold">{userLabel}</b>{subtitle && <small className="block truncate text-[11px] text-muted-foreground">{subtitle}</small>}</span>
+            <ChevronsUpDown className="h-3.5 w-3.5 text-muted-foreground" />
+          </button>
+        </div>
+      </aside>
+
+      <TeammatePickerDialog open={pickerOpen} onOpenChange={setPickerOpen} />
+      <RoutinesDialog open={routinesOpen} onOpenChange={setRoutinesOpen} agents={agents} />
+    </>
   )
 }

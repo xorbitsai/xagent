@@ -209,7 +209,7 @@ describe("TemplatesPage persona routing", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "templates.marketplace.chat" }));
 
-    expect(routerPushMock).toHaveBeenCalledWith("/agent/42");
+    expect(routerPushMock).toHaveBeenCalledWith("/task?agent=42");
     expect(routerPushMock).not.toHaveBeenCalledWith(
       expect.stringContaining("/templates/sales-email-lead-response-agent")
     );

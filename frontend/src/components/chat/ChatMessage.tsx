@@ -28,6 +28,7 @@ import {
   TaskRuntimeMessageMetadataExtension,
   type TaskRuntimeMessageMetadataExtensionProps,
 } from "@/lib/task-runtime-ui-extension";
+import { getAgentTaskHref } from "@/lib/agent-ui-access";
 
 const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
 const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
@@ -356,7 +357,7 @@ export function ChatMessage({
   const [copied, setCopied] = useState(false);
 
   const handleAgentClick = (agentId: string, agentName: string) => {
-    router.push(`/agent/${agentId}`);
+    router.push(getAgentTaskHref(agentId));
   };
 
   const handleFileClick = (filePath: string, fileName: string) => {

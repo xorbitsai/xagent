@@ -370,7 +370,7 @@ describe("AgentBuilder published-agent handoff", () => {
     apiRequestMock.mockClear()
     fireEvent.click(startChat)
     expect(routerPushMock).toHaveBeenCalledTimes(1)
-    expect(routerPushMock).toHaveBeenCalledWith(`/agent/${AGENT_ID}`)
+    expect(routerPushMock).toHaveBeenCalledWith(`/task?agent=${AGENT_ID}`)
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
 

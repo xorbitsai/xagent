@@ -10,7 +10,7 @@ import { SearchInput } from "@/components/ui/search-input"
 import { PageHeader } from "@/components/ui/page-header"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { useI18n } from "@/contexts/i18n-context"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import {
   archiveWorkforce,
   deleteWorkforcePermanently,
@@ -33,12 +33,16 @@ import {
   WorkforceWidgetDialog,
 } from "@/components/workforce"
 import { AgentTriggersDialog } from "@/components/build/agent-triggers-dialog"
+import { MyTeamTabs } from "@/components/team/my-team-tabs"
+import BuildsPage from "@/app/build/page"
 
 type DeployView = "options" | "embed" | "api" | "share"
 
 export default function WorkforcesPage() {
   const { t } = useI18n()
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const teamView = searchParams.get("view")
   const [items, setItems] = useState<WorkforceListItem[]>([])
   // handleDelete reads this instead of the closed-over `items` state: it's
   // an async function created at click time, so `items` inside it stays
@@ -103,8 +107,9 @@ export default function WorkforcesPage() {
   }, [t])
 
   useEffect(() => {
+    if (teamView === "teammates") return
     void load(page, search)
-  }, [load, page, search])
+  }, [load, page, search, teamView])
 
   // Shared shape for every immediate (non-confirm-dialog) menu action:
   // close the menu, claim the busy slot, call the API, toast, reload, clear
@@ -167,6 +172,10 @@ export default function WorkforcesPage() {
     }
   }
 
+  if (teamView === "teammates") {
+    return <BuildsPage />
+  }
+
   if (view === "create") {
     return (
       <div className="h-full overflow-y-auto">
@@ -184,8 +193,7 @@ export default function WorkforcesPage() {
     <div className="h-full overflow-y-auto">
       {/* Header — build-page style */}
       <PageHeader
-        title={t("workforces.list.title")}
-        description={t("workforces.list.description")}
+        title={t("builds.list.header.title")}
         actions={
           <>
             <SearchInput
@@ -206,6 +214,7 @@ export default function WorkforcesPage() {
       />
 
       <div className="mx-auto flex w-full flex-col gap-6 px-6 py-6 md:px-8">
+        <MyTeamTabs active="workforces" workforceCount={total} />
 
         {loading ? <div className="p-8 text-muted-foreground">{t("workforces.loading.list")}</div> : null}
         {error ? <div className="p-8 text-red-500">{error}</div> : null}

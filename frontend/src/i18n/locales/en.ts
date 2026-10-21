@@ -2840,6 +2840,7 @@ Build when you need.`,
       status: {
         draft: "Draft",
         published: "Enabled",
+        archived: "Archived",
       },
       actions: {
         chat: "Chat",

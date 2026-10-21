@@ -134,14 +134,21 @@ describe("Agent profile editing", () => {
     expect(mocks.dispatch).not.toHaveBeenCalled()
   })
 
-  it("localizes header actions and profile links in Chinese", async () => {
+  it.each([
+    ["published", "已启用"],
+    ["draft", "草稿"],
+    ["archived", "已归档"],
+  ])("localizes the %s profile status and actions in Chinese", async (status, label) => {
     mocks.locale = "zh"
+    savedProfile = { ...savedProfile, status }
     render(<AgentChatHeader agentId={7} name="Ben" showBack />)
     expect(screen.getByRole("button", { name: "返回新建任务" })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "例行任务" })).toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "Ben 的更多选项" }))
     fireEvent.click(screen.getByRole("button", { name: "员工资料" }))
     expect(await screen.findByRole("button", { name: "构建器设置 指令、模型、知识、技能、工具和触发器" })).toBeInTheDocument()
+    expect(await screen.findByLabelText("状态")).toHaveValue(label)
+    expect(screen.getByLabelText("状态")).toHaveAttribute("readonly")
     expect(screen.queryByText("Builder settings")).not.toBeInTheDocument()
   })
 
@@ -159,9 +166,29 @@ describe("Agent profile editing", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
     const saveCall = mocks.request.mock.calls.find(([, options]) => options?.method === "PUT")
     expect(JSON.parse(saveCall?.[1].body)).toEqual({
-      name: "Ben", description, instructions: "Answer support requests.",
+      name: "Ben", description,
     })
     await openProfile()
     expect(screen.getByLabelText("Description")).toHaveValue(description)
+  })
+
+  it.each([null, "", "   "])("preserves unchanged rules (%j) when saving metadata", async (instructions) => {
+    savedProfile = { ...savedProfile, instructions }
+    render(<AgentChatHeader agentId={7} name="Ben" />)
+    await openProfile()
+    const rules = screen.getByLabelText("Standing rules")
+    expect(rules).not.toBeRequired()
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled()
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Ben Support" } })
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Updated description" } })
+    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled()
+    expect(rules.closest("form")!.checkValidity()).toBe(true)
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument())
+    const saveCall = mocks.request.mock.calls.find(([, options]) => options?.method === "PUT")
+    expect(JSON.parse(saveCall?.[1].body)).toEqual({ name: "Ben Support", description: "Updated description" })
+    expect(savedProfile.instructions).toBe(instructions)
+    await openProfile()
+    expect(screen.getByLabelText("Standing rules")).toHaveValue(instructions ?? "")
   })
 })

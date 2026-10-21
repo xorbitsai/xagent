@@ -2835,6 +2835,7 @@ const zh = {
       status: {
         draft: "草稿",
         published: "已启用",
+        archived: "已归档",
       },
       actions: {
         chat: "聊天",

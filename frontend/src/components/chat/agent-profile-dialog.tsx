@@ -43,9 +43,15 @@ export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }
   const mounted = useRef(false)
   const savingRef = useRef(false)
   const canEdit = loaded && canEditAgent(profile)
+  const instructionsChanged = draft.instructions !== (profile.instructions ?? "")
+  const invalidInstructions = instructionsChanged && !draft.instructions.trim()
   const dirty = draft.name !== profile.name
     || draft.description !== (profile.description ?? "")
-    || draft.instructions !== (profile.instructions ?? "")
+    || instructionsChanged
+  const statusLabel = profile.status === "published"
+    ? t("builds.list.status.published")
+    : profile.status === "draft" ? t("builds.list.status.draft")
+      : profile.status === "archived" ? t("builds.list.status.archived") : profile.status
 
   useEffect(() => {
     mounted.current = true
@@ -85,7 +91,7 @@ export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }
       setError(t("builds.editor.validation.nameRequired"))
       return
     }
-    if (!draft.instructions.trim()) {
+    if (invalidInstructions) {
       setError(t("builds.editor.validation.instructionsRequired"))
       return
     }
@@ -99,7 +105,9 @@ export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }
         body: JSON.stringify({
           name: draft.name.trim(),
           description: draft.description,
-          instructions: draft.instructions,
+          // Omit untouched rules so metadata edits preserve null/empty values
+          // (and do not overwrite instructions changed elsewhere).
+          ...(instructionsChanged ? { instructions: draft.instructions } : {}),
         }),
       })
       if (!response.ok) throw await parseAgentUpdateError(response, t("agentProfile.saveFailed"))
@@ -141,14 +149,14 @@ export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }
                   <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} readOnly={!canEdit} disabled={saving} maxLength={200} required className={inputClass} />
                 </label>
                 <label className="space-y-1.5 text-xs font-semibold">{t("agentProfile.status")}
-                  <input value={profile.status} readOnly className={`${inputClass} capitalize`} />
+                  <input value={statusLabel} readOnly className={inputClass} />
                 </label>
               </div>
               <label className="block space-y-1.5 text-xs font-semibold">{t("agentProfile.description")}
                 <textarea value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} readOnly={!canEdit} disabled={saving} rows={3} className={`${inputClass} h-auto resize-y py-2 leading-relaxed`} />
               </label>
               <label className="block space-y-1.5 text-xs font-semibold">{t("agentProfile.rules")}
-                <textarea value={draft.instructions} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} readOnly={!canEdit} disabled={saving} rows={5} required className={`${inputClass} h-auto resize-y py-2 leading-relaxed`} />
+                <textarea value={draft.instructions} onChange={(event) => setDraft({ ...draft, instructions: event.target.value })} readOnly={!canEdit} disabled={saving} rows={5} required={instructionsChanged} className={`${inputClass} h-auto resize-y py-2 leading-relaxed`} />
               </label>
             </>}
             {error && <div role="alert" className="text-sm text-destructive">{error}{!loaded && !loading && <Button type="button" variant="outline" className="ml-2" onClick={() => setRetry((value) => value + 1)}>{t("common.retry")}</Button>}</div>}
@@ -156,7 +164,7 @@ export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }
           </div>
           <div className="flex shrink-0 justify-end gap-2 border-t border-border px-5 py-3">
             <Button type="button" variant="outline" onClick={close} disabled={saving}>{t("common.cancel")}</Button>
-            {canEdit && <Button type="submit" disabled={saving || !dirty || !draft.name.trim() || !draft.instructions.trim()}>
+            {canEdit && <Button type="submit" disabled={saving || !dirty || !draft.name.trim() || invalidInstructions}>
               {saving && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {saving ? t("agentProfile.saving") : t("common.save")}
             </Button>}

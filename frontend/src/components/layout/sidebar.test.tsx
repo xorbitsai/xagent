@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { NavigationGroup, NavigationItem } from "@/lib/sidebar-navigation"
+import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 import { Sidebar } from "./sidebar"
 
@@ -22,6 +23,7 @@ const navState = vi.hoisted(() => ({ groups: [] as unknown[], items: [] as Navig
 const extensionState = vi.hoisted(() => ({ groups: [] as NavigationGroup[] }))
 const routerPush = vi.hoisted(() => vi.fn())
 const appState = vi.hoisted(() => ({ lastTaskUpdate: 0 }))
+const localeState = vi.hoisted(() => ({ locale: "en" as "en" | "zh" }))
 const createSeededAgentTaskMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({ usePathname: () => routeState.pathname, useRouter: () => ({ push: routerPush }) }))
@@ -29,7 +31,7 @@ vi.mock("next/image", () => ({ default: (props: React.ImgHTMLAttributes<HTMLImag
 vi.mock("next/link", () => ({ default: ({ children, onClick, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => <a {...props} onClick={(event) => { event.preventDefault(); onClick?.(event) }}>{children}</a> }))
 vi.mock("@/contexts/auth-context", () => ({ useAuth: () => authState }))
 vi.mock("@/contexts/app-context-chat", () => ({ useApp: () => ({ state: appState }) }))
-vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ locale: "en", t: (key: string) => key }) }))
+vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ locale: localeState.locale, t: (key: TranslationKey, vars?: Record<string, string | number>) => key.startsWith("workspace.") || localeState.locale === "zh" ? resolveTranslation(localeState.locale, key, vars) : key }) }))
 vi.mock("@/components/ui/sonner", () => ({ toast }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: (input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init) }))
 vi.mock("@/lib/branding", () => ({ getBrandingFromEnv: () => ({ appName: "Xagent" }) }))
@@ -39,6 +41,147 @@ vi.mock("@/lib/sidebar-navigation", async () => ({
   getNavigationGroupsForUser: () => navState.groups, getUserMenuItemsForUser: () => navState.items,
 }))
 vi.mock("@/lib/hire-agent", () => ({ createSeededAgentTask: createSeededAgentTaskMock }))
+
+describe("Sidebar review regressions", () => {
+  beforeEach(() => {
+    authState.user.id = "1"
+    localeState.locale = "en"
+    routeState.pathname = "/task/101"
+    navState.groups = []
+    routerPush.mockReset()
+    toast.error.mockReset()
+  })
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    authState.user.id = "1"
+    localeState.locale = "en"
+  })
+
+  it.each([false, true])("discards old-identity search data (pending: %s) on account switch", async (pending) => {
+    let release: (value: Response) => void = () => {}
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (authState.user.id === "2") return new Response(null, { status: 503 })
+      if (url.includes("search=") && url.includes("/api/agents")) {
+        if (pending) return new Promise<Response>((resolve) => { release = resolve })
+        return Response.json([{ id: 8, name: "Private Alice employee", status: "published" }])
+      }
+      if (url.includes("/api/chat/tasks")) return Response.json({ tasks: [{ task_id: 101, title: "Private Alice conversation" }] })
+      return Response.json(url.includes("/api/agents") ? [{ id: 7, name: "Alice teammate", status: "published" }] : [])
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const view = render(<Sidebar />)
+    await screen.findByText("Alice teammate")
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "private" } })
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/api/agents?search="))).toBe(true))
+    if (!pending) await screen.findByText("Private Alice employee")
+    authState.user.id = "2"
+    view.rerender(<Sidebar />)
+    expect(screen.getByRole("searchbox")).toHaveValue("")
+    expect(screen.queryByText("Alice teammate")).not.toBeInTheDocument()
+    expect(screen.queryByText("Private Alice employee")).not.toBeInTheDocument()
+    expect(screen.queryByText("Private Alice conversation")).not.toBeInTheDocument()
+    if (pending) await act(async () => { release(Response.json([{ id: 8, name: "Private Alice employee", status: "published" }])) })
+    fireEvent.change(screen.getByRole("searchbox"), { target: { value: "private" } })
+    await screen.findByRole("alert")
+    expect(screen.queryByText("Private Alice employee")).not.toBeInTheDocument()
+    expect(screen.queryByText("Private Alice conversation")).not.toBeInTheDocument()
+  })
+
+  it("renames a conversation, confirms deletion, and leaves a deleted current chat", async () => {
+    const tasks = [{ task_id: 101, title: "Original conversation", created_at: "2026-10-20" }]
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "PUT") {
+        tasks[0].title = JSON.parse(String(init.body)).title
+        return Response.json({ success: true })
+      }
+      if (init?.method === "DELETE") return Response.json({ success: true })
+      return Response.json(String(input).includes("/api/chat/tasks") ? { tasks } : [])
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    render(<Sidebar />)
+    fireEvent.click(screen.getByRole("button", { name: "Show recent conversations" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Options for Original conversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "common.rename" }))
+    const rename = screen.getByRole("dialog", { name: "Rename conversation" })
+    fireEvent.change(within(rename).getByRole("textbox"), { target: { value: "Updated conversation" } })
+    fireEvent.click(within(rename).getByRole("button", { name: "common.save" }))
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Rename conversation" })).not.toBeInTheDocument())
+    expect(screen.getByRole("link", { name: /Updated conversation/ })).toHaveAttribute("href", "/task/101")
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("/api/chat/task/101"), expect.objectContaining({ method: "PUT", body: JSON.stringify({ title: "Updated conversation" }) }))
+    fireEvent.click(screen.getByRole("button", { name: "Options for Updated conversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "common.delete" }))
+    let dialog = screen.getByRole("dialog", { name: "Delete conversation" })
+    fireEvent.click(within(dialog).getByRole("button", { name: "common.cancel" }))
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false)
+    fireEvent.click(screen.getByRole("button", { name: "Options for Updated conversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "common.delete" }))
+    dialog = screen.getByRole("dialog", { name: "Delete conversation" })
+    fireEvent.click(within(dialog).getByRole("button", { name: "common.delete" }))
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/task"))
+    expect(screen.queryByRole("link", { name: /Updated conversation/ })).not.toBeInTheDocument()
+  })
+
+  it.each(["rename", "delete"])("keeps conversation data and the dialog when %s fails", async (kind) => {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method) return new Response(null, { status: 500 })
+      return Response.json(String(input).includes("/api/chat/tasks") ? { tasks: [{ task_id: 101, title: "Keep this conversation" }] } : [])
+    }))
+    render(<Sidebar />)
+    fireEvent.click(screen.getByRole("button", { name: "Show recent conversations" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Options for Keep this conversation" }))
+    fireEvent.click(screen.getByRole("button", { name: `common.${kind}` }))
+    const dialog = screen.getByRole("dialog", { name: kind === "rename" ? "Rename conversation" : "Delete conversation" })
+    if (kind === "rename") fireEvent.change(within(dialog).getByRole("textbox"), { target: { value: "New title" } })
+    fireEvent.click(within(dialog).getByRole("button", { name: kind === "rename" ? "common.save" : "common.delete" }))
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(kind === "rename" ? "Could not rename conversation" : "common.deleteFailed"))
+    expect(screen.getByRole("dialog", { name: kind === "rename" ? "Rename conversation" : "Delete conversation" })).toBeInTheDocument()
+    expect(screen.getByText("Keep this conversation")).toBeInTheDocument()
+    expect(routerPush).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])("distinguishes failed routine reads from an empty list (partial: %s)", async (partial) => {
+    let retry = false
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith("/triggers")) {
+        if (url.includes("/7/") || !partial && !retry) return new Response(null, { status: 503 })
+        return Response.json([{ id: 81, type: "scheduled", name: "Morning report", enabled: true }])
+      }
+      if (url.endsWith("/api/agents")) return Response.json([
+        { id: 7, name: "Ben", status: "published" },
+        { id: 8, name: "Maya", status: "published" },
+        { id: 9, name: "Shared", status: "published", readonly: true },
+      ])
+      return Response.json(url.includes("/api/chat/tasks") ? { tasks: [] } : [])
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    render(<Sidebar />)
+    await screen.findByText("Ben")
+    fireEvent.click(screen.getByRole("button", { name: "Recurring jobs" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent("existing schedules have not been stopped")
+    expect(screen.queryByText("Nothing runs on a schedule yet.")).not.toBeInTheDocument()
+    if (partial) expect(screen.getByRole("switch", { name: "Toggle Morning report" })).toBeChecked()
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/9/triggers"))).toBe(false)
+    retry = true
+    fireEvent.click(screen.getByRole("button", { name: "common.retry" }))
+    expect(await screen.findByRole("switch", { name: "Toggle Morning report" })).toBeChecked()
+  })
+
+  it("renders Chinese workspace, picker and routine labels", async () => {
+    localeState.locale = "zh"
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => Response.json(String(input).includes("/api/chat/tasks") ? { tasks: [] } : [])))
+    render(<Sidebar />)
+    expect(screen.getByRole("searchbox")).toHaveAttribute("placeholder", "搜索员工和消息")
+    expect(screen.getByRole("heading", { name: "我的团队" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "开始新工作" }))
+    fireEvent.click(screen.getByRole("button", { name: "添加员工" }))
+    expect(screen.getByRole("dialog", { name: "添加员工" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "创建" })).toBeInTheDocument()
+    expect(screen.getByText("创建自己的员工")).toBeInTheDocument()
+  })
+})
 
 describe("Sidebar conversation presentation", () => {
   beforeEach(() => {

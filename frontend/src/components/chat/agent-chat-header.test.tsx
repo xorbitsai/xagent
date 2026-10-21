@@ -2,9 +2,11 @@ import React from "react"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import en from "@/i18n/locales/en"
+import zh from "@/i18n/locales/zh"
 import { AgentChatHeader } from "./agent-chat-header"
 
 const mocks = vi.hoisted(() => ({
+  locale: "en",
   request: vi.fn(),
   dispatch: vi.fn(),
   success: vi.fn(),
@@ -12,7 +14,7 @@ const mocks = vi.hoisted(() => ({
 }))
 const translate = (key: string, params?: Record<string, string>) => {
   const translation = key.split(".").reduce<unknown>((object, part) =>
-    object && typeof object === "object" ? (object as Record<string, unknown>)[part] : undefined, en)
+    object && typeof object === "object" ? (object as Record<string, unknown>)[part] : undefined, mocks.locale === "zh" ? zh : en)
   const value = typeof translation === "string" ? translation : key
   return Object.entries(params ?? {}).reduce((text, [name, replacement]) => text.replace(`{${name}}`, replacement), value)
 }
@@ -35,6 +37,7 @@ async function openProfile() {
 describe("Agent profile editing", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.locale = "en"
     savedProfile = {
       id: 7, name: "Ben", description: "Support specialist",
       instructions: "Answer support requests.", status: "published",
@@ -129,6 +132,17 @@ describe("Agent profile editing", () => {
     expect(screen.getByText("Maya")).toBeInTheDocument()
     expect(screen.queryByText("Saved Ben")).not.toBeInTheDocument()
     expect(mocks.dispatch).not.toHaveBeenCalled()
+  })
+
+  it("localizes header actions and profile links in Chinese", async () => {
+    mocks.locale = "zh"
+    render(<AgentChatHeader agentId={7} name="Ben" showBack />)
+    expect(screen.getByRole("button", { name: "返回新建任务" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "例行任务" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "Ben 的更多选项" }))
+    fireEvent.click(screen.getByRole("button", { name: "员工资料" }))
+    expect(await screen.findByRole("button", { name: "构建器设置 指令、模型、知识、技能、工具和触发器" })).toBeInTheDocument()
+    expect(screen.queryByText("Builder settings")).not.toBeInTheDocument()
   })
 
   it("edits a multiline description and removes the memory entry from Profile", async () => {

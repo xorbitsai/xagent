@@ -171,7 +171,8 @@ def _stream_aliases(events: list[TaskExecutionEvent]) -> dict[str, str]:
     return aliases
 
 
-def _message(event: TaskExecutionEvent) -> dict[str, Any] | None:
+def project_event_message(event: TaskExecutionEvent) -> dict[str, Any] | None:
+    """Project one fact using the public transcript visibility and safety policy."""
     data = event_data(event)
     if is_audit_only_trace_data(data) or is_agent_checkpoint_data(data):
         return None
@@ -240,7 +241,7 @@ def convert_display_event(
     kind = str(event.kind)
     wire_id = event.payload.get("protocol_event_id")
     if kind in {"input_accepted", "assistant_message"}:
-        message = message or _message(event)
+        message = message or project_event_message(event)
         assert message is not None
         wire_id = f"execution_message_{event.event_id}"
         content = message["content"]
@@ -300,7 +301,7 @@ def convert_display_event(
             data["display"] = "timeline"
         elif kind == "agent_message":
             if message is None:
-                _message(event)
+                project_event_message(event)
             data["message_id"] = f"execution_message_{event.event_id}"
             if replay:
                 data["expect_response"] = False
@@ -354,7 +355,7 @@ def load_event_display_snapshot(
     events = []
     compactions = []
     for row in facts:
-        message = _message(row)
+        message = project_event_message(row)
         if message is not None:
             messages.append(message)
         converted = convert_display_event(

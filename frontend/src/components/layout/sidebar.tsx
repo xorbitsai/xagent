@@ -15,6 +15,7 @@ import {
   Hash,
   Loader2,
   LogOut,
+  MoreHorizontal,
   Plus,
   Radio,
   RotateCcw,
@@ -37,7 +38,7 @@ import { getCompactChannelName, getChannelTooltip } from "@/lib/channel-display"
 import extraNav from "@/lib/extra-nav"
 import { categoryLabel } from "@/lib/template-categories"
 import { createSeededAgentTask } from "@/lib/hire-agent"
-import { getAgentTaskHref } from "@/lib/agent-ui-access"
+import { canEditAgent, getAgentTaskHref } from "@/lib/agent-ui-access"
 import {
   composeSidebarNavigation,
   getNavigationGroupsForUser,
@@ -51,6 +52,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog"
+import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Switch } from "@/components/ui/switch"
 import { PersonaAvatar } from "@/components/templates/persona-avatar"
@@ -132,17 +134,17 @@ function ChannelTypeIcon({ channelType }: { channelType?: string }) {
   return <Radio className="h-3 w-3 shrink-0" aria-hidden="true" />
 }
 
-function compactTime(value: string | number): string {
+function compactTime(value: string | number, locale: string, t: Translate): string {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ""
   const now = new Date()
   if (date.toDateString() === now.toDateString()) {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    return date.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" })
   }
   const yesterday = new Date(now)
   yesterday.setDate(now.getDate() - 1)
-  if (date.toDateString() === yesterday.toDateString()) return "Yesterday"
-  return date.toLocaleDateString([], { month: "short", day: "numeric" })
+  if (date.toDateString() === yesterday.toDateString()) return t("workspace.yesterday")
+  return date.toLocaleDateString(locale, { month: "short", day: "numeric" })
 }
 
 function taskPresence(status?: Task["status"]) {
@@ -232,7 +234,7 @@ function TeammatePickerDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const router = useRouter()
-  const { locale } = useI18n()
+  const { locale, t } = useI18n()
   const [templates, setTemplates] = useState<TemplateSummary[]>([])
   const [loading, setLoading] = useState(false)
   const [category, setCategory] = useState("All")
@@ -265,24 +267,24 @@ function TeammatePickerDialog({
       <DialogContent className="w-[min(520px,calc(100vw-24px))] max-w-none gap-0 overflow-hidden rounded-[20px] border-border bg-background p-0 shadow-2xl">
         <div className="border-b border-border px-5 pb-4 pt-5">
           <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-muted-foreground">XAGENT</div>
-          <DialogTitle className="mt-1 text-xl font-semibold tracking-tight">Add a teammate</DialogTitle>
-          <p className="mt-1 text-sm text-muted-foreground">Pick the job you want done and the teammate arrives configured.</p>
+          <DialogTitle className="mt-1 text-xl font-semibold tracking-tight">{t("workspace.addTeammate")}</DialogTitle>
+          <p className="mt-1 text-sm text-muted-foreground">{t("workspace.pickJob")}</p>
         </div>
         <div className="max-h-[62vh] overflow-y-auto p-4">
           <div className="flex items-center gap-3 rounded-2xl border border-[#d9defb] bg-[#f7f8ff] p-3">
             <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-white text-[#2536e0] shadow-sm"><Sparkles className="h-4 w-4" /></span>
             <div className="min-w-0 flex-1">
-              <b className="block text-sm font-semibold">Build your own teammate</b>
-              <span className="block text-xs text-muted-foreground">Describe the job, or configure one field by field.</span>
+              <b className="block text-sm font-semibold">{t("workspace.buildOwn")}</b>
+              <span className="block text-xs text-muted-foreground">{t("workspace.buildDescription")}</span>
             </div>
             <button onClick={() => go("/build?create=true")} className="inline-flex h-9 items-center gap-1.5 rounded-full bg-[#2536e0] px-4 text-xs font-semibold text-white hover:bg-[#1e2fdb]">
-              <Sparkles className="h-3.5 w-3.5" /> Build
+              <Sparkles className="h-3.5 w-3.5" /> {t("workspace.build")}
             </button>
           </div>
 
           <div className="my-4 flex gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             {categories.slice(0, 7).map((item) => (
-              <button key={item} onClick={() => setCategory(item)} className={cn("rounded-full px-3 py-1.5 text-xs font-medium", category === item ? "bg-[#eef1fe] text-[#2536e0]" : "text-muted-foreground hover:bg-accent")}>{item}</button>
+              <button key={item} onClick={() => setCategory(item)} className={cn("rounded-full px-3 py-1.5 text-xs font-medium", category === item ? "bg-[#eef1fe] text-[#2536e0]" : "text-muted-foreground hover:bg-accent")}>{item === "All" ? t("workspace.all") : categoryLabel(t, item)}</button>
             ))}
           </div>
 
@@ -296,7 +298,7 @@ function TeammatePickerDialog({
                   <button key={template.id} onClick={() => go(target)} className="group flex w-full items-center gap-3 rounded-xl px-2.5 py-2.5 text-left hover:bg-accent">
                     <PersonaAvatar persona={{ name: template.persona?.name || template.name, avatar: template.persona?.avatar }} sizeClassName="h-9 w-9" textClassName="text-xs" decorative />
                     <span className="min-w-0 flex-1">
-                      <b className="flex items-center gap-2 text-[13px] font-semibold"><span className="truncate">{template.persona?.name || template.name}</span>{template.featured && <span className="rounded-full bg-[#eef1fe] px-2 py-0.5 text-[8px] font-bold uppercase tracking-wide text-[#2536e0]">Featured</span>}</b>
+                      <b className="flex items-center gap-2 text-[13px] font-semibold"><span className="truncate">{template.persona?.name || template.name}</span>{template.featured && <span className="rounded-full bg-[#eef1fe] px-2 py-0.5 text-[8px] font-bold uppercase tracking-wide text-[#2536e0]">{t("workspace.featured")}</span>}</b>
                       <span className="mt-0.5 block truncate text-xs text-muted-foreground">{template.persona?.role || template.description}</span>
                     </span>
                     <ChevronRight className="h-4 w-4 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
@@ -307,7 +309,7 @@ function TeammatePickerDialog({
           )}
         </div>
         <div className="border-t border-border p-3">
-          <button onClick={() => go("/templates")} className="flex h-9 w-full items-center justify-center gap-2 rounded-full border border-border text-xs font-semibold hover:bg-accent">See all teammates <ChevronRight className="h-3.5 w-3.5" /></button>
+          <button onClick={() => go("/templates")} className="flex h-9 w-full items-center justify-center gap-2 rounded-full border border-border text-xs font-semibold hover:bg-accent">{t("workspace.seeAll")} <ChevronRight className="h-3.5 w-3.5" /></button>
         </div>
       </DialogContent>
     </Dialog>
@@ -323,27 +325,41 @@ function RoutinesDialog({
   onOpenChange: (open: boolean) => void
   agents: AgentSummary[]
 }) {
+  const { t } = useI18n()
   const [items, setItems] = useState<Array<{ agent: AgentSummary; trigger: AgentTrigger }>>([])
   const [loading, setLoading] = useState(false)
   const [busyId, setBusyId] = useState<number | null>(null)
+  const [failedAgents, setFailedAgents] = useState<string[]>([])
+  const loadVersion = useRef(0)
 
   const load = useCallback(async () => {
     if (!open) return
+    const version = ++loadVersion.current
     setLoading(true)
+    // Trigger management is owner-only. Shared read-only teammates cannot be
+    // queried here; their expected 404 is not a failed owned-job read.
+    const owners = agents.filter((agent) => agent.status === "published" && canEditAgent(agent))
     const results = await Promise.allSettled(
-      agents.filter((agent) => agent.status === "published").map(async (agent) => ({
+      owners.map(async (agent) => ({
         agent,
         triggers: await listOwnerTriggers({ kind: "agent", id: agent.id }),
       })),
     )
+    if (version !== loadVersion.current) return
     const next = results.flatMap((result) => result.status === "fulfilled"
       ? result.value.triggers.filter((trigger) => trigger.type === "scheduled").map((trigger) => ({ agent: result.value.agent, trigger }))
       : [])
-    setItems(next)
+    const failedIds = new Set(owners.filter((_, index) => results[index].status === "rejected").map((agent) => agent.id))
+    setFailedAgents(owners.filter((agent) => failedIds.has(agent.id)).map((agent) => agent.name))
+    // A failed refresh must not erase previously loaded stop controls.
+    setItems((previous) => [...next, ...previous.filter((item) => failedIds.has(item.agent.id))])
     setLoading(false)
   }, [agents, open])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    void load()
+    return () => { loadVersion.current += 1 }
+  }, [load])
 
   const toggle = async (entry: { agent: AgentSummary; trigger: AgentTrigger }) => {
     setBusyId(entry.trigger.id)
@@ -351,7 +367,7 @@ function RoutinesDialog({
       const updated = await updateOwnerTrigger({ kind: "agent", id: entry.agent.id }, entry.trigger.id, { enabled: !entry.trigger.enabled })
       setItems((current) => current.map((item) => item.trigger.id === updated.id && item.agent.id === entry.agent.id ? { ...item, trigger: updated } : item))
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "Could not update recurring job")
+      toast.error(error instanceof Error ? error.message : t("workspace.routinesUpdateFailed"))
     } finally {
       setBusyId(null)
     }
@@ -362,17 +378,21 @@ function RoutinesDialog({
       <DialogContent className="w-[min(500px,calc(100vw-24px))] max-w-none gap-0 overflow-hidden rounded-[20px] p-0">
         <div className="border-b border-border px-5 pb-4 pt-5">
           <div className="text-[9px] font-bold uppercase tracking-[0.18em] text-muted-foreground">XAGENT</div>
-          <DialogTitle className="mt-1 text-xl font-semibold">Recurring jobs</DialogTitle>
-          <p className="mt-1 text-sm text-muted-foreground">Standing work, and the switch that stops it.</p>
+          <DialogTitle className="mt-1 text-xl font-semibold">{t("workspace.recurringJobs")}</DialogTitle>
+          <p className="mt-1 text-sm text-muted-foreground">{t("workspace.routinesDescription")}</p>
         </div>
         <div className="max-h-[62vh] overflow-y-auto p-4">
+          {failedAgents.length > 0 && <div role="alert" className="mb-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900">
+            <p>{t("workspace.routinesIncomplete", { names: failedAgents.join(", ") })}</p>
+            <Button variant="outline" disabled={loading} onClick={() => void load()} className="mt-2">{t("common.retry")}</Button>
+          </div>}
           {loading ? (
             <div className="grid place-items-center py-12"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
-          ) : items.length === 0 ? (
+          ) : items.length === 0 && failedAgents.length === 0 ? (
             <div className="rounded-2xl border border-dashed border-border px-6 py-10 text-center">
               <Clock3 className="mx-auto h-6 w-6 text-muted-foreground" />
-              <p className="mt-3 text-sm font-medium">Nothing runs on a schedule yet.</p>
-              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">Ask a teammate to do something every morning and it will appear here.</p>
+              <p className="mt-3 text-sm font-medium">{t("workspace.routinesEmpty")}</p>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{t("workspace.routinesEmptyHint")}</p>
             </div>
           ) : (
             <div className="space-y-2">
@@ -383,7 +403,7 @@ function RoutinesDialog({
                     <b className="block truncate text-sm font-semibold">{entry.trigger.name}</b>
                     <span className="block truncate text-xs text-muted-foreground">{entry.agent.name}{entry.trigger.next_run_at ? ` · ${new Date(entry.trigger.next_run_at).toLocaleString()}` : ""}</span>
                   </div>
-                  {busyId === entry.trigger.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Switch checked={entry.trigger.enabled} onCheckedChange={() => void toggle(entry)} aria-label={`Toggle ${entry.trigger.name}`} />}
+                  {busyId === entry.trigger.id ? <Loader2 className="h-4 w-4 animate-spin" /> : <Switch checked={entry.trigger.enabled} onCheckedChange={() => void toggle(entry)} aria-label={t("workspace.toggleRoutine", { name: entry.trigger.name })} />}
                 </div>
               ))}
             </div>
@@ -394,7 +414,14 @@ function RoutinesDialog({
   )
 }
 
-export function Sidebar({ className, allowCollapse = true, profileSubtitle }: SidebarProps) {
+// Identity changes must unmount all cached data, pending requests and dialogs,
+// including a same-origin login change received from another browser tab.
+export function Sidebar(props: SidebarProps) {
+  const { user } = useAuth()
+  return <SidebarWorkspace key={user?.id ?? "signed-out"} {...props} />
+}
+
+function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: SidebarProps) {
   const pathname = usePathname()
   const router = useRouter()
   const { user, logout } = useAuth()
@@ -432,6 +459,49 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
   const loadingMoreTasksRef = useRef(false)
   const [templatesById, setTemplatesById] = useState<Record<string, Template>>({})
   const [openingAgentId, setOpeningAgentId] = useState<number | null>(null)
+  const [taskAction, setTaskAction] = useState<{ task: Task; kind: "rename" | "delete" } | null>(null)
+  const [taskMenuId, setTaskMenuId] = useState<string | null>(null)
+  const [taskTitle, setTaskTitle] = useState("")
+  const [savingTask, setSavingTask] = useState(false)
+  const savingTaskRef = useRef(false)
+  const mounted = useRef(false)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
+  const saveTaskAction = async () => {
+    if (!taskAction || savingTaskRef.current || (taskAction.kind === "rename" && !taskTitle.trim())) return
+    const { task, kind } = taskAction
+    const title = taskTitle.trim()
+    savingTaskRef.current = true
+    setSavingTask(true)
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/chat/task/${task.task_id}`, kind === "delete"
+        ? { method: "DELETE" }
+        : { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title }) })
+      if (!response.ok) throw new Error("Task update failed")
+      if (!mounted.current) return
+      const update = (rows: Task[]) => kind === "delete"
+        ? rows.filter((row) => String(row.task_id) !== String(task.task_id))
+        : rows.map((row) => String(row.task_id) === String(task.task_id) ? { ...row, title } : row)
+      // Fence off old list responses, then update both Recent and search caches.
+      workspaceVersion.current += 1
+      setLoading(false)
+      loadingMoreTasksRef.current = false
+      setLoadingMoreTasks(false)
+      setTasks(update)
+      setSearchResults((previous) => ({ ...previous, tasks: update(previous.tasks) }))
+      setSearchAttempt((attempt) => attempt + 1)
+      setTaskAction(null)
+      if (kind === "delete" && String(task.task_id) === activeTaskId) router.push("/task")
+    } catch {
+      if (mounted.current) toast.error(t(kind === "delete" ? "common.deleteFailed" : "workspace.renameFailed"))
+    } finally {
+      savingTaskRef.current = false
+      if (mounted.current) setSavingTask(false)
+    }
+  }
   const [loading, setLoading] = useState(true)
   const userMenuRef = useRef<HTMLDivElement>(null)
   const openingAgentRef = useRef<number | null>(null)
@@ -445,6 +515,10 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
     setTasksHasNext(false)
     loadingMoreTasksRef.current = false
     setLoadingMoreTasks(false)
+    if (!user) {
+      setLoading(false)
+      return
+    }
     void (async () => {
       const [agentResult, taskResult, templateResult] = await Promise.allSettled([
         apiRequest(`${getApiUrl()}/api/agents`),
@@ -504,7 +578,7 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
   }
 
   useEffect(() => {
-    if (!searchQuery) {
+    if (!user || !searchQuery) {
       setSearching(false)
       setSearchError(false)
       setSearchResults({ query: "", agents: [], tasks: [], hasNext: false })
@@ -547,7 +621,7 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
       clearTimeout(timer)
       controller.abort()
     }
-  }, [searchQuery, searchPage, searchAttempt, state.lastTaskUpdate])
+  }, [searchQuery, searchPage, searchAttempt, state.lastTaskUpdate, user?.id])
 
   const changeSearch = (value: string) => {
     setSearch(value)
@@ -617,6 +691,7 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
       const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?agent_id=${agent.id}&page=1&per_page=1`)
       if (!response.ok) throw new Error("Could not load teammate conversations")
       const data = await response.json()
+      if (!mounted.current) return
       if (!Array.isArray(data?.tasks)) throw new Error("Invalid teammate conversations")
       const latest = data.tasks[0] as Task | undefined
       if (latest) {
@@ -637,6 +712,7 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
           connectAppsLabel: t("chatPage.clarification.connectApps.title"),
         },
       })
+      if (!mounted.current) return
       const fullTitle = template.persona.role
         ? `${template.persona.name} — ${template.persona.role}`
         : template.persona.name
@@ -654,10 +730,10 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
       }, ...current])
       router.push(`/task/${result.taskId}`)
     } catch {
-      toast.error(t("chatPage.page.startConversationFailed"))
+      if (mounted.current) toast.error(t("chatPage.page.startConversationFailed"))
     } finally {
       openingAgentRef.current = null
-      setOpeningAgentId(null)
+      if (mounted.current) setOpeningAgentId(null)
     }
   }, [router, t, templatesById])
 
@@ -672,7 +748,7 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
         <Link href="/task" className="grid h-9 w-9 place-items-center rounded-xl hover:bg-white">
           <Image src={branding.logoPath} alt={branding.logoAlt} width={28} height={28} className="h-7 w-7 rounded-lg object-contain" />
         </Link>
-        <button onClick={() => setSidebarOpen(true)} className="mt-3 grid h-9 w-9 place-items-center rounded-xl text-muted-foreground hover:bg-white hover:text-foreground" aria-label="Open navigation"><ChevronRight className="h-4 w-4" /></button>
+        <button onClick={() => setSidebarOpen(true)} className="mt-3 grid h-9 w-9 place-items-center rounded-xl text-muted-foreground hover:bg-white hover:text-foreground" aria-label={t("workspace.openNavigation")}><ChevronRight className="h-4 w-4" /></button>
         <div className="mt-auto">
           <button onClick={() => setSidebarOpen(true)} aria-label={profileLabel} title={profileLabel} className="grid h-9 w-9 place-items-center rounded-full bg-[#2536e0] text-xs font-semibold uppercase text-white">{userLabel.charAt(0)}</button>
         </div>
@@ -690,31 +766,31 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
           </Link>
           <Popover open={startOpen} onOpenChange={setStartOpen}>
             <PopoverTrigger asChild>
-              <button aria-label="Start something new" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-[#2536e0]"><Plus className="h-4 w-4" /></button>
+              <button aria-label={t("workspace.startNew")} className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-[#2536e0]"><Plus className="h-4 w-4" /></button>
             </PopoverTrigger>
             <PopoverContent align="end" sideOffset={8} className="w-56 rounded-2xl p-1.5 shadow-xl">
-              <button onClick={() => { setStartOpen(false); router.push("/task") }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-accent"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#eef1fe] text-[#2536e0]"><Sparkles className="h-4 w-4" /></span><b className="text-sm font-semibold">New task</b><ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" /></button>
+              <button onClick={() => { setStartOpen(false); router.push("/task") }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-accent"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#eef1fe] text-[#2536e0]"><Sparkles className="h-4 w-4" /></span><b className="text-sm font-semibold">{t("workspace.newTask")}</b><ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" /></button>
               <div className="my-1 h-px bg-border" />
-              <button onClick={() => { setStartOpen(false); setPickerOpen(true) }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-accent"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#f4efff] text-[#7657d8]"><Bot className="h-4 w-4" /></span><b className="text-sm font-semibold">Add a teammate</b><ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" /></button>
+              <button onClick={() => { setStartOpen(false); setPickerOpen(true) }} className="flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left hover:bg-accent"><span className="grid h-8 w-8 place-items-center rounded-lg bg-[#f4efff] text-[#7657d8]"><Bot className="h-4 w-4" /></span><b className="text-sm font-semibold">{t("workspace.addTeammate")}</b><ChevronRight className="ml-auto h-4 w-4 text-muted-foreground" /></button>
             </PopoverContent>
           </Popover>
-          {allowCollapse && <button onClick={() => setSidebarOpen(false)} aria-label="Close navigation" className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-foreground"><ChevronLeft className="h-4 w-4" /></button>}
+          {allowCollapse && <button onClick={() => setSidebarOpen(false)} aria-label={t("workspace.closeNavigation")} className="grid h-8 w-8 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-foreground"><ChevronLeft className="h-4 w-4" /></button>}
         </div>
 
         <div className="px-3 pb-2">
           <label className="relative block">
-            <span className="sr-only">Search your team and conversations</span>
+            <span className="sr-only">{t("workspace.searchLabel")}</span>
             <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <input value={search} onChange={(event) => changeSearch(event.target.value)} type="search" placeholder="Search teammates and messages" className="h-9 w-full rounded-xl border border-[#e7e7ec] bg-white pl-9 pr-8 text-xs outline-none transition-shadow placeholder:text-[#9a9aa5] focus:border-[#b9c1f7] focus:ring-4 focus:ring-[#2536e0]/[0.07] [&::-webkit-search-cancel-button]:appearance-none" />
-            {search && <button onClick={() => changeSearch("")} aria-label="Clear search" className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground hover:bg-accent"><X className="h-3 w-3" /></button>}
+            <input value={search} onChange={(event) => changeSearch(event.target.value)} type="search" placeholder={t("workspace.searchPlaceholder")} className="h-9 w-full rounded-xl border border-[#e7e7ec] bg-white pl-9 pr-8 text-xs outline-none transition-shadow placeholder:text-[#9a9aa5] focus:border-[#b9c1f7] focus:ring-4 focus:ring-[#2536e0]/[0.07] [&::-webkit-search-cancel-button]:appearance-none" />
+            {search && <button onClick={() => changeSearch("")} aria-label={t("workspace.clearSearch")} className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground hover:bg-accent"><X className="h-3 w-3" /></button>}
           </label>
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col px-2.5">
           <div className="flex items-center px-2 pb-2 pt-2">
-            <h2 className="flex-1 text-[10.5px] font-bold uppercase tracking-[0.08em] text-[#6b6b76]">{view === "team" ? "Your team" : "Recent"}</h2>
-            <button onClick={() => router.push("/workforces?view=teammates")} aria-label="Manage my team" title="Manage my team" className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-[#2536e0]"><Settings2 className="h-3.5 w-3.5" /></button>
-            <button onClick={() => setView(view === "team" ? "recent" : "team")} aria-label={view === "team" ? "Show recent conversations" : "Show my team"} className="ml-1 inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium text-muted-foreground hover:bg-white hover:text-foreground">{view === "team" ? <Clock3 className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}{view === "team" ? "Recent" : "Team"}</button>
+            <h2 className="flex-1 text-[10.5px] font-bold uppercase tracking-[0.08em] text-[#6b6b76]">{t(view === "team" ? "workspace.yourTeam" : "workspace.recent")}</h2>
+            <button onClick={() => router.push("/workforces?view=teammates")} aria-label={t("workspace.manageTeam")} title={t("workspace.manageTeam")} className="grid h-7 w-7 place-items-center rounded-lg text-muted-foreground hover:bg-white hover:text-[#2536e0]"><Settings2 className="h-3.5 w-3.5" /></button>
+            <button onClick={() => setView(view === "team" ? "recent" : "team")} aria-label={t(view === "team" ? "workspace.showRecent" : "workspace.showTeam")} className="ml-1 inline-flex h-7 items-center gap-1.5 rounded-lg px-2 text-[11px] font-medium text-muted-foreground hover:bg-white hover:text-foreground">{view === "team" ? <Clock3 className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}{t(view === "team" ? "workspace.recent" : "workspace.team")}</button>
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto pb-3 [scrollbar-width:thin]">
@@ -746,8 +822,8 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
                         <i className={cn("absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#f8f8fa]", presence.dot)} />
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="flex items-baseline gap-1.5"><b className="max-w-[48%] shrink-0 truncate text-[13px] font-semibold">{agent.name}</b><small className="min-w-0 truncate text-[10.5px] text-muted-foreground">{getAgentCategory(agent)}</small>{isOpening ? <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-muted-foreground" /> : task && <time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.updated_at ?? task.created_at)}</time>}</span>
-                        <span className="mt-0.5 block truncate text-[11.5px] leading-4 text-muted-foreground">{task?.title || "Just joined — ready for your first job"}</span>
+                        <span className="flex items-baseline gap-1.5"><b className="max-w-[48%] shrink-0 truncate text-[13px] font-semibold">{agent.name}</b><small className="min-w-0 truncate text-[10.5px] text-muted-foreground">{getAgentCategory(agent)}</small>{isOpening ? <Loader2 className="ml-auto h-3 w-3 shrink-0 animate-spin text-muted-foreground" /> : task && <time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.updated_at ?? task.created_at, locale, t)}</time>}</span>
+                        <span className="mt-0.5 block truncate text-[11.5px] leading-4 text-muted-foreground">{task?.title || t("workspace.justJoined")}</span>
                       </span>
                     </Link>
                   )
@@ -767,13 +843,22 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
                       ? getAgentAvatar(taskAgent)
                       : branding.logoPath
                   return (
-                    <Link key={task.task_id} href={`/task/${task.task_id}`} className={cn("flex items-start gap-2.5 rounded-xl px-2.5 py-2 hover:bg-[#f0f0f3]", active && "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]")}>
+                    <div key={task.task_id} className="group flex items-center rounded-xl hover:bg-[#f0f0f3]">
+                    <Link href={`/task/${task.task_id}`} className={cn("flex min-w-0 flex-1 items-start gap-2.5 rounded-xl px-2.5 py-2 hover:bg-[#f0f0f3]", active && "bg-white shadow-[0_1px_2px_rgba(24,28,60,.06)]")}>
                       <PersonaAvatar persona={{ name: task.agent_name || branding.appName, avatar: taskAvatar }} sizeClassName="h-7 w-7" textClassName="text-[10px]" decorative />
-                      <span className="min-w-0 flex-1"><span className="flex items-center gap-2"><b className="truncate text-xs font-semibold">{task.title || "Untitled task"}</b><time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.created_at)}</time></span><span className="mt-0.5 flex items-center gap-1.5 truncate text-[10.5px] text-muted-foreground">{task.agent_name || branding.appName}{compactChannelName && <span title={getChannelTooltip(task.channel_name!, task.channel_type)} className="inline-flex items-center gap-1 rounded border border-border px-1"><ChannelTypeIcon channelType={task.channel_type} />{compactChannelName}</span>}</span></span>
+                      <span className="min-w-0 flex-1"><span className="flex items-center gap-2"><b className="truncate text-xs font-semibold">{task.title || t("workspace.untitledTask")}</b><time className="ml-auto shrink-0 text-[9.5px] text-muted-foreground">{compactTime(task.created_at, locale, t)}</time></span><span className="mt-0.5 flex items-center gap-1.5 truncate text-[10.5px] text-muted-foreground">{task.agent_name || branding.appName}{compactChannelName && <span title={getChannelTooltip(task.channel_name!, task.channel_type)} className="inline-flex items-center gap-1 rounded border border-border px-1"><ChannelTypeIcon channelType={task.channel_type} />{compactChannelName}</span>}</span></span>
                     </Link>
+                    <Popover open={taskMenuId === String(task.task_id)} onOpenChange={(open) => setTaskMenuId(open ? String(task.task_id) : null)}>
+                      <PopoverTrigger asChild><button aria-label={t("workspace.conversationOptions", { title: task.title || t("workspace.untitledTask") })} className="mr-1 rounded-lg p-1 text-muted-foreground hover:bg-white"><MoreHorizontal className="h-3.5 w-3.5" /></button></PopoverTrigger>
+                      <PopoverContent align="end" className="w-40 p-1">
+                        <button onClick={() => { setTaskMenuId(null); setTaskTitle(task.title || ""); setTaskAction({ task, kind: "rename" }) }} className="block w-full rounded px-3 py-2 text-left text-sm hover:bg-accent">{t("common.rename")}</button>
+                        <button onClick={() => { setTaskMenuId(null); setTaskAction({ task, kind: "delete" }) }} className="block w-full rounded px-3 py-2 text-left text-sm text-destructive hover:bg-accent">{t("common.delete")}</button>
+                      </PopoverContent>
+                    </Popover>
+                    </div>
                   )
                 })}
-                {!searchQuery && visibleTasks.length === 0 && <p className="px-3 py-8 text-center text-xs text-muted-foreground">No conversations yet.</p>}
+                {!searchQuery && visibleTasks.length === 0 && <p className="px-3 py-8 text-center text-xs text-muted-foreground">{t("workspace.noConversations")}</p>}
                 {!searchQuery && tasksHasNext && <button disabled={loadingMoreTasks} onClick={() => void loadMoreTasks()} className="w-full px-3 py-3 text-xs text-primary disabled:opacity-50">{loadingMoreTasks ? t("common.loading") : t("sidebar.search.loadMore")}</button>}
                 {searchQuery && hasSearchResults && searchResults.hasNext && !searchError && <button disabled={searching} onClick={() => setSearchPage((page) => page + 1)} className="w-full px-3 py-3 text-xs text-primary disabled:opacity-50">{searching ? t("common.loading") : t("sidebar.search.loadMore")}</button>}
               </div>
@@ -784,9 +869,9 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
         </div>
 
         <div className="border-t border-[#ececf1] px-2.5 py-2">
-          <Link href="/files" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/files") && "bg-white text-[#2536e0]")}><FileText className="h-4 w-4" /> Files</Link>
-          <Link href="/tools" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/tools") && "bg-white text-[#2536e0]")}><Wrench className="h-4 w-4" /> Tools and apps</Link>
-          <button onClick={() => setRoutinesOpen(true)} className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground"><RotateCcw className="h-4 w-4" /> Recurring jobs</button>
+          <Link href="/files" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/files") && "bg-white text-[#2536e0]")}><FileText className="h-4 w-4" /> {t("workspace.files")}</Link>
+          <Link href="/tools" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/tools") && "bg-white text-[#2536e0]")}><Wrench className="h-4 w-4" /> {t("workspace.toolsApps")}</Link>
+          <button onClick={() => setRoutinesOpen(true)} className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground"><RotateCcw className="h-4 w-4" /> {t("workspace.recurringJobs")}</button>
         </div>
 
         <div ref={userMenuRef} className="relative border-t border-[#ececf1] p-2.5">
@@ -810,6 +895,20 @@ export function Sidebar({ className, allowCollapse = true, profileSubtitle }: Si
 
       <TeammatePickerDialog open={pickerOpen} onOpenChange={setPickerOpen} />
       <RoutinesDialog open={routinesOpen} onOpenChange={setRoutinesOpen} agents={agents} />
+      <Dialog open={Boolean(taskAction)} onOpenChange={(open) => { if (!open && !savingTaskRef.current) setTaskAction(null) }}>
+        <DialogContent showCloseButton={!savingTask}>
+          <DialogTitle>{t(taskAction?.kind === "delete" ? "workspace.deleteConversation" : "workspace.renameConversation")}</DialogTitle>
+          <form onSubmit={(event) => { event.preventDefault(); void saveTaskAction() }} className="space-y-4">
+            {taskAction?.kind === "rename"
+              ? <label className="block space-y-2 text-sm">{t("workspace.conversationTitle")}<input autoFocus required value={taskTitle} onChange={(event) => setTaskTitle(event.target.value)} disabled={savingTask} className="block w-full rounded-lg border bg-background p-2" /></label>
+              : <p className="text-sm text-muted-foreground">{t("workspace.deleteConversationConfirm", { title: taskAction?.task.title || t("workspace.untitledTask") })}</p>}
+            <div className="flex justify-end gap-2">
+              <Button type="button" variant="outline" disabled={savingTask} onClick={() => setTaskAction(null)}>{t("common.cancel")}</Button>
+              <Button type="submit" variant={taskAction?.kind === "delete" ? "destructive" : "default"} disabled={savingTask || (taskAction?.kind === "rename" && !taskTitle.trim())}>{t(savingTask ? "common.loading" : taskAction?.kind === "delete" ? "common.delete" : "common.save")}</Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
     </>
   )
 }

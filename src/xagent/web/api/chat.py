@@ -46,7 +46,10 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owned_agent_clause,
 )
-from ..services.assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
+from ..services.assistant_history_safety import (
+    ASSISTANT_RESPONSE_MESSAGE_TYPE,
+    KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES,
+)
 from ..services.chat_history_service import (
     persist_assistant_message_no_commit,
 )
@@ -83,6 +86,7 @@ from ..services.task_cleanup_obligations import (
     settle_cleanup_attempts_sync,
 )
 from ..services.task_deletion import purge_task_rows
+from ..services.task_event_display import project_event_message
 from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
@@ -893,18 +897,67 @@ async def get_tasks(
                 )
                 pattern = f"%{escaped}%"
                 legacy_messages = select(TaskChatMessage.task_id).where(
-                    TaskChatMessage.role.in_(["user", "assistant"]),
+                    or_(
+                        TaskChatMessage.role == "user",
+                        and_(
+                            TaskChatMessage.role == "assistant",
+                            TaskChatMessage.message_type.in_(
+                                KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES
+                            ),
+                        ),
+                    ),
                     TaskChatMessage.content.ilike(pattern, escape="\\"),
                 )
-                canonical_messages = select(TaskExecutionEvent.task_id).where(
-                    TaskExecutionEvent.scope_id == "root",
-                    TaskExecutionEvent.kind.in_(
-                        ["input_accepted", "assistant_message"]
-                    ),
-                    TaskExecutionEvent.payload["content"]
-                    .as_string()
-                    .ilike(pattern, escape="\\"),
+                # SQL narrows candidates before the shared public projection
+                # applies provenance, audit/checkpoint and question visibility
+                # rules. Never match raw diagnostics or hidden event metadata.
+                candidate_events = (
+                    db.query(TaskExecutionEvent)
+                    .join(Task, Task.id == TaskExecutionEvent.task_id)
+                    .filter(
+                        Task.conversation_storage_version == 2,
+                        TaskExecutionEvent.sequence <= Task.conversation_event_sequence,
+                        TaskExecutionEvent.task_id.in_(query.with_entities(Task.id)),
+                        TaskExecutionEvent.scope_id == "root",
+                        TaskExecutionEvent.kind.in_(
+                            ["input_accepted", "assistant_message", "agent_message"]
+                        ),
+                        or_(
+                            TaskExecutionEvent.payload["content"]
+                            .as_string()
+                            .ilike(pattern, escape="\\"),
+                            TaskExecutionEvent.payload["data"]["content"]
+                            .as_string()
+                            .ilike(pattern, escape="\\"),
+                            TaskExecutionEvent.payload["message"]
+                            .as_string()
+                            .ilike(pattern, escape="\\"),
+                            TaskExecutionEvent.payload["data"]["message"]
+                            .as_string()
+                            .ilike(pattern, escape="\\"),
+                        ),
+                    )
+                    .yield_per(200)
                 )
+                canonical_messages: set[int] = set()
+                for event in candidate_events:
+                    try:
+                        message = project_event_message(event)
+                    except ValueError:
+                        # Invalid/unknown persisted payloads fail closed.
+                        continue
+                    if (
+                        message
+                        and message["role"] == "assistant"
+                        and message["message_type"]
+                        not in KNOWN_SAFE_ASSISTANT_MESSAGE_TYPES
+                    ):
+                        # Match legacy search: redacted rows are not searchable,
+                        # even when raw diagnostics contain the generic failure
+                        # text used by the public projection.
+                        continue
+                    if message and keyword.casefold() in message["content"].casefold():
+                        canonical_messages.add(int(event.task_id))
                 query = query.filter(
                     or_(
                         Task.title.ilike(pattern, escape="\\"),

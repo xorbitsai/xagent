@@ -1205,7 +1205,10 @@ def test_task_search_matches_messages_before_pagination_and_preserves_scope(
             ("output match", {"output": "needle output"}),
             ("employee match", {"agent_id": agent.id}),
             ("legacy message", {"conversation_storage_version": 1}),
-            ("canonical message", {"conversation_storage_version": 2}),
+            (
+                "canonical message",
+                {"conversation_storage_version": 2, "conversation_event_sequence": 1},
+            ),
             ("needle hidden", {"is_visible": False}),
             ("needle foreign", {"user_id": admin.id}),
             ("unmatched", {}),
@@ -1270,6 +1273,151 @@ def test_task_search_matches_messages_before_pagination_and_preserves_scope(
             "/api/chat/tasks", params={"search": "%"}, headers=user1_headers
         )
         assert [task["title"] for task in literal.json()["tasks"]] == ["legacy message"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("storage_version", [1, 2])
+def test_task_search_never_matches_redacted_assistant_diagnostics(
+    test_db, user1_headers, storage_version
+):
+    from uuid import uuid4
+
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.task_execution_event import TaskExecutionEvent
+    from xagent.web.models.user import User
+    from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter_by(username="user1").one()
+        task = Task(
+            user_id=user.id,
+            title="Failed conversation",
+            status=TaskStatus.FAILED,
+            conversation_storage_version=storage_version,
+            conversation_event_sequence=8,
+        )
+        db.add(task)
+        db.flush()
+        for sequence, (role, kind, content) in enumerate(
+            [
+                ("assistant", "chat_response", "provider-secret-needle"),
+                ("assistant", "assistant_message", "unknown-secret-needle"),
+                ("assistant", "future_type", "future-secret-needle"),
+                (
+                    "assistant",
+                    "task_failure",
+                    f"failure-secret-needle {CLIENT_SAFE_TASK_FAILURE}",
+                ),
+                ("assistant", "assistant_response", "safe-answer-needle"),
+                ("user", "user_message", "user-input-needle"),
+            ],
+            start=1,
+        ):
+            if storage_version == 1:
+                db.add(
+                    TaskChatMessage(
+                        task_id=task.id,
+                        user_id=user.id,
+                        role=role,
+                        message_type=kind,
+                        content=content,
+                    )
+                )
+            else:
+                db.add(
+                    TaskExecutionEvent(
+                        event_id=str(uuid4()),
+                        task_id=task.id,
+                        sequence=sequence,
+                        scope_id="root",
+                        idempotency_key=f"search:{sequence}",
+                        kind="input_accepted"
+                        if role == "user"
+                        else "assistant_message",
+                        payload_version=1,
+                        payload={"content": content, "message_type": kind},
+                        occurred_at=datetime.now(UTC),
+                    )
+                )
+        db.commit()
+        for keyword in (
+            "provider-secret",
+            "unknown-secret",
+            "future-secret",
+            "failure-secret",
+            CLIENT_SAFE_TASK_FAILURE,
+        ):
+            response = client.get(
+                "/api/chat/tasks", params={"search": keyword}, headers=user1_headers
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["pagination"]["total_count"] == 0
+        for keyword in ("safe-answer", "user-input"):
+            response = client.get(
+                "/api/chat/tasks", params={"search": keyword}, headers=user1_headers
+            )
+            assert [row["task_id"] for row in response.json()["tasks"]] == [task.id]
+    finally:
+        db.close()
+
+
+def test_task_search_projects_only_public_canonical_questions(test_db, user1_headers):
+    from uuid import uuid4
+
+    from xagent.web.models.task import Task
+    from xagent.web.models.task_execution_event import TaskExecutionEvent
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter_by(username="user1").one()
+        task = Task(
+            user_id=user.id,
+            title="Questions",
+            conversation_storage_version=2,
+            conversation_event_sequence=9,
+        )
+        db.add(task)
+        db.flush()
+        fixtures = [
+            ("visible-needle", {}),
+            ("hidden-needle", {"visible": False}),
+            ("audit-needle", {"__audit_only__": True}),
+            ("checkpoint-needle", {"checkpoint_type": "agent_execution_checkpoint"}),
+            ("nonquestion-needle", {"expect_response": False}),
+            ("child-needle", {}),
+            ("zero-visible-needle", {"visible": 0}),
+            ("string-response-needle", {"expect_response": "yes"}),
+            ("empty-response-needle", {"expect_response": []}),
+            ("uncommitted-needle", {}),
+        ]
+        for sequence, (content, extra) in enumerate(fixtures, start=1):
+            db.add(
+                TaskExecutionEvent(
+                    event_id=str(uuid4()),
+                    task_id=task.id,
+                    sequence=sequence,
+                    scope_id="child" if sequence == 6 else "root",
+                    idempotency_key=f"search:{sequence}",
+                    kind="agent_message",
+                    payload_version=1,
+                    payload={
+                        "data": {"message": content, "expect_response": True, **extra}
+                    },
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+        db.commit()
+        for index, (keyword, _) in enumerate(fixtures):
+            response = client.get(
+                "/api/chat/tasks", params={"search": keyword}, headers=user1_headers
+            )
+            assert response.status_code == 200, response.text
+            expected = 1 if index in (0, 6, 7) else 0
+            assert response.json()["pagination"]["total_count"] == expected, keyword
     finally:
         db.close()
 

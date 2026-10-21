@@ -1,4 +1,5 @@
 import os
+from dataclasses import replace
 from typing import Callable, Optional, overload
 
 from ....model import ChatModelConfig, ModelConfig
@@ -23,23 +24,34 @@ from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
 from .openai import OpenAILLM
 from .openrouter import OpenRouterLLM
-from .router import RouterLLM
+from .router import RouterLLM, is_auto_failover_failure
 from .xinference import XinferenceLLM
 from .zhipu import ZhipuLLM
 
 
 @overload
 def attach_chat_retry_wrapper(
-    llm: BaseLLM, max_retries: Optional[int] = ...
+    llm: BaseLLM,
+    max_retries: Optional[int] = ...,
+    *,
+    failover_max_attempts: Optional[int] = ...,
 ) -> BaseLLM: ...
 
 
 @overload
-def attach_chat_retry_wrapper(llm: None, max_retries: Optional[int] = ...) -> None: ...
+def attach_chat_retry_wrapper(
+    llm: None,
+    max_retries: Optional[int] = ...,
+    *,
+    failover_max_attempts: Optional[int] = ...,
+) -> None: ...
 
 
 def attach_chat_retry_wrapper(
-    llm: Optional[BaseLLM], max_retries: Optional[int] = None
+    llm: Optional[BaseLLM],
+    max_retries: Optional[int] = None,
+    *,
+    failover_max_attempts: Optional[int] = None,
 ) -> Optional[BaseLLM]:
     """Install the shared retry layer on a chat model.
 
@@ -51,6 +63,8 @@ def attach_chat_retry_wrapper(
 
     ``max_retries`` defaults to what a model row without an explicit value
     would carry, read off the config model so the two cannot drift.
+    ``failover_max_attempts`` caps only the failures a configured Auto
+    fallback would take over (see ``is_auto_failover_failure``).
     """
     # The env and default factories are all ``Optional``-returning, and this
     # sits on their ``return`` statements: pass a missing model through rather
@@ -59,6 +73,13 @@ def attach_chat_retry_wrapper(
         return None
     if max_retries is None:
         max_retries = int(ModelConfig.model_fields["max_retries"].default)
+    budget = chat_retry_budget()
+    if failover_max_attempts is not None:
+        budget = replace(
+            budget,
+            failover_max_attempts=failover_max_attempts,
+            failover_matches=is_auto_failover_failure,
+        )
     return create_retry_wrapper(
         llm,
         BaseLLM,  # type: ignore[type-abstract]
@@ -69,13 +90,13 @@ def attach_chat_retry_wrapper(
         # execution slot, because each attempt may consume a full request
         # timeout. The budget adds the wall-clock ceiling and the short
         # capacity-refusal budget on top of it.
-        budget=chat_retry_budget(),
+        budget=budget,
     )
 
 
 def create_base_llm(
     model: ModelConfig,
-    downstream_resolver: Optional[Callable[[str], BaseLLM]] = None,
+    downstream_resolver: Optional[Callable[..., BaseLLM]] = None,
 ) -> BaseLLM:
     """
     Creates a custom BaseLLM instance from a ModelConfig.
@@ -239,4 +260,8 @@ def create_base_llm(
     # Stamp the unique model id so token-usage details can disambiguate models
     # that share a model_name (e.g. a platform model vs a user's own).
     llm._model_id = model.id
-    return attach_chat_retry_wrapper(llm, model.max_retries)
+    return attach_chat_retry_wrapper(
+        llm,
+        model.max_retries,
+        failover_max_attempts=model.auto_failover_max_attempts,
+    )

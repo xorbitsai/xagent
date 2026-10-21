@@ -106,7 +106,7 @@ describe("widget chrome", () => {
     // corresponding control (a same-origin, same-source, correctly-enveloped
     // message the host would now just ignore) with no compiler error to
     // catch it.
-    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse"]
+    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse", "prompt_context_request"]
     for (const messageType of messageTypes) {
       expect(widgetScript).toContain(`data.type === '${messageType}'`)
     }
@@ -259,6 +259,109 @@ describe("widget chrome", () => {
     fromIframe("widget_minimize")
 
     expect(panelEl()).toHaveClass("open")
+  })
+
+  it("replies to a prompt_context_request with the parsed attribute values", () => {
+    runWidget({
+      "data-widget-key": "widget-secret",
+      "data-prompt-context": '{"product.sku":"A-100","customer.tier":"vip"}',
+    })
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("prompt_context_request")
+
+    expect(postToIframe).toHaveBeenCalledWith(
+      {
+        xagent: true,
+        v: 1,
+        type: "prompt_context",
+        values: { "product.sku": "A-100", "customer.tier": "vip" },
+      },
+      HOST,
+    )
+  })
+
+  it("reads data-prompt-context when the request arrives, not at load", () => {
+    runWidget()
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    document.currentScript!.setAttribute("data-prompt-context", '{"late":"value"}')
+    fromIframe("prompt_context_request")
+
+    expect(postToIframe).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "prompt_context", values: { late: "value" } },
+      HOST,
+    )
+  })
+
+  it("warns once and replies values: null for invalid JSON or an array", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    runWidget({ "data-widget-key": "widget-secret", "data-prompt-context": "not json" })
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("prompt_context_request")
+    document.currentScript!.setAttribute("data-prompt-context", '["A-100"]')
+    fromIframe("prompt_context_request")
+
+    expect(postToIframe).toHaveBeenCalledTimes(2)
+    expect(postToIframe.mock.calls[0][0]).toMatchObject({ values: null })
+    expect(postToIframe.mock.calls[1][0]).toMatchObject({ values: null })
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(warn.mock.calls[0][0]).toContain("Xagent Widget:")
+  })
+
+  it("replies values: null for a missing data-prompt-context attribute", () => {
+    runWidget()
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("prompt_context_request")
+
+    expect(postToIframe).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "prompt_context", values: null },
+      HOST,
+    )
+  })
+
+  it("never replies in session mode", () => {
+    runWidget({
+      "data-encrypted-context": "grant",
+      "data-prompt-context": '{"product.sku":"A-100"}',
+    })
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("prompt_context_request")
+
+    expect(postToIframe).not.toHaveBeenCalled()
+  })
+
+  it("ignores a prompt_context_request from a different source or origin", () => {
+    runWidget({ "data-widget-key": "widget-secret", "data-prompt-context": '{"a":"b"}' })
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "prompt_context_request" },
+      origin: HOST,
+      source: window,
+    }))
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "prompt_context_request" },
+      origin: "https://evil.example",
+      source: iframeEl()!.contentWindow,
+    }))
+
+    expect(postToIframe).not.toHaveBeenCalled()
+  })
+
+  it("never puts prompt context values in the iframe URL", async () => {
+    runWidget({
+      "data-widget-key": "widget-secret",
+      "data-prompt-context": '{"product.sku":"SKU-IN-URL-SENTINEL"}',
+    })
+
+    await vi.waitFor(() => {
+      expect(iframeEl()!.src).toContain("embed_ticket=t")
+    })
+    expect(iframeEl()!.src).not.toContain("SKU-IN-URL-SENTINEL")
   })
 
   it("expands the panel when the iframe posts widget_expand", () => {

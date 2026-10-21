@@ -143,6 +143,16 @@ class TaskCreateRequest(BaseModel):
         return data
 
 
+class WidgetTaskCreateRequest(TaskCreateRequest):
+    """Widget guest task create body.
+
+    The only task-create entry point that accepts top-level prompt-context
+    values; they are always unsigned and server-filtered.
+    """
+
+    prompt_context: Optional[Dict[str, Any]] = None
+
+
 class TaskCreateResponse(BaseModel):
     """Create task response"""
 

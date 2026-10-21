@@ -23,6 +23,13 @@ const app = vi.hoisted(() => ({
     onSend?: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     voiceInputEnabled?: boolean
   },
+  conversationPanelProps: null as null | {
+    onSend?: (
+      message: string,
+      config?: Record<string, string>,
+      files?: File[],
+    ) => Promise<void> | void
+  },
 }))
 
 const i18n = vi.hoisted(() => ({ t: (key: string) => key }))
@@ -80,9 +87,19 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({
-  TaskConversationPanel: ({ showProcessView }: { showProcessView?: boolean }) => (
-    <div data-testid="conversation-panel" data-show-process-view={String(showProcessView)} />
-  ),
+  TaskConversationPanel: (props: {
+    showProcessView?: boolean
+    onSend?: (
+      message: string,
+      config?: Record<string, string>,
+      files?: File[],
+    ) => Promise<void> | void
+  }) => {
+    app.conversationPanelProps = props
+    return (
+      <div data-testid="conversation-panel" data-show-process-view={String(props.showProcessView)} />
+    )
+  },
 }))
 
 vi.mock("@/lib/utils", async () => {
@@ -240,6 +257,7 @@ describe("PublicAgentChatPage", () => {
     app.rerender = null
     app.provider = null
     app.startScreenProps = null
+    app.conversationPanelProps = null
     sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
@@ -531,6 +549,142 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
     expect(app.setTaskId).toHaveBeenCalledWith(42, { navigate: false })
+  })
+
+  function dispatchPromptContext(
+    values: unknown,
+    source: MessageEventSource = window.parent as unknown as MessageEventSource,
+  ) {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "prompt_context", values },
+      source,
+    }))
+  }
+
+  function stubParent(reply?: () => unknown) {
+    const postMessage = vi.fn((message: { type?: string }) => {
+      if (message.type === "prompt_context_request" && reply) {
+        dispatchPromptContext(reply())
+      }
+    })
+    vi.stubGlobal("parent", { postMessage })
+    return postMessage
+  }
+
+  it("does not request prompt context on mount", async () => {
+    const parentPost = stubParent()
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+
+    renderWidgetPage()
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    expect(parentPost.mock.calls.filter(([data]) => data.type === "prompt_context_request")).toEqual([])
+  })
+
+  it("includes the values returned at send time in the create body", async () => {
+    const parentPost = stubParent(() => ({ "product.sku": "B-200" }))
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(46, "pending")))
+
+    renderWidgetPage({ widgetKey: "widget-secret" })
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    fireEvent.click(screen.getByRole("button", { name: "start:Support Agent" }))
+
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(46, { navigate: false })
+    })
+    expect(parentPost).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "prompt_context_request" },
+      "*",
+    )
+    const createBody = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(createBody.prompt_context).toEqual({ "product.sku": "B-200" })
+  })
+
+  it("uses newly returned values after starting a new conversation", async () => {
+    let reply: Record<string, unknown> = { "product.sku": "A-100" }
+    stubParent(() => reply)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(46, "pending")))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(50, "pending")))
+
+    renderWidgetPage({ widgetKey: "widget-secret" })
+    fireEvent.click(await screen.findByRole("button", { name: "start:Support Agent" }))
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(46, { navigate: false })
+    })
+
+    reply = { "product.sku": "B-200" }
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.newConversation" }))
+    fireEvent.click(await screen.findByRole("button", { name: "start:Support Agent" }))
+
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(50, { navigate: false })
+    })
+    const secondCreateBody = JSON.parse(fetchMock.mock.calls[2][1].body)
+    expect(secondCreateBody.prompt_context).toEqual({ "product.sku": "B-200" })
+  })
+
+  it("neither requests nor sends prompt context in share mode", async () => {
+    const parentPost = stubParent(() => ({ "product.sku": "A-100" }))
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(48, "pending")))
+
+    renderSharePage()
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    expect(parentPost.mock.calls.filter(([data]) => data.type === "prompt_context_request")).toEqual([])
+    fireEvent.click(screen.getByRole("button", { name: "start:Support Agent" }))
+
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(48, { navigate: false })
+    })
+    const createBody = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(createBody.prompt_context).toBeUndefined()
+  })
+
+  it("omits prompt context from follow-up messages", async () => {
+    const parentPost = stubParent(() => ({ "product.sku": "A-100" }))
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(49, "pending")))
+
+    renderWidgetPage({ widgetKey: "widget-secret" })
+    fireEvent.click(await screen.findByRole("button", { name: "start:Support Agent" }))
+
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(49, { navigate: false })
+    })
+    const createBody = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(createBody.prompt_context).toEqual({ "product.sku": "A-100" })
+
+    app.sendMessage.mockClear()
+    fetchMock.mockClear()
+    parentPost.mockClear()
+    await app.conversationPanelProps!.onSend!("follow up", { mode: "balanced" }, [])
+
+    expect(app.sendMessage).toHaveBeenCalledWith("follow up", { mode: "balanced" }, [])
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(parentPost).not.toHaveBeenCalled()
+  })
+
+  it("creates the task without prompt context when the parent never replies", async () => {
+    stubParent()
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(51, "pending")))
+
+    renderWidgetPage({ widgetKey: "widget-secret" })
+    fireEvent.click(await screen.findByRole("button", { name: "start:Support Agent" }))
+
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(51, { navigate: false })
+    }, { timeout: 2000 })
+    const createBody = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect(createBody.prompt_context).toBeUndefined()
   })
 
   it("omits the timezone from the opening turn when the browser resolves none", async () => {

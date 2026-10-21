@@ -13,6 +13,7 @@ export type WidgetParentMessageType =
   | "widget_chrome_not_ready"
   | "widget_expand"
   | "widget_collapse"
+  | "prompt_context_request"
 
 export function postToParentWidget(type: WidgetParentMessageType): void {
   // A direct (non-embedded) visit to this page has window.parent === window;
@@ -22,10 +23,43 @@ export function postToParentWidget(type: WidgetParentMessageType): void {
   }
 }
 
+export function requestPromptContext(
+  timeoutMs = 500,
+): Promise<Record<string, unknown> | null> {
+  if (window.parent === window) return Promise.resolve(null)
+  return new Promise((resolve) => {
+    const finish = (values: Record<string, unknown> | null) => {
+      clearTimeout(timer)
+      window.removeEventListener("message", handleMessage)
+      resolve(values)
+    }
+    const handleMessage = (event: MessageEvent) => {
+      if (event.source !== window.parent) return
+      const data: unknown = event.data
+      if (
+        !data || typeof data !== "object"
+        || (data as Record<string, unknown>).xagent !== true
+        || (data as Record<string, unknown>).v !== 1
+        || (data as Record<string, unknown>).type !== "prompt_context"
+      ) return
+      const values = (data as Record<string, unknown>).values
+      const proto = values && typeof values === "object" ? Object.getPrototypeOf(values) : undefined
+      if (proto !== Object.prototype && proto !== null) {
+        finish(null)
+        return
+      }
+      finish(values as Record<string, unknown>)
+    }
+    window.addEventListener("message", handleMessage)
+    const timer = setTimeout(() => finish(null), timeoutMs)
+    postToParentWidget("prompt_context_request")
+  })
+}
+
 // The other direction: widget.js can reject a widget_expand (its own mobile
 // guard rejects it) and needs to correct the iframe's optimistic guess about
-// its own state -- this is the only message the host currently ever
-// initiates on this channel. event.source, not origin, is the check here:
+// its own state; prompt_context replies go through requestPromptContext instead.
+// event.source, not origin, is the check here:
 // the embedding page is an arbitrary third-party origin the iframe can't
 // allowlist in advance (unlike the host, which set iframe.src itself and so
 // already knows this iframe's real origin for its own sends).

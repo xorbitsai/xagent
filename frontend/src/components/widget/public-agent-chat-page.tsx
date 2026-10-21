@@ -13,6 +13,7 @@ import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
 import { clientErrorTranslationKey } from "@/lib/client-errors"
 import { normalizeTaskStatus } from "@/lib/task-status"
+import { requestPromptContext } from "@/lib/widget-parent-message"
 import {
   getApiUrl,
 } from "@/lib/utils"
@@ -261,9 +262,15 @@ function PublicConversationContent({
 
     setIsBootstrappingTask(true)
     try {
-      const taskPayload: Record<string, string | number | string[]> = {
+      const taskPayload: Record<string, unknown> = {
         title: message,
         description: message,
+      }
+      if (authMode === "widget") {
+        const promptContext = await requestPromptContext()
+        if (promptContext && Object.keys(promptContext).length > 0) {
+          taskPayload.prompt_context = promptContext
+        }
       }
       // Workforce opening turns start inside this request and never reach
       // sendChatMessage, so the zone has to ride along here or the first

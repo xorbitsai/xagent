@@ -1,4 +1,4 @@
-"""A process at its dispatch cap gives up ownership of tasks it will not run."""
+"""A process at its dispatch cap or batch line gives up ownership of tasks it will not run."""
 
 # Pytest fixture imports are intentionally shadowed by test parameters.
 # ruff: noqa: F811
@@ -23,6 +23,10 @@ from xagent.web.models.task_admission import TaskAdmissionBucket, TaskAdmissionT
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services import task_command_transport as transport
 from xagent.web.services import task_coordinator_runtime as runtime
+from xagent.web.services.task_dispatch_cap import (
+    DISPATCH_CLASS_BATCH,
+    DISPATCH_CLASS_INTERACTIVE,
+)
 
 
 def record_idle_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -398,16 +402,16 @@ async def test_full_process_hands_held_start_to_other_runners(
     assert other_runner_candidate(host, started[neighbour]) is None
 
 
-async def test_batch_line_releases_an_idle_task_that_this_process_can_still_start(
+async def test_batch_line_keeps_an_idle_task_whose_interactive_start_this_process_can_start(
     cap_host: CapHost,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """On the batch line the idle check releases a task as for a batch command.
+    """On the batch line an interactive earliest command keeps the task here.
 
-    The task's queued command is interactive and this process could still start
-    it, so releasing is coarser than necessary; the released command stays
-    claimable here and anywhere else with room.
+    This process still starts interactive commands, so the idle check leaves
+    the lease with it and it starts the command itself; no other process can
+    claim the command meanwhile.
     """
 
     host = cap_host
@@ -425,15 +429,202 @@ async def test_batch_line_releases_an_idle_task_that_this_process_can_still_star
     coordinator._ensure_idle_check()
     await eventually(lambda: outcomes)
 
-    assert outcomes[0] == "released"
-    assert lease_runner(host, target) is None
-    assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == [
-        f"Task {target} lease released by runner worker at its dispatch cap or "
-        "batch line (limit=3, active=2); 1 queued execution command(s) left for "
-        "a process with a free slot"
-    ]
-    assert other_runner_candidate(host, start) == start
+    assert outcomes[0] == "busy"
+    assert lease_runner(host, target) == "worker"
+    assert [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()] == []
+    assert other_runner_candidate(host, start) is None
     assert await asyncio.wait_for(
         transport.dispatch_one_task_command(host.handler), DB_PROGRESS_TIMEOUT
     )
     assert host.claimed == [(target, transport.TaskCommandKind.START)]
+
+
+LINE = (3, 1, 2)  # limit, interactive reserve, other active tasks
+FULL = (2, 1, 2)
+FULL_NO_RESERVE = (1, 0, 1)
+
+# id, cap (limit, reserve, other active), task status,
+# rows (kind, status, attempts, dispatch class), outcome, held rows logged
+EARLIEST_COMMAND_ROWS = [
+    (
+        "batch-line-no-unfinished-command",
+        LINE,
+        TaskStatus.COMPLETED,
+        [("start", "completed", 0, DISPATCH_CLASS_BATCH)],
+        "released",
+        0,
+    ),
+    (
+        "batch-line-batch-start",
+        LINE,
+        TaskStatus.PENDING,
+        [("start", "pending", 0, DISPATCH_CLASS_BATCH)],
+        "released",
+        1,
+    ),
+    (
+        "batch-line-interactive-start-claimed-once",
+        LINE,
+        TaskStatus.PENDING,
+        [("start", "pending", 1, DISPATCH_CLASS_INTERACTIVE)],
+        "busy",
+        0,
+    ),
+    (
+        "batch-line-interactive-start-then-batch-message",
+        LINE,
+        TaskStatus.PENDING,
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+            ("message", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
+        "busy",
+        0,
+    ),
+    (
+        "batch-line-batch-start-then-interactive-answer",
+        LINE,
+        TaskStatus.PENDING,
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_BATCH),
+            ("resume_input", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+        ],
+        "released",
+        2,
+    ),
+    (
+        "batch-line-batch-start-then-cancel",
+        LINE,
+        TaskStatus.PENDING,
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_BATCH),
+            ("cancel", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
+        "busy",
+        0,
+    ),
+    (
+        "batch-line-batch-start-answer-cancel",
+        LINE,
+        TaskStatus.PENDING,
+        [
+            ("start", "pending", 0, DISPATCH_CLASS_BATCH),
+            ("resume_input", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+            ("cancel", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
+        "busy",
+        0,
+    ),
+    (
+        "batch-line-completed-batch-start-then-interactive-message",
+        LINE,
+        TaskStatus.COMPLETED,
+        [
+            ("start", "completed", 0, DISPATCH_CLASS_BATCH),
+            ("message", "pending", 0, DISPATCH_CLASS_INTERACTIVE),
+        ],
+        "busy",
+        0,
+    ),
+    (
+        "batch-line-completed-interactive-start-then-batch-message",
+        LINE,
+        TaskStatus.COMPLETED,
+        [
+            ("start", "completed", 0, DISPATCH_CLASS_INTERACTIVE),
+            ("message", "pending", 0, DISPATCH_CLASS_BATCH),
+        ],
+        "released",
+        1,
+    ),
+    (
+        "batch-line-running-task",
+        LINE,
+        TaskStatus.RUNNING,
+        [("start", "pending", 0, DISPATCH_CLASS_BATCH)],
+        "busy",
+        0,
+    ),
+    (
+        "cap-with-reserve-interactive-start",
+        FULL,
+        TaskStatus.PENDING,
+        [("start", "pending", 0, DISPATCH_CLASS_INTERACTIVE)],
+        "released",
+        1,
+    ),
+    (
+        "cap-without-reserve-interactive-start",
+        FULL_NO_RESERVE,
+        TaskStatus.PENDING,
+        [("start", "pending", 0, DISPATCH_CLASS_INTERACTIVE)],
+        "released",
+        1,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "cap,status,rows,expected,logged",
+    [row[1:] for row in EARLIEST_COMMAND_ROWS],
+    ids=[row[0] for row in EARLIEST_COMMAND_ROWS],
+)
+async def test_idle_check_follows_the_earliest_command_of_the_task(
+    cap_host: CapHost,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cap: tuple[int, int, int],
+    status: TaskStatus,
+    rows: list[tuple[str, str, int, str]],
+    expected: str,
+    logged: int,
+) -> None:
+    """At the cap every queued execution is held back.
+
+    On the batch line they are held only when the task's earliest unfinished
+    command is a pending batch execution.
+    """
+
+    host = cap_host
+    limit, reserve, other_active = cap
+    set_limit(monkeypatch, limit)
+    monkeypatch.setenv(
+        "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS", str(reserve)
+    )
+    for _ in range(other_active):
+        host.live(host.new_task())
+    target = host.new_task(status=status)
+    ids = [
+        add_command(host, target, kind, status=s, attempts=a, dispatch_class=c)
+        for kind, s, a, c in rows
+    ]
+    unfinished = [
+        command_id for command_id, (_, s, _, _) in zip(ids, rows) if s != "completed"
+    ]
+    outcomes = record_idle_outcomes(monkeypatch)
+    caplog.set_level(logging.INFO, logger=runtime.logger.name)
+
+    coordinator = await host.registry.ensure(target)
+    assert coordinator is not None
+    coordinator._ensure_idle_check()
+    await eventually(lambda: outcomes)
+
+    assert outcomes[0] == expected
+    cap_lines = [r.getMessage() for r in caplog.records if CAP_LOG in r.getMessage()]
+    assert cap_lines == (
+        [
+            f"Task {target} lease released by runner worker at its dispatch cap or "
+            f"batch line (limit={limit}, active={other_active}); {logged} queued "
+            "execution command(s) left for a process with a free slot"
+        ]
+        if logged
+        else []
+    )
+    first = unfinished[0] if unfinished else None
+    if expected == "released":
+        assert lease_runner(host, target) is None
+        if first is not None:
+            assert other_runner_candidate(host, first) == first
+    else:
+        assert lease_runner(host, target) == "worker"
+        assert other_runner_candidate(host, first) is None

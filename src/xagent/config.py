@@ -178,6 +178,8 @@ _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
 LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
+AUTO_PRIMARY_MAX_ATTEMPTS = "XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS"
+AUTO_CANDIDATE_COOLDOWN_SECONDS = "XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS"
 LLM_STREAM_EMPTY_DELTA_LIMIT = "XAGENT_LLM_STREAM_EMPTY_DELTA_LIMIT"
 LLM_STREAM_DEGENERATE_WINDOW = "XAGENT_LLM_STREAM_DEGENERATE_WINDOW"
 LLM_STREAM_DEGENERATE_MAX_PERIOD = "XAGENT_LLM_STREAM_DEGENERATE_MAX_PERIOD"
@@ -3523,6 +3525,49 @@ def get_llm_capacity_max_attempts() -> int:
         values fall back to the default.
     """
     return _get_positive_int_env(LLM_CAPACITY_MAX_ATTEMPTS, 2)
+
+
+def get_auto_primary_max_attempts() -> int:
+    """Get the attempt budget for an Auto candidate that has a fallback.
+
+    When a configured Auto call can move to its fallback (one is set and
+    supports the request's input), the routed candidate stops after this
+    many attempts and the request goes to the fallback instead, so an
+    outage costs seconds rather than the whole retry deadline. A call that
+    cannot move keeps the candidate's own ``max_retries``. The fallback itself keeps its own ``max_retries``. Only
+    ever lowers a candidate's ceiling -- it cannot raise it above that
+    candidate's ``max_retries``.
+
+    Priority:
+        1. XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS environment variable
+        2. 2
+
+    Returns:
+        Attempts allowed for the routed candidate; invalid or non-positive
+        values fall back to the default.
+    """
+    return _get_positive_int_env(AUTO_PRIMARY_MAX_ATTEMPTS, 2)
+
+
+def get_auto_candidate_cooldown_seconds() -> float:
+    """Get how long a failed Auto candidate is skipped in favour of the fallback.
+
+    After a routed candidate fails with an availability failure (provider
+    down, timeout, quota, rejected credential, missing model; not a rate
+    limit, which clears within seconds),
+    this process sends requests routed to it straight to the fallback for
+    this long, then tries the candidate again. The state is per process.
+
+    Priority:
+        1. XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS environment variable
+        2. 300
+
+    Returns:
+        Cooldown in seconds; invalid or non-positive values fall back to
+        the default.
+    """
+    cooldown = _get_positive_float_env(AUTO_CANDIDATE_COOLDOWN_SECONDS, 300.0)
+    return 300.0 if cooldown is None else cooldown
 
 
 def get_llm_stream_empty_delta_limit() -> int:

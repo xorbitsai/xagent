@@ -1010,6 +1010,29 @@
   // <html>'s own childList changes when body itself is swapped out.
   panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
 
+  // Read when a conversation is created (not at load) so a host SPA can still
+  // update the attribute before the visitor starts chatting.
+  var promptContextWarned = false;
+  function readPromptContext() {
+    var raw = scriptTag.getAttribute('data-prompt-context');
+    if (raw === null) return null;
+    var parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      parsed = null;
+    }
+    // Entries are not checked here; the server filter drops undeclared or unusable ones.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (!promptContextWarned) {
+        promptContextWarned = true;
+        console.warn('Xagent Widget: data-prompt-context must be a JSON object; ignoring it.');
+      }
+      return null;
+    }
+    return parsed;
+  }
+
   // The header's close control lives inside the iframe's React app and has
   // no direct handle to panel/fab, so it signals intent back here over
   // postMessage instead. Named (not inline) so panelRemovalObserver can
@@ -1042,6 +1065,14 @@
       }
     } else if (data.type === 'widget_collapse') {
       collapsePanel();
+    } else if (data.type === 'prompt_context_request') {
+      // Only the guest channel filters unsigned values; the signed Session
+      // path lands later, so Session mode stays silent.
+      if (!mode.guest) return;
+      iframe.contentWindow.postMessage(
+        { xagent: true, v: 1, type: 'prompt_context', values: readPromptContext() },
+        host
+      );
     }
   }
   window.addEventListener('message', onChromeMessage);
@@ -1058,6 +1089,7 @@
     }
 
     return {
+      guest: true,
       attach: function (iframe) {
         // Generate guest_id if not exists
         var guestId = localStorage.getItem('xagent_guest_id');

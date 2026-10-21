@@ -216,6 +216,9 @@ export default defineConfig({
       "src/lib/connector-runtime-api.test.ts",
       "src/lib/files-disabled-presentation.test.ts",
       "src/lib/remark-currency-safe-math.test.ts",
+      "src/lib/prompt-context-fields.test.ts",
+      "src/components/build/agent-builder-prompt-context-fields.test.tsx",
+      "src/lib/widget-parent-message.test.ts",
     ],
   },
 })

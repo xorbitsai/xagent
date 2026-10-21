@@ -261,3 +261,27 @@ class TestRetryAfterHttpDate:
         error = _status_error(429, "slow down", headers={"retry-after": "soon"})
 
         assert retry_after_seconds(error) is None
+
+
+def test_failover_limit_applies_only_to_matching_failures() -> None:
+    def matches(error: BaseException) -> bool:
+        return isinstance(error, ConnectionError)
+
+    budget = RetryBudget(failover_max_attempts=2, failover_matches=matches)
+
+    assert budget.attempt_limit(ConnectionError("down")) == 2
+    assert budget.attempt_limit(RuntimeError("empty content")) is None
+
+
+def test_failover_and_capacity_limits_take_the_lower_ceiling() -> None:
+    budget = RetryBudget(
+        capacity_max_attempts=3,
+        failover_max_attempts=2,
+        failover_matches=lambda _error: True,
+    )
+
+    assert budget.attempt_limit(RuntimeError("model is overloaded")) == 2
+    assert (
+        RetryBudget(failover_max_attempts=2).attempt_limit(ConnectionError("down"))
+        is None
+    )

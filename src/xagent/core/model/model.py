@@ -49,6 +49,10 @@ class ChatModelConfig(ModelConfig):
     router_config_name: Optional[str] = None
     router_candidate_models: Optional[List[str]] = None
     router_fallback_model: Optional[str] = None
+    # Runtime-only: set by configured Auto on a candidate whose call can move
+    # to the fallback, so the failures that would move it stop retrying after
+    # this many attempts. Other failures keep ``max_retries``.
+    auto_failover_max_attempts: Optional[int] = None
     # Runtime-only, and deliberately narrow: not a general "no ambient
     # credentials" switch. When set, ``create_base_llm`` refuses a missing or
     # placeholder ``api_key`` (which adapters would otherwise replace from the

@@ -394,6 +394,7 @@ describe("AgentBuilderChat", () => {
     onUpdateConfig: Mock<(config: Partial<AgentConfig>) => void>,
     toolParams: Record<string, unknown>,
     storedCategories: string[] | null,
+    toolName = "update_agent",
   ) => {
     render(
       <AgentBuilderChat agentConfig={agentConfig} onUpdateConfig={onUpdateConfig} />
@@ -414,7 +415,7 @@ describe("AgentBuilderChat", () => {
         step_id: "react-1",
         timestamp: 3,
         data: {
-          tool_name: "update_agent",
+          tool_name: toolName,
           tool_params: { agent_id: 7, ...toolParams },
           result: { status: "success", agent_id: 7, tool_categories: storedCategories },
         },
@@ -443,6 +444,14 @@ describe("AgentBuilderChat", () => {
   ])("leaves the unsaved selection alone on %s", async (_label, toolParams, stored) => {
     const updates = await emitAgentToolEnd(vi.fn(), toolParams, stored)
     expect(updates.some((arg) => arg?.selectedToolCategories !== undefined)).toBe(false)
+  })
+
+  it.each([
+    ["create_agent", true],
+    ["update_agent", undefined],
+  ])("marks only a %s result as created", async (toolName, created) => {
+    const updates = await emitAgentToolEnd(vi.fn(), { name: "Agent" }, null, toolName)
+    expect(updates.find((arg) => arg?.id !== undefined)?.created).toBe(created)
   })
 
   it("passes failed task completion status into the process renderer", async () => {

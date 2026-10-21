@@ -50,6 +50,8 @@ const updateLastAssistantMessage = (
 
 export interface AgentConfig {
   id?: number | string
+  // Only on a create_agent result: the id names a new agent rather than one being updated.
+  created?: boolean
   name: string
   description: string
   instructions: string
@@ -406,6 +408,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
                       }
                       if (result.agent_id) {
                         configUpdates.id = result.agent_id;
+                        if (data.data.tool_name === "create_agent") configUpdates.created = true;
                       }
                       if (Object.keys(configUpdates).length > 0) {
                         onUpdateConfig(configUpdates);

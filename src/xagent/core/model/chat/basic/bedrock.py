@@ -50,15 +50,17 @@ _RETRYABLE_CODES = frozenset(
         "ThrottlingException",
     }
 )
-_RETRYABLE_STREAM_EVENTS = frozenset(
-    {
-        "internalServerException",
-        "modelStreamErrorException",
-        "modelTimeoutException",
-        "serviceUnavailableException",
-        "throttlingException",
-    }
-)
+# The HTTP status each retryable ConverseStream exception event stands for.
+# An in-band event carries no response metadata, so the raised error is given
+# this status for provider-failure classification (Auto failover, the call
+# boundary); the event's text stays out of it.
+_RETRYABLE_STREAM_EVENTS = {
+    "internalServerException": 500,
+    "modelStreamErrorException": 500,
+    "modelTimeoutException": 408,
+    "serviceUnavailableException": 503,
+    "throttlingException": 429,
+}
 _IMAGE_MEDIA_TYPES = {
     "image/png": "png",
     "image/jpeg": "jpeg",
@@ -1114,7 +1116,9 @@ class BedrockLLM(BaseLLM):
                         f"{redact_sensitive_text(str(message))}"
                     )
                     if key in _RETRYABLE_STREAM_EVENTS:
-                        raise LLMRetryableError(detail)
+                        error = LLMRetryableError(detail)
+                        error.status_code = _RETRYABLE_STREAM_EVENTS[key]  # type: ignore[attr-defined]
+                        raise error
                     raise RuntimeError(detail)
                 elif "messageStart" not in event:
                     raise RuntimeError("Bedrock stream returned an unknown event")

@@ -26,7 +26,7 @@ from ..models.database import get_db
 from ..models.deployment import DeploymentOwnerType
 from ..models.user import User
 from ..models.workforce import Workforce
-from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..schemas.chat import TaskCreateResponse, WidgetTaskCreateRequest
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
 from ..services.share_rate_limit import (
     get_share_rate_limiter,
@@ -582,7 +582,7 @@ async def upload_widget_file(
 
 @widget_router.post("/chat/task/create", response_model=TaskCreateResponse)
 async def create_widget_task(
-    request: TaskCreateRequest,
+    request: WidgetTaskCreateRequest,
     http_request: Request,
     widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
     db: Session = Depends(get_db),
@@ -613,6 +613,7 @@ async def create_widget_task(
         db=db,
         default_channel_name="Web Widget",
         client_ip=client_ip,
+        prompt_context=request.prompt_context,
     )
 
 

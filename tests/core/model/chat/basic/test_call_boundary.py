@@ -16,6 +16,12 @@ from typing import Any, AsyncIterator, List
 
 import httpx
 import pytest
+from botocore.exceptions import (
+    ClientError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 from google.genai import errors as genai_errors
 
 from xagent.core.model.chat.basic import call_boundary as call_boundary_module
@@ -39,6 +45,7 @@ from xagent.core.model.chat.basic.call_boundary import (
     UnavailableVisionModel,
     classify_provider_failure,
     guard_llm_calls,
+    names_output_budget,
 )
 from xagent.core.model.chat.error import is_context_length_error
 from xagent.core.model.chat.exceptions import (
@@ -638,6 +645,84 @@ class TestTransient:
         assert ProviderCallError(RATE_LIMITED).transient is False
 
 
+class _StatusError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status
+
+
+_AFFORDABILITY_402 = _StatusError(
+    402,
+    "This request requires more credits, or fewer max_tokens. "
+    "You requested up to 8000 tokens, but can only afford 1500.",
+)
+
+
+class TestBotocoreFailures:
+    """Bedrock surfaces botocore errors, which keep their status in a dict."""
+
+    @pytest.mark.parametrize(
+        ("error", "code"),
+        [
+            (
+                ClientError(
+                    {
+                        "Error": {"Code": "ServiceUnavailableException"},
+                        "ResponseMetadata": {"HTTPStatusCode": 503},
+                    },
+                    "Converse",
+                ),
+                PROVIDER_UNAVAILABLE,
+            ),
+            (
+                ClientError(
+                    {
+                        "Error": {"Code": "ThrottlingException"},
+                        "ResponseMetadata": {"HTTPStatusCode": 429},
+                    },
+                    "Converse",
+                ),
+                RATE_LIMITED,
+            ),
+            (
+                EndpointConnectionError(endpoint_url="https://bedrock"),
+                PROVIDER_UNAVAILABLE,
+            ),
+            (ReadTimeoutError(endpoint_url="https://bedrock"), TIMEOUT),
+            (ConnectTimeoutError(endpoint_url="https://bedrock"), TIMEOUT),
+        ],
+    )
+    def test_botocore_failures_are_classified(self, error, code):
+        assert classify_provider_failure(error) == code
+
+
+class TestBudgetSensitive:
+    @pytest.mark.parametrize(
+        ("error", "code", "budget_sensitive"),
+        [
+            # OpenRouter's affordability refusal: a smaller budget fixes it.
+            (_AFFORDABILITY_402, PROVIDER_QUOTA, True),
+            # An exhausted account says nothing about the output budget.
+            (_StatusError(402, "insufficient_quota"), PROVIDER_QUOTA, False),
+            (_StatusError(429, "slow down"), RATE_LIMITED, False),
+        ],
+    )
+    async def test_budget_refusals_are_flagged_without_their_text(
+        self, error, code, budget_sensitive
+    ):
+        llm = guard_llm_calls(FakeLLM(behaviour=error), call_scope=ScopeProbe())
+        with pytest.raises(ProviderCallError) as caught:
+            await llm.chat(MESSAGES)
+        _assert_safe(caught.value)
+        assert caught.value.code == code
+        assert caught.value.budget_sensitive is budget_sensitive
+        assert names_output_budget(caught.value) is budget_sensitive
+        assert names_output_budget(error) is budget_sensitive
+
+    def test_the_flag_is_off_by_default(self):
+        assert ProviderCallError(PROVIDER_QUOTA).budget_sensitive is False
+
+
 class TestNestedBoundaries:
     async def test_an_inner_boundary_keeps_its_code_and_both_scopes_run(self):
         outer_probe, inner_probe = ScopeProbe(), ScopeProbe()
@@ -667,6 +752,16 @@ class TestNestedBoundaries:
             await llm.chat(MESSAGES)
         assert caught.value.code == PROVIDER_ERROR
         assert caught.value.transient is True
+
+    async def test_the_budget_flag_survives_an_outer_boundary(self):
+        inner = guard_llm_calls(
+            FakeLLM(behaviour=_AFFORDABILITY_402), call_scope=ScopeProbe()
+        )
+        llm = guard_llm_calls(inner, call_scope=ScopeProbe())
+        with pytest.raises(ProviderCallError) as caught:
+            await llm.chat(MESSAGES)
+        assert caught.value.code == PROVIDER_QUOTA
+        assert caught.value.budget_sensitive is True
 
     async def test_an_inner_context_length_error_stays_one(self):
         inner = guard_llm_calls(

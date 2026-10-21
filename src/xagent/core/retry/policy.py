@@ -34,6 +34,7 @@ setting; this module only assembles them into a budget.
 
 import email.utils
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ...config import get_llm_capacity_max_attempts, get_llm_retry_deadline_seconds
@@ -147,20 +148,30 @@ class RetryBudget:
 
     ``deadline_seconds`` caps the wall clock of the whole loop.
     ``capacity_max_attempts`` caps the attempts spent on a capacity refusal.
-    Both are optional; an empty budget imposes nothing, which is what every
+    ``failover_max_attempts`` caps the attempts spent on a failure that
+    ``failover_matches`` says the caller can recover from elsewhere (a
+    configured Auto fallback); every other failure keeps the full count.
+    All are optional; an empty budget imposes nothing, which is what every
     caller that does not pass one gets.
     """
 
     deadline_seconds: float | None = None
     capacity_max_attempts: int | None = None
+    failover_max_attempts: int | None = None
+    failover_matches: Callable[[BaseException], bool] | None = None
 
     def attempt_limit(self, error: BaseException) -> int | None:
         """Return a lower attempt ceiling for ``error``, or ``None`` for none."""
-        if self.capacity_max_attempts is None:
-            return None
-        if not is_capacity_error(error):
-            return None
-        return self.capacity_max_attempts
+        limits: list[int] = []
+        if self.capacity_max_attempts is not None and is_capacity_error(error):
+            limits.append(self.capacity_max_attempts)
+        if (
+            self.failover_max_attempts is not None
+            and self.failover_matches is not None
+            and self.failover_matches(error)
+        ):
+            limits.append(self.failover_max_attempts)
+        return min(limits) if limits else None
 
 
 def chat_retry_budget() -> RetryBudget:

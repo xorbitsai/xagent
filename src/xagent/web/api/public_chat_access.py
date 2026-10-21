@@ -43,6 +43,7 @@ from ..services.connector_runtime import (
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.orphan_upload_gc import TASKLESS_SHARE_UPLOAD_SOURCE
+from ..services.prompt_context import build_prompt_context_value
 from ..services.share_rate_limit import (
     entity_rate_limit_key,
     get_share_rate_limiter,
@@ -984,6 +985,7 @@ async def _create_workforce_widget_chat_task(
     access_context: PublicChatAccessContext,
     db: Session,
     client_ip: str | None,
+    prompt_context: dict[str, Any] | None = None,
 ) -> TaskCreateResponse:
     """Guest task creation for a widget-embedded workforce.
 
@@ -1004,6 +1006,14 @@ async def _create_workforce_widget_chat_task(
     workforce = db.query(Workforce).filter(Workforce.id == widget_workforce_id).first()
     if workforce is None:
         raise HTTPException(status_code=403, detail="Widget is unavailable")
+    # Workforce runs have no single agent whose declarations could filter
+    # against, so these values are dropped rather than half-applied.
+    if prompt_context:
+        logger.info(
+            "Workforce widget %s dropped %d prompt_context field(s)",
+            workforce.id,
+            len(prompt_context),
+        )
 
     result = await create_workforce_run(
         db,
@@ -1054,6 +1064,7 @@ async def create_public_chat_task(
     # ``None`` only for a genuinely IP-less path, never by omission. A silent
     # default would degrade the quota to entity-only without anything failing.
     client_ip: str | None,
+    prompt_context: dict[str, Any] | None = None,
 ) -> TaskCreateResponse:
     if request.runtime_extensions:
         raise HTTPException(
@@ -1062,7 +1073,11 @@ async def create_public_chat_task(
         )
     if access_context.widget_workforce_id is not None:
         return await _create_workforce_widget_chat_task(
-            request=request, access_context=access_context, db=db, client_ip=client_ip
+            request=request,
+            access_context=access_context,
+            db=db,
+            client_ip=client_ip,
+            prompt_context=prompt_context,
         )
 
     task_description = request.description or ""
@@ -1108,6 +1123,13 @@ async def create_public_chat_task(
             "selection will be empty",
             access_context.widget_agent_id,
         )
+    if agent is not None and prompt_context is not None:
+        # Unsigned is literal: no widget entry path signs values yet.
+        value = build_prompt_context_value(
+            prompt_context, agent.prompt_context_fields, signed=False
+        )
+        if value is not None:
+            agent_config["prompt_context"] = value
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:
         task_title = task_title[:50] + "..."

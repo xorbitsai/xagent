@@ -43,6 +43,7 @@ from .task_coordinator_service import (
     renew_task_leases_no_commit,
 )
 from .task_dispatch_cap import (
+    DISPATCH_CLASS_BATCH,
     EXECUTION_OPENING_KINDS,
     DispatchCapSnapshot,
     build_dispatch_cap_snapshot,
@@ -633,17 +634,56 @@ class TaskCoordinator:
                 if task is not None and task.status != TaskStatus.RUNNING:
                     release_task_admissions(db, self.lease)
 
+    def _queued_executions_held(
+        self, db: Session, cap: DispatchCapSnapshot | None
+    ) -> bool:
+        """Whether this process will not start the task's queued executions now.
+
+        ``cap`` is the snapshot of a process that starts no new execution for
+        this task as for a batch command, or None. At its dispatch cap the
+        process starts none. At its batch line it still starts interactive
+        commands, and the commands of a task run in order, so the task's
+        earliest unfinished command decides: only a pending batch command that
+        would open an execution holds the commands queued behind it. A cancel
+        or pause behind it is not an execution, so it is not excluded and
+        keeps the task busy.
+        """
+        if cap is None:
+            return False
+        if cap.closed:
+            return True
+        earliest = db.execute(
+            select(
+                TaskExecutionCommand.kind,
+                TaskExecutionCommand.status,
+                TaskExecutionCommand.dispatch_class,
+            )
+            .where(
+                TaskExecutionCommand.task_id == self.task_id,
+                TaskExecutionCommand.status.in_(("pending", "processing")),
+            )
+            .order_by(TaskExecutionCommand.id.asc())
+            .limit(1)
+        ).first()
+        return (
+            earliest is not None
+            and earliest.status == "pending"
+            and earliest.kind in EXECUTION_OPENING_KINDS
+            and earliest.dispatch_class == DISPATCH_CLASS_BATCH
+        )
+
     def _release_if_idle(
         self, *, held_by_cap: DispatchCapSnapshot | None = None
     ) -> str:
         """Release the lease unless the task still has work for this owner.
 
         ``held_by_cap`` is the snapshot of a process that will not start a new
-        execution for this task: at its dispatch cap, or at its batch line
-        (checked as for a batch command). Its pending execution-opening
-        commands would wait here for a free slot, so they do not keep the lease
-        and any process with room may claim them. Not applied to a RUNNING
-        task, whose orphaned row keeps the busy/recover handling.
+        execution for this task as for a batch command: at its dispatch cap, or
+        at its batch line. When ``_queued_executions_held`` says this process
+        will not start the task's queued executions now, its pending
+        execution-opening commands do not keep the lease and any process with
+        room may claim them. Not applied to a RUNNING task, whose orphaned row
+        keeps the busy/recover handling.
         """
         assert self.lease is not None
         with self._registry.session_factory() as db, db.begin():
@@ -663,9 +703,9 @@ class TaskCoordinator:
                 TaskExecutionCommand.kind.in_(sorted(EXECUTION_OPENING_KINDS)),
             )
             exclude_held = (
-                held_by_cap is not None
-                and task is not None
+                task is not None
                 and task.status != TaskStatus.RUNNING
+                and self._queued_executions_held(db, held_by_cap)
             )
             if exclude_held:
                 unfinished = unfinished.where(~held_execution)

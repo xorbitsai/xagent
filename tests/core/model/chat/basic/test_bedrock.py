@@ -1036,3 +1036,97 @@ async def test_client_error_is_redacted_and_transient_failures_are_retryable():
     assert "very-secret" not in str(raised.value)
     assert "also-secret" not in str(raised.value)
     assert "ThrottlingException" in str(raised.value)
+
+
+_HI = [{"role": "user", "content": "hi"}]
+_HI_REQUEST = {
+    "modelId": "model",
+    "messages": [{"role": "user", "content": [{"text": "hi"}]}],
+    "inferenceConfig": {"maxTokens": 4096},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "status", "failure"),
+    [
+        ("ServiceUnavailableException", 503, "provider_unavailable"),
+        ("InternalServerException", 500, "provider_unavailable"),
+        ("ThrottlingException", 429, "rate_limited"),
+        ("AccessDeniedException", 403, "credential_rejected"),
+    ],
+)
+async def test_converse_outages_reach_the_auto_failover_vocabulary(
+    code, status, failure
+):
+    from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
+    from xagent.core.model.chat.basic.router import is_auto_failover_failure
+
+    client = _runtime_client()
+    stubber = Stubber(client)
+    stubber.add_client_error(
+        "converse",
+        service_error_code=code,
+        service_message="unavailable",
+        http_status_code=status,
+        expected_params=_HI_REQUEST,
+    )
+    stubber.activate()
+    llm = BedrockLLM("model", client=client)
+
+    with pytest.raises(Exception) as raised:
+        await llm.chat(_HI)
+
+    assert classify_provider_failure(raised.value) == failure
+    assert is_auto_failover_failure(raised.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "failure"),
+    [
+        ("serviceUnavailableException", "provider_unavailable"),
+        ("internalServerException", "provider_unavailable"),
+        ("modelStreamErrorException", "provider_unavailable"),
+        ("throttlingException", "rate_limited"),
+        ("modelTimeoutException", "timeout"),
+    ],
+)
+async def test_converse_stream_outage_events_reach_the_auto_failover_vocabulary(
+    event, failure
+):
+    from xagent.core.model.chat.basic.call_boundary import classify_provider_failure
+    from xagent.core.model.chat.basic.router import is_auto_failover_failure
+
+    stream = _FakeEventStream([{event: {"message": "secret detail"}}])
+    llm = BedrockLLM("model", client=_FakeClient(stream))
+
+    with pytest.raises(Exception) as raised:
+        async for _chunk in llm.stream_chat(_HI):
+            pass
+
+    assert type(raised.value).__name__ == "LLMRetryableError"
+    assert classify_provider_failure(raised.value) == failure
+    assert is_auto_failover_failure(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_empty_bedrock_output_is_retryable_but_not_an_outage():
+    from xagent.core.model.chat.basic.router import is_auto_failover_failure
+
+    client = _FakeConverseClient(
+        [
+            {
+                "output": {"message": {"role": "assistant", "content": []}},
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 0, "totalTokens": 1},
+            }
+        ]
+    )
+    llm = BedrockLLM("model", client=client)
+
+    with pytest.raises(Exception) as raised:
+        await llm.chat(_HI)
+
+    assert type(raised.value).__name__ == "LLMRetryableError"
+    assert not is_auto_failover_failure(raised.value)

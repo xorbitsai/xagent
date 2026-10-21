@@ -141,10 +141,16 @@ _SAFE_MESSAGES = {
 _CREDENTIAL_ERROR_NAMES = frozenset({"AuthenticationError", "PermissionDeniedError"})
 _RATE_LIMIT_ERROR_NAMES = frozenset({"RateLimitError"})
 _NOT_FOUND_ERROR_NAMES = frozenset({"NotFoundError"})
-_TIMEOUT_ERROR_NAMES = frozenset({"APITimeoutError", "LLMTimeoutError"})
+# botocore's transport errors (Bedrock) are named here too: they subclass
+# neither the builtin ConnectionError/TimeoutError nor httpx's types.
+_TIMEOUT_ERROR_NAMES = frozenset(
+    {"APITimeoutError", "LLMTimeoutError", "ConnectTimeoutError", "ReadTimeoutError"}
+)
 _UNAVAILABLE_ERROR_NAMES = frozenset(
     {
         "APIConnectionError",
+        "ConnectionClosedError",
+        "EndpointConnectionError",
         "InternalServerError",
         "OverloadedError",
         "ServiceUnavailableError",
@@ -178,11 +184,18 @@ class ProviderCallError(RuntimeError):
     already spent -- and the provider did not name the output budget as the
     problem. A caller that steps its budget down after a failure (the
     runtime's compaction-summary ladder) stops on it.
+
+    ``budget_sensitive`` is a text-free flag: the provider named the output
+    budget (for example OpenRouter's 402 "fewer max_tokens"), so the same
+    request with a smaller budget may succeed. See :func:`names_output_budget`.
     """
 
-    def __init__(self, code: str, *, transient: bool = False) -> None:
+    def __init__(
+        self, code: str, *, transient: bool = False, budget_sensitive: bool = False
+    ) -> None:
         self.code = code if code in PROVIDER_CALL_FAILURE_CODES else PROVIDER_ERROR
         self.transient = bool(transient)
+        self.budget_sensitive = bool(budget_sensitive)
         super().__init__(_SAFE_MESSAGES[self.code])
 
 
@@ -217,7 +230,13 @@ def _http_status(exc: BaseException) -> int | None:
     candidates = [
         getattr(exc, name, None) for name in ("status_code", "code", "status")
     ]
-    candidates.append(getattr(getattr(exc, "response", None), "status_code", None))
+    response = getattr(exc, "response", None)
+    candidates.append(getattr(response, "status_code", None))
+    if isinstance(response, dict):
+        # botocore's ClientError keeps the HTTP status in a response dict.
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, dict):
+            candidates.append(metadata.get("HTTPStatusCode"))
     for value in candidates:
         if (
             isinstance(value, int)
@@ -314,6 +333,22 @@ def _classify_safely(exc: BaseException) -> str:
         return PROVIDER_ERROR
 
 
+def names_output_budget(exc: BaseException) -> bool:
+    """Whether a provider failure names the output budget as the problem.
+
+    Such a refusal is about this request, not the provider's availability: a
+    smaller ``max_tokens`` may succeed. A guarded failure carries the answer
+    as ``ProviderCallError.budget_sensitive``; for a raw one the provider's
+    text is read here and never returned.
+    """
+    if isinstance(exc, ProviderCallError):
+        return exc.budget_sensitive
+    try:
+        return any(_mentions(cause, _BUDGET_MARKERS) for cause in _chain(exc))
+    except Exception:  # noqa: BLE001 - the boundary must not leak on its own failure
+        return False
+
+
 def _retried_as_transient(exc: BaseException) -> bool:
     """Whether the retry predicate treats ``exc`` as transient.
 
@@ -323,9 +358,7 @@ def _retried_as_transient(exc: BaseException) -> bool:
     if not isinstance(exc, Exception):
         return False
     try:
-        return retry_on(exc) and not any(
-            _mentions(cause, _BUDGET_MARKERS) for cause in _chain(exc)
-        )
+        return retry_on(exc) and not names_output_budget(exc)
     except Exception:  # noqa: BLE001 - the boundary must not leak on its own failure
         return False
 
@@ -333,12 +366,17 @@ def _retried_as_transient(exc: BaseException) -> bool:
 class _Failure(NamedTuple):
     code: str
     transient: bool = False
+    budget_sensitive: bool = False
 
 
 def _safe_error(failure: _Failure) -> Exception:
     if failure.code == CONTEXT_LENGTH:
         return ProviderContextLengthError()
-    return ProviderCallError(failure.code, transient=failure.transient)
+    return ProviderCallError(
+        failure.code,
+        transient=failure.transient,
+        budget_sensitive=failure.budget_sensitive,
+    )
 
 
 def _detached_protocol_error(exc: LLMToolProtocolError) -> LLMToolProtocolError:
@@ -467,11 +505,16 @@ class BoundaryLLM(BaseLLM):
                 failure = _Failure(
                     code if code in PROVIDER_CALL_FAILURE_CODES else PROVIDER_ERROR,
                     getattr(exc, "transient", False) is True,
+                    getattr(exc, "budget_sensitive", False) is True,
                 )
             elif isinstance(exc, ProviderContextLengthError):
                 failure = _Failure(CONTEXT_LENGTH)
             else:
-                failure = _Failure(_classify_safely(exc), _retried_as_transient(exc))
+                failure = _Failure(
+                    _classify_safely(exc),
+                    _retried_as_transient(exc),
+                    names_output_budget(exc),
+                )
         except Exception:  # noqa: BLE001 - the boundary must not leak on its own failure
             pass
         try:

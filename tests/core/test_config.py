@@ -2598,6 +2598,44 @@ class TestLlmRetryBudgetConfig:
         monkeypatch.setenv("XAGENT_LLM_CAPACITY_MAX_ATTEMPTS", value)
         assert get_llm_capacity_max_attempts() == 2
 
+    def test_auto_primary_attempts_default(self, monkeypatch):
+        from xagent.config import get_auto_primary_max_attempts
+
+        monkeypatch.delenv("XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS", raising=False)
+        assert get_auto_primary_max_attempts() == 2
+
+    def test_auto_primary_attempts_env_override(self, monkeypatch):
+        from xagent.config import get_auto_primary_max_attempts
+
+        monkeypatch.setenv("XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS", "3")
+        assert get_auto_primary_max_attempts() == 3
+
+    @pytest.mark.parametrize("value", ["", "1.5", "not-a-number", "0", "-3"])
+    def test_auto_primary_attempts_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_auto_primary_max_attempts
+
+        monkeypatch.setenv("XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS", value)
+        assert get_auto_primary_max_attempts() == 2
+
+    def test_auto_candidate_cooldown_default(self, monkeypatch):
+        from xagent.config import get_auto_candidate_cooldown_seconds
+
+        monkeypatch.delenv("XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS", raising=False)
+        assert get_auto_candidate_cooldown_seconds() == 300.0
+
+    def test_auto_candidate_cooldown_env_override(self, monkeypatch):
+        from xagent.config import get_auto_candidate_cooldown_seconds
+
+        monkeypatch.setenv("XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS", "45.5")
+        assert get_auto_candidate_cooldown_seconds() == 45.5
+
+    @pytest.mark.parametrize("value", ["", "not-a-number", "0", "-3", "nan", "inf"])
+    def test_auto_candidate_cooldown_rejects_unusable_values(self, monkeypatch, value):
+        from xagent.config import get_auto_candidate_cooldown_seconds
+
+        monkeypatch.setenv("XAGENT_AUTO_CANDIDATE_COOLDOWN_SECONDS", value)
+        assert get_auto_candidate_cooldown_seconds() == 300.0
+
 
 class TestLlmStreamProgressConfig:
     """#2785: knobs for aborting an OpenAI-compatible LLM stream that stops

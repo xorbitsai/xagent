@@ -2083,6 +2083,12 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
           ),
         }
       }
+      // A settlement with no unique owner must not use the ordinary late-
+      // trace fallback below: the last assistant result may belong to a
+      // different invocation (or a legacy call with a reused provider id).
+      if ((action.payload.data as Record<string, unknown> | undefined)?.settlement_delivery === true) {
+        return { ...state, traceEvents: [...state.traceEvents, action.payload] }
+      }
       // If the last message is a result message from assistant, append the trace event to that message directly.
       // This ensures that events arriving after the result message (like react_task_end) are correctly displayed.
       const lastMsg = state.messages.length > 0 ? state.messages[state.messages.length - 1] : null

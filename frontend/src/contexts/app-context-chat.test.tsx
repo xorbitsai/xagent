@@ -11410,6 +11410,11 @@ describe("resend after reconnect", () => {
 })
 
 describe("projectAppState exact settlement routing", () => {
+  let timestampSequence = 0
+  beforeEach(() => { timestampSequence = 0 })
+  // Valid ordered timestamps keep message sorting independent of clock speed
+  // and coverage instrumentation (invalid dates fall back to Date.now()).
+  const nextTimestamp = () => new Date(Date.UTC(2026, 9, 21) + ++timestampSequence * 1000).toISOString()
   type ProjectAction = Parameters<typeof projectAppState>[1]
   type TracePayload = Extract<ProjectAction, { type: "ADD_TRACE_EVENT" }>["payload"]
   type ProjectState = ReturnType<typeof createInitialState>
@@ -11422,7 +11427,7 @@ describe("projectAppState exact settlement routing", () => {
     event_id: eventId,
     event_type: eventType,
     step_id: stepId,
-    timestamp: eventId,
+    timestamp: nextTimestamp(),
     data,
   })
   const apply = (state: ProjectState, action: ProjectAction) =>
@@ -11439,13 +11444,13 @@ describe("projectAppState exact settlement routing", () => {
       id,
       role: "assistant",
       content,
-      timestamp: id,
+      timestamp: nextTimestamp(),
       isResult: true,
     },
   })
   const addUser = (state: ProjectState, id: string) => apply(state, {
     type: "ADD_MESSAGE",
-    payload: { id, role: "user", content: id, timestamp: id },
+    payload: { id, role: "user", content: id, timestamp: nextTimestamp() },
   })
 
   it("routes a settlement to the exact invocation when one step reuses a provider id", () => {
@@ -11507,13 +11512,14 @@ describe("projectAppState exact settlement routing", () => {
       .toEqual(["b1"])
   })
 
-  it("does not route an unknown exact invocation into a legacy owner", () => {
+  it.each([false, true])("does not route an unknown exact invocation into a legacy owner (later user: %s)", (hasLaterUser) => {
     let state = createInitialState()
     state = dispatch(state, trace("tool_execution_start", "legacy", "step-a", {
       tool_call_id: "tool_call_0",
     }))
     state = seal(state, "legacy-message", "legacy")
-    state = addUser(state, "reply")
+    if (hasLaterUser) state = addUser(state, "reply")
+    expect(state.messages.at(-1)?.role).toBe(hasLaterUser ? "user" : "assistant")
 
     state = dispatch(state, trace("tool_execution_end", "exact", "step-a", {
       tool_call_id: "tool_call_0",
@@ -11548,6 +11554,21 @@ describe("projectAppState exact settlement routing", () => {
       .toEqual(["a1", "a2"])
     expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id))
       .toEqual(["b1"])
+  })
+
+  it("does not guess the last result for an ambiguous legacy settlement", () => {
+    let state = createInitialState()
+    for (const id of ["a", "b"]) {
+      state = dispatch(state, trace("tool_execution_start", id, "shared-step", { tool_call_id: "reused" }))
+      state = seal(state, `message-${id}`, id)
+      if (id === "a") state = addUser(state, "between")
+    }
+    state = dispatch(state, trace("tool_execution_end", "ambiguous", "shared-step", {
+      tool_call_id: "reused", settlement_delivery: true,
+    }))
+    expect(state.messages.find(message => message.id === "message-a")?.traceEvents?.map(event => event.event_id)).toEqual(["a"])
+    expect(state.messages.find(message => message.id === "message-b")?.traceEvents?.map(event => event.event_id)).toEqual(["b"])
+    expect(state.traceEvents.map(event => event.event_id)).toEqual(["ambiguous"])
   })
 
   it("keeps an orphan settlement in the live buffer for truncated windows", () => {

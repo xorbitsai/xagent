@@ -97,7 +97,8 @@ describe('InlineFilePreview', () => {
       )
     })
 
-    const image = screen.getByAltText('linkedin-visual.png')
+    // Starting the request does not mean the blob has resolved and rendered.
+    const image = await screen.findByAltText('linkedin-visual.png')
     await waitFor(() => {
       expect(image.getAttribute('src')).toMatch(/^blob:/)
     })

@@ -9,6 +9,7 @@ const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => ({ value: new URLSearchParams() }))
 const localeMock = vi.hoisted(() => ({ value: "en" }))
 const taskUpdate = vi.hoisted(() => ({ value: 0 }))
+vi.mock("@/contexts/auth-context", () => ({ useAuth: () => ({ user: { id: "alice" } }) }))
 
 interface MockAgent {
   id: number | string
@@ -141,6 +142,44 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe("TaskHomePage agents", () => {
+  it("clears assignment/config on query removal and reapplies a returning agent query", async () => {
+    let resolveConfig!: (response: Response) => void
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.endsWith("/api/agents")) return Promise.resolve(jsonResponse([VERA, KEVIN]))
+      if (url.endsWith(`/api/agents/${VERA.id}`)) return new Promise<Response>((resolve) => { resolveConfig = resolve })
+      return Promise.resolve(jsonResponse({ models: { general: "kevin-model" } }))
+    })
+    searchParamsMock.value = new URLSearchParams({ agent: String(VERA.id) })
+    const view = render(<TaskHomePage />)
+    await waitFor(() => expect(chatStartScreenProps.current?.selectedAgents?.[0]?.id).toBe(VERA.id))
+    searchParamsMock.value = new URLSearchParams()
+    view.rerender(<TaskHomePage />)
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+    await act(async () => resolveConfig(jsonResponse({ models: { general: "old-model" } })))
+    expect(chatStartScreenProps.current?.taskConfig).toBeUndefined()
+    fireEvent.click(screen.getByText("send"))
+    await waitFor(() => expect(sendMessageMock).toHaveBeenCalled())
+    expect(sendMessageMock.mock.calls[0][1]).not.toHaveProperty("agentId")
+    fireEvent.click(await screen.findByText("pick-Kevin"))
+    expect(chatStartScreenProps.current?.selectedAgents?.[0]?.id).toBe(KEVIN.id)
+    searchParamsMock.value = new URLSearchParams({ agent: String(VERA.id) })
+    view.rerender(<TaskHomePage />)
+    await waitFor(() => expect(chatStartScreenProps.current?.selectedAgents?.[0]?.id).toBe(VERA.id))
+  })
+
+  it("starts an unassigned draft on every explicit New task, including on /task", async () => {
+    apiRequestMock.mockImplementation(async (url: string) => url.endsWith("/api/agents") ? jsonResponse([KEVIN]) : jsonResponse({ models: { general: "kevin-model" } }))
+    const view = render(<TaskHomePage />)
+    for (const intent of ["first", "second"]) {
+      fireEvent.click(await screen.findByText("pick-Kevin"))
+      act(() => chatStartScreenProps.current?.onInputChange?.("Private draft"))
+      searchParamsMock.value = new URLSearchParams({ new: intent })
+      view.rerender(<TaskHomePage />)
+      expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+      expect(chatStartScreenProps.current?.taskConfig).toBeUndefined()
+      expect(screen.getByTestId("composer")).toHaveValue("")
+    }
+  })
   it("refreshes newly hired teammates without a remount and preserves the typed draft", async () => {
     let list = [VERA]
     apiRequestMock.mockImplementation(async (url: string) =>

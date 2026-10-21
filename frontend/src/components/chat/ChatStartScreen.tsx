@@ -7,7 +7,7 @@ import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface PromptCard {
-  icon?: any;
+  icon?: React.ElementType<{ className?: string }>;
   title?: string;
   description?: string;
   prompt: string;
@@ -62,7 +62,7 @@ type ChatStartScreenProps = {
   onRetryAgents?: () => void;
   onAgentClick?: (agent: AgentCard) => void;
   selectedAgents?: AgentCard[];
-  onSend: (message: string, files: File[], config?: any) => void | Promise<void>;
+  onSend: (message: string, files: File[], config?: React.ComponentProps<typeof ChatInput>["taskConfig"]) => void | Promise<void>;
   isSending?: boolean;
   inputValue?: string;
   onInputChange?: (value: string) => void;
@@ -78,7 +78,7 @@ type ChatStartScreenProps = {
   deferFileUpload?: boolean;
   filesDisabled?: boolean;
   voiceInputEnabled?: boolean;
-  taskConfig?: any;
+  taskConfig?: React.ComponentProps<typeof ChatInput>["taskConfig"];
   autoFocus?: boolean;
   inputMinHeightClass?: string;
 };
@@ -267,7 +267,7 @@ export function ChatStartScreen({
         ) : agents && agents.length > 0 && (
           <div className="space-y-1 text-center">
             <p className="text-[11.5px] text-muted-foreground">
-              <b className="font-medium text-foreground/70">Talk to...</b>
+              <b className="font-medium text-foreground/70">{t("chatPage.sections.assignToTeammateLead")}</b>
               <span className="sr-only">{t("chatPage.sections.assignToTeammate")}</span>
             </p>
             <div

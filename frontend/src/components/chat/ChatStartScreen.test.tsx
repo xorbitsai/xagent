@@ -1,6 +1,9 @@
 import React from "react"
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
+import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
+
+const localeState = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
 
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -20,7 +23,7 @@ vi.mock("@/contexts/i18n-context", () => ({
     // returns just the bare key would let a wrong/omitted/misnamed
     // variable pass silently.
     t: (key: string, vars?: Record<string, string | number>) =>
-      vars ? `${key}:${JSON.stringify(vars)}` : key,
+      key === "chatPage.sections.assignToTeammateLead" ? resolveTranslation(localeState.value, key as TranslationKey) : vars ? `${key}:${JSON.stringify(vars)}` : key,
   }),
 }))
 
@@ -58,9 +61,15 @@ const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["age
 afterEach(() => {
   cleanup()
   chatInputProps.current = null
+  localeState.value = "en"
 })
 
 describe("ChatStartScreen agents section", () => {
+  it.each([["en", "Talk to..."], ["zh", "与员工聊聊…"]] as const)("translates the teammate heading in %s", (locale, label) => {
+    localeState.value = locale
+    renderScreen([{ id: 7, name: "Ben" }])
+    expect(screen.getByText(label)).toBeInTheDocument()
+  })
   it("renders nothing when no agent list is passed", () => {
     renderScreen(undefined)
 

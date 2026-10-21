@@ -307,6 +307,20 @@ describe("Sidebar collapsible nav groups", () => {
 })
 
 describe("Sidebar workspace menu", () => {
+  it("gives each New task a fresh route intent without retaining an employee", () => {
+    routerPush.mockClear()
+    render(<Sidebar />)
+    for (let click = 0; click < 2; click++) {
+      fireEvent.click(screen.getByRole("button", { name: "Start something new" }))
+      fireEvent.click(screen.getByRole("button", { name: "New task" }))
+    }
+    const targets = routerPush.mock.calls.map(([target]) => new URL(target, "http://localhost"))
+    expect(targets).toHaveLength(2)
+    expect(targets[0].pathname).toBe("/task")
+    expect(targets[0].searchParams.has("agent")).toBe(false)
+    expect(targets[0].searchParams.get("new")).toBeTruthy()
+    expect(targets[0].searchParams.get("new")).not.toBe(targets[1].searchParams.get("new"))
+  })
   beforeEach(async () => {
     const navigation = await vi.importActual<typeof import("@/lib/sidebar-navigation")>("@/lib/sidebar-navigation")
     navState.groups = navigation.getNavigationGroupsForUser()

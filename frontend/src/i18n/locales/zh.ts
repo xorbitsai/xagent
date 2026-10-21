@@ -310,7 +310,7 @@ const zh = {
     sections: {
       startingPrompts: "快捷指令",
       assignToTeammate: "我的团队",
-      assignToTeammateLead: "将此任务分配给一位队员",
+      assignToTeammateLead: "与员工聊聊…",
       assignToTeammateHint: "——或者不选，让 {appName} 自行决定。",
       assignToTeammateError: "无法加载你的团队。",
       leadReady: "{name} 已准备好接手这项任务。",

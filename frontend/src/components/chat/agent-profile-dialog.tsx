@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
+import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { canEditAgent } from "@/lib/agent-ui-access"
 import { parseAgentUpdateError } from "@/lib/agent-widget-config"
@@ -31,7 +32,20 @@ interface AgentProfileDialogProps {
 }
 
 /** Mounted per opening so Cancel discards drafts and reopening reads fresh data. */
-export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }: AgentProfileDialogProps) {
+export function AgentProfileDialog(props: AgentProfileDialogProps) {
+  const { user } = useAuth()
+  const [ownerId] = useState(user?.id)
+  const identityChanged = !user || user.id !== ownerId
+  const { onClose } = props
+  useEffect(() => {
+    if (identityChanged) onClose()
+  }, [identityChanged, onClose])
+  // Hide synchronously: an effect-only reset would first paint the old draft.
+  if (identityChanged) return null
+  return <AgentProfileDialogContent key={`${ownerId}:${props.agent.id}`} {...props} />
+}
+
+function AgentProfileDialogContent({ agent, avatar, onClose, onSaved, children }: AgentProfileDialogProps) {
   const { t } = useI18n()
   const [profile, setProfile] = useState(agent)
   const [draft, setDraft] = useState({ name: "", description: "", instructions: "" })
@@ -86,7 +100,7 @@ export function AgentProfileDialog({ agent, avatar, onClose, onSaved, children }
   }
 
   const save = async () => {
-    if (!canEdit || !dirty || savingRef.current) return
+    if (!mounted.current || !canEdit || !dirty || savingRef.current) return
     if (!draft.name.trim()) {
       setError(t("builds.editor.validation.nameRequired"))
       return

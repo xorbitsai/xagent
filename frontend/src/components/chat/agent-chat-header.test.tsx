@@ -4,9 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import en from "@/i18n/locales/en"
 import zh from "@/i18n/locales/zh"
 import { AgentChatHeader } from "./agent-chat-header"
+import { AgentProfileDialog } from "./agent-profile-dialog"
 
 const mocks = vi.hoisted(() => ({
   locale: "en",
+  userId: "alice",
   request: vi.fn(),
   dispatch: vi.fn(),
   success: vi.fn(),
@@ -20,6 +22,7 @@ const translate = (key: string, params?: Record<string, string>) => {
 }
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: translate }) }))
 vi.mock("@/contexts/app-context-chat", () => ({ useApp: () => ({ dispatch: mocks.dispatch }) }))
+vi.mock("@/contexts/auth-context", () => ({ useAuth: () => ({ user: { id: mocks.userId } }) }))
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: mocks.push }) }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest: mocks.request }))
 vi.mock("@/components/ui/sonner", () => ({ toast: { success: mocks.success } }))
@@ -38,6 +41,7 @@ describe("Agent profile editing", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.locale = "en"
+    mocks.userId = "alice"
     savedProfile = {
       id: 7, name: "Ben", description: "Support specialist",
       instructions: "Answer support requests.", status: "published",
@@ -51,6 +55,63 @@ describe("Agent profile editing", () => {
     })
   })
   afterEach(cleanup)
+
+  it("closes the old profile and clears header details when accounts switch", async () => {
+    const view = render(<AgentChatHeader agentId={7} name="Ben" description="Private hint" />)
+    await openProfile()
+    const save = screen.getByRole("button", { name: "Save" })
+    fireEvent.change(screen.getByLabelText("Standing rules"), { target: { value: "Alice's private draft" } })
+    mocks.userId = "bob"
+    mocks.request.mockResolvedValue(new Response(null, { status: 403 }))
+    view.rerender(<AgentChatHeader agentId={7} name="Ben" description="Private hint" />)
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(screen.queryByText("Ben")).not.toBeInTheDocument()
+    expect(screen.queryByText("Private hint")).not.toBeInTheDocument()
+    fireEvent.click(save)
+    await act(async () => {})
+    expect(mocks.request.mock.calls.some(([, options]) => options?.method === "PUT")).toBe(false)
+  })
+
+  it.each(["header", "profile", "save"])("discards a late %s response after an account switch", async (pending) => {
+    let resolveOld!: (response: Response) => void
+    const oldProfile = { ...savedProfile, name: "Alice private employee", instructions: "Private rules" }
+    if (pending === "header") mocks.request.mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveOld = resolve }))
+    const view = render(<AgentChatHeader agentId={7} name="Ben" />)
+    if (pending === "profile") {
+      await screen.findByText("Ben")
+      mocks.request.mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveOld = resolve }))
+      fireEvent.click(screen.getByRole("button", { name: /More options for/ }))
+      fireEvent.click(screen.getByRole("button", { name: "Profile" }))
+    }
+    if (pending === "save") {
+      await openProfile()
+      mocks.request.mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveOld = resolve }))
+      fireEvent.change(screen.getByLabelText("Name"), { target: { value: oldProfile.name } })
+      fireEvent.click(screen.getByRole("button", { name: "Save" }))
+    }
+    mocks.userId = "bob"
+    mocks.request.mockResolvedValue(new Response(null, { status: 403 }))
+    view.rerender(<AgentChatHeader agentId={7} name="Ben" />)
+    await act(async () => resolveOld(Response.json(oldProfile)))
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(screen.queryByText(oldProfile.name)).not.toBeInTheDocument()
+    expect(screen.queryByDisplayValue(oldProfile.instructions)).not.toBeInTheDocument()
+    expect(mocks.success).not.toHaveBeenCalled()
+    expect(mocks.dispatch).not.toHaveBeenCalled()
+  })
+
+  it("protects a directly mounted profile even if its parent does not remount", async () => {
+    const onClose = vi.fn()
+    const props = { agent: { id: 7, name: "Ben", status: "published" }, avatar: null, onClose, onSaved: vi.fn() }
+    const view = render(<AgentProfileDialog {...props} />)
+    await screen.findByLabelText("Standing rules")
+    fireEvent.change(screen.getByLabelText("Standing rules"), { target: { value: "Private draft" } })
+    mocks.userId = "bob"
+    view.rerender(<AgentProfileDialog {...props} />)
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
+    expect(onClose).toHaveBeenCalled()
+    expect(mocks.request.mock.calls.some(([, options]) => options?.method === "PUT")).toBe(false)
+  })
 
   it("saves editable fields through the API and refreshes the header and sidebar", async () => {
     render(<AgentChatHeader agentId={7} name="Ben" />)
@@ -144,7 +205,7 @@ describe("Agent profile editing", () => {
     render(<AgentChatHeader agentId={7} name="Ben" showBack />)
     expect(screen.getByRole("button", { name: "返回新建任务" })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "例行任务" })).toBeInTheDocument()
-    fireEvent.click(screen.getByRole("button", { name: "Ben 的更多选项" }))
+    fireEvent.click(await screen.findByRole("button", { name: "Ben 的更多选项" }))
     fireEvent.click(screen.getByRole("button", { name: "员工资料" }))
     expect(await screen.findByRole("button", { name: "构建器设置 指令、模型、知识、技能、工具和触发器" })).toBeInTheDocument()
     expect(await screen.findByLabelText("状态")).toHaveValue(label)

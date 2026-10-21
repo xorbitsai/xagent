@@ -310,7 +310,7 @@ const en = {
     sections: {
       startingPrompts: "STARTING PROMPTS",
       assignToTeammate: "MY TEAM",
-      assignToTeammateLead: "Assign this to a teammate",
+      assignToTeammateLead: "Talk to...",
       assignToTeammateHint: " — or leave it and let {appName} choose.",
       assignToTeammateError: "Couldn't load your team.",
       leadReady: "{name} is ready to lead this task.",

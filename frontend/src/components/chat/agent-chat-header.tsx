@@ -18,6 +18,7 @@ import { PersonaAvatar } from "@/components/templates/persona-avatar"
 import { AgentProfileDialog } from "@/components/chat/agent-profile-dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
+import { useAuth } from "@/contexts/auth-context"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
@@ -73,9 +74,6 @@ function normalizeAgent(value: unknown, agentId: number): AgentDetails {
 
 function AgentChatHeaderContent({
   agentId,
-  name,
-  description,
-  logoUrl,
   showBack = false,
   rightSlot,
 }: AgentChatHeaderProps) {
@@ -83,7 +81,9 @@ function AgentChatHeaderContent({
   const router = useRouter()
   const { dispatch } = useApp()
   const detailVersion = useRef(0)
-  const [agent, setAgent] = useState<AgentDetails>(() => normalizeAgent({ name, description, logo_url: logoUrl }, agentId))
+  // Route props can still belong to the previous account. Only display
+  // details fetched under this mounted identity, never those stale hints.
+  const [agent, setAgent] = useState<AgentDetails>(() => normalizeAgent({ readonly: true, can_edit: false }, agentId))
   const [menuOpen, setMenuOpen] = useState(false)
   const [profileOpen, setProfileOpen] = useState(false)
   const [deployOpen, setDeployOpen] = useState(false)
@@ -170,5 +170,7 @@ function AgentChatHeaderContent({
 }
 
 export function AgentChatHeader(props: AgentChatHeaderProps) {
-  return <AgentChatHeaderContent key={props.agentId} {...props} />
+  const { user } = useAuth()
+  if (!user) return null
+  return <AgentChatHeaderContent key={`${user.id}:${props.agentId}`} {...props} />
 }

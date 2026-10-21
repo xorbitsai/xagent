@@ -2329,6 +2329,13 @@ interface PendingMessage {
   reject?: (error: Error) => void
 }
 
+interface SendMessageOptions {
+  // UI ownership only, never serialized into task configuration. Checked
+  // before adopting a create response; normal navigation after adoption must
+  // not cancel delivery of that task's first message.
+  canAdoptCreatedTask?: () => boolean
+}
+
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
@@ -2336,7 +2343,7 @@ interface AppContextType {
   agentCardsEnabled: boolean
   voiceInputEnabled: boolean
   taskControlsEnabled: boolean
-  sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
+  sendMessage: (message: string, config?: any, files?: File[], options?: SendMessageOptions) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
   resumeTask: () => void
@@ -7118,7 +7125,7 @@ export function AppProvider({
     if (mountedRef.current) setMessageDeliveryCount(nextCount)
   }, [])
 
-  const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
+  const sendMessage = useCallback(async (message: string, config?: any, files?: File[], options?: SendMessageOptions) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
 
     if (sessionTransport && !mountedRef.current) {
@@ -7379,6 +7386,9 @@ export function AppProvider({
     }
 
     if (!state.taskId) {
+      const canAdoptCreatedTask = () => mountedRef.current && (options?.canAdoptCreatedTask?.() ?? true)
+      if (!canAdoptCreatedTask()) return
+      let adopted = false
       // Create a new task via API
       try {
         const apiUrl = getApiUrl()
@@ -7475,6 +7485,8 @@ export function AppProvider({
           requestBody.runtime_extensions = config.runtimeExtensions
         }
 
+        // Uploads may have completed after the user left this draft.
+        if (!canAdoptCreatedTask()) return
         const response = await apiRequest(`${apiUrl}/api/chat/task/create`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -7483,6 +7495,10 @@ export function AppProvider({
 
         if (response.ok) {
           const taskData = await response.json()
+          // The server may already have created A, but it no longer owns the
+          // route or provider state once the user has opened draft B.
+          if (!canAdoptCreatedTask()) return
+          adopted = true
           const newTaskId = taskData.task_id
 
           console.log('✅ Task created successfully:', {
@@ -7599,6 +7615,7 @@ export function AppProvider({
           throw new Error(errorMessage)
         }
       } catch (error) {
+        if (!adopted && !canAdoptCreatedTask()) return
         console.error('Error creating task:', error)
         throw error
       }

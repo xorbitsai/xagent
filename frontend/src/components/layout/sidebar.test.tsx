@@ -307,7 +307,8 @@ describe("Sidebar collapsible nav groups", () => {
 })
 
 describe("Sidebar workspace menu", () => {
-  it("gives each New task a fresh route intent without retaining an employee", () => {
+  it.each([false, true])("gives each New task a fresh route intent (randomUUID absent: %s)", (missingRandomUUID) => {
+    if (missingRandomUUID) vi.stubGlobal("crypto", { randomUUID: undefined })
     routerPush.mockClear()
     render(<Sidebar />)
     for (let click = 0; click < 2; click++) {

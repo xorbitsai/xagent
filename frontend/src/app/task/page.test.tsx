@@ -795,6 +795,27 @@ describe("TaskHomePage agents", () => {
 })
 
 describe("TaskHomePage send", () => {
+  it("revokes pending create ownership when New task replaces the draft", async () => {
+    let finish!: () => void
+    sendMessageMock.mockImplementationOnce(() => new Promise<void>((resolve) => { finish = resolve }))
+    const view = render(<TaskHomePage />)
+    fireEvent.click(screen.getByText("send"))
+    const owner = sendMessageMock.mock.calls[0][3]
+    expect(owner.canAdoptCreatedTask()).toBe(true)
+
+    searchParamsMock.value = new URLSearchParams({ new: "draft-b" })
+    view.rerender(<TaskHomePage />)
+    act(() => chatStartScreenProps.current?.onInputChange?.("Keep draft B"))
+    expect(owner.canAdoptCreatedTask()).toBe(false)
+    await act(async () => finish())
+    expect(screen.getByTestId("composer")).toHaveValue("Keep draft B")
+    fireEvent.click(screen.getByText("send"))
+    const nextOwner = sendMessageMock.mock.calls[1][3]
+    expect(nextOwner.canAdoptCreatedTask()).toBe(true)
+    view.unmount()
+    expect(nextOwner.canAdoptCreatedTask()).toBe(false)
+  })
+
   it("includes the selected agent's id and resets state on a successful send", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
     sendMessageMock.mockResolvedValueOnce(undefined)
@@ -808,7 +829,8 @@ describe("TaskHomePage send", () => {
       expect(sendMessageMock).toHaveBeenCalledWith(
         "hello",
         { mode: "balanced", agentId: 1 },
-        []
+        [],
+        { canAdoptCreatedTask: expect.any(Function) }
       )
     })
     await waitFor(() => {

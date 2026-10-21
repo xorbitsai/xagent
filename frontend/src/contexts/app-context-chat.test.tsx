@@ -2659,6 +2659,46 @@ describe("AppProvider websocket message routing", () => {
     expect(sendChatMessageMock).not.toHaveBeenCalled()
   })
 
+  it.each(["response", "body", "failure", "upload"])("does not adopt or deliver a superseded draft after deferred %s", async (phase) => {
+    let release!: (value: Response) => void
+    const pending = new Promise<Response>((resolve) => { release = resolve })
+    let releaseBody!: (value: unknown) => void
+    const body = new Promise((resolve) => { releaseBody = resolve })
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.endsWith("/api/files/upload")) return pending
+      if (url.endsWith("/api/chat/task/create")) {
+        return phase === "body" ? { ok: true, json: () => body } : pending
+      }
+      return jsonResponse({})
+    })
+    let owned = true
+    let send!: () => Promise<void>
+    function DraftProbe() {
+      const { sendMessage } = useApp()
+      send = () => sendMessage("draft A", undefined,
+        phase === "upload" ? [new File(["data"], "a.txt")] : [],
+        { canAdoptCreatedTask: () => owned })
+      return null
+    }
+    render(<AppProvider token="token"><DraftProbe /><StateProbe /></AppProvider>)
+    let delivery!: Promise<void>
+    await act(async () => { delivery = send() })
+    owned = false
+    await act(async () => {
+      if (phase === "body") releaseBody({ task_id: 101, title: "draft A", status: "pending" })
+      else if (phase === "upload") release(jsonResponse({ success: true, files: [{ file_id: "file-a" }] }))
+      else release(new Response(JSON.stringify({ task_id: 101, title: "draft A", status: "pending" }), { status: phase === "failure" ? 500 : 200, headers: { "Content-Type": "application/json" } }))
+      await delivery
+    })
+    expect(screen.getByTestId("task-id")).toHaveTextContent(/^$/)
+    expect(screen.getByTestId("task-title")).toHaveTextContent(/^$/)
+    expect(routerPushMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    if (phase === "upload") {
+      expect(apiRequestMock.mock.calls.some(([url]) => url.endsWith("/api/chat/task/create"))).toBe(false)
+    }
+  })
+
   it("sends selected task runtime extensions in the create request", async () => {
     let createBody: Record<string, unknown> | undefined
     apiRequestMock.mockImplementation(
@@ -2680,12 +2720,17 @@ describe("AppProvider websocket message routing", () => {
     )
 
     let send: (() => Promise<void>) | undefined
+    let ownsDraft = true
     function RuntimeExtensionProbe() {
-      const { sendMessage } = useApp()
+      const { sendMessage, state } = useApp()
+      React.useLayoutEffect(() => {
+        // Simulate leaving /task for /task/id after successful adoption.
+        if (state.taskId !== null) ownsDraft = false
+      }, [state.taskId])
       send = () => sendMessage("inspect browser", {
         clientMessageId: "turn-local-browser",
         runtimeExtensions: { local_browser: {} },
-      })
+      }, [], { canAdoptCreatedTask: () => ownsDraft })
       return null
     }
 
@@ -2707,6 +2752,7 @@ describe("AppProvider websocket message routing", () => {
         runtime_extensions: { local_browser: {} },
       })
     )
+    expect(ownsDraft).toBe(false)
 
     await act(async () => {
       wsHarness.isConnected = true
@@ -2716,6 +2762,7 @@ describe("AppProvider websocket message routing", () => {
     await act(async () => {
       await delivery
     })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
   })
 
   it("loads task runtime metadata for history replay", async () => {

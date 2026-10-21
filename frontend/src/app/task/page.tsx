@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useRef } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import Image from "next/image";
 import { Bot, CalendarDays, PenLine } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
@@ -26,6 +26,13 @@ function firstNonBlankPrompt(prompts?: Array<string | undefined | null>): string
 }
 
 function TaskHomePageContent() {
+  // Each keyed draft owns its create until it is replaced or left. Revoke
+  // synchronously at commit, before a pending response can adopt its task.
+  const ownsTaskCreation = useRef(false);
+  useLayoutEffect(() => {
+    ownsTaskCreation.current = true;
+    return () => { ownsTaskCreation.current = false; };
+  }, []);
   const { t, locale } = useI18n();
   const { sendMessage, state, dispatch, closeFilePreview } = useApp();
   const searchParams = useSearchParams();
@@ -338,7 +345,10 @@ function TaskHomePageContent() {
 
     try {
       // Use sendMessage from AppContext - it will create task and send files via WebSocket
-      await sendMessage(message, nextConfig, filesToSend || files);
+      await sendMessage(message, nextConfig, filesToSend || files, {
+        canAdoptCreatedTask: () => ownsTaskCreation.current,
+      });
+      if (!ownsTaskCreation.current) return;
 
       setFiles([]);
       setInputValue("");

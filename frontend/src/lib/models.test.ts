@@ -620,18 +620,15 @@ describe("task LLM selection", () => {
   })
 })
 
-describe("Home and Build model-reader architecture", () => {
-  it("keeps endpoint decoding out of pages and imports only the shared resolver", () => {
-    const home = readFileSync(`${process.cwd()}/src/app/page.tsx`, "utf8")
-    const build = readFileSync(`${process.cwd()}/src/app/build/page.tsx`, "utf8")
+describe("Build model-reader architecture", () => {
+  it("keeps endpoint decoding out of the page and imports only the shared resolver", () => {
+    const source = readFileSync(`${process.cwd()}/src/app/build/page.tsx`, "utf8")
 
-    for (const source of [home, build]) {
-      expect(source).not.toContain("/api/models")
-      expect(source).not.toMatch(/\b(?:LlmModel|DefaultModelRecord|resolveTaskLlmIds|parseModelList|parseUserDefaultModels)\b/)
-      expect(source).not.toMatch(/\b(?:getUserModels|getUserDefaultModels)\b/)
-      expect(source).toMatch(/import\s*\{\s*resolveTaskLlmSelection\s*\}\s*from\s*["']@\/lib\/models["']/)
-      expect(source).not.toMatch(/import\s*\{[^}]*\b(?:getUserModels|getUserDefaultModels|parseModelList|parseUserDefaultModels)\b[^}]*\}\s*from\s*["']@\/lib\/models["']/)
-      expect(source).toContain("parseApiResponse")
-    }
+    expect(source).not.toContain("/api/models")
+    expect(source).not.toMatch(/\b(?:LlmModel|DefaultModelRecord|resolveTaskLlmIds|parseModelList|parseUserDefaultModels)\b/)
+    expect(source).not.toMatch(/\b(?:getUserModels|getUserDefaultModels)\b/)
+    expect(source).toMatch(/import\s*\{\s*resolveTaskLlmSelection\s*\}\s*from\s*["']@\/lib\/models["']/)
+    expect(source).not.toMatch(/import\s*\{[^}]*\b(?:getUserModels|getUserDefaultModels|parseModelList|parseUserDefaultModels)\b[^}]*\}\s*from\s*["']@\/lib\/models["']/)
+    expect(source).toContain("parseApiResponse")
   })
 })

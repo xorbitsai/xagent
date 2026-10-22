@@ -6,16 +6,17 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import ipaddress
 import logging
 import os
 import shlex
 import tempfile
 import textwrap
 import uuid
-from typing import Optional
+from typing import Optional, TypeVar
 
-import boxlite  # type: ignore[import-not-found]
-from boxlite import SimpleBox  # type: ignore[unused-ignore]
+import boxlite  # type: ignore[import-untyped]
+from boxlite import SimpleBox
 
 from ..config import get_sandbox_image
 from .base import (
@@ -32,6 +33,72 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
+
+# BoxLite's allow_net is enforced against the resolved connection destination.
+# Build an allowlist that is the IPv4 Internet minus IANA special-use ranges,
+# plus IPv6 global unicast minus documentation/benchmark/special transition
+# prefixes. This blocks loopback, link-local, RFC1918/ULA, metadata-adjacent
+# and multicast destinations even when untrusted code uses literal addresses
+# or a hostname is rebound after validation.
+_NON_PUBLIC_IPV4 = tuple(
+    ipaddress.IPv4Network(network)
+    for network in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.88.99.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    )
+)
+_NON_PUBLIC_IPV6 = tuple(
+    ipaddress.IPv6Network(network)
+    for network in (
+        # The IETF protocol-assignment block contains transition, benchmarking,
+        # discard and other special-purpose allocations. Deny it as a whole;
+        # false negatives are safer than exposing a non-public control plane.
+        "2001::/23",
+        "2001:db8::/32",
+        "2002::/16",
+        "3fff::/20",
+    )
+)
+
+
+_Network = TypeVar("_Network", ipaddress.IPv4Network, ipaddress.IPv6Network)
+
+
+def _subtract_networks(
+    allowed: list[_Network],
+    blocked: tuple[_Network, ...],
+) -> list[_Network]:
+    for denied in blocked:
+        remaining: list[_Network] = []
+        for candidate in allowed:
+            if candidate.version != denied.version or not candidate.overlaps(denied):
+                remaining.append(candidate)
+            elif denied.subnet_of(candidate):
+                remaining.extend(candidate.address_exclude(denied))
+        allowed = list(ipaddress.collapse_addresses(remaining))
+    return allowed
+
+
+PUBLIC_EGRESS_NETWORKS = tuple(
+    str(network)
+    for network in (
+        _subtract_networks([ipaddress.IPv4Network("0.0.0.0/0")], _NON_PUBLIC_IPV4)
+        + _subtract_networks([ipaddress.IPv6Network("2000::/3")], _NON_PUBLIC_IPV6)
+    )
+)
 
 
 class BoxliteStore(abc.ABC):
@@ -382,6 +449,13 @@ async def _create_or_reuse_box(  # type: ignore[no-any-unimported]
         # guest networking. BoxLite 0.10 requires an explicit guest policy.
         kwargs["network"] = boxlite.NetworkSpec(
             outbound=boxlite.OutboundNetworkSpec(mode="disabled"),
+            inbound=boxlite.InboundNetworkSpec(mode="disabled"),
+        )
+    else:
+        kwargs["network"] = boxlite.NetworkSpec(
+            outbound=boxlite.OutboundNetworkSpec(
+                mode="enabled", allow_net=list(PUBLIC_EGRESS_NETWORKS)
+            ),
             inbound=boxlite.InboundNetworkSpec(mode="disabled"),
         )
 

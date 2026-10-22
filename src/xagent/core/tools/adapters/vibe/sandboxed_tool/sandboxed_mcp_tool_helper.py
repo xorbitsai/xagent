@@ -79,7 +79,9 @@ def should_sandbox_mcp_connection(connection: Connection) -> bool:
     if not isinstance(command, str) or not command.strip():
         return False
 
-    return posixpath.basename(command) in _MCP_SANDBOX_COMMANDS
+    return bool(connection.get("sandbox_required")) or (
+        posixpath.basename(command) in _MCP_SANDBOX_COMMANDS
+    )
 
 
 def _serialize_connection(connection: Connection) -> str:

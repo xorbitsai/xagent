@@ -510,42 +510,44 @@ Images are automatically saved to workspace.
         if image_input.startswith(("http://", "https://")):
             return image_input
 
-        # Treat as local file path
-        if self._workspace:
+        # Local image reads are a workspace capability, not ambient host file
+        # access. In particular, never fall back to CWD/absolute-path
+        # resolution after the workspace rejects a selector.
+        if self._workspace is None:
+            raise ValueError("Access denied: local images require a task workspace")
+
+        resolved_path = self._workspace.resolve_path_with_search(image_input)
+        try:
+            workspace_path = resolve_workspace_media_path(
+                Path(resolved_path), self._workspace.workspace_dir
+            )
+        except ValueError:
+            # A durable FileRef may resolve into an account-owned cache outside
+            # the task directory. Materialize only that owned reference into
+            # upload-safe task scratch; arbitrary external paths still fail.
+            if Path(image_input).name != image_input:
+                raise
             try:
-                # Use workspace's resolve_path_with_search method for intelligent directory search
-                resolved_path = self._workspace.resolve_path_with_search(image_input)
-                logger.info(
-                    f"Resolved image path using workspace search: {image_input} -> {resolved_path}"
+                staged_path = self._workspace.stage_file_for_external_upload(
+                    image_input
                 )
-                return str(resolved_path)
-            except ValueError as e:
-                logger.warning(f"Cannot resolve image path in workspace: {e}")
-                # Fall back to simple path resolution
-            except Exception as e:
-                logger.warning(f"Error using workspace path resolution: {e}")
-                # Fall back to simple path resolution
-
-        # Fallback: simple path resolution (for when workspace is not available)
-        image_path = Path(image_input)
-
-        # If it's a relative path, resolve it relative to current working directory
-        if not image_path.is_absolute():
-            image_path = Path.cwd() / image_path
-
-        # Convert to absolute path string
-        absolute_path = str(image_path.resolve())
-
-        # Check if file exists
-        if not image_path.exists():
-            logger.warning(f"Local image file not found: {absolute_path}")
-            # Return the path anyway - the model will handle the error
-        else:
-            logger.info(
-                f"Resolved image path using fallback method: {image_input} -> {absolute_path}"
+            except (FileNotFoundError, ValueError) as exc:
+                raise ValueError(
+                    "Access denied: local image is outside the task workspace"
+                ) from exc
+            workspace_path = resolve_workspace_media_path(
+                staged_path, self._workspace.workspace_dir
             )
 
-        return absolute_path
+        if not workspace_path.is_file():
+            raise FileNotFoundError(f"Local image file not found: {image_input}")
+
+        logger.info(
+            "Resolved image path inside task workspace: %s -> %s",
+            image_input,
+            workspace_path,
+        )
+        return str(workspace_path)
 
     def _normalize_image_inputs(self, image: str | list[str]) -> list[str]:
         """Normalize image inputs to a non-empty list of strings."""

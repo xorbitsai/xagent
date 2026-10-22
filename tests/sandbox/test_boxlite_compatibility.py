@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -14,7 +15,44 @@ except ImportError:
     pytest.skip("BoxLite SDK unavailable on this platform", allow_module_level=True)
 
 from xagent.sandbox.base import SandboxConfig, SandboxInfo, SandboxTemplate
-from xagent.sandbox.boxlite_sandbox import BoxliteSandboxService, MemBoxliteStore
+from xagent.sandbox.boxlite_sandbox import (
+    PUBLIC_EGRESS_NETWORKS,
+    BoxliteSandboxService,
+    MemBoxliteStore,
+)
+
+
+def test_public_egress_ranges_exclude_local_and_special_destinations():
+    allowed = [ipaddress.ip_network(network) for network in PUBLIC_EGRESS_NETWORKS]
+
+    for address in (
+        "10.0.0.1",
+        "100.64.0.1",
+        "127.0.0.1",
+        "169.254.169.254",
+        "172.16.0.1",
+        "192.168.0.1",
+        "198.18.0.1",
+        "::1",
+        "2001:2::1",
+        "2001:db8::1",
+        "2002::1",
+        "3fff::1",
+        "fc00::1",
+        "fe80::1",
+    ):
+        candidate = ipaddress.ip_address(address)
+        assert not any(
+            candidate.version == network.version and candidate in network
+            for network in allowed
+        )
+
+    for address in ("1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"):
+        candidate = ipaddress.ip_address(address)
+        assert any(
+            candidate.version == network.version and candidate in network
+            for network in allowed
+        )
 
 
 @pytest.fixture
@@ -125,7 +163,12 @@ async def test_guest_network_policy_uses_native_box_options(
         assert options.network.inbound.mode == "disabled"
         assert options.advanced is None
     else:
-        assert options.network is None
+        assert options.network.outbound.mode == "enabled"
+        assert set(options.network.outbound.allow_net) == set(PUBLIC_EGRESS_NETWORKS)
+        assert options.network.inbound.mode == "disabled"
+        assert "10.0.0.0/8" not in options.network.outbound.allow_net
+        assert "127.0.0.0/8" not in options.network.outbound.allow_net
+        assert "fc00::/7" not in options.network.outbound.allow_net
 
 
 @pytest.mark.asyncio

@@ -1116,8 +1116,9 @@ async def _create_container(
         # PID-1 tini forwards SIGTERM so tail exits fast, not on a SIGKILL timeout.
         "init": True,
         "detach": True,
-        # Run as root to match the file access behavior of Boxlite.
-        "user": "root",
+        # Match Dockerfile.sandbox's dedicated runtime identity. Never let
+        # user code or custom stdio MCP processes inherit container root.
+        "user": "1100:1010",
         "working_dir": config.working_dir,
         "environment": config.env,
         "volumes": volumes,
@@ -1127,6 +1128,8 @@ async def _create_container(
         "network_disabled": bool(config.network_isolated),
         # Security config
         "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
+        "pids_limit": 256,
         "labels": labels,
     }
     return cast(

@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from xagent.core.model.image.base import BaseImageModel
+from xagent.core.tools.core.image_tool import ImageGenerationToolCore
+from xagent.core.workspace import TaskWorkspace
 from xagent.core.tools.adapters.vibe.image_tool import (
     ImageGenerationTool,
     create_image_tool,
@@ -106,6 +108,45 @@ class TestImageGenerationTool:
         tool = ImageGenerationTool({}, workspace=mock_workspace)
         assert tool._image_models == {}
         assert len(tool._image_models) == 0
+
+    def test_local_image_read_is_limited_to_task_workspace(self, tmp_path):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path))
+        image = workspace.input_dir / "reference.png"
+        image.write_bytes(b"png")
+        tool = ImageGenerationTool({}, workspace=workspace)
+
+        assert tool._resolve_image_path("input/reference.png") == str(image.resolve())
+
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"secret")
+        with pytest.raises(ValueError, match="outside"):
+            tool._resolve_image_path(str(outside))
+
+    def test_local_image_read_rejects_workspace_symlink_escape(self, tmp_path):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path))
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(b"secret")
+        link = workspace.input_dir / "escape.png"
+        link.symlink_to(outside)
+        tool = ImageGenerationTool({}, workspace=workspace)
+
+        with pytest.raises((ValueError, FileNotFoundError)):
+            tool._resolve_image_path("input/escape.png")
+
+    def test_local_image_read_requires_workspace(self, tmp_path):
+        image = tmp_path / "reference.png"
+        image.write_bytes(b"png")
+
+        with pytest.raises(ValueError, match="require a task workspace"):
+            ImageGenerationToolCore({})._resolve_image_path(str(image))
+
+    def test_remote_image_url_does_not_require_workspace(self):
+        assert (
+            ImageGenerationToolCore({})._resolve_image_path(
+                "https://images.example/reference.png"
+            )
+            == "https://images.example/reference.png"
+        )
 
     @pytest.mark.asyncio
     @patch("aiohttp.ClientSession.get")

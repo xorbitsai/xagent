@@ -22,7 +22,8 @@ Sandboxing is opt-in: Xagent runs tool calls in the backend process unless `SAND
 
 The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, CPU and memory limits, and optional network isolation; its Boxlite backend runs the sandbox inside a KVM microVM. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for the two modes and their trade-offs.
 
-The image itself defines an unprivileged `sandbox` user (uid 1100, gid 1010) as its default. Note that Xagent's Docker backend deliberately overrides this and runs the container as root, to match the file access behavior of the Boxlite backend.
+The image defines an unprivileged `sandbox` user (uid 1100, gid 1010), and both
+the Docker and BoxLite backends preserve that runtime identity.
 
 ## Tags
 

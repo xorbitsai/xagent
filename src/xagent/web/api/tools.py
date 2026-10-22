@@ -692,7 +692,10 @@ async def delete_tool_credential(
 
 
 @tools_router.get("/usage")
-async def get_tool_usage(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+async def get_tool_usage(
+    db: Session = Depends(get_db),
+    _current_user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
     """Get tool usage statistics"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop

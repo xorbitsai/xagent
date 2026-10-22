@@ -31,6 +31,15 @@ class TestShouldSandboxMcpConnection:
             ({"transport": "stdio", "command": "npx", "args": []}, True),
             ({"transport": "stdio", "command": "uvx", "args": []}, True),
             ({"transport": "stdio", "command": "/usr/bin/npx", "args": []}, True),
+            (
+                {
+                    "transport": "stdio",
+                    "command": "python",
+                    "args": [],
+                    "sandbox_required": True,
+                },
+                True,
+            ),
             ({"transport": "stdio", "command": "python", "args": []}, False),
             ({"transport": "sse", "url": "http://localhost"}, False),
             ({"transport": "streamable_http", "url": "http://localhost"}, False),

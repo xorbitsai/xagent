@@ -4350,6 +4350,7 @@ class WebToolConfig(BaseToolConfig):
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
         actor_builtin_invalid_reason: str = "config_load_failed",
+        custom_stdio: bool = False,
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
         actor_builtin = bool(
@@ -4663,6 +4664,8 @@ class WebToolConfig(BaseToolConfig):
                 config["transport"] = "stdio"
 
         if server.transport == "stdio":
+            if custom_stdio:
+                transport_config["sandbox_required"] = True
             if server.command:
                 transport_config["command"] = server.command
             if server.args:
@@ -4925,6 +4928,7 @@ class WebToolConfig(BaseToolConfig):
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
         actor_builtin_invalid_reason: str = "config_load_failed",
+        custom_stdio: bool = False,
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -4936,6 +4940,7 @@ class WebToolConfig(BaseToolConfig):
                 actor_catalog_app_info=actor_catalog_app_info,
                 actor_builtin_invalid=actor_builtin_invalid,
                 actor_builtin_invalid_reason=actor_builtin_invalid_reason,
+                custom_stdio=custom_stdio,
             )
         except ConnectorRuntimeError:
             raise
@@ -5041,6 +5046,24 @@ class WebToolConfig(BaseToolConfig):
                 self._user_id,
                 self._connector_team_id,
             )
+
+            visible_stdio_ids = [
+                int(server.id) for server in servers if server.transport == "stdio"
+            ]
+            if visible_stdio_ids:
+                from ...web.models.mcp import UserMCPServer
+
+                custom_stdio_ids = {
+                    int(server_id)
+                    for (server_id,) in self.db.query(UserMCPServer.mcpserver_id)
+                    .filter(
+                        UserMCPServer.mcpserver_id.in_(visible_stdio_ids),
+                        UserMCPServer.is_owner.is_(True),
+                    )
+                    .all()
+                }
+            else:
+                custom_stdio_ids = set()
 
             # Classify the complete personal ∪ governing-team visible set
             # before constructing any runtime config. Canonical builtins use
@@ -5190,6 +5213,9 @@ class WebToolConfig(BaseToolConfig):
                 )[1],
                 actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
                     int(server.id), "config_load_failed"
+                ),
+                custom_stdio=(
+                    server.transport == "stdio" and int(server.id) in custom_stdio_ids
                 ),
             )
             for server in servers

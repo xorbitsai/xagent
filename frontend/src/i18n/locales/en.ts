@@ -2833,6 +2833,16 @@ Build when you need.`,
         enabled: "Enabled",
         drafts: "Drafts",
       },
+      ownership: {
+        mine: "My agents",
+        others: "Other users' agents",
+      },
+      pagination: {
+        showing: "Showing {start}–{end} of {total}",
+        previous: "Previous",
+        next: "Next",
+        page: "Page {page} of {pages}",
+      },
       sort: {
         updated: "Recently updated",
         name: "Name (A–Z)",

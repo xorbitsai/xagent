@@ -2828,6 +2828,16 @@ const zh = {
         enabled: "已启用",
         drafts: "草稿",
       },
+      ownership: {
+        mine: "我的 Agent",
+        others: "其他人的 Agent",
+      },
+      pagination: {
+        showing: "显示第 {start}–{end} 条，共 {total} 条",
+        previous: "上一页",
+        next: "下一页",
+        page: "第 {page} / {pages} 页",
+      },
       sort: {
         updated: "最近更新",
         name: "名称（A–Z）",

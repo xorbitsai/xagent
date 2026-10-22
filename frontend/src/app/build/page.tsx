@@ -1,10 +1,10 @@
 "use client"
 
-import React, { useState, useEffect, useMemo, useRef } from "react"
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
 import { PageHeader } from "@/components/ui/page-header"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, ArrowUpDown, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook, Mic, Square, Loader2 } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, ArrowUpDown, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound, Webhook, Mic, Square, Loader2, ChevronLeft, ChevronRight } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
@@ -53,18 +53,71 @@ import {
 import { MyTeamTabs } from "@/components/team/my-team-tabs"
 
 type StatusTab = "all" | "enabled" | "drafts"
+type OwnershipScope = "auto" | "mine" | "others"
 
-// "drafts" means "not enabled" rather than a strict `=== "draft"` check, so
-// every agent lands in exactly one of Enabled/Drafts (matching the "All"
-// count) even for a status other than the two the UI otherwise names
-// (e.g. `archived`, defined on the backend but not currently reachable
-// through any create/update path).
-const matchesStatusTab = (agent: Agent, tab: StatusTab): boolean =>
-  tab === "all" ? true : tab === "enabled" ? agent.status === "published" : agent.status !== "published"
+interface AgentListPage {
+  items: Agent[]
+  page: number
+  size: number
+  total: number
+  pages: number
+  visible_total: number
+  status_counts: Record<StatusTab, number>
+  ownership: "all" | "mine" | "others"
+  can_view_others: boolean
+}
 
-const matchesSearch = (agent: Agent, searchTerm: string): boolean =>
-  agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-  Boolean(agent.description && agent.description.toLowerCase().includes(searchTerm.toLowerCase()))
+const AGENT_PAGE_SIZE = 12
+
+function normalizeAgentListPage(
+  payload: AgentListPage | Agent[],
+  options: {
+    page: number
+    search: string
+    status: StatusTab
+    sort: "updated" | "name"
+  },
+): AgentListPage {
+  if (!Array.isArray(payload)) return payload
+
+  // Rolling-deploy compatibility for an older backend. The current backend
+  // always returns the envelope when page parameters are present.
+  const search = options.search.toLocaleLowerCase()
+  const searched = payload.filter((agent) =>
+    !search
+    || agent.name.toLocaleLowerCase().includes(search)
+    || agent.description?.toLocaleLowerCase().includes(search),
+  )
+  const enabled = searched.filter((agent) => agent.status === "published").length
+  const filtered = searched
+    .filter((agent) =>
+      options.status === "all"
+      || (options.status === "enabled" && agent.status === "published")
+      || (options.status === "drafts" && agent.status !== "published"),
+    )
+    .sort((left, right) =>
+      options.sort === "name"
+        ? left.name.localeCompare(right.name)
+        : right.updated_at.localeCompare(left.updated_at),
+    )
+  const pages = Math.max(Math.ceil(filtered.length / AGENT_PAGE_SIZE), 1)
+  const page = Math.min(options.page, pages)
+  return {
+    items: filtered.slice((page - 1) * AGENT_PAGE_SIZE, page * AGENT_PAGE_SIZE),
+    page,
+    size: AGENT_PAGE_SIZE,
+    total: filtered.length,
+    pages,
+    visible_total: payload.length,
+    status_counts: {
+      all: searched.length,
+      enabled,
+      drafts: searched.length - enabled,
+    },
+    ownership: "all",
+    can_view_others: false,
+  }
+}
 
 function BuildsPageContent() {
   const { t, locale } = useI18n()
@@ -80,10 +133,22 @@ function BuildsPageContent() {
   const taskCreateCounterRef = useRef(0)
   const draftRevisionRef = useRef(0)
   const [searchTerm, setSearchTerm] = useState("")
+  const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
   const [statusTab, setStatusTab] = useState<StatusTab>("all")
   const [sortMode, setSortMode] = useState<"updated" | "name">("updated")
+  const [ownershipScope, setOwnershipScope] = useState<OwnershipScope>("auto")
+  const [canViewOthers, setCanViewOthers] = useState(false)
+  const [page, setPage] = useState(1)
+  const [pages, setPages] = useState(1)
+  const [total, setTotal] = useState(0)
+  const [visibleTotal, setVisibleTotal] = useState(0)
+  const [statusCounts, setStatusCounts] = useState<Record<StatusTab, number>>({
+    all: 0,
+    enabled: 0,
+    drafts: 0,
+  })
   // Best-effort enrichment only: an agent traces back to the template it was
   // hired from via `template_id`, and this lookup supplies that template's
   // category/persona for the card badge and avatar. A custom, scratch-built
@@ -117,23 +182,43 @@ function BuildsPageContent() {
   }, [searchParams, router])
 
   // Fetch agents on mount
-  const fetchAgents = async () => {
+  const fetchAgents = useCallback(async () => {
     if (!isMountedRef.current) return
     const requestGeneration = agentListRequestGenerationRef.current + 1
     agentListRequestGenerationRef.current = requestGeneration
 
     try {
       setLoading(true)
-      const response = await apiRequest(`${getApiUrl()}/api/agents`)
+      const params = new URLSearchParams({
+        page: String(page),
+        size: String(AGENT_PAGE_SIZE),
+        status: statusTab,
+        sort: sortMode,
+        ownership: ownershipScope,
+      })
+      if (debouncedSearchTerm.trim()) params.set("search", debouncedSearchTerm.trim())
+      const response = await apiRequest(`${getApiUrl()}/api/agents?${params}`)
       if (response.ok) {
-        const data = await response.json()
+        const payload: AgentListPage | Agent[] = await response.json()
+        const data = normalizeAgentListPage(payload, {
+          page,
+          search: debouncedSearchTerm.trim(),
+          status: statusTab,
+          sort: sortMode,
+        })
         if (
           !isMountedRef.current ||
           requestGeneration !== agentListRequestGenerationRef.current
         ) {
           return
         }
-        setAgents(data)
+        setAgents(data.items)
+        setPage(data.page)
+        setPages(data.pages)
+        setTotal(data.total)
+        setVisibleTotal(data.visible_total)
+        setStatusCounts(data.status_counts)
+        setCanViewOthers(data.can_view_others)
       }
     } catch (error) {
       if (
@@ -150,11 +235,10 @@ function BuildsPageContent() {
         setLoading(false)
       }
     }
-  }
+  }, [debouncedSearchTerm, ownershipScope, page, sortMode, statusTab])
 
   useEffect(() => {
     isMountedRef.current = true
-    void fetchAgents()
     return () => {
       isMountedRef.current = false
       activeTaskCreateAttemptRef.current = null
@@ -162,6 +246,18 @@ function BuildsPageContent() {
       agentDeleteActionGenerationRef.current += 1
     }
   }, [])
+
+  useEffect(() => {
+    void fetchAgents()
+  }, [fetchAgents])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setPage(1)
+      setDebouncedSearchTerm(searchTerm)
+    }, 250)
+    return () => window.clearTimeout(timer)
+  }, [searchTerm])
 
   useEffect(() => {
     let cancelled = false
@@ -376,27 +472,20 @@ function BuildsPageContent() {
           <>
             {t(`builds.list.tabs.${tab}`)}
             <span className="ml-1.5 text-[10px] text-muted-foreground/70">
-              {
-                agents
-                  .filter((agent) => matchesStatusTab(agent, tab))
-                  .filter((agent) => matchesSearch(agent, searchTerm)).length
-              }
+              {statusCounts[tab]}
             </span>
           </>
         ),
       })),
-    [agents, searchTerm, t]
+    [statusCounts, t]
   )
 
-  const filteredAgents = useMemo(
-    () =>
-      agents
-        .filter((agent) => matchesStatusTab(agent, statusTab))
-        .filter((agent) => matchesSearch(agent, searchTerm))
-        .sort((a, b) =>
-          sortMode === "name" ? a.name.localeCompare(b.name) : b.updated_at.localeCompare(a.updated_at)
-        ),
-    [agents, statusTab, searchTerm, sortMode]
+  const ownershipTabs: SegmentedTabItem[] = useMemo(
+    () => [
+      { id: "mine", label: t("builds.list.ownership.mine") },
+      { id: "others", label: t("builds.list.ownership.others") },
+    ],
+    [t],
   )
 
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
@@ -551,13 +640,13 @@ function BuildsPageContent() {
 
       {/* Main Content */}
       <div className="flex-1 px-4 md:px-6 py-6 space-y-6 overflow-auto">
-        <MyTeamTabs active="teammates" teammateCount={agents.length} />
+        <MyTeamTabs active="teammates" teammateCount={visibleTotal} />
         {/* Loading State */}
         {loading ? (
           <div className="flex items-center justify-center h-[400px]">
             <div className="text-muted-foreground">{t("common.loading")}</div>
           </div>
-        ) : agents.length === 0 ? (
+        ) : visibleTotal === 0 ? (
           <FeatureEmptyState
             icon={Bot}
             title={t("builds.emptyState.title")}
@@ -591,10 +680,32 @@ function BuildsPageContent() {
         ) : (
           <>
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <SegmentedTabs items={statusTabs} value={statusTab} onValueChange={(value) => setStatusTab(value as StatusTab)} />
+              <div className="flex flex-wrap items-center gap-3">
+                {canViewOthers && (
+                  <SegmentedTabs
+                    items={ownershipTabs}
+                    value={ownershipScope === "others" ? "others" : "mine"}
+                    onValueChange={(value) => {
+                      setPage(1)
+                      setOwnershipScope(value as Exclude<OwnershipScope, "auto">)
+                    }}
+                  />
+                )}
+                <SegmentedTabs
+                  items={statusTabs}
+                  value={statusTab}
+                  onValueChange={(value) => {
+                    setPage(1)
+                    setStatusTab(value as StatusTab)
+                  }}
+                />
+              </div>
               <button
                 type="button"
-                onClick={() => setSortMode((mode) => (mode === "updated" ? "name" : "updated"))}
+                onClick={() => {
+                  setPage(1)
+                  setSortMode((mode) => (mode === "updated" ? "name" : "updated"))
+                }}
                 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
               >
                 {t(`builds.list.sort.${sortMode}`)}
@@ -603,9 +714,9 @@ function BuildsPageContent() {
             </div>
 
             {/* List */}
-            {filteredAgents.length > 0 ? (
+            {agents.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
-                {filteredAgents.map((agent) => {
+                {agents.map((agent) => {
                   const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())
                   const template = agent.template_id ? templatesById[agent.template_id] : undefined
                   const personaRole = template?.persona?.role
@@ -816,6 +927,41 @@ function BuildsPageContent() {
                   <Plus className="mr-2 h-4 w-4" />
                   {t("builds.list.empty.create")}
                 </Button>
+              </div>
+            )}
+
+            {pages > 1 && (
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-sm text-muted-foreground">
+                  {t("builds.list.pagination.showing", {
+                    start: (page - 1) * AGENT_PAGE_SIZE + 1,
+                    end: Math.min(page * AGENT_PAGE_SIZE, total),
+                    total,
+                  })}
+                </p>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage((current) => Math.max(1, current - 1))}
+                    disabled={page <= 1 || loading}
+                  >
+                    <ChevronLeft className="mr-1 h-4 w-4" />
+                    {t("builds.list.pagination.previous")}
+                  </Button>
+                  <span className="text-sm text-muted-foreground">
+                    {t("builds.list.pagination.page", { page, pages })}
+                  </span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setPage((current) => Math.min(pages, current + 1))}
+                    disabled={page >= pages || loading}
+                  >
+                    {t("builds.list.pagination.next")}
+                    <ChevronRight className="ml-1 h-4 w-4" />
+                  </Button>
+                </div>
               </div>
             )}
           </>

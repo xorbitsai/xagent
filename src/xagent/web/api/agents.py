@@ -6,9 +6,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, cast
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import String
+from sqlalchemy import String, func
 from sqlalchemy import cast as sql_cast
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
@@ -25,7 +25,7 @@ from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
 from ..auth_dependencies import get_current_user, is_admin_user
-from ..models.agent import Agent, AgentOrigin
+from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
@@ -63,6 +63,7 @@ from ..services.agent_store import (
 from ..services.agent_team_scope import (
     get_agent_team_scope,
     owned_agent_clause,
+    owns_agent,
 )
 from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.client_error_messages import CLIENT_SAFE_AUTO_MODEL_UNAVAILABLE
@@ -198,6 +199,28 @@ class AgentListItem(BaseModel):
     can_edit: bool = True
     can_publish: bool = True
     can_delete: bool = True
+
+
+class AgentListStatusCounts(BaseModel):
+    """Status totals for the active search and ownership scope."""
+
+    all: int
+    enabled: int
+    drafts: int
+
+
+class AgentListPage(BaseModel):
+    """Database-paginated response used by the Agent management page."""
+
+    items: List[AgentListItem]
+    page: int
+    size: int
+    total: int
+    pages: int
+    visible_total: int
+    status_counts: AgentListStatusCounts
+    ownership: Literal["all", "mine", "others"]
+    can_view_others: bool
 
 
 class AgentShareLinkResponse(BaseModel):
@@ -785,16 +808,154 @@ async def create_agent(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("", response_model=List[AgentListItem])
+@router.get("", response_model=List[AgentListItem] | AgentListPage)
 async def list_agents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     search: Optional[str] = None,
-) -> List[AgentListItem]:
-    """List agents visible to the current user."""
+    page: Optional[int] = Query(None, ge=1),
+    size: int = Query(12, ge=1, le=100),
+    status: Literal["all", "enabled", "drafts"] = "all",
+    sort: Literal["updated", "name"] = "updated",
+    ownership: Literal["auto", "all", "mine", "others"] = "all",
+) -> List[AgentListItem] | AgentListPage:
+    """List agents visible to the current user.
+
+    The response remains the legacy array when ``page`` is omitted because
+    several compact pickers consume this endpoint. Supplying ``page`` opts
+    into database-side filtering, sorting, and pagination for the management
+    page, so an administrator never has to load every platform Agent.
+    """
     try:
         store = AgentStore(db)
         keyword = (search or "").strip().casefold()
+        if page is not None:
+            user_id = int(current_user.id)
+            team_scope = get_agent_team_scope(db, user_id)
+            can_view_others = bool(
+                current_user.is_admin
+                or (team_scope is not None and team_scope.is_team_admin)
+            )
+            effective_ownership: Literal["all", "mine", "others"]
+            if ownership == "auto":
+                effective_ownership = "mine" if can_view_others else "all"
+            else:
+                effective_ownership = ownership
+
+            if effective_ownership == "others" and not can_view_others:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Administrator privileges required to list other users' agents",
+                )
+
+            query = db.query(Agent).filter(
+                Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+            )
+            if not current_user.is_admin:
+                access_clauses = [owned_agent_clause(user_id, team_scope)]
+                visible_agent_ids = get_visible_agent_ids(
+                    db, current_user, "agent_list"
+                )
+                if visible_agent_ids:
+                    access_clauses.append(
+                        (Agent.id.in_(visible_agent_ids))
+                        & (Agent.visibility != "admins")
+                    )
+                query = query.filter(or_(*access_clauses))
+
+            visible_total = query.count()
+
+            if keyword:
+                # Treat SQL wildcard characters as ordinary search text, just
+                # like the legacy in-memory substring filter does.
+                escaped_keyword = (
+                    keyword.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                pattern = f"%{escaped_keyword}%"
+                query = query.filter(
+                    or_(
+                        func.lower(Agent.name).like(pattern, escape="\\"),
+                        func.lower(Agent.description).like(pattern, escape="\\"),
+                    )
+                )
+
+            if effective_ownership == "mine":
+                query = query.filter(Agent.user_id == user_id)
+            elif effective_ownership == "others":
+                query = query.filter(Agent.user_id != user_id)
+
+            status_rows = (
+                query.with_entities(Agent.status, func.count(Agent.id))
+                .group_by(Agent.status)
+                .all()
+            )
+            status_totals = {
+                getattr(agent_status, "value", agent_status): int(count)
+                for agent_status, count in status_rows
+            }
+            all_count = sum(status_totals.values())
+            enabled_count = status_totals.get("published", 0)
+            status_counts = AgentListStatusCounts(
+                all=all_count,
+                enabled=enabled_count,
+                drafts=all_count - enabled_count,
+            )
+
+            if status == "enabled":
+                query = query.filter(Agent.status == AgentStatus.PUBLISHED)
+                total = status_counts.enabled
+            elif status == "drafts":
+                query = query.filter(Agent.status != AgentStatus.PUBLISHED)
+                total = status_counts.drafts
+            else:
+                total = status_counts.all
+
+            pages = max((total + size - 1) // size, 1)
+            current_page = min(page, pages)
+            if sort == "name":
+                query = query.order_by(func.lower(Agent.name).asc(), Agent.id.asc())
+            else:
+                query = query.order_by(Agent.updated_at.desc(), Agent.id.desc())
+            rows = query.offset((current_page - 1) * size).limit(size).all()
+
+            items: List[AgentListItem] = []
+            for agent in rows:
+                if owns_agent(agent, user_id, team_scope):
+                    accessible = AccessibleAgent(
+                        agent=agent,
+                        access="owner",
+                        can_edit=True,
+                        can_publish=True,
+                        can_delete=True,
+                    )
+                else:
+                    accessible = AccessibleAgent(
+                        agent=agent,
+                        access="policy",
+                        can_edit=False,
+                        can_publish=False,
+                        can_delete=False,
+                    )
+                items.append(
+                    AgentListItem.model_validate(
+                        _serialize_agent_list_item(store, accessible)
+                    )
+                )
+
+            return AgentListPage(
+                items=items,
+                page=current_page,
+                size=size,
+                total=total,
+                pages=pages,
+                visible_total=visible_total,
+                status_counts=status_counts,
+                ownership=effective_ownership,
+                can_view_others=can_view_others,
+            )
+
         items = [
             _serialize_agent_list_item(store, item)
             for item in list_accessible_agents(
@@ -808,6 +969,8 @@ async def list_agents(
         ]
         return [AgentListItem.model_validate(item) for item in items]
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to list agents: {e}")
         raise HTTPException(status_code=500, detail=str(e))

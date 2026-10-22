@@ -113,6 +113,37 @@ const agent = {
   can_delete: true,
 }
 
+function agentPage(
+  items: typeof agent[],
+  overrides: Partial<{
+    page: number
+    size: number
+    total: number
+    pages: number
+    visible_total: number
+    status_counts: { all: number; enabled: number; drafts: number }
+    ownership: "all" | "mine" | "others"
+    can_view_others: boolean
+  }> = {},
+) {
+  return {
+    items,
+    page: 1,
+    size: 12,
+    total: items.length,
+    pages: 1,
+    visible_total: items.length,
+    status_counts: {
+      all: items.length,
+      enabled: items.filter((item) => item.status === "published").length,
+      drafts: items.filter((item) => item.status !== "published").length,
+    },
+    ownership: "all" as const,
+    can_view_others: false,
+    ...overrides,
+  }
+}
+
 const conflictPayload = {
   detail: {
     code: "agent_in_use_by_workforce",
@@ -201,6 +232,69 @@ describe("BuildsPage rendering", () => {
     expect(screen.queryByRole("button", {
       name: "builds.list.actions.viewConfig",
     })).not.toBeInTheDocument()
+  })
+
+  it("lets administrators switch between their agents and other users' agents", async () => {
+    const mine = { ...agent, id: 1, name: "My Agent" }
+    const other = { ...agent, id: 2, name: "Other Agent", can_edit: false }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents?")) {
+        const ownership = new URL(url).searchParams.get("ownership")
+        return Promise.resolve(jsonResponse(
+          ownership === "others"
+            ? agentPage([other], {
+                visible_total: 583,
+                ownership: "others",
+                can_view_others: true,
+              })
+            : agentPage([mine], {
+                visible_total: 583,
+                ownership: "mine",
+                can_view_others: true,
+              }),
+        ))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("My Agent")
+    expect(screen.getByRole("button", { name: "builds.list.ownership.mine" })).toHaveAttribute("aria-pressed", "true")
+    expect(screen.getByRole("button", { name: "builds.list.ownership.others" })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "builds.list.ownership.others" }))
+
+    await screen.findByText("Other Agent")
+    expect(apiRequestMock.mock.calls.some(([url]) =>
+      String(url).includes("ownership=others"),
+    )).toBe(true)
+  })
+
+  it("requests the next Agent page from the backend", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents?")) {
+        const requestedPage = Number(new URL(url).searchParams.get("page"))
+        return Promise.resolve(jsonResponse(agentPage([
+          { ...agent, id: requestedPage, name: `Agent page ${requestedPage}` },
+        ], {
+          page: requestedPage,
+          total: 13,
+          pages: 2,
+          visible_total: 13,
+          status_counts: { all: 13, enabled: 0, drafts: 13 },
+        })))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Agent page 1")
+    fireEvent.click(screen.getByRole("button", { name: "builds.list.pagination.next" }))
+
+    await screen.findByText("Agent page 2")
+    expect(apiRequestMock.mock.calls.some(([url]) =>
+      String(url).includes("page=2"),
+    )).toBe(true)
   })
 
   it("limits a published read-only Agent to run and view actions", async () => {
@@ -448,7 +542,7 @@ describe("BuildsPage Agent deletion", () => {
     let deleteRequests = 0
 
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return Promise.resolve(jsonResponse(listRequests === 1 ? [agent] : []))
       }
@@ -509,7 +603,7 @@ describe("BuildsPage Agent deletion", () => {
     let listRequests = 0
 
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return listRequests === 1
           ? Promise.resolve(jsonResponse([agent]))
@@ -548,7 +642,7 @@ describe("BuildsPage Agent deletion", () => {
     let listRequests = 0
 
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         if (listRequests === 1) return Promise.resolve(jsonResponse([agent]))
         if (listRequests === 2) return staleRefresh.promise
@@ -595,7 +689,7 @@ describe("BuildsPage Agent deletion", () => {
     const deleteRequest = deferred<Response>()
 
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         return Promise.resolve(jsonResponse([agent]))
       }
       if (url === "http://api.local/api/agents/42" && options?.method === "DELETE") {
@@ -627,7 +721,7 @@ describe("BuildsPage Agent deletion", () => {
     const discardRequest = deferred<Response>()
 
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         return Promise.resolve(jsonResponse([agent]))
       }
       if (url === "http://api.local/api/agents/42" && options?.method === "DELETE") {
@@ -674,7 +768,7 @@ describe("BuildsPage Agent deletion", () => {
   ])("localizes stable Workforce discard error %s", async (code, translationKey) => {
     let discardRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         return Promise.resolve(jsonResponse([agent]))
       }
       if (url === "http://api.local/api/agents/42" && options?.method === "DELETE") {
@@ -745,7 +839,7 @@ describe("BuildsPage publication lifecycle", () => {
     ["unpublish", "http://api.local/api/agents/42/unpublish", "builds.publication.unpublishFailed", "Failed to unpublish agent:"],
   ] as const)("reports mounted non-OK %s failures with the operation-owned key and diagnostic", async (kind, endpoint, key, diagnostic) => {
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         return Promise.resolve(jsonResponse([publicationAgent(kind === "publish" ? "draft" : "published")]))
       }
       if (url === endpoint && options?.method === "POST") {
@@ -771,7 +865,7 @@ describe("BuildsPage publication lifecycle", () => {
   ] as const)("reports mounted rejected %s requests with the operation-owned key and diagnostic", async (kind, endpoint, key, diagnostic) => {
     const rejection = new Error(`${kind} transport rejected`)
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         return Promise.resolve(jsonResponse([publicationAgent(kind === "publish" ? "draft" : "published")]))
       }
       if (url === endpoint && options?.method === "POST") return Promise.reject(rejection)
@@ -792,7 +886,7 @@ describe("BuildsPage publication lifecycle", () => {
     const refresh = deferred<Response>()
     let listRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return listRequests === 1 ? Promise.resolve(jsonResponse([publicationAgent("draft")])) : refresh.promise
       }
@@ -819,7 +913,7 @@ describe("BuildsPage publication lifecycle", () => {
     const refreshFailure = new Error("refresh rejected")
     let listRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return listRequests === 1
           ? Promise.resolve(jsonResponse([publicationAgent("draft")]))
@@ -845,7 +939,7 @@ describe("BuildsPage publication lifecycle", () => {
   it("keeps a refresh 503 out of publication feedback", async () => {
     let listRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return Promise.resolve(
           listRequests === 1
@@ -876,7 +970,7 @@ describe("BuildsPage publication lifecycle", () => {
     const mutation = deferred<Response>()
     let listRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return Promise.resolve(jsonResponse([publicationAgent("draft")]))
       }
@@ -916,7 +1010,7 @@ describe("BuildsPage publication lifecycle", () => {
     let publicationRequests = 0
     let listRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         return listRequests === 1 ? Promise.resolve(jsonResponse([publicationAgent("draft")])) : refresh.promise
       }
@@ -958,7 +1052,7 @@ describe("BuildsPage publication lifecycle", () => {
     const secondRefresh = deferred<Response>()
     let listRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         listRequests += 1
         if (listRequests === 1) return Promise.resolve(jsonResponse([
           publicationAgent("draft", 42),
@@ -1075,7 +1169,7 @@ function openCreateModal() {
 
 function configureCreateApi(create: () => Promise<Response> | Response) {
   apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-    if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
       return Promise.resolve(jsonResponse([]))
     }
     if (url === "http://api.local/api/chat/task/create") return create()
@@ -1106,7 +1200,7 @@ describe("BuildsPage task creation lifecycle", () => {
       expect(createPromptInput()).toHaveValue("  hello\n  world  ")
     })
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) return Promise.resolve(jsonResponse([]))
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/task/create") {
         expect(options?.method).toBe("POST")
         expect(JSON.parse(String(options?.body))).toEqual({

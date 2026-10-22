@@ -1095,6 +1095,150 @@ def test_list_agents_search_preserves_access_scope() -> None:
     assert empty.json() == []
 
 
+def test_list_agents_paginated_admin_defaults_to_mine_and_pages_other_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+
+    mine_id = _create_agent_row(user_id=admin_id, name="Mine")
+    newest_other_id = _create_agent_row(
+        user_id=bob_id,
+        name="Zulu other",
+        status=AgentStatus.PUBLISHED,
+    )
+    older_other_id = _create_agent_row(user_id=bob_id, name="Alpha other")
+
+    def fail_full_list(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("paginated requests must not load the full Agent list")
+
+    monkeypatch.setattr(
+        agents_api,
+        "list_accessible_agents",
+        fail_full_list,
+    )
+
+    mine = client.get(
+        "/api/agents",
+        params={"page": 1, "size": 1, "ownership": "auto"},
+        headers=headers,
+    )
+    assert mine.status_code == 200, mine.text
+    mine_page = mine.json()
+    assert mine_page["ownership"] == "mine"
+    assert mine_page["can_view_others"] is True
+    assert mine_page["visible_total"] == 3
+    assert mine_page["total"] == 1
+    assert [item["id"] for item in mine_page["items"]] == [mine_id]
+    assert mine_page["status_counts"] == {"all": 1, "enabled": 0, "drafts": 1}
+
+    others = client.get(
+        "/api/agents",
+        params={
+            "page": 1,
+            "size": 1,
+            "ownership": "others",
+            "sort": "name",
+        },
+        headers=headers,
+    )
+    assert others.status_code == 200, others.text
+    other_page = others.json()
+    assert other_page["ownership"] == "others"
+    assert other_page["total"] == 2
+    assert other_page["pages"] == 2
+    assert [item["id"] for item in other_page["items"]] == [older_other_id]
+
+    enabled = client.get(
+        "/api/agents",
+        params={
+            "page": 1,
+            "size": 12,
+            "ownership": "others",
+            "status": "enabled",
+        },
+        headers=headers,
+    )
+    assert enabled.status_code == 200, enabled.text
+    assert [item["id"] for item in enabled.json()["items"]] == [newest_other_id]
+
+
+def test_list_agents_paginated_literal_search_and_non_admin_others_guard() -> None:
+    _admin_headers()
+    headers = _register_second_user()
+    bob_id = _user_id("bob")
+    _create_agent_row(user_id=bob_id, name="100% literal")
+    _create_agent_row(user_id=bob_id, name="100 wildcard")
+
+    response = client.get(
+        "/api/agents",
+        params={"page": 1, "search": "%"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert [item["name"] for item in response.json()["items"]] == ["100% literal"]
+    assert response.json()["can_view_others"] is False
+
+    forbidden = client.get(
+        "/api/agents",
+        params={"page": 1, "ownership": "others"},
+        headers=headers,
+    )
+    assert forbidden.status_code == 403
+
+
+def test_list_agents_paginated_team_admin_can_switch_to_other_creators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services import agent_team_scope as scope_module
+    from xagent.web.services.agent_team_scope import AgentTeamScope
+
+    _admin_headers()
+    headers = _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+    team_id = 77
+    mine_id = _create_agent_row(user_id=bob_id, name="Team admin's agent")
+    other_id = _create_agent_row(user_id=admin_id, name="Team member's agent")
+    db = _direct_db_session()
+    try:
+        db.query(Agent).filter(Agent.id.in_([mine_id, other_id])).update(
+            {Agent.team_id: team_id}, synchronize_session=False
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        scope_module,
+        "_agent_team_scope_hook",
+        lambda _db, user_id: (
+            AgentTeamScope(team_id=team_id, is_team_admin=True)
+            if user_id == bob_id
+            else None
+        ),
+    )
+
+    mine = client.get(
+        "/api/agents",
+        params={"page": 1, "ownership": "auto"},
+        headers=headers,
+    )
+    assert mine.status_code == 200, mine.text
+    assert mine.json()["can_view_others"] is True
+    assert [item["id"] for item in mine.json()["items"]] == [mine_id]
+
+    others = client.get(
+        "/api/agents",
+        params={"page": 1, "ownership": "others"},
+        headers=headers,
+    )
+    assert others.status_code == 200, others.text
+    assert [item["id"] for item in others.json()["items"]] == [other_id]
+
+
 def test_list_agents_response_carries_suggested_prompts_through_owner_and_policy_rows() -> (
     None
 ):

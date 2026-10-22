@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from xagent.core.model.image.base import BaseImageModel
-from xagent.core.tools.core.image_tool import ImageGenerationToolCore
-from xagent.core.workspace import TaskWorkspace
 from xagent.core.tools.adapters.vibe.image_tool import (
     ImageGenerationTool,
     create_image_tool,
 )
+from xagent.core.tools.core.image_tool import ImageGenerationToolCore
+from xagent.core.workspace import TaskWorkspace
 
 
 @pytest.fixture

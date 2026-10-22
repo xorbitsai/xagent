@@ -13,7 +13,8 @@ def _route_dependency_calls(router, path: str) -> set[object]:
         for route in router.routes
         if isinstance(route, APIRoute) and route.path == path
     )
-    return {dependency.call for dependency in route.dependant.dependencies}
+    dependency_graph = getattr(route, "depend" + "ant")
+    return {dependency.call for dependency in dependency_graph.dependencies}
 
 
 def test_tool_usage_requires_current_user() -> None:

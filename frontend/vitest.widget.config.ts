@@ -173,6 +173,7 @@ export default defineConfig({
       "src/ci/browser-security.test.ts",
       "src/app/widget/chat/[token]/page-client.test.tsx",
       "src/app/settings/page.test.tsx",
+      "src/components/settings/settings-content.test.tsx",
       "src/components/chat/ChatInput.test.tsx",
       "src/components/chat/FileChip.test.tsx",
       "src/components/chat/chat-input-public-file-access.test.tsx",

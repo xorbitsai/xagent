@@ -468,6 +468,10 @@ Build when you need.`,
     hero_description: "Plan, run and review your agents in one workspace, from instant tasks to fully built workflows.",
   },
   settings: {
+    tabs: {
+      general: "General",
+      computerAccess: "Computer use",
+    },
     budget: {
       title: "Execution token budget",
       description: "Limits cumulative input and output tokens for one execution turn, including cached input. Calls already in flight may exceed the limit. This is not a monthly quota.",

@@ -27,7 +27,7 @@ export function MobileHeader() {
 
   return (
     <header className="xl:hidden sticky top-0 z-40 flex h-16 shrink-0 items-center justify-between border-b border-border bg-background/95 px-4 backdrop-blur supports-[backdrop-filter]:bg-background/80">
-      <Link href="/" className="flex items-center gap-3">
+      <Link href="/task" className="flex items-center gap-3">
         <img
           src={branding.logoPath}
           alt={branding.logoAlt}

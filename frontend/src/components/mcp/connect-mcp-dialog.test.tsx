@@ -475,6 +475,38 @@ function saveCustomApiEditor() {
   }))
 }
 
+describe("ConnectMcpDialog closed state", () => {
+  afterEach(cleanup)
+
+  it("opens from a closed parent without entering an update loop when selected servers are omitted", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    try {
+      function Harness() {
+        const [open, setOpen] = React.useState(false)
+        return (
+          <>
+            <button type="button" onClick={() => setOpen(true)}>Tools and apps</button>
+            <ConnectMcpDialog open={open} onOpenChange={setOpen} />
+          </>
+        )
+      }
+
+      render(<Harness />)
+      fireEvent.click(screen.getByRole("button", { name: "Tools and apps" }))
+      await act(async () => {})
+
+      expect(screen.getByRole("dialog")).toBeInTheDocument()
+      expect(
+        consoleError.mock.calls.some((call) =>
+          call.some((value) => String(value).includes("Maximum update depth exceeded")),
+        ),
+      ).toBe(false)
+    } finally {
+      consoleError.mockRestore()
+    }
+  })
+})
+
 describe("ConnectMcpDialog Custom API detail loading", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()

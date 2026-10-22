@@ -64,6 +64,7 @@ const MASKED_SECRET_VALUE = "********"
 // — silently blocking every future dialog close with no explanation
 // (round-6 MAJOR-1).
 const CATALOG_CONNECT_TIMEOUT_MS = 30_000
+const EMPTY_SELECTED_MCP_SERVERS: string[] = []
 
 // A connector's (type, numeric id) for the /api/connectors sharing endpoints.
 // Only connected connectors carry a numeric server_id; catalog entries without
@@ -105,7 +106,7 @@ export function ConnectMcpDialog({
   open,
   onOpenChange,
   onConnectCustom,
-  selectedMcpServers = [],
+  selectedMcpServers = EMPTY_SELECTED_MCP_SERVERS,
   onConnectSelected,
   customContent,
   onSuccess
@@ -413,7 +414,7 @@ export function ConnectMcpDialog({
   // genuinely successful auth, completed after the user closed the dialog,
   // still fire onSuccess/auto-select via a listener the (now-cleared)
   // interval was the only thing that used to remove.
-  const clearMcpOauthPollState = () => {
+  const clearMcpOauthPollState = React.useCallback(() => {
     mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
     mcpOauthPollTimersRef.current.clear()
     mcpOauthMessageListenersRef.current.forEach((listener) =>
@@ -426,12 +427,12 @@ export function ConnectMcpDialog({
     // (#1330), or an app whose OAuth flow was abandoned by a dialog close
     // would keep its claimed slot and never be connectable again.
     loadingAppsRef.current.clear()
-    setLoadingApps(new Set())
+    setLoadingApps((current) => current.size === 0 ? current : new Set())
     // F5 (close case): bump so any handleConnectMcpOAuthApp call that
     // captured the generation before this teardown ran can detect it's
     // stale and skip registering a new poll.
     mcpOauthPollGenerationRef.current += 1
-  }
+  }, [])
 
   useEffect(() => {
     if (open) {
@@ -458,7 +459,7 @@ export function ConnectMcpDialog({
       // spinner on the card if the dialog is reopened.
       clearMcpOauthPollState()
     }
-  }, [open, t, selectedMcpServers])
+  }, [open, selectedMcpServers, clearMcpOauthPollState])
 
   useEffect(() => () => {
     connectorEditRequestRef.current += 1
@@ -473,7 +474,7 @@ export function ConnectMcpDialog({
 
   useEffect(() => () => {
     clearMcpOauthPollState()
-  }, [])
+  }, [clearMcpOauthPollState])
 
   useEffect(() => {
     if (open) {

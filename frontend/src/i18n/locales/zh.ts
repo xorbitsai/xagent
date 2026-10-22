@@ -468,6 +468,10 @@ const zh = {
     hero_description: "在同一个工作空间中规划、运行并审查你的智能体，从即时任务到完整工作流。",
   },
   settings: {
+    tabs: {
+      general: "通用",
+      computerAccess: "操作电脑",
+    },
     budget: {
       title: "执行 token 预算",
       description: "限制单次执行累计的输入和输出 token（含缓存输入）。已发出的请求可能导致超额。这不是月度配额。",

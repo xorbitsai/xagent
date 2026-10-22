@@ -38,8 +38,10 @@ describe("sidebar navigation", () => {
   })
 
   it("puts common actions on the first level without duplicating them in Builder", () => {
-    const topLevelRoutes = getUserMenuItemsForUser().map((item) => item.href)
+    const userMenuItems = getUserMenuItemsForUser()
+    const topLevelRoutes = userMenuItems.map((item) => item.href)
     expect(topLevelRoutes).toEqual(["/tools", "/skill-hub", "/files", "/settings"])
+    expect(userMenuItems[0]).toMatchObject({ name: "Tools", nameKey: "nav.tools" })
     expect(getNavigationGroupsForUser()[0].items.some((item) => topLevelRoutes.includes(item.href))).toBe(false)
   })
 

@@ -18,15 +18,20 @@ const authState = vi.hoisted(() => ({
   },
 }))
 const toast = vi.hoisted(() => ({ error: vi.fn() }))
-const routeState = vi.hoisted(() => ({ pathname: "/task" }))
+const routeState = vi.hoisted(() => ({ pathname: "/task", searchParams: new URLSearchParams() }))
 const navState = vi.hoisted(() => ({ groups: [] as unknown[], items: [] as NavigationItem[] }))
 const extensionState = vi.hoisted(() => ({ groups: [] as NavigationGroup[] }))
 const routerPush = vi.hoisted(() => vi.fn())
+const routerReplace = vi.hoisted(() => vi.fn())
 const appState = vi.hoisted(() => ({ lastTaskUpdate: 0 }))
 const localeState = vi.hoisted(() => ({ locale: "en" as "en" | "zh" }))
 const createSeededAgentTaskMock = vi.hoisted(() => vi.fn())
 
-vi.mock("next/navigation", () => ({ usePathname: () => routeState.pathname, useRouter: () => ({ push: routerPush }) }))
+vi.mock("next/navigation", () => ({
+  usePathname: () => routeState.pathname,
+  useSearchParams: () => routeState.searchParams,
+  useRouter: () => ({ push: routerPush, replace: routerReplace }),
+}))
 vi.mock("next/image", () => ({ default: (props: React.ImgHTMLAttributes<HTMLImageElement>) => <img {...props} /> }))
 vi.mock("next/link", () => ({ default: ({ children, onClick, ...props }: React.AnchorHTMLAttributes<HTMLAnchorElement>) => <a {...props} onClick={(event) => { event.preventDefault(); onClick?.(event) }}>{children}</a> }))
 vi.mock("@/contexts/auth-context", () => ({ useAuth: () => authState }))
@@ -41,6 +46,45 @@ vi.mock("@/lib/sidebar-navigation", async () => ({
   getNavigationGroupsForUser: () => navState.groups, getUserMenuItemsForUser: () => navState.items,
 }))
 vi.mock("@/lib/hire-agent", () => ({ createSeededAgentTask: createSeededAgentTaskMock }))
+vi.mock("@/components/mcp/connect-mcp-dialog", () => ({
+  ConnectMcpDialog: ({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) => open ? (
+    <div role="dialog" aria-label="Connectors">
+      <button type="button" onClick={() => onOpenChange(false)}>Close connectors</button>
+    </div>
+  ) : null,
+}))
+vi.mock("@/components/settings/settings-dialog", () => ({
+  SettingsDialog: ({ open, onOpenChange, initialTab }: { open: boolean; onOpenChange: (open: boolean) => void; initialTab?: string }) => open ? (
+    <div role="dialog" aria-label="Settings dialog" data-tab={initialTab}>
+      <button type="button" onClick={() => onOpenChange(false)}>Close settings</button>
+    </div>
+  ) : null,
+}))
+
+describe("Sidebar connector dialog", () => {
+  beforeEach(() => {
+    routeState.pathname = "/task"
+    routeState.searchParams = new URLSearchParams()
+    navState.groups = []
+    navState.items = []
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false }))
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    cleanup()
+  })
+
+  it("opens the connector picker from the fixed Tools and apps action", () => {
+    render(<Sidebar />)
+
+    fireEvent.click(screen.getByRole("button", { name: "nav.toolsAndApps" }))
+    expect(screen.getByRole("dialog", { name: "Connectors" })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "Close connectors" }))
+    expect(screen.queryByRole("dialog", { name: "Connectors" })).not.toBeInTheDocument()
+  })
+})
 
 describe("Sidebar review regressions", () => {
   beforeEach(() => {
@@ -327,12 +371,15 @@ describe("Sidebar workspace menu", () => {
     navState.groups = navigation.getNavigationGroupsForUser()
     navState.items = navigation.getUserMenuItemsForUser()
     routeState.pathname = "/task"
+    routeState.searchParams = new URLSearchParams()
+    routerReplace.mockReset()
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(null, { status: 500 })))
   })
   afterEach(() => {
     navState.items = []
     navState.groups = []
     extensionState.groups = []
+    routeState.searchParams = new URLSearchParams()
     vi.unstubAllGlobals()
     cleanup()
   })
@@ -344,9 +391,12 @@ describe("Sidebar workspace menu", () => {
     fireEvent.click(trigger)
     const menu = within(screen.getByTestId("workspace-menu"))
     expect(menu.getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
-      "/tools", "/skill-hub", "/files", "/settings",
+      "/tools", "/skill-hub", "/files",
     ])
+    expect(menu.getByRole("link", { name: "nav.tools" })).toHaveAttribute("href", "/tools")
+    expect(screen.getByRole("button", { name: "nav.toolsAndApps" })).toBeInTheDocument()
     const builder = menu.getByRole("button", { name: "nav.builder" })
+    expect(menu.getByText("nav.builderDescription")).toHaveClass("truncate")
     expect(builder).toHaveAttribute("aria-expanded", "false")
     fireEvent.click(builder)
     expect(menu.getByRole("link", { name: "nav.teammates" })).toHaveAttribute("href", "/workforces?view=teammates")
@@ -355,6 +405,29 @@ describe("Sidebar workspace menu", () => {
     fireEvent.click(menu.getByRole("link", { name: "nav.models" }))
     expect(trigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByTestId("workspace-menu")).not.toBeInTheDocument()
+  })
+
+  it("opens Settings in a dialog instead of navigating", () => {
+    render(<Sidebar />)
+    fireEvent.click(screen.getByRole("button", { name: /alice@example\.com/i }))
+    const menu = within(screen.getByTestId("workspace-menu"))
+
+    const settings = menu.getByRole("button", { name: "nav.settings" })
+    expect(settings.closest("a")).toBeNull()
+    fireEvent.click(settings)
+
+    expect(screen.getByRole("dialog", { name: "Settings dialog" })).toBeInTheDocument()
+    expect(screen.queryByTestId("workspace-menu")).not.toBeInTheDocument()
+  })
+
+  it("opens a deep-linked Computer use dialog and clears the URL state on close", async () => {
+    routeState.searchParams = new URLSearchParams({ settings: "computer" })
+    render(<Sidebar />)
+
+    const dialog = await screen.findByRole("dialog", { name: "Settings dialog" })
+    expect(dialog).toHaveAttribute("data-tab", "computer")
+    fireEvent.click(screen.getByRole("button", { name: "Close settings" }))
+    expect(routerReplace).toHaveBeenCalledWith("/task", { scroll: false })
   })
 
   it("opens Builder and highlights its active child, including nested routes", () => {
@@ -402,6 +475,11 @@ describe("Sidebar workspace menu", () => {
     expect(menu.getByRole("button", { name: "Team" })).toHaveAttribute("aria-expanded", "true")
     expect(menu.getByRole("link", { name: "Billing" })).toHaveAttribute("aria-current", "page")
     const builder = menu.getByRole("button", { name: "nav.builder" })
+    const team = menu.getByRole("button", { name: "Team" })
+    const settings = menu.getByRole("button", { name: "nav.settings" })
+    expect(builder.compareDocumentPosition(team) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(team.compareDocumentPosition(settings) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(team.parentElement?.parentElement).toBe(builder.parentElement?.parentElement)
     expect(builder).toHaveAttribute("aria-expanded", "false")
     expect(menu.queryByRole("button", { name: "Create with AI" })).not.toBeInTheDocument()
     fireEvent.click(builder)

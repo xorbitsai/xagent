@@ -48,8 +48,9 @@ export interface NavigationGroup {
      */
     id?: string
     /**
-     * Host-provided placement: workspace adds a first-level group before
-     * Settings; builder appends its items to the shared Builder group.
+     * Host-provided placement: workspace adds a first-level group after the
+     * shared Builder group and before Settings; builder appends its items to
+     * that shared Builder group.
      * Omit to preserve the legacy standalone-group behavior.
      */
     placement?: "workspace" | "builder"
@@ -190,8 +191,8 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
 
 const baseUserMenuItems: NavigationItem[] = [
     {
-        name: "Tools and apps",
-        nameKey: "nav.toolsAndApps",
+        name: "Tools",
+        nameKey: "nav.tools",
         href: "/tools",
         icon: Wrench,
     },

@@ -2,7 +2,7 @@
 
 import Image from "next/image"
 import Link from "next/link"
-import { usePathname, useRouter } from "next/navigation"
+import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Bot,
@@ -56,6 +56,8 @@ import { Button } from "@/components/ui/button"
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover"
 import { Switch } from "@/components/ui/switch"
 import { PersonaAvatar } from "@/components/templates/persona-avatar"
+import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
+import { SettingsDialog, type SettingsDialogTab } from "@/components/settings/settings-dialog"
 import { toast } from "@/components/ui/sonner"
 import type { Template } from "@/types/template"
 
@@ -184,10 +186,10 @@ function SectionMenu({
       >
         {group.icon && <group.icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
         <span className="min-w-0 flex-1">
-          <span className="block font-medium">{title}</span>
-          {group.descriptionKey && <span className="mt-0.5 block text-[10px] leading-relaxed text-muted-foreground">{t(group.descriptionKey)}</span>}
+          <span className="block truncate font-medium">{title}</span>
+          {group.descriptionKey && <span className="mt-0.5 block truncate text-[10px] leading-relaxed text-muted-foreground">{t(group.descriptionKey)}</span>}
         </span>
-        {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+        {collapsed ? <ChevronRight className="h-3 w-3 shrink-0" /> : <ChevronDown className="h-3 w-3 shrink-0" />}
       </button>
       {!collapsed && (
         <div id={contentId} className="ml-3 mt-1 space-y-0.5 border-l border-border/60 pl-2">
@@ -424,6 +426,7 @@ export function Sidebar(props: SidebarProps) {
 function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: SidebarProps) {
   const pathname = usePathname()
   const router = useRouter()
+  const searchParams = useSearchParams()
   const { user, logout } = useAuth()
   const { state } = useApp()
   const { locale, t } = useI18n()
@@ -451,6 +454,10 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [routinesOpen, setRoutinesOpen] = useState(false)
+  const [connectorsOpen, setConnectorsOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsTab, setSettingsTab] = useState<SettingsDialogTab>("general")
+  const [settingsTargetId, setSettingsTargetId] = useState<string>()
   const [agents, setAgents] = useState<AgentSummary[]>([])
   const [tasks, setTasks] = useState<Task[]>([])
   const [taskPage, setTaskPage] = useState(1)
@@ -505,6 +512,29 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
   const [loading, setLoading] = useState(true)
   const userMenuRef = useRef<HTMLDivElement>(null)
   const openingAgentRef = useRef<number | null>(null)
+
+  const settingsQuery = searchParams.toString()
+  useEffect(() => {
+    const params = new URLSearchParams(settingsQuery)
+    const requestedTab = params.get("settings")
+    if (requestedTab !== "general" && requestedTab !== "computer") return
+
+    setSettingsTab(requestedTab)
+    setSettingsTargetId(window.location.hash.replace(/^#/, "") || undefined)
+    setSettingsOpen(true)
+  }, [settingsQuery])
+
+  const handleSettingsOpenChange = useCallback((open: boolean) => {
+    setSettingsOpen(open)
+    if (open) return
+
+    setSettingsTargetId(undefined)
+    const params = new URLSearchParams(searchParams.toString())
+    if (!params.has("settings")) return
+    params.delete("settings")
+    const query = params.toString()
+    router.replace(`${pathname}${query ? `?${query}` : ""}`, { scroll: false })
+  }, [pathname, router, searchParams])
 
   const workspaceVersion = useRef(0)
   useEffect(() => {
@@ -741,6 +771,11 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
   const visibleAgents = (searchQuery ? hasSearchResults ? searchResults.agents : [] : agents)
     .filter((agent) => agent.status === "published")
   const visibleTasks = searchQuery ? hasSearchResults ? searchResults.tasks : [] : tasks
+  const primaryUserMenuItems = userMenuItems.filter((item) => item.href !== "/settings" && !item.children?.length)
+  const workspaceUserMenuItems = userMenuItems.filter((item) => item.children?.length)
+  const settingsMenuItems = userMenuItems.filter((item) => item.href === "/settings")
+  const builderNavigationGroups = navigationGroups.filter((group) => group.id === "builder")
+  const remainingNavigationGroups = navigationGroups.filter((group) => group.id !== "builder")
 
   if (shouldCollapse) {
     return (
@@ -870,7 +905,13 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
 
         <div className="border-t border-[#ececf1] px-2.5 py-2">
           <Link href="/files" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/files") && "bg-white text-[#2536e0]")}><FileText className="h-4 w-4" /> {t("workspace.files")}</Link>
-          <Link href="/tools" className={cn("flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground", pathname.startsWith("/tools") && "bg-white text-[#2536e0]")}><Wrench className="h-4 w-4" /> {t("workspace.toolsApps")}</Link>
+          <button
+            type="button"
+            onClick={() => setConnectorsOpen(true)}
+            className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground"
+          >
+            <Wrench className="h-4 w-4" /> {t("nav.toolsAndApps")}
+          </button>
           <button onClick={() => setRoutinesOpen(true)} className="flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[12.5px] font-medium text-muted-foreground hover:bg-white hover:text-foreground"><RotateCcw className="h-4 w-4" /> {t("workspace.recurringJobs")}</button>
         </div>
 
@@ -879,9 +920,29 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
             <div className="flex items-center gap-3 px-4 py-3"><span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-[#2536e0] text-xs font-semibold uppercase text-white">{userLabel.charAt(0)}</span><span className="min-w-0"><b className="block truncate text-sm font-semibold">{userLabel}</b>{subtitle && <small className="block truncate text-xs text-muted-foreground">{subtitle}</small>}</span></div>
             <div className="mx-3 my-1 h-px bg-border" />
             <div className="space-y-0.5 px-2">
-              {userMenuItems.map((item) => <WorkspaceMenuItem key={item.href} item={item} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
+              {primaryUserMenuItems.map((item) => <WorkspaceMenuItem key={item.href} item={item} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
             </div>
-            {navigationGroups.map((group) => <SectionMenu key={`${group.id ?? group.title}:${pathname}`} group={group} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
+            {builderNavigationGroups.map((group) => <SectionMenu key={`${group.id ?? group.title}:${pathname}`} group={group} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
+            {workspaceUserMenuItems.map((item) => <WorkspaceMenuItem key={item.href} item={item} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
+            <div className="space-y-0.5 px-2">
+              {settingsMenuItems.map((item) => (
+                <button
+                  key={item.href}
+                  type="button"
+                  onClick={() => {
+                    setUserMenuOpen(false)
+                    setSettingsTab("general")
+                    setSettingsTargetId(undefined)
+                    setSettingsOpen(true)
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-[12px] text-foreground transition-colors hover:bg-accent"
+                >
+                  <item.icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <span className="truncate">{item.nameKey ? t(item.nameKey) : item.name}</span>
+                </button>
+              ))}
+            </div>
+            {remainingNavigationGroups.map((group) => <SectionMenu key={`${group.id ?? group.title}:${pathname}`} group={group} pathname={pathname} t={t} onNavigate={() => setUserMenuOpen(false)} />)}
             <div className="mx-3 my-1 h-px bg-border" />
             <button onClick={() => void (async () => { if (await logout()) setUserMenuOpen(false); else toast.error(t("sidebar.user.logoutFailed")) })()} className="mx-2 flex w-[calc(100%-16px)] items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-red-600 hover:bg-red-50"><LogOut className="h-4 w-4" />{t("sidebar.user.logoutTitle")}</button>
           </div>}
@@ -909,6 +970,13 @@ function SidebarWorkspace({ className, allowCollapse = true, profileSubtitle }: 
           </form>
         </DialogContent>
       </Dialog>
+      <ConnectMcpDialog open={connectorsOpen} onOpenChange={setConnectorsOpen} />
+      <SettingsDialog
+        open={settingsOpen}
+        onOpenChange={handleSettingsOpenChange}
+        initialTab={settingsTab}
+        targetId={settingsTargetId}
+      />
     </>
   )
 }

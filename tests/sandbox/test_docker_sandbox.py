@@ -694,6 +694,10 @@ class TestDockerSandboxService:
             template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
 
             temp_dir = tempfile.mkdtemp()
+            # A bind mount is writable by uid 1100 only when the host-side
+            # permissions grant access; the sandbox intentionally no longer
+            # bypasses those permissions as root.
+            os.chmod(temp_dir, 0o777)
             host_port = _get_free_host_port()
             config = SandboxConfig(
                 cpus=2,
@@ -1244,12 +1248,13 @@ class TestDockerSandbox:
 
             # Execute simple command
             msg = "hello word"
-            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > test.txt')
+            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > /tmp/test.txt')
+            assert result.exit_code == 0
 
-            result = await sandbox.exec("sh", "-c", "ls | grep test.txt")
+            result = await sandbox.exec("sh", "-c", "ls /tmp | grep test.txt")
             print(f"Command output: {result.stdout.strip()}")
 
-            result = await sandbox.exec("cat", "test.txt")
+            result = await sandbox.exec("cat", "/tmp/test.txt")
             print(f"result: {result.stdout.strip()}")
             assert result.stdout.strip() == msg
 

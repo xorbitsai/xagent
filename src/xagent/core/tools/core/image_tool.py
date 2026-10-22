@@ -506,8 +506,9 @@ Images are automatically saved to workspace.
         Returns:
             str: Resolved image path/URL suitable for the image model
         """
-        # Check if it's a URL (http/https)
-        if image_input.startswith(("http://", "https://")):
+        # Remote URLs and inline image payloads do not read from the host
+        # filesystem, so workspace path confinement does not apply to them.
+        if image_input.startswith(("http://", "https://", "data:image/")):
             return image_input
 
         # Local image reads are a workspace capability, not ambient host file

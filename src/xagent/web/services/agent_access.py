@@ -7,11 +7,11 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Query, Session
 
 from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.user import User
-from .agent_team_scope import get_agent_team_scope, owned_agent_clause
+from .agent_team_scope import get_agent_team_scope, owned_agent_clause, owns_agent
 from .workforce_access import get_visible_agent_ids
 
 AgentAccessLevel = Literal["owner", "policy"]
@@ -89,6 +89,40 @@ def _exclude_private_workforce_manager_agents(query: Any) -> Any:
     return query.filter(Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value)
 
 
+def query_accessible_agents(
+    db: Session,
+    user: User,
+    *,
+    purpose: str = "agent_list",
+    exclude_agent_ids: Iterable[int] | None = None,
+    include_private_workforce_manager_agents: bool = False,
+) -> Query[Agent]:
+    """Build the canonical query for Agents visible to ``user``.
+
+    Keep ownership and policy visibility in one SQL predicate so paginated and
+    bounded list callers cannot drift from the normal Agent list semantics.
+    """
+    query = db.query(Agent)
+    if not user.is_admin:
+        team_scope = get_agent_team_scope(db, int(user.id))
+        access_clauses = [owned_agent_clause(int(user.id), team_scope)]
+        visible_agent_ids = get_visible_agent_ids(db, user, purpose)
+        if visible_agent_ids:
+            # Admins-only Agents surface only through the owned clause (team
+            # admin); policy visibility must never leak them to non-admins.
+            access_clauses.append(
+                (Agent.id.in_(visible_agent_ids)) & (Agent.visibility != "admins")
+            )
+        query = query.filter(or_(*access_clauses))
+
+    excluded = _normalize_excluded_agent_ids(exclude_agent_ids)
+    if excluded:
+        query = query.filter(Agent.id.notin_(excluded))
+    if not include_private_workforce_manager_agents:
+        query = _exclude_private_workforce_manager_agents(query)
+    return query
+
+
 def list_accessible_agents(
     db: Session,
     user: User,
@@ -98,42 +132,22 @@ def list_accessible_agents(
     include_private_workforce_manager_agents: bool = False,
 ) -> list[AccessibleAgent]:
     """List agents visible to the user, including owned and policy-visible drafts."""
-    excluded = _normalize_excluded_agent_ids(exclude_agent_ids)
-    items_by_id: dict[int, AccessibleAgent] = {}
-
     team_scope = get_agent_team_scope(db, int(user.id))
-    owned_query = db.query(Agent).filter(owned_agent_clause(int(user.id), team_scope))
-    if excluded:
-        owned_query = owned_query.filter(Agent.id.notin_(excluded))
-    if not include_private_workforce_manager_agents:
-        owned_query = _exclude_private_workforce_manager_agents(owned_query)
-    for agent in owned_query.all():
-        items_by_id[int(agent.id)] = _owned_accessible_agent(agent)
-
-    if user.is_admin:
-        policy_query = db.query(Agent)
-    else:
-        visible_agent_ids = get_visible_agent_ids(db, user, purpose)
-        if not visible_agent_ids:
-            return _sort_by_created_desc(list(items_by_id.values()))
-        # Admins-only agents surface only through the owned clause (team admin);
-        # the policy/published path must never leak them to non-admins.
-        policy_query = db.query(Agent).filter(
-            Agent.id.in_(visible_agent_ids), Agent.visibility != "admins"
+    items = [
+        (
+            _owned_accessible_agent(agent)
+            if owns_agent(agent, int(user.id), team_scope)
+            else _policy_accessible_agent(agent)
         )
-
-    if excluded:
-        policy_query = policy_query.filter(Agent.id.notin_(excluded))
-    if not include_private_workforce_manager_agents:
-        policy_query = _exclude_private_workforce_manager_agents(policy_query)
-
-    for agent in policy_query.all():
-        agent_id = int(agent.id)
-        if agent_id in items_by_id:
-            continue
-        items_by_id[agent_id] = _policy_accessible_agent(agent)
-
-    return _sort_by_created_desc(list(items_by_id.values()))
+        for agent in query_accessible_agents(
+            db,
+            user,
+            purpose=purpose,
+            exclude_agent_ids=exclude_agent_ids,
+            include_private_workforce_manager_agents=include_private_workforce_manager_agents,
+        ).all()
+    ]
+    return _sort_by_created_desc(items)
 
 
 def list_accessible_published_agent_items(
@@ -171,25 +185,16 @@ def list_accessible_published_agents(
 ) -> list[Agent]:
     if limit is not None:
         bounded_limit = max(1, int(limit))
-        excluded = _normalize_excluded_agent_ids(exclude_agent_ids)
-        team_scope = get_agent_team_scope(db, int(user.id))
-        access_clauses = [owned_agent_clause(int(user.id), team_scope)]
-        if user.is_admin:
-            access_query = db.query(Agent)
-        else:
-            visible_agent_ids = get_visible_agent_ids(db, user, purpose)
-            if visible_agent_ids:
-                access_clauses.append(
-                    (Agent.id.in_(visible_agent_ids)) & (Agent.visibility != "admins")
-                )
-            access_query = db.query(Agent).filter(or_(*access_clauses))
+        access_query = query_accessible_agents(
+            db,
+            user,
+            purpose=purpose,
+            exclude_agent_ids=exclude_agent_ids,
+            include_private_workforce_manager_agents=include_private_workforce_manager_agents,
+        )
         access_query = access_query.filter(
             Agent.__table__.c.status == AgentStatus.PUBLISHED.value
         )
-        if excluded:
-            access_query = access_query.filter(Agent.id.notin_(excluded))
-        if not include_private_workforce_manager_agents:
-            access_query = _exclude_private_workforce_manager_agents(access_query)
         return list(access_query.order_by(Agent.id).limit(bounded_limit).all())
 
     return [

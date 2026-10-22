@@ -1122,7 +1122,7 @@ def test_list_agents_paginated_admin_defaults_to_mine_and_pages_other_users(
 
     mine = client.get(
         "/api/agents",
-        params={"page": 1, "size": 1, "ownership": "auto"},
+        params={"page": 1, "size": 1},
         headers=headers,
     )
     assert mine.status_code == 200, mine.text
@@ -1187,6 +1187,42 @@ def test_list_agents_paginated_literal_search_and_non_admin_others_guard() -> No
         headers=headers,
     )
     assert forbidden.status_code == 403
+
+
+def test_list_agents_paginated_non_admin_preserves_access_scope() -> None:
+    _admin_headers()
+    headers = _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+
+    owned_id = _create_agent_row(user_id=bob_id, name="Owned")
+    shared_id = _create_agent_row(user_id=admin_id, name="Policy visible")
+    _create_agent_row(user_id=admin_id, name="Private")
+    admins_only_id = _create_agent_row(user_id=admin_id, name="Admins only")
+    db = _direct_db_session()
+    try:
+        admins_only = db.get(Agent, admins_only_id)
+        assert admins_only is not None
+        admins_only.visibility = "admins"
+        db.commit()
+    finally:
+        db.close()
+    set_workforce_policy(_VisibleAgentPolicy({shared_id, admins_only_id}))
+
+    response = client.get(
+        "/api/agents",
+        params={"page": 1, "size": 12},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    page = response.json()
+    assert page["visible_total"] == 2
+    assert page["total"] == 2
+    assert page["ownership"] == "all"
+    assert {item["id"] for item in page["items"]} == {owned_id, shared_id}
+    items_by_id = {item["id"]: item for item in page["items"]}
+    assert items_by_id[owned_id]["access"] == "owner"
+    assert items_by_id[shared_id]["access"] == "policy"
 
 
 def test_list_agents_paginated_team_admin_can_switch_to_other_creators(

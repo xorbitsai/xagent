@@ -190,6 +190,24 @@ function jsonResponse(data: unknown, init?: ResponseInit) {
   })
 }
 
+function agentPage(items: typeof agent[]) {
+  return {
+    items,
+    page: 1,
+    size: 12,
+    total: items.length,
+    pages: 1,
+    visible_total: items.length,
+    status_counts: {
+      all: items.length,
+      enabled: items.filter((item) => item.status === "published").length,
+      drafts: items.filter((item) => item.status !== "published").length,
+    },
+    ownership: "all",
+    can_view_others: false,
+  }
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   const promise = new Promise<T>((resolvePromise) => {
@@ -295,7 +313,7 @@ describe("BuildsPage extension boundaries", () => {
     let agentListRequests = 0
 
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
-      if (url === "http://api.local/api/agents" && !options?.method) {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
         agentListRequests += 1
         return agentListRequests === 1
           ? initialAgents.promise
@@ -315,7 +333,7 @@ describe("BuildsPage extension boundaries", () => {
     expect(providerLifetime).toEqual({ mounts: 1, unmounts: 0 })
 
     await act(async () => {
-      initialAgents.resolve(jsonResponse([agent]))
+      initialAgents.resolve(jsonResponse(agentPage([agent])))
       await initialAgents.promise
     })
     await screen.findByText("Research Agent")
@@ -324,11 +342,12 @@ describe("BuildsPage extension boundaries", () => {
       name: "builds.list.actions.publish",
     }))
     await waitFor(() => expect(agentListRequests).toBe(2))
-    expect(screen.getByText("common.loading")).toBeInTheDocument()
+    expect(screen.queryByText("common.loading")).not.toBeInTheDocument()
+    expect(screen.getByText("Research Agent")).toBeInTheDocument()
     expect(providerLifetime).toEqual({ mounts: 1, unmounts: 0 })
 
     await act(async () => {
-      refreshedAgents.resolve(jsonResponse([]))
+      refreshedAgents.resolve(jsonResponse(agentPage([])))
       await refreshedAgents.promise
     })
     await screen.findByText("builds.emptyState.title")

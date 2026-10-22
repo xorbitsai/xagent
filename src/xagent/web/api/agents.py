@@ -8,9 +8,9 @@ from typing import Any, Dict, List, Literal, Optional, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import String, func
+from sqlalchemy import String
 from sqlalchemy import cast as sql_cast
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,7 @@ from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
     list_accessible_agents,
+    query_accessible_agents,
 )
 from ..services.agent_management import (
     AgentManagementRuntime,
@@ -817,7 +818,7 @@ async def list_agents(
     size: int = Query(12, ge=1, le=100),
     status: Literal["all", "enabled", "drafts"] = "all",
     sort: Literal["updated", "name"] = "updated",
-    ownership: Literal["auto", "all", "mine", "others"] = "all",
+    ownership: Literal["auto", "all", "mine", "others"] = "auto",
 ) -> List[AgentListItem] | AgentListPage:
     """List agents visible to the current user.
 
@@ -828,7 +829,9 @@ async def list_agents(
     """
     try:
         store = AgentStore(db)
-        keyword = (search or "").strip().casefold()
+        raw_keyword = (search or "").strip()
+        keyword = raw_keyword.lower()
+        legacy_keyword = raw_keyword.casefold()
         if page is not None:
             user_id = int(current_user.id)
             team_scope = get_agent_team_scope(db, user_id)
@@ -848,20 +851,11 @@ async def list_agents(
                     detail="Administrator privileges required to list other users' agents",
                 )
 
-            query = db.query(Agent).filter(
-                Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+            query = query_accessible_agents(
+                db,
+                current_user,
+                purpose="agent_list",
             )
-            if not current_user.is_admin:
-                access_clauses = [owned_agent_clause(user_id, team_scope)]
-                visible_agent_ids = get_visible_agent_ids(
-                    db, current_user, "agent_list"
-                )
-                if visible_agent_ids:
-                    access_clauses.append(
-                        (Agent.id.in_(visible_agent_ids))
-                        & (Agent.visibility != "admins")
-                    )
-                query = query.filter(or_(*access_clauses))
 
             visible_total = query.count()
 
@@ -886,9 +880,10 @@ async def list_agents(
             elif effective_ownership == "others":
                 query = query.filter(Agent.user_id != user_id)
 
+            status_column = Agent.__table__.c.status
             status_rows = (
-                query.with_entities(Agent.status, func.count(Agent.id))
-                .group_by(Agent.status)
+                query.with_entities(status_column, func.count(Agent.id))
+                .group_by(status_column)
                 .all()
             )
             status_totals = {
@@ -904,10 +899,10 @@ async def list_agents(
             )
 
             if status == "enabled":
-                query = query.filter(Agent.status == AgentStatus.PUBLISHED)
+                query = query.filter(status_column == AgentStatus.PUBLISHED.value)
                 total = status_counts.enabled
             elif status == "drafts":
-                query = query.filter(Agent.status != AgentStatus.PUBLISHED)
+                query = query.filter(status_column != AgentStatus.PUBLISHED.value)
                 total = status_counts.drafts
             else:
                 total = status_counts.all
@@ -956,18 +951,18 @@ async def list_agents(
                 can_view_others=can_view_others,
             )
 
-        items = [
+        legacy_items = [
             _serialize_agent_list_item(store, item)
             for item in list_accessible_agents(
                 db,
                 current_user,
                 purpose="agent_list",
             )
-            if not keyword
-            or keyword in (item.agent.name or "").casefold()
-            or keyword in (item.agent.description or "").casefold()
+            if not legacy_keyword
+            or legacy_keyword in (item.agent.name or "").casefold()
+            or legacy_keyword in (item.agent.description or "").casefold()
         ]
-        return [AgentListItem.model_validate(item) for item in items]
+        return [AgentListItem.model_validate(item) for item in legacy_items]
 
     except HTTPException:
         raise

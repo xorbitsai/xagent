@@ -136,6 +136,8 @@ function BuildsPageContent() {
   const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
+  const [hasLoadedAgents, setHasLoadedAgents] = useState(false)
+  const [refreshVersion, setRefreshVersion] = useState(0)
   const [statusTab, setStatusTab] = useState<StatusTab>("all")
   const [sortMode, setSortMode] = useState<"updated" | "name">("updated")
   const [ownershipScope, setOwnershipScope] = useState<OwnershipScope>("auto")
@@ -232,6 +234,7 @@ function BuildsPageContent() {
         isMountedRef.current &&
         requestGeneration === agentListRequestGenerationRef.current
       ) {
+        setHasLoadedAgents(true)
         setLoading(false)
       }
     }
@@ -249,7 +252,7 @@ function BuildsPageContent() {
 
   useEffect(() => {
     void fetchAgents()
-  }, [fetchAgents])
+  }, [fetchAgents, refreshVersion])
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -329,7 +332,7 @@ function BuildsPageContent() {
   ) => {
     const outcome = await performPublicationMutation(agentId, kind)
     if (outcome === "success" && isMountedRef.current) {
-      void fetchAgents()
+      setRefreshVersion((current) => current + 1)
     }
   }
 
@@ -376,7 +379,7 @@ function BuildsPageContent() {
       setAgentDeleteSession((current) =>
         current?.target.id === session.target.id ? null : current,
       )
-      void fetchAgents()
+      setRefreshVersion((current) => current + 1)
     } catch (error) {
       if (!isCurrentAction()) return
       console.error("Failed to delete agent:", error)
@@ -639,10 +642,15 @@ function BuildsPageContent() {
       />
 
       {/* Main Content */}
-      <div className="flex-1 px-4 md:px-6 py-6 space-y-6 overflow-auto">
+      <div
+        aria-busy={loading}
+        className={`flex-1 px-4 md:px-6 py-6 space-y-6 overflow-auto transition-opacity ${
+          loading && hasLoadedAgents ? "opacity-60" : ""
+        }`}
+      >
         <MyTeamTabs active="teammates" teammateCount={visibleTotal} />
         {/* Loading State */}
-        {loading ? (
+        {loading && !hasLoadedAgents ? (
           <div className="flex items-center justify-center h-[400px]">
             <div className="text-muted-foreground">{t("common.loading")}</div>
           </div>

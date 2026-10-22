@@ -297,6 +297,111 @@ describe("BuildsPage rendering", () => {
     )).toBe(true)
   })
 
+  it("sends server filters and resets a debounced search to page one", async () => {
+    const agentListUrls: URL[] = []
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents?")) {
+        const requestUrl = new URL(url)
+        agentListUrls.push(requestUrl)
+        const requestedPage = Number(requestUrl.searchParams.get("page"))
+        return Promise.resolve(jsonResponse(agentPage([
+          { ...agent, id: requestedPage, name: `Filtered page ${requestedPage}` },
+        ], {
+          page: requestedPage,
+          total: 24,
+          pages: 2,
+          visible_total: 24,
+          status_counts: { all: 24, enabled: 8, drafts: 16 },
+        })))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Filtered page 1")
+    expect(Object.fromEntries(agentListUrls[0].searchParams)).toMatchObject({
+      page: "1",
+      size: "12",
+      status: "all",
+      sort: "updated",
+      ownership: "auto",
+    })
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.pagination.next",
+    }))
+    await screen.findByText("Filtered page 2")
+
+    fireEvent.change(screen.getByPlaceholderText("builds.list.search.placeholder"), {
+      target: { value: "  needle  " },
+    })
+    await waitFor(() => expect(agentListUrls.some((url) =>
+      url.searchParams.get("page") === "1"
+      && url.searchParams.get("search") === "needle",
+    )).toBe(true))
+
+    fireEvent.click(screen.getByRole("button", {
+      name: /builds\.list\.tabs\.enabled/,
+    }))
+    await waitFor(() => expect(agentListUrls.some((url) =>
+      url.searchParams.get("status") === "enabled",
+    )).toBe(true))
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.sort.updated",
+    }))
+    await waitFor(() => expect(agentListUrls.some((url) =>
+      url.searchParams.get("sort") === "name",
+    )).toBe(true))
+  })
+
+  it("refreshes a completed mutation with the latest page state", async () => {
+    const publication = deferred<Response>()
+    const agentListUrls: URL[] = []
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.startsWith("http://api.local/api/agents?") && !options?.method) {
+        const requestUrl = new URL(url)
+        agentListUrls.push(requestUrl)
+        const requestedPage = Number(requestUrl.searchParams.get("page"))
+        return Promise.resolve(jsonResponse(agentPage([
+          { ...agent, id: requestedPage, name: `Mutation page ${requestedPage}` },
+        ], {
+          page: requestedPage,
+          total: 24,
+          pages: 2,
+          visible_total: 24,
+          status_counts: { all: 24, enabled: 0, drafts: 24 },
+        })))
+      }
+      if (url.endsWith("/api/agents/1/publish") && options?.method === "POST") {
+        return publication.promise
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Mutation page 1")
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.actions.publish",
+    }))
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/agents/1/publish",
+      { method: "POST" },
+    ))
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.pagination.next",
+    }))
+    await screen.findByText("Mutation page 2")
+
+    await act(async () => {
+      publication.resolve(new Response(null, { status: 204 }))
+      await publication.promise
+    })
+    await waitFor(() => expect(agentListUrls.length).toBeGreaterThanOrEqual(3))
+    expect(agentListUrls.at(-1)?.searchParams.get("page")).toBe("2")
+  })
+
   it("limits a published read-only Agent to run and view actions", async () => {
     apiRequestMock.mockResolvedValue(jsonResponse([{
       ...agent,
@@ -667,6 +772,7 @@ describe("BuildsPage Agent deletion", () => {
       name: "builds.list.actions.delete",
     })
     fireEvent.click(publishButton)
+    await waitFor(() => expect(listRequests).toBe(2))
     fireEvent.click(deleteButton)
     fireEvent.click(screen.getByRole("button", {
       name: "builds.list.deleteDialog.confirm",
@@ -1109,7 +1215,7 @@ describe("BuildsPage publication lifecycle", () => {
     expect(wrapper).toContain(
       "const outcome = await performPublicationMutation(agentId, kind)\n"
       + "    if (outcome === \"success\" && isMountedRef.current) {\n"
-      + "      void fetchAgents()\n"
+      + "      setRefreshVersion((current) => current + 1)\n"
       + "    }",
     )
     expect(wrapper.match(/\.then\(/g) ?? []).toHaveLength(0)

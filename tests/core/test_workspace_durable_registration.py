@@ -8,6 +8,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+import xagent.core.workspace as workspace_module
 from xagent.core.agent.service import AgentService
 from xagent.core.file_storage.factory import (
     get_unscoped_file_storage,
@@ -15,7 +16,11 @@ from xagent.core.file_storage.factory import (
 )
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.core.workspace import TaskWorkspace, WorkspaceManager
+from xagent.core.workspace import (
+    ExternalUploadStagingError,
+    TaskWorkspace,
+    WorkspaceManager,
+)
 from xagent.web.models import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -1565,10 +1570,10 @@ def test_stage_and_discard_external_upload_file(tmp_path, monkeypatch):
 
     assert staged.is_file()
     assert staged.read_bytes() == b"workbook"
-    assert staged.is_relative_to(workspace.temp_dir / ".xagent-internal" / "mcp-upload")
+    assert not staged.is_relative_to(workspace.workspace_dir)
     assert str(staged) not in workspace.get_allowed_dirs()
-    assert any(
-        staged.is_relative_to(Path(directory))
+    assert not any(
+        staged.is_relative_to(Path(directory).resolve())
         for directory in workspace.get_allowed_dirs()
     )
 
@@ -1586,16 +1591,15 @@ def test_stage_external_upload_rejects_unregistered_file(tmp_path):
         workspace.stage_file_for_external_upload("not-registered")
 
 
-def test_external_upload_staging_rejects_symlinked_internal_root(tmp_path):
+def test_external_upload_staging_rejects_symlinked_internal_root(tmp_path, monkeypatch):
     workspace = TaskWorkspace(id="task_stage_root", base_dir=str(tmp_path))
     escaped = tmp_path / "escaped"
     escaped.mkdir()
     workspace.internal_temp_dir.symlink_to(escaped, target_is_directory=True)
+    monkeypatch.setattr(workspace_module, "in_sandbox_tool_runner", lambda: True)
 
-    with pytest.raises(ValueError, match="outside temp directory"):
-        workspace.discard_staged_external_upload(
-            escaped / "mcp-upload" / "staged" / "file.xlsx"
-        )
+    with pytest.raises(ExternalUploadStagingError, match="staging area"):
+        workspace._external_upload_staging_root()
 
 
 def test_stage_external_upload_rejects_source_symlink_outside_storage(

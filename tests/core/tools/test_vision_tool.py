@@ -481,6 +481,18 @@ class TestVisionToolUnderstandImages:
         assert ".vision-staging" not in result.error
 
     @pytest.mark.asyncio
+    async def test_media_batch_keeps_valid_items_when_one_selector_fails(
+        self, vision_tool_with_workspace
+    ):
+        result = await vision_tool_with_workspace.understand_images(
+            ["existing_image.jpg", "missing.jpg"], "Describe the usable image"
+        )
+
+        assert result.success is True
+        assert result.images_processed == 1
+        assert any("missing.jpg" in warning for warning in result.warnings)
+
+    @pytest.mark.asyncio
     async def test_understand_rejects_workspace_escape_paths(
         self, mock_vision_model, tmp_path
     ):
@@ -2026,6 +2038,29 @@ class TestVisionToolHelperMethods:
 
         with pytest.raises(RuntimeError, match="Failed to read local media"):
             core._read_local_media_bytes(str(source))
+
+    @pytest.mark.asyncio
+    async def test_core_rejects_workspace_escape_selectors(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        outside = tmp_path / "outside.jpg"
+        outside.write_bytes(b"outside")
+        escape_link = workspace_root / "escape.jpg"
+        escape_link.symlink_to(outside)
+        core = vision_tool_without_workspace.core
+        core.workspace_root = workspace_root
+
+        for selector in (
+            str(outside),
+            str(workspace_root / ".." / "outside.jpg"),
+            str(escape_link),
+        ):
+            result = await core.understand_media(selector, "Describe it")
+            assert result.success is False
+
+        vision_tool_without_workspace.vision_model.vision_chat.assert_not_awaited()
 
     def test_decode_svg_bytes_rejects_script(self, vision_tool_without_workspace):
         svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'

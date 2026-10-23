@@ -126,14 +126,29 @@ class VisionTool:
         self,
         media: Union[str, List[str]],
         staged_sources: Optional[dict[str, str]] = None,
+        resolution_warnings: Optional[list[str]] = None,
     ) -> str | list[str]:
         """Resolve all media paths using workspace."""
         if isinstance(media, str):
             return await self._resolve_media_path(media, staged_sources)
         if isinstance(media, list):
             resolved: list[str] = []
+            failures: list[Exception] = []
             for item in media:
-                resolved.append(await self._resolve_media_path(item, staged_sources))
+                try:
+                    resolved.append(
+                        await self._resolve_media_path(item, staged_sources)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures.append(exc)
+                    if resolution_warnings is not None:
+                        resolution_warnings.append(
+                            f"Failed to resolve media {item}: {exc}"
+                        )
+            if not resolved and failures:
+                raise failures[0]
             return resolved
         return media
 
@@ -198,9 +213,12 @@ class VisionTool:
     ) -> UnderstandMediaResult:
         """Analyze images, videos, or mixed media with one public tool."""
         staged_sources: dict[str, str] = {}
+        resolution_warnings: list[str] = []
         try:
             normalized_media = self._normalize_media(media)
-            resolved_media = await self._resolve_media(normalized_media, staged_sources)
+            resolved_media = await self._resolve_media(
+                normalized_media, staged_sources, resolution_warnings
+            )
             result = await self.core.understand_media(
                 resolved_media,
                 question,
@@ -210,6 +228,7 @@ class VisionTool:
                 temperature,
                 max_tokens,
             )
+            result.warnings = [*resolution_warnings, *result.warnings]
             self._restore_media_selectors(result, staged_sources)
             return result
         except Exception as e:
@@ -264,14 +283,16 @@ class VisionTool:
             UnderstandImagesResult with descriptions and metadata
         """
         staged_sources: dict[str, str] = {}
+        resolution_warnings: list[str] = []
         try:
             normalized_images = self._normalize_images(images)
             resolved_images = await self._resolve_media(
-                normalized_images, staged_sources
+                normalized_images, staged_sources, resolution_warnings
             )
             result = await self.core.describe_images(
                 resolved_images, detail_level, temperature, max_tokens
             )
+            result.warnings = [*resolution_warnings, *result.warnings]
             self._restore_media_selectors(result, staged_sources)
             return result
         except Exception as e:

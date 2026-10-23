@@ -433,6 +433,29 @@ def _replace_staged_upload_paths(value: Any, replacements: Mapping[str, str]) ->
     return value
 
 
+def _replace_exact_string_values(value: Any, replacements: Mapping[str, str]) -> Any:
+    """Replace string values that equal a key of ``replacements`` exactly.
+
+    Only whole values are replaced, never substrings and never mapping keys.
+    With no replacements the argument itself is returned.
+    """
+
+    if not replacements:
+        return value
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, Mapping):
+        return {
+            key: _replace_exact_string_values(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_exact_string_values(item, replacements) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_exact_string_values(item, replacements) for item in value)
+    return value
+
+
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Three consumers read it: _bounded_exception_nodes (the 401 resolver's
@@ -3280,6 +3303,162 @@ class MCPToolAdapter(AbstractBaseTool):
                 type(retry_exc).__name__,
             )
             return _delegated_retry_failed_result()
+
+    async def _execute_named_mcp_call(
+        self,
+        connection: Connection,
+        tool_name: str,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Call ``tool_name`` on the connector this adapter belongs to.
+
+        For calls the host makes itself, as opposed to calls the model asks
+        for.  It is the counterpart of ``_execute_mcp_call`` without the
+        tool-specific post-processing, and does not replace it.
+        """
+        async with create_session(connection) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                tool_name,
+                dict(tool_args),
+                meta=dict(tool_meta) or None,
+            )
+            return _normalized_mcp_call_result(result)
+
+    async def _call_issuing_tool_with_authorization_retry(
+        self,
+        connection: Connection,
+        tool_name: str,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+        *,
+        was_refreshed: bool,
+    ) -> dict[str, Any]:
+        """Run a host-issued call under the authorization policy of a model call.
+
+        A failure is handled exactly as it is for the call the model asked
+        for: the same retries after a 401, the same results for a failed
+        refresh or retry, and the same exception otherwise.  Refresh callbacks
+        are read from ``self.connection``, never from ``connection``.
+
+        This mirrors the outer call section of ``run_json_async``,
+        ``_retry_after_authorization_failure`` and ``_retry_resolver_401``.
+        Whoever changes one of those three must change this method too; the
+        equivalence test between the two paths fails when they drift apart.
+        """
+        try:
+            return await self._execute_named_mcp_call(
+                connection, tool_name, tool_args, tool_meta
+            )
+        except (BaseExceptionGroup, Exception) as exc:
+            if was_refreshed:
+                raise
+
+            if isinstance(self.connection, Mapping) and (
+                _OAUTH_TOKEN_RESOLVER_REFRESH_KEY in self.connection
+            ):
+                challenge, initial_response_ids = _resolver_401_evidence(exc)
+                if not initial_response_ids:
+                    raise
+
+                resolver_refresh = self.connection.get(
+                    _OAUTH_TOKEN_RESOLVER_REFRESH_KEY
+                )
+                if challenge is None or not callable(resolver_refresh):
+                    return _delegated_authorization_failed_result()
+
+                logger.info(
+                    "Retrying MCP tool %s after resolver authorization failure",
+                    tool_name,
+                )
+                try:
+                    refreshed = resolver_refresh(challenge)
+                    if inspect.isawaitable(refreshed):
+                        refreshed = await refreshed
+                except (BaseExceptionGroup, Exception) as refresh_exc:
+                    logger.error(
+                        "MCP tool %s resolver authorization refresh failed with %s",
+                        tool_name,
+                        type(refresh_exc).__name__,
+                    )
+                    return _delegated_authorization_failed_result()
+
+                from ....agent.result import ClassifiedToolFailure
+
+                if isinstance(refreshed, ClassifiedToolFailure):
+                    return _delegated_authorization_failed_result(
+                        failure_code=refreshed.failure_code
+                    )
+
+                if not _is_executable_remote_connection(refreshed):
+                    return _delegated_authorization_failed_result()
+
+                try:
+                    return await self._execute_named_mcp_call(
+                        cast(Connection, refreshed), tool_name, tool_args, tool_meta
+                    )
+                except (BaseExceptionGroup, Exception) as retry_exc:
+                    excluded_response_ids = (
+                        frozenset() if retry_exc is exc else initial_response_ids
+                    )
+                    if (
+                        next(
+                            _strict_http_401_responses(
+                                retry_exc,
+                                excluded_response_ids=excluded_response_ids,
+                                excluded_subtree_ids=frozenset({id(exc)}),
+                            ),
+                            None,
+                        )
+                        is not None
+                    ):
+                        return _delegated_authorization_failed_result()
+                    logger.error(
+                        "MCP tool %s resolver authorization retry failed with %s",
+                        tool_name,
+                        type(retry_exc).__name__,
+                    )
+                    return _delegated_retry_failed_result()
+
+            if not _exception_indicates_http_401(exc):
+                raise
+            if not isinstance(self.connection, Mapping):
+                raise
+            refresh = self.connection.get(_RUNTIME_CONNECTION_REFRESH_KEY)
+            if not callable(refresh):
+                raise
+
+            logger.info(
+                "Retrying MCP tool %s after delegated authorization failure",
+                tool_name,
+            )
+            try:
+                refreshed = refresh()
+                if inspect.isawaitable(refreshed):
+                    refreshed = await refreshed
+            except (BaseExceptionGroup, Exception) as refresh_exc:
+                logger.error(
+                    "MCP tool %s delegated authorization refresh failed with %s",
+                    tool_name,
+                    type(refresh_exc).__name__,
+                )
+                return _delegated_authorization_failed_result()
+            if not isinstance(refreshed, dict):
+                return _delegated_authorization_failed_result()
+            try:
+                return await self._execute_named_mcp_call(
+                    cast(Connection, refreshed), tool_name, tool_args, tool_meta
+                )
+            except (BaseExceptionGroup, Exception) as retry_exc:
+                if _exception_indicates_http_401(retry_exc):
+                    return _delegated_authorization_failed_result()
+                logger.error(
+                    "MCP tool %s delegated authorization retry failed with %s",
+                    tool_name,
+                    type(retry_exc).__name__,
+                )
+                return _delegated_retry_failed_result()
 
     def _get_current_user_id(self) -> Optional[str]:
         """Get current user ID from environment or context."""

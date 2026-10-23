@@ -1420,14 +1420,18 @@
       if (deliveryId !== state.stableDeliveryId && deliveryId !== state.invalidatedDeliveryId) {
         state.awaitedDeliveryId = deliveryId;
       }
-      send({
+      var update = {
         type: 'session_update',
         session_delivery_id: deliveryId,
         session_token: state.session.session_token,
         session_token_expires_at: state.session.session_token_expires_at,
         absolute_expires_at: state.session.absolute_expires_at,
         agent: state.session.agent
-      });
+      };
+      // Forwarded untouched; the iframe validates it and treats anything
+      // malformed as "no capabilities".
+      if (state.session.capabilities) update.capabilities = state.session.capabilities;
+      send(update);
     }
 
     function isRecord(value) {
@@ -1452,13 +1456,15 @@
           !isRecord(data.session.agent)) {
         return null;
       }
+      var session = {
+        session_token: data.session_token,
+        session_token_expires_at: data.session_token_expires_at,
+        absolute_expires_at: data.session.absolute_expires_at,
+        agent: data.session.agent
+      };
+      if (isRecord(data.session.capabilities)) session.capabilities = data.session.capabilities;
       return {
-        session: {
-          session_token: data.session_token,
-          session_token_expires_at: data.session_token_expires_at,
-          absolute_expires_at: data.session.absolute_expires_at,
-          agent: data.session.agent
-        },
+        session: session,
         reconnectToken: data.reconnect_token
       };
     }

@@ -17,6 +17,9 @@ const CLIENT_ONLY_CODES = new Set<ClientErrorCode>([
   "upload_too_large",
   "upload_proxy_error",
   "upload_failed",
+  "upload_rate_limited",
+  "upload_quota_exceeded",
+  "upload_rejected",
   "connection_not_ready",
   "message_not_accepted",
 ])
@@ -49,6 +52,9 @@ describe("client error wire contract", () => {
     ["upload_too_large", "clientErrors.uploadTooLarge", "File is too large. Please reduce the upload size and try again."],
     ["upload_proxy_error", "clientErrors.uploadProxyError", "Upload failed before reaching the application. Please check the server upload limit."],
     ["upload_failed", "clientErrors.uploadFailed", "Upload failed. Please try again."],
+    ["upload_rate_limited", "clientErrors.uploadRateLimited", "The file could not be uploaded right now. Please try again in a minute."],
+    ["upload_quota_exceeded", "clientErrors.uploadQuotaExceeded", "You have reached the file limit for this chat."],
+    ["upload_rejected", "clientErrors.uploadRejected", "This file can't be uploaded. Check its name and type."],
     ["connection_not_ready", "clientErrors.connectionNotReady", "Not connected. Your message was not sent."],
     ["message_not_accepted", "clientErrors.messageNotAccepted", "The message was not accepted."],
     ["missing_runtime_context", "clientErrors.missingRuntimeContext", "This connector needs additional runtime input before it can run."],
@@ -72,6 +78,14 @@ describe("client error wire contract", () => {
   )("readServerRejectionCode reads %s as %s", (code, expected) => {
     expect(readServerRejectionCode(code)).toBe(expected)
   })
+
+  it.each(["upload_rate_limited", "upload_quota_exceeded", "upload_rejected"])(
+    "never accepts %s from a server rejection frame",
+    (code) => {
+      expect(readClientErrorCode(code)).toBe(code)
+      expect(readServerRejectionCode(code)).toBeNull()
+    },
+  )
 
   it("keeps the fallback strings identical to the English locale", () => {
     for (const code of CLIENT_ERROR_CODES) {

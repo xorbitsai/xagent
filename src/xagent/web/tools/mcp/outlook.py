@@ -9,6 +9,7 @@ from urllib.parse import quote, unquote, urlsplit
 from dateutil import parser as _date_parser
 from dateutil import tz as _date_tz
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from ....core.utils import public_requests as requests
 from .outlook_recurrence import build_graph_recurrence
@@ -603,8 +604,14 @@ def outlook_list_messages(
     folder_id: str | None = None,
     search: str | None = None,
     select_fields: list[str] | None = None,
+    order_by: str | None = None,
 ) -> str:
-    """List Outlook email messages, optionally filtered by folder or search query."""
+    """List Outlook email messages, optionally filtered by folder or search query.
+
+    Unsearched lists default to newest-first ordering. Microsoft Graph chooses
+    the order of message search results and rejects ``$search`` combined with
+    ``$orderby``, so a caller cannot request both explicitly.
+    """
     try:
         top = max(1, min(top, 100))
         path = (
@@ -612,7 +619,17 @@ def outlook_list_messages(
             if folder_id
             else "/me/messages"
         )
-        params: dict[str, Any] = {"$top": top, "$orderby": "receivedDateTime DESC"}
+        if search and order_by is not None:
+            raise ValueError("order_by cannot be combined with search")
+
+        params: dict[str, Any] = {"$top": top}
+        if order_by is not None:
+            normalized_order_by = order_by.strip()
+            if not normalized_order_by:
+                raise ValueError("order_by must not be empty")
+            params["$orderby"] = normalized_order_by
+        elif not search:
+            params["$orderby"] = "receivedDateTime DESC"
         if select_fields:
             params["$select"] = ",".join(select_fields)
         else:
@@ -632,7 +649,10 @@ def outlook_list_messages(
         )
     except Exception as e:
         logger.error("Error listing Outlook messages: %s", e)
-        return _error(str(e))
+        # ToolError is converted by FastMCP into CallToolResult(isError=True).
+        # Returning a JSON ``status=error`` string instead would be wrapped as
+        # successful structured output and mislead the agent and trace.
+        raise ToolError(str(e)) from e
 
 
 @mcp.tool()

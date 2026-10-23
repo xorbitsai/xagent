@@ -71,6 +71,12 @@ _LINK_CLOSING_CHARS = frozenset(")]}<>\"'")
 # itself followed by whitespace ("Join at <url>.").
 _LINK_TRAILING_PUNCTUATION = frozenset(".,;:!?")
 
+# The reply values this connector can set on the caller's own attendee entry
+# (Events.attendees[].responseStatus). "needsAction" is the absence of a reply,
+# not a reply. A tuple, not a set, so error messages list the values in a fixed
+# order.
+_RSVP_RESPONSES = ("accepted", "declined", "tentative")
+
 
 def _is_insufficient_scope_error(exc: Any) -> bool:
     """Whether `exc` is specifically "the access token doesn't have the
@@ -2843,6 +2849,181 @@ def google_calendar_delete_events(event_id: str) -> str:
         )
     except Exception as e:
         logger.error(f"Error deleting event: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool()
+def google_calendar_respond_to_event(
+    event_id: str,
+    response: str,
+    comment: str = "",
+    notify_organizer: bool = True,
+) -> str:
+    """
+    Accept, decline or tentatively accept a Google Calendar invitation on the
+    user's primary calendar. Only call this when the user has explicitly asked
+    to respond to this event (for example "accept the 3pm invite"); never pick a
+    response on the user's behalf.
+    response must be one of "accepted", "declined" or "tentative" (case and
+    surrounding whitespace are ignored); "needsAction" is not a reply and is
+    rejected. The tool changes only the caller's own attendee entry (the one
+    Google marks with self=true): it sets that entry's responseStatus and, when
+    comment is not empty, that entry's comment. If the response changes and no
+    new comment is given, an existing comment on that entry is cleared, so an
+    old note cannot stay attached to a different reply; a non-empty comment is
+    written as the new note. No other attendee entry is ever sent or modified.
+    If the caller's own attendee entry already has the requested
+    responseStatus and no new comment is given, the tool writes nothing and
+    returns the current event with "changed": false in the result, so a retry
+    cannot send the organizer a duplicate reply.
+    notify_organizer=True (the default) lets Google send its notification for
+    this reply; pass False to send none.
+    A reply only applies to an invitation someone else organized. When the user
+    is the organizer of the event - including when only the caller's own
+    attendee entry carries organizer=true - the tool returns an error without
+    writing, because declining one's own meeting would only change the
+    organizer's own responseStatus and leave the meeting in place. To cancel a
+    meeting the user organized, use google_calendar_delete_events.
+    This tool never adds the user as an attendee, so an invitation that is not
+    on the primary calendar as the caller's own attendee entry (for example one
+    delivered through a Google group) returns an error instead; respond in
+    Google Calendar itself in that case. It also returns an error, without
+    writing, when the event is not found on the primary calendar or when it is
+    cancelled.
+    google_calendar_search_events lists occurrences of a recurring series (each
+    carrying a recurringEventId pointing at the actual series), so passing an
+    occurrence's id answers only that occurrence. Pass the series' own id
+    (recurringEventId) to answer the whole series; occurrences that were edited
+    separately before may keep their own response, because Google does not
+    document how a series-wide reply interacts with existing exceptions.
+    Declining an invitation is not the same as deleting the event: use this
+    tool to decline it, and google_calendar_delete_events only to actually
+    remove an event. Like the other Calendar tools, this only works on the
+    primary calendar.
+    """
+    try:
+        if not isinstance(event_id, str) or not event_id.strip():
+            raise ValueError(
+                "event_id is required: pass the id of the event on the user's "
+                "primary calendar, for example the id returned by "
+                "google_calendar_search_events. Nothing was written."
+            )
+        normalized_response = (
+            response.strip().lower() if isinstance(response, str) else ""
+        )
+        if normalized_response not in _RSVP_RESPONSES:
+            raise ValueError(
+                f"response must be one of {', '.join(_RSVP_RESPONSES)}; "
+                f"got {response!r}. Nothing was written."
+            )
+        comment_text = comment.strip() if isinstance(comment, str) else ""
+
+        service = get_calendar_service()
+        try:
+            event = (
+                service.events().get(calendarId="primary", eventId=event_id).execute()
+            )
+        except HttpError as exc:
+            if exc.resp.status in (404, 410):
+                raise ValueError(
+                    f"Event {event_id!r} was not found on the user's primary "
+                    "calendar. Nothing was written; use "
+                    "google_calendar_search_events to find its id."
+                ) from exc
+            raise
+
+        if event.get("status") == "cancelled":
+            raise ValueError(
+                f"Event {event_id!r} is cancelled, so there is no invitation "
+                "to respond to. Nothing was written."
+            )
+
+        attendees = event.get("attendees") or []
+        own_entry = next(
+            (
+                attendee
+                for attendee in attendees
+                if isinstance(attendee, dict) and attendee.get("self") is True
+            ),
+            None,
+        )
+        organizer = event.get("organizer") or {}
+        caller_is_organizer = organizer.get("self") is True or (
+            own_entry is not None and own_entry.get("organizer") is True
+        )
+
+        if caller_is_organizer:
+            # A reply only applies to an invitation someone else organized.
+            # Declining one's own meeting would only change the organizer's own
+            # responseStatus and leave the meeting exactly as it is for every
+            # guest, so point at deleting it instead of writing a reply that
+            # does not cancel anything.
+            raise ValueError(
+                "The user is the organizer of this event, so there is no "
+                "invitation to respond to: a reply only applies to an "
+                "invitation someone else organized. Nothing was written; to "
+                "cancel a meeting the user organized, use "
+                "google_calendar_delete_events."
+            )
+        if own_entry is None:
+            raise ValueError(
+                "The user is not an attendee of this event (the invitation may "
+                "have arrived through a Google group, a forward or a shared "
+                "calendar), so there is no reply to set. Nothing was written; "
+                "respond in Google Calendar itself. This tool never adds the "
+                "user as an attendee."
+            )
+
+        existing_comment = own_entry.get("comment") or ""
+        new_comment = (
+            comment_text if comment_text and comment_text != existing_comment else ""
+        )
+        if own_entry.get("responseStatus") == normalized_response and not new_comment:
+            # Patching the same reply again would send the organizer another
+            # notification for a reply they already have. Reuse the normal
+            # success envelope and mark the result as not written.
+            response_payload = json.loads(_event_response(event))
+            response_payload["changed"] = False
+            response_payload["message"] = (
+                "No reply was sent: the caller's attendee entry already has "
+                "this response and no new comment was given. Nothing was "
+                "written."
+            )
+            return json.dumps(response_payload)
+
+        # Google's documented way to change only the caller's reply is a body
+        # with just that attendee entry plus attendeesOmitted=true, not the
+        # full attendee list: a list read back from get() can be incomplete
+        # (guestsCanSeeOtherGuests=false, maxAttendees) and another guest can
+        # answer between get() and patch(), so re-sending the whole list could
+        # drop or revert someone else's reply.
+        own = copy.deepcopy(own_entry)
+        own["responseStatus"] = normalized_response
+        if new_comment:
+            own["comment"] = new_comment
+        elif existing_comment:
+            # The response changed and no replacement note was given, so clear
+            # the old note explicitly: under attendeesOmitted an omitted
+            # comment key has no documented meaning, while "" clears the note
+            # under either interpretation.
+            own["comment"] = ""
+        body = {"attendees": [own], "attendeesOmitted": True}
+
+        send_updates = "all" if notify_organizer else "none"
+        updated_event = (
+            service.events()
+            .patch(
+                calendarId="primary",
+                eventId=event_id,
+                body=body,
+                sendUpdates=send_updates,
+            )
+            .execute()
+        )
+        return _event_response(updated_event)
+
+    except Exception as e:
+        logger.error(f"Error responding to event: {e}")
         return json.dumps({"status": "error", "message": str(e)})
 
 

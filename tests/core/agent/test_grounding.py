@@ -43,6 +43,21 @@ def test_grounding_rule_covers_quantitative_data() -> None:
     assert "verify. Never fill a gap" in rule
 
 
+@pytest.mark.parametrize("can_call_tools", [True, False])
+def test_grounding_rule_does_not_turn_an_observation_into_a_diagnosis(
+    can_call_tools: bool,
+) -> None:
+    rule = grounding_rule(can_call_tools=can_call_tools)
+
+    for phrase in (
+        "does not by itself establish why it happened",
+        "a field is stale",
+        "a workflow or integration is broken",
+        "the cause was not verified",
+    ):
+        assert phrase in rule
+
+
 def test_grounding_rule_without_tools_omits_tool_verification() -> None:
     rule = grounding_rule(can_call_tools=False)
 

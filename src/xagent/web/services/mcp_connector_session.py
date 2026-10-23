@@ -7,8 +7,13 @@ and a remote ``mcp_oauth`` row gets the user's bearer grant. This module runs
 that same builder for a single server and then lists the server's tools, so a
 caller outside a task (the tools route, the connector smoke checks) sees what a
 task would see instead of a parallel, partial reconstruction of it. The
-GET /api/mcp/servers/{id}/tools route uses it today; the connector smoke
-checks (#3246, #3247) are its intended next callers.
+GET /api/mcp/servers/{id}/tools route and the connector probe use it.
+
+A caller that checks a connector the way an actor-scoped task loads it (the
+Toby connector probe, #3288) passes the task's actor policy, actor stdio
+adapter, execution identity and governing team through unchanged. An actor
+stdio connection has no ``MCPServer`` row, so it is started by catalog
+``app_id`` through ``list_actor_stdio_connector_tools`` instead.
 """
 
 from __future__ import annotations
@@ -18,11 +23,14 @@ import shlex
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Mapping, cast
 
 if TYPE_CHECKING:
     from ...core.tools.adapters.vibe.mcp_adapter import MCPLoadResult
     from ...core.tools.core.mcp.sessions import Connection
+    from ..tools.config import WebToolConfig
+    from .actor_mcp_runtime import ActorMCPStdioConnectionAdapter
+    from .mcp_runtime import MCPActorAuthorizationPolicy, MCPActorExecutionIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +52,13 @@ class ConnectorToolsResult:
     ``reason`` is a public-safe code: the task builder's unavailable reason, or
     the load failure phase. ``diagnostic`` is the remote MCP OAuth diagnostic
     the builder produced, which carries no credential. ``load_result`` holds
-    the loaded tools and is kept out of ``repr``.
+    the loaded tools and is kept out of ``repr``. ``server_id`` is None for
+    an actor stdio connection, which has no server row; its ``server_name``
+    is the catalog app id.
     """
 
     outcome: ConnectorToolsOutcome
-    server_id: int
+    server_id: int | None
     server_name: str | None = None
     reason: str | None = None
     diagnostic: Mapping[str, Any] | None = None
@@ -83,14 +93,34 @@ async def list_connector_tools(
     server_id: int,
     name_prefix: str,
     refuse_sandboxed: bool = False,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy | None = None,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None = None,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    connector_team_id: int | None = None,
 ) -> ConnectorToolsResult:
     """Start ``server_id`` for ``user`` as a task would and list its tools.
 
-    Only a server the user has an active personal link to is started. Tool
-    names get ``name_prefix``; the persisted server id travels as the
-    connector ref, as at every other MCP materialization seam, so a gated
+    Only a server visible to the user is started: one the user has an active
+    personal link to or, when ``connector_team_id`` names the governing
+    agent's team, one that team owns, the same visibility the task's config
+    uses. Tool names get ``name_prefix``; the persisted server id travels as
+    the connector ref, as at every other MCP materialization seam, so a gated
     call built from these tools can never fail closed for want of an
     identity.
+
+    The actor keywords are handed to ``WebToolConfig`` unchanged, so a
+    builtin OAuth row reads the policy owner's credential, a remote
+    ``mcp_oauth`` row prefers the owner's grant, and the policy's catalog
+    checks apply. Every default keeps the behaviour of a call without them.
+    A failure to resolve the team scope raises the config's typed
+    ``ConnectorRuntimeError``, as a task's would.
+
+    ``connector_team_id`` and the actor policy, adapter and identity carry
+    authorization meaning and are trusted as given: they must come from an
+    agent or turn the caller has already authorized ``user`` to run (the
+    governing agent's owning team, never request input), as ``WebToolConfig``
+    documents for ``connector_team_id``. The team hook does no membership
+    check.
 
     The sandbox lease is released when this returns, so a caller that goes on
     to call a tool would open a new session on the web host. Such a caller
@@ -101,26 +131,14 @@ async def list_connector_tools(
     an OAuth row, a possible token refresh) but before any sandbox lease,
     process spawn or loader call.
     """
-    from ...core.tools.adapters.vibe import mcp_adapter
     from ...core.tools.adapters.vibe.config import MCPConfigLoadError
-    from ...core.tools.adapters.vibe.connector_runtime import ConnectorRef
-    from ...core.tools.adapters.vibe.mcp_tools import _apply_stdio_output_limit_env
-    from ...core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
-        should_sandbox_mcp_connection,
-    )
-    from ..models.mcp import MCPServer, UserMCPServer
-    from ..tools.config import WebToolConfig
 
     user_id = int(user.id)
-    server = (
-        db.query(MCPServer)
-        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-        .filter(
-            UserMCPServer.user_id == user_id,
-            UserMCPServer.is_active,
-            MCPServer.id == server_id,
-        )
-        .first()
+    server = find_visible_server(
+        db,
+        user_id=user_id,
+        server_id=server_id,
+        connector_team_id=connector_team_id,
     )
     if server is None:
         return ConnectorToolsResult(ConnectorToolsOutcome.NOT_FOUND, server_id)
@@ -132,12 +150,13 @@ async def list_connector_tools(
     if _is_execution_scoped(db, server):
         return result(ConnectorToolsOutcome.UNSUPPORTED, reason="execution_scoped")
 
-    tool_config = WebToolConfig(
-        db=db,
-        request=None,
-        user=user,
-        user_id=user_id,
-        is_admin=bool(getattr(user, "is_admin", False)),
+    tool_config = _task_tool_config(
+        db,
+        user,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+        mcp_actor_execution_identity=mcp_actor_execution_identity,
+        connector_team_id=connector_team_id,
     )
     try:
         server_config = await tool_config.load_mcp_server_config(server_id)
@@ -161,6 +180,195 @@ async def list_connector_tools(
             diagnostic=inner_config.get("diagnostic"),
         )
 
+    return await _start_and_list(
+        tool_config,
+        server_config,
+        user_id=user_id,
+        server_name=server_name,
+        name_prefix=name_prefix,
+        refuse_sandboxed=refuse_sandboxed,
+        result=result,
+    )
+
+
+async def list_actor_stdio_connector_tools(
+    db: Any,
+    *,
+    user: Any,
+    app_id: str,
+    name_prefix: str,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    connector_team_id: int | None = None,
+    refuse_sandboxed: bool = False,
+) -> ConnectorToolsResult:
+    """Start the actor stdio connection for catalog ``app_id`` as a task would.
+
+    An actor stdio connection has no ``MCPServer`` row, so it is addressed by
+    its catalog app id. The connection is the one the task's config
+    synthesizes for the same policy and adapter
+    (``resolve_actor_mcp_stdio_configs``), checked against the user's whole
+    visible server set, as a task checks it, so a visible row that shadows
+    the app suppresses it here too. It carries no connector ref, as a task
+    gives none to a config without a server id.
+
+    An execution-scoped app (chrome-devtools) needs a task's session runtime,
+    so it is UNSUPPORTED before anything else is checked, whether or not the
+    actor has connected it. Otherwise NOT_FOUND covers every case in which a
+    task would silently leave the connection out: the policy does not allow
+    builtin stdio, the deployment flag is off, the actor has no connection
+    for the app, a visible row shadows it, or the resolver dropped it because
+    its storage read failed, its credentials were incomplete, or its
+    lifecycle generation was stale. NOT_FOUND therefore does not prove the
+    actor never connected the app. A failure to resolve the team scope
+    raises the config's typed ``ConnectorRuntimeError``, as in
+    ``list_connector_tools``; ``refuse_sandboxed`` behaves as it does there.
+
+    The team id, policy and adapter are trusted as given, under the same
+    contract as ``list_connector_tools``: they must come from an agent or
+    turn the caller has already authorized ``user`` to run, and the team hook
+    does no membership check. ``mcp_actor_execution_identity`` has no effect
+    here: execution-scoped apps are UNSUPPORTED before resolution, and the
+    resolver reads the identity only for those apps. It is accepted for
+    signature parity with ``list_connector_tools``.
+    """
+    from ..builtin_mcp_registry import get_builtin_stdio_session_scope
+    from .actor_mcp_runtime import resolve_actor_mcp_stdio_configs
+
+    user_id = int(user.id)
+
+    def result(outcome: ConnectorToolsOutcome, **fields: Any) -> ConnectorToolsResult:
+        return ConnectorToolsResult(outcome, None, app_id, **fields)
+
+    if get_builtin_stdio_session_scope(app_id) == "execution":
+        return result(ConnectorToolsOutcome.UNSUPPORTED, reason="execution_scoped")
+
+    # The team scope is resolved outside the guard, and its typed error
+    # propagates, as in the task's _load_mcp_server_configs; a scan failure
+    # inside it is the task's config_load_failed.
+    visible_query = _visible_server_query(
+        db, user_id=user_id, connector_team_id=connector_team_id
+    )
+    try:
+        resolution = resolve_actor_mcp_stdio_configs(
+            db,
+            user_id=user_id,
+            policy=mcp_runtime_authorization_policy,
+            adapter=mcp_actor_stdio_connection_adapter,
+            visible_servers=visible_query.all(),
+            execution_identity=mcp_actor_execution_identity,
+        )
+    except Exception as error:
+        logger.warning(
+            "Failed to scan actor stdio configs with %s", type(error).__name__
+        )
+        return result(
+            ConnectorToolsOutcome.FAILED_TO_START, reason="config_load_failed"
+        )
+    server_config = next(
+        (config for config in resolution.configs if config.get("name") == app_id),
+        None,
+    )
+    if server_config is None:
+        return result(ConnectorToolsOutcome.NOT_FOUND)
+
+    tool_config = _task_tool_config(
+        db,
+        user,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+        mcp_actor_execution_identity=mcp_actor_execution_identity,
+        connector_team_id=connector_team_id,
+    )
+    return await _start_and_list(
+        tool_config,
+        server_config,
+        user_id=user_id,
+        server_name=app_id,
+        name_prefix=name_prefix,
+        refuse_sandboxed=refuse_sandboxed,
+        result=result,
+    )
+
+
+def find_visible_server(
+    db: Any, *, user_id: int, server_id: int, connector_team_id: int | None
+) -> Any | None:
+    """The ``MCPServer`` row ``server_id`` if the task's config would see it.
+
+    Visibility is the config's own: an active personal link, or ownership by
+    the governing team ``connector_team_id``. With no team id this is exactly
+    the personal link check.
+    """
+    from ..models.mcp import MCPServer
+
+    return (
+        _visible_server_query(db, user_id=user_id, connector_team_id=connector_team_id)
+        .filter(MCPServer.id == server_id)
+        .first()
+    )
+
+
+def _visible_server_query(
+    db: Any, *, user_id: int, connector_team_id: int | None
+) -> Any:
+    """The config's own ``_visible_mcp_server_query``, run with the team ids
+    resolved by the same function ``_load_mcp_server_configs`` uses, so the
+    two cannot drift."""
+    from ..tools.config import WebToolConfig
+    from .connector_team_scope import resolve_team_connector_selection_or_raise
+
+    team_selection = resolve_team_connector_selection_or_raise(
+        db, team_id=connector_team_id, log_subject=user_id
+    )
+    return WebToolConfig(
+        db=db, request=None, user_id=user_id
+    )._visible_mcp_server_query(team_selection.mcp_ids)
+
+
+def _task_tool_config(
+    db: Any,
+    user: Any,
+    *,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy | None,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None,
+    connector_team_id: int | None,
+) -> WebToolConfig:
+    from ..tools.config import WebToolConfig
+
+    return WebToolConfig(
+        db=db,
+        request=None,
+        user=user,
+        user_id=int(user.id),
+        is_admin=bool(getattr(user, "is_admin", False)),
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+        mcp_actor_execution_identity=mcp_actor_execution_identity,
+        connector_team_id=connector_team_id,
+    )
+
+
+async def _start_and_list(
+    tool_config: WebToolConfig,
+    server_config: dict[str, Any],
+    *,
+    user_id: int,
+    server_name: str,
+    name_prefix: str,
+    refuse_sandboxed: bool,
+    result: Callable[..., ConnectorToolsResult],
+) -> ConnectorToolsResult:
+    """Start one built task config and list its tools, as a task would."""
+    from ...core.tools.adapters.vibe import mcp_adapter
+    from ...core.tools.adapters.vibe.factory import ToolFactory
+    from ...core.tools.adapters.vibe.mcp_tools import _apply_stdio_output_limit_env
+    from ...core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
+        should_sandbox_mcp_connection,
+    )
+
     (server_config,) = _apply_stdio_output_limit_env([server_config], tool_config)
     connection = _connection_from_config(server_config)
     if refuse_sandboxed and should_sandbox_mcp_connection(
@@ -181,7 +389,9 @@ async def list_connector_tools(
             load_result = await mcp_adapter.load_mcp_tools_as_agent_tools(
                 connections,
                 name_prefix=name_prefix,
-                connector_refs={server_name: ConnectorRef("mcp", int(server_id))},
+                connector_refs=ToolFactory._mcp_connector_refs(
+                    {server_name: server_config}
+                ),
                 **load_kwargs,
             )
     except _SandboxUnavailable:

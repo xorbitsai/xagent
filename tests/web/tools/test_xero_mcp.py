@@ -501,6 +501,16 @@ def _paid_pages(pages: list[list[dict[str, Any]]]) -> Callable[..., MockResponse
     return respond
 
 
+def _invoice_pages_without_pagination(
+    pages: list[list[dict[str, Any]]],
+) -> Callable[..., MockResponse]:
+    def respond(call: dict[str, Any]) -> MockResponse:
+        page = call["params"]["page"]
+        return MockResponse({"Invoices": pages[page - 1]})
+
+    return respond
+
+
 def test_list_paid_invoices_reads_later_pages_after_mixed_dates(
     fake: FakeXero,
 ) -> None:
@@ -589,17 +599,18 @@ def test_list_paid_invoices_rejects_paid_record_without_settlement_date(
         xero.list_paid_invoices(paidOnDate="2026-10-13")
 
 
-def test_list_paid_invoices_rejects_partial_scan_without_pagination(
+def test_list_paid_invoices_accepts_short_page_without_pagination(
     fake: FakeXero,
 ) -> None:
     fake.responder = lambda call: MockResponse(
         {"Invoices": [_paid_invoice("INV-1", "2026-10-13")]}
     )
 
-    with pytest.raises(
-        RuntimeError, match="refusing to report a partial settlement-date list"
-    ):
-        xero.list_paid_invoices(paidOnDate="2026-10-13")
+    result = _call_tool("list_paid_invoices", paidOnDate="2026-10-13")
+
+    assert result["complete"] is True
+    assert result["total_count"] == 1
+    assert result["invoices"][0]["invoice_number"] == "INV-1"
 
 
 def test_list_paid_invoices_rejects_partial_scan_at_safety_limit(
@@ -884,12 +895,100 @@ def test_overdue_fails_instead_of_reporting_partial_totals(
         xero.list_overdue_invoices(asOfDate="2026-10-13")
 
 
-def test_overdue_without_page_metadata_fails_closed(fake: FakeXero) -> None:
+def test_overdue_accepts_short_page_without_pagination(
+    fake: FakeXero, caplog: pytest.LogCaptureFixture
+) -> None:
     fake.responder = lambda call: MockResponse(
-        {"Invoices": [_invoice("INV-1", "2026-09-01", 10)]}
+        {"Invoices": [_invoice("INV-SECRET", "2026-09-01", 10)]}
     )
 
-    with pytest.raises(RuntimeError, match="no pagination metadata"):
+    with caplog.at_level("WARNING", logger="xero-mcp"):
+        result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
+
+    assert result["complete"] is True
+    assert result["total_count"] == 1
+    assert "requested_page_size=1000" in caplog.text
+    assert "returned_count=1" in caplog.text
+    assert "INV-SECRET" not in caplog.text
+
+
+def test_overdue_without_pagination_reads_until_a_short_page(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "XERO_BULK_PAGE_SIZE", 2)
+    fake.responder = _invoice_pages_without_pagination(
+        [
+            [
+                _invoice("INV-1", "2026-09-01", 10),
+                _invoice("INV-2", "2026-09-01", 20),
+            ],
+            [_invoice("INV-3", "2026-09-01", 30)],
+        ]
+    )
+
+    result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
+
+    api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
+    assert [call["params"]["page"] for call in api_calls] == [1, 2]
+    assert result["total_count"] == 3
+    assert result["total_amount_due_by_currency"] == {"AUD": "60.00"}
+
+
+def test_overdue_without_pagination_checks_after_an_exact_multiple(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "XERO_BULK_PAGE_SIZE", 2)
+    fake.responder = _invoice_pages_without_pagination(
+        [
+            [
+                _invoice("INV-1", "2026-09-01", 10),
+                _invoice("INV-2", "2026-09-01", 20),
+            ],
+            [
+                _invoice("INV-3", "2026-09-01", 30),
+                _invoice("INV-4", "2026-09-01", 40),
+            ],
+            [],
+        ]
+    )
+
+    result = _call_tool("list_overdue_invoices", asOfDate="2026-10-13")
+
+    api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
+    assert [call["params"]["page"] for call in api_calls] == [1, 2, 3]
+    assert result["total_count"] == 4
+
+
+def test_overdue_without_pagination_rejects_a_repeated_full_page(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "XERO_BULK_PAGE_SIZE", 2)
+    repeated = [
+        _invoice("INV-1", "2026-09-01", 10),
+        _invoice("INV-2", "2026-09-01", 20),
+    ]
+    fake.responder = lambda call: MockResponse({"Invoices": repeated})
+
+    with pytest.raises(RuntimeError, match="pagination did not advance"):
+        xero.list_overdue_invoices(asOfDate="2026-10-13")
+
+    api_calls = [call for call in fake.calls if call.get("path") == "Invoices"]
+    assert [call["params"]["page"] for call in api_calls] == [1, 2]
+
+
+def test_overdue_without_pagination_still_honours_the_safety_limit(
+    fake: FakeXero, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xero, "XERO_BULK_PAGE_SIZE", 1)
+    monkeypatch.setattr(xero, "OPEN_INVOICE_MAX_PAGES", 2)
+    fake.responder = _invoice_pages_without_pagination(
+        [
+            [_invoice("INV-1", "2026-09-01", 10)],
+            [_invoice("INV-2", "2026-09-01", 20)],
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="safety limit of 2 pages"):
         xero.list_overdue_invoices(asOfDate="2026-10-13")
 
 
@@ -1038,6 +1137,17 @@ def test_ageing_reads_every_page_and_does_not_narrow_by_due_date(
     assert sent[0]["Statuses"] == "AUTHORISED"
     assert result["total_invoice_count"] == 3
     assert result["totals_by_currency"]["AUD"]["buckets"]["Current"] == "30.00"
+
+
+def test_ageing_accepts_short_page_without_pagination(fake: FakeXero) -> None:
+    fake.responder = _invoice_pages_without_pagination(
+        [[_invoice("INV-1", "2026-09-01", 10)]]
+    )
+
+    result = _call_tool("list_receivables_ageing", asOfDate="2026-10-13")
+
+    assert result["total_invoice_count"] == 1
+    assert result["rows_complete"] is True
 
 
 def test_ageing_rows_window_resumes_with_next_skip(fake: FakeXero) -> None:

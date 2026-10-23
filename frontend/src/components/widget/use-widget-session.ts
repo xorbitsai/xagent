@@ -1,7 +1,9 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
+import { RESEND_RECONNECT_DEADLINE_MS } from "@/contexts/chat-delivery-resend"
 import type { WebSocketConnectionFailure } from "@/hooks/use-websocket"
+import { WidgetSessionUploadError } from "@/lib/widget-session-upload"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
@@ -21,11 +23,25 @@ export interface WidgetSessionAgent {
   suggestedPrompts: string[]
 }
 
+export interface WidgetSessionFileUploads {
+  allowedExtensions: readonly string[]
+  maxFileBytes: number
+  maxFilesPerMessage: number
+}
+
+// What the session server advertises for this session. A session without a
+// usable advertisement has no `capabilities` key, so no capability-gated
+// feature is offered.
+export interface WidgetSessionCapabilities {
+  fileUploads: WidgetSessionFileUploads
+}
+
 export interface WidgetSession {
   token: string
   tokenExpiresAt: string
   absoluteExpiresAt: string
   agent: WidgetSessionAgent
+  capabilities?: WidgetSessionCapabilities
   generation: number
 }
 
@@ -82,6 +98,38 @@ const parseAgent = (value: unknown): WidgetSessionAgent | null => {
   }
 }
 
+const isPositiveInteger = (value: unknown): value is number =>
+  typeof value === "number" && Number.isInteger(value) && value > 0
+
+const isAllowedExtension = (value: unknown): value is string =>
+  typeof value === "string"
+  && value.length >= 2
+  && value.startsWith(".")
+  && value === value.toLowerCase()
+
+// The parent forwards the server's capabilities untouched, so everything here
+// is untrusted. Anything that does not match the documented shape counts as
+// "no capabilities" (undefined) instead of failing the session.
+export const parseCapabilities = (value: unknown): WidgetSessionCapabilities | undefined => {
+  if (!isRecord(value) || !isRecord(value.file_uploads)) return undefined
+  const uploads = value.file_uploads
+  const extensions = uploads.allowed_extensions
+  if (
+    !Array.isArray(extensions)
+    || extensions.length === 0
+    || !extensions.every(isAllowedExtension)
+    || !isPositiveInteger(uploads.max_file_bytes)
+    || !isPositiveInteger(uploads.max_files_per_message)
+  ) return undefined
+  return {
+    fileUploads: {
+      allowedExtensions: [...extensions],
+      maxFileBytes: uploads.max_file_bytes,
+      maxFilesPerMessage: uploads.max_files_per_message,
+    },
+  }
+}
+
 const isProtocolMessage = (value: unknown): value is ProtocolMessage => {
   if (!isRecord(value)) return false
   return value.xagent === true
@@ -108,6 +156,12 @@ export function buildWidgetSessionWebSocketUrl(origin: string): string {
   return url.toString()
 }
 
+interface Waiter<T> {
+  resolve: (value: T) => void
+  reject: (error: Error) => void
+  timer: ReturnType<typeof setTimeout>
+}
+
 export function useWidgetSession() {
   const [state, setState] = useState<WidgetSessionBridgeState>(initialState)
   const mountedRef = useRef(false)
@@ -118,6 +172,37 @@ export function useWidgetSession() {
   const activeSessionGenerationRef = useRef<number | null>(null)
   const activeDeliveryIdRef = useRef<string | null>(null)
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // The session the current generation was built from; null while there is no
+  // usable session (waiting, refreshing, degraded, terminal).
+  const sessionRef = useRef<WidgetSession | null>(null)
+  const degradedRef = useRef(false)
+  // The generation whose socket has opened, if any.
+  const openGenerationRef = useRef<number | null>(null)
+  const sessionWaitRef = useRef<{ promise: Promise<WidgetSession>, waiters: Waiter<WidgetSession>[] } | null>(null)
+  const openWaitersRef = useRef<Waiter<void>[]>([])
+
+  const rejectSessionWaiters = useCallback((error: Error) => {
+    const pending = sessionWaitRef.current
+    sessionWaitRef.current = null
+    pending?.waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    })
+  }, [])
+
+  const rejectOpenWaiters = useCallback((error: Error) => {
+    const waiters = openWaitersRef.current
+    openWaitersRef.current = []
+    waiters.forEach((waiter) => {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    })
+  }, [])
+
+  const failPendingWaits = useCallback(() => {
+    rejectSessionWaiters(new WidgetSessionUploadError("upload_failed"))
+    rejectOpenWaiters(new WidgetSessionUploadError("connection_not_ready"))
+  }, [rejectOpenWaiters, rejectSessionWaiters])
 
   const clearWarningTimer = useCallback(() => {
     if (warningTimerRef.current) {
@@ -131,8 +216,11 @@ export function useWidgetSession() {
     terminalRef.current = true
     activeSessionGenerationRef.current = null
     activeDeliveryIdRef.current = null
+    sessionRef.current = null
+    openGenerationRef.current = null
     recoveryInFlightRef.current = false
     clearWarningTimer()
+    failPendingWaits()
     setState({
       status: "terminal",
       session: null,
@@ -140,13 +228,17 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
-  }, [clearWarningTimer])
+  }, [clearWarningTimer, failPendingWaits])
 
   const transitionDegraded = useCallback(() => {
     if (terminalRef.current) return
     activeSessionGenerationRef.current = null
     activeDeliveryIdRef.current = null
+    sessionRef.current = null
+    openGenerationRef.current = null
+    degradedRef.current = true
     clearWarningTimer()
+    failPendingWaits()
     setState((current) => ({
       status: "degraded",
       session: null,
@@ -154,7 +246,7 @@ export function useWidgetSession() {
       terminalCode: null,
       isAbsoluteExpiryWarningVisible: false,
     }))
-  }, [clearWarningTimer])
+  }, [clearWarningTimer, failPendingWaits])
 
   const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
     const targetOrigin = targetOriginRef.current
@@ -162,6 +254,8 @@ export function useWidgetSession() {
 
     if (recoveryInFlightRef.current) return
     recoveryInFlightRef.current = true
+    sessionRef.current = null
+    openGenerationRef.current = null
     clearWarningTimer()
     setState((current) => ({
       status: "refreshing",
@@ -189,6 +283,18 @@ export function useWidgetSession() {
 
   const handleConnectionOpen = useCallback((connectionIdentity: string) => {
     const activeGeneration = activeSessionGenerationRef.current
+    // Recorded before any early return below: whether the parent is told about
+    // this open depends on the delivery id, but whether the socket is open does
+    // not.
+    if (activeGeneration !== null && connectionIdentity === `widget-session:${activeGeneration}`) {
+      openGenerationRef.current = activeGeneration
+      const waiters = openWaitersRef.current
+      openWaitersRef.current = []
+      waiters.forEach((waiter) => {
+        clearTimeout(waiter.timer)
+        waiter.resolve()
+      })
+    }
     const deliveryId = activeDeliveryIdRef.current
     const targetOrigin = targetOriginRef.current
     if (
@@ -243,6 +349,94 @@ export function useWidgetSession() {
     }
     transitionTerminal("unexpected_error")
   }, [isActiveConnection, requestReconnect, transitionTerminal])
+
+  const newWaiter = useCallback(<T,>(
+    resolve: (value: T) => void,
+    reject: (error: Error) => void,
+    onTimeout: () => void,
+    errorCode: "upload_failed" | "connection_not_ready",
+  ): Waiter<T> => ({
+    resolve,
+    reject,
+    timer: setTimeout(() => {
+      onTimeout()
+      reject(new WidgetSessionUploadError(errorCode, "timed out"))
+    }, RESEND_RECONNECT_DEADLINE_MS),
+  }), [])
+
+  // Waits for the next accepted session. Callers share one wait and one
+  // deadline: the wait gives up RESEND_RECONNECT_DEADLINE_MS after the first
+  // caller started it, so a caller that joins later waits only for the time
+  // left. A wait never issues a second reconnect request.
+  const waitForNextSession = useCallback((): Promise<WidgetSession> => {
+    if (sessionWaitRef.current) return sessionWaitRef.current.promise
+    const waiters: Waiter<WidgetSession>[] = []
+    const promise = new Promise<WidgetSession>((resolve, reject) => {
+      const waiter = newWaiter<WidgetSession>(resolve, reject, () => {
+        if (sessionWaitRef.current?.waiters === waiters) sessionWaitRef.current = null
+      }, "upload_failed")
+      waiters.push(waiter)
+    })
+    sessionWaitRef.current = { promise, waiters }
+    return promise
+  }, [newWaiter])
+
+  const unavailableError = useCallback((): WidgetSessionUploadError | null =>
+    terminalRef.current || degradedRef.current || !mountedRef.current
+      ? new WidgetSessionUploadError("upload_failed", "session unavailable")
+      : null, [])
+
+  // Resolves with a session whose token has at least TOKEN_REFRESH_THRESHOLD_MS
+  // left, asking the parent for a new one when it does not. Every refresh
+  // closes the chat socket and opens a new one, and frontend/public/widget.js
+  // ends the session (session_terminal, network_unavailable) on the fourth
+  // reconnect -- for any reason, a closed socket included -- unless a
+  // connection has stayed open for 60 s since the count was last reset.
+  const ensureFreshSession = useCallback((): Promise<WidgetSession> => {
+    const unavailable = unavailableError()
+    if (unavailable) return Promise.reject(unavailable)
+    const current = sessionRef.current
+    if (current && Date.parse(current.tokenExpiresAt) - Date.now() >= TOKEN_REFRESH_THRESHOLD_MS) {
+      return Promise.resolve(current)
+    }
+    const wait = waitForNextSession()
+    if (current) requestReconnect("token_expired")
+    return wait
+  }, [requestReconnect, unavailableError, waitForNextSession])
+
+  // Recovers from a rejected token. Resolves with the current session when it
+  // no longer uses `rejectedToken`, because another caller already replaced
+  // it; otherwise resolves with a newly issued one, sharing the wait of any
+  // refresh already under way.
+  const refreshSession = useCallback((rejectedToken: string): Promise<WidgetSession> => {
+    const unavailable = unavailableError()
+    if (unavailable) return Promise.reject(unavailable)
+    const current = sessionRef.current
+    if (current && current.token !== rejectedToken) return Promise.resolve(current)
+    const alreadyWaiting = sessionWaitRef.current !== null
+    const wait = waitForNextSession()
+    if (!alreadyWaiting && current) requestReconnect("token_expired")
+    return wait
+  }, [requestReconnect, unavailableError, waitForNextSession])
+
+  // Resolves once the socket of the current generation is open; waits through
+  // a refresh for the next generation's socket.
+  const waitForOpenConnection = useCallback((): Promise<void> => {
+    const unavailable = unavailableError()
+    if (unavailable) {
+      return Promise.reject(new WidgetSessionUploadError("connection_not_ready", "session unavailable"))
+    }
+    const activeGeneration = activeSessionGenerationRef.current
+    if (activeGeneration !== null && openGenerationRef.current === activeGeneration) {
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter = newWaiter<void>(resolve, reject, () => {
+        openWaitersRef.current = openWaitersRef.current.filter((entry) => entry !== waiter)
+      }, "connection_not_ready")
+      openWaitersRef.current.push(waiter)
+    })
+  }, [newWaiter, unavailableError])
 
   const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
     clearWarningTimer()
@@ -325,15 +519,20 @@ export function useWidgetSession() {
 
       recoveryInFlightRef.current = false
       generationRef.current += 1
+      const capabilities = parseCapabilities(event.data.capabilities)
       const session: WidgetSession = {
         token,
         tokenExpiresAt: event.data.session_token_expires_at as string,
         absoluteExpiresAt: event.data.absolute_expires_at as string,
         agent,
+        ...(capabilities ? { capabilities } : {}),
         generation: generationRef.current,
       }
       activeSessionGenerationRef.current = session.generation
       activeDeliveryIdRef.current = hasDeliveryId ? deliveryId as string : null
+      sessionRef.current = session
+      degradedRef.current = false
+      openGenerationRef.current = null
       setState({
         status: "active",
         session,
@@ -342,6 +541,12 @@ export function useWidgetSession() {
         isAbsoluteExpiryWarningVisible: false,
       })
       scheduleExpiryWarning(absoluteExpiresAt)
+      const pending = sessionWaitRef.current
+      sessionWaitRef.current = null
+      pending?.waiters.forEach((waiter) => {
+        clearTimeout(waiter.timer)
+        waiter.resolve(session)
+      })
     }
 
     window.addEventListener("message", onMessage)
@@ -351,6 +556,9 @@ export function useWidgetSession() {
       mountedRef.current = false
       activeSessionGenerationRef.current = null
       activeDeliveryIdRef.current = null
+      sessionRef.current = null
+      openGenerationRef.current = null
+      failPendingWaits()
       window.removeEventListener("message", onMessage)
       recoveryInFlightRef.current = false
       clearWarningTimer()
@@ -365,5 +573,8 @@ export function useWidgetSession() {
     handleConnectionOpen,
     handleConnectionClose,
     handleConnectionFailure,
+    ensureFreshSession,
+    refreshSession,
+    waitForOpenConnection,
   }
 }

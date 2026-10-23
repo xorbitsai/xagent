@@ -160,6 +160,14 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "source body: attribute only claims supported by text actually "
         "available in the conversation, retrieved context, or tool results. "
     )
+    causal_inference_rule = (
+        " An observed mismatch, age, correlation, missing value, or unusual "
+        "distribution does not by itself establish why it happened or that a "
+        "field is stale, a workflow or integration is broken, or a system has "
+        "a defect. State the observation, but state one of those diagnoses only "
+        "when the available evidence directly supports it; otherwise say the "
+        "cause was not verified. "
+    )
     source_inspection_rule = (
         "When the user asks you to read or inspect a source, retrieve its "
         "relevant content before claiming to have done so; if retrieval fails, "
@@ -199,7 +207,7 @@ def grounding_rule(*, can_call_tools: bool = True) -> str:
         "explaining that some values are not real, remove those values and "
         "report the gap instead."
         f"{tool_argument_rule}"
-        f"{source_evidence_rule}{source_inspection_rule}"
+        f"{source_evidence_rule}{source_inspection_rule}{causal_inference_rule}"
     )
 
 

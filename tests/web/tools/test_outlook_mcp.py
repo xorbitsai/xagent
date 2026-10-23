@@ -3,6 +3,8 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from mcp import types
+from mcp.server.fastmcp.exceptions import ToolError
 
 from xagent.web.tools.mcp import outlook
 
@@ -48,6 +50,104 @@ def test_graph_request_preserves_http_status(monkeypatch):
 
     assert exc_info.value.status_code == 429
     assert "rate limited" in str(exc_info.value)
+
+
+def test_list_messages_keeps_default_order_for_unsearched_lists(monkeypatch):
+    graph_request = Mock(
+        return_value={"value": [{"id": "message-1"}], "@odata.nextLink": "next"}
+    )
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(outlook.outlook_list_messages(top=25))
+
+    assert result == {
+        "status": "success",
+        "messages": [{"id": "message-1"}],
+        "next_link": "next",
+    }
+    assert graph_request.call_args.kwargs["params"]["$orderby"] == (
+        "receivedDateTime DESC"
+    )
+    assert graph_request.call_args.kwargs["params"]["$top"] == 25
+
+
+def test_list_messages_omits_order_by_for_search(monkeypatch):
+    graph_request = Mock(return_value={"value": []})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(
+        outlook.outlook_list_messages(
+            search="received:10/16/2026..10/23/2026",
+            select_fields=["id", "receivedDateTime"],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert graph_request.call_args.kwargs["params"] == {
+        "$top": 10,
+        "$select": "id,receivedDateTime",
+        "$search": '"received:10/16/2026..10/23/2026"',
+    }
+    assert graph_request.call_args.kwargs["extra_headers"] == {
+        "ConsistencyLevel": "eventual"
+    }
+
+
+def test_list_messages_accepts_explicit_order_without_search(monkeypatch):
+    graph_request = Mock(return_value={"value": []})
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    result = json.loads(outlook.outlook_list_messages(order_by="subject ASC"))
+
+    assert result["status"] == "success"
+    assert graph_request.call_args.kwargs["params"]["$orderby"] == "subject ASC"
+
+
+def test_list_messages_rejects_explicit_order_with_search(monkeypatch):
+    graph_request = Mock()
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+
+    with pytest.raises(ToolError, match="cannot be combined"):
+        outlook.outlook_list_messages(search="roadmap", order_by="subject ASC")
+
+    graph_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_messages_graph_failure_is_an_mcp_tool_error(monkeypatch):
+    graph_request = Mock(side_effect=RuntimeError("SearchWithOrderBy"))
+    monkeypatch.setattr(outlook, "_graph_request", graph_request)
+    handler = outlook.mcp._mcp_server.request_handlers[types.CallToolRequest]
+    request = types.CallToolRequest(
+        params=types.CallToolRequestParams(
+            name="outlook_list_messages",
+            arguments={"search": "received:10/16/2026..10/23/2026"},
+        )
+    )
+
+    result = await handler(request)
+
+    assert result.root.isError is True
+    assert result.root.structuredContent is None
+    assert result.root.content[0].text.endswith(": SearchWithOrderBy")
+
+
+@pytest.mark.asyncio
+async def test_list_messages_success_with_error_field_stays_successful(monkeypatch):
+    monkeypatch.setattr(
+        outlook,
+        "_graph_request",
+        Mock(return_value={"value": [{"id": "message-1", "error": "quoted text"}]}),
+    )
+    handler = outlook.mcp._mcp_server.request_handlers[types.CallToolRequest]
+    request = types.CallToolRequest(
+        params=types.CallToolRequestParams(name="outlook_list_messages", arguments={})
+    )
+
+    result = await handler(request)
+
+    assert result.root.isError is False
+    assert json.loads(result.root.structuredContent["result"])["status"] == "success"
 
 
 def test_utc_field_in_zone_converts_an_aware_instant_instead_of_relabeling_it():

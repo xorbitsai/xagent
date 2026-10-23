@@ -22,6 +22,13 @@ manager is configured, after the task's config build (database lookups, env
 decryption and, for an OAuth row, a possible token refresh) but before any
 sandbox lease, process spawn or loader call.
 
+A caller that checks a connector the way an actor-scoped task loads it
+passes the task's actor policy, adapter, execution identity and governing
+team through to the connector session unchanged; an actor stdio connection,
+which has no server row, is probed by catalog app id through
+``run_actor_stdio_connector_probe``. Its config is synthesized from the catalog
+definition, so the catalog-identity rule above holds by construction.
+
 Nothing here returns the tool's text: the in-repo servers put the vendor's
 raw error in it, which may carry a URL or a credential fragment. A result
 carries codes only, like the tools route.
@@ -34,7 +41,7 @@ import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
 from ...config import get_connector_probe_users, get_mcp_tool_init_timeout_seconds
 from ..connector_probes import (
@@ -42,7 +49,17 @@ from ..connector_probes import (
     get_connector_probe,
     get_unprobeable_reason,
 )
-from .mcp_connector_session import ConnectorToolsOutcome, list_connector_tools
+from .mcp_connector_session import (
+    ConnectorToolsOutcome,
+    ConnectorToolsResult,
+    find_visible_server,
+    list_actor_stdio_connector_tools,
+    list_connector_tools,
+)
+
+if TYPE_CHECKING:
+    from .actor_mcp_runtime import ActorMCPStdioConnectionAdapter
+    from .mcp_runtime import MCPActorAuthorizationPolicy, MCPActorExecutionIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +111,13 @@ _HTTP_STATUS: Mapping[ConnectorProbeOutcome, tuple[int, str]] = {
 
 @dataclass(frozen=True)
 class ConnectorProbeResult:
-    """Outcome of one probe. Every field is a public-safe code or identifier."""
+    """Outcome of one probe. Every field is a public-safe code or identifier.
+
+    ``server_id`` is None for an actor stdio connection, which has no row.
+    """
 
     outcome: ConnectorProbeOutcome
-    server_id: int
+    server_id: int | None
     app_id: str | None = None
     tool: str | None = None
     reason: str | None = None
@@ -163,35 +183,126 @@ def is_connector_probe_user(user: Any) -> bool:
 
 
 async def run_connector_probe(
-    db: Any, *, user: Any, server_id: int
+    db: Any,
+    *,
+    user: Any,
+    server_id: int,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy | None = None,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None = None,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    connector_team_id: int | None = None,
 ) -> ConnectorProbeResult:
     """Run the probe declared for ``server_id``'s catalog app, as ``user``.
 
-    Raises ``ConnectorProbeBusy`` when a probe is already running.
+    The actor keywords are passed to the connector session unchanged (see
+    ``list_connector_tools``); every default keeps the route's behaviour.
+    Raises ``ConnectorProbeBusy`` when a probe is already running, and the
+    config's typed ``ConnectorRuntimeError`` when ``connector_team_id`` is
+    given and its team scope cannot be resolved, as a task's load would.
+
+    The team id and actor keywords are trusted as given, under the contract
+    ``list_connector_tools`` states: they must come from an agent or turn the
+    caller has already authorized ``user`` to run, never from request input.
     """
+    return await _exclusive(
+        lambda: _run(
+            db,
+            user=user,
+            server_id=server_id,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+            mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+            mcp_actor_execution_identity=mcp_actor_execution_identity,
+            connector_team_id=connector_team_id,
+        )
+    )
+
+
+async def run_actor_stdio_connector_probe(
+    db: Any,
+    *,
+    user: Any,
+    app_id: str,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
+    connector_team_id: int | None = None,
+) -> ConnectorProbeResult:
+    """Run the probe declared for catalog ``app_id`` on the actor's stdio
+    connection, started by ``list_actor_stdio_connector_tools``.
+
+    The app's own declarations are checked first (UNPROBEABLE, NOT_DECLARED),
+    then the connection (NOT_FOUND when a task would not load it, see
+    ``list_actor_stdio_connector_tools`` for what that covers). Shares the
+    one probe slot with ``run_connector_probe``; raises ``ConnectorProbeBusy``
+    when a probe is already running, and ``ConnectorRuntimeError`` as
+    ``run_connector_probe`` does.
+
+    The trust contract of ``list_actor_stdio_connector_tools`` applies to the
+    team id, policy and adapter. ``mcp_actor_execution_identity`` has no
+    effect here, because execution-scoped apps are UNSUPPORTED before
+    resolution and the resolver reads the identity only for those apps; it
+    is accepted for signature parity.
+    """
+    return await _exclusive(
+        lambda: _run_actor_stdio(
+            db,
+            user=user,
+            app_id=app_id,
+            mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+            mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+            mcp_actor_execution_identity=mcp_actor_execution_identity,
+            connector_team_id=connector_team_id,
+        )
+    )
+
+
+async def _exclusive(
+    run: Callable[[], Awaitable[ConnectorProbeResult]],
+) -> ConnectorProbeResult:
     global _probe_running
     if _probe_running:
         raise ConnectorProbeBusy()
     _probe_running = True
     try:
-        return await _run(db, user=user, server_id=server_id)
+        return await run()
     finally:
         _probe_running = False
 
 
-async def _run(db: Any, *, user: Any, server_id: int) -> ConnectorProbeResult:
-    from ..mcp_apps import get_app_for_mcp_server
-    from ..models.mcp import MCPServer, UserMCPServer
+# Builds a result for one probed connector from (outcome, tool=, reason=).
+_ResultFactory = Callable[..., ConnectorProbeResult]
 
-    server = (
-        db.query(MCPServer)
-        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-        .filter(
-            UserMCPServer.user_id == int(user.id),
-            UserMCPServer.is_active,
-            MCPServer.id == server_id,
-        )
-        .first()
+
+def _declared_probe(
+    app_id: str, result: _ResultFactory
+) -> ConnectorProbe | ConnectorProbeResult:
+    """The probe declared for ``app_id``, or the result that refuses it."""
+    unprobeable = get_unprobeable_reason(app_id)
+    if unprobeable is not None:
+        return result(ConnectorProbeOutcome.UNPROBEABLE, tool=None, reason=unprobeable)
+    probe = get_connector_probe(app_id)
+    if probe is None:
+        return result(ConnectorProbeOutcome.NOT_DECLARED, tool=None, reason=None)
+    return probe
+
+
+async def _run(
+    db: Any,
+    *,
+    user: Any,
+    server_id: int,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy | None,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None,
+    connector_team_id: int | None,
+) -> ConnectorProbeResult:
+    from ..mcp_apps import get_app_for_mcp_server
+
+    server = find_visible_server(
+        db,
+        user_id=int(user.id),
+        server_id=server_id,
+        connector_team_id=connector_team_id,
     )
     if server is None:
         return ConnectorProbeResult(ConnectorProbeOutcome.NOT_FOUND, server_id)
@@ -210,13 +321,9 @@ async def _run(db: Any, *, user: Any, server_id: int) -> ConnectorProbeResult:
     ) -> ConnectorProbeResult:
         return ConnectorProbeResult(outcome, server_id, app_id, tool, reason)
 
-    unprobeable = get_unprobeable_reason(app_id)
-    if unprobeable is not None:
-        return result(ConnectorProbeOutcome.UNPROBEABLE, tool=None, reason=unprobeable)
-    probe = get_connector_probe(app_id)
-    if probe is None:
-        return result(ConnectorProbeOutcome.NOT_DECLARED, tool=None, reason=None)
-    tool_name = probe.tool
+    probe = _declared_probe(app_id, result)
+    if isinstance(probe, ConnectorProbeResult):
+        return probe
 
     listing = await list_connector_tools(
         db,
@@ -224,7 +331,56 @@ async def _run(db: Any, *, user: Any, server_id: int) -> ConnectorProbeResult:
         server_id=server_id,
         name_prefix="probe_",
         refuse_sandboxed=True,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+        mcp_actor_execution_identity=mcp_actor_execution_identity,
+        connector_team_id=connector_team_id,
     )
+    return await _call_declared_probe(listing, probe, app_id=app_id, result=result)
+
+
+async def _run_actor_stdio(
+    db: Any,
+    *,
+    user: Any,
+    app_id: str,
+    mcp_runtime_authorization_policy: MCPActorAuthorizationPolicy,
+    mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter,
+    mcp_actor_execution_identity: MCPActorExecutionIdentity | None,
+    connector_team_id: int | None,
+) -> ConnectorProbeResult:
+    def result(
+        outcome: ConnectorProbeOutcome, *, tool: str | None, reason: str | None
+    ) -> ConnectorProbeResult:
+        return ConnectorProbeResult(outcome, None, app_id, tool, reason)
+
+    probe = _declared_probe(app_id, result)
+    if isinstance(probe, ConnectorProbeResult):
+        return probe
+
+    listing = await list_actor_stdio_connector_tools(
+        db,
+        user=user,
+        app_id=app_id,
+        name_prefix="probe_",
+        refuse_sandboxed=True,
+        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
+        mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
+        mcp_actor_execution_identity=mcp_actor_execution_identity,
+        connector_team_id=connector_team_id,
+    )
+    return await _call_declared_probe(listing, probe, app_id=app_id, result=result)
+
+
+async def _call_declared_probe(
+    listing: ConnectorToolsResult,
+    probe: ConnectorProbe,
+    *,
+    app_id: str,
+    result: _ResultFactory,
+) -> ConnectorProbeResult:
+    """Call ``probe``'s tool on a listed connector and judge its envelope."""
+    tool_name = probe.tool
     if listing.outcome is not ConnectorToolsOutcome.OK or listing.load_result is None:
         return result(
             _LISTING_OUTCOMES[listing.outcome], tool=tool_name, reason=listing.reason

@@ -3457,6 +3457,10 @@ async def test_react_pattern_uses_decision_for_repeated_tools() -> None:
     assert [schema["function"]["name"] for schema in llm.calls[3]["tools"]] == [
         "final_answer"
     ]
+    final_prompt = "\n".join(
+        str(message.get("content") or "") for message in llm.calls[3]["messages"]
+    )
+    assert "Completion assessment JSON" not in final_prompt
     assert pattern.pending_tool_calls == []
 
 
@@ -3520,7 +3524,9 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"The current batch is enough."}'
+                                '"reason":"The current batch is enough.",'
+                                '"supported_findings":["Both searches completed."],'
+                                '"missing_verification":""}'
                             ),
                         },
                     }
@@ -3555,6 +3561,14 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
     assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
         "final_answer"
     ]
+    final_prompt = "\n".join(
+        str(message.get("content") or "") for message in llm.calls[2]["messages"]
+    )
+    assert "Both searches completed." in final_prompt
+    assert "constrain only interpretive or causal claims" in final_prompt
+    assert "not an exhaustive list of source facts or requested records" in final_prompt
+    assert "report every requested item" in final_prompt
+    assert "answer-scope ceiling" not in final_prompt
     assert pattern.pending_tool_calls == []
 
 
@@ -6896,6 +6910,7 @@ def test_react_decision_schema_assesses_work_before_choosing_action() -> None:
 
     assert list(parameters["properties"]) == [
         "reason",
+        "supported_findings",
         "missing_verification",
         "action",
     ]
@@ -6931,8 +6946,104 @@ def test_react_decision_does_not_finalize_with_missing_work() -> None:
     assert decision == {
         "action": "tool_call",
         "reason": "One more audio clip must be synthesized.",
+        "supported_findings": [],
         "missing_verification": "Synthesize the final audio clip.",
     }
+
+
+@pytest.mark.parametrize(
+    ("raw_findings", "expected"),
+    [
+        ("not-a-list", []),
+        ([None, 7, {}, "", "  ", "\n", "  verified finding  "], ["verified finding"]),
+    ],
+)
+def test_react_decision_normalizes_supported_findings(
+    raw_findings: object,
+    expected: list[str],
+) -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_findings",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "Enough evidence is available.",
+                            "supported_findings": raw_findings,
+                            "missing_verification": "",
+                            "action": "final_answer",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision is not None
+    assert decision["supported_findings"] == expected
+
+
+def test_react_decision_bounds_supported_findings_during_parsing() -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_many_findings",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "Enough evidence is available.",
+                            "supported_findings": [
+                                " ",
+                                "x" * 600,
+                                *[f" finding {index} " for index in range(12)],
+                            ],
+                            "missing_verification": "",
+                            "action": "final_answer",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision is not None
+    assert len(decision["supported_findings"]) == 12
+    assert decision["supported_findings"][0].endswith("... [truncated]")
+    assert decision["supported_findings"][-1] == "finding 10"
+
+
+def test_react_decision_discards_supported_findings_when_continuing() -> None:
+    response = {
+        "tool_calls": [
+            {
+                "id": "decision_continue",
+                "function": {
+                    "name": "react_decision",
+                    "arguments": json.dumps(
+                        {
+                            "reason": "One more source is required.",
+                            "supported_findings": ["Do not carry this forward."],
+                            "missing_verification": "Fetch the next source.",
+                            "action": "tool_call",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+    decision = ReActPattern()._parse_react_decision(response)
+
+    assert decision is not None
+    assert decision["action"] == "tool_call"
+    assert decision["supported_findings"] == []
 
 
 @pytest.mark.asyncio

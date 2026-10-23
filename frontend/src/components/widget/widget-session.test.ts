@@ -449,6 +449,88 @@ describe("widget session mode", () => {
     expect(message).not.toHaveProperty("reconnect_token")
   })
 
+  describe("session capabilities forwarding", () => {
+    const capabilities = {
+      file_uploads: {
+        allowed_extensions: [".pdf", ".png"],
+        max_file_bytes: 1024,
+        max_files_per_message: 2,
+      },
+    }
+
+    async function exchangeAndReady(body: Record<string, unknown>) {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, body))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+      await flushAsync()
+      fromIframe("ready")
+      return post
+    }
+
+    it("forwards a capabilities object unchanged in session_update", async () => {
+      const body = exchangeBody()
+      ;(body.session as Record<string, unknown>).capabilities = capabilities
+
+      const post = await exchangeAndReady(body)
+
+      expect(post).toHaveBeenCalledTimes(1)
+      expect(post.mock.calls[0][0].capabilities).toEqual(capabilities)
+    })
+
+    it("omits the capabilities key when the exchange has none", async () => {
+      const post = await exchangeAndReady(exchangeBody())
+
+      expect(post).toHaveBeenCalledTimes(1)
+      expect(post.mock.calls[0][0]).not.toHaveProperty("capabilities")
+    })
+
+    it.each([
+      ["an array", ["x"]],
+      ["a string", "file_uploads"],
+      ["null", null],
+    ])("omits the capabilities key when it is %s and still delivers the session", async (_label, value) => {
+      const body = exchangeBody()
+      ;(body.session as Record<string, unknown>).capabilities = value
+
+      const post = await exchangeAndReady(body)
+
+      expect(post).toHaveBeenCalledTimes(1)
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_update", session_token: "st_first" })
+      expect(post.mock.calls[0][0]).not.toHaveProperty("capabilities")
+    })
+
+    it("overwrites the previous capabilities with the reconnect response", async () => {
+      const first = exchangeBody()
+      ;(first.session as Record<string, unknown>).capabilities = capabilities
+      const nextCapabilities = {
+        file_uploads: {
+          allowed_extensions: [".csv"],
+          max_file_bytes: 2048,
+          max_files_per_message: 3,
+        },
+      }
+      const second = exchangeBody({ session_token: "st_second", reconnect_token: "rt_second" })
+      ;(second.session as Record<string, unknown>).capabilities = nextCapabilities
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse(200, first))
+        .mockResolvedValueOnce(jsonResponse(200, second))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+      await flushAsync()
+      fromIframe("ready")
+      fromIframe("reconnect_request", { reason: "ws_closed" })
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+      await flushAsync()
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0].capabilities).toEqual(capabilities)
+      expect(post.mock.calls[1][0]).toMatchObject({ session_token: "st_second" })
+      expect(post.mock.calls[1][0].capabilities).toEqual(nextCapabilities)
+    })
+  })
+
   it("holds only the latest state until ready arrives", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))

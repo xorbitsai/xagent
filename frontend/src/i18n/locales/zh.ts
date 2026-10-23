@@ -60,6 +60,9 @@ const zh = {
     uploadTooLarge: "文件过大，请减小上传大小后重试。",
     uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
     uploadFailed: "上传失败，请重试。",
+    uploadRateLimited: "文件暂时无法上传，请一分钟后再试。",
+    uploadQuotaExceeded: "本次对话的文件已达上限。",
+    uploadRejected: "无法上传此文件，请检查文件名和类型。",
     connectionNotReady: "当前未连接，消息没有发出。",
     messageNotAccepted: "这条消息未被接受。",
     connectionReconnecting: "连接已断开，正在重连",
@@ -680,6 +683,13 @@ const zh = {
     stoppingResponse: "正在停止…",
     stopTimedOut: "无法确认停止请求是否生效。",
     stopNotSent: "停止请求未发出，请重试。",
+    attachments: {
+      typeNotSupported: "此处不支持该文件类型。",
+      tooManyFiles: "每条消息最多附带 {count} 个文件。",
+      noFilesOnAnswer: "回答问题时不能附带文件，请先发送回答，再附带文件。",
+      uploading: "上传中…",
+      uploadFailedRetry: "上传失败，点击重试",
+    },
     expired: {
       title: "聊天会话已过期",
       description: "请刷新页面以开始新的聊天会话。",

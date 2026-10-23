@@ -40,6 +40,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/remark-currency-safe-math.ts",
         "src/lib/remark-preserve-table-content.ts",
         "src/lib/widget-parent-message.ts",
+        "src/lib/widget-session-upload.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
         "src/components/layout/sidebar.tsx",
@@ -81,6 +82,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
           statements: 95, branches: 80, functions: 90, lines: 95,
         },
         "src/components/widget/widget-chrome-controls.tsx": {
+          statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/lib/widget-session-upload.ts": {
           statements: 95, branches: 90, functions: 95, lines: 95,
         },
         "src/lib/widget-parent-message.ts": {
@@ -220,6 +224,8 @@ export default defineConfig({
       "src/lib/prompt-context-fields.test.ts",
       "src/components/build/agent-builder-prompt-context-fields.test.tsx",
       "src/lib/widget-parent-message.test.ts",
+      "src/lib/widget-session-upload.test.ts",
+      "src/lib/client-errors.test.ts",
     ],
   },
 })

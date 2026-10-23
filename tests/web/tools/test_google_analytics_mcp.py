@@ -363,6 +363,7 @@ def test_run_report_builds_body_and_returns_rows(monkeypatch):
                         "metricValues": [{"value": "1200"}],
                     }
                 ],
+                "totals": [{"metricValues": [{"value": "1200"}]}],
                 "rowCount": 1,
             }
         )
@@ -392,12 +393,37 @@ def test_run_report_builds_body_and_returns_rows(monkeypatch):
 
     assert result["status"] == "success"
     assert result["row_count"] == 1
+    assert result["returned_count"] == 1
+    assert result["has_more"] is False
+    assert result["truncated"] is False
+    assert result["totals"] == [{"metricValues": [{"value": "1200"}]}]
     assert result["rows"][0]["metricValues"] == [{"value": "1200"}]
+    assert result["query"] == {
+        "property_id": "42",
+        "metrics": ["sessions", "conversions"],
+        "date_ranges": [
+            {
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-28",
+                "name": "current",
+            },
+            {
+                "start_date": "2026-06-03",
+                "end_date": "2026-06-30",
+                "name": "previous",
+            },
+        ],
+        "limit": 50,
+        "offset": 0,
+        "dimensions": ["sessionDefaultChannelGroup"],
+    }
+    assert "Use totals for headline totals" in result["aggregation_note"]
 
     call_kwargs = mock_request.call_args.kwargs
     assert call_kwargs["url"].endswith("/properties/42:runReport")
     body = call_kwargs["json"]
     assert body["metrics"] == [{"name": "sessions"}, {"name": "conversions"}]
+    assert body["metricAggregations"] == ["TOTAL"]
     assert body["dateRanges"] == [
         {"startDate": "2026-07-01", "endDate": "2026-07-28", "name": "current"},
         {"startDate": "2026-06-03", "endDate": "2026-06-30", "name": "previous"},
@@ -659,7 +685,76 @@ def test_run_report_sends_default_limit_and_omits_zero_offset(monkeypatch):
 
     body = mock_request.call_args.kwargs["json"]
     assert body["limit"] == str(google_analytics.RUN_REPORT_DEFAULT_LIMIT)
+    assert body["metricAggregations"] == ["TOTAL"]
     assert "offset" not in body
+
+
+def test_run_report_surfaces_pagination_without_skipping_rows(monkeypatch):
+    rows = [
+        {
+            "dimensionValues": [{"value": f"page-{i}"}],
+            "metricValues": [{"value": str(i)}],
+        }
+        for i in range(100)
+    ]
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"rows": rows, "rowCount": 250})
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "30daysAgo", "end_date": "yesterday"}],
+            dimensions=["landingPage"],
+            limit=100,
+        )
+    )
+
+    assert result["row_count"] == 250
+    assert result["returned_count"] == 100
+    assert result["api_returned_count"] == 100
+    assert result["has_more"] is True
+    assert result["next_offset"] == 100
+    assert result["output_truncated"] is False
+    assert result["truncated"] is True
+    assert "offset=100" in result["pagination_hint"]
+
+
+def test_run_report_keeps_ga_total_when_dimension_rows_do_not_add_up(monkeypatch):
+    values = [16852, 5193, 47, 31, 16, 12, 1]
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "rows": [
+                    {
+                        "dimensionValues": [{"value": f"channel-{i}"}],
+                        "metricValues": [{"value": str(value)}],
+                    }
+                    for i, value in enumerate(values)
+                ],
+                "totals": [{"metricValues": [{"value": "22129"}]}],
+                "rowCount": len(values),
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "properties/282735824",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "30daysAgo", "end_date": "yesterday"}],
+            dimensions=["sessionDefaultChannelGroup"],
+        )
+    )
+
+    assert result["query"]["property_id"] == "282735824"
+    assert result["totals"] == [{"metricValues": [{"value": "22129"}]}]
+    assert sum(int(row["metricValues"][0]["value"]) for row in result["rows"]) == 22152
+    assert "do not replace totals by summing rows" in result["aggregation_note"]
+    assert result["truncated"] is False
 
 
 def test_run_report_rejects_empty_metrics(monkeypatch):
@@ -786,7 +881,10 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
                 "dimensionHeaders": [{"name": f"dim{i}"} for i in range(5)],
                 "metricHeaders": [{"name": f"metric{i}"} for i in range(5)],
                 "rows": rows,
-                "rowCount": len(rows),
+                # More matches exist after this API page as well as rows that
+                # will be trimmed locally. next_offset must remain unavailable
+                # until the caller retries this same page with a smaller limit.
+                "rowCount": len(rows) * 2,
             }
         )
     )
@@ -803,6 +901,10 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     result = json.loads(response)
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["has_more"] is True
+    assert result["output_truncated"] is True
+    assert result["next_offset"] is None
+    assert "same offset=0" in result["pagination_hint"]
     assert len(result["rows"]) < google_analytics.RUN_REPORT_MAX_LIMIT
     assert len(response) < get_tool_max_output_length()
     assert "still-processing" in result["note"]

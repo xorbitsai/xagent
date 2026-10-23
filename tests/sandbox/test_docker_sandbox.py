@@ -30,8 +30,8 @@ from xagent.sandbox.base import (
 from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
-    _SandboxControl,
     _parse_container_config,
+    _SandboxControl,
     _write_tar_from_content,
     _write_tar_from_local_path,
     is_docker_available,

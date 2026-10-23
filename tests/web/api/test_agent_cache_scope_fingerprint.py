@@ -362,6 +362,10 @@ class _CachedAgentWithToolConfig:
     def __init__(self, tool_config: _ScopeTrackingToolConfig) -> None:
         self.tool_config = tool_config
         self.invalidate_calls = 0
+        self.memory_policy_calls: list[dict[str, object]] = []
+
+    def apply_memory_policy(self, **policy: object) -> None:
+        self.memory_policy_calls.append(policy)
 
     def invalidate_tools(self) -> None:
         self.invalidate_calls += 1
@@ -410,6 +414,7 @@ async def test_cached_agent_service_is_resynced_with_the_turn_execution_scope() 
     assert tool_config.scope is scope_b
     assert tool_config.set_calls == [scope_b]
     assert cached_agent.invalidate_calls == 1
+    assert len(cached_agent.memory_policy_calls) == 1
 
 
 @pytest.mark.asyncio

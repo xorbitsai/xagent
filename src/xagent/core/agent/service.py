@@ -28,6 +28,7 @@ from ..tools.adapters.vibe.config import (
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .budget import BudgetPolicyProvider
+from .context.enrichment import MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
 from .context.execution import (
     MODEL_CONTEXT_WATERMARK_METADATA_KEY,
     TRANSCRIPT_WATERMARK_METADATA_KEY,
@@ -436,16 +437,41 @@ class AgentService:
         execution. That is what lets a caller treat the swap as atomic with
         respect to the turn it is about to run.
         """
-        self.memory = inert_store
-        # Keep the compatibility shim in step with a freshly built service.
-        self.agent.memory_store = inert_store
-        self.memory_enabled = False
-        self.memory_available = False
+        self.apply_memory_policy(
+            memory_store=inert_store,
+            enabled=False,
+            available=False,
+            availability_reason=availability_reason,
+            execution_metadata=execution_metadata,
+        )
+
+    def apply_memory_policy(
+        self,
+        *,
+        memory_store: MemoryStore,
+        enabled: bool,
+        available: bool,
+        availability_reason: str | None,
+        execution_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Atomically replace the memory capability before the next turn."""
+        self.memory = memory_store
+        self.agent.memory_store = memory_store
+        self.memory_enabled = enabled
+        self.memory_available = available
         self.memory_availability_reason = availability_reason
+        self.execution_metadata.pop("memory_available", None)
+        self.execution_metadata.pop("memory_availability_reason", None)
+        self.execution_metadata.pop(
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+            None,
+        )
         if execution_metadata:
             self.execution_metadata.update(execution_metadata)
         if self._execution_adapter is not None:
-            self._execution_adapter.config.memory_store = None
+            self._execution_adapter.config.memory_store = (
+                memory_store if enabled else None
+            )
             self._execution_adapter.config.execution_metadata = dict(
                 self.execution_metadata
             )

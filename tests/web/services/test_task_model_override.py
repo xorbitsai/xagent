@@ -270,6 +270,9 @@ class _Builds:
             def revoke_memory(self, **kwargs: Any) -> None:
                 AgentService.revoke_memory(self, **kwargs)
 
+            def apply_memory_policy(self, **kwargs: Any) -> None:
+                AgentService.apply_memory_policy(self, **kwargs)
+
             def __init__(self, **kwargs: Any) -> None:
                 super().__init__()
                 self.execution_status = {"is_running": False, "is_resumable": False}

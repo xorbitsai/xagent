@@ -138,11 +138,10 @@ def test_authority_read_happens_under_the_lock(monkeypatch) -> None:
 # --------------------------------------------------------------------------
 # A store that was already handed out is revoked too.
 #
-# Revoking the manager's publication does not reach what callers already hold:
-# AgentService keeps its store in self.memory, and the agent cache's hit path
-# re-checks owner and scope only, never memory policy. The published store is
-# therefore a generation-bound proxy, so a cached agent -- and an execution
-# already in flight -- fails closed the moment the publication is revoked.
+# Revoking the manager's publication does not mutate references callers already
+# hold. The published store is therefore a generation-bound proxy, so a cached
+# agent -- and an execution already in flight -- fails closed the moment the
+# publication is revoked, even before cache-hit reconciliation swaps its store.
 # --------------------------------------------------------------------------
 
 

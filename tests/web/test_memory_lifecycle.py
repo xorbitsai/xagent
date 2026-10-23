@@ -19,6 +19,7 @@ import threading
 import time
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import lancedb  # type: ignore
@@ -794,6 +795,19 @@ async def _turn(agents, *, task_id=7, owner_id=3):
         task_id,
         task_owner_user_id=owner_id,
         resolved_execution_scope=None,
+        task_setup_snapshot=SimpleNamespace(
+            task=SimpleNamespace(
+                id=task_id,
+                user_id=owner_id,
+                agent_id=None,
+                source=None,
+                agent_config={},
+                run_id=None,
+            ),
+            runtime_user=None,
+            agent_config={},
+            model_override=None,
+        ),
     )
 
 
@@ -903,16 +917,11 @@ async def test_a_ready_cache_hit_costs_one_authority_read_and_changes_nothing(
 
 
 @pytest.mark.asyncio
-async def test_a_service_already_without_memory_reads_nothing_and_stays_off(
+async def test_a_service_already_without_memory_is_revalidated_and_reenabled(
     monkeypatch, tmp_path
 ):
-    """One-directional: this path disables, it never re-enables.
-
-    A preview or an agent-backed task runs with memory off by configuration,
-    not by lifecycle, and the cache-hit path does not carry the inputs that
-    decided that -- so a healthy lifecycle must not turn memory back on.
-    """
-    state, _manager_ = _ready_runtime(monkeypatch, tmp_path)
+    """Every cache hit replaces stale policy, including a prior denial."""
+    state, manager = _ready_runtime(monkeypatch, tmp_path)
     agent = _cached_agent(
         InMemoryMemoryStore(),
         memory_enabled=False,
@@ -924,10 +933,11 @@ async def test_a_service_already_without_memory_reads_nothing_and_stays_off(
     before = state["reads"]
     await _turn(agents)
 
-    assert state["reads"] == before
-    assert agent.memory_enabled is False
-    assert agent.memory_available is False
-    assert agent.memory_availability_reason == "blocked_repair"
+    assert state["reads"] - before == 1
+    assert agent.memory is manager.get_memory_store()
+    assert agent.memory_enabled is True
+    assert agent.memory_available is True
+    assert agent.memory_availability_reason is None
 
 
 # --------------------------------------------------------------------------

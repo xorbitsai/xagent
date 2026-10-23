@@ -24,6 +24,11 @@ from xagent.core.agent.checkpoint import (
     CheckpointPersistenceError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.context.enrichment import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+)
 from xagent.core.agent.context.execution import (
     COMPACT_THRESHOLD_SOURCE_CONTEXT_WINDOW,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -1640,6 +1645,74 @@ def test_merge_context_metadata_replaces_legacy_raw_memory_reason(
     assert context.metadata["memory_available"] is False
     assert context.metadata["memory_availability_reason"] == "unavailable"
     assert context.metadata["other"] == "checkpointed"
+
+
+@pytest.mark.parametrize(
+    "checkpoint_scope",
+    [None, "scope-a"],
+    ids=("legacy-checkpoint", "changed-scope"),
+)
+def test_restored_memory_scope_change_clears_only_automatic_retrieval(
+    tmp_path: Path,
+    checkpoint_scope: str | None,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-memory-scope-change")
+    context.metadata.update(
+        {
+            RETRIEVED_MEMORIES_METADATA_KEY: {"react": ["scope-a-note"]},
+            MEMORY_CONTEXT_METADATA_KEY: "scope-a-context",
+            "conversation_marker": "preserved",
+        }
+    )
+    if checkpoint_scope is not None:
+        context.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] = (
+            checkpoint_scope
+        )
+
+    runner._merge_context_metadata(
+        context,
+        {MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-b"},
+        restored=True,
+    )
+
+    assert RETRIEVED_MEMORIES_METADATA_KEY not in context.metadata
+    assert MEMORY_CONTEXT_METADATA_KEY not in context.metadata
+    assert context.metadata["conversation_marker"] == "preserved"
+    assert (
+        context.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] == "scope-b"
+    )
+
+
+def test_restored_same_memory_scope_preserves_automatic_retrieval(
+    tmp_path: Path,
+) -> None:
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    context = ExecutionContext(execution_id="exec-same-memory-scope")
+    context.metadata.update(
+        {
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a",
+            RETRIEVED_MEMORIES_METADATA_KEY: {"react": ["scope-a-note"]},
+            MEMORY_CONTEXT_METADATA_KEY: "scope-a-context",
+        }
+    )
+
+    runner._merge_context_metadata(
+        context,
+        {MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a"},
+        restored=True,
+    )
+
+    assert context.metadata[RETRIEVED_MEMORIES_METADATA_KEY] == {
+        "react": ["scope-a-note"]
+    }
+    assert context.metadata[MEMORY_CONTEXT_METADATA_KEY] == "scope-a-context"
 
 
 @pytest.mark.asyncio

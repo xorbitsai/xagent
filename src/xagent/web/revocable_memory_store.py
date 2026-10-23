@@ -2,11 +2,10 @@
 
 Revoking the manager's publication is not enough on its own. ``AgentService``
 keeps the store it was built with in ``self.memory``, and so do its execution
-adapter and its execution-scoped memory tools. The agent cache's hit path
-re-checks owner and scope invariants only, never memory policy, so after an
-authority vector-identity change a cache hit would keep reading and writing
-through the adapter built for the *previous* vector space while the manager
-reports ``restart_required``.
+adapter and its execution-scoped memory tools. Without cache-hit policy
+reconciliation, an authority vector-identity change would leave those
+references reading and writing through the adapter built for the *previous*
+vector space while the manager reports ``restart_required``.
 
 Invalidating the agent cache would not fix that: it is a far larger surface,
 and it cannot reach an execution that is already in flight. So the manager
@@ -74,6 +73,18 @@ class RevocableMemoryStore(MemoryStore):
     def revoked(self) -> bool:
         """Whether this reference has been superseded."""
         return self._source.publication_generation() != self._generation
+
+    def with_base_store(self, base_store: MemoryStore) -> "RevocableMemoryStore":
+        """Copy this publication guard around another store wrapper.
+
+        The generation and source stay identical, so a task-specific wrapper
+        cannot outlive the admitted publication it was derived from.
+        """
+        return RevocableMemoryStore(
+            base_store=base_store,
+            source=self._source,
+            generation=self._generation,
+        )
 
     # -- MemoryStore surface ---------------------------------------------
 

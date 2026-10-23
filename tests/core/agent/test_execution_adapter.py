@@ -15,6 +15,8 @@ from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
+from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -46,6 +48,7 @@ class BlockingLLM:
 class TracerCheckpointStore:
     def __init__(self) -> None:
         self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.events: list[dict[str, Any]] = []
 
     async def checkpoint(self, **payload: Any) -> None:
         self.by_execution_id[str(payload["execution_id"])] = dict(payload)
@@ -53,6 +56,20 @@ class TracerCheckpointStore:
     async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
         payload = self.by_execution_id.get(execution_id)
         return dict(payload) if payload is not None else None
+
+    async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+        self.events.append({"event_type": event_type, **kwargs})
+        return f"event-{len(self.events)}"
+
+
+class CountingMemoryStore(InMemoryMemoryStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.search_calls = 0
+
+    def search(self, *args: Any, **kwargs: Any) -> list[MemoryNote]:
+        self.search_calls += 1
+        return super().search(*args, **kwargs)
 
 
 class RecordingTracer:
@@ -1913,6 +1930,187 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     assert handle.runner.agent.tools == adapter.config.tools
     resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
     assert ("noop" in resumed_names) is not remove_tool
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_enabled", [True, False])
+async def test_execution_adapter_resume_rebinds_retained_runner_memory(
+    replacement_enabled: bool,
+) -> None:
+    old_store = InMemoryMemoryStore()
+    replacement_store = InMemoryMemoryStore() if replacement_enabled else None
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "name": "ask_user_question",
+                        "args": {"message": "Confirm before continuing."},
+                    }
+                ]
+            }
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="refresh-memory",
+            pattern="react",
+            llm=llm,
+            tracer=TracerCheckpointStore(),
+            memory_store=old_store,
+            skill_manager=NoSkillManager(),
+        )
+    )
+    waiting = await adapter.execute(task="Remember the answer", task_id="memory-exec")
+    assert waiting["status"] == "waiting_for_user"
+    handle = adapter.registry.get("memory-exec")
+    assert handle is not None
+    assert handle.runner.agent.memory_store is old_store
+
+    await adapter.post_user_message(
+        "memory-exec", "Confirmed.", request_interrupt=False
+    )
+    adapter.config.memory_store = replacement_store
+    llm.responses.extend(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-store",
+                        "name": "store_memory",
+                        "args": {
+                            "content": "The retained runner used current policy.",
+                            "kind": "domain_insight",
+                        },
+                    }
+                ]
+            },
+            "done",
+        ]
+    )
+
+    resumed = await adapter.resume("memory-exec")
+
+    assert resumed is not None
+    assert resumed["status"] == "completed"
+    assert old_store.list_all() == []
+    assert handle.runner.agent.memory_store is replacement_store
+    if replacement_store is not None:
+        assert [note.content for note in replacement_store.list_all()] == [
+            "The retained runner used current policy."
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart", [False, True], ids=("retained", "cold"))
+@pytest.mark.parametrize(
+    "replacement",
+    ["same", "scope-b", "denied"],
+)
+async def test_execution_adapter_resume_refreshes_automatic_memory_context(
+    restart: bool,
+    replacement: str,
+) -> None:
+    tracer = TracerCheckpointStore()
+    old_store = CountingMemoryStore()
+    old_store.add(MemoryNote(content="scope A: Remember the answer"))
+    first_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "name": "ask_user_question",
+                        "args": {"message": "Confirm before continuing."},
+                    }
+                ]
+            }
+        ]
+    )
+    first_adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="memory-context-refresh",
+            pattern="react",
+            llm=first_llm,
+            tracer=tracer,
+            memory_store=old_store,
+            execution_metadata={
+                "memory_retrieval_scope_fingerprint": "scope-a",
+            },
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    waiting = await first_adapter.execute(
+        task="Remember the answer", task_id="memory-context-exec"
+    )
+    assert waiting["status"] == "waiting_for_user"
+    assert "scope A" in first_llm.calls[0]["messages"][0]["content"]
+    initial_search_calls = old_store.search_calls
+    assert initial_search_calls > 0
+
+    replacement_store: CountingMemoryStore | None
+    replacement_fingerprint: str
+    if replacement == "same":
+        replacement_store = old_store
+        replacement_fingerprint = "scope-a"
+    elif replacement == "scope-b":
+        replacement_store = CountingMemoryStore()
+        replacement_store.add(MemoryNote(content="scope B: Remember the answer"))
+        replacement_fingerprint = "scope-b"
+    else:
+        replacement_store = None
+        replacement_fingerprint = "disabled"
+
+    resumed_llm = FakeLLM(["done"])
+    if restart:
+        adapter = AgentExecutionAdapter(
+            AgentExecutionConfig(
+                name="memory-context-refresh",
+                pattern="react",
+                llm=resumed_llm,
+                tracer=tracer,
+                memory_store=replacement_store,
+                execution_metadata={
+                    "memory_retrieval_scope_fingerprint": replacement_fingerprint,
+                },
+                skill_manager=NoSkillManager(),
+            )
+        )
+    else:
+        adapter = first_adapter
+        adapter.config.llm = resumed_llm
+        handle = adapter.registry.get("memory-context-exec")
+        assert handle is not None
+        handle.runner.agent.llm = resumed_llm
+        adapter.config.memory_store = replacement_store
+        adapter.config.execution_metadata = {
+            "memory_retrieval_scope_fingerprint": replacement_fingerprint,
+        }
+
+    await adapter.post_user_message(
+        "memory-context-exec", "Confirmed.", request_interrupt=False
+    )
+    resumed = await adapter.resume(
+        "memory-context-exec",
+        metadata={"memory_retrieval_scope_fingerprint": "scope-a"},
+    )
+
+    assert resumed is not None
+    assert resumed["status"] == "completed"
+    system_prompt = resumed_llm.calls[0]["messages"][0]["content"]
+    if replacement == "same":
+        assert "scope A" in system_prompt
+        assert old_store.search_calls == initial_search_calls
+    elif replacement == "scope-b":
+        assert "scope A" not in system_prompt
+        assert "scope B" in system_prompt
+        assert replacement_store is not None
+        assert replacement_store.search_calls > 0
+    else:
+        assert "scope A" not in system_prompt
+        assert "Relevant memories from previous tasks" not in system_prompt
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,8 @@ from xagent.core.memory.core import MemoryNote, MemoryResponse
 from xagent.core.memory.scope_columns import SCOPE_EXCLUSIVE_FILTER_KEY
 from xagent.core.user_context import current_user_id
 
+from .services.memory_policy import MemoryAccessScope
+
 
 class UserIsolatedMemoryStore(MemoryStore):
     """Memory store implementation that isolates memory by user ID using context.
@@ -39,11 +41,18 @@ class UserIsolatedMemoryStore(MemoryStore):
     "not found or access denied" response, indistinguishable from a genuine
     miss.
 
-    Scope is a cooperative namespace, not a security boundary: ``user_id``
-    remains the only access-control key.
+    Ambient scope is a cooperative namespace, not a security boundary:
+    ``user_id`` remains its access-control key.  A trusted fixed
+    ``MemoryAccessScope`` instead binds both owner and dimensions to this
+    store instance; ambient task identity cannot override either value.
     """
 
-    def __init__(self, base_store: MemoryStore) -> None:
+    def __init__(
+        self,
+        base_store: MemoryStore,
+        *,
+        access_scope: MemoryAccessScope | None = None,
+    ) -> None:
         """
         Initialize with a base memory store for actual storage.
 
@@ -51,10 +60,21 @@ class UserIsolatedMemoryStore(MemoryStore):
             base_store: The underlying memory store for storage operations
         """
         self._base_store = base_store
+        self._access_scope = access_scope
 
     def _get_current_user_id(self) -> Optional[int]:
-        """Get the current user ID from context."""
+        """Get the fixed memory owner, or the legacy ambient user."""
+        if self._access_scope is not None:
+            return self._access_scope.owner_user_id
         return current_user_id.get()
+
+    def _get_memory_scope(self) -> Optional[ExecutionScope]:
+        if self._access_scope is not None:
+            return ExecutionScope(
+                memory_dimensions=self._access_scope.memory_dimensions,
+                strict_memory_isolation=True,
+            )
+        return get_execution_scope()
 
     def _add_user_filter(
         self, filters: Optional[dict[str, Any]] = None
@@ -82,7 +102,7 @@ class UserIsolatedMemoryStore(MemoryStore):
         # Scoped searches filter on the active scope's memory dimensions;
         # dimension-less scopes add nothing (unscoped searches see
         # everything under the user — one-way visibility by default).
-        scope = get_execution_scope()
+        scope = self._get_memory_scope()
         metadata_filters.update(memory_dimension_metadata(scope))
 
         filters["metadata"] = metadata_filters
@@ -101,18 +121,16 @@ class UserIsolatedMemoryStore(MemoryStore):
 
         return filters
 
-    @staticmethod
-    def _scope_gates_by_id_access() -> bool:
+    def _scope_gates_by_id_access(self) -> bool:
         """Whether the active scope constrains by-id (get/update/delete)
         access. An unscoped or empty non-strict scope gates nothing, so the
         by-id path stays byte-for-byte unchanged when no scope is active."""
-        scope: Optional[ExecutionScope] = get_execution_scope()
+        scope = self._get_memory_scope()
         if scope is None:
             return False
         return bool(scope.memory_dimensions) or scope.strict_memory_isolation
 
-    @staticmethod
-    def _scope_permits(note: MemoryNote) -> bool:
+    def _scope_permits(self, note: MemoryNote) -> bool:
         """Whether the active scope may touch ``note`` by id, mirroring the
         equality-filter semantics of ``search``/``add``/``list_all``:
 
@@ -124,7 +142,7 @@ class UserIsolatedMemoryStore(MemoryStore):
         - unscoped / dimension-less non-strict callers keep one-way
           visibility (access allowed).
         """
-        scope: Optional[ExecutionScope] = get_execution_scope()
+        scope = self._get_memory_scope()
         dimension_metadata = memory_dimension_metadata(scope)
         if dimension_metadata:
             return all(
@@ -162,7 +180,7 @@ class UserIsolatedMemoryStore(MemoryStore):
 
         # Stamp the active scope's memory dimensions so scoped searches can
         # filter on them (no-op when unscoped or dimension-less).
-        note.metadata.update(memory_dimension_metadata(get_execution_scope()))
+        note.metadata.update(memory_dimension_metadata(self._get_memory_scope()))
 
         return self._base_store.add(note)
 
@@ -430,3 +448,27 @@ class UserContext:
     ) -> None:
         if self.token is not None:
             reset_user_context(self.token)
+
+
+def bind_memory_access_scope(
+    store: MemoryStore, access_scope: MemoryAccessScope
+) -> MemoryStore:
+    """Replace the user-isolation wrapper with one fixed trusted scope.
+
+    Supported publications are either the user-isolation wrapper itself or
+    the revocable wrapper published by ``DynamicMemoryStoreManager``.  Rewrap
+    the original base store rather than nesting wrappers, so a previous fixed
+    scope can never override a later policy decision.  Unknown compositions
+    fail closed instead of falling back to ambient task identity.
+    """
+    from .revocable_memory_store import RevocableMemoryStore
+
+    publication = store if isinstance(store, RevocableMemoryStore) else None
+    isolated = publication._base_store if publication is not None else store
+    if not isinstance(isolated, UserIsolatedMemoryStore):
+        raise TypeError("memory publication does not support fixed access scopes")
+    bound = UserIsolatedMemoryStore(
+        isolated._base_store,
+        access_scope=access_scope,
+    )
+    return publication.with_base_store(bound) if publication is not None else bound

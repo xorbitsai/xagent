@@ -46,6 +46,11 @@ from .checkpoint import (
     read_latest_checkpoint_payload,
 )
 from .context import ContextManager, ExecutionContext
+from .context.enrichment import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+)
 from .context.execution import (
     ACCEPTED_TURN_IDS_METADATA_KEY,
     COMPACT_THRESHOLD_SOURCE_DEFAULT,
@@ -117,6 +122,7 @@ RESERVED_ENGINE_METADATA_KEYS = frozenset(
         TOOL_EVIDENCE_REMOVED_METADATA_KEY,
         ACCEPTED_TURN_IDS_METADATA_KEY,
         _TRACED_TURN_IDS_METADATA_KEY,
+        MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
     }
 )
 
@@ -1690,11 +1696,33 @@ class AgentRunner:
                     context.metadata[key] = metadata[key]
                 else:
                     context.metadata.pop(key, None)
+            current_memory_scope = metadata.get(
+                MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+            )
+            if isinstance(current_memory_scope, str):
+                if current_memory_scope != context.metadata.get(
+                    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+                ):
+                    context.metadata.pop(RETRIEVED_MEMORIES_METADATA_KEY, None)
+                    context.metadata.pop(MEMORY_CONTEXT_METADATA_KEY, None)
+                context.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] = (
+                    current_memory_scope
+                )
             return
 
         current_metadata = dict(metadata)
         for reserved_key in RESERVED_ENGINE_METADATA_KEYS:
             current_metadata.pop(reserved_key, None)
+        agent_metadata = getattr(self.agent, "metadata", None)
+        memory_scope = (
+            agent_metadata.get(MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY)
+            if isinstance(agent_metadata, dict)
+            else None
+        )
+        if isinstance(memory_scope, str):
+            context.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] = (
+                memory_scope
+            )
         preferred_modalities = normalize_input_modalities(
             current_metadata.pop(PREFERRED_INPUT_MODALITIES_METADATA_KEY, ())
         )

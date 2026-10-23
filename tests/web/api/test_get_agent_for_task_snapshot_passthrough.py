@@ -307,6 +307,7 @@ async def test_explicit_unscoped_result_skips_internal_scope_resolver() -> None:
             task_id=42,
             user=_make_user(),
             task_owner_user_id=1,
+            task_setup_snapshot=_build_snapshot(),
             resolved_execution_scope=None,
         )
 

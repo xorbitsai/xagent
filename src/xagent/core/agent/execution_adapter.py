@@ -175,7 +175,10 @@ class AgentExecutionAdapter:
         kwargs.setdefault(
             "outbound_message_handler", self.config.outbound_message_handler
         )
-        resume_metadata = dict(kwargs.get("metadata") or {})
+        resume_metadata = {
+            **dict(kwargs.get("metadata") or {}),
+            **self.config.execution_metadata,
+        }
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
         )
@@ -193,8 +196,10 @@ class AgentExecutionAdapter:
             )
         else:
             # AgentService may have rebuilt the tool objects after a connection
-            # or policy change. A paused runner still holds the previous list.
+            # or policy change. A paused runner still holds the previous list
+            # and memory capability, so refresh both before it can resume.
             handle.runner.agent.tools = self.config.tools
+            handle.runner.agent.memory_store = self.config.memory_store
             handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()

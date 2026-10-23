@@ -24,10 +24,12 @@ from xagent.core.execution_scope import (
 )
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote, MemoryResponse
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.scope_columns import (
     SCOPE_EXCLUSIVE_FILTER_KEY,
     encode_scope_dims,
 )
+from xagent.web.services.memory_policy import MemoryAccessScope
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 SCOPE_A = ExecutionScope(memory_dimensions={"tenant": "a"})
@@ -236,6 +238,65 @@ class TestCallerFiltersNotMutated:
         assert seen_a and seen_b
         assert seen_a.isdisjoint(seen_b)
         assert shared == {"metadata": {}}
+
+
+def test_fixed_scope_covers_every_user_memory_method() -> None:
+    base = InMemoryMemoryStore()
+    shared = MemoryAccessScope(
+        owner_user_id=700,
+        memory_dimensions={"principal": "person-1"},
+    )
+    first = UserIsolatedMemoryStore(base, access_scope=shared)
+    second = UserIsolatedMemoryStore(base, access_scope=shared)
+    other_principal = UserIsolatedMemoryStore(
+        base,
+        access_scope=MemoryAccessScope(
+            owner_user_id=700,
+            memory_dimensions={"principal": "person-2"},
+        ),
+    )
+    other_owner = UserIsolatedMemoryStore(
+        base,
+        access_scope=MemoryAccessScope(
+            owner_user_id=701,
+            memory_dimensions={"principal": "person-1"},
+        ),
+    )
+
+    with UserContext(1), ExecutionScopeContext(SCOPE_A):
+        note = MemoryNote(content="shared memory")
+        assert first.add(note).success
+    with UserContext(2), ExecutionScopeContext(SCOPE_B):
+        assert second.search("shared") == [note]
+        assert second.list_all() == [note]
+        assert second.get(note.id).success
+        updated = MemoryNote(
+            id=note.id,
+            content="updated memory",
+            metadata={
+                "user_id": 999,
+                "execution_scope_principal": "forged",
+            },
+        )
+        assert second.update(updated).success
+        assert second.get_stats()["total_count"] == 1
+
+    stored = base.get(note.id).content
+    assert stored.metadata["user_id"] == 700
+    assert stored.metadata["execution_scope_principal"] == "person-1"
+    assert not other_principal.get(note.id).success
+    assert not other_owner.get(note.id).success
+    assert other_principal.search("updated") == []
+    assert other_owner.list_all() == []
+    assert second.delete(note.id).success
+    assert not base.get(note.id).success
+
+    retained = MemoryNote(content="other principal")
+    assert other_principal.add(retained).success
+    assert first.add(MemoryNote(content="clear me")).success
+    first.clear()
+    assert first.list_all() == []
+    assert other_principal.get(retained.id).success
 
 
 class TestResolverPathAndNestedReactivation:

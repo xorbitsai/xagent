@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 MEMORY_CONTEXT_METADATA_KEY = "retrieved_memory_context"
 RETRIEVED_MEMORIES_METADATA_KEY = "retrieved_memories"
+MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY = "memory_retrieval_scope_fingerprint"
 SELECTED_SKILL_METADATA_KEY = "selected_skill"
 SKILL_CONTEXT_METADATA_KEY = "selected_skill_context"
 # True only when generate_image is registered and edit_image is not; a deployment

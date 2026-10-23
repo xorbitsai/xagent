@@ -33,6 +33,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
+_EXECUTION_TIMEOUT_SECONDS = 60 * 60
 _EXECUTION_KILL_TIMEOUT_SECONDS = 5.0
 
 # BoxLite's allow_net is enforced against the resolved connection destination.
@@ -274,7 +275,7 @@ class BoxliteSandbox(Sandbox):
             list(args) if args else None,
             list(env.items()) if env else None,
             user=None,
-            timeout_secs=None,
+            timeout_secs=_EXECUTION_TIMEOUT_SECONDS,
             cwd=None,
         )
         try:

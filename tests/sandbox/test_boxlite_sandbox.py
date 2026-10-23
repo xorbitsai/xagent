@@ -139,7 +139,7 @@ async def test_exec_caps_output_while_draining_boxlite_streams():
         "demo",
         ["--flag"],
         [("KEY", "value")],
-        {"user": None, "timeout_secs": None, "cwd": None},
+        {"user": None, "timeout_secs": 3600, "cwd": None},
     )
 
 

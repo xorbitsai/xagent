@@ -103,36 +103,20 @@ def _engage_permission_error(error: Exception) -> dict[str, Any] | None:
 
 
 def _event_property_names(result: Any) -> list[str]:
-    """Normalize the shapes returned by Mixpanel's top-properties endpoint."""
+    """Return keys from Mixpanel's flat top-event-properties response."""
 
-    if isinstance(result, dict):
-        for nested_key in ("results", "properties", "event_properties"):
-            nested = result.get(nested_key)
-            if isinstance(nested, (dict, list)):
-                return _event_property_names(nested)
-        return [str(name) for name in result if isinstance(name, str)]
-    if not isinstance(result, list):
+    if not isinstance(result, dict):
         return []
-    names: list[str] = []
-    for item in result:
-        if isinstance(item, str):
-            names.append(item)
-        elif isinstance(item, dict):
-            name = item.get("name") or item.get("property")
-            if isinstance(name, str):
-                names.append(name)
-    return names
+    return [name for name in result if isinstance(name, str)]
 
 
-def _identity_property(properties: list[str]) -> str | None:
-    """Choose a known identity property without losing its source casing."""
+def _identity_properties(properties: list[str]) -> list[str]:
+    """Find known identity properties without guessing between namespaces."""
 
-    by_casefold = {name.casefold(): name for name in properties}
-    for candidate in IDENTITY_PROPERTY_CANDIDATES:
-        match = by_casefold.get(candidate.casefold())
-        if match is not None:
-            return match
-    return None
+    candidate_names = {
+        candidate.casefold() for candidate in IDENTITY_PROPERTY_CANDIDATES
+    }
+    return [name for name in properties if name.casefold() in candidate_names]
 
 
 def _property_equals(property_name: str, value: str) -> str:
@@ -495,13 +479,16 @@ def mixpanel_query_user_activity(
     another stable identifier did. This is an event query, not an Engage
     profile export, so it can still work when the Service Account lacks
     ``download_users_csv``. The tool inspects up to 100 properties on the
-    selected event and automatically chooses a common identity property.
+    selected event and automatically chooses a common identity property only
+    when exactly one candidate exists.
 
     identifier: email, distinct id, or user id to match exactly.
     event: an event name from mixpanel_list_event_names.
     from_date, to_date: inclusive YYYY-MM-DD dates.
     identity_property: optional exact event-property name. Leave empty to
-    auto-detect $email, Email/email, distinct_id, or a user-id property.
+    auto-detect $email, Email/email, distinct_id, or a user-id property when
+    exactly one is present. When multiple identity properties exist, pass the
+    intended property explicitly so email and ID namespaces are not confused.
     unit: "minute", "hour", "day", or "month".
     """
 
@@ -523,8 +510,10 @@ def mixpanel_query_user_activity(
                 params={"event": event, "limit": MAX_LIMIT},
             )
             property_names = _event_property_names(properties_result)
-            selected_property = _identity_property(property_names) or ""
-            if not selected_property:
+            identity_properties = _identity_properties(property_names)
+            if len(identity_properties) == 1:
+                selected_property = identity_properties[0]
+            elif not identity_properties:
                 return _error(
                     "No common identity property was found on the selected event",
                     error_code="mixpanel_event_identity_property_missing",
@@ -532,6 +521,16 @@ def mixpanel_query_user_activity(
                     checked_property_limit=MAX_LIMIT,
                     available_properties=property_names,
                     profile_query_requires="download_users_csv",
+                )
+            else:
+                return _error(
+                    "Multiple identity properties were found on the selected "
+                    "event; specify identity_property explicitly",
+                    error_code="mixpanel_event_identity_property_ambiguous",
+                    event=event,
+                    checked_property_limit=MAX_LIMIT,
+                    candidate_identity_properties=identity_properties,
+                    required_parameter="identity_property",
                 )
 
         where = _property_equals(selected_property, identifier)

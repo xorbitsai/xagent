@@ -644,6 +644,63 @@ def test_query_user_activity_discovers_email_beyond_default_property_limit(
     )
 
 
+@pytest.mark.parametrize(
+    "colliding_property", ["results", "properties", "event_properties"]
+)
+def test_query_user_activity_treats_envelope_names_as_event_properties(
+    monkeypatch,
+    colliding_property,
+):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    colliding_property: {"count": 20},
+                    "Email": {"count": 10},
+                }
+            ),
+            MockResponse(json_data={"data": {"values": {"Login": {}}}}),
+        ]
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "named@example.com", "Login", "2026-10-01", "2026-10-23"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["user_activity"]["identity_property"] == "Email"
+    assert mock_request.call_count == 2
+
+
+def test_query_user_activity_requires_explicit_property_for_ambiguous_identity(
+    monkeypatch,
+):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "Email": {"count": 10},
+                "distinct_id": {"count": 20},
+            }
+        )
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "user-123", "Login", "2026-10-01", "2026-10-23"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "mixpanel_event_identity_property_ambiguous"
+    assert result["candidate_identity_properties"] == ["Email", "distinct_id"]
+    assert result["required_parameter"] == "identity_property"
+    assert mock_request.call_count == 1
+
+
 def test_query_user_activity_escapes_identifier_and_explicit_property(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"data": {}}))
     monkeypatch.setattr(mixpanel.requests, "request", mock_request)

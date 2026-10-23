@@ -611,6 +611,81 @@ def test_query_segmentation_omits_optional_params_when_not_provided(monkeypatch)
     assert "where" not in params
 
 
+def test_query_user_activity_discovers_email_beyond_default_property_limit(
+    monkeypatch,
+):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    **{f"property_{index}": {"count": 1} for index in range(20)},
+                    "Email": {"count": 7},
+                }
+            ),
+            MockResponse(json_data={"data": {"values": {"Login": {}}}}),
+        ]
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "named@example.com", "Login", "2026-10-01", "2026-10-23"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["user_activity"]["identity_property"] == "Email"
+    assert mock_request.call_count == 2
+    property_params = mock_request.call_args_list[0].kwargs["params"]
+    assert property_params["limit"] == mixpanel.MAX_LIMIT
+    segmentation_params = mock_request.call_args_list[1].kwargs["params"]
+    assert segmentation_params["where"] == (
+        'properties["Email"] == "named@example.com"'
+    )
+
+
+def test_query_user_activity_escapes_identifier_and_explicit_property(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {}}))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            'person"@example.com',
+            "Login",
+            "2026-10-01",
+            "2026-10-23",
+            identity_property='Email"Key',
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_count == 1
+    assert mock_request.call_args.kwargs["params"]["where"] == (
+        'properties["Email\\"Key"] == "person\\"@example.com"'
+    )
+
+
+def test_query_user_activity_reports_missing_identity_property(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"Browser": {"count": 10}, "Page": {"count": 8}}
+        )
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "named@example.com", "Login", "2026-10-01", "2026-10-23"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "mixpanel_event_identity_property_missing"
+    assert result["checked_property_limit"] == mixpanel.MAX_LIMIT
+    assert result["profile_query_requires"] == "download_users_csv"
+    assert mock_request.call_count == 1
+
+
 def test_query_retention_defaults_and_optional_params(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"data": {}}))
     monkeypatch.setattr(mixpanel.requests, "request", mock_request)
@@ -729,6 +804,31 @@ def test_query_engage_rejects_page_without_session_id(monkeypatch):
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
+
+
+def test_query_engage_identifies_profile_permission_without_blocking_events(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=403,
+                json_data={
+                    "error": "Service account requires download_users_csv permission"
+                },
+            )
+        ),
+    )
+
+    result = json.loads(mixpanel.mixpanel_query_engage())
+
+    assert result["status"] == "error"
+    assert result["error_code"] == "mixpanel_profile_permission_missing"
+    assert result["required_permission"] == "download_users_csv"
+    assert result["event_query_available"] is True
+    assert result["recommended_tool"] == "mixpanel_query_user_activity"
 
 
 def test_list_annotations_requires_valid_dates(monkeypatch):

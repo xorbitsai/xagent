@@ -29,6 +29,26 @@ MAX_RETRY_AFTER_SECONDS = 30
 # amount of data into the tool's own output.
 MAX_EXPORT_EVENTS = 500
 
+IDENTITY_PROPERTY_CANDIDATES = (
+    "$email",
+    "Email",
+    "email",
+    "EMAIL",
+    "distinct_id",
+    "$user_id",
+    "user_id",
+)
+
+
+class MixpanelAPIError(RuntimeError):
+    """An HTTP error returned by Mixpanel, with machine-readable status."""
+
+    def __init__(self, message: str, *, status_code: int, detail: str = "") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail
+
+
 # Mixpanel splits its HTTP API across three host+path families per
 # data-residency region, all sharing the same three regional hostnames
 # (mixpanel.com / eu.mixpanel.com / in.mixpanel.com for US/EU/India) but
@@ -56,8 +76,72 @@ def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
-def _error(message: str) -> str:
-    return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+def _error(message: str, **details: Any) -> str:
+    return json.dumps(
+        {"status": "error", "message": message, **details}, ensure_ascii=False
+    )
+
+
+def _engage_permission_error(error: Exception) -> dict[str, Any] | None:
+    """Describe the known Engage-only permission failure.
+
+    ``download_users_csv`` gates profile export through Engage. It does not
+    gate event segmentation, so callers must not turn this failure into the
+    broader claim that a named user's event activity cannot be queried.
+    """
+
+    if not isinstance(error, MixpanelAPIError) or error.status_code != 403:
+        return None
+    if "download_users_csv" not in error.detail.lower():
+        return None
+    return {
+        "error_code": "mixpanel_profile_permission_missing",
+        "required_permission": "download_users_csv",
+        "event_query_available": True,
+        "recommended_tool": "mixpanel_query_user_activity",
+    }
+
+
+def _event_property_names(result: Any) -> list[str]:
+    """Normalize the shapes returned by Mixpanel's top-properties endpoint."""
+
+    if isinstance(result, dict):
+        for nested_key in ("results", "properties", "event_properties"):
+            nested = result.get(nested_key)
+            if isinstance(nested, (dict, list)):
+                return _event_property_names(nested)
+        return [str(name) for name in result if isinstance(name, str)]
+    if not isinstance(result, list):
+        return []
+    names: list[str] = []
+    for item in result:
+        if isinstance(item, str):
+            names.append(item)
+        elif isinstance(item, dict):
+            name = item.get("name") or item.get("property")
+            if isinstance(name, str):
+                names.append(name)
+    return names
+
+
+def _identity_property(properties: list[str]) -> str | None:
+    """Choose a known identity property without losing its source casing."""
+
+    by_casefold = {name.casefold(): name for name in properties}
+    for candidate in IDENTITY_PROPERTY_CANDIDATES:
+        match = by_casefold.get(candidate.casefold())
+        if match is not None:
+            return match
+    return None
+
+
+def _property_equals(property_name: str, value: str) -> str:
+    """Build a Mixpanel expression with JSON-escaped names and values."""
+
+    return (
+        f"properties[{json.dumps(property_name, ensure_ascii=False)}] == "
+        f"{json.dumps(value, ensure_ascii=False)}"
+    )
 
 
 def _success_with_capped_list(key: str, items: Any) -> str:
@@ -313,7 +397,11 @@ def _request(
             # since that module is shared by every connector, not owned by
             # this file.
             message = f"{message} - {redact_sensitive_text(detail)}"
-        raise RuntimeError(message) from exc
+        raise MixpanelAPIError(
+            message,
+            status_code=response.status_code,
+            detail=detail or "",
+        ) from exc
 
     if stream:
         return response
@@ -389,6 +477,89 @@ def mixpanel_get_event_properties(event: str, limit: int = 10) -> str:
         return success_with_capped_dict("event_properties", result)
     except Exception as e:
         logger.error(f"Error fetching Mixpanel properties for event {event}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def mixpanel_query_user_activity(
+    identifier: str,
+    event: str,
+    from_date: str,
+    to_date: str,
+    identity_property: str = "",
+    unit: str = "day",
+) -> str:
+    """Query one named user's event activity over a date range.
+
+    Use this tool for questions about what a person identified by email or
+    another stable identifier did. This is an event query, not an Engage
+    profile export, so it can still work when the Service Account lacks
+    ``download_users_csv``. The tool inspects up to 100 properties on the
+    selected event and automatically chooses a common identity property.
+
+    identifier: email, distinct id, or user id to match exactly.
+    event: an event name from mixpanel_list_event_names.
+    from_date, to_date: inclusive YYYY-MM-DD dates.
+    identity_property: optional exact event-property name. Leave empty to
+    auto-detect $email, Email/email, distinct_id, or a user-id property.
+    unit: "minute", "hour", "day", or "month".
+    """
+
+    try:
+        _validate_date(from_date, "from_date")
+        _validate_date(to_date, "to_date")
+        if not identifier.strip():
+            raise ValueError("identifier must not be empty")
+        if not event.strip():
+            raise ValueError("event must not be empty")
+
+        property_names: list[str] = []
+        selected_property = identity_property.strip()
+        if not selected_property:
+            properties_result = _request(
+                "GET",
+                _region_hosts()["query"],
+                "/api/query/events/properties/top",
+                params={"event": event, "limit": MAX_LIMIT},
+            )
+            property_names = _event_property_names(properties_result)
+            selected_property = _identity_property(property_names) or ""
+            if not selected_property:
+                return _error(
+                    "No common identity property was found on the selected event",
+                    error_code="mixpanel_event_identity_property_missing",
+                    event=event,
+                    checked_property_limit=MAX_LIMIT,
+                    available_properties=property_names,
+                    profile_query_requires="download_users_csv",
+                )
+
+        where = _property_equals(selected_property, identifier)
+        result = _request(
+            "GET",
+            _region_hosts()["query"],
+            "/api/query/segmentation",
+            params={
+                "event": event,
+                "from_date": from_date,
+                "to_date": to_date,
+                "unit": unit,
+                "where": where,
+            },
+        )
+        return success_with_capped_dict(
+            "user_activity",
+            {
+                "event": event,
+                "identity_property": selected_property,
+                "identifier": identifier,
+                "from_date": from_date,
+                "to_date": to_date,
+                "segmentation": result,
+            },
+        )
+    except Exception as e:
+        logger.error("Error querying Mixpanel user activity for event %s: %s", event, e)
         return _error(str(e))
 
 
@@ -541,6 +712,10 @@ def mixpanel_query_engage(
     Query user profiles (Mixpanel's "Engage" store) -- distinct_id and
     profile properties, optionally filtered. Mixpanel paginates results
     server-side in fixed-size pages; there is no client-specified limit.
+    This endpoint requires the Service Account's download_users_csv
+    permission. For a named person's event behavior, use
+    mixpanel_query_user_activity instead; an Engage permission failure does
+    not mean event-level filtering is unavailable.
     where: an optional Mixpanel expression to filter profiles by, e.g.
     "properties[\\"$email\\"] is set".
     output_properties: optional comma-separated property names to return,
@@ -570,7 +745,8 @@ def mixpanel_query_engage(
         return success_with_capped_dict("engage", result)
     except Exception as e:
         logger.error(f"Error querying Mixpanel engage profiles: {e}")
-        return _error(str(e))
+        permission_error = _engage_permission_error(e)
+        return _error(str(e), **(permission_error or {}))
 
 
 @mcp.tool()

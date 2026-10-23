@@ -31,9 +31,7 @@ MAX_EXPORT_EVENTS = 500
 
 IDENTITY_PROPERTY_CANDIDATES = (
     "$email",
-    "Email",
     "email",
-    "EMAIL",
     "distinct_id",
     "$user_id",
     "user_id",
@@ -92,14 +90,20 @@ def _engage_permission_error(error: Exception) -> dict[str, Any] | None:
 
     if not isinstance(error, MixpanelAPIError) or error.status_code != 403:
         return None
-    if "download_users_csv" not in error.detail.lower():
-        return None
-    return {
-        "error_code": "mixpanel_profile_permission_missing",
-        "required_permission": "download_users_csv",
-        "event_query_available": True,
+    guidance: dict[str, Any] = {
         "recommended_tool": "mixpanel_query_user_activity",
     }
+    if "download_users_csv" in error.detail.lower():
+        guidance.update(
+            {
+                "error_code": "mixpanel_profile_permission_missing",
+                "required_permission": "download_users_csv",
+                "event_query_available": True,
+            }
+        )
+    else:
+        guidance["event_query_may_be_available"] = True
+    return guidance
 
 
 def _event_property_names(result: Any) -> list[str]:
@@ -126,6 +130,28 @@ def _property_equals(property_name: str, value: str) -> str:
         f"properties[{json.dumps(property_name, ensure_ascii=False)}] == "
         f"{json.dumps(value, ensure_ascii=False)}"
     )
+
+
+def _numeric_values(value: Any) -> list[int | float]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [value]
+    if isinstance(value, dict):
+        return [number for item in value.values() for number in _numeric_values(item)]
+    if isinstance(value, list):
+        return [number for item in value for number in _numeric_values(item)]
+    return []
+
+
+def _segmentation_has_only_zero_counts(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    counts = _numeric_values(data.get("values"))
+    return bool(counts) and all(count == 0 for count in counts)
 
 
 def _success_with_capped_list(key: str, items: Any) -> str:
@@ -482,7 +508,8 @@ def mixpanel_query_user_activity(
     selected event and automatically chooses a common identity property only
     when exactly one candidate exists.
 
-    identifier: email, distinct id, or user id to match exactly.
+    identifier: email, distinct id, or user id to match exactly and
+    case-sensitively after surrounding whitespace is removed.
     event: an event name from mixpanel_list_event_names.
     from_date, to_date: inclusive YYYY-MM-DD dates.
     identity_property: optional exact event-property name. Leave empty to
@@ -499,6 +526,8 @@ def mixpanel_query_user_activity(
             raise ValueError("identifier must not be empty")
         if not event.strip():
             raise ValueError("event must not be empty")
+        identifier = identifier.strip()
+        event = event.strip()
 
         property_names: list[str] = []
         selected_property = identity_property.strip()
@@ -546,16 +575,24 @@ def mixpanel_query_user_activity(
                 "where": where,
             },
         )
+        user_activity = {
+            "event": event,
+            "identity_property": selected_property,
+            "identifier": identifier,
+            "from_date": from_date,
+            "to_date": to_date,
+            "segmentation": result,
+        }
+        if _segmentation_has_only_zero_counts(result):
+            user_activity["identity_match_warning"] = (
+                "All returned counts are zero. Identity matching is exact and "
+                "case-sensitive; verify the identifier, identity_property, "
+                "casing, and identity namespace before concluding that the user "
+                "had no activity."
+            )
         return success_with_capped_dict(
             "user_activity",
-            {
-                "event": event,
-                "identity_property": selected_property,
-                "identifier": identifier,
-                "from_date": from_date,
-                "to_date": to_date,
-                "segmentation": result,
-            },
+            user_activity,
         )
     except Exception as e:
         logger.error("Error querying Mixpanel user activity for event %s: %s", event, e)

@@ -722,6 +722,140 @@ def test_query_user_activity_escapes_identifier_and_explicit_property(monkeypatc
     )
 
 
+def test_query_user_activity_escapes_backslash_and_preserves_non_ascii(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {}}))
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "用户\\甲",
+            "Login",
+            "2026-10-01",
+            "2026-10-23",
+            identity_property="外部\\编号",
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"]["where"] == (
+        'properties["外部\\\\编号"] == "用户\\\\甲"'
+    )
+
+
+def test_query_user_activity_strips_identifier_and_event(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"Email": {"count": 10}}),
+            MockResponse(json_data={"data": {"values": {"Login": {}}}}),
+        ]
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "  named@example.com ", " Login\n", "2026-10-01", "2026-10-23"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["user_activity"]["identifier"] == "named@example.com"
+    assert result["user_activity"]["event"] == "Login"
+    assert mock_request.call_args_list[0].kwargs["params"]["event"] == "Login"
+    assert mock_request.call_args_list[1].kwargs["params"]["where"] == (
+        'properties["Email"] == "named@example.com"'
+    )
+
+
+def test_query_user_activity_warns_when_exact_match_returns_only_zeroes(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"values": {"Login": {"2026-10-01": 0}}}}
+        )
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "named@example.com",
+            "Login",
+            "2026-10-01",
+            "2026-10-23",
+            identity_property="Email",
+        )
+    )
+
+    warning = result["user_activity"]["identity_match_warning"]
+    assert "exact and case-sensitive" in warning
+    assert "before concluding that the user had no activity" in warning
+
+
+def test_query_user_activity_returns_segmentation_http_error(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            status_code=500,
+            json_data={"error": "segmentation failed"},
+            url="https://mixpanel.com/api/query/segmentation",
+        )
+    )
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(
+        mixpanel.mixpanel_query_user_activity(
+            "named@example.com",
+            "Login",
+            "2026-10-01",
+            "2026-10-23",
+            identity_property="Email",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "segmentation failed" in result["message"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {
+                "identifier": " ",
+                "event": "Login",
+                "from_date": "2026-10-01",
+                "to_date": "2026-10-23",
+            },
+            "identifier",
+        ),
+        (
+            {
+                "identifier": "named@example.com",
+                "event": "\n",
+                "from_date": "2026-10-01",
+                "to_date": "2026-10-23",
+            },
+            "event",
+        ),
+        (
+            {
+                "identifier": "named@example.com",
+                "event": "Login",
+                "from_date": "bad-date",
+                "to_date": "2026-10-23",
+            },
+            "from_date",
+        ),
+    ],
+)
+def test_query_user_activity_rejects_invalid_input(monkeypatch, kwargs, message):
+    mock_request = Mock()
+    monkeypatch.setattr(mixpanel.requests, "request", mock_request)
+
+    result = json.loads(mixpanel.mixpanel_query_user_activity(**kwargs))
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_query_user_activity_reports_missing_identity_property(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -886,6 +1020,44 @@ def test_query_engage_identifies_profile_permission_without_blocking_events(
     assert result["required_permission"] == "download_users_csv"
     assert result["event_query_available"] is True
     assert result["recommended_tool"] == "mixpanel_query_user_activity"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error", "expects_event_hint"),
+    [
+        (500, "server error", False),
+        (403, "forbidden", True),
+    ],
+)
+def test_query_engage_does_not_infer_specific_permission_without_token(
+    monkeypatch,
+    status_code,
+    error,
+    expects_event_hint,
+):
+    monkeypatch.setattr(
+        mixpanel.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=status_code,
+                json_data={"error": error},
+                url="https://mixpanel.com/api/query/engage",
+            )
+        ),
+    )
+
+    result = json.loads(mixpanel.mixpanel_query_engage())
+
+    assert result["status"] == "error"
+    assert "error_code" not in result
+    assert (result.get("recommended_tool") == "mixpanel_query_user_activity") is (
+        expects_event_hint
+    )
+    assert result.get("event_query_may_be_available") is (
+        True if expects_event_hint else None
+    )
+    assert "event_query_available" not in result
 
 
 def test_list_annotations_requires_valid_dates(monkeypatch):

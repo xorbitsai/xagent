@@ -189,8 +189,10 @@ class TestScopedWorkspace:
             workspace.temp_dir,
         ):
             assert stat.S_IMODE(real_stat(directory).st_mode) & 0o777 == 0o770
-        assert assigned_gids == [1010, 1010, 1010, 1010]
-        assert requested_modes == [0o2750, 0o2770, 0o2770, 0o2770]
+        # workspace + input/output/temp + the private runtime temp directory;
+        # the latter is visited once more by the legacy-content migration.
+        assert assigned_gids == [1010] * 6
+        assert requested_modes == [0o2750, *([0o2770] * 5)]
 
     def test_two_scopes_produce_disjoint_workspace_dirs(self, tmp_path):
         ws_a = self._scoped_workspace(tmp_path, ("tenant-a",))

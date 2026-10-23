@@ -28,6 +28,13 @@ class FakeSandbox:
     def __init__(self, name: str) -> None:
         self.name = name
         self.exec_calls: list[tuple[str, tuple[str, ...]]] = []
+        self.files: dict[str, str] = {}
+
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
+        assert overwrite or remote_path not in self.files
+        self.files[remote_path] = content
 
     async def exec(self, command: str, *args: str, env: dict[str, str] | None = None):
         self.exec_calls.append((command, args))

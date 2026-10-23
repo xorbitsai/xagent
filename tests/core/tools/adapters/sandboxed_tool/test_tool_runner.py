@@ -55,7 +55,13 @@ class TestLoadArgs:
         """Base64-encoded JSON should decode back to original dict."""
         original = {"msg": "hello", "count": 42}
         b64 = base64.b64encode(json.dumps(original).encode()).decode()
-        assert _load_args(b64) == original
+        assert _load_args(b64, None) == original
+
+    def test_private_file(self, tmp_path):
+        """Production payload files should load without argv content."""
+        args_file = tmp_path / "args.json"
+        args_file.write_text('{"token": "private"}', encoding="utf-8")
+        assert _load_args(None, str(args_file)) == {"token": "private"}
 
 
 class TestLoadInitParams:
@@ -63,13 +69,22 @@ class TestLoadInitParams:
 
     def test_none_returns_empty(self):
         """None input should return empty dict."""
-        assert _load_init_params(None) == {}
+        assert _load_init_params(None, None) == {}
 
     def test_roundtrip(self):
         """Cloudpickle-serialized params should deserialize correctly."""
         params = {"key": "value"}
         b64 = base64.b64encode(cloudpickle.dumps(params)).decode()
-        assert _load_init_params(b64) == params
+        assert _load_init_params(b64, None) == params
+
+    def test_private_file(self, tmp_path):
+        """Cloudpickled constructor state can be supplied outside argv."""
+        params = {"token": "private"}
+        params_file = tmp_path / "init.b64"
+        params_file.write_text(
+            base64.b64encode(cloudpickle.dumps(params)).decode(), encoding="ascii"
+        )
+        assert _load_init_params(None, str(params_file)) == params
 
 
 class TestLoadToolClass:

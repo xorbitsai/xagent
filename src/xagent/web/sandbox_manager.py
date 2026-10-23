@@ -26,6 +26,7 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_pids_limit,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
@@ -54,6 +55,7 @@ from ..sandbox.base import (
     SandboxTemplate,
     SpecVerdict,
     canonical_sandbox_path,
+    grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
 from .sandbox_keys import (
@@ -875,6 +877,9 @@ class SandboxManager:
         if memory is not None:
             config.memory = memory
 
+        config.pids_limit = get_sandbox_pids_limit()
+        config.security_profile = self._service.runtime_security_profile()
+
         # ENV
         env = get_sandbox_env()
         if env:
@@ -988,10 +993,10 @@ class SandboxManager:
         The mount root is always created; each extra/allowlist mount is
         created only if it already exists (never freshly created) — same
         split as the historical base_dir(True)/allowed_external_dirs(False)
-        behavior. Called explicitly right before a creation attempt (never
-        on a cache hit or a plain reuse/start_existing), independent of
-        spec/volume-list construction: this is not a side effect threaded
-        through volume-list building.
+        behavior. Called explicitly before creation and before a reconciled
+        start_existing after process restart, but not on an in-process cache
+        hit. It is independent of spec/volume-list construction: this is not
+        a side effect threaded through volume-list building.
 
         ``prepare_root``, when given, overrides *only* the mount root's
         creation target (see ``ChatWorkspaceBinding.prepare_root``): folding
@@ -1001,6 +1006,7 @@ class SandboxManager:
         exist on disk, not necessarily the (possibly shallower) directory
         actually bind-mounted. Extra/allowlist mounts are unaffected.
         """
+
         for backend_path, should_create in self._workspace_mount_paths(
             lifecycle_type, lifecycle_id, mount_intent
         ):
@@ -1027,15 +1033,20 @@ class SandboxManager:
                 and str(backend_path) == mount_intent.mount_root
             ):
                 target = Path(prepare_root)
-            try:
-                if should_create or target.exists():
-                    os.makedirs(target, exist_ok=True)
-            except OSError as exc:
-                logger.warning(
-                    "Failed to prepare sandbox workspace mount %s: %s",
-                    target,
-                    exc,
+            if should_create and self._service.host_workspace_gid() is not None:
+                # Grant the actual bind root first. A sandbox cannot replace
+                # its own mount point, so it is a stable descriptor anchor for
+                # any deeper scoped prepare root. Using get_uploads_dir()
+                # directly as the anchor for that deeper grant is unsafe when
+                # mount folding exposes a writable ancestor that contains the
+                # uploads entry.
+                grant_sandbox_runtime_access(
+                    backend_path, trusted_root=get_uploads_dir()
                 )
+                if target != backend_path:
+                    grant_sandbox_runtime_access(target, trusted_root=backend_path)
+            elif should_create or target.exists():
+                os.makedirs(target, exist_ok=True)
 
     @staticmethod
     def _config_equivalent(
@@ -1081,6 +1092,8 @@ class SandboxManager:
             volumes=info.config.volumes,
             network_isolated=bool(info.config.network_isolated),
             ports=info.config.ports,
+            pids_limit=info.config.pids_limit,
+            security_profile=info.config.security_profile,
         )
 
     def _build_runtime_spec(
@@ -1115,6 +1128,8 @@ class SandboxManager:
             volumes=volumes,
             network_isolated=bool(config.network_isolated),
             ports=config.ports,
+            pids_limit=config.pids_limit,
+            security_profile=config.security_profile,
         )
 
     def _make_default_volumes(
@@ -1567,6 +1582,9 @@ class SandboxManager:
         ordinary absent-\\>create path instead, re-inspecting under the
         now-free gate and creating the (confirmed-absent) sandbox fresh.
         """
+        self._prepare_workspace_mounts(
+            lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
+        )
         cap = get_sandbox_max_containers()
         try:
             if cap is None:
@@ -1967,10 +1985,8 @@ class SandboxManager:
         (every pop site drops both together), so the comparison never
         degrades to "no cached spec, allow".
 
-        ``prepare_root``, when given, is only consulted on that cache miss
-        (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
-        and ``_prepare_workspace_mounts``; a cache hit never creates
-        directories at all.
+        ``prepare_root`` is used while initially creating or reconciling the
+        sandbox. Cached providers do not repeat mount preparation.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)

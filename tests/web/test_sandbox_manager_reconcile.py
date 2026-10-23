@@ -48,6 +48,7 @@ def _env(tmp_path):
             "xagent.web.sandbox_manager.build_code_mount_volumes",
             return_value=[("/repo/src", "/app/src", "ro")],
         ),
+        patch("xagent.web.sandbox_manager.grant_sandbox_runtime_access"),
     ):
         yield
 
@@ -423,7 +424,7 @@ class TestReconcileBudget:
                 state="stopped",
                 spec=stale_spec,
                 fingerprint_label=stale_spec.fingerprint(),
-                version_label="1",
+                version_label=str(SPEC_CONTRACT_VERSION),
             )
 
         _seed_stale()
@@ -506,7 +507,7 @@ class TestReconcileBudget:
             state="stopped",
             spec=stale_spec,
             fingerprint_label=stale_spec.fingerprint(),
-            version_label="1",
+            version_label=str(SPEC_CONTRACT_VERSION),
         )
         await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
         assert manager._reconcile_budget["user::1"] == 0
@@ -605,7 +606,7 @@ class TestReconcileBudget:
             state="stopped",
             spec=stale_spec,
             fingerprint_label=stale_spec.fingerprint(),
-            version_label="1",
+            version_label=str(SPEC_CONTRACT_VERSION),
         )
         with pytest.raises(SandboxRuntimeConflictError):
             await manager.get_or_create_sandbox(
@@ -821,6 +822,59 @@ class TestProviderCacheMountIntentGate:
 
         assert second is first
         assert set(service._containers) == {"user::1"}
+
+    @pytest.mark.asyncio
+    async def test_cached_provider_does_not_repeat_mount_preparation(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        prepared: list[Path] = []
+
+        def record_grant(path: Path, *, trusted_root: Path) -> None:
+            prepared.append(path)
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        intent = _intent(tmp_path, "user-root")
+        user_root = tmp_path / "user-root"
+
+        first = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent, prepare_root=str(user_root)
+        )
+        second = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent, prepare_root=str(user_root)
+        )
+
+        assert second is first
+        assert prepared == [user_root]
+
+    def test_folded_mount_root_is_the_trusted_grant_anchor(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        grants: list[tuple[Path, Path]] = []
+
+        def record_grant(path: Path, *, trusted_root: Path) -> None:
+            grants.append((path, trusted_root))
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        mount_root = tmp_path / "user-root"
+        prepare_root = mount_root / "scopes" / "actor-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "1",
+            SandboxMountIntent(mount_root=str(mount_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert grants[0][0] == mount_root
+        assert grants[1] == (prepare_root, mount_root)
 
 
 class TestReadinessReservedUploadsSubtree:

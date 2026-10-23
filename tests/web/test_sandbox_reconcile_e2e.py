@@ -67,6 +67,10 @@ from xagent.web.services.workspace_binding import build_chat_workspace_binding
 requires_docker = pytest.mark.skipif(
     not is_docker_available(), reason="Requires reachable Docker daemon"
 )
+requires_workspace_chown = pytest.mark.skipif(
+    os.geteuid() != 0,
+    reason="writable fixed-gid Docker workspace tests require host CAP_CHOWN",
+)
 
 OWNER_ID = 4242
 
@@ -145,6 +149,7 @@ async def _delete_lifecycle(service, lifecycle_type: str, lifecycle_id: str) -> 
 
 
 @requires_docker
+@requires_workspace_chown
 class TestSameCAConflictFreeReuse:
     """#296's fix, asserted directly against real containers: two Actors
     under the same CA fold to a byte-identical mount intent and share
@@ -244,6 +249,7 @@ class TestSameCAConflictFreeReuse:
 
 
 @requires_docker
+@requires_workspace_chown
 class TestLegacyContainerMigration:
     """A container built the way the pre-1b sandbox layer built it (managed
     + name labels only, no spec attestation, the Actor subtree mounted as a
@@ -366,6 +372,7 @@ class TestLegacyContainerMigration:
 
 
 @requires_docker
+@requires_workspace_chown
 class TestLegacyMatchingStoreRowStaysUnverified:
     """A legacy-shaped container whose store row's recorded spec already
     equals the new desired spec reuses via UNVERIFIED-equal convergence: no
@@ -444,6 +451,7 @@ class TestLegacyMatchingStoreRowStaysUnverified:
 
 
 @requires_docker
+@requires_workspace_chown
 class TestReconcileBudgetExhaustion:
     """The per-key reconcile rebuild budget (default 1) rejects a second
     drift for the same lifecycle key instead of rebuilding again."""
@@ -528,6 +536,7 @@ class TestReconcileBudgetExhaustion:
 
 
 @requires_docker
+@requires_workspace_chown
 class TestProviderABAAcrossReleaseToZero:
     """A provider handle obtained before release-to-zero must never
     re-attach once release installed no provider (and a later

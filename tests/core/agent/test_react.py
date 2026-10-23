@@ -3520,7 +3520,9 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
                             "name": "react_decision",
                             "arguments": (
                                 '{"action":"final_answer",'
-                                '"reason":"The current batch is enough."}'
+                                '"reason":"The current batch is enough.",'
+                                '"supported_findings":["Both searches completed."],'
+                                '"missing_verification":""}'
                             ),
                         },
                     }
@@ -3555,6 +3557,12 @@ async def test_react_repeated_decision_drains_current_tool_call_batch() -> None:
     assert [schema["function"]["name"] for schema in llm.calls[2]["tools"]] == [
         "final_answer"
     ]
+    final_prompt = "\n".join(
+        str(message.get("content") or "") for message in llm.calls[2]["messages"]
+    )
+    assert "Both searches completed." in final_prompt
+    assert "answer-scope ceiling" in final_prompt
+    assert "field is stale or a workflow/integration is broken" in final_prompt
     assert pattern.pending_tool_calls == []
 
 
@@ -6896,11 +6904,13 @@ def test_react_decision_schema_assesses_work_before_choosing_action() -> None:
 
     assert list(parameters["properties"]) == [
         "reason",
+        "supported_findings",
         "missing_verification",
         "action",
     ]
     assert parameters["required"] == [
         "reason",
+        "supported_findings",
         "missing_verification",
         "action",
     ]
@@ -6931,6 +6941,7 @@ def test_react_decision_does_not_finalize_with_missing_work() -> None:
     assert decision == {
         "action": "tool_call",
         "reason": "One more audio clip must be synthesized.",
+        "supported_findings": [],
         "missing_verification": "Synthesize the final audio clip.",
     }
 

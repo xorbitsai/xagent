@@ -17,6 +17,9 @@ from typing import Mapping
 # asks for JSON via an Accept header -- without it, response.json() raises
 # instead of parsing a genuinely successful response.
 _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER = frozenset({"github"})
+# Shopify's OAuth docs send the header on every token request. Matched as a
+# family, like every other Shopify step of the account-host flow.
+_PROVIDER_FAMILIES_REQUIRING_JSON_ACCEPT_HEADER = ("shopify",)
 
 # Meta's two distinct top-level OAuthException codes for a dead
 # access/session token within its nested error shape (see
@@ -33,7 +36,10 @@ _META_INVALID_TOKEN_ERROR_CODES = frozenset({190, 102})
 
 
 def requires_json_accept_header(provider: str) -> bool:
-    return provider.lower() in _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER
+    return provider.lower() in _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER or any(
+        matches_provider_family(provider, family)
+        for family in _PROVIDER_FAMILIES_REQUIRING_JSON_ACCEPT_HEADER
+    )
 
 
 def meta_invalid_token_error_code(error: object) -> str | None:

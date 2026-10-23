@@ -13,9 +13,9 @@ import shlex
 import tempfile
 import textwrap
 import uuid
-from typing import Optional, TypeVar
+from typing import Any, Optional, TypeVar
 
-import boxlite  # type: ignore[import-not-found]
+import boxlite  # type: ignore[import-untyped]
 from boxlite import SimpleBox
 
 from ..config import get_sandbox_image
@@ -179,12 +179,21 @@ def _get_info_from_box_info(raw_info: boxlite.BoxInfo) -> SandboxInfo:  # type: 
     return info
 
 
-def _truncate_utf8(text: str, cap: int) -> tuple[str, bool]:
-    """Cut ``text`` to at most ``cap`` UTF-8 bytes; report if it was cut."""
-    encoded = text.encode("utf-8")
-    if len(encoded) <= cap:
-        return text, False
-    return encoded[:cap].decode("utf-8", errors="ignore"), True
+async def _collect_capped_stream(stream: Any, cap: int) -> tuple[str, bool]:
+    """Drain a BoxLite output stream while retaining at most ``cap`` bytes."""
+    if stream is None:
+        return "", False
+
+    retained = bytearray()
+    truncated = False
+    async for chunk in stream:
+        encoded = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+        remaining = cap - len(retained)
+        if remaining > 0:
+            retained.extend(encoded[:remaining])
+        if len(encoded) > max(remaining, 0):
+            truncated = True
+    return retained.decode("utf-8", errors="replace"), truncated
 
 
 class BoxliteSandbox(Sandbox):
@@ -229,6 +238,66 @@ class BoxliteSandbox(Sandbox):
 
     # --- Execution ---
 
+    async def _exec_with_output_cap(
+        self,
+        command: str,
+        *args: str,
+        env: Optional[dict[str, str]],
+        max_output_bytes: int,
+    ) -> ExecResult:
+        """Use BoxLite's streaming handle so retained output is bounded.
+
+        ``SimpleBox.exec`` joins every output chunk before returning. The
+        locked BoxLite API exposes the same execution streams on its native
+        box handle; consume and drain them concurrently here so a noisy guest
+        cannot grow backend memory without bound.
+        """
+        if max_output_bytes < 0:
+            raise ValueError("max_output_bytes must be non-negative")
+
+        native_box = getattr(self._box, "_box", None)
+        if native_box is None:
+            raise RuntimeError("BoxLite box is not started")
+        execution = await native_box.exec(
+            command,
+            list(args) if args else None,
+            list(env.items()) if env else None,
+            user=None,
+            timeout_secs=None,
+            cwd=None,
+        )
+        try:
+            stdout_stream = execution.stdout()
+        except Exception:  # noqa: BLE001 - native stream acquisition
+            logger.exception("Failed to acquire BoxLite stdout stream")
+            stdout_stream = None
+        try:
+            stderr_stream = execution.stderr()
+        except Exception:  # noqa: BLE001 - native stream acquisition
+            logger.exception("Failed to acquire BoxLite stderr stream")
+            stderr_stream = None
+
+        (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
+            _collect_capped_stream(stdout_stream, max_output_bytes),
+            _collect_capped_stream(stderr_stream, max_output_bytes),
+        )
+        error_message = None
+        try:
+            raw_result = await execution.wait()
+            exit_code = raw_result.exit_code
+            error_message = raw_result.error_message
+        except Exception:  # noqa: BLE001 - native wait failure becomes exec failure
+            logger.exception("Failed to wait for BoxLite execution")
+            exit_code = -1
+
+        return ExecResult(
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            truncated=stdout_truncated or stderr_truncated,
+            error_message=error_message,
+        )
+
     async def exec(
         self,
         command: str,
@@ -236,7 +305,17 @@ class BoxliteSandbox(Sandbox):
         env: Optional[dict[str, str]] = None,
         max_output_bytes: Optional[int] = None,
     ) -> ExecResult:
-        res = await self._box.exec(command, *args, env=env)
+        if max_output_bytes is None:
+            res = await self._box.exec(command, *args, env=env)
+            truncated = False
+        else:
+            res = await self._exec_with_output_cap(
+                command,
+                *args,
+                env=env,
+                max_output_bytes=max_output_bytes,
+            )
+            truncated = res.truncated
 
         # Filter out seccomp warnings (known issue on macOS, usually appears on first line)
         stderr = res.stderr
@@ -246,21 +325,9 @@ class BoxliteSandbox(Sandbox):
                 # Remove first line, keep the rest
                 stderr = lines[1] if len(lines) > 1 else ""
 
-        stdout = res.stdout
-        truncated = False
-        if max_output_bytes is not None:
-            # ponytail: boxlite's runtime buffers the whole output before we get
-            # it, so this trims after the fact — host memory isn't actually
-            # bounded here the way the Docker stream path is. boxlite is the
-            # local, low-volume runner; add a stream-level cap only if it ever
-            # backs a high-volume path.
-            stdout, out_t = _truncate_utf8(stdout, max_output_bytes)
-            stderr, err_t = _truncate_utf8(stderr, max_output_bytes)
-            truncated = out_t or err_t
-
         return ExecResult(
             exit_code=res.exit_code,
-            stdout=stdout,
+            stdout=res.stdout,
             stderr=stderr,
             truncated=truncated,
             error_message=res.error_message,

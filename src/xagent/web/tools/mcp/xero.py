@@ -1028,22 +1028,64 @@ def _iter_complete_invoice_pages(
     partial_result: str,
     narrow_hint: str,
 ) -> Iterator[list[dict[str, Any]]]:
-    """Yield invoice pages until Xero confirms the filtered list is complete."""
+    """Yield every invoice page without silently accepting a partial scan.
+
+    Xero normally includes ``pagination.pageCount`` for paged invoice lists,
+    but some filtered bulk responses omit the pagination object entirely. In
+    that case, use the requested page size as the completion signal: a short
+    (including empty) page is the end of the list. Full pages remain bounded by
+    ``max_pages`` and repeated pages fail closed in case the API ignores the
+    requested page number.
+    """
     page = 1
+    requested_page_size = max(1, int(params.get("pageSize") or XERO_BULK_PAGE_SIZE))
+    fallback_page_fingerprints: set[tuple[str, ...]] = set()
+    warned_about_missing_pagination = False
     while True:
         data = _request(
             "GET", "Invoices", scope="invoices", params={**params, "page": page}
         )
-        yield data.get("Invoices") or []
+        records = data.get("Invoices") or []
 
-        pagination = data.get("pagination") or {}
+        pagination_value = data.get("pagination")
+        pagination = pagination_value if isinstance(pagination_value, dict) else {}
         page_count = pagination.get("pageCount")
         if page_count is None:
-            raise RuntimeError(
-                f"Xero {label} scan returned no pagination metadata; refusing "
-                f"to report {partial_result} as complete"
-            )
-        if page >= int(page_count):
+            if not warned_about_missing_pagination:
+                logger.warning(
+                    "Xero %s scan omitted pagination.pageCount; using bounded "
+                    "page-length fallback (page=%s, requested_page_size=%s, "
+                    "returned_count=%s, response_keys=%s, pagination_keys=%s)",
+                    label,
+                    page,
+                    requested_page_size,
+                    len(records),
+                    sorted(data),
+                    sorted(pagination),
+                )
+                warned_about_missing_pagination = True
+
+            if len(records) >= requested_page_size:
+                fingerprint = tuple(
+                    str(
+                        record.get("InvoiceID")
+                        or record.get("InvoiceNumber")
+                        or json.dumps(record, sort_keys=True, default=str)
+                    )
+                    for record in records
+                )
+                if fingerprint in fallback_page_fingerprints:
+                    raise RuntimeError(
+                        f"Xero {label} scan pagination did not advance; refusing "
+                        f"to report {partial_result} as complete"
+                    )
+                fallback_page_fingerprints.add(fingerprint)
+
+        yield records
+
+        if page_count is not None and page >= int(page_count):
+            break
+        if page_count is None and len(records) < requested_page_size:
             break
         if page >= max_pages:
             raise RuntimeError(

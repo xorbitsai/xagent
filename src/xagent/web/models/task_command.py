@@ -46,6 +46,15 @@ class TaskExecutionCommand(Base):  # type: ignore
             sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
             postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
         ),
+        # Ordered for the oldest claimable ids of one tenant key and dispatch class.
+        Index(
+            "ix_task_commands_claimable_fair",
+            "fairness_key",
+            "dispatch_class",
+            "id",
+            sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
+            postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
+        ),
     )
 
     id = Column(Integer, primary_key=True)

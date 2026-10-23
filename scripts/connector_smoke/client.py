@@ -145,6 +145,22 @@ class SmokeClient:
             payload = response.text
         return JSONResponse(response.status_code, payload)
 
+    def probe_server(self, server_id: int, *, timeout: float) -> JSONResponse:
+        """Run the read-only probe the server declares for this connector.
+
+        The route starts the connector, as ``list_server_tools`` does, and
+        then calls one tool against the vendor, so this request carries its
+        own timeout too.
+        """
+        response = self._request(
+            "POST", f"/api/mcp/servers/{int(server_id)}/probe", timeout=timeout
+        )
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            payload = response.text
+        return JSONResponse(response.status_code, payload)
+
     def start_launch(
         self, provider: str, app_id: str, account: str | None = None
     ) -> LaunchStart:

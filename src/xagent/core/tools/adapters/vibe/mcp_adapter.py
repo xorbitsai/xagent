@@ -84,6 +84,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
+from .signed_upload import is_signed_upload_issuing_tool
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
@@ -4080,6 +4081,10 @@ async def _load_direct_mcp_tools(
 
     adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
+        if is_signed_upload_issuing_tool(connection, mcp_tool.name):
+            # The host calls this tool itself while preparing a registered
+            # signed upload; the model never receives the URL it returns.
+            continue
         try:
             adapter = _build_mcp_tool_adapter(
                 server_name,

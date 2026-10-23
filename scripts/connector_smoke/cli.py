@@ -1,6 +1,6 @@
 """Command line entry point for the connector smoke checks.
 
-Usage: ``PYTHONPATH=src:scripts python -m connector_smoke {l1,l2} --help``.
+Usage: ``PYTHONPATH=src:scripts python -m connector_smoke {l1,l2,l3} --help``.
 See ``scripts/connector_smoke/README.md``.
 """
 
@@ -16,7 +16,7 @@ from typing import Any, TextIO
 
 import httpx
 
-from . import l1, l2
+from . import l1, l2, l3
 from .client import SmokeClient, SmokeError, SmokeTimeout
 
 ENV_BASE_URL = "XAGENT_CONNECTOR_SMOKE_BASE_URL"
@@ -34,6 +34,9 @@ ENV_EXPECT = "XAGENT_CONNECTOR_SMOKE_EXPECT"
 # sandbox lease that run before it. A shorter client timeout gives up while the
 # server is still working.
 DEFAULT_TOOLS_TIMEOUT = 120.0
+# A probe starts the connector (bounded like a listing) and then calls one tool,
+# which the server bounds by XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS again.
+DEFAULT_PROBE_TIMEOUT = 180.0
 
 
 def run_l1(
@@ -175,6 +178,76 @@ def run_l2(
     return results
 
 
+def run_l3(
+    client: SmokeClient,
+    *,
+    login: str,
+    password: str,
+    login_field: str,
+    login_start: bool,
+    expect: set[str],
+    probe_timeout: float,
+) -> list[l1.CheckResult | l3.Skipped]:
+    try:
+        client.login(login, password, login_field=login_field, login_start=login_start)
+    except SmokeError as exc:
+        return [l1.CheckResult("login", False, str(exc))]
+
+    try:
+        apps = client.list_catalog_apps()
+    except SmokeError as exc:
+        return [l1.CheckResult("catalog", False, str(exc))]
+
+    targets, missing = l2.select_targets(apps, expect=expect)
+    results: list[l1.CheckResult | l3.Skipped] = []
+    # Connectors that produced a check rather than a skip: a pass, a failure,
+    # or no answer.
+    checked = 0
+    # One connector at a time, as in L2; the server also runs one probe per
+    # process and answers probe_busy to a second.
+    for target in targets:
+        try:
+            response = client.probe_server(target.server_id, timeout=probe_timeout)
+        except SmokeTimeout:
+            results.append(l3.check_timeout(target.app_id, probe_timeout))
+            checked += 1
+            continue
+        except SmokeError as exc:
+            results.append(l3.check_request_error(target.app_id, str(exc)))
+            checked += 1
+            continue
+        if l3.is_forbidden(response.status_code, response.payload):
+            # The account itself is refused, so every other probe would be too.
+            return [l3.FORBIDDEN]
+        result = l3.check_probe_response(
+            target.app_id, response.status_code, response.payload
+        )
+        checked += not isinstance(result, l3.Skipped)
+        results.append(result)
+
+    try:
+        servers = client.list_servers()
+    except SmokeError as exc:
+        results.append(l1.CheckResult("servers", False, str(exc)))
+        servers = []
+    unconnected = l2.select_unconnected(
+        servers,
+        connected=(target.app_id for target in targets),
+        missing=missing,
+    )
+    results.extend(
+        l3.relabel(l2.check_unconnected(app_id, apps, servers))
+        for app_id in unconnected
+    )
+    if not checked and not unconnected:
+        # Every connected connector was skipped, or none is connected: a
+        # misconfigured monitor account must not pass by checking nothing.
+        results.append(
+            l1.CheckResult("connectors", False, "no connected connector to probe")
+        )
+    return results
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -197,6 +270,17 @@ def main(
     base_origin = l1.normalize_origin(args.base_url)
     if base_origin is None:
         parser.error("--base-url must be an http(s) URL")
+    if args.layer == "l3":
+        return _main_l3(
+            args,
+            parser,
+            env,
+            login=login,
+            password=password,
+            base_origin=base_origin,
+            transport=transport,
+            out=out,
+        )
     if args.layer == "l2":
         return _main_l2(
             args,
@@ -295,6 +379,56 @@ def _main_l2(
     return _report(results, out, suffix=f" in {time.monotonic() - started:.0f}s")
 
 
+def _main_l3(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    env: Mapping[str, str],
+    *,
+    login: str,
+    password: str,
+    base_origin: str,
+    transport: httpx.BaseTransport | None,
+    out: TextIO,
+) -> int:
+    try:
+        cookies = _parse_pairs(
+            _arg_or_env(args.cookie, env, ENV_COOKIES), separator=";"
+        )
+    except ValueError as exc:
+        parser.error(f"{exc} (--cookie)")
+    if not math.isfinite(args.probe_timeout) or args.probe_timeout <= 0:
+        parser.error("--probe-timeout must be a positive number")
+
+    started = time.monotonic()
+    with SmokeClient(
+        args.base_url,
+        origin=base_origin,
+        cookies=cookies,
+        timeout=args.timeout,
+        transport=transport,
+    ) as client:
+        outcomes = run_l3(
+            client,
+            login=login,
+            password=password,
+            login_field=args.login_field,
+            login_start=args.login_start,
+            expect=_parse_list(_arg_or_env(args.expect, env, ENV_EXPECT)),
+            probe_timeout=args.probe_timeout,
+        )
+    checks = [result for result in outcomes if isinstance(result, l1.CheckResult)]
+    failed = sum(not result.ok for result in checks)
+    for result in outcomes:
+        print(l3.format_outcome(result), file=out)
+    print(
+        f"{len(checks)} checks, {failed} failed, "
+        f"{len(outcomes) - len(checks)} skipped "
+        f"in {time.monotonic() - started:.0f}s",
+        file=out,
+    )
+    return 1 if failed else 0
+
+
 def _report(results: list[l1.CheckResult], out: TextIO, *, suffix: str = "") -> int:
     failed = sum(not result.ok for result in results)
     for result in results:
@@ -382,6 +516,25 @@ def _build_parser(env: Mapping[str, str]) -> argparse.ArgumentParser:
         default=DEFAULT_TOOLS_TIMEOUT,
         help="seconds to wait for one connector to start and list its tools "
         f"(default: {DEFAULT_TOOLS_TIMEOUT:g})",
+    )
+
+    p = sub.add_parser(
+        "l3",
+        parents=[common],
+        help="tool-call smoke: run every connected connector's read-only probe",
+    )
+    p.add_argument(
+        "--expect",
+        action="append",
+        help="app the monitor account must have connected; repeatable or "
+        f"comma-separated (env {ENV_EXPECT})",
+    )
+    p.add_argument(
+        "--probe-timeout",
+        type=float,
+        default=DEFAULT_PROBE_TIMEOUT,
+        help="seconds to wait for one connector to start and answer its probe "
+        f"(default: {DEFAULT_PROBE_TIMEOUT:g})",
     )
     return parser
 

@@ -279,6 +279,15 @@ class _SlackMissingScopeError(_SlackActionableError):
     """
 
 
+class _SlackMessagesTabDisabledError(_SlackActionableError):
+    """Raised when the Slack app cannot start an App Home conversation.
+
+    This is an app-level App Home setting, not an OAuth grant. Reconnecting
+    the connector therefore cannot fix it; a Slack app administrator must
+    enable the Messages tab for the app itself.
+    """
+
+
 class _SlackNotAMemberError(_SlackActionableError):
     """Raised by _request_requiring_membership once a not-a-member-style
     failure has been translated into an actionable, user-facing message.
@@ -364,6 +373,15 @@ def _request(
                 "is missing a permission this action needs. Ask the user "
                 "to reconnect the Slack connector so it can request the "
                 "updated permissions, then retry."
+            ) from None
+        if code == "messages_tab_disabled":
+            raise _SlackMessagesTabDisabledError(
+                "messages_tab_disabled: this connector's Slack app has its "
+                "App Home Messages tab disabled. Ask a Slack app administrator "
+                "to enable App Home > Messages Tab for the connector app (or "
+                "set features.app_home.messages_tab_enabled to true in its "
+                "manifest), then retry. Reconnecting the connector or changing "
+                "OAuth scopes will not fix this app-level setting."
             ) from None
         raise _SlackAPIError(code)
     return payload

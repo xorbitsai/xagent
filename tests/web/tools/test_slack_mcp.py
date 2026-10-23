@@ -137,6 +137,27 @@ def test_request_surfaces_needed_scope_without_provided(monkeypatch):
         slack._request("GET", "auth.test")
 
 
+def test_request_translates_disabled_messages_tab_without_retrying(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"ok": False, "error": "messages_tab_disabled"})
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    with pytest.raises(
+        slack._SlackMessagesTabDisabledError,
+        match=r"App Home Messages tab disabled.*administrator.*manifest",
+    ) as exc_info:
+        slack._request(
+            "POST",
+            "chat.postMessage",
+            json_data={"channel": "U0123456789", "text": "hello"},
+        )
+
+    assert isinstance(exc_info.value, slack._SlackActionableError)
+    assert "OAuth scopes will not fix" in str(exc_info.value)
+    assert mock_request.call_count == 1
+
+
 def test_request_raises_generic_message_when_error_field_absent(monkeypatch):
     monkeypatch.setattr(
         slack.requests,
@@ -489,6 +510,21 @@ def test_post_message_sends_a_bare_user_id_unchanged(monkeypatch):
 
     json.loads(slack.slack_post_message("U0123456789", "hello"))
 
+    assert mock_request.call_args.kwargs["json"]["channel"] == "U0123456789"
+
+
+def test_post_message_reports_disabled_messages_tab_for_user_id(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse({"ok": False, "error": "messages_tab_disabled"})
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_post_message("U0123456789", "hello"))
+
+    assert result["status"] == "error"
+    assert "App Home Messages tab disabled" in result["message"]
+    assert "OAuth scopes will not fix" in result["message"]
+    assert mock_request.call_count == 1
     assert mock_request.call_args.kwargs["json"]["channel"] == "U0123456789"
 
 

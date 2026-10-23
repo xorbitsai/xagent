@@ -2654,6 +2654,30 @@ class TestLlmRetryBudgetConfig:
         assert get_auto_candidate_cooldown_seconds() == 300.0
 
 
+class TestConnectorProbeUsersConfig:
+    def test_connector_probe_users_unset(self, monkeypatch):
+        from xagent.config import get_connector_probe_users
+
+        monkeypatch.delenv("XAGENT_CONNECTOR_PROBE_USERS", raising=False)
+        result = get_connector_probe_users()
+        assert result == frozenset()
+        assert isinstance(result, frozenset)
+
+    def test_connector_probe_users_parses_and_strips(self, monkeypatch):
+        from xagent.config import get_connector_probe_users
+
+        monkeypatch.setenv(
+            "XAGENT_CONNECTOR_PROBE_USERS", " monitor@example.com , ops,,  "
+        )
+        assert get_connector_probe_users() == {"monitor@example.com", "ops"}
+
+    def test_connector_probe_users_blank(self, monkeypatch):
+        from xagent.config import get_connector_probe_users
+
+        monkeypatch.setenv("XAGENT_CONNECTOR_PROBE_USERS", "  ,  ")
+        assert get_connector_probe_users() == frozenset()
+
+
 class TestLlmStreamProgressConfig:
     """#2785: knobs for aborting an OpenAI-compatible LLM stream that stops
     making progress."""

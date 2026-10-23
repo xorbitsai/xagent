@@ -254,6 +254,120 @@ L1's.
 pytest tests/scripts/test_connector_smoke_l2.py
 ```
 
+## L3: tool-call smoke
+
+L3 runs one read-only tool call against the vendor for every catalog connector
+the monitor account has connected
+([#3247](https://github.com/xorbitsai/xagent/issues/3247)). It is the only layer
+that proves a builtin OAuth or API-key credential works, because those
+connectors' `tools/list` is static and never reaches the vendor. It calls
+`POST /api/mcp/servers/{id}/probe`, which starts the server the way L2 does and
+then calls the one tool declared for that connector in
+`src/xagent/web/connector_probes.py`, with the arguments declared there
+(`src/xagent/web/services/connector_probe.py`). The script sends only the server
+id: it cannot choose the tool or its arguments.
+
+**Which connectors.** The same apps as L2: every connected catalog app, plus
+`--expect` and `needs reconnect` reporting exactly as in L2. A connector with no
+probe is reported as `SKIP` and is not a check:
+
+| Skip | Connectors | Why |
+| --- | --- | --- |
+| `unprobeable (covered_by_l2)` | Remote MCP (Notion, HubSpot, Atlassian, …) | Their `tools/list` reaches the vendor, so L2 already proves the credential. |
+| `unprobeable (sandboxed)` | `google-maps` | An `npx` connector; the call would run on the backend host after the listing released its sandbox. |
+| `unprobeable (execution_scoped)` | `chrome-devtools` | It can only run inside a task. |
+| `unprobeable (needs_fixture)` | Google Docs, Sheets, Slides; Word, Excel, PowerPoint | Every read-only tool needs a document the monitor account would have to own. |
+| `no probe declared` | A custom catalog app | Only builtin apps declare probes. The route must name the app itself; see `not the catalog's row` below. |
+
+A run that probes nothing, because every connected app was skipped or none is
+connected, fails.
+
+**Account.** The deployment must name the monitor account in
+`XAGENT_CONNECTOR_PROBE_USERS` (username, or email compared case-insensitively;
+see `example.env`). The account needs no admin flag. Otherwise the route refuses
+it, and the run stops at the first connector the route answers with one
+failure.
+
+### Side effects
+
+- Each probe is one read-only, idempotent vendor call that asks for the
+  smallest page the tool accepts, for example `github_get_current_user`,
+  `slack_list_channels` with `limit=1`, `stripe_get_account_info`. Nothing is
+  written at the vendor. Intercom's probe is a read through Intercom's
+  `POST /conversations/search`.
+- The connector is started exactly as in L2, including the token refresh, so
+  L2's side effects apply.
+- The server runs one probe per web process at a time. A probe that overlaps
+  another (two runs at once) fails as `probe busy`. So can the connector after
+  one that hit `--probe-timeout`: the server keeps running the probe the client
+  gave up on.
+- The backend logs one `No user ID found in environment` warning per probe:
+  the in-repo tools read the caller only from a task's environment.
+
+### Run time
+
+A probe costs a listing plus one call, usually a few seconds. The server bounds
+each by `XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS` (60 s by default), so
+`--probe-timeout` defaults to 180 s. If the deployment raises the server bound,
+raise `--probe-timeout` by twice the same amount. The worst case is the number
+of probed apps times `--probe-timeout`; a skipped app answers before anything
+starts. The 20 Phase 1 connectors in
+[#3262](https://github.com/xorbitsai/xagent/issues/3262) that have a probe take
+60 minutes if every one hangs, within the 120-minute default of
+`XAGENT_ACCESS_TOKEN_EXPIRE_MINUTES`.
+
+### Usage
+
+```bash
+export XAGENT_CONNECTOR_SMOKE_LOGIN=monitor@example.com
+export XAGENT_CONNECTOR_SMOKE_PASSWORD=...
+PYTHONPATH=src:scripts python -m connector_smoke l3 \
+  --base-url https://xagent.example.com \
+  --expect github,slack,stripe
+```
+
+L3 takes the same common options as L2, plus `--expect` (as in L2) and:
+
+| Option | Environment variable | Meaning |
+| --- | --- | --- |
+| `--probe-timeout` | (none) | Seconds to wait for one connector to start and answer its probe. Default 180. |
+
+### Output
+
+```text
+PASS l3:github: github_get_current_user
+SKIP l3:notion: unprobeable (covered_by_l2)
+FAIL l3:slack: unexpected probe result (status_not_success)
+FAIL l3:stripe: not connected (oauth_token_required)
+3 checks, 2 failed, 1 skipped in 12s
+```
+
+A pass names the tool that answered. Failures that are not L2's:
+
+| Failure | Meaning |
+| --- | --- |
+| `unexpected probe result (status_not_success)` | The tool ran and reported an error in its own result, which is how the in-repo servers report a vendor error: a revoked or expired token, a missing scope, an API change. Other reasons: `not_a_json_object`, `no_status`, `missing_keys` (the result had an unexpected shape). |
+| `probe failed (<reason>)` | `tool_error`: the call came back flagged as an MCP error. `exception`: the call raised. `invalid_result`: the adapter returned something that is not a result. |
+| `probe tool missing (<tool>)` | The server started but does not offer the declared tool. |
+| `timed out on the server (<phase or probe_call>)` | The server gave up on the listing or, with `probe_call`, on the call itself. |
+| `not the catalog's row for this app (no probe)` | The catalog lists the app as connected, but the server row is not the catalog's own: a custom server claiming the app, a user-owned row under the app's id, or a row whose command or URL no longer matches the catalog. The route declines to probe it. |
+| `cannot be probed: runs in a sandbox` | The row's effective command is one a task runs in a sandbox (`npx`, `uvx`); the call would run outside it. |
+| `probe busy (another probe, or one that timed out, still runs)` | Another probe was running in the same web process, possibly the previous connector's after a client timeout. |
+| `FAIL probe: this account may not run connector probes (XAGENT_CONNECTOR_PROBE_USERS)` | The account is not on the deployment's probe list. The run stops. |
+| `HTTP 404` on every connector | The deployment predates the probe route. |
+
+`not connected (<code>)`, `failed to start (<phase or reason>)`, `no tools`,
+`unsupported outside a task (<reason>)`, `server not found`,
+`timed out after <n>s` (here against `--probe-timeout`) and the request errors
+mean what they mean in L2. As in L2, reasons are codes only: the output never
+contains a token, a key, or a tool's or vendor's error text.
+
+### Tests
+
+```bash
+pytest tests/scripts/test_connector_smoke_l3.py
+```
+
 ## Startability check: every connector, no accounts
 
 L1 proves a connector is listed and its OAuth client is configured; it cannot

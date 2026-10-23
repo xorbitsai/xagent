@@ -176,6 +176,7 @@ _STANDARD_OTEL_EXPORTER_OTLP_ENDPOINT = "OTEL_EXPORTER_OTLP_ENDPOINT"
 _STANDARD_OTEL_METRIC_EXPORT_INTERVAL = "OTEL_METRIC_EXPORT_INTERVAL"
 _STANDARD_OTEL_SERVICE_NAME = "OTEL_SERVICE_NAME"
 MCP_TOOL_INIT_TIMEOUT_SECONDS = "XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS"
+CONNECTOR_PROBE_USERS = "XAGENT_CONNECTOR_PROBE_USERS"
 LLM_RETRY_DEADLINE_SECONDS = "XAGENT_LLM_RETRY_DEADLINE_SECONDS"
 LLM_CAPACITY_MAX_ATTEMPTS = "XAGENT_LLM_CAPACITY_MAX_ATTEMPTS"
 AUTO_PRIMARY_MAX_ATTEMPTS = "XAGENT_AUTO_PRIMARY_MAX_ATTEMPTS"
@@ -3503,6 +3504,29 @@ def get_mcp_tool_init_timeout_seconds() -> int:
         Seconds allowed per MCP server; 0 disables the timeout.
     """
     return _get_positive_int_env(MCP_TOOL_INIT_TIMEOUT_SECONDS, 60, minimum=0)
+
+
+def get_connector_probe_users() -> frozenset[str]:
+    """Get the accounts allowed to run a connector's read-only probe.
+
+    The probe route (POST /api/mcp/servers/{id}/probe) calls a connector's
+    declared read-only tool against the vendor for the caller's own connected
+    server. It is meant for the connector smoke monitor, not for every user,
+    and the platform has no role beyond ``is_admin``, which the low-privilege
+    monitor account must not hold. An entry names an account by its exact
+    username, or by its email address compared case-insensitively; both
+    columns are unique, and an entry matches either axis. Create the account
+    before naming it here: an entry for an account that does not exist yet
+    goes to whoever registers that username or address first.
+
+    Priority:
+        1. XAGENT_CONNECTOR_PROBE_USERS environment variable (comma-separated)
+        2. empty (nobody may run probes)
+
+    Returns:
+        Frozenset of usernames and email addresses; empty when unset or blank.
+    """
+    return frozenset(_csv_env(CONNECTOR_PROBE_USERS))
 
 
 def get_llm_retry_deadline_seconds() -> float:

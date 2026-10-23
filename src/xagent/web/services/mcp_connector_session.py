@@ -18,10 +18,11 @@ import shlex
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping
+from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping, cast
 
 if TYPE_CHECKING:
     from ...core.tools.adapters.vibe.mcp_adapter import MCPLoadResult
+    from ...core.tools.core.mcp.sessions import Connection
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,7 @@ async def list_connector_tools(
     user: Any,
     server_id: int,
     name_prefix: str,
+    refuse_sandboxed: bool = False,
 ) -> ConnectorToolsResult:
     """Start ``server_id`` for ``user`` as a task would and list its tools.
 
@@ -89,11 +91,23 @@ async def list_connector_tools(
     connector ref, as at every other MCP materialization seam, so a gated
     call built from these tools can never fail closed for want of an
     identity.
+
+    The sandbox lease is released when this returns, so a caller that goes on
+    to call a tool would open a new session on the web host. Such a caller
+    passes ``refuse_sandboxed``: an effective connection a task would sandbox
+    (``npx``/``uvx``) is refused whether or not a sandbox manager is
+    configured, with UNSUPPORTED and reason ``sandboxed``. The refusal comes
+    after the task's config build (database lookups, env decryption and, for
+    an OAuth row, a possible token refresh) but before any sandbox lease,
+    process spawn or loader call.
     """
     from ...core.tools.adapters.vibe import mcp_adapter
     from ...core.tools.adapters.vibe.config import MCPConfigLoadError
     from ...core.tools.adapters.vibe.connector_runtime import ConnectorRef
     from ...core.tools.adapters.vibe.mcp_tools import _apply_stdio_output_limit_env
+    from ...core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
+        should_sandbox_mcp_connection,
+    )
     from ..models.mcp import MCPServer, UserMCPServer
     from ..tools.config import WebToolConfig
 
@@ -149,6 +163,10 @@ async def list_connector_tools(
 
     (server_config,) = _apply_stdio_output_limit_env([server_config], tool_config)
     connection = _connection_from_config(server_config)
+    if refuse_sandboxed and should_sandbox_mcp_connection(
+        cast("Connection", connection)
+    ):
+        return result(ConnectorToolsOutcome.UNSUPPORTED, reason="sandboxed")
     # What follows is network and process I/O: do not hold a pooled
     # connection across it, as create_mcp_tools does not (issue #889).
     tool_config.release_db_connection()

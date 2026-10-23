@@ -61,6 +61,7 @@ from ..mcp_apps import (
     get_all_mcp_apps,
     get_app_for_mcp_server,
     get_catalog_mcp_oauth_credentials,
+    is_user_owned_server,
     normalize_catalog_key,
     oauth_grant_keys_rejected_by_app_scope,
     restrict_to_app_scoped_oauth_grant,
@@ -3695,15 +3696,7 @@ def _reject_user_owned_catalog_squat(db: Session, server: MCPServer) -> None:
     owner. Shared by every catalog-connect shape so a hardening fix here can't
     land in only one copy.
     """
-    owned = (
-        db.query(UserMCPServer)
-        .filter(
-            UserMCPServer.mcpserver_id == server.id,
-            UserMCPServer.is_owner.is_(True),
-        )
-        .first()
-    )
-    if owned is not None:
+    if is_user_owned_server(db, int(server.id)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="A user-owned server already exists under this catalog id",
@@ -6103,6 +6096,53 @@ async def get_mcp_server_tools(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get MCP server tools",
         )
+
+
+@mcp_router.post("/servers/{server_id}/probe")
+async def probe_mcp_server(
+    server_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Run the read-only probe declared for this server's connector (L3).
+
+    The tool and its arguments come from the declaration in
+    web/connector_probes.py, never from the request, and only the accounts
+    named in XAGENT_CONNECTOR_PROBE_USERS may call this. The server is
+    started exactly as an agent task would start it
+    (services/connector_probe.py).
+    """
+    from ..services.connector_probe import (
+        ConnectorProbeBusy,
+        ConnectorProbeOutcome,
+        is_connector_probe_user,
+        run_connector_probe,
+    )
+
+    if not is_connector_probe_user(current_user):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "probe_forbidden",
+                "message": "This account may not run connector probes",
+            },
+        )
+    try:
+        result = await run_connector_probe(db, user=current_user, server_id=server_id)
+    except ConnectorProbeBusy:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": "probe_busy", "message": "A probe is already running"},
+        )
+    except Exception as e:
+        logger.error("Connector probe failed (%s)", type(e).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Connector probe failed",
+        )
+    if result.outcome is ConnectorProbeOutcome.OK:
+        return result.payload()
+    raise HTTPException(status_code=result.http_status, detail=result.payload())
 
 
 @mcp_router.get("/oauth/callback")

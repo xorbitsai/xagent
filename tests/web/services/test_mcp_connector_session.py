@@ -575,6 +575,27 @@ async def test_npx_connector_runs_in_the_users_sandbox(db_users, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_refuse_sandboxed_declines_before_leasing_or_loading(
+    db_users, monkeypatch
+):
+    db, user, _ = db_users
+    server = _connect_google_maps(db, user)
+    manager = _SandboxManager()
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: manager)
+    loader = _Loader()
+    monkeypatch.setattr(LOADER, loader)
+
+    result = await list_connector_tools(
+        db, user=user, server_id=server.id, name_prefix="mcp_", refuse_sandboxed=True
+    )
+
+    assert result.outcome is ConnectorToolsOutcome.UNSUPPORTED
+    assert result.reason == "sandboxed"
+    assert loader.calls == []
+    assert manager.released == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("manager_kwargs", [{"attach": False}, {"create_error": True}])
 async def test_npx_connector_fails_closed_without_a_sandbox_lease(
     db_users, monkeypatch, manager_kwargs

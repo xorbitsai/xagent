@@ -107,7 +107,7 @@ def test_workspace_access_grants_only_the_mount_root(tmp_path, monkeypatch):
 
     monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args, **kwargs: None)
     monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
-    grant_sandbox_runtime_access(workspace)
+    grant_sandbox_runtime_access(workspace, trusted_root=tmp_path)
 
     workspace_mode = stat.S_IMODE(workspace.stat().st_mode)
     nested_mode = stat.S_IMODE(nested.stat().st_mode)
@@ -133,7 +133,7 @@ def test_workspace_access_fails_closed_when_gid_cannot_be_assigned(
 
     monkeypatch.setattr("xagent.sandbox.base.os.fchown", refuse_chown)
     with pytest.raises(SandboxContractError, match="root or CAP_CHOWN"):
-        grant_sandbox_runtime_access(workspace)
+        grant_sandbox_runtime_access(workspace, trusted_root=tmp_path)
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
 
 
@@ -154,10 +154,27 @@ def test_workspace_access_accepts_trusted_symlinked_ancestor(tmp_path, monkeypat
     monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
     monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
 
-    grant_sandbox_runtime_access(linked_root / "workspace")
+    grant_sandbox_runtime_access(linked_root / "workspace", trusted_root=linked_root)
 
     assert stat.S_IMODE(workspace.stat().st_mode) & 0o777 == 0o750
     assert requested_modes == [0o2750]
+
+
+def test_workspace_access_rejects_symlink_in_managed_suffix(tmp_path, monkeypatch):
+    trusted_root = tmp_path / "uploads"
+    trusted_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (trusted_root / "workspace").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
+
+    with pytest.raises(SandboxContractError, match="safely open"):
+        grant_sandbox_runtime_access(
+            trusted_root / "workspace", trusted_root=trusted_root
+        )
+
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o700
 
 
 # --- ResolvedSandboxRuntimeSpec: field sensitivity ---

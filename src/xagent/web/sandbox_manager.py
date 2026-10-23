@@ -1033,10 +1033,10 @@ class SandboxManager:
                 and str(backend_path) == mount_intent.mount_root
             ):
                 target = Path(prepare_root)
-            if should_create or target.exists():
-                os.makedirs(target, exist_ok=True)
             if should_create and self._service.host_workspace_gid() is not None:
-                grant_sandbox_runtime_access(target)
+                grant_sandbox_runtime_access(target, trusted_root=get_uploads_dir())
+            elif should_create or target.exists():
+                os.makedirs(target, exist_ok=True)
 
     @staticmethod
     def _config_equivalent(

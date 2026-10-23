@@ -71,10 +71,9 @@ class VisionTool:
         source = self.workspace.resolve_path_with_search(
             media_path, detached_file_ids=True
         )
-        try:
-            source = source.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise FileNotFoundError(f"File not found: {media_path}") from exc
+        source = Path(source)
+        if not source.is_absolute():
+            raise FileNotFoundError(f"File not found: {media_path}")
         mime_type = mimetypes.guess_type(str(source))[0] or ""
         media_kind: Literal["image", "video"] = (
             "video" if mime_type.startswith("video/") else "image"

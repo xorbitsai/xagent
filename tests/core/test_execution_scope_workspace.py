@@ -194,6 +194,46 @@ class TestScopedWorkspace:
         assert assigned_gids == [1010] * 6
         assert requested_modes == [0o2750, *([0o2770] * 5)]
 
+    def test_scoped_parent_chain_and_existing_contents_are_repaired(
+        self, tmp_path, monkeypatch
+    ):
+        prepared_root = tmp_path / "user_7"
+        base = prepared_root / "tenant-a" / "proj-1"
+        output = base / "web_task_5" / "output"
+        output.mkdir(parents=True)
+        (base / "web_task_5" / "input").mkdir()
+        (base / "web_task_5" / "temp").mkdir()
+        legacy = output / "legacy.txt"
+        legacy.write_text("legacy", encoding="utf-8")
+        legacy.chmod(0o600)
+        (base / "web_task_5" / ".xagent-permissions-v2").write_text("")
+
+        prepared_inode = prepared_root.stat().st_ino
+        real_fstat = os.fstat
+
+        def sandbox_anchor_fstat(fd: int):
+            result = real_fstat(fd)
+            if result.st_ino == prepared_inode:
+                values = list(result)
+                values[0] |= stat.S_ISGID
+                values[5] = 1010
+                return os.stat_result(values)
+            return result
+
+        assigned_gids: list[int] = []
+        monkeypatch.setattr("xagent.core.workspace.os.fstat", sandbox_anchor_fstat)
+        monkeypatch.setattr(
+            "xagent.core.workspace.os.fchown",
+            lambda _fd, _uid, gid: assigned_gids.append(gid),
+        )
+
+        TaskWorkspace("web_task_5", str(base), scope_segments=SEGMENTS, db_task_id=5)
+
+        assert stat.S_IMODE((prepared_root / "tenant-a").stat().st_mode) == 0o2750
+        assert stat.S_IMODE(base.stat().st_mode) == 0o2750
+        assert stat.S_IMODE(legacy.stat().st_mode) == 0o660
+        assert assigned_gids
+
     def test_two_scopes_produce_disjoint_workspace_dirs(self, tmp_path):
         ws_a = self._scoped_workspace(tmp_path, ("tenant-a",))
         ws_b = self._scoped_workspace(tmp_path, ("tenant-b",))

@@ -25,7 +25,7 @@ CodeType = Literal["python", "javascript"]
 SANDBOX_RUNTIME_GID = 1010
 
 
-def grant_sandbox_runtime_access(root: Path) -> None:
+def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
     """Make one sandbox mount root safely traversable by the sandbox identity.
 
     This deliberately changes only the mount root.  The sandbox may traverse
@@ -42,9 +42,18 @@ def grant_sandbox_runtime_access(root: Path) -> None:
     and never falls back to world-writable permissions.
     """
     # Deployment roots may legitimately sit behind an operator-controlled
-    # symlink (for example /data -> /mnt/data). Resolve that trusted prefix
-    # once, then keep the untrusted walk descriptor-relative and no-follow.
-    absolute = Path(os.path.realpath(root))
+    # symlink (for example /data -> /mnt/data). Resolve only that immutable
+    # prefix. The sandbox-controlled suffix must stay lexical and is then
+    # created/opened descriptor-relatively without following links.
+    lexical_root = Path(os.path.abspath(root))
+    lexical_trusted_root = Path(os.path.abspath(trusted_root))
+    try:
+        relative_parts = lexical_root.relative_to(lexical_trusted_root).parts
+    except ValueError as exc:
+        raise SandboxContractError(
+            f"Docker workspace root is outside its trusted prefix: {root}"
+        ) from exc
+    resolved_trusted_root = Path(os.path.realpath(lexical_trusted_root))
     flags = os.O_RDONLY | os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -57,7 +66,15 @@ def grant_sandbox_runtime_access(root: Path) -> None:
         ) from exc
     try:
         try:
-            for component in absolute.parts[1:]:
+            for component in resolved_trusted_root.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            for component in relative_parts:
+                try:
+                    os.mkdir(component, mode=0o750, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
                 next_fd = os.open(component, flags, dir_fd=current_fd)
                 os.close(current_fd)
                 current_fd = next_fd

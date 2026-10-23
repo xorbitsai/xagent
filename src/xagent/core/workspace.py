@@ -402,7 +402,9 @@ class TaskWorkspace:
                 current_fd = next_fd
             file_fd = os.open(
                 absolute.name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=current_fd,
             )
         except OSError as exc:
@@ -423,10 +425,11 @@ class TaskWorkspace:
     ) -> Path:
         """Copy an already-authorized source fd into private task staging."""
         source_fd = self._open_regular_file_nofollow(source, selector)
-        staging_root = self._external_upload_staging_root()
-        staging_dir = staging_root / uuid4().hex
-        target = staging_dir / source.name
+        staging_dir: Path | None = None
         try:
+            staging_root = self._external_upload_staging_root()
+            staging_dir = staging_root / uuid4().hex
+            target = staging_dir / source.name
             source_size = os.fstat(source_fd).st_size
             if max_bytes is not None and source_size > max_bytes:
                 raise ExternalUploadSizeLimitError(
@@ -448,7 +451,8 @@ class TaskWorkspace:
                         target_file.write(chunk)
             os.chmod(target, 0o600)
         except BaseException:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
             raise
         finally:
             if source_fd >= 0:
@@ -467,11 +471,9 @@ class TaskWorkspace:
         swap cannot redirect the copy outside the approved file.
         """
 
-        source = self.resolve_path_with_search(file_path, detached_file_ids=True)
-        try:
-            source = source.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise FileNotFoundError(f"File not found: {file_path}") from exc
+        source = Path(self.resolve_path_with_search(file_path, detached_file_ids=True))
+        if not source.is_absolute():
+            raise FileNotFoundError(f"File not found: {file_path}")
         return self._stage_authorized_source(source, file_path, max_bytes=max_bytes)
 
     def stage_resolved_path_for_external_upload(
@@ -1940,11 +1942,48 @@ class TaskWorkspace:
         finally:
             db.close()
 
+    def _prepare_sandbox_workspace_parent(self) -> bool:
+        """Repair descendants of the first prepared sandbox-group ancestor.
+
+        The mounted prefix can be a strict ancestor of an actor/task layout.
+        Those intermediate directories may predate the non-root sandbox
+        contract, so detecting only the immediate parent would silently skip
+        their repair. Walk the already-resolved parent by descriptor and, once
+        a gid/setgid anchor is found, prepare every remaining component.
+        """
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        parent = self.workspace_dir.parent.absolute()
+        current_fd = os.open(os.path.sep, flags)
+        prepared_ancestor_found = False
+        try:
+            for component in parent.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+                component_stat = os.fstat(current_fd)
+                if prepared_ancestor_found:
+                    os.fchown(current_fd, -1, 1010)
+                    os.fchmod(current_fd, 0o2750)
+                elif component_stat.st_gid == 1010 and (
+                    component_stat.st_mode & stat.S_ISGID
+                ):
+                    prepared_ancestor_found = True
+            return prepared_ancestor_found
+        finally:
+            os.close(current_fd)
+
     def _ensure_directories(self) -> None:
         """Ensure task directories inherit writable sandbox-group access."""
         self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
         parent_stat = self.workspace_dir.parent.stat()
-        if not (parent_stat.st_gid == 1010 and parent_stat.st_mode & stat.S_ISGID):
+        parent_is_prepared = parent_stat.st_gid == 1010 and bool(
+            parent_stat.st_mode & stat.S_ISGID
+        )
+        repaired_parent_chain = False
+        if not parent_is_prepared:
+            repaired_parent_chain = self._prepare_sandbox_workspace_parent()
+            parent_is_prepared = repaired_parent_chain
+        if not parent_is_prepared:
             self.workspace_dir.mkdir(exist_ok=True)
             self.input_dir.mkdir(exist_ok=True)
             self.output_dir.mkdir(exist_ok=True)
@@ -1998,7 +2037,9 @@ class TaskWorkspace:
                     os.close(internal_fd)
             finally:
                 os.close(temp_fd)
-            self._migrate_existing_sandbox_permissions(workspace_fd, flags)
+            self._migrate_existing_sandbox_permissions(
+                workspace_fd, flags, force=repaired_parent_chain
+            )
         finally:
             os.close(workspace_fd)
 
@@ -2011,7 +2052,7 @@ class TaskWorkspace:
         return special | (owner_permissions << 6) | (owner_permissions << 3)
 
     def _migrate_existing_sandbox_permissions(
-        self, workspace_fd: int, directory_flags: int
+        self, workspace_fd: int, directory_flags: int, *, force: bool = False
     ) -> None:
         """One-time, descriptor-safe migration for pre-nonroot task contents."""
         marker_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -2029,7 +2070,8 @@ class TaskWorkspace:
             try:
                 marker_stat = os.fstat(marker_fd)
                 if (
-                    stat.S_ISREG(marker_stat.st_mode)
+                    not force
+                    and stat.S_ISREG(marker_stat.st_mode)
                     and marker_stat.st_uid == os.geteuid()
                 ):
                     return

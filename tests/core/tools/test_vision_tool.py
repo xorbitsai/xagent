@@ -434,6 +434,29 @@ class TestVisionToolUnderstandImages:
         staging_root = workspace.workspace_dir / ".xagent-upload-staging"
         assert not staging_root.exists() or list(staging_root.iterdir()) == []
 
+    def test_media_staging_rejects_swap_after_workspace_authorization(
+        self, mock_vision_model, tmp_path, monkeypatch
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        source = workspace.output_dir / "image.jpg"
+        source.write_bytes(b"authorized")
+        outside = tmp_path / "secret.jpg"
+        outside.write_bytes(b"secret")
+        real_resolve = workspace.resolve_path_with_search
+
+        def resolve_then_swap(selector: str, **kwargs):
+            resolved = real_resolve(selector, **kwargs)
+            source.unlink()
+            source.symlink_to(outside)
+            return resolved
+
+        monkeypatch.setattr(workspace, "resolve_path_with_search", resolve_then_swap)
+
+        with pytest.raises(FileNotFoundError):
+            VisionTool(mock_vision_model, workspace)._stage_media_path_sync(
+                "output/image.jpg"
+            )
+
     @pytest.mark.asyncio
     async def test_understand_rejects_workspace_escape_paths(
         self, mock_vision_model, tmp_path

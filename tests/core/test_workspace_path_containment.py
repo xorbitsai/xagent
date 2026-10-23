@@ -11,6 +11,7 @@ which do not delegate to one another).
 
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,56 @@ def test_stage_path_rejects_non_regular_file(workspace):
 
     with pytest.raises(FileNotFoundError):
         workspace.stage_path_for_external_upload("output/folder")
+
+
+def test_stage_path_rejects_symlink_swap_after_authorization(
+    workspace, tmp_path, monkeypatch
+):
+    source = workspace.output_dir / "report.txt"
+    source.write_text("authorized", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    real_resolve = workspace.resolve_path_with_search
+
+    def resolve_then_swap(selector: str, **kwargs):
+        resolved = real_resolve(selector, **kwargs)
+        source.unlink()
+        source.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(workspace, "resolve_path_with_search", resolve_then_swap)
+
+    with pytest.raises(FileNotFoundError):
+        workspace.stage_path_for_external_upload("output/report.txt")
+
+    staging_root = workspace.workspace_dir / ".xagent-upload-staging"
+    assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
+def test_stage_path_rejects_fifo_without_blocking(workspace):
+    fifo = workspace.output_dir / "pipe"
+    os.mkfifo(fifo)
+    outcome: list[BaseException | None] = []
+
+    def stage_fifo() -> None:
+        try:
+            workspace.stage_path_for_external_upload("output/pipe")
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=stage_fifo, daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    if worker.is_alive():
+        writer_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(writer_fd)
+        worker.join(timeout=2)
+    assert not worker.is_alive(), "opening a FIFO must not block the worker"
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], FileNotFoundError)
 
 
 def test_stage_path_rejects_oversized_file_without_leaving_partial_copy(workspace):

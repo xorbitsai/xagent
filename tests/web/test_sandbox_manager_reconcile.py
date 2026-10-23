@@ -829,7 +829,7 @@ class TestProviderCacheMountIntentGate:
     ) -> None:
         prepared: list[Path] = []
 
-        def record_grant(path: Path) -> None:
+        def record_grant(path: Path, *, trusted_root: Path) -> None:
             prepared.append(path)
 
         monkeypatch.setattr(

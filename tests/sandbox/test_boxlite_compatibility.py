@@ -168,6 +168,30 @@ async def test_security_profile_change_recreates_existing_box(service_and_runtim
 
 
 @pytest.mark.asyncio
+async def test_pids_limit_change_does_not_recreate_boxlite_vm(service_and_runtime):
+    service, runtime, raw_box, metadata = service_and_runtime
+    runtime.get.return_value = raw_box
+    runtime.get_or_create.return_value = (raw_box, False)
+    stored = SandboxInfo(
+        name=metadata.name,
+        state="running",
+        template=SandboxTemplate(image=metadata.image),
+        config=SandboxConfig(pids_limit=256),
+        created_at=metadata.created_at,
+    )
+    service._store.add_info(metadata.name, stored)
+
+    sandbox = await service.get_or_create(
+        metadata.name,
+        template=SandboxTemplate(image=metadata.image),
+        config=SandboxConfig(pids_limit=1024),
+    )
+
+    runtime.remove.assert_not_awaited()
+    assert sandbox._info is stored
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("isolated", [True, False, None])
 async def test_guest_network_policy_uses_native_box_options(
     service_and_runtime, isolated

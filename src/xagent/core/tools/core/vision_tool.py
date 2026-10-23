@@ -5,6 +5,7 @@ Standalone vision capabilities without framework dependencies
 
 import asyncio
 import base64
+import io
 import logging
 import math
 import mimetypes
@@ -254,6 +255,24 @@ class VisionCore:
             raise FileNotFoundError(f"Media file not found: {media_path}")
         return resolved
 
+    def _read_local_media_bytes(
+        self, media_path: str, *, max_bytes: int | None = None
+    ) -> tuple[Path, bytes]:
+        """Authorize and read a local file once without following a final symlink."""
+        resolved = self._resolve_local_media_path(media_path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(resolved, flags)
+            with os.fdopen(fd, "rb", closefd=True) as media_file:
+                data = media_file.read(None if max_bytes is None else max_bytes + 1)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to read local media: {type(exc).__name__}"
+            ) from exc
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ValueError(f"Local media exceeds maximum size of {max_bytes} bytes")
+        return resolved, data
+
     def _coerce_optional_float(self, value: Any, field_name: str) -> Optional[float]:
         """Normalize optional numeric tool arguments before model calls."""
         if value is None:
@@ -305,7 +324,7 @@ class VisionCore:
         if image_path.startswith(("http://", "https://", "data:")):
             return image_path
 
-        resolved_path = self._resolve_local_media_path(image_path)
+        resolved_path, image_data = self._read_local_media_bytes(image_path)
         image_path = str(resolved_path)
 
         # Get MIME type
@@ -315,13 +334,11 @@ class VisionCore:
 
         # Read and encode file
         try:
-            with open(image_path, "rb") as image_file:
-                image_data = image_file.read()
-                if mime_type == "image/svg+xml" or image_path.lower().endswith(".svg"):
-                    image_data = rasterize_svg_bytes(image_data)
-                    mime_type = "image/png"
-                base64_data = base64.b64encode(image_data).decode("utf-8")
-                return f"data:{mime_type};base64,{base64_data}"
+            if mime_type == "image/svg+xml" or image_path.lower().endswith(".svg"):
+                image_data = rasterize_svg_bytes(image_data)
+                mime_type = "image/png"
+            base64_data = base64.b64encode(image_data).decode("utf-8")
+            return f"data:{mime_type};base64,{base64_data}"
         except Exception as e:
             raise RuntimeError(f"Failed to read image file {image_path}: {e}")
 
@@ -346,19 +363,12 @@ class VisionCore:
                     ".svg"
                 ):
                     return None, None
-                svg_path = self._resolve_local_media_path(image_path)
-                if (
-                    await asyncio.to_thread(lambda: svg_path.stat().st_size)
-                    > MAX_SVG_BYTES
-                ):
-                    raise ValueError(
-                        f"SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
-                    )
-                source = await asyncio.to_thread(
-                    svg_path.read_text,
-                    encoding="utf-8-sig",
-                    errors="replace",
+                svg_path, svg_bytes = await asyncio.to_thread(
+                    self._read_local_media_bytes,
+                    image_path,
+                    max_bytes=MAX_SVG_BYTES,
                 )
+                source = svg_bytes.decode("utf-8-sig", errors="replace")
                 if "<svg" not in source[:4096].lower():
                     raise ValueError("SVG source does not contain an <svg> root")
                 label = svg_path.name
@@ -431,19 +441,16 @@ class VisionCore:
         if video_path.startswith(("http://", "https://", "data:")):
             return video_path
 
-        resolved_path = self._resolve_local_media_path(video_path)
-        if resolved_path.stat().st_size > _MAX_INLINE_VIDEO_BYTES:
-            raise ValueError(
-                "Local video is too large for inline native input; "
-                "falling back to sampled frames"
-            )
+        resolved_path, video_bytes = self._read_local_media_bytes(
+            video_path, max_bytes=_MAX_INLINE_VIDEO_BYTES
+        )
 
         mime_type = mimetypes.guess_type(str(resolved_path))[0] or "video/mp4"
         if not mime_type.startswith("video/"):
             raise ValueError(f"Unsupported video MIME type: {mime_type}")
 
         try:
-            encoded = base64.b64encode(resolved_path.read_bytes()).decode("ascii")
+            encoded = base64.b64encode(video_bytes).decode("ascii")
         except OSError as exc:
             raise RuntimeError(
                 f"Failed to read video file {video_path}: {exc}"
@@ -1424,9 +1431,10 @@ class VisionCore:
                 "PIL (Pillow) library is required for image marking. Install with: pip install Pillow"
             )
 
-        image_path = str(self._resolve_local_media_path(image_path))
+        resolved_path, image_bytes = self._read_local_media_bytes(image_path)
+        image_path = str(resolved_path)
         try:
-            with Image.open(image_path) as img:
+            with Image.open(io.BytesIO(image_bytes)) as img:
                 if img.mode != "RGB":
                     img = img.convert("RGB")
 

@@ -5,10 +5,12 @@ DockerSandbox tests
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
 import socket
+import tarfile
 import tempfile
 import uuid
 from pathlib import Path
@@ -27,8 +29,21 @@ from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
     _SandboxControl,
+    _write_tar_from_content,
     is_docker_available,
 )
+
+
+def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
+    archive = io.BytesIO()
+
+    _write_tar_from_content("secret", "id_key", archive)
+
+    with tarfile.open(fileobj=archive, mode="r") as tar:
+        info = tar.getmember("id_key")
+        assert info.uid == 1100
+        assert info.gid == 1010
+        assert info.mode == 0o600
 
 
 @pytest.fixture(scope="module")

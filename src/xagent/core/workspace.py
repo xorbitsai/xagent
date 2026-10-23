@@ -11,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -390,6 +391,44 @@ class TaskWorkspace:
         except BaseException:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+        return target
+
+    def stage_path_for_external_upload(self, file_path: str) -> Path:
+        """Copy one workspace-authorized selector into private task staging.
+
+        Unlike :meth:`stage_file_for_external_upload`, this accepts relative
+        workspace paths (including authorized upload symlinks) and absolute
+        paths permitted by the workspace policy. The source is opened once
+        with ``O_NOFOLLOW`` after authorization so a last-component symlink
+        swap cannot redirect the copy outside the approved file.
+        """
+
+        source = self.resolve_path_with_search(file_path)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            source_fd = os.open(source, flags)
+        except OSError as exc:
+            raise FileNotFoundError(f"File not found: {file_path}") from exc
+
+        staging_root = self._external_upload_staging_root()
+        staging_dir = staging_root / uuid4().hex
+        target = staging_dir / source.name
+        try:
+            source_stat = os.fstat(source_fd)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            staging_dir.mkdir(parents=True, exist_ok=False)
+            with os.fdopen(source_fd, "rb", closefd=True) as source_file:
+                source_fd = -1
+                with target.open("xb") as target_file:
+                    shutil.copyfileobj(source_file, target_file)
+            os.chmod(target, 0o600)
+        except BaseException:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
         return target
 
     def discard_staged_external_upload(self, file_path: str | Path) -> None:

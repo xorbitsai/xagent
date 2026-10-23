@@ -5047,24 +5047,43 @@ class WebToolConfig(BaseToolConfig):
                 self._connector_team_id,
             )
 
-            visible_ids = [int(server.id) for server in servers]
             custom_stdio_ids: set[int] = set()
-            if visible_ids:
-                from ...web.mcp_apps import get_app_for_mcp_server
-                from ...web.models.mcp import MCPServer
-
-                visible_stdio_servers = (
-                    self.db.query(MCPServer)
-                    .filter(
-                        MCPServer.id.in_(visible_ids),
-                        MCPServer.transport == "stdio",
-                    )
-                    .all()
+            if servers:
+                from ...web.mcp_apps import (
+                    get_app_for_mcp_server,
+                    is_user_owned_server,
                 )
+
+                def is_canonical_catalog_stdio(server: Any) -> bool:
+                    if str(server.transport or "").lower() != "stdio":
+                        return False
+                    # A custom row may supply auth.app_id itself. Catalog rows
+                    # are shared (ownerless) and must still match the vetted
+                    # launch command and args exactly.
+                    if is_user_owned_server(self.db, int(server.id)):
+                        return False
+                    app = get_app_for_mcp_server(self.db, server)
+                    if (
+                        app is None
+                        or str(app.get("transport") or "").lower() != "stdio"
+                    ):
+                        return False
+                    launch = app.get("launch_config")
+                    if not isinstance(launch, Mapping):
+                        return False
+                    expected_args = launch.get("args")
+                    if expected_args is None:
+                        expected_args = []
+                    return (
+                        server.command == launch.get("command")
+                        and (server.args or []) == expected_args
+                    )
+
                 custom_stdio_ids = {
                     int(server.id)
-                    for server in visible_stdio_servers
-                    if get_app_for_mcp_server(self.db, server) is None
+                    for server in servers
+                    if str(server.transport or "").lower() == "stdio"
+                    and not is_canonical_catalog_stdio(server)
                 }
 
             # Classify the complete personal ∪ governing-team visible set

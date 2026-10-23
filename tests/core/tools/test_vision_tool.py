@@ -17,6 +17,7 @@ from xagent.core.tools.core.vision_tool import (
     UnderstandMediaResult,
     _normalize_vision_response,
 )
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.services.model_service import get_default_vision_model
 
 
@@ -376,6 +377,29 @@ class TestVisionToolUnderstandImages:
 
         # Verify workspace methods were called
         mock_workspace.resolve_path_with_search.assert_called_with("existing_image.jpg")
+
+    @pytest.mark.asyncio
+    async def test_understand_uploaded_symlink_stages_and_cleans_up(
+        self, mock_vision_model, tmp_path
+    ):
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        source = uploads / "chat-upload.jpg"
+        source.write_bytes(b"uploaded-image")
+        workspace = TaskWorkspace(
+            "task",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(uploads)],
+        )
+        (workspace.input_dir / source.name).symlink_to(source)
+
+        result = await VisionTool(mock_vision_model, workspace).understand_images(
+            f"input/{source.name}", "What is in this image?"
+        )
+
+        assert result.success is True
+        staging_root = workspace.temp_dir / ".xagent-internal" / "mcp-upload"
+        assert not staging_root.exists() or list(staging_root.iterdir()) == []
 
     @pytest.mark.asyncio
     async def test_understand_single_image_path_without_workspace(
@@ -1602,10 +1626,8 @@ class TestVisionToolDetectObjects:
             temp_image.write_bytes(b"fake_image_data")
             temp_image_path = str(temp_image)
             original_resolver = mock_workspace.resolve_path_with_search.side_effect
-            mock_workspace.resolve_path_with_search.side_effect = (
-                lambda value: temp_image
-                if value == temp_image_path
-                else original_resolver(value)
+            mock_workspace.resolve_path_with_search.side_effect = lambda value: (
+                temp_image if value == temp_image_path else original_resolver(value)
             )
 
             try:

@@ -70,7 +70,12 @@ class SandboxTmpfsSecretMaterializer:
             await sb.write_file(
                 content=known_hosts, remote_path=known_hosts_path, overwrite=True
             )
-            await sb.exec("chmod", "600", key_path, known_hosts_path)
+            chmod_result = await sb.exec("chmod", "600", key_path, known_hosts_path)
+            if getattr(chmod_result, "exit_code", 0) != 0:
+                raise SshError(
+                    SshErrorCode.SANDBOX_UNAVAILABLE,
+                    "could not secure sandbox SSH credential files",
+                )
             yield MaterializedSshPaths(
                 private_key_path=key_path, known_hosts_path=known_hosts_path
             )

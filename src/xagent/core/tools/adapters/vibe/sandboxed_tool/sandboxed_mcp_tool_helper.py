@@ -84,6 +84,13 @@ def should_sandbox_mcp_connection(connection: Connection) -> bool:
     )
 
 
+def requires_sandbox_mcp_connection(connection: Connection) -> bool:
+    """Return whether host execution is forbidden for this connection."""
+    return connection.get("transport") == "stdio" and bool(
+        connection.get("sandbox_required")
+    )
+
+
 def _serialize_connection(connection: Connection) -> str:
     """Serialize a connection dict for sandbox transport."""
     return base64.b64encode(

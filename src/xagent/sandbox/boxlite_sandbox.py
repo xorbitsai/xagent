@@ -589,10 +589,18 @@ class BoxliteSandboxService(SandboxService):
                     # is therefore the only way to detect a security-profile
                     # or network-policy upgrade and prevent reuse of an old,
                     # less restricted VM.
+                    stored_config = (
+                        info.config.model_copy(update={"pids_limit": None})
+                        if info is not None
+                        else None
+                    )
+                    effective_config = desired_config.model_copy(
+                        update={"pids_limit": None}
+                    )
                     if (
                         info is None
                         or info.template != desired_template
-                        or info.config != desired_config
+                        or stored_config != effective_config
                     ):
                         await self._runtime.remove(name, force=True)
                         self._store.delete_info(name)

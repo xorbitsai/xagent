@@ -8,6 +8,7 @@ import abc
 import hashlib
 import os
 import posixpath
+import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,22 +28,18 @@ SANDBOX_RUNTIME_GID = 1010
 def grant_sandbox_runtime_access(root: Path) -> None:
     """Make one task-workspace tree writable by the sandbox identity.
 
-    Rootful deployments assign the sandbox group directly. Rootless local
-    deployments cannot chgrp to an arbitrary gid, so they grant equivalent
-    ``other`` permissions as a narrowly scoped fallback. Symlinks are never
-    followed or modified.
+    The grant is group-only and fails closed when the host process cannot
+    assign the sandbox gid. Falling back to ``other`` permissions would make
+    every file in the user's workspace writable by unrelated host users.
+    Symlinks are never followed or modified.
     """
 
     def grant(path: Path, *, directory: bool) -> None:
-        if path.is_symlink():
+        path_stat = os.stat(path, follow_symlinks=False)
+        if stat.S_ISLNK(path_stat.st_mode):
             return
-        mode = path.stat().st_mode
-        try:
-            os.chown(path, -1, SANDBOX_RUNTIME_GID, follow_symlinks=False)
-        except PermissionError:
-            fallback = 0o007 if directory else 0o006
-            path.chmod(mode | fallback, follow_symlinks=False)
-            return
+        mode = path_stat.st_mode
+        os.chown(path, -1, SANDBOX_RUNTIME_GID, follow_symlinks=False)
         group_bits = 0o2070 if directory else 0o060
         path.chmod(mode | group_bits, follow_symlinks=False)
 
@@ -174,7 +171,9 @@ class SandboxConfig(BaseModel):
     Configuration parameters for creating a sandbox.
     """
 
-    working_dir: Optional[str] = Field(default="/home", description="Working dir")
+    working_dir: Optional[str] = Field(
+        default="/home/sandbox", description="Working dir"
+    )
 
     cpus: Optional[int] = Field(default=1, ge=1, description="CPU core limit")
 
@@ -408,7 +407,8 @@ class ResolvedSandboxRuntimeSpec:
         ``cpus``/``memory`` fall back to the same defaults the Docker backend
         applies at container creation (``cpus or 1``, ``memory or 512``) so a
         resolved spec never carries a 0/None value the backend would silently
-        have upgraded on its own. ``working_dir`` defaults to ``"/home"`` and
+        have upgraded on its own. ``working_dir`` defaults to
+        ``"/home/sandbox"`` and
         is canonicalized the same way.
         """
         normalized_env = tuple(sorted((env or {}).items()))
@@ -432,7 +432,7 @@ class ResolvedSandboxRuntimeSpec:
             image=image,
             snapshot_id=snapshot_id,
             working_dir=(
-                canonical_sandbox_path(working_dir) if working_dir else "/home"
+                canonical_sandbox_path(working_dir) if working_dir else "/home/sandbox"
             ),
             cpus=cpus or 1,
             memory=memory or 512,

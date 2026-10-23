@@ -28,9 +28,8 @@ from typing import (
     cast,
 )
 
-from docker.errors import APIError, ImageNotFound, NotFound
-
 import docker
+from docker.errors import APIError, ImageNotFound, NotFound
 
 from ..config import (
     get_sandbox_image,
@@ -314,7 +313,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
             type="image", image=str(config_data.get("Image") or "")
         )
     config = SandboxConfig(
-        working_dir=str(config_data.get("WorkingDir") or "/home"),
+        working_dir=str(config_data.get("WorkingDir") or "/home/sandbox"),
         cpus=max(1, cpus),
         memory=max(128, memory),
         pids_limit=cast(Optional[int], host_config.get("PidsLimit")) or None,
@@ -618,12 +617,19 @@ def _write_tar_from_local_path(
 
 
 def _write_tar_from_content(
-    content: str, arcname: str, file_obj: io.BufferedRandom
+    content: str,
+    arcname: str,
+    file_obj: io.BufferedRandom,
+    *,
+    mode: int = 0o600,
 ) -> None:
     """Pack in-memory text content into a tar stream for Docker put_archive."""
     data = content.encode("utf-8")
     info = tarfile.TarInfo(name=arcname)
     info.size = len(data)
+    info.uid = 1100
+    info.gid = 1010
+    info.mode = mode
     with tarfile.open(fileobj=file_obj, mode="w") as tar:
         tar.addfile(info, io.BytesIO(data))
     file_obj.seek(0)

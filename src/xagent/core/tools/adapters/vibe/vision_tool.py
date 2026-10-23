@@ -63,7 +63,9 @@ class VisionTool:
             workspace_root=workspace.workspace_dir if workspace else None,
         )
 
-    def _resolve_media_path(self, media_path: str) -> str:
+    def _resolve_media_path(
+        self, media_path: str, staged_paths: Optional[list[Path]] = None
+    ) -> str:
         """Resolve an image or video path using the task workspace."""
         # If it's a URL, return as-is
         if media_path.startswith(("http://", "https://", "data:")):
@@ -79,9 +81,14 @@ class VisionTool:
             resolved_path = self.workspace.resolve_path_with_search(media_path)
         except FileNotFoundError:
             return media_path
-        safe_path = resolve_workspace_media_path(
-            Path(resolved_path), self.workspace.workspace_dir
-        )
+        try:
+            safe_path = resolve_workspace_media_path(
+                Path(resolved_path), self.workspace.workspace_dir
+            )
+        except ValueError:
+            safe_path = self.workspace.stage_path_for_external_upload(media_path)
+            if staged_paths is not None:
+                staged_paths.append(safe_path)
         if not safe_path.is_file():
             raise FileNotFoundError(f"Media file not found: {media_path}")
         return str(safe_path)
@@ -89,13 +96,23 @@ class VisionTool:
     def _resolve_media(
         self,
         media: Union[str, List[str]],
+        staged_paths: Optional[list[Path]] = None,
     ) -> str | list[str]:
         """Resolve all media paths using workspace."""
         if isinstance(media, str):
-            return self._resolve_media_path(media)
+            return self._resolve_media_path(media, staged_paths)
         if isinstance(media, list):
-            return [self._resolve_media_path(item) for item in media]
+            return [self._resolve_media_path(item, staged_paths) for item in media]
         return media
+
+    def _discard_staged_media(self, staged_paths: list[Path]) -> None:
+        if self.workspace is None:
+            return
+        for path in staged_paths:
+            try:
+                self.workspace.discard_staged_external_upload(path)
+            except Exception as exc:
+                logger.warning("Failed to discard staged vision input: %s", exc)
 
     def _normalize_media(
         self,
@@ -131,21 +148,26 @@ class VisionTool:
         max_tokens: Optional[int] = None,
     ) -> UnderstandMediaResult:
         """Analyze images, videos, or mixed media with one public tool."""
+        staged_paths: list[Path] = []
         try:
             normalized_media = self._normalize_media(media)
-            resolved_media = self._resolve_media(normalized_media)
+            resolved_media = self._resolve_media(normalized_media, staged_paths)
         except Exception as e:
             logger.error("understand_media: error resolving media: %s", e)
+            self._discard_staged_media(staged_paths)
             return UnderstandMediaResult(success=False, error=str(e))
-        return await self.core.understand_media(
-            resolved_media,
-            question,
-            start_time,
-            end_time,
-            max_frames,
-            temperature,
-            max_tokens,
-        )
+        try:
+            return await self.core.understand_media(
+                resolved_media,
+                question,
+                start_time,
+                end_time,
+                max_frames,
+                temperature,
+                max_tokens,
+            )
+        finally:
+            self._discard_staged_media(staged_paths)
 
     async def understand_images(
         self,
@@ -192,15 +214,20 @@ class VisionTool:
         Returns:
             UnderstandImagesResult with descriptions and metadata
         """
+        staged_paths: list[Path] = []
         try:
             normalized_images = self._normalize_images(images)
-            resolved_images = self._resolve_images(normalized_images)
+            resolved_images = self._resolve_media(normalized_images, staged_paths)
         except Exception as e:
             logger.error(f"describe_images: Error in resolving images: {e}")
+            self._discard_staged_media(staged_paths)
             return UnderstandImagesResult(success=False, error=str(e))
-        return await self.core.describe_images(
-            resolved_images, detail_level, temperature, max_tokens
-        )
+        try:
+            return await self.core.describe_images(
+                resolved_images, detail_level, temperature, max_tokens
+            )
+        finally:
+            self._discard_staged_media(staged_paths)
 
     async def detect_objects(
         self,
@@ -227,16 +254,28 @@ class VisionTool:
         Returns:
             DetectObjectsResult with detected objects and optionally marked image path
         """
+        staged_paths: list[Path] = []
         try:
             normalized_images = self._normalize_images(images)
-            resolved_images = self._resolve_images(normalized_images)
+            resolved_images = self._resolve_media(normalized_images, staged_paths)
         except Exception as e:
             logger.error(f"detect_objects: Error in resolving images: {e}")
+            self._discard_staged_media(staged_paths)
             return DetectObjectsResult(success=False, error=str(e))
-
-        # Execute within auto_register context when marking
-        if mark_objects and self.workspace:
-            with self.workspace.auto_register_files():
+        try:
+            # Execute within auto_register context when marking
+            if mark_objects and self.workspace:
+                with self.workspace.auto_register_files():
+                    result = await self.core.detect_objects(
+                        resolved_images,
+                        task,
+                        mark_objects,
+                        box_color,
+                        confidence_threshold,
+                        temperature,
+                        max_tokens,
+                    )
+            else:
                 result = await self.core.detect_objects(
                     resolved_images,
                     task,
@@ -246,16 +285,8 @@ class VisionTool:
                     temperature,
                     max_tokens,
                 )
-        else:
-            result = await self.core.detect_objects(
-                resolved_images,
-                task,
-                mark_objects,
-                box_color,
-                confidence_threshold,
-                temperature,
-                max_tokens,
-            )
+        finally:
+            self._discard_staged_media(staged_paths)
 
         if (
             mark_objects

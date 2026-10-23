@@ -535,23 +535,35 @@ Images are automatically saved to workspace.
     def _resolve_edit_image_path(
         self, image_input: str, staged_paths: list[Path]
     ) -> str:
-        """Resolve one edit input and track any durable FileRef staging copy."""
+        """Resolve one edit input and track any authorized staging copy."""
         try:
             return self._resolve_image_path(image_input)
-        except (FileNotFoundError, ValueError):
+        except (FileNotFoundError, ValueError) as path_error:
             if self._workspace is None:
                 raise
-            file_id = parse_file_id_ref(image_input)
-            if file_id is None and Path(image_input).name == image_input:
-                file_id = image_input
-            if file_id is None:
-                raise
             try:
-                staged_path = self._workspace.stage_file_for_external_upload(file_id)
+                staged_path = self._workspace.stage_path_for_external_upload(
+                    image_input
+                )
             except (FileNotFoundError, ValueError) as exc:
-                raise ValueError(
-                    "Access denied: local image is outside the task workspace"
-                ) from exc
+                file_id = parse_file_id_ref(image_input)
+                if file_id is not None:
+                    try:
+                        staged_path = self._workspace.stage_file_for_external_upload(
+                            file_id
+                        )
+                    except (FileNotFoundError, ValueError):
+                        if isinstance(path_error, FileNotFoundError):
+                            raise path_error
+                        raise ValueError(
+                            "Access denied: local image is outside the task workspace"
+                        ) from exc
+                elif isinstance(path_error, FileNotFoundError):
+                    raise path_error
+                else:
+                    raise ValueError(
+                        "Access denied: local image is outside the task workspace"
+                    ) from exc
             try:
                 resolved = self._resolve_image_path(str(staged_path))
             except BaseException:

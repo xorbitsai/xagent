@@ -302,9 +302,11 @@ Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
 directory; replacing one with a symlink or changing that topology while the
 service is running is unsupported.
 
-Custom stdio MCP servers and `npx`/`uvx` MCP connectors require a sandbox and
-fail closed when no sandbox lease is available; they are never launched in the
-backend process. Their command and `cwd` are interpreted inside the sandbox, so
+Custom stdio MCP servers require a sandbox and fail closed when no sandbox
+lease is available; they are never launched in the backend process. Catalog
+`npx`/`uvx` connectors prefer the sandbox when sandboxing is enabled, while a
+deployment with `SANDBOX_ENABLED=false` keeps their legacy host execution.
+Custom commands and `cwd` values are interpreted inside the sandbox, so
 host-only binaries and host paths must be installed or mounted there. Docker
 sandboxes run as uid 1100/gid 1010 with all Linux
 capabilities dropped and `no-new-privileges`; `SANDBOX_PIDS_LIMIT` controls the
@@ -480,7 +482,8 @@ packages come only from the dedicated `[dependency-groups].sandbox` group in
 root and commit the updated `uv.lock`. `docker/Dockerfile.sandbox` exports the
 group from the lockfile and checks all supported imports during the image build.
 The build stage does not copy `pyproject.toml` or `uv.lock` into the runtime
-image.
+image. The default working directory is `/home/sandbox`; custom images must
+create it and make it writable by uid 1100/gid 1010.
 
 Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox` and must provide uid 1100/gid 1010 with writable home/cache locations. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide `stat`, Linux `/proc`, Unix sockets, and a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail. A warmed writable npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser; the execution-scoped controller passes its cache path explicitly to the sandbox child.
 

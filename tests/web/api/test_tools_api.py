@@ -252,7 +252,9 @@ class _AvailableToolsRouteHarness:
             def query(self, model: object) -> Query:
                 return Query(model)
 
-        def load_tool_usage_counts(_db: object) -> dict[str, int]:
+        def load_tool_usage_counts(
+            _db: object, _usage_user_id: int | None
+        ) -> dict[str, int]:
             harness.events.append("tool_usage")
             return harness.usage_counts
 

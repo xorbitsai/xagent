@@ -101,12 +101,14 @@ class _Loader:
         )
 
 
-def _link(db, user: User, server: MCPServer, **fields: Any) -> None:
+def _link(
+    db, user: User, server: MCPServer, *, is_owner: bool = True, **fields: Any
+) -> None:
     db.add(
         UserMCPServer(
             user_id=user.id,
             mcpserver_id=server.id,
-            is_owner=True,
+            is_owner=is_owner,
             is_active=True,
             **fields,
         )
@@ -155,6 +157,7 @@ def _connect_stripe(db, user: User, *, env_source: str | None = "own") -> MCPSer
         db,
         user,
         server,
+        is_owner=False,
         env=encrypt_env_dict({"STRIPE_API_KEY": "user-key"}),
         env_source=env_source,
     )
@@ -375,6 +378,19 @@ async def test_ownerless_custom_stdio_is_still_sandbox_required(db_users, monkey
 
 
 @pytest.mark.asyncio
+async def test_custom_stdio_cannot_spoof_catalog_app_id(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _connect_plain_stdio(db, user)
+    server.auth = {"app_id": "google-maps"}
+    db.commit()
+
+    connection, _refs = await _task_connection(db, user, server, monkeypatch)
+
+    assert connection["command"] == "python"
+    assert connection["sandbox_required"] is True
+
+
+@pytest.mark.asyncio
 async def test_only_the_requested_server_is_resolved(db_users):
     db, user, _ = db_users
     github = _connect_github(db, user)
@@ -552,7 +568,7 @@ class _SandboxManager:
 
 def _connect_google_maps(db, user: User) -> MCPServer:
     server, _ = _ensure_catalog_app_server(db, "google-maps")
-    _link(db, user, server)
+    _link(db, user, server, is_owner=False)
     return server
 
 
@@ -618,7 +634,7 @@ async def test_npx_connector_fails_closed_without_a_sandbox_lease(
 
 
 @pytest.mark.asyncio
-async def test_npx_connector_fails_closed_without_a_sandbox_manager(
+async def test_catalog_npx_connector_keeps_host_fallback_without_a_sandbox_manager(
     db_users, monkeypatch
 ):
     db, user, _ = db_users
@@ -630,9 +646,8 @@ async def test_npx_connector_fails_closed_without_a_sandbox_manager(
         db, user=user, server_id=server.id, name_prefix="mcp_"
     )
 
-    assert result.outcome is ConnectorToolsOutcome.FAILED_TO_START
-    assert result.reason == "sandbox_unavailable"
-    assert loader.calls == []
+    assert result.outcome is ConnectorToolsOutcome.OK
+    assert "sandbox" not in loader.calls[0][1]
 
 
 @pytest.mark.asyncio

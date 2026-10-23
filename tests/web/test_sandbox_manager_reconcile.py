@@ -48,6 +48,7 @@ def _env(tmp_path):
             "xagent.web.sandbox_manager.build_code_mount_volumes",
             return_value=[("/repo/src", "/app/src", "ro")],
         ),
+        patch("xagent.web.sandbox_manager.grant_sandbox_runtime_access"),
     ):
         yield
 
@@ -821,6 +822,33 @@ class TestProviderCacheMountIntentGate:
 
         assert second is first
         assert set(service._containers) == {"user::1"}
+
+    @pytest.mark.asyncio
+    async def test_cached_provider_prepares_each_new_task_root(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        prepared: list[Path] = []
+
+        def record_grant(path: Path) -> None:
+            prepared.append(path)
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        manager, _service = _make_manager()
+        intent = _intent(tmp_path, "user-root")
+        first_task = tmp_path / "user-root" / "web_task_1"
+        second_task = tmp_path / "user-root" / "web_task_2"
+
+        first = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent, prepare_root=str(first_task)
+        )
+        second = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent, prepare_root=str(second_task)
+        )
+
+        assert second is first
+        assert prepared == [first_task, second_task]
 
 
 class TestReadinessReservedUploadsSubtree:

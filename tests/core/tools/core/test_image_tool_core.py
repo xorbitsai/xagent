@@ -645,11 +645,14 @@ class TestImageGenerationToolCore:
         workspace.output_dir = workspace_root / "output"
         workspace.output_dir.mkdir()
         workspace.resolve_path_with_search = Mock(
-            side_effect=lambda value: staged_path
-            if value == str(staged_path)
-            else (_ for _ in ()).throw(FileNotFoundError(value))
+            side_effect=lambda value: (
+                staged_path
+                if value == str(staged_path)
+                else (_ for _ in ()).throw(FileNotFoundError(value))
+            )
         )
-        workspace.stage_file_for_external_upload = Mock(return_value=staged_path)
+        workspace.stage_path_for_external_upload = Mock(return_value=staged_path)
+        workspace.stage_file_for_external_upload = Mock()
         workspace.discard_staged_external_upload = Mock()
 
         @contextmanager
@@ -668,9 +671,10 @@ class TestImageGenerationToolCore:
         )
 
         assert result["success"] is True
-        workspace.stage_file_for_external_upload.assert_called_once_with(
-            "355f1fee-48e4-4cb6-afd3-71654e2f5c7e"
+        workspace.stage_path_for_external_upload.assert_called_once_with(
+            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e"
         )
+        workspace.stage_file_for_external_upload.assert_not_called()
         model.edit_image.assert_awaited_once()
         assert model.edit_image.await_args.kwargs["image_url"] == str(staged_path)
         workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
@@ -683,12 +687,16 @@ class TestImageGenerationToolCore:
         workspace.resolve_path_with_search = Mock(
             side_effect=ValueError("outside workspace")
         )
+        workspace.stage_path_for_external_upload = Mock(
+            side_effect=ValueError("outside workspace")
+        )
         workspace.stage_file_for_external_upload = Mock()
         tool = ImageGenerationToolCore(mock_image_models, workspace=workspace)
 
-        with pytest.raises(ValueError, match="outside workspace"):
+        with pytest.raises(ValueError, match="Access denied"):
             tool._resolve_edit_image_path("/etc/passwd", [])
 
+        workspace.stage_path_for_external_upload.assert_called_once_with("/etc/passwd")
         workspace.stage_file_for_external_upload.assert_not_called()
 
     @pytest.mark.asyncio

@@ -399,6 +399,11 @@ def google_analytics_run_report(
       serialized response under the MCP output size limit).
     offset: row offset for paging — if row_count in the response exceeds
       limit, call again with offset=limit, then offset=2*limit, and so on.
+    truncated: true when the response has fewer rows than row_count or rows
+      were removed to fit the MCP output size limit.
+    totals: the complete report-level metric totals returned by GA4. For any
+      total, use this field rather than summing rows; never compare totals
+      across calls that use different date_ranges or filters.
     """
     try:
         normalized_property_id = _normalize_property_id(property_id)
@@ -415,6 +420,9 @@ def google_analytics_run_report(
         body: dict[str, Any] = {
             "metrics": [{"name": m} for m in metrics],
             "dateRanges": [_date_range_body(dr) for dr in date_ranges],
+            # Always request report-level totals so callers do not have to
+            # derive them from a possibly truncated dimension breakdown.
+            "metricAggregations": ["TOTAL"],
             # Always sent explicitly: GA4's default would otherwise return up
             # to 10k rows in one response.
             "limit": str(limit),
@@ -441,6 +449,8 @@ def google_analytics_run_report(
         metric_headers = result.get("metricHeaders") or []
         rows = result.get("rows") or []
         row_count = result.get("rowCount") or 0
+        totals = result.get("totals") or []
+        server_truncated = row_count > len(rows)
 
         # Surface two gotchas in the result itself, so the LLM catches them
         # even if it never reads the docstring.
@@ -509,7 +519,8 @@ def google_analytics_run_report(
             metric_headers=metric_headers,
             rows=rows,
             row_count=row_count,
-            truncated=False,
+            totals=totals,
+            truncated=server_truncated,
         )
         while len(response) > max_output_length and len(rows) > 1:
             rows = rows[: len(rows) // 2]
@@ -519,6 +530,7 @@ def google_analytics_run_report(
                 metric_headers=metric_headers,
                 rows=rows,
                 row_count=row_count,
+                totals=totals,
                 truncated=True,
             )
         if len(rows) < original_row_count:

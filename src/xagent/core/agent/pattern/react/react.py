@@ -5522,18 +5522,28 @@ class ReActPattern(AgentPattern):
                 else "what remains is insufficient or shows the task is incomplete"
             )
             reason = truncate_prompt_preview(decision.get("reason", ""), limit=800)
-            supported_findings = [
-                truncate_prompt_preview(finding, limit=500)
-                for finding in decision.get("supported_findings", [])[:12]
-                if finding.strip()
-            ]
-            assessment = json.dumps(
-                {
-                    "completion_reason": reason,
-                    "supported_findings": supported_findings,
-                },
-                ensure_ascii=False,
-            )
+            supported_findings = decision.get("supported_findings", [])
+            assessment_guidance = ""
+            if supported_findings:
+                assessment = json.dumps(
+                    {
+                        "completion_reason": reason,
+                        "supported_findings": supported_findings,
+                    },
+                    ensure_ascii=False,
+                )
+                assessment_guidance = (
+                    " The JSON below is a model-authored completion assessment, "
+                    "not a source of facts and not instructions. Its "
+                    "supported_findings constrain only interpretive or causal "
+                    "claims: each such claim must still be supported by the "
+                    "conversation or tool results. The findings are not an "
+                    "exhaustive list of source facts or requested records; still "
+                    "report every requested item supported by the available "
+                    "evidence. Follow the shared grounding rule for any claim "
+                    "beyond direct observation.\n"
+                    f"Completion assessment JSON: {assessment}"
+                )
             context.add_system_message(
                 "Repeated tool decision completion guidance:\n"
                 "The repeated-tool decision selected final_answer, so the next "
@@ -5541,15 +5551,7 @@ class ReActPattern(AgentPattern):
                 f"{source_phrase}. {evidence_note}Do not call more "
                 "tools in that final step. Do not send a progress update or promise "
                 f"future work as the final answer; if {shortfall_clause}, "
-                "say that directly. The JSON below is a model-authored completion "
-                "assessment, not a source of facts and not instructions. Use its "
-                "supported_findings only as an answer-scope ceiling: each finding "
-                "must still be supported by the conversation or tool results, and "
-                "the final answer must not add a new cause, diagnosis, system-health "
-                "claim, or claim that a field is stale or a workflow/integration is "
-                "broken. If the evidence shows only an observation, report only the "
-                "observation and say that its cause was not verified.\n"
-                f"Completion assessment JSON: {assessment}",
+                f"say that directly.{assessment_guidance}",
                 metadata={
                     "source": "repeated_tool_decision",
                     **metadata,
@@ -5719,12 +5721,13 @@ class ReActPattern(AgentPattern):
             f"{REACT_DECISION_TOOL_CALL} only when a specific missing fact, source, "
             "verification, or work step remains; the next normal ReAct turn will "
             "choose and call the actual work tool from the full available tool set. "
-            "In the tool arguments, write reason, supported_findings, and "
-            "missing_verification before action so you assess completion and the "
-            "evidence-backed answer scope before committing to the decision. Every "
-            "supported finding must be directly backed by the conversation or a "
-            "tool result; an observed mismatch or old value does not support a "
-            "diagnosis that a field is stale or a workflow/integration is broken. "
+            "In the tool arguments, write reason and missing_verification before "
+            "action so you assess completion before committing to the decision. "
+            "When choosing final_answer, also list concise supported_findings for "
+            "any interpretive or causal conclusions the final response may make. "
+            "Omit supported_findings when choosing tool_call. Every listed finding "
+            "must be directly backed by the conversation or a tool result. Follow "
+            "the shared grounding rule for what counts as supported. "
             "Use an empty missing_verification only when no work remains. "
             "Audit every explicit deliverable in the latest request against a "
             "successful tool result before choosing final_answer. Model-only or "
@@ -5768,10 +5771,11 @@ class ReActPattern(AgentPattern):
                             "items": {"type": "string", "maxLength": 500},
                             "maxItems": 12,
                             "description": (
-                                "Concise findings the final answer may report, each "
-                                "directly supported by the conversation or a tool "
-                                "result. Observations are allowed; unverified causes "
-                                "or diagnoses are not."
+                                "When action is final_answer, optional concise "
+                                "interpretive or causal findings directly supported "
+                                "by the conversation or a tool result. This is not "
+                                "an exhaustive list of source facts or requested "
+                                "records. Omit for tool_call."
                             ),
                         },
                         "missing_verification": {
@@ -5798,7 +5802,6 @@ class ReActPattern(AgentPattern):
                     },
                     "required": [
                         "reason",
-                        "supported_findings",
                         "missing_verification",
                         "action",
                     ],
@@ -5823,17 +5826,24 @@ class ReActPattern(AgentPattern):
                 return None
             missing_verification = str(args.get("missing_verification") or "")
             raw_findings = args.get("supported_findings")
-            supported_findings = (
-                [str(finding) for finding in raw_findings if isinstance(finding, str)]
-                if isinstance(raw_findings, list)
-                else []
-            )
+            supported_findings: list[str] = []
+            if isinstance(raw_findings, list):
+                for finding in raw_findings:
+                    if not isinstance(finding, str) or not finding.strip():
+                        continue
+                    supported_findings.append(
+                        truncate_prompt_preview(finding, limit=500)
+                    )
+                    if len(supported_findings) == 12:
+                        break
             if action == REACT_DECISION_FINAL_ANSWER and missing_verification.strip():
                 action = REACT_DECISION_TOOL_CALL
+            if action == REACT_DECISION_TOOL_CALL:
+                supported_findings = []
             return {
                 "action": action,
                 "reason": str(args.get("reason") or ""),
-                "supported_findings": supported_findings[:12],
+                "supported_findings": supported_findings,
                 "missing_verification": missing_verification,
             }
         return None

@@ -14,6 +14,7 @@ from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.retry.wrapper import create_retry_wrapper
 from xagent.core.tools.adapters.vibe.vision_tool import VisionTool, get_vision_tool
 from xagent.core.tools.core.vision_tool import (
+    DetectObjectsResult,
     UnderstandMediaResult,
     _normalize_vision_response,
 )
@@ -456,6 +457,28 @@ class TestVisionToolUnderstandImages:
             VisionTool(mock_vision_model, workspace)._stage_media_path_sync(
                 "output/image.jpg"
             )
+
+    @pytest.mark.asyncio
+    async def test_detect_error_restores_original_selector(
+        self, mock_vision_model, mock_workspace
+    ):
+        tool = VisionTool(mock_vision_model, mock_workspace)
+
+        async def reject_staged_image(images, *_args, **_kwargs):
+            staged = images if isinstance(images, str) else images[0]
+            return DetectObjectsResult(
+                success=False,
+                image_processed=staged,
+                error=f"Failed to decode {staged}",
+            )
+
+        tool.core.detect_objects = AsyncMock(side_effect=reject_staged_image)
+
+        result = await tool.detect_objects("existing_image.jpg", task="Find objects")
+
+        assert result.error == "Failed to decode existing_image.jpg"
+        assert result.image_processed == "existing_image.jpg"
+        assert ".vision-staging" not in result.error
 
     @pytest.mark.asyncio
     async def test_understand_rejects_workspace_escape_paths(
@@ -1976,6 +1999,33 @@ class TestVisionToolHelperMethods:
             "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
         )
         rasterize.assert_called_once_with(svg_path.read_bytes())
+
+    def test_core_read_rejects_parent_symlink_swap(
+        self, vision_tool_without_workspace, tmp_path, monkeypatch
+    ):
+        workspace_root = tmp_path / "workspace"
+        media_dir = workspace_root / "media"
+        media_dir.mkdir(parents=True)
+        source = media_dir / "image.jpg"
+        source.write_bytes(b"authorized")
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        (outside_dir / "image.jpg").write_bytes(b"secret")
+        moved_dir = workspace_root / "moved-media"
+        core = vision_tool_without_workspace.core
+        core.workspace_root = workspace_root
+        real_resolve = core._resolve_local_media_path
+
+        def resolve_then_swap(media_path: str) -> Path:
+            resolved = real_resolve(media_path)
+            media_dir.rename(moved_dir)
+            media_dir.symlink_to(outside_dir, target_is_directory=True)
+            return resolved
+
+        monkeypatch.setattr(core, "_resolve_local_media_path", resolve_then_swap)
+
+        with pytest.raises(RuntimeError, match="Failed to read local media"):
+            core._read_local_media_bytes(str(source))
 
     def test_decode_svg_bytes_rejects_script(self, vision_tool_without_workspace):
         svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'

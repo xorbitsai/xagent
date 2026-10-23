@@ -12,6 +12,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from pathlib import Path
@@ -259,13 +260,37 @@ class VisionCore:
     def _read_local_media_bytes(
         self, media_path: str, *, max_bytes: int | None = None
     ) -> tuple[Path, bytes]:
-        """Authorize and read a local file once without following a final symlink."""
+        """Authorize and read a regular local file without following links."""
         resolved = self._resolve_local_media_path(media_path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        absolute = resolved.absolute()
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(os.path.sep, directory_flags)
         try:
-            fd = os.open(resolved, flags)
+            for component in absolute.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            fd = os.open(
+                absolute.name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to read local media: {type(exc).__name__}"
+            ) from exc
+        finally:
+            os.close(current_fd)
+
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise RuntimeError("Failed to read local media: not a regular file")
             with os.fdopen(fd, "rb", closefd=True) as media_file:
-                if max_bytes is not None and os.fstat(fd).st_size > max_bytes:
+                fd = -1
+                if max_bytes is not None and file_stat.st_size > max_bytes:
                     raise ValueError(
                         f"Local media exceeds maximum size of {max_bytes} bytes"
                     )
@@ -274,6 +299,9 @@ class VisionCore:
             raise RuntimeError(
                 f"Failed to read local media: {type(exc).__name__}"
             ) from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
         if max_bytes is not None and len(data) > max_bytes:
             raise ValueError(f"Local media exceeds maximum size of {max_bytes} bytes")
         return resolved, data

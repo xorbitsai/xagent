@@ -151,6 +151,9 @@ class VisionTool:
         result: UnderstandMediaResult | DetectObjectsResult,
         staged_sources: dict[str, str],
     ) -> None:
+        if result.error:
+            for staged, original in staged_sources.items():
+                result.error = result.error.replace(staged, original)
         if isinstance(result, DetectObjectsResult) and result.image_processed:
             result.image_processed = staged_sources.get(
                 result.image_processed, result.image_processed

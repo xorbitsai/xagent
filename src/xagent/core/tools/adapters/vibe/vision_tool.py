@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
+from xagent.config import get_media_download_max_bytes
 from xagent.core.workspace import TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
@@ -77,7 +78,10 @@ class VisionTool:
             return media_path
 
         try:
-            safe_path = self.workspace.stage_path_for_external_upload(media_path)
+            safe_path = self.workspace.stage_path_for_external_upload(
+                media_path,
+                max_bytes=get_media_download_max_bytes("video"),
+            )
         except FileNotFoundError:
             return media_path
         if staged_paths is not None:

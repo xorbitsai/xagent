@@ -289,8 +289,10 @@ absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container. Read-write sources must be writable by
 the sandbox identity (uid 1100/gid 1010); do not make them world-writable.
 The backend process that prepares managed workspace bind roots must run as
-root or with `CAP_CHOWN` so it can assign gid 1010. Other sandbox backends do
-not perform this host ownership change.
+root or with `CAP_CHOWN` so it can assign gid 1010. Managed user roots are
+group-traversable but not group-writable; only the task `input/`, `output/`,
+and `temp/` directories are writable by the sandbox identity. Other sandbox
+backends do not perform this host ownership change.
 
 Sandbox workspace guest paths are reserved below
 `<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or

@@ -1565,7 +1565,7 @@ def test_stage_and_discard_external_upload_file(tmp_path, monkeypatch):
 
     assert staged.is_file()
     assert staged.read_bytes() == b"workbook"
-    assert staged.is_relative_to(workspace.temp_dir / ".xagent-internal" / "mcp-upload")
+    assert staged.is_relative_to(workspace.workspace_dir / ".xagent-upload-staging")
     assert str(staged) not in workspace.get_allowed_dirs()
     assert any(
         staged.is_relative_to(Path(directory))
@@ -1586,16 +1586,15 @@ def test_stage_external_upload_rejects_unregistered_file(tmp_path):
         workspace.stage_file_for_external_upload("not-registered")
 
 
-def test_external_upload_staging_rejects_symlinked_internal_root(tmp_path):
+def test_external_upload_staging_rejects_symlinked_staging_root(tmp_path):
     workspace = TaskWorkspace(id="task_stage_root", base_dir=str(tmp_path))
     escaped = tmp_path / "escaped"
     escaped.mkdir()
-    workspace.internal_temp_dir.symlink_to(escaped, target_is_directory=True)
+    staging_root = workspace.workspace_dir / ".xagent-upload-staging"
+    staging_root.symlink_to(escaped, target_is_directory=True)
 
-    with pytest.raises(ValueError, match="outside temp directory"):
-        workspace.discard_staged_external_upload(
-            escaped / "mcp-upload" / "staged" / "file.xlsx"
-        )
+    with pytest.raises(ValueError, match="staging area"):
+        workspace.discard_staged_external_upload(escaped / "staged" / "file.xlsx")
 
 
 def test_stage_external_upload_rejects_source_symlink_outside_storage(

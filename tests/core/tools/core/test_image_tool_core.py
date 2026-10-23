@@ -672,7 +672,8 @@ class TestImageGenerationToolCore:
 
         assert result["success"] is True
         workspace.stage_path_for_external_upload.assert_called_once_with(
-            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e"
+            "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
+            max_bytes=64 * 1024 * 1024,
         )
         workspace.stage_file_for_external_upload.assert_not_called()
         model.edit_image.assert_awaited_once()
@@ -728,7 +729,9 @@ class TestImageGenerationToolCore:
         with pytest.raises(ValueError, match="Access denied"):
             tool._resolve_edit_image_path("/etc/passwd", [])
 
-        workspace.stage_path_for_external_upload.assert_called_once_with("/etc/passwd")
+        workspace.stage_path_for_external_upload.assert_called_once_with(
+            "/etc/passwd", max_bytes=64 * 1024 * 1024
+        )
         workspace.stage_file_for_external_upload.assert_not_called()
 
     @pytest.mark.asyncio

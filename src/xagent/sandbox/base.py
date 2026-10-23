@@ -26,13 +26,15 @@ SANDBOX_RUNTIME_GID = 1010
 
 
 def grant_sandbox_runtime_access(root: Path) -> None:
-    """Make one sandbox mount root writable by the sandbox identity.
+    """Make one sandbox mount root safely traversable by the sandbox identity.
 
-    This deliberately changes only the mount root.  Descendants inherit gid
-    1010 through setgid and task directories add group-write permission when
-    they are created.  Avoiding a recursive privileged walk makes lease cost
-    constant and removes the opportunity for a sandbox process to redirect a
-    path-based walk through a concurrently swapped symlink.
+    This deliberately changes only the mount root.  The sandbox may traverse
+    that root but cannot create, rename, or replace task directories there;
+    descendants inherit gid 1010 through setgid and task directories add
+    group-write permission when they are created.  Avoiding a recursive
+    privileged walk makes lease cost constant and removes the opportunity for
+    a sandbox process to redirect a path-based walk through a concurrently
+    swapped symlink.
 
     Every path component is opened relative to its parent with ``O_NOFOLLOW``
     before the final directory is changed through its file descriptor.  The
@@ -55,7 +57,7 @@ def grant_sandbox_runtime_access(root: Path) -> None:
             raise NotADirectoryError(str(root))
         try:
             os.fchown(current_fd, -1, SANDBOX_RUNTIME_GID)
-            os.fchmod(current_fd, root_stat.st_mode | 0o2070)
+            os.fchmod(current_fd, 0o2750)
         except PermissionError as exc:
             raise SandboxContractError(
                 "Docker workspace preparation requires root or CAP_CHOWN "

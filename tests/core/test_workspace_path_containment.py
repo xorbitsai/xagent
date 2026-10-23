@@ -85,6 +85,17 @@ def test_stage_path_rejects_non_regular_file(workspace):
         workspace.stage_path_for_external_upload("output/folder")
 
 
+def test_stage_path_rejects_oversized_file_without_leaving_partial_copy(workspace):
+    source = workspace.output_dir / "large.bin"
+    source.write_bytes(b"12345")
+
+    with pytest.raises(ValueError, match="maximum staging size"):
+        workspace.stage_path_for_external_upload("output/large.bin", max_bytes=4)
+
+    staging_root = workspace.workspace_dir / ".xagent-upload-staging"
+    assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+
 def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(
     workspace, tmp_path
 ):

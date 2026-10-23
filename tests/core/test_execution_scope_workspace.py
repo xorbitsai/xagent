@@ -166,23 +166,31 @@ class TestScopedWorkspace:
             return result
 
         assigned_gids: list[int] = []
+        requested_modes: list[int] = []
+        real_fchmod = os.fchmod
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            requested_modes.append(mode)
+            real_fchmod(fd, mode)
+
         monkeypatch.setattr(Path, "stat", sandbox_root_stat)
         monkeypatch.setattr(
             "xagent.core.workspace.os.fchown",
             lambda _fd, _uid, gid: assigned_gids.append(gid),
         )
+        monkeypatch.setattr("xagent.core.workspace.os.fchmod", record_fchmod)
 
         workspace = TaskWorkspace("web_task_5", str(base))
 
+        assert stat.S_IMODE(real_stat(workspace.workspace_dir).st_mode) & 0o777 == 0o750
         for directory in (
-            workspace.workspace_dir,
             workspace.input_dir,
             workspace.output_dir,
             workspace.temp_dir,
         ):
-            mode = stat.S_IMODE(real_stat(directory).st_mode)
-            assert mode & 0o2070 == 0o2070
+            assert stat.S_IMODE(real_stat(directory).st_mode) & 0o777 == 0o770
         assert assigned_gids == [1010, 1010, 1010, 1010]
+        assert requested_modes == [0o2750, 0o2770, 0o2770, 0o2770]
 
     def test_two_scopes_produce_disjoint_workspace_dirs(self, tmp_path):
         ws_a = self._scoped_workspace(tmp_path, ("tenant-a",))

@@ -541,7 +541,10 @@ Images are automatically saved to workspace.
         if self._workspace is None:
             return self._resolve_image_path(image_input)
         try:
-            staged_path = self._workspace.stage_path_for_external_upload(image_input)
+            staged_path = self._workspace.stage_path_for_external_upload(
+                image_input,
+                max_bytes=get_media_download_max_bytes("image"),
+            )
         except (FileNotFoundError, ValueError) as path_error:
             file_id = parse_file_id_ref(image_input)
             if file_id is None:
@@ -550,7 +553,10 @@ Images are automatically saved to workspace.
                 raise ValueError(
                     "Access denied: local image is outside the task workspace"
                 ) from path_error
-            staged_path = self._workspace.stage_file_for_external_upload(file_id)
+            staged_path = self._workspace.stage_file_for_external_upload(
+                file_id,
+                max_bytes=get_media_download_max_bytes("image"),
+            )
         try:
             resolved = self._resolve_image_path(str(staged_path))
         except BaseException:

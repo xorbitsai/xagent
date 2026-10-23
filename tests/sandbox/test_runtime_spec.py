@@ -10,6 +10,7 @@ path.
 from __future__ import annotations
 
 import dataclasses
+import os
 import stat
 
 import pytest
@@ -86,6 +87,7 @@ def _make_inspection(**overrides) -> SandboxInspection:
 def test_workspace_access_grants_only_the_mount_root(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o700)
+    workspace.chmod(0o777)
     nested = workspace / "nested"
     nested.mkdir(mode=0o700)
     source = nested / "source.txt"
@@ -96,14 +98,22 @@ def test_workspace_access_grants_only_the_mount_root(tmp_path, monkeypatch):
     outside.chmod(0o600)
     (workspace / "outside-link").symlink_to(outside)
 
+    requested_modes: list[int] = []
+    real_fchmod = os.fchmod
+
+    def record_fchmod(fd: int, mode: int) -> None:
+        requested_modes.append(mode)
+        real_fchmod(fd, mode)
+
     monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
     grant_sandbox_runtime_access(workspace)
 
     workspace_mode = stat.S_IMODE(workspace.stat().st_mode)
     nested_mode = stat.S_IMODE(nested.stat().st_mode)
     source_mode = stat.S_IMODE(source.stat().st_mode)
-    assert workspace_mode & 0o070 == 0o070
-    assert workspace_mode & stat.S_ISGID
+    assert workspace_mode & 0o777 == 0o750
+    assert requested_modes == [0o2750]
     assert nested_mode == 0o700
     assert source_mode == 0o600
     assert workspace_mode & 0o007 == 0

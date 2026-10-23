@@ -21,6 +21,7 @@ from urllib.parse import unquote_to_bytes, urlsplit
 import httpx
 from pydantic import BaseModel, Field
 
+from ....config import get_media_download_max_bytes
 from ...model.chat.basic.base import BaseLLM
 from ...utils.media_download import resolve_workspace_media_path
 from ...utils.security import fetch_public_http_bytes
@@ -328,7 +329,9 @@ class VisionCore:
         if image_path.startswith(("http://", "https://", "data:")):
             return image_path
 
-        resolved_path, image_data = self._read_local_media_bytes(image_path)
+        resolved_path, image_data = self._read_local_media_bytes(
+            image_path, max_bytes=get_media_download_max_bytes("image")
+        )
         image_path = str(resolved_path)
 
         # Get MIME type
@@ -1435,7 +1438,9 @@ class VisionCore:
                 "PIL (Pillow) library is required for image marking. Install with: pip install Pillow"
             )
 
-        resolved_path, image_bytes = self._read_local_media_bytes(image_path)
+        resolved_path, image_bytes = self._read_local_media_bytes(
+            image_path, max_bytes=get_media_download_max_bytes("image")
+        )
         image_path = str(resolved_path)
         try:
             with Image.open(io.BytesIO(image_bytes)) as img:

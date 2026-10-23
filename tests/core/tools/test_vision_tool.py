@@ -122,7 +122,7 @@ def mock_workspace():
     staging_dir = temp_dir / ".vision-staging"
     staged_index = 0
 
-    def stage_path_for_external_upload(filename):
+    def stage_path_for_external_upload(filename, *, max_bytes=None):
         nonlocal staged_index
         source = workspace.resolve_path_with_search(filename)
         staging_dir.mkdir(exist_ok=True)
@@ -417,7 +417,7 @@ class TestVisionToolUnderstandImages:
         )
 
         assert result.success is True
-        staging_root = workspace.temp_dir / ".xagent-internal" / "mcp-upload"
+        staging_root = workspace.workspace_dir / ".xagent-upload-staging"
         assert not staging_root.exists() or list(staging_root.iterdir()) == []
 
     @pytest.mark.asyncio

@@ -28,8 +28,7 @@ from typing import (
     cast,
 )
 
-import docker
-from docker.errors import APIError, ImageNotFound, NotFound
+from docker import errors, from_env
 
 from ..config import (
     get_sandbox_image,
@@ -169,7 +168,7 @@ def _create_docker_client() -> Any:
     The Docker SDK can also talk to Docker-compatible runtimes such as Podman
     when ``DOCKER_HOST`` points at a compatible socket/service.
     """
-    return cast(Any, docker.from_env())
+    return cast(Any, from_env())
 
 
 def is_docker_available() -> bool:
@@ -706,7 +705,7 @@ def _archive_path_exists(container: Container, remote_path: str) -> bool:
     try:
         container.get_archive(remote_path)
         return True
-    except NotFound:
+    except errors.NotFound:
         return False
 
 
@@ -809,7 +808,7 @@ class DockerSandbox(Sandbox):
         """Return the managed container or raise if it has been deleted."""
         try:
             await asyncio.to_thread(self._container.reload)
-        except NotFound as e:
+        except errors.NotFound as e:
             raise SandboxNotFoundError(
                 f"Sandbox container not found: {self._name}"
             ) from e
@@ -975,7 +974,7 @@ class DockerSandbox(Sandbox):
                     stream, _ = await asyncio.to_thread(
                         container.get_archive, remote_path
                     )
-                except NotFound as e:
+                except errors.NotFound as e:
                     raise FileNotFoundError(
                         f"Remote file not found: {remote_path}"
                     ) from e
@@ -1029,7 +1028,7 @@ class DockerSandbox(Sandbox):
                     stream, _ = await asyncio.to_thread(
                         container.get_archive, remote_path
                     )
-                except NotFound as e:
+                except errors.NotFound as e:
                     raise FileNotFoundError(
                         f"Remote file not found: {remote_path}"
                     ) from e
@@ -1044,7 +1043,7 @@ async def _ensure_image(client: Any, image: str) -> None:
     """Ensure the requested image exists locally before container creation."""
     try:
         await asyncio.to_thread(client.images.get, image)
-    except ImageNotFound:
+    except errors.ImageNotFound:
         logger.info("Start pulling sandbox image: %s", image)
         await asyncio.to_thread(client.images.pull, image)
         logger.info("Finish pulling sandbox image: %s", image)
@@ -1512,7 +1511,7 @@ class DockerSandboxService(SandboxService):
                     backend_config,
                     extra_labels=extra_labels,
                 )
-            except APIError as exc:
+            except errors.APIError as exc:
                 if exc.status_code == 409 or "already in use" in str(exc):
                     raise SandboxAlreadyExistsError(
                         f"Sandbox already exists: {name!r}"
@@ -1812,13 +1811,13 @@ class DockerSandboxService(SandboxService):
         if image_tag:
             try:
                 await asyncio.to_thread(self._client.images.remove, image=image_tag)
-            except (ImageNotFound, NotFound):
+            except (errors.ImageNotFound, errors.NotFound):
                 logger.info(
                     "Snapshot image already absent during delete: snapshot_id=%s tag=%s",
                     snapshot_id,
                     image_tag,
                 )
-            except APIError as exc:
+            except errors.APIError as exc:
                 raise RuntimeError(
                     f"Failed to delete snapshot {snapshot_id}: {exc}"
                 ) from exc

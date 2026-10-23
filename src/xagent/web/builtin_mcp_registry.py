@@ -1468,11 +1468,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # backend and sandbox images, which each guarantee that path
             # exists) — a hardcoded path here would break every other
             # platform.
-            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
-            # Docker sandbox backend runs Chrome as root while Boxlite uses
-            # the image's uid 1100. This matches the root/no-sandbox exposure
-            # the existing
-            # browser_use tool (core/tools/core/browser_use.py) already
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': both
+            # sandbox backends run Chrome as the image's uid 1100. The
+            # Chrome process still disables its own namespace sandbox, so
+            # process-level uid/capability isolation remains load-bearing.
+            # This matches the no-sandbox exposure the existing browser_use
+            # tool (core/tools/core/browser_use.py) already
             # carries in the backend image -- not identical flags
             # (browser_use passes only --no-sandbox, plus
             # --disable-web-security and file-access flags this connector

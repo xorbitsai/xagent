@@ -18,7 +18,7 @@ from ...core.tools.adapters.vibe.config import run_with_tool_runtime_cleanup
 from ..auth_dependencies import get_current_user
 from ..init_tool_configs import get_default_tool_configs
 from ..models.database import get_db
-from ..models.task import TraceEvent
+from ..models.task import Task, TraceEvent
 from ..models.tool_config import ToolConfig
 from ..models.user import User
 from ..services.tool_credentials import (
@@ -36,7 +36,7 @@ from ..tools.config import WebToolConfig
 logger = logging.getLogger(__name__)
 
 
-def _tool_usage_query(db: Session) -> Query[Any]:
+def _tool_usage_query(db: Session, user_id: int | None = None) -> Query[Any]:
     """Count persisted completion events, shared by the list and usage endpoints."""
     tool_name = TraceEvent.data["tool_name"].as_string()
     query: Query[Any] = (
@@ -51,6 +51,10 @@ def _tool_usage_query(db: Session) -> Query[Any]:
         )
         .group_by(tool_name)
     )
+    if user_id is not None:
+        query = query.filter(
+            TraceEvent.task_id.in_(db.query(Task.id).filter(Task.user_id == user_id))
+        )
     return query
 
 
@@ -59,7 +63,7 @@ def _tool_usage_query(db: Session) -> Query[Any]:
 _USAGE_STATS_STATEMENT_TIMEOUT_MS = 3_000
 
 
-def _load_tool_usage_counts(db: Session) -> dict[str, int]:
+def _load_tool_usage_counts(db: Session, user_id: int | None = None) -> dict[str, int]:
     """Best-effort usage counts for the tool list; empty when they cannot be read.
 
     The query runs in a SAVEPOINT that is always rolled back. On PostgreSQL that
@@ -76,7 +80,7 @@ def _load_tool_usage_counts(db: Session) -> dict[str, int]:
                     text("SELECT set_config('statement_timeout', :statement, true)"),
                     {"statement": f"{_USAGE_STATS_STATEMENT_TIMEOUT_MS}ms"},
                 )
-            rows = _tool_usage_query(db).all()
+            rows = _tool_usage_query(db, user_id).all()
             return {row.tool_name: row.usage_count for row in rows}
         finally:
             savepoint.rollback()
@@ -449,7 +453,10 @@ async def get_available_tools(
             tools.append(withheld)
 
         if include_usage:
-            usage_map = await asyncio.to_thread(_load_tool_usage_counts, db)
+            usage_user_id = None if bool(current_user.is_admin) else current_user_id
+            usage_map = await asyncio.to_thread(
+                _load_tool_usage_counts, db, usage_user_id
+            )
             for tool_item in tools:
                 tool_item["usage_count"] = usage_map.get(tool_item.get("name", ""), 0)
 
@@ -692,15 +699,22 @@ async def delete_tool_credential(
 
 
 @tools_router.get("/usage")
-async def get_tool_usage(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+async def get_tool_usage(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
     """Get tool usage statistics"""
     try:
         # Run synchronous database queries in thread pool to avoid blocking event loop
+        user_id = (
+            None if bool(current_user.is_admin) else _require_user_id(current_user)
+        )
+
         def _get_tool_usage_sync() -> list[dict[str, Any]]:
             # Completion payloads carry a boolean; older events omit it on success.
             success = func.coalesce(TraceEvent.data["success"].as_boolean(), True)
             usage_stats = (
-                _tool_usage_query(db)
+                _tool_usage_query(db, user_id)
                 .add_columns(
                     func.sum(case((success, 1), else_=0)).label("success_count"),
                     func.sum(case((success, 0), else_=1)).label("error_count"),

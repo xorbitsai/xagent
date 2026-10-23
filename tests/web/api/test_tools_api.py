@@ -189,6 +189,7 @@ class _AvailableToolsRouteHarness:
         self.cleanup_error = cleanup_error
         self.primary_error = primary_error
         self.usage_counts = usage_counts or {}
+        self.usage_user_ids: list[int | None] = []
         self.events: list[str] = []
         self.close_calls = 0
 
@@ -252,8 +253,11 @@ class _AvailableToolsRouteHarness:
             def query(self, model: object) -> Query:
                 return Query(model)
 
-        def load_tool_usage_counts(_db: object) -> dict[str, int]:
+        def load_tool_usage_counts(
+            _db: object, _usage_user_id: int | None
+        ) -> dict[str, int]:
             harness.events.append("tool_usage")
+            harness.usage_user_ids.append(_usage_user_id)
             return harness.usage_counts
 
         monkeypatch.setattr(
@@ -374,6 +378,25 @@ async def test_available_tools_reports_usage_counts_by_default(
 
     assert response["tools"][0]["usage_count"] == 4
     assert "tool_usage" in harness.events
+    assert harness.usage_user_ids == [7]
+
+
+@pytest.mark.asyncio
+async def test_available_tools_admin_usage_is_global(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.api.tools import get_available_tools
+
+    harness = _AvailableToolsRouteHarness(usage_counts={"test_tool": 9})
+    db = harness.install(monkeypatch)
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=1, is_admin=True),
+        db=db,
+    )
+
+    assert response["tools"][0]["usage_count"] == 9
+    assert harness.usage_user_ids == [None]
 
 
 @pytest.mark.asyncio

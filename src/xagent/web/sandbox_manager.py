@@ -26,6 +26,7 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_pids_limit,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
@@ -54,6 +55,7 @@ from ..sandbox.base import (
     SandboxTemplate,
     SpecVerdict,
     canonical_sandbox_path,
+    grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
 from .sandbox_keys import (
@@ -71,6 +73,7 @@ _WORKER_LIFECYCLE_MARKER = "::worker::"
 # sites, rather than each falling back to the backend's own (backend-specific,
 # potentially unbounded) default.
 _SANDBOX_STOP_TIMEOUT_SECONDS = 30
+_SANDBOX_SECURITY_PROFILE = "nonroot-public-egress-v1"
 
 
 class SandboxCapacityError(RuntimeError):
@@ -875,6 +878,9 @@ class SandboxManager:
         if memory is not None:
             config.memory = memory
 
+        config.pids_limit = get_sandbox_pids_limit()
+        config.security_profile = _SANDBOX_SECURITY_PROFILE
+
         # ENV
         env = get_sandbox_env()
         if env:
@@ -1030,6 +1036,8 @@ class SandboxManager:
             try:
                 if should_create or target.exists():
                     os.makedirs(target, exist_ok=True)
+                if should_create:
+                    grant_sandbox_runtime_access(target)
             except OSError as exc:
                 logger.warning(
                     "Failed to prepare sandbox workspace mount %s: %s",
@@ -1081,6 +1089,8 @@ class SandboxManager:
             volumes=info.config.volumes,
             network_isolated=bool(info.config.network_isolated),
             ports=info.config.ports,
+            pids_limit=info.config.pids_limit,
+            security_profile=info.config.security_profile,
         )
 
     def _build_runtime_spec(
@@ -1115,6 +1125,8 @@ class SandboxManager:
             volumes=volumes,
             network_isolated=bool(config.network_isolated),
             ports=config.ports,
+            pids_limit=config.pids_limit,
+            security_profile=config.security_profile,
         )
 
     def _make_default_volumes(

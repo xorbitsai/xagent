@@ -123,15 +123,19 @@ class TestImageGenerationTool:
             tool._resolve_image_path(str(outside))
 
     def test_local_image_read_rejects_workspace_symlink_escape(self, tmp_path):
-        workspace = TaskWorkspace("task", base_dir=str(tmp_path))
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
         outside = tmp_path / "outside.png"
         outside.write_bytes(b"secret")
-        link = workspace.input_dir / "escape.png"
+        link = workspace_root / "escape.png"
         link.symlink_to(outside)
+        workspace = Mock()
+        workspace.workspace_dir = workspace_root
+        workspace.resolve_path_with_search = Mock(return_value=link)
         tool = ImageGenerationTool({}, workspace=workspace)
 
-        with pytest.raises((ValueError, FileNotFoundError)):
-            tool._resolve_image_path("input/escape.png")
+        with pytest.raises(ValueError, match="local path is outside the workspace"):
+            tool._resolve_image_path("escape.png")
 
     def test_local_image_read_requires_workspace(self, tmp_path):
         image = tmp_path / "reference.png"

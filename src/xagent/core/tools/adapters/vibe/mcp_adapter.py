@@ -4241,7 +4241,14 @@ async def load_mcp_tools_as_agent_tools(
     for server_name, connection in connection_map.items():
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
-            if sandbox is not None and should_sandbox_mcp_connection(connection):
+            sandbox_required = should_sandbox_mcp_connection(connection)
+            if sandbox_required and sandbox is None:
+                raise RuntimeError(
+                    "This stdio MCP connection requires a sandbox, but no sandbox "
+                    "is available"
+                )
+            if sandbox_required:
+                assert sandbox is not None
                 concurrency_safe, concurrent_tools = _connection_concurrency_config(
                     connection
                 )

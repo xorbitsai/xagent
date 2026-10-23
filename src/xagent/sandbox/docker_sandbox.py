@@ -35,6 +35,7 @@ import docker
 from ..config import (
     get_sandbox_image,
     get_sandbox_namespace,
+    get_sandbox_pids_limit,
     validate_sandbox_namespace,
 )
 from .base import (
@@ -316,6 +317,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
         working_dir=str(config_data.get("WorkingDir") or "/home"),
         cpus=max(1, cpus),
         memory=max(128, memory),
+        pids_limit=cast(Optional[int], host_config.get("PidsLimit")) or None,
         env=env_map or None,
         volumes=volumes or None,
         network_isolated=bool(
@@ -1129,9 +1131,17 @@ async def _create_container(
         # Security config
         "security_opt": ["no-new-privileges:true"],
         "cap_drop": ["ALL"],
-        "pids_limit": 256,
+        "pids_limit": config.pids_limit or get_sandbox_pids_limit(),
         "labels": labels,
     }
+    guest_paths = [guest for _, guest, _ in (config.volumes or [])]
+    if any(path.startswith("/root/") for path in guest_paths):
+        # The stock image keeps /root at 0700. A private tmpfs supplies only
+        # traversable parents for nested workspace bind mounts; it exposes no
+        # host files and is discarded with the container.
+        kwargs["tmpfs"] = {
+            "/root": "rw,nosuid,nodev,noexec,size=64k,mode=0711,uid=1100,gid=1010"
+        }
     return cast(
         "Container", await asyncio.to_thread(client.containers.create, **kwargs)
     )

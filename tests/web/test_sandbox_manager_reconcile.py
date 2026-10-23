@@ -423,7 +423,7 @@ class TestReconcileBudget:
                 state="stopped",
                 spec=stale_spec,
                 fingerprint_label=stale_spec.fingerprint(),
-                version_label="1",
+                version_label=str(SPEC_CONTRACT_VERSION),
             )
 
         _seed_stale()
@@ -506,7 +506,7 @@ class TestReconcileBudget:
             state="stopped",
             spec=stale_spec,
             fingerprint_label=stale_spec.fingerprint(),
-            version_label="1",
+            version_label=str(SPEC_CONTRACT_VERSION),
         )
         await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
         assert manager._reconcile_budget["user::1"] == 0
@@ -605,7 +605,7 @@ class TestReconcileBudget:
             state="stopped",
             spec=stale_spec,
             fingerprint_label=stale_spec.fingerprint(),
-            version_label="1",
+            version_label=str(SPEC_CONTRACT_VERSION),
         )
         with pytest.raises(SandboxRuntimeConflictError):
             await manager.get_or_create_sandbox(

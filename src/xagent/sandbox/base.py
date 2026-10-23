@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import abc
 import hashlib
+import os
 import posixpath
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Literal, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, Field
@@ -18,6 +20,39 @@ TemplateType = Literal["image", "snapshot"]
 
 CodeType = Literal["python", "javascript"]
 """Supported code execution types."""
+
+SANDBOX_RUNTIME_GID = 1010
+
+
+def grant_sandbox_runtime_access(root: Path) -> None:
+    """Make one task-workspace tree writable by the sandbox identity.
+
+    Rootful deployments assign the sandbox group directly. Rootless local
+    deployments cannot chgrp to an arbitrary gid, so they grant equivalent
+    ``other`` permissions as a narrowly scoped fallback. Symlinks are never
+    followed or modified.
+    """
+
+    def grant(path: Path, *, directory: bool) -> None:
+        if path.is_symlink():
+            return
+        mode = path.stat().st_mode
+        try:
+            os.chown(path, -1, SANDBOX_RUNTIME_GID, follow_symlinks=False)
+        except PermissionError:
+            fallback = 0o007 if directory else 0o006
+            path.chmod(mode | fallback, follow_symlinks=False)
+            return
+        group_bits = 0o2070 if directory else 0o060
+        path.chmod(mode | group_bits, follow_symlinks=False)
+
+    grant(root, directory=True)
+    for current_root, directories, files in os.walk(root, followlinks=False):
+        current = Path(current_root)
+        for name in directories:
+            grant(current / name, directory=True)
+        for name in files:
+            grant(current / name, directory=False)
 
 
 class ExactGenerationProbe(str, Enum):
@@ -145,6 +180,15 @@ class SandboxConfig(BaseModel):
 
     memory: Optional[int] = Field(default=512, ge=128, description="Memory limit in MB")
 
+    pids_limit: Optional[int] = Field(
+        default=None, ge=64, description="Container process/thread limit"
+    )
+
+    security_profile: Optional[str] = Field(
+        default=None,
+        description="Runtime hardening profile included in desired-state matching",
+    )
+
     env: Optional[dict[str, str]] = Field(
         default=None, description="Environment variables to inject"
     )
@@ -225,7 +269,7 @@ class ExecResult(BaseModel):
 # untrustworthy for matching against a newly-desired spec. Not part of the
 # fingerprint itself (see ResolvedSandboxRuntimeSpec.fingerprint), so bumping
 # it does not change any existing fingerprint value.
-SPEC_CONTRACT_VERSION = 1
+SPEC_CONTRACT_VERSION = 2
 
 # Realizable bounds for a resolved spec, mirroring the `ge=` constraints
 # SandboxConfig declares for the same two fields. Kept here so an
@@ -301,6 +345,8 @@ class ResolvedSandboxRuntimeSpec:
     volumes: tuple[tuple[str, str, str], ...]
     network_isolated: bool
     ports: tuple[tuple[int, int], ...]
+    pids_limit: Optional[int] = None
+    security_profile: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.template_type == "image":
@@ -332,6 +378,10 @@ class ResolvedSandboxRuntimeSpec:
                 f"memory must be >= {_MIN_SPEC_MEMORY_MB} MB to be realizable, "
                 f"got {self.memory!r}"
             )
+        if self.pids_limit is not None and self.pids_limit < 64:
+            raise ValueError(
+                f"pids_limit must be >= 64 to be realizable, got {self.pids_limit!r}"
+            )
 
     @classmethod
     def from_parts(
@@ -347,6 +397,8 @@ class ResolvedSandboxRuntimeSpec:
         volumes: Optional[Sequence[tuple[str, str, str]]] = None,
         network_isolated: bool = False,
         ports: Optional[Sequence[tuple[int, int]]] = None,
+        pids_limit: Optional[int] = None,
+        security_profile: Optional[str] = None,
     ) -> "ResolvedSandboxRuntimeSpec":
         """Build a spec, normalizing all collection fields.
 
@@ -388,6 +440,8 @@ class ResolvedSandboxRuntimeSpec:
             volumes=normalized_volumes,
             network_isolated=network_isolated,
             ports=normalized_ports,
+            pids_limit=pids_limit,
+            security_profile=security_profile,
         )
 
     def to_backend_config(self) -> tuple["SandboxTemplate", "SandboxConfig"]:
@@ -409,6 +463,8 @@ class ResolvedSandboxRuntimeSpec:
             volumes=[tuple(volume) for volume in self.volumes] or None,
             network_isolated=self.network_isolated,
             ports=[tuple(port) for port in self.ports] or None,
+            pids_limit=self.pids_limit,
+            security_profile=self.security_profile,
         )
         return template, config
 
@@ -431,6 +487,8 @@ class ResolvedSandboxRuntimeSpec:
                 self.volumes,
                 self.network_isolated,
                 self.ports,
+                self.pids_limit,
+                self.security_profile,
             )
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

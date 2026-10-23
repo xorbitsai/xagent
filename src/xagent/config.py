@@ -187,6 +187,7 @@ LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
 LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
+SANDBOX_PIDS_LIMIT = "SANDBOX_PIDS_LIMIT"
 SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 # Set only inside the sandbox tool runner, which has no database credentials.
@@ -3717,6 +3718,16 @@ def get_sandbox_memory() -> int | None:
         except ValueError:
             logger.warning(f"Invalid {SANDBOX_MEMORY} value: {env_str}")
     return None
+
+
+def get_sandbox_pids_limit() -> int:
+    """Get the process/thread limit for sandbox containers.
+
+    Linux counts threads against the pids cgroup. The default therefore
+    leaves enough room for Chrome and numeric libraries while still bounding
+    fork bombs. Invalid values fall back to 1024.
+    """
+    return _get_positive_int_env(SANDBOX_PIDS_LIMIT, 1024, minimum=64)
 
 
 def get_sandbox_env() -> dict[str, str]:

@@ -183,6 +183,29 @@ class TestLoadMcpToolsAsAgentTools:
         mock_sandboxed.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_required_sandbox_without_instance_fails_closed(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["server.py"],
+            "sandbox_required": True,
+        }
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.mcp_adapter._load_direct_mcp_tools",
+            new=AsyncMock(),
+        ) as mock_direct:
+            result = await load_mcp_tools_as_agent_tools(
+                {"custom": connection}, sandbox=None
+            )
+
+        assert result.tools == ()
+        assert result.loaded_servers == ()
+        assert len(result.failures) == 1
+        assert result.failures[0].phase is MCPFailurePhase.SESSION_START
+        mock_direct.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_sandbox_list_failure_is_preserved_without_secret(self, caplog):
         # Pinned below default: the sandboxed-load path also emits a DEBUG
         # traceback (test_sandbox_list_failure_debug_traceback_is_opt_in

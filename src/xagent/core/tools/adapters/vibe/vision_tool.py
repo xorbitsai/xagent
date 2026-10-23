@@ -5,8 +5,10 @@ Framework wrapper around the pure vision core
 
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
+from xagent.core.utils.media_download import resolve_workspace_media_path
 from xagent.core.workspace import TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
@@ -55,7 +57,11 @@ class VisionTool:
         output_dir = str(workspace.output_dir) if workspace else "./output"
 
         # Create core instance
-        self.core = VisionCore(vision_model, output_directory=output_dir)
+        self.core = VisionCore(
+            vision_model,
+            output_directory=output_dir,
+            workspace_root=workspace.workspace_dir if workspace else None,
+        )
 
     def _resolve_media_path(self, media_path: str) -> str:
         """Resolve an image or video path using the task workspace."""
@@ -63,16 +69,22 @@ class VisionTool:
         if media_path.startswith(("http://", "https://", "data:")):
             return media_path
 
-        # Try to resolve using workspace
-        if self.workspace:
-            try:
-                resolved_path = self.workspace.resolve_path_with_search(media_path)
-                return str(resolved_path)
-            except (ValueError, FileNotFoundError):
-                pass
+        # The core owns the final read boundary as defense in depth. Keeping
+        # an unresolved value here lets it still validate arguments before a
+        # local read and preserves callers that mock the media conversion.
+        if self.workspace is None:
+            return media_path
 
-        # Return original path
-        return media_path
+        try:
+            resolved_path = self.workspace.resolve_path_with_search(media_path)
+        except FileNotFoundError:
+            return media_path
+        safe_path = resolve_workspace_media_path(
+            Path(resolved_path), self.workspace.workspace_dir
+        )
+        if not safe_path.is_file():
+            raise FileNotFoundError(f"Media file not found: {media_path}")
+        return str(safe_path)
 
     def _resolve_media(
         self,

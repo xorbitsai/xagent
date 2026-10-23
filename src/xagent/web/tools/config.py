@@ -5047,23 +5047,25 @@ class WebToolConfig(BaseToolConfig):
                 self._connector_team_id,
             )
 
-            visible_stdio_ids = [
-                int(server.id) for server in servers if server.transport == "stdio"
-            ]
-            if visible_stdio_ids:
-                from ...web.models.mcp import UserMCPServer
+            visible_ids = [int(server.id) for server in servers]
+            custom_stdio_ids: set[int] = set()
+            if visible_ids:
+                from ...web.mcp_apps import get_app_for_mcp_server
+                from ...web.models.mcp import MCPServer
 
-                custom_stdio_ids = {
-                    int(server_id)
-                    for (server_id,) in self.db.query(UserMCPServer.mcpserver_id)
+                visible_stdio_servers = (
+                    self.db.query(MCPServer)
                     .filter(
-                        UserMCPServer.mcpserver_id.in_(visible_stdio_ids),
-                        UserMCPServer.is_owner.is_(True),
+                        MCPServer.id.in_(visible_ids),
+                        MCPServer.transport == "stdio",
                     )
                     .all()
+                )
+                custom_stdio_ids = {
+                    int(server.id)
+                    for server in visible_stdio_servers
+                    if get_app_for_mcp_server(self.db, server) is None
                 }
-            else:
-                custom_stdio_ids = set()
 
             # Classify the complete personal ∪ governing-team visible set
             # before constructing any runtime config. Canonical builtins use
@@ -5214,9 +5216,7 @@ class WebToolConfig(BaseToolConfig):
                 actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
                     int(server.id), "config_load_failed"
                 ),
-                custom_stdio=(
-                    server.transport == "stdio" and int(server.id) in custom_stdio_ids
-                ),
+                custom_stdio=int(server.id) in custom_stdio_ids,
             )
             for server in servers
         ]

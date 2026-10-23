@@ -18,9 +18,9 @@ The Python set comes only from the dedicated `sandbox` dependency group in Xagen
 
 ## Isolation
 
-Sandboxing is opt-in: Xagent runs tool calls in the backend process unless `SANDBOX_ENABLED=true`, and falls back to the backend when no sandbox backend is available or a tool cannot be wrapped. What follows applies to work that does reach a sandbox.
+Sandboxing is opt-in: Xagent runs tool calls in the backend process unless `SANDBOX_ENABLED=true`. Connections that are explicitly classified as custom stdio MCP or `npx`/`uvx` MCP fail closed when their required sandbox is unavailable; they never fall back to the backend process. What follows applies to work that does reach a sandbox.
 
-The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, CPU and memory limits, and optional network isolation; its Boxlite backend runs the sandbox inside a KVM microVM. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for the two modes and their trade-offs.
+The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, drops all Linux capabilities, and enforces CPU, memory, and PID limits; its Boxlite backend runs the sandbox inside a KVM microVM and permits egress only to public destinations. Both policies are included in sandbox desired-state matching, so an existing sandbox created under an older profile is rebuilt before reuse. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for the two modes and their trade-offs.
 
 The image defines an unprivileged `sandbox` user (uid 1100, gid 1010), and both
 the Docker and BoxLite backends preserve that runtime identity.

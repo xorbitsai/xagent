@@ -11,13 +11,18 @@ import re
 import socket
 import tempfile
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
-from xagent.sandbox.base import SandboxConfig, SandboxTemplate
+from xagent.sandbox.base import (
+    SandboxConfig,
+    SandboxTemplate,
+    grant_sandbox_runtime_access,
+)
 from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
@@ -509,7 +514,22 @@ class TestNamespaceIsolation:
             assert captured["init"] is True
             assert captured["user"] == "1100:1010"
             assert captured["cap_drop"] == ["ALL"]
-            assert captured["pids_limit"] == 256
+            assert captured["pids_limit"] == 1024
+
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(
+                pids_limit=2048,
+                volumes=[("/host/workspace", "/root/.xagent/user_1", "rw")],
+            ),
+        )
+        assert captured["pids_limit"] == 2048
+        assert captured["tmpfs"]["/root"].endswith("mode=0711,uid=1100,gid=1010")
 
 
 class TestManagerPathsRespectNamespace:
@@ -694,10 +714,9 @@ class TestDockerSandboxService:
             template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
 
             temp_dir = tempfile.mkdtemp()
-            # A bind mount is writable by uid 1100 only when the host-side
-            # permissions grant access; the sandbox intentionally no longer
-            # bypasses those permissions as root.
-            os.chmod(temp_dir, 0o777)
+            # Match the manager's task-workspace preparation. This grants the
+            # sandbox group access without making the workspace world-writable.
+            grant_sandbox_runtime_access(Path(temp_dir))
             host_port = _get_free_host_port()
             config = SandboxConfig(
                 cpus=2,

@@ -28,6 +28,11 @@ URLs came from a model provider. The downloader now:
 - Restricts local image results to the task workspace, including symlink
   resolution, matching the existing video boundary. In-workspace files and
   existing data-URL workflows remain supported.
+- Restricts image-edit source reads to the current task workspace as well.
+  Durable `file:`, `file://`, and bare file IDs are staged into task scratch
+  for the provider call and removed afterwards. Arbitrary absolute paths and
+  `allowed_external_dirs` paths are intentionally not accepted by this tool;
+  import/register the file and pass its FileRef instead.
 
 The default remote limits are 64 MiB for images and 512 MiB for videos; change
 `XAGENT_IMAGE_DOWNLOAD_MAX_BYTES` / `XAGENT_VIDEO_DOWNLOAD_MAX_BYTES` with positive
@@ -53,5 +58,6 @@ This patch does not claim global SSRF closure. General-purpose HTTP tools,
 configured MCP/model connections, proxy-side DNS policies and worker egress
 firewalls need their own trust/allowlist boundaries. Do not apply a global
 private-network exception to public URL downloads to work around a failure.
-Image edit-input downloads in provider adapters remain a separate hardening
-follow-up; this result-download boundary does not make them safe automatically.
+Provider-specific edit-input downloads remain a separate hardening follow-up;
+the core tool's local-file boundary does not make arbitrary adapter downloads
+safe automatically.

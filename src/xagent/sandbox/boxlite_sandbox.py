@@ -15,7 +15,7 @@ import textwrap
 import uuid
 from typing import Optional, TypeVar
 
-import boxlite  # type: ignore
+import boxlite  # type: ignore[import-not-found]
 from boxlite import SimpleBox
 
 from ..config import get_sandbox_image
@@ -84,7 +84,7 @@ def _subtract_networks(
     for denied in blocked:
         remaining: list[_Network] = []
         for candidate in allowed:
-            if candidate.version != denied.version or not candidate.overlaps(denied):
+            if not candidate.overlaps(denied):
                 remaining.append(candidate)
             elif denied.subnet_of(candidate):
                 remaining.extend(candidate.address_exclude(denied))
@@ -508,21 +508,49 @@ class BoxliteSandboxService(SandboxService):
         # Use lock to protect entire get_or_create process
         async with lock:
             # Check if box already exists
+            info: SandboxInfo | None = None
             raw_box = await self._runtime.get(name)
             if raw_box:
                 # Box exists, get or restore info
                 info = self._store.get_info(name)
-                if not info:
-                    # DB data lost, read from boxlite
-                    info = _get_info_from_box_info(await raw_box.info())
-            else:
-                # Box doesn't exist, create new one
-                tpl = template or SandboxTemplate(
+                desired_template = template or SandboxTemplate(
                     type="image", image=DEFAULT_SANDBOX_IMAGE
                 )
-                cfg = config or SandboxConfig()
-                info = SandboxInfo(name=name, state="running", template=tpl, config=cfg)
+                desired_config = config or SandboxConfig()
+                if template is not None or config is not None:
+                    # BoxLite has no immutable labels. Persisted desired state
+                    # is therefore the only way to detect a security-profile
+                    # or network-policy upgrade and prevent reuse of an old,
+                    # less restricted VM.
+                    if (
+                        info is None
+                        or info.template != desired_template
+                        or info.config != desired_config
+                    ):
+                        await self._runtime.remove(name, force=True)
+                        self._store.delete_info(name)
+                        raw_box = None
+                        info = SandboxInfo(
+                            name=name,
+                            state="running",
+                            template=desired_template,
+                            config=desired_config,
+                        )
+                if raw_box is not None and not info:
+                    # DB data lost, read from boxlite
+                    info = _get_info_from_box_info(await raw_box.info())
+            if not raw_box:
+                # Box doesn't exist, create new one
+                if info is None:
+                    tpl = template or SandboxTemplate(
+                        type="image", image=DEFAULT_SANDBOX_IMAGE
+                    )
+                    cfg = config or SandboxConfig()
+                    info = SandboxInfo(
+                        name=name, state="running", template=tpl, config=cfg
+                    )
 
+            assert info is not None
             # Create or reuse box
             box = await _create_or_reuse_box(
                 name, info.template, info.config, self._runtime

@@ -101,6 +101,7 @@ def mock_workspace():
     test_image.write_bytes(b"fake_image_data_for_test_image")
 
     workspace = Mock()
+    workspace.workspace_dir = temp_dir
 
     output_dir = temp_dir / "output"
     output_dir.mkdir(exist_ok=True)
@@ -693,6 +694,7 @@ class TestVisionToolUnderstandMedia:
             "</svg>"
         )
         svg_path.write_text(svg_source)
+        vision_tool_without_workspace.core.workspace_root = tmp_path
 
         with patch(
             "xagent.core.tools.core.vision_tool.rasterize_svg_bytes",
@@ -1176,6 +1178,7 @@ class TestVisionToolUnderstandMedia:
     ):
         video_path = tmp_path / "clip.mp4"
         video_path.write_bytes(b"fake-video")
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         completed_frames = [Mock(stdout=b""), Mock(stdout=b"jpeg-frame")]
 
         with (
@@ -1595,9 +1598,15 @@ class TestVisionToolDetectObjects:
         with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
             mock_draw.return_value = "/workspace/output/marked_test_image.jpg"
 
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
-                temp_image_path = temp_file.name
-                temp_file.write(b"fake_image_data")
+            temp_image = mock_workspace.workspace_dir / "marking-input.jpg"
+            temp_image.write_bytes(b"fake_image_data")
+            temp_image_path = str(temp_image)
+            original_resolver = mock_workspace.resolve_path_with_search.side_effect
+            mock_workspace.resolve_path_with_search.side_effect = (
+                lambda value: temp_image
+                if value == temp_image_path
+                else original_resolver(value)
+            )
 
             try:
                 result = await vision_tool.detect_objects(
@@ -1711,6 +1720,7 @@ class TestVisionToolDetectObjects:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
             temp_image_path = temp_file.name
             temp_file.write(b"fake_image_data")
+        vision_tool.core.workspace_root = Path(temp_image_path).parent
 
         try:
             with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
@@ -1780,6 +1790,7 @@ class TestVisionToolDetectObjects:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
             temp_image_path = temp_file.name
             temp_file.write(b"fake_image_data")
+        vision_tool.core.workspace_root = Path(temp_image_path).parent
 
         try:
             with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
@@ -1843,6 +1854,7 @@ class TestVisionToolHelperMethods:
         svg_path = tmp_path / "official-logo.svg"
         svg_path.write_text('<svg xmlns="http://www.w3.org/2000/svg" />')
         png_bytes = b"rendered-png"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
 
         with patch(
             "xagent.core.tools.core.vision_tool.rasterize_svg_bytes",
@@ -1869,6 +1881,7 @@ class TestVisionToolHelperMethods:
         from xagent.core.utils.svg import MAX_SVG_BYTES
 
         svg_path = tmp_path / "huge.svg"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         with open(svg_path, "w") as f:
             f.write("<svg>")
             f.write("a" * (MAX_SVG_BYTES + 1))
@@ -1887,6 +1900,7 @@ class TestVisionToolHelperMethods:
         self, vision_tool_without_workspace, tmp_path
     ):
         svg_path = tmp_path / "not-really.svg"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         svg_path.write_text("just some text pretending to be an svg file")
 
         content, warning = await vision_tool_without_workspace.core._svg_source_content(
@@ -1902,6 +1916,7 @@ class TestVisionToolHelperMethods:
         self, vision_tool_without_workspace, tmp_path
     ):
         svg_path = tmp_path / "official-logo.svg"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         svg_source = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>'
         svg_path.write_text(svg_source)
 
@@ -2345,7 +2360,7 @@ class TestDrawBoundingBoxes:
         )
 
         assert result.success is False
-        assert "Image file not found" in result.error
+        assert "Local media files require a task workspace" in result.error
 
     def test_draw_bounding_boxes_workspace_output(self, mock_workspace):
         """Test that bounding boxes are saved to workspace output directory"""

@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 from urllib import parse
 
 from ....config import get_media_download_max_bytes
-from ...file_ref import build_workspace_file_ref
+from ...file_ref import build_workspace_file_ref, parse_file_id_ref
 from ...model.image.base import BaseImageModel
 from ...utils.media_download import (
     describe_media_download_error,
@@ -159,7 +159,7 @@ transparent-background support):
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
-- image_url (required): single image path/URL/file_id (supports both `file_id` and `file:file_id`) or a list of image paths/URLs/file_ids for multi-image editing
+- image_url (required): single image path/URL/file_id (supports bare `file_id`, `file:file_id`, and `file://file_id`) or a list of image paths/URLs/file_ids for multi-image editing. Local paths must resolve inside this task's workspace; use a FileRef for a durable user-owned upload.
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
 - transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene. Only models marked ◻ support it; the call fails on any other model. Asking for it in the prompt text does NOT work.
@@ -518,27 +518,9 @@ Images are automatically saved to workspace.
             raise ValueError("Access denied: local images require a task workspace")
 
         resolved_path = self._workspace.resolve_path_with_search(image_input)
-        try:
-            workspace_path = resolve_workspace_media_path(
-                Path(resolved_path), self._workspace.workspace_dir
-            )
-        except ValueError:
-            # A durable FileRef may resolve into an account-owned cache outside
-            # the task directory. Materialize only that owned reference into
-            # upload-safe task scratch; arbitrary external paths still fail.
-            if Path(image_input).name != image_input:
-                raise
-            try:
-                staged_path = self._workspace.stage_file_for_external_upload(
-                    image_input
-                )
-            except (FileNotFoundError, ValueError) as exc:
-                raise ValueError(
-                    "Access denied: local image is outside the task workspace"
-                ) from exc
-            workspace_path = resolve_workspace_media_path(
-                staged_path, self._workspace.workspace_dir
-            )
+        workspace_path = resolve_workspace_media_path(
+            Path(resolved_path), self._workspace.workspace_dir
+        )
 
         if not workspace_path.is_file():
             raise FileNotFoundError(f"Local image file not found: {image_input}")
@@ -549,6 +531,34 @@ Images are automatically saved to workspace.
             workspace_path,
         )
         return str(workspace_path)
+
+    def _resolve_edit_image_path(
+        self, image_input: str, staged_paths: list[Path]
+    ) -> str:
+        """Resolve one edit input and track any durable FileRef staging copy."""
+        try:
+            return self._resolve_image_path(image_input)
+        except (FileNotFoundError, ValueError):
+            if self._workspace is None:
+                raise
+            file_id = parse_file_id_ref(image_input)
+            if file_id is None and Path(image_input).name == image_input:
+                file_id = image_input
+            if file_id is None:
+                raise
+            try:
+                staged_path = self._workspace.stage_file_for_external_upload(file_id)
+            except (FileNotFoundError, ValueError) as exc:
+                raise ValueError(
+                    "Access denied: local image is outside the task workspace"
+                ) from exc
+            try:
+                resolved = self._resolve_image_path(str(staged_path))
+            except BaseException:
+                self._workspace.discard_staged_external_upload(staged_path)
+                raise
+            staged_paths.append(staged_path)
+            return resolved
 
     def _normalize_image_inputs(self, image: str | list[str]) -> list[str]:
         """Normalize image inputs to a non-empty list of strings."""
@@ -866,6 +876,7 @@ Images are automatically saved to workspace.
         Returns:
             Dictionary with image editing result
         """
+        staged_image_paths: list[Path] = []
         try:
             # Get the image model to use
             image_model = self._get_edit_model(model_id)
@@ -879,7 +890,8 @@ Images are automatically saved to workspace.
 
             image_inputs = self._normalize_image_inputs(image_url)
             resolved_image_paths = [
-                self._resolve_image_path(image_input) for image_input in image_inputs
+                self._resolve_edit_image_path(image_input, staged_image_paths)
+                for image_input in image_inputs
             ]
             logger.info(
                 f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
@@ -992,6 +1004,16 @@ Images are automatically saved to workspace.
                 "image_path": None,
                 "model_used": actual_model_id,
             }
+        finally:
+            if self._workspace is not None:
+                for staged_path in staged_image_paths:
+                    try:
+                        self._workspace.discard_staged_external_upload(staged_path)
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up staged image edit input",
+                            exc_info=True,
+                        )
 
     def list_available_models(self) -> Dict[str, Any]:
         """

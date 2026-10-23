@@ -72,6 +72,7 @@ def service_and_runtime():
     runtime = SimpleNamespace(
         get=AsyncMock(return_value=None),
         get_or_create=AsyncMock(return_value=(raw_box, True)),
+        remove=AsyncMock(),
     )
     # Bypass only native runtime initialization. The real SimpleBox constructor,
     # start() and async info() methods still run against this fake runtime.
@@ -141,6 +142,29 @@ async def test_reuse_preserves_stored_configuration(service_and_runtime):
     options = runtime.get_or_create.await_args.args[0]
     assert options.network.outbound.mode == "disabled"
     assert options.network.inbound.mode == "disabled"
+
+
+@pytest.mark.asyncio
+async def test_security_profile_change_recreates_existing_box(service_and_runtime):
+    service, runtime, raw_box, metadata = service_and_runtime
+    runtime.get.return_value = raw_box
+    stored = SandboxInfo(
+        name=metadata.name,
+        state="running",
+        template=SandboxTemplate(image=metadata.image),
+        config=SandboxConfig(security_profile="legacy"),
+        created_at=metadata.created_at,
+    )
+    service._store.add_info(metadata.name, stored)
+
+    sandbox = await service.get_or_create(
+        metadata.name,
+        template=SandboxTemplate(image=metadata.image),
+        config=SandboxConfig(security_profile="nonroot-public-egress-v1"),
+    )
+
+    runtime.remove.assert_awaited_once_with(metadata.name, force=True)
+    assert sandbox._info.config.security_profile == "nonroot-public-egress-v1"
 
 
 @pytest.mark.asyncio

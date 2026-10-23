@@ -232,10 +232,11 @@ async def _task_sandbox(connection: Any, user_id: int) -> AsyncIterator[Any]:
     )
     from ..sandbox_manager import get_sandbox_manager
 
-    manager = (
-        get_sandbox_manager() if should_sandbox_mcp_connection(connection) else None
-    )
+    sandbox_required = should_sandbox_mcp_connection(connection)
+    manager = get_sandbox_manager() if sandbox_required else None
     if manager is None:
+        if sandbox_required:
+            raise _SandboxUnavailable()
         yield None
         return
 

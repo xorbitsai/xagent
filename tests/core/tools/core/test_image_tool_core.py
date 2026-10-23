@@ -2,6 +2,8 @@
 Tests for ImageGenerationToolCore class
 """
 
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -52,10 +54,6 @@ def mock_image_models():
 @pytest.fixture
 def mock_workspace():
     """Create a mock workspace for testing"""
-    from contextlib import contextmanager
-    from pathlib import Path
-    from unittest.mock import Mock
-
     workspace = Mock()
     workspace.output_dir = Path("/tmp/test_workspace/output")
     workspace.output_dir.mkdir(parents=True, exist_ok=True)
@@ -631,6 +629,67 @@ class TestImageGenerationToolCore:
         assert result["success"] is False
         assert result["error"] == "Edit model error"
         assert result["model_used"] == "model1"
+
+    @pytest.mark.asyncio
+    async def test_edit_image_stages_file_ref_and_cleans_up(
+        self, mock_image_models, tmp_path
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        staged_path = workspace_root / ".staged" / "source.png"
+        staged_path.parent.mkdir()
+        staged_path.write_bytes(b"source")
+
+        workspace = Mock()
+        workspace.workspace_dir = workspace_root
+        workspace.output_dir = workspace_root / "output"
+        workspace.output_dir.mkdir()
+        workspace.resolve_path_with_search = Mock(
+            side_effect=lambda value: staged_path
+            if value == str(staged_path)
+            else (_ for _ in ()).throw(FileNotFoundError(value))
+        )
+        workspace.stage_file_for_external_upload = Mock(return_value=staged_path)
+        workspace.discard_staged_external_upload = Mock()
+
+        @contextmanager
+        def auto_register_files():
+            yield workspace
+
+        workspace.auto_register_files = auto_register_files
+        model = mock_image_models["model1"]
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(return_value={"image_url": None})
+        tool = ImageGenerationToolCore({"model1": model}, workspace=workspace)
+
+        result = await tool.edit_image(
+            prompt="edit",
+            image_url="file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
+        )
+
+        assert result["success"] is True
+        workspace.stage_file_for_external_upload.assert_called_once_with(
+            "355f1fee-48e4-4cb6-afd3-71654e2f5c7e"
+        )
+        model.edit_image.assert_awaited_once()
+        assert model.edit_image.await_args.kwargs["image_url"] == str(staged_path)
+        workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
+
+    def test_edit_image_rejects_arbitrary_absolute_path(
+        self, mock_image_models, tmp_path
+    ):
+        workspace = Mock()
+        workspace.workspace_dir = tmp_path
+        workspace.resolve_path_with_search = Mock(
+            side_effect=ValueError("outside workspace")
+        )
+        workspace.stage_file_for_external_upload = Mock()
+        tool = ImageGenerationToolCore(mock_image_models, workspace=workspace)
+
+        with pytest.raises(ValueError, match="outside workspace"):
+            tool._resolve_edit_image_path("/etc/passwd", [])
+
+        workspace.stage_file_for_external_upload.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("aiohttp.ClientSession.get")

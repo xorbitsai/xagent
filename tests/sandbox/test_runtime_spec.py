@@ -10,6 +10,7 @@ path.
 from __future__ import annotations
 
 import dataclasses
+import stat
 
 import pytest
 
@@ -28,6 +29,7 @@ from xagent.sandbox.base import (
     SandboxTemplate,
     SpecVerdict,
     canonical_sandbox_path,
+    grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
 
@@ -39,6 +41,8 @@ def _make_spec(**overrides) -> ResolvedSandboxRuntimeSpec:
         working_dir="/home",
         cpus=1,
         memory=512,
+        pids_limit=1024,
+        security_profile="nonroot-public-egress-v1",
         env={"FOO": "bar", "BAZ": "qux"},
         volumes=[("/host/a", "/guest/a", "ro")],
         network_isolated=False,
@@ -79,6 +83,30 @@ def _make_inspection(**overrides) -> SandboxInspection:
     return SandboxInspection(**kwargs)
 
 
+def test_workspace_access_is_granted_without_following_symlinks(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    nested = workspace / "nested"
+    nested.mkdir(mode=0o700)
+    source = nested / "source.txt"
+    source.write_text("data")
+    source.chmod(0o600)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    outside.chmod(0o600)
+    (workspace / "outside-link").symlink_to(outside)
+
+    grant_sandbox_runtime_access(workspace)
+
+    workspace_mode = stat.S_IMODE(workspace.stat().st_mode)
+    nested_mode = stat.S_IMODE(nested.stat().st_mode)
+    source_mode = stat.S_IMODE(source.stat().st_mode)
+    assert workspace_mode & 0o070 == 0o070 or workspace_mode & 0o007 == 0o007
+    assert nested_mode & 0o070 == 0o070 or nested_mode & 0o007 == 0o007
+    assert source_mode & 0o060 == 0o060 or source_mode & 0o006 == 0o006
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o600
+
+
 # --- ResolvedSandboxRuntimeSpec: field sensitivity ---
 
 
@@ -95,6 +123,8 @@ class TestSpecFieldSensitivity:
             {"working_dir": "/other"},
             {"cpus": 2},
             {"memory": 1024},
+            {"pids_limit": 2048},
+            {"security_profile": "different-profile"},
             {"env": {"FOO": "different", "BAZ": "qux"}},
             {"volumes": [("/host/a", "/guest/a", "rw")]},
             {"network_isolated": True},
@@ -144,6 +174,8 @@ class TestSpecFieldSensitivity:
             "working_dir",
             "cpus",
             "memory",
+            "pids_limit",
+            "security_profile",
             "env",
             "volumes",
             "network_isolated",
@@ -411,7 +443,7 @@ class TestContractVersionNotInFingerprint:
         assert "contract_version" not in field_names
 
     def test_module_constant_exists(self):
-        assert SPEC_CONTRACT_VERSION == 1
+        assert SPEC_CONTRACT_VERSION == 2
 
 
 # --- ResolvedSandboxRuntimeSpec: to_backend_config round trip ---
@@ -429,6 +461,8 @@ class TestToBackendConfig:
         assert config.working_dir == "/home"
         assert config.cpus == 1
         assert config.memory == 512
+        assert config.pids_limit == 1024
+        assert config.security_profile == "nonroot-public-egress-v1"
         assert config.env == {"FOO": "bar", "BAZ": "qux"}
         assert config.volumes == [("/host/a", "/guest/a", "ro")]
         assert config.network_isolated is False

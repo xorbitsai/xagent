@@ -364,6 +364,14 @@ def test_run_report_builds_body_and_returns_rows(monkeypatch):
                     }
                 ],
                 "rowCount": 1,
+                "totals": [
+                    {
+                        "metricValues": [
+                            {"value": "1200"},
+                            {"value": "300"},
+                        ]
+                    }
+                ],
             }
         )
     )
@@ -392,7 +400,9 @@ def test_run_report_builds_body_and_returns_rows(monkeypatch):
 
     assert result["status"] == "success"
     assert result["row_count"] == 1
+    assert result["truncated"] is False
     assert result["rows"][0]["metricValues"] == [{"value": "1200"}]
+    assert result["totals"] == [{"metricValues": [{"value": "1200"}, {"value": "300"}]}]
 
     call_kwargs = mock_request.call_args.kwargs
     assert call_kwargs["url"].endswith("/properties/42:runReport")
@@ -402,11 +412,66 @@ def test_run_report_builds_body_and_returns_rows(monkeypatch):
         {"startDate": "2026-07-01", "endDate": "2026-07-28", "name": "current"},
         {"startDate": "2026-06-03", "endDate": "2026-06-30", "name": "previous"},
     ]
+    assert body["metricAggregations"] == ["TOTAL"]
     assert body["dimensions"] == [{"name": "sessionDefaultChannelGroup"}]
     assert body["limit"] == "50"
     assert "dimensionFilter" not in body
     assert "orderBys" not in body
     assert "note" not in result
+
+
+def test_run_report_flags_server_truncation_and_keeps_totals(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "rows": [
+                    {
+                        "dimensionValues": [{"value": "Organic Search"}],
+                        "metricValues": [{"value": "1200"}],
+                    }
+                ],
+                "rowCount": 2,
+                "totals": [{"metricValues": [{"value": "2400"}]}],
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
+            dimensions=["sessionDefaultChannelGroup"],
+            limit=1,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["row_count"] == 2
+    assert result["truncated"] is True
+    assert result["totals"] == [{"metricValues": [{"value": "2400"}]}]
+
+
+def test_run_report_returns_totals_without_dimensions(monkeypatch):
+    totals = [{"metricValues": [{"value": "22129"}]}]
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"rowCount": 0, "totals": totals})
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+
+    result = json.loads(
+        google_analytics.google_analytics_run_report(
+            "42",
+            metrics=["sessions"],
+            date_ranges=[{"start_date": "30daysAgo", "end_date": "yesterday"}],
+        )
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["metricAggregations"] == ["TOTAL"]
+    assert "dimensions" not in body
+    assert result["totals"] == totals
 
 
 def test_run_report_flags_note_when_a_date_range_ends_today(monkeypatch):
@@ -745,6 +810,9 @@ def test_run_report_keeps_serialized_response_under_truncation_threshold(
                 "metricHeaders": [{"name": f"metric{i}"} for i in range(5)],
                 "rows": rows,
                 "rowCount": len(rows),
+                "totals": [
+                    {"metricValues": [{"value": str(1000 + i)} for i in range(5)]}
+                ],
             }
         )
     )
@@ -787,6 +855,9 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
                 "metricHeaders": [{"name": f"metric{i}"} for i in range(5)],
                 "rows": rows,
                 "rowCount": len(rows),
+                "totals": [
+                    {"metricValues": [{"value": str(1000 + i)} for i in range(5)]}
+                ],
             }
         )
     )
@@ -804,6 +875,9 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["rows"]) < google_analytics.RUN_REPORT_MAX_LIMIT
+    assert result["totals"] == [
+        {"metricValues": [{"value": str(1000 + i)} for i in range(5)]}
+    ]
     assert len(response) < get_tool_max_output_length()
     assert "still-processing" in result["note"]
 

@@ -362,14 +362,6 @@ class TaskWorkspace:
         if source is None:
             raise FileNotFoundError(f"File not found: {file_id}")
         raw_source = Path(source)
-        probe = raw_source
-        while probe != probe.parent:
-            if probe.is_symlink():
-                # A registered path can be replaced after lookup. Refuse
-                # symlink sources entirely so a later swap cannot redirect
-                # bytes to a different tenant's file before containment.
-                raise FileNotFoundError(f"File not found: {file_id}")
-            probe = probe.parent
         try:
             source = raw_source.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -380,43 +372,40 @@ class TaskWorkspace:
             source
         ):
             raise FileNotFoundError(f"File not found: {file_id}")
+        return self._stage_authorized_source(source, file_id)
 
-        staging_root = self._external_upload_staging_root()
-        staging_dir = staging_root / uuid4().hex
-        staging_dir.mkdir(parents=True, exist_ok=False)
-        target = staging_dir / source.name
+    @staticmethod
+    def _open_regular_file_nofollow(source: Path, selector: str) -> int:
+        """Open an absolute file without following any path component."""
+        absolute = source.absolute()
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(os.path.sep, directory_flags)
         try:
-            shutil.copy2(source, target)
-            os.chmod(target, 0o600)
-        except BaseException:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
-        return target
-
-    def stage_path_for_external_upload(self, file_path: str) -> Path:
-        """Copy one workspace-authorized selector into private task staging.
-
-        Unlike :meth:`stage_file_for_external_upload`, this accepts relative
-        workspace paths (including authorized upload symlinks) and absolute
-        paths permitted by the workspace policy. The source is opened once
-        with ``O_NOFOLLOW`` after authorization so a last-component symlink
-        swap cannot redirect the copy outside the approved file.
-        """
-
-        source = self.resolve_path_with_search(file_path)
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            source_fd = os.open(source, flags)
+            for component in absolute.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            file_fd = os.open(
+                absolute.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
         except OSError as exc:
-            raise FileNotFoundError(f"File not found: {file_path}") from exc
+            raise FileNotFoundError(f"File not found: {selector}") from exc
+        finally:
+            os.close(current_fd)
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            os.close(file_fd)
+            raise FileNotFoundError(f"File not found: {selector}")
+        return file_fd
 
+    def _stage_authorized_source(self, source: Path, selector: str) -> Path:
+        """Copy an already-authorized source fd into private task staging."""
+        source_fd = self._open_regular_file_nofollow(source, selector)
         staging_root = self._external_upload_staging_root()
         staging_dir = staging_root / uuid4().hex
         target = staging_dir / source.name
         try:
-            source_stat = os.fstat(source_fd)
-            if not stat.S_ISREG(source_stat.st_mode):
-                raise FileNotFoundError(f"File not found: {file_path}")
             staging_dir.mkdir(parents=True, exist_ok=False)
             with os.fdopen(source_fd, "rb", closefd=True) as source_file:
                 source_fd = -1
@@ -430,6 +419,19 @@ class TaskWorkspace:
             if source_fd >= 0:
                 os.close(source_fd)
         return target
+
+    def stage_path_for_external_upload(self, file_path: str) -> Path:
+        """Copy one workspace-authorized selector into private task staging.
+
+        Unlike :meth:`stage_file_for_external_upload`, this accepts relative
+        workspace paths (including authorized upload symlinks) and absolute
+        paths permitted by the workspace policy. The source is opened once
+        with ``O_NOFOLLOW`` after authorization so a last-component symlink
+        swap cannot redirect the copy outside the approved file.
+        """
+
+        source = self.resolve_path_with_search(file_path)
+        return self._stage_authorized_source(source, file_path)
 
     def discard_staged_external_upload(self, file_path: str | Path) -> None:
         """Remove a file previously returned by staging.
@@ -1804,11 +1806,53 @@ class TaskWorkspace:
             db.close()
 
     def _ensure_directories(self) -> None:
-        """Ensure all workspace directories exist"""
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
-        self.input_dir.mkdir(exist_ok=True)
-        self.output_dir.mkdir(exist_ok=True)
-        self.temp_dir.mkdir(exist_ok=True)
+        """Ensure task directories inherit writable sandbox-group access."""
+        self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
+        parent_stat = self.workspace_dir.parent.stat()
+        if not (parent_stat.st_gid == 1010 and parent_stat.st_mode & stat.S_ISGID):
+            self.workspace_dir.mkdir(exist_ok=True)
+            self.input_dir.mkdir(exist_ok=True)
+            self.output_dir.mkdir(exist_ok=True)
+            self.temp_dir.mkdir(exist_ok=True)
+            return
+
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        parent = self.workspace_dir.parent.absolute()
+        parent_fd = os.open(os.path.sep, flags)
+        try:
+            for component in parent.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            try:
+                os.mkdir(self.workspace_dir.name, mode=0o770, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            workspace_fd = os.open(self.workspace_dir.name, flags, dir_fd=parent_fd)
+        finally:
+            os.close(parent_fd)
+
+        try:
+            directory_stat = os.fstat(workspace_fd)
+            os.fchown(workspace_fd, -1, 1010)
+            os.fchmod(workspace_fd, directory_stat.st_mode | 0o2070)
+            for directory in (self.input_dir, self.output_dir, self.temp_dir):
+                try:
+                    os.mkdir(directory.name, mode=0o770, dir_fd=workspace_fd)
+                except FileExistsError:
+                    pass
+                fd = os.open(directory.name, flags, dir_fd=workspace_fd)
+                try:
+                    directory_stat = os.fstat(fd)
+                    os.fchown(fd, -1, 1010)
+                    os.fchmod(fd, directory_stat.st_mode | 0o2070)
+                finally:
+                    os.close(fd)
+        finally:
+            os.close(workspace_fd)
 
     def _warn_if_reserved_output_name_is_taken(self) -> None:
         """Log once per process and workspace that the reserved output name is taken."""

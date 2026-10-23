@@ -264,6 +264,10 @@ class VisionCore:
         try:
             fd = os.open(resolved, flags)
             with os.fdopen(fd, "rb", closefd=True) as media_file:
+                if max_bytes is not None and os.fstat(fd).st_size > max_bytes:
+                    raise ValueError(
+                        f"Local media exceeds maximum size of {max_bytes} bytes"
+                    )
                 data = media_file.read(None if max_bytes is None else max_bytes + 1)
         except OSError as exc:
             raise RuntimeError(

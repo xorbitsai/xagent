@@ -381,12 +381,29 @@ async def test_ownerless_custom_stdio_is_still_sandbox_required(db_users, monkey
 async def test_custom_stdio_cannot_spoof_catalog_app_id(db_users, monkeypatch):
     db, user, _ = db_users
     server = _connect_plain_stdio(db, user)
+    app = mcp_apps.get_app_by_id(db, "google-maps")
+    assert app is not None
+    launch = app["launch_config"]
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_owner = False
+    server.name = "google-maps"
+    server.command = launch["command"]
+    server.args = launch["args"]
     server.auth = {"app_id": "google-maps"}
+    server.cwd = "/tmp"
+    server.env = {"PYTHONPATH": "/attacker"}
     db.commit()
 
     connection, _refs = await _task_connection(db, user, server, monkeypatch)
 
-    assert connection["command"] == "python"
+    assert connection["command"] == launch["command"]
     assert connection["sandbox_required"] is True
 
 
@@ -586,6 +603,7 @@ async def test_npx_connector_runs_in_the_users_sandbox(db_users, monkeypatch):
     )
 
     assert result.outcome is ConnectorToolsOutcome.OK
+    assert "sandbox_required" not in loader.calls[0][0]["google-maps"]
     assert loader.calls[0][1]["sandbox"] is manager.lease
     assert manager.released == [("tools", str(user.id))]
 

@@ -5053,13 +5053,17 @@ class WebToolConfig(BaseToolConfig):
                     get_app_for_mcp_server,
                     is_user_owned_server,
                 )
+                from ...web.models.mcp import MCPServer
 
                 def is_canonical_catalog_stdio(server: Any) -> bool:
+                    # Actor-only tests and snapshot resolvers intentionally
+                    # expose stable identity fields only.  Runtime execution
+                    # classification applies to persisted MCP rows, not those
+                    # lightweight identity projections.
+                    if not isinstance(server, MCPServer):
+                        return False
                     if str(server.transport or "").lower() != "stdio":
                         return False
-                    # A custom row may supply auth.app_id itself. Catalog rows
-                    # are shared (ownerless) and must still match the vetted
-                    # launch command and args exactly.
                     if is_user_owned_server(self.db, int(server.id)):
                         return False
                     app = get_app_for_mcp_server(self.db, server)
@@ -5074,14 +5078,33 @@ class WebToolConfig(BaseToolConfig):
                     expected_args = launch.get("args")
                     if expected_args is None:
                         expected_args = []
-                    return (
-                        server.command == launch.get("command")
-                        and (server.args or []) == expected_args
+                    marker = launch.get("builtin_provenance")
+                    expected_auth = (
+                        {"builtin_provenance": marker}
+                        if isinstance(marker, Mapping)
+                        else None
+                    )
+                    required_env = launch.get("required_env") or []
+                    if not isinstance(required_env, list) or not all(
+                        isinstance(key, str) for key in required_env
+                    ):
+                        return False
+                    actual_env: Any = server.env or {}
+                    if not isinstance(actual_env, Mapping):
+                        return False
+                    return bool(
+                        str(server.name or "") == str(app.get("id") or "")
+                        and cast(Any, server.auth) == expected_auth
+                        and cast(Any, server.command) == launch.get("command")
+                        and cast(Any, server.args or []) == expected_args
+                        and not server.cwd
+                        and set(actual_env).issubset(required_env)
                     )
 
                 custom_stdio_ids = {
                     int(server.id)
                     for server in servers
+                    if isinstance(server, MCPServer)
                     if str(server.transport or "").lower() == "stdio"
                     and not is_canonical_catalog_stdio(server)
                 }

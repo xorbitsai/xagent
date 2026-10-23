@@ -286,7 +286,11 @@ docker compose \
 
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
-expanded inside the backend container.
+expanded inside the backend container. Read-write sources must be writable by
+the sandbox identity (uid 1100/gid 1010); do not make them world-writable.
+The backend process that prepares managed workspace bind roots must run as
+root or with `CAP_CHOWN` so it can assign gid 1010. Other sandbox backends do
+not perform this host ownership change.
 
 Sandbox workspace guest paths are reserved below
 `<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
@@ -306,6 +310,9 @@ Custom stdio MCP servers require a sandbox and fail closed when no sandbox
 lease is available; they are never launched in the backend process. Catalog
 `npx`/`uvx` connectors prefer the sandbox when sandboxing is enabled, while a
 deployment with `SANDBOX_ENABLED=false` keeps their legacy host execution.
+Before upgrading, enable and verify a sandbox backend for every existing
+custom stdio server; leaving `SANDBOX_ENABLED=false` makes those custom
+connections unavailable by design.
 Custom commands and `cwd` values are interpreted inside the sandbox, so
 host-only binaries and host paths must be installed or mounted there. Docker
 sandboxes run as uid 1100/gid 1010 with all Linux
@@ -313,7 +320,10 @@ capabilities dropped and `no-new-privileges`; `SANDBOX_PIDS_LIMIT` controls the
 per-sandbox process/thread limit (default `1024`, minimum `64`). BoxLite egress
 is public-only: loopback, link-local, private, carrier-grade NAT, multicast,
 documentation, benchmark, and otherwise non-global address ranges are denied.
-There is intentionally no private-CIDR allowlist override.
+There is intentionally no private-CIDR allowlist override. Consequently,
+`XAGENT_SSH_ALLOW_CIDRS` cannot make a private SSH target reachable from a
+BoxLite sandbox; use the Docker backend with an explicitly reviewed network
+policy when private SSH access is required.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import posixpath
@@ -92,10 +91,8 @@ def requires_sandbox_mcp_connection(connection: Connection) -> bool:
 
 
 def _serialize_connection(connection: Connection) -> str:
-    """Serialize a connection dict for sandbox transport."""
-    return base64.b64encode(
-        json.dumps(connection, ensure_ascii=False).encode("utf-8")
-    ).decode("ascii")
+    """Serialize a connection dict for a private sandbox-side file."""
+    return json.dumps(connection, ensure_ascii=False)
 
 
 async def list_tools_in_sandbox(
@@ -106,7 +103,7 @@ async def list_tools_in_sandbox(
 ) -> list[MCPTool]:
     """List MCP tools by creating the MCP session inside sandbox."""
     result_file = f"/tmp/xagent_mcp_tools_{uuid.uuid4().hex}.json"
-    connection_b64 = _serialize_connection(connection)
+    connection_file = f"/tmp/xagent_mcp_connection_{uuid.uuid4().hex}.json"
 
     # `sandbox` may be a SandboxLeaseProvider (no exec/read_file/name of its
     # own) rather than a real Sandbox -- unwrap to the primary sandbox, since
@@ -116,6 +113,9 @@ async def list_tools_in_sandbox(
     await SandboxDependencyManager.ensure_requirements(
         target_sandbox, _SANDBOX_MCP_DEPENDENCIES
     )
+    await target_sandbox.write_file(
+        _serialize_connection(connection), connection_file, overwrite=False
+    )
 
     try:
         try:
@@ -123,8 +123,8 @@ async def list_tools_in_sandbox(
                 target_sandbox.exec(
                     "python",
                     _MCP_RUNNER_PATH,
-                    "--connection-b64",
-                    connection_b64,
+                    "--connection-file",
+                    connection_file,
                     "--result-file",
                     result_file,
                     env={"PYTHONPATH": SANDBOX_SRC_ROOT},
@@ -185,7 +185,7 @@ async def list_tools_in_sandbox(
         return tools
     finally:
         try:
-            await target_sandbox.exec("rm", "-f", result_file)
+            await target_sandbox.exec("rm", "-f", connection_file, result_file)
         except Exception:
             pass
 

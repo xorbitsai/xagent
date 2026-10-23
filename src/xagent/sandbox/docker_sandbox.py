@@ -12,6 +12,7 @@ import os
 import posixpath
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 import textwrap
@@ -37,6 +38,7 @@ from ..config import (
     validate_sandbox_namespace,
 )
 from .base import (
+    SANDBOX_RUNTIME_GID,
     SPEC_CONTRACT_VERSION,
     CodeType,
     ExecResult,
@@ -610,8 +612,24 @@ def _write_tar_from_local_path(
     local_path: str, arcname: str, file_obj: io.BufferedRandom
 ) -> None:
     """Pack a local file into a tar stream for Docker put_archive."""
-    with tarfile.open(fileobj=file_obj, mode="w") as tar:
-        tar.add(local_path, arcname=arcname)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    source_fd = os.open(local_path, flags)
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Sandbox uploads require a regular local file")
+        info = tarfile.TarInfo(name=arcname)
+        info.size = source_stat.st_size
+        info.uid = 1100
+        info.gid = 1010
+        info.mode = 0o600
+        with os.fdopen(source_fd, "rb", closefd=True) as source:
+            source_fd = -1
+            with tarfile.open(fileobj=file_obj, mode="w") as tar:
+                tar.addfile(info, source)
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
     file_obj.seek(0)
 
 
@@ -1488,6 +1506,8 @@ class DockerSandboxService(SandboxService):
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
+                pids_limit=config.pids_limit,
+                security_profile=config.security_profile,
             )
             extra_labels = {
                 LABEL_SPEC_FINGERPRINT: desired.fingerprint(),
@@ -1822,3 +1842,6 @@ class DockerSandboxService(SandboxService):
                     f"Failed to delete snapshot {snapshot_id}: {exc}"
                 ) from exc
         self._store.delete_snapshot(snapshot_id)
+
+    def host_workspace_gid(self) -> int | None:
+        return SANDBOX_RUNTIME_GID

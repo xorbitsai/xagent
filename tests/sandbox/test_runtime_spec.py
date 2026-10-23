@@ -83,7 +83,7 @@ def _make_inspection(**overrides) -> SandboxInspection:
     return SandboxInspection(**kwargs)
 
 
-def test_workspace_access_is_granted_without_following_symlinks(tmp_path, monkeypatch):
+def test_workspace_access_grants_only_the_mount_root(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir(mode=0o700)
     nested = workspace / "nested"
@@ -96,15 +96,16 @@ def test_workspace_access_is_granted_without_following_symlinks(tmp_path, monkey
     outside.chmod(0o600)
     (workspace / "outside-link").symlink_to(outside)
 
-    monkeypatch.setattr("xagent.sandbox.base.os.chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args, **kwargs: None)
     grant_sandbox_runtime_access(workspace)
 
     workspace_mode = stat.S_IMODE(workspace.stat().st_mode)
     nested_mode = stat.S_IMODE(nested.stat().st_mode)
     source_mode = stat.S_IMODE(source.stat().st_mode)
     assert workspace_mode & 0o070 == 0o070
-    assert nested_mode & 0o070 == 0o070
-    assert source_mode & 0o060 == 0o060
+    assert workspace_mode & stat.S_ISGID
+    assert nested_mode == 0o700
+    assert source_mode == 0o600
     assert workspace_mode & 0o007 == 0
     assert nested_mode & 0o007 == 0
     assert source_mode & 0o006 == 0
@@ -120,8 +121,8 @@ def test_workspace_access_fails_closed_when_gid_cannot_be_assigned(
     def refuse_chown(*args, **kwargs):
         raise PermissionError("not permitted")
 
-    monkeypatch.setattr("xagent.sandbox.base.os.chown", refuse_chown)
-    with pytest.raises(PermissionError, match="not permitted"):
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", refuse_chown)
+    with pytest.raises(SandboxContractError, match="root or CAP_CHOWN"):
         grant_sandbox_runtime_access(workspace)
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
 

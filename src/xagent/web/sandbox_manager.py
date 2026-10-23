@@ -1008,43 +1008,36 @@ class SandboxManager:
         actually bind-mounted. Extra/allowlist mounts are unaffected.
         """
 
-        def prepare() -> None:
-            for backend_path, should_create in self._workspace_mount_paths(
-                lifecycle_type, lifecycle_id, mount_intent
+        for backend_path, should_create in self._workspace_mount_paths(
+            lifecycle_type, lifecycle_id, mount_intent
+        ):
+            target = backend_path
+            if (
+                should_create
+                and prepare_root is not None
+                and mount_intent is not None
+                # Identifies the mount-root entry (there is at most one) so
+                # ``prepare_root`` only redirects that path, never an
+                # extra/allowlist mount. ``backend_path`` here is exactly
+                # ``Path(mount_intent.mount_root)`` (see
+                # ``_workspace_mount_paths``), so this comparison reduces to
+                # ``str(Path(c)) == c`` for ``c = mount_intent.mount_root``.
+                # That holds because ``mount_intent.mount_root`` always
+                # passed through ``canonical_sandbox_path``, which is a
+                # fixed point of ``Path``: ``str(Path(canonical_sandbox_path(
+                # x))) == canonical_sandbox_path(x)`` — not because its
+                # normalization is a subset of ``Path``'s own (it is not:
+                # e.g. ``canonical_sandbox_path("/a/b/..") == "/a"`` while
+                # ``str(Path("/a/b/.."))`` leaves the ``..`` unresolved). If
+                # the normalizer ever stops being idempotent under ``Path``,
+                # this comparison can start missing the mount root.
+                and str(backend_path) == mount_intent.mount_root
             ):
-                target = backend_path
-                if (
-                    should_create
-                    and prepare_root is not None
-                    and mount_intent is not None
-                    # Identifies the mount-root entry (there is at most one) so
-                    # ``prepare_root`` only redirects that path, never an
-                    # extra/allowlist mount. ``backend_path`` here is exactly
-                    # ``Path(mount_intent.mount_root)`` (see
-                    # ``_workspace_mount_paths``), so this comparison reduces to
-                    # ``str(Path(c)) == c`` for ``c = mount_intent.mount_root``.
-                    # That holds because ``mount_intent.mount_root`` always
-                    # passed through ``canonical_sandbox_path``, which is a
-                    # fixed point of ``Path``: ``str(Path(canonical_sandbox_path(
-                    # x))) == canonical_sandbox_path(x)`` — not because its
-                    # normalization is a subset of ``Path``'s own (it is not:
-                    # e.g. ``canonical_sandbox_path("/a/b/..") == "/a"`` while
-                    # ``str(Path("/a/b/.."))`` leaves the ``..`` unresolved). If
-                    # the normalizer ever stops being idempotent under ``Path``,
-                    # this comparison can start missing the mount root.
-                    and str(backend_path) == mount_intent.mount_root
-                ):
-                    target = Path(prepare_root)
-                if should_create or target.exists():
-                    os.makedirs(target, exist_ok=True)
-                if should_create:
-                    grant_sandbox_runtime_access(target)
-
-        # Directory walks can be large and this method is called while the
-        # async lifecycle lock is held. Keep filesystem traversal off the
-        # event loop and propagate failures so a sandbox is never leased with
-        # a partially prepared workspace.
-        await asyncio.to_thread(prepare)
+                target = Path(prepare_root)
+            if should_create or target.exists():
+                os.makedirs(target, exist_ok=True)
+            if should_create and self._service.host_workspace_gid() is not None:
+                grant_sandbox_runtime_access(target)
 
     @staticmethod
     def _config_equivalent(
@@ -1252,12 +1245,6 @@ class SandboxManager:
         cached_spec = self._config_cache.get(sandbox_name)
         if cached_spec is not None:
             self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
-            await self._prepare_workspace_mounts(
-                lifecycle_type,
-                lifecycle_id,
-                mount_intent,
-                prepare_root=prepare_root,
-            )
             return self._cache[sandbox_name]
 
         probe = await self._resolve_backend_probe()
@@ -1586,6 +1573,9 @@ class SandboxManager:
         ordinary absent-\\>create path instead, re-inspecting under the
         now-free gate and creating the (confirmed-absent) sandbox fresh.
         """
+        await self._prepare_workspace_mounts(
+            lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
+        )
         cap = get_sandbox_max_containers()
         try:
             if cap is None:
@@ -1986,10 +1976,8 @@ class SandboxManager:
         (every pop site drops both together), so the comparison never
         degrades to "no cached spec, allow".
 
-        ``prepare_root``, when given, is only consulted on that cache miss
-        (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
-        and ``_prepare_workspace_mounts``; a cache hit never creates
-        directories at all.
+        ``prepare_root`` is used while initially creating or reconciling the
+        sandbox. Cached providers do not repeat mount preparation.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
@@ -2003,12 +1991,6 @@ class SandboxManager:
                         self._build_runtime_spec(
                             lifecycle_type, lifecycle_id, mount_intent=mount_intent
                         ),
-                    )
-                    await self._prepare_workspace_mounts(
-                        lifecycle_type,
-                        lifecycle_id,
-                        mount_intent,
-                        prepare_root=prepare_root,
                     )
                     self._touch_locked(base_name)
                     return provider

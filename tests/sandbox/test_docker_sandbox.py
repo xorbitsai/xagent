@@ -13,7 +13,6 @@ import socket
 import tarfile
 import tempfile
 import uuid
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,15 +20,18 @@ import pytest
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
+    ResolvedSandboxRuntimeSpec,
     SandboxConfig,
     SandboxTemplate,
-    grant_sandbox_runtime_access,
+    SpecVerdict,
+    spec_matches_inspection,
 )
 from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
     _SandboxControl,
     _write_tar_from_content,
+    _write_tar_from_local_path,
     is_docker_available,
 )
 
@@ -44,6 +46,24 @@ def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
         assert info.uid == 1100
         assert info.gid == 1010
         assert info.mode == 0o600
+
+
+def test_write_tar_local_path_normalizes_owner_and_mode(tmp_path) -> None:
+    source = tmp_path / "id_key"
+    source.write_text("secret", encoding="utf-8")
+    source.chmod(0o400)
+    archive = io.BytesIO()
+
+    _write_tar_from_local_path(str(source), "id_key", archive)
+
+    with tarfile.open(fileobj=archive, mode="r") as tar:
+        info = tar.getmember("id_key")
+        assert info.uid == 1100
+        assert info.gid == 1010
+        assert info.mode == 0o600
+        extracted = tar.extractfile(info)
+        assert extracted is not None
+        assert extracted.read() == b"secret"
 
 
 @pytest.fixture(scope="module")
@@ -729,9 +749,6 @@ class TestDockerSandboxService:
             template = SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
 
             temp_dir = tempfile.mkdtemp()
-            # Match the manager's task-workspace preparation. This grants the
-            # sandbox group access without making the workspace world-writable.
-            grant_sandbox_runtime_access(Path(temp_dir))
             host_port = _get_free_host_port()
             config = SandboxConfig(
                 cpus=2,
@@ -740,18 +757,33 @@ class TestDockerSandboxService:
                     "MY_VAR": "hello",
                 },
                 volumes=[
-                    (temp_dir, "/mnt/data", "rw"),  # Read-write mount
+                    (temp_dir, "/mnt/data", "ro"),
                 ],
                 network_isolated=False,
                 ports=[
                     (host_port, 80),  # Host dynamic port -> Container 80
                 ],
+                pids_limit=256,
+                security_profile="nonroot-public-egress-v1",
             )
-            sandbox = await service.get_or_create(
-                name,
-                template=template,
-                config=config,
+            sandbox = await service.create(name, template, config)
+
+            inspection = await service.inspect(name)
+            assert inspection is not None
+            desired = ResolvedSandboxRuntimeSpec.from_parts(
+                template_type="image",
+                image=DEFAULT_SANDBOX_IMAGE,
+                working_dir=config.working_dir,
+                cpus=config.cpus,
+                memory=config.memory,
+                env=config.env,
+                volumes=config.volumes,
+                network_isolated=bool(config.network_isolated),
+                ports=config.ports,
+                pids_limit=config.pids_limit,
+                security_profile=config.security_profile,
             )
+            assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
 
             # Check status
             info = await sandbox.info()
@@ -774,14 +806,6 @@ class TestDockerSandboxService:
             result = await sandbox.exec("test", "-d", "/mnt/data")
             assert result.exit_code == 0
             print("✓ Volume mount configuration effective")
-
-            # Write file in mounted volume, verify visible on host
-            await sandbox.exec("sh", "-c", "echo 'test' > /mnt/data/test.txt")
-            host_file = os.path.join(temp_dir, "test.txt")
-            assert os.path.exists(host_file)
-            with open(host_file, "r") as f:
-                assert f.read().strip() == "test"
-            print("✓ Volume mount read-write normal")
 
             # Verify port mapping is effective
             # Start HTTP server inside sandbox (port 80 in container)
@@ -1540,6 +1564,8 @@ class TestDockerSandbox:
     @pytest.mark.asyncio(loop_scope="module")
     async def test_upload_download_with_volume(self, docker_service):
         """Test upload/download compatibility with volume mounts"""
+        if os.geteuid() != 0:
+            pytest.skip("writable fixed-uid bind-mount test requires host CAP_CHOWN")
         name = "test_upload_download_with_volume"
         service = docker_service
 

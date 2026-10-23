@@ -1409,8 +1409,8 @@ async def test_tool_factory_keeps_actor_stdio_session_identity_out_of_connection
             _serialize_connection,
         )
 
-        argv_payload = base64.b64decode(_serialize_connection(connection_config))
-        assert owner_bytes not in argv_payload
+        file_payload = _serialize_connection(connection_config).encode()
+        assert owner_bytes not in file_payload
         import cloudpickle
 
         pickled = base64.b64decode(

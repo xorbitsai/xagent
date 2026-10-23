@@ -824,7 +824,7 @@ class TestProviderCacheMountIntentGate:
         assert set(service._containers) == {"user::1"}
 
     @pytest.mark.asyncio
-    async def test_cached_provider_prepares_each_new_task_root(
+    async def test_cached_provider_does_not_repeat_mount_preparation(
         self, _env, tmp_path, monkeypatch
     ) -> None:
         prepared: list[Path] = []
@@ -835,20 +835,20 @@ class TestProviderCacheMountIntentGate:
         monkeypatch.setattr(
             sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
         )
-        manager, _service = _make_manager()
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
         intent = _intent(tmp_path, "user-root")
-        first_task = tmp_path / "user-root" / "web_task_1"
-        second_task = tmp_path / "user-root" / "web_task_2"
+        user_root = tmp_path / "user-root"
 
         first = await manager.get_or_create_lease_provider(
-            "user", "1", mount_intent=intent, prepare_root=str(first_task)
+            "user", "1", mount_intent=intent, prepare_root=str(user_root)
         )
         second = await manager.get_or_create_lease_provider(
-            "user", "1", mount_intent=intent, prepare_root=str(second_task)
+            "user", "1", mount_intent=intent, prepare_root=str(user_root)
         )
 
         assert second is first
-        assert prepared == [first_task, second_task]
+        assert prepared == [user_root]
 
 
 class TestReadinessReservedUploadsSubtree:

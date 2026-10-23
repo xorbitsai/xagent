@@ -6,6 +6,10 @@ scoped keys), the workspace's scoped canonical roots, and the allowed-path
 enforcement confining scoped executions.
 """
 
+import os
+import stat
+from pathlib import Path
+
 import pytest
 
 from xagent.core.execution_scope import (
@@ -146,6 +150,39 @@ class TestScopedWorkspace:
             workspace.workspace_dir
             == (tmp_path / "user_7" / "tenant-a" / "proj-1" / "web_task_5").resolve()
         )
+
+    def test_task_directories_inherit_sandbox_group_write(self, tmp_path, monkeypatch):
+        base = tmp_path / "user_7"
+        base.mkdir()
+        real_stat = Path.stat
+
+        def sandbox_root_stat(path: Path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == base:
+                values = list(result)
+                values[0] |= stat.S_ISGID
+                values[5] = 1010
+                return os.stat_result(values)
+            return result
+
+        assigned_gids: list[int] = []
+        monkeypatch.setattr(Path, "stat", sandbox_root_stat)
+        monkeypatch.setattr(
+            "xagent.core.workspace.os.fchown",
+            lambda _fd, _uid, gid: assigned_gids.append(gid),
+        )
+
+        workspace = TaskWorkspace("web_task_5", str(base))
+
+        for directory in (
+            workspace.workspace_dir,
+            workspace.input_dir,
+            workspace.output_dir,
+            workspace.temp_dir,
+        ):
+            mode = stat.S_IMODE(real_stat(directory).st_mode)
+            assert mode & 0o2070 == 0o2070
+        assert assigned_gids == [1010, 1010, 1010, 1010]
 
     def test_two_scopes_produce_disjoint_workspace_dirs(self, tmp_path):
         ws_a = self._scoped_workspace(tmp_path, ("tenant-a",))

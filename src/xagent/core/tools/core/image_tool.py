@@ -159,7 +159,7 @@ transparent-background support):
 **IMPORTANT: Prefer the default model marked with ⭐[DEFAULT]. Only specify model_id if the user explicitly requests a different model.**
 
 Parameters:
-- image_url (required): single image path/URL/file_id (supports bare `file_id`, `file:file_id`, and `file://file_id`) or a list of image paths/URLs/file_ids for multi-image editing. Local paths must resolve inside this task's workspace; use a FileRef for a durable user-owned upload.
+- image_url (required): single image path/URL/file_id (supports bare `file_id`, `file:file_id`, and `file://file_id`) or a list of image paths/URLs/file_ids for multi-image editing. Local paths must be authorized by this task's workspace policy and are staged before provider access; use a FileRef for a durable user-owned upload.
 - prompt (required): description of the desired edits and changes
 - negative_prompt (optional): brief, quality-focused exclusions; put critical constraints in the prompt
 - transparent_background (optional): return a PNG with a real alpha channel instead of an opaque background, e.g. to cut a subject out of its scene. Only models marked ◻ support it; the call fails on any other model. Asking for it in the prompt text does NOT work.
@@ -535,42 +535,29 @@ Images are automatically saved to workspace.
     def _resolve_edit_image_path(
         self, image_input: str, staged_paths: list[Path]
     ) -> str:
-        """Resolve one edit input and track any authorized staging copy."""
-        try:
+        """Stage one authorized edit input so providers cannot reopen a swap."""
+        if image_input.startswith(("http://", "https://", "data:image/")):
+            return image_input
+        if self._workspace is None:
             return self._resolve_image_path(image_input)
+        try:
+            staged_path = self._workspace.stage_path_for_external_upload(image_input)
         except (FileNotFoundError, ValueError) as path_error:
-            if self._workspace is None:
-                raise
-            try:
-                staged_path = self._workspace.stage_path_for_external_upload(
-                    image_input
-                )
-            except (FileNotFoundError, ValueError) as exc:
-                file_id = parse_file_id_ref(image_input)
-                if file_id is not None:
-                    try:
-                        staged_path = self._workspace.stage_file_for_external_upload(
-                            file_id
-                        )
-                    except (FileNotFoundError, ValueError):
-                        if isinstance(path_error, FileNotFoundError):
-                            raise path_error
-                        raise ValueError(
-                            "Access denied: local image is outside the task workspace"
-                        ) from exc
-                elif isinstance(path_error, FileNotFoundError):
+            file_id = parse_file_id_ref(image_input)
+            if file_id is None:
+                if isinstance(path_error, FileNotFoundError):
                     raise path_error
-                else:
-                    raise ValueError(
-                        "Access denied: local image is outside the task workspace"
-                    ) from exc
-            try:
-                resolved = self._resolve_image_path(str(staged_path))
-            except BaseException:
-                self._workspace.discard_staged_external_upload(staged_path)
-                raise
-            staged_paths.append(staged_path)
-            return resolved
+                raise ValueError(
+                    "Access denied: local image is outside the task workspace"
+                ) from path_error
+            staged_path = self._workspace.stage_file_for_external_upload(file_id)
+        try:
+            resolved = self._resolve_image_path(str(staged_path))
+        except BaseException:
+            self._workspace.discard_staged_external_upload(staged_path)
+            raise
+        staged_paths.append(staged_path)
+        return resolved
 
     def _normalize_image_inputs(self, image: str | list[str]) -> list[str]:
         """Normalize image inputs to a non-empty list of strings."""

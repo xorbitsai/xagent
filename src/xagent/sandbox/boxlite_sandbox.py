@@ -277,18 +277,25 @@ class BoxliteSandbox(Sandbox):
             logger.exception("Failed to acquire BoxLite stderr stream")
             stderr_stream = None
 
-        (stdout, stdout_truncated), (stderr, stderr_truncated) = await asyncio.gather(
-            _collect_capped_stream(stdout_stream, max_output_bytes),
-            _collect_capped_stream(stderr_stream, max_output_bytes),
-        )
+        stdout = stderr = ""
+        stdout_truncated = stderr_truncated = False
         error_message = None
         try:
-            raw_result = await execution.wait()
-            exit_code = raw_result.exit_code
-            error_message = raw_result.error_message
-        except Exception:  # noqa: BLE001 - native wait failure becomes exec failure
-            logger.exception("Failed to wait for BoxLite execution")
-            exit_code = -1
+            (
+                (stdout, stdout_truncated),
+                (stderr, stderr_truncated),
+            ) = await asyncio.gather(
+                _collect_capped_stream(stdout_stream, max_output_bytes),
+                _collect_capped_stream(stderr_stream, max_output_bytes),
+            )
+        finally:
+            try:
+                raw_result = await execution.wait()
+                exit_code = raw_result.exit_code
+                error_message = raw_result.error_message
+            except Exception:  # noqa: BLE001 - native wait failure becomes exec failure
+                logger.exception("Failed to wait for BoxLite execution")
+                exit_code = -1
 
         return ExecResult(
             exit_code=exit_code,

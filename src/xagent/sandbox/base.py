@@ -26,30 +26,43 @@ SANDBOX_RUNTIME_GID = 1010
 
 
 def grant_sandbox_runtime_access(root: Path) -> None:
-    """Make one task-workspace tree writable by the sandbox identity.
+    """Make one sandbox mount root writable by the sandbox identity.
 
-    The grant is group-only and fails closed when the host process cannot
-    assign the sandbox gid. Falling back to ``other`` permissions would make
-    every file in the user's workspace writable by unrelated host users.
-    Symlinks are never followed or modified.
+    This deliberately changes only the mount root.  Descendants inherit gid
+    1010 through setgid and task directories add group-write permission when
+    they are created.  Avoiding a recursive privileged walk makes lease cost
+    constant and removes the opportunity for a sandbox process to redirect a
+    path-based walk through a concurrently swapped symlink.
+
+    Every path component is opened relative to its parent with ``O_NOFOLLOW``
+    before the final directory is changed through its file descriptor.  The
+    backend must therefore run as root or with CAP_CHOWN; failure is explicit
+    and never falls back to world-writable permissions.
     """
+    absolute = root.absolute()
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
 
-    def grant(path: Path, *, directory: bool) -> None:
-        path_stat = os.stat(path, follow_symlinks=False)
-        if stat.S_ISLNK(path_stat.st_mode):
-            return
-        mode = path_stat.st_mode
-        os.chown(path, -1, SANDBOX_RUNTIME_GID, follow_symlinks=False)
-        group_bits = 0o2070 if directory else 0o060
-        path.chmod(mode | group_bits, follow_symlinks=False)
-
-    grant(root, directory=True)
-    for current_root, directories, files in os.walk(root, followlinks=False):
-        current = Path(current_root)
-        for name in directories:
-            grant(current / name, directory=True)
-        for name in files:
-            grant(current / name, directory=False)
+    current_fd = os.open(os.path.sep, flags)
+    try:
+        for component in absolute.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        root_stat = os.fstat(current_fd)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise NotADirectoryError(str(root))
+        try:
+            os.fchown(current_fd, -1, SANDBOX_RUNTIME_GID)
+            os.fchmod(current_fd, root_stat.st_mode | 0o2070)
+        except PermissionError as exc:
+            raise SandboxContractError(
+                "Docker workspace preparation requires root or CAP_CHOWN "
+                f"to assign gid {SANDBOX_RUNTIME_GID}: {root}"
+            ) from exc
+    finally:
+        os.close(current_fd)
 
 
 class ExactGenerationProbe(str, Enum):
@@ -1026,6 +1039,15 @@ class SandboxService(abc.ABC):
         this to return True.
         """
         return False
+
+    def host_workspace_gid(self) -> int | None:
+        """Host gid required for writable bind mounts, if any.
+
+        Backends such as BoxLite do not need host ownership changes.  Docker
+        overrides this so the web layer prepares only the bind roots that
+        actually need the fixed in-container runtime group.
+        """
+        return None
 
     async def inspect(self, name: str) -> Optional[SandboxInspection]:
         """Observe a sandbox's current state and runtime facts.

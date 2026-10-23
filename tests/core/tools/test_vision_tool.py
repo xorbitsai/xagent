@@ -119,6 +119,25 @@ def mock_workspace():
 
     workspace.resolve_path_with_search = Mock(side_effect=mock_resolve_path_with_search)
 
+    staging_dir = temp_dir / ".vision-staging"
+    staged_index = 0
+
+    def stage_path_for_external_upload(filename):
+        nonlocal staged_index
+        source = workspace.resolve_path_with_search(filename)
+        staging_dir.mkdir(exist_ok=True)
+        staged_index += 1
+        target = staging_dir / f"{staged_index}-{Path(source).name}"
+        target.write_bytes(Path(source).read_bytes())
+        return target
+
+    workspace.stage_path_for_external_upload = Mock(
+        side_effect=stage_path_for_external_upload
+    )
+    workspace.discard_staged_external_upload = Mock(
+        side_effect=lambda path: Path(path).unlink(missing_ok=True)
+    )
+
     # Mock auto_register_files to return a proper context manager
     @contextmanager
     def auto_register_files():

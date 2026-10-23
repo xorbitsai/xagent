@@ -10,6 +10,7 @@ which do not delegate to one another).
 """
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,27 @@ def test_resolve_path_allows_legitimate_relative_path(workspace):
 
     assert resolved.is_relative_to(workspace.workspace_dir.resolve())
     assert resolved == (workspace.output_dir / "report.txt").resolve()
+
+
+def test_stage_path_copies_regular_file_and_cleanup_is_confined(workspace):
+    source = workspace.output_dir / "report.txt"
+    source.write_text("original", encoding="utf-8")
+
+    staged = workspace.stage_path_for_external_upload("output/report.txt")
+    source.write_text("changed", encoding="utf-8")
+
+    assert staged.read_text(encoding="utf-8") == "original"
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    workspace.discard_staged_external_upload(staged)
+    assert not staged.exists()
+
+
+def test_stage_path_rejects_non_regular_file(workspace):
+    directory = workspace.output_dir / "folder"
+    directory.mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        workspace.stage_path_for_external_upload("output/folder")
 
 
 def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(

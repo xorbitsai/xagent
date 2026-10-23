@@ -30,9 +30,9 @@ URLs came from a model provider. The downloader now:
   existing data-URL workflows remain supported.
 - Restricts image-edit source reads to the current task workspace as well.
   Durable `file:`, `file://`, and bare file IDs are staged into task scratch
-  for the provider call and removed afterwards. Arbitrary absolute paths and
-  `allowed_external_dirs` paths are intentionally not accepted by this tool;
-  import/register the file and pass its FileRef instead.
+  for the provider call and removed afterwards. Workspace-authorized
+  `allowed_external_dirs` paths are also copied into private task staging;
+  arbitrary host paths outside the workspace policy remain rejected.
 
 The default remote limits are 64 MiB for images and 512 MiB for videos; change
 `XAGENT_IMAGE_DOWNLOAD_MAX_BYTES` / `XAGENT_VIDEO_DOWNLOAD_MAX_BYTES` with positive

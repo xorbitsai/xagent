@@ -679,6 +679,38 @@ class TestImageGenerationToolCore:
         assert model.edit_image.await_args.kwargs["image_url"] == str(staged_path)
         workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
 
+    @pytest.mark.asyncio
+    async def test_edit_image_discards_staged_input_when_provider_fails(
+        self, mock_image_models, tmp_path
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        staged_path = workspace_root / ".staged" / "source.png"
+        staged_path.parent.mkdir()
+        staged_path.write_bytes(b"source")
+        workspace = Mock()
+        workspace.workspace_dir = workspace_root
+        workspace.output_dir = workspace_root / "output"
+        workspace.output_dir.mkdir()
+        workspace.stage_path_for_external_upload = Mock(return_value=staged_path)
+        workspace.resolve_path_with_search = Mock(return_value=staged_path)
+        workspace.discard_staged_external_upload = Mock()
+
+        @contextmanager
+        def auto_register_files():
+            yield workspace
+
+        workspace.auto_register_files = auto_register_files
+        model = mock_image_models["model1"]
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(side_effect=RuntimeError("provider failed"))
+        tool = ImageGenerationToolCore({"model1": model}, workspace=workspace)
+
+        result = await tool.edit_image(prompt="edit", image_url="output/source.png")
+
+        assert result["success"] is False
+        workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
+
     def test_edit_image_rejects_arbitrary_absolute_path(
         self, mock_image_models, tmp_path
     ):

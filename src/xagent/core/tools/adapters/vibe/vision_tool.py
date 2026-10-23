@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
-from xagent.core.utils.media_download import resolve_workspace_media_path
 from xagent.core.workspace import TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
@@ -78,17 +77,11 @@ class VisionTool:
             return media_path
 
         try:
-            resolved_path = self.workspace.resolve_path_with_search(media_path)
+            safe_path = self.workspace.stage_path_for_external_upload(media_path)
         except FileNotFoundError:
             return media_path
-        try:
-            safe_path = resolve_workspace_media_path(
-                Path(resolved_path), self.workspace.workspace_dir
-            )
-        except ValueError:
-            safe_path = self.workspace.stage_path_for_external_upload(media_path)
-            if staged_paths is not None:
-                staged_paths.append(safe_path)
+        if staged_paths is not None:
+            staged_paths.append(safe_path)
         if not safe_path.is_file():
             raise FileNotFoundError(f"Media file not found: {media_path}")
         return str(safe_path)

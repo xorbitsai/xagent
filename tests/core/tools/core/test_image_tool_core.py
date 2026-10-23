@@ -10,6 +10,7 @@ import pytest
 
 from xagent.core.model.image.base import BaseImageModel
 from xagent.core.tools.core.image_tool import ImageGenerationToolCore
+from xagent.core.workspace import ExternalUploadStagingError
 
 
 @pytest.fixture
@@ -733,6 +734,19 @@ class TestImageGenerationToolCore:
             "/etc/passwd", max_bytes=64 * 1024 * 1024
         )
         workspace.stage_file_for_external_upload.assert_not_called()
+
+    def test_edit_image_preserves_staging_failure_reason(
+        self, mock_image_models, tmp_path
+    ):
+        workspace = Mock()
+        workspace.workspace_dir = tmp_path
+        workspace.stage_path_for_external_upload = Mock(
+            side_effect=ExternalUploadStagingError("staging is read-only")
+        )
+        tool = ImageGenerationToolCore(mock_image_models, workspace=workspace)
+
+        with pytest.raises(ExternalUploadStagingError, match="staging is read-only"):
+            tool._resolve_edit_image_path("output/source.png", [])
 
     @pytest.mark.asyncio
     @patch("aiohttp.ClientSession.get")

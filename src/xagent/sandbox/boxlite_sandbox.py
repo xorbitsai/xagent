@@ -15,7 +15,7 @@ import textwrap
 import uuid
 from typing import Any, Optional, TypeVar
 
-import boxlite  # type: ignore[import-not-found]
+import boxlite  # type: ignore[import-not-found,import-untyped,unused-ignore]
 from boxlite import SimpleBox
 
 from ..config import get_sandbox_image
@@ -33,6 +33,7 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
+_EXECUTION_KILL_TIMEOUT_SECONDS = 5.0
 
 # BoxLite's allow_net is enforced against the resolved connection destination.
 # Build an allowlist that is the IPv4 Internet minus IANA special-use ranges,
@@ -75,6 +76,16 @@ _NON_PUBLIC_IPV6 = tuple(
 
 
 _Network = TypeVar("_Network", ipaddress.IPv4Network, ipaddress.IPv6Network)
+
+
+async def _kill_execution_bounded(execution: Any, reason: str) -> None:
+    """Best-effort guest termination that cannot replace one hang with another."""
+    try:
+        await asyncio.wait_for(
+            execution.kill(), timeout=_EXECUTION_KILL_TIMEOUT_SECONDS
+        )
+    except Exception:  # noqa: BLE001 - preserve the original failure/cancellation
+        logger.exception("Failed to kill %s BoxLite execution", reason)
 
 
 def _subtract_networks(
@@ -288,14 +299,23 @@ class BoxliteSandbox(Sandbox):
                 _collect_capped_stream(stdout_stream, max_output_bytes),
                 _collect_capped_stream(stderr_stream, max_output_bytes),
             )
-        finally:
-            try:
-                raw_result = await execution.wait()
-                exit_code = raw_result.exit_code
-                error_message = raw_result.error_message
-            except Exception:  # noqa: BLE001 - native wait failure becomes exec failure
-                logger.exception("Failed to wait for BoxLite execution")
-                exit_code = -1
+        except asyncio.CancelledError:
+            await _kill_execution_bounded(execution, "cancelled")
+            raise
+        except BaseException:
+            await _kill_execution_bounded(execution, "failed")
+            raise
+
+        try:
+            raw_result = await execution.wait()
+            exit_code = raw_result.exit_code
+            error_message = raw_result.error_message
+        except asyncio.CancelledError:
+            await _kill_execution_bounded(execution, "cancelled")
+            raise
+        except Exception:  # noqa: BLE001 - native wait failure becomes exec failure
+            logger.exception("Failed to wait for BoxLite execution")
+            exit_code = -1
 
         return ExecResult(
             exit_code=exit_code,
@@ -696,6 +716,9 @@ class BoxliteSandboxService(SandboxService):
         that up front instead of hitting that exception.
         """
         return False
+
+    def runtime_security_profile(self) -> str | None:
+        return "nonroot-public-egress-v1"
 
     async def create_snapshot(self, name: str, snapshot_id: str) -> SandboxSnapshot:
         raise NotImplementedError("Unsupported")

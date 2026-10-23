@@ -23,7 +23,7 @@ from ...utils.media_download import (
     download_public_media,
     resolve_workspace_media_path,
 )
-from ...workspace import TaskWorkspace
+from ...workspace import ExternalUploadStagingError, TaskWorkspace
 
 logger = logging.getLogger(__name__)
 
@@ -545,6 +545,8 @@ Images are automatically saved to workspace.
                 image_input,
                 max_bytes=get_media_download_max_bytes("image"),
             )
+        except ExternalUploadStagingError:
+            raise
         except (FileNotFoundError, ValueError) as path_error:
             file_id = parse_file_id_ref(image_input)
             if file_id is None:
@@ -564,6 +566,25 @@ Images are automatically saved to workspace.
             raise
         staged_paths.append(staged_path)
         return resolved
+
+    async def _resolve_edit_image_path_async(
+        self, image_input: str, staged_paths: list[Path]
+    ) -> str:
+        """Stage without blocking the event loop or leaking on cancellation."""
+        task = asyncio.create_task(
+            asyncio.to_thread(self._resolve_edit_image_path, image_input, staged_paths)
+        )
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            raise
 
     def _normalize_image_inputs(self, image: str | list[str]) -> list[str]:
         """Normalize image inputs to a non-empty list of strings."""
@@ -894,10 +915,13 @@ Images are automatically saved to workspace.
                 }
 
             image_inputs = self._normalize_image_inputs(image_url)
-            resolved_image_paths = [
-                self._resolve_edit_image_path(image_input, staged_image_paths)
-                for image_input in image_inputs
-            ]
+            resolved_image_paths = []
+            for image_input in image_inputs:
+                resolved_image_paths.append(
+                    await self._resolve_edit_image_path_async(
+                        image_input, staged_image_paths
+                    )
+                )
             logger.info(
                 f"Resolved image paths: {image_inputs} -> {resolved_image_paths}"
             )

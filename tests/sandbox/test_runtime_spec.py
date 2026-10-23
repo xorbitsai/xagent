@@ -137,6 +137,29 @@ def test_workspace_access_fails_closed_when_gid_cannot_be_assigned(
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
 
 
+def test_workspace_access_accepts_trusted_symlinked_ancestor(tmp_path, monkeypatch):
+    real_root = tmp_path / "real-root"
+    workspace = real_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    requested_modes: list[int] = []
+    real_fchmod = os.fchmod
+
+    def record_fchmod(fd: int, mode: int) -> None:
+        requested_modes.append(mode)
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
+
+    grant_sandbox_runtime_access(linked_root / "workspace")
+
+    assert stat.S_IMODE(workspace.stat().st_mode) & 0o777 == 0o750
+    assert requested_modes == [0o2750]
+
+
 # --- ResolvedSandboxRuntimeSpec: field sensitivity ---
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import xagent.core.workspace as workspace_module
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
 
@@ -77,6 +78,22 @@ def test_stage_path_copies_regular_file_and_cleanup_is_confined(workspace):
     assert not staged.exists()
 
 
+def test_stage_path_uses_worker_safe_file_id_resolution(workspace, monkeypatch):
+    source = workspace.output_dir / "report.txt"
+    source.write_text("original", encoding="utf-8")
+    monkeypatch.setattr(workspace, "resolve_file_id_detached", lambda _file_id: source)
+
+    def fail_bound_resolution(_file_id):
+        raise AssertionError("caller-owned DB session must not reach the worker")
+
+    monkeypatch.setattr(workspace, "resolve_file_id", fail_bound_resolution)
+
+    staged = workspace.stage_path_for_external_upload("file-id")
+
+    assert staged.read_text(encoding="utf-8") == "original"
+    workspace.discard_staged_external_upload(staged)
+
+
 def test_stage_path_rejects_non_regular_file(workspace):
     directory = workspace.output_dir / "folder"
     directory.mkdir()
@@ -94,6 +111,67 @@ def test_stage_path_rejects_oversized_file_without_leaving_partial_copy(workspac
 
     staging_root = workspace.workspace_dir / ".xagent-upload-staging"
     assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+
+def test_sandbox_runner_stages_under_writable_temp_directory(workspace, monkeypatch):
+    source = workspace.output_dir / "report.txt"
+    source.write_text("sandbox output", encoding="utf-8")
+    internal_root = workspace.temp_dir / ".xagent-internal"
+    internal_root.mkdir(mode=0o770)
+    internal_inode = internal_root.stat().st_ino
+    real_fchmod = os.fchmod
+
+    def refuse_host_parent_chmod(fd: int, mode: int) -> None:
+        if os.fstat(fd).st_ino == internal_inode:
+            raise AssertionError("sandbox must not chmod a host-owned parent")
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(workspace_module, "in_sandbox_tool_runner", lambda: True)
+    monkeypatch.setattr(workspace_module.os, "fchmod", refuse_host_parent_chmod)
+
+    staged = workspace.stage_path_for_external_upload("output/report.txt")
+
+    expected_root = workspace.temp_dir / ".xagent-internal" / "mcp-upload"
+    assert staged.is_relative_to(expected_root)
+    assert staged.read_text(encoding="utf-8") == "sandbox output"
+    workspace.discard_staged_external_upload(staged)
+
+
+def test_permission_migration_repairs_nested_legacy_files(
+    workspace, tmp_path, monkeypatch
+):
+    nested = workspace.output_dir / "legacy" / "nested"
+    nested.mkdir(parents=True)
+    nested.chmod(0o700)
+    report = nested / "report.txt"
+    report.write_text("legacy", encoding="utf-8")
+    report.chmod(0o4600)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    outside.chmod(0o600)
+    (workspace.output_dir / "outside-link").symlink_to(outside)
+    requested_modes: list[int] = []
+    real_fchmod = os.fchmod
+
+    def record_fchmod(fd: int, mode: int) -> None:
+        requested_modes.append(mode)
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *args: None)
+    monkeypatch.setattr(workspace_module.os, "fchmod", record_fchmod)
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    workspace_fd = os.open(workspace.workspace_dir, flags)
+    try:
+        workspace._migrate_existing_sandbox_permissions(workspace_fd, flags)
+    finally:
+        os.close(workspace_fd)
+
+    assert stat.S_IMODE(nested.stat().st_mode) & 0o777 == 0o770
+    assert stat.S_IMODE(report.stat().st_mode) == 0o660
+    assert 0o2770 in requested_modes
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o600
+    assert (workspace.workspace_dir / ".xagent-permissions-v2").is_file()
 
 
 def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(

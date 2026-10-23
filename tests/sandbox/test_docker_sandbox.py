@@ -20,6 +20,7 @@ import pytest
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
+    SANDBOX_RUNTIME_GID,
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
     SandboxTemplate,
@@ -30,6 +31,7 @@ from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
     _SandboxControl,
+    _parse_container_config,
     _write_tar_from_content,
     _write_tar_from_local_path,
     is_docker_available,
@@ -64,6 +66,16 @@ def test_write_tar_local_path_normalizes_owner_and_mode(tmp_path) -> None:
         extracted = tar.extractfile(info)
         assert extracted is not None
         assert extracted.read() == b"secret"
+
+
+@pytest.mark.parametrize("raw_pids_limit", [0, -1, None])
+def test_inspect_treats_nonpositive_pids_limit_as_unset(raw_pids_limit) -> None:
+    container = _labeled_container({})
+    container.attrs["HostConfig"]["PidsLimit"] = raw_pids_limit
+
+    info = _parse_container_config(container)
+
+    assert info.config.pids_limit is None
 
 
 @pytest.fixture(scope="module")
@@ -1579,6 +1591,12 @@ class TestDockerSandbox:
 
             # Create temporary directory as volume
             temp_dir = tempfile.mkdtemp()
+            os.chown(temp_dir, -1, SANDBOX_RUNTIME_GID)
+            os.chmod(temp_dir, 0o2750)
+            runtime_output = os.path.join(temp_dir, "output")
+            os.mkdir(runtime_output, mode=0o770)
+            os.chown(runtime_output, -1, SANDBOX_RUNTIME_GID)
+            os.chmod(runtime_output, 0o2770)
             volume_file_path = os.path.join(temp_dir, "volume_file.txt")
             volume_content = "This file is in the mounted volume"
             with open(volume_file_path, "w") as f:
@@ -1650,6 +1668,19 @@ class TestDockerSandbox:
                     host_written_content = f.read()
                 assert host_written_content == write_content
                 print("✓ Sandbox write to volume directory, visible on host")
+
+                # Prove the container's runtime uid 1100 (not the Docker
+                # archive API) can create a file in a managed workspace dir.
+                runtime_write = await sandbox.exec(
+                    "sh",
+                    "-c",
+                    "printf runtime-write > /mnt/data/output/from-runtime.txt",
+                )
+                assert runtime_write.exit_code == 0, runtime_write.stderr
+                with open(
+                    os.path.join(runtime_output, "from-runtime.txt"), "r"
+                ) as runtime_file:
+                    assert runtime_file.read() == "runtime-write"
 
                 await sandbox.stop()
 

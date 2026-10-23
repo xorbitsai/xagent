@@ -28,11 +28,14 @@ URLs came from a model provider. The downloader now:
 - Restricts local image results to the task workspace, including symlink
   resolution, matching the existing video boundary. In-workspace files and
   existing data-URL workflows remain supported.
-- Restricts image-edit source reads to the current task workspace as well.
-  Durable `file:`, `file://`, and bare file IDs are staged into task scratch
-  for the provider call and removed afterwards. Workspace-authorized
-  `allowed_external_dirs` paths are also copied into private task staging;
-  arbitrary host paths outside the workspace policy remain rejected.
+- Restricts image-edit, vision, and video source reads to the current task
+  workspace as well. Durable `file:`, `file://`, and bare file IDs are staged
+  through no-follow file descriptors for the provider or ffmpeg call and
+  removed afterwards. Workspace-authorized `allowed_external_dirs` paths are
+  also copied into private task staging; arbitrary host paths outside the
+  workspace policy remain rejected. Staging uses the configured image/video
+  byte limit off the async event loop, and user-visible results keep the
+  original selector instead of exposing the temporary staging path.
 
 The default remote limits are 64 MiB for images and 512 MiB for videos; change
 `XAGENT_IMAGE_DOWNLOAD_MAX_BYTES` / `XAGENT_VIDEO_DOWNLOAD_MAX_BYTES` with positive

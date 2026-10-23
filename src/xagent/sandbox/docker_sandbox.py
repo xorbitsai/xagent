@@ -313,11 +313,13 @@ def _parse_container_config(container: Container) -> SandboxInfo:
         template = SandboxTemplate(
             type="image", image=str(config_data.get("Image") or "")
         )
+    raw_pids_limit = cast(Optional[int], host_config.get("PidsLimit"))
+    pids_limit = raw_pids_limit if raw_pids_limit and raw_pids_limit > 0 else None
     config = SandboxConfig(
         working_dir=str(config_data.get("WorkingDir") or "/home/sandbox"),
         cpus=max(1, cpus),
         memory=max(128, memory),
-        pids_limit=cast(Optional[int], host_config.get("PidsLimit")) or None,
+        pids_limit=pids_limit,
         env=env_map or None,
         volumes=volumes or None,
         network_isolated=bool(
@@ -1845,3 +1847,8 @@ class DockerSandboxService(SandboxService):
 
     def host_workspace_gid(self) -> int | None:
         return SANDBOX_RUNTIME_GID
+
+    def runtime_security_profile(self) -> str | None:
+        # Docker currently provides non-root/capability hardening but relies
+        # on deployment firewalling for public-only egress.
+        return "nonroot-docker-egress-unfiltered-v1"

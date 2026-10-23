@@ -94,6 +94,7 @@ class _FakeExecution:
     def __init__(self, stdout, stderr):
         self.stdout_stream = _FakeStream(stdout)
         self.stderr_stream = _FakeStream(stderr)
+        self.killed = False
 
     def stdout(self):
         return self.stdout_stream
@@ -103,6 +104,9 @@ class _FakeExecution:
 
     async def wait(self):
         return SimpleNamespace(exit_code=0, error_message=None)
+
+    async def kill(self):
+        self.killed = True
 
 
 class _FakeNativeBox:
@@ -137,6 +141,69 @@ async def test_exec_caps_output_while_draining_boxlite_streams():
         [("KEY", "value")],
         {"user": None, "timeout_secs": None, "cwd": None},
     )
+
+
+@pytest.mark.asyncio
+async def test_exec_with_output_cap_kills_guest_when_cancelled():
+    release = asyncio.Event()
+
+    class BlockingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await release.wait()
+            raise StopAsyncIteration
+
+    execution = _FakeExecution([], [])
+    execution.stdout_stream = BlockingStream()
+    execution.stderr_stream = BlockingStream()
+    native_box = _FakeNativeBox(execution)
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=native_box)
+
+    task = asyncio.create_task(sandbox.exec("hang", max_output_bytes=4))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert execution.killed is True
+
+
+@pytest.mark.asyncio
+async def test_exec_cancellation_is_not_blocked_by_hung_guest_kill(monkeypatch):
+    never = asyncio.Event()
+
+    class BlockingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await never.wait()
+            raise StopAsyncIteration
+
+    execution = _FakeExecution([], [])
+    execution.stdout_stream = BlockingStream()
+    execution.stderr_stream = BlockingStream()
+
+    async def hung_kill():
+        await never.wait()
+
+    execution.kill = hung_kill
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=_FakeNativeBox(execution))
+    monkeypatch.setattr(
+        "xagent.sandbox.boxlite_sandbox._EXECUTION_KILL_TIMEOUT_SECONDS", 0.01
+    )
+
+    task = asyncio.create_task(sandbox.exec("hang", max_output_bytes=4))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
 
 
 @requires_boxlite

@@ -41,17 +41,30 @@ def grant_sandbox_runtime_access(root: Path) -> None:
     backend must therefore run as root or with CAP_CHOWN; failure is explicit
     and never falls back to world-writable permissions.
     """
-    absolute = root.absolute()
+    # Deployment roots may legitimately sit behind an operator-controlled
+    # symlink (for example /data -> /mnt/data). Resolve that trusted prefix
+    # once, then keep the untrusted walk descriptor-relative and no-follow.
+    absolute = Path(os.path.realpath(root))
     flags = os.O_RDONLY | os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
 
-    current_fd = os.open(os.path.sep, flags)
     try:
-        for component in absolute.parts[1:]:
-            next_fd = os.open(component, flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
+        current_fd = os.open(os.path.sep, flags)
+    except OSError as exc:
+        raise SandboxContractError(
+            f"Cannot open Docker workspace root for gid preparation: {root}"
+        ) from exc
+    try:
+        try:
+            for component in absolute.parts[1:]:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+        except OSError as exc:
+            raise SandboxContractError(
+                f"Cannot safely open Docker workspace root: {root}"
+            ) from exc
         root_stat = os.fstat(current_fd)
         if not stat.S_ISDIR(root_stat.st_mode):
             raise NotADirectoryError(str(root))
@@ -1049,6 +1062,10 @@ class SandboxService(abc.ABC):
         overrides this so the web layer prepares only the bind roots that
         actually need the fixed in-container runtime group.
         """
+        return None
+
+    def runtime_security_profile(self) -> str | None:
+        """Backend-specific hardening profile included in desired state."""
         return None
 
     async def inspect(self, name: str) -> Optional[SandboxInspection]:

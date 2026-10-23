@@ -73,7 +73,6 @@ _WORKER_LIFECYCLE_MARKER = "::worker::"
 # sites, rather than each falling back to the backend's own (backend-specific,
 # potentially unbounded) default.
 _SANDBOX_STOP_TIMEOUT_SECONDS = 30
-_SANDBOX_SECURITY_PROFILE = "nonroot-public-egress-v1"
 
 
 class SandboxCapacityError(RuntimeError):
@@ -879,7 +878,7 @@ class SandboxManager:
             config.memory = memory
 
         config.pids_limit = get_sandbox_pids_limit()
-        config.security_profile = _SANDBOX_SECURITY_PROFILE
+        config.security_profile = self._service.runtime_security_profile()
 
         # ENV
         env = get_sandbox_env()
@@ -981,7 +980,7 @@ class SandboxManager:
                 return False
         return True
 
-    async def _prepare_workspace_mounts(
+    def _prepare_workspace_mounts(
         self,
         lifecycle_type: str,
         lifecycle_id: str,
@@ -994,10 +993,10 @@ class SandboxManager:
         The mount root is always created; each extra/allowlist mount is
         created only if it already exists (never freshly created) — same
         split as the historical base_dir(True)/allowed_external_dirs(False)
-        behavior. Called explicitly right before a creation attempt (never
-        on a cache hit or a plain reuse/start_existing), independent of
-        spec/volume-list construction: this is not a side effect threaded
-        through volume-list building.
+        behavior. Called explicitly before creation and before a reconciled
+        start_existing after process restart, but not on an in-process cache
+        hit. It is independent of spec/volume-list construction: this is not
+        a side effect threaded through volume-list building.
 
         ``prepare_root``, when given, overrides *only* the mount root's
         creation target (see ``ChatWorkspaceBinding.prepare_root``): folding
@@ -1305,7 +1304,7 @@ class SandboxManager:
                 self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
                 return self._cache[sandbox_name]
 
-            await self._prepare_workspace_mounts(
+            self._prepare_workspace_mounts(
                 lifecycle_type,
                 lifecycle_id,
                 mount_intent,
@@ -1407,7 +1406,7 @@ class SandboxManager:
         fail-closed error — the alternative would spuriously reject a
         legitimate concurrent creator.
         """
-        await self._prepare_workspace_mounts(
+        self._prepare_workspace_mounts(
             lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
         )
         template, config = desired.to_backend_config()
@@ -1573,7 +1572,7 @@ class SandboxManager:
         ordinary absent-\\>create path instead, re-inspecting under the
         now-free gate and creating the (confirmed-absent) sandbox fresh.
         """
-        await self._prepare_workspace_mounts(
+        self._prepare_workspace_mounts(
             lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
         )
         cap = get_sandbox_max_containers()

@@ -312,6 +312,11 @@ Custom stdio MCP servers require a sandbox and fail closed when no sandbox
 lease is available; they are never launched in the backend process. Catalog
 `npx`/`uvx` connectors prefer the sandbox when sandboxing is enabled, while a
 deployment with `SANDBOX_ENABLED=false` keeps their legacy host execution.
+Catalog rows whose stored arguments predate the current registry are not
+treated as canonical until they are reconnected and healed from the catalog;
+reconnect those rows before relying on the legacy host path. This strict check
+prevents an ownerless custom row with modified arguments from being mistaken
+for a vetted catalog command.
 Before upgrading, enable and verify a sandbox backend for every existing
 custom stdio server; leaving `SANDBOX_ENABLED=false` makes those custom
 connections unavailable by design.
@@ -325,7 +330,16 @@ documentation, benchmark, and otherwise non-global address ranges are denied.
 There is intentionally no private-CIDR allowlist override. Consequently,
 `XAGENT_SSH_ALLOW_CIDRS` cannot make a private SSH target reachable from a
 BoxLite sandbox; use the Docker backend with an explicitly reviewed network
-policy when private SSH access is required.
+policy when private SSH access is required. Docker itself does not filter
+private, metadata, or host-gateway destinations when networking is enabled;
+enforce public-only Docker egress in the host or network firewall.
+
+On first use after upgrading, each pre-existing task workspace is migrated once
+with a descriptor-safe walk: regular files and directories below `input/`,
+`output/`, and `temp/` are reassigned to gid 1010 and receive group permissions
+matching their owner permissions. Symlinks and special files are skipped. A
+private marker prevents repeating this potentially expensive task-local walk,
+and newly registered host-created deliverables are repaired individually.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide

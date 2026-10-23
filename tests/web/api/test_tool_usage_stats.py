@@ -112,6 +112,14 @@ async def test_usage_is_scoped_to_the_authenticated_non_admin(engine, task_id):
         )
         assert {row["tool_name"] for row in response} == {"own-tool"}
 
+        admin_response = await get_tool_usage(
+            db, SimpleNamespace(id=own_task.user_id, is_admin=True)
+        )
+        assert {row["tool_name"] for row in admin_response} == {
+            "own-tool",
+            "other-tool",
+        }
+
 
 def test_tool_trace_persists_without_accessing_shared_counters(engine, task_id):
     with Session(engine) as db:

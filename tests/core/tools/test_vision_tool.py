@@ -109,7 +109,7 @@ def mock_workspace():
     workspace.output_dir = output_dir
 
     # Mock the resolve_path_with_search method that VisionTool actually uses
-    def mock_resolve_path_with_search(filename):
+    def mock_resolve_path_with_search(filename, **_kwargs):
         if filename == "existing_image.jpg":
             return existing_image
         elif filename == "test_image.png":
@@ -133,6 +133,18 @@ def mock_workspace():
 
     workspace.stage_path_for_external_upload = Mock(
         side_effect=stage_path_for_external_upload
+    )
+
+    def stage_resolved_path_for_external_upload(source, _selector, **_kwargs):
+        nonlocal staged_index
+        staging_dir.mkdir(exist_ok=True)
+        staged_index += 1
+        target = staging_dir / f"{staged_index}-{Path(source).name}"
+        target.write_bytes(Path(source).read_bytes())
+        return target
+
+    workspace.stage_resolved_path_for_external_upload = Mock(
+        side_effect=stage_resolved_path_for_external_upload
     )
     workspace.discard_staged_external_upload = Mock(
         side_effect=lambda path: Path(path).unlink(missing_ok=True)
@@ -395,7 +407,9 @@ class TestVisionToolUnderstandImages:
         assert result.images_processed == 1
 
         # Verify workspace methods were called
-        mock_workspace.resolve_path_with_search.assert_called_with("existing_image.jpg")
+        mock_workspace.resolve_path_with_search.assert_called_with(
+            "existing_image.jpg", detached_file_ids=True
+        )
 
     @pytest.mark.asyncio
     async def test_understand_uploaded_symlink_stages_and_cleans_up(
@@ -419,6 +433,29 @@ class TestVisionToolUnderstandImages:
         assert result.success is True
         staging_root = workspace.workspace_dir / ".xagent-upload-staging"
         assert not staging_root.exists() or list(staging_root.iterdir()) == []
+
+    @pytest.mark.asyncio
+    async def test_understand_rejects_workspace_escape_paths(
+        self, mock_vision_model, tmp_path
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        outside = workspace.workspace_dir.parent / "outside.jpg"
+        outside.write_bytes(b"outside")
+        escape_link = workspace.output_dir / "escape.jpg"
+        escape_link.symlink_to(outside)
+
+        selectors = (
+            str(outside),
+            "output/../../outside.jpg",
+            "output/escape.jpg",
+        )
+        for selector in selectors:
+            result = await VisionTool(mock_vision_model, workspace).understand_images(
+                selector, "What is in this image?"
+            )
+            assert result.success is False
+
+        mock_vision_model.vision_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_understand_single_image_path_without_workspace(
@@ -473,7 +510,7 @@ class TestVisionToolUnderstandImages:
         image_path = mock_workspace.resolve_path_with_search("existing_image.jpg")
         mock_workspace.resolve_path_with_search.reset_mock()
 
-        def resolve_file_ref(value: str) -> Path:
+        def resolve_file_ref(value: str, **_kwargs) -> Path:
             if value == file_ref:
                 return image_path
             raise FileNotFoundError(value)
@@ -486,7 +523,9 @@ class TestVisionToolUnderstandImages:
 
         assert result.success is True
         assert result.images_processed == 1
-        mock_workspace.resolve_path_with_search.assert_called_once_with(file_ref)
+        mock_workspace.resolve_path_with_search.assert_called_once_with(
+            file_ref, detached_file_ids=True
+        )
 
     @pytest.mark.asyncio
     async def test_understand_multiple_image_paths_with_workspace(
@@ -670,7 +709,7 @@ class TestVisionToolUnderstandImages:
         )
 
         assert result.success is False
-        assert "No valid images or video frames could be processed" in result.error
+        assert "File not found: nonexistent_image.jpg" in result.error
 
     @pytest.mark.asyncio
     async def test_understand_no_model_available(self):
@@ -1645,8 +1684,12 @@ class TestVisionToolDetectObjects:
             temp_image.write_bytes(b"fake_image_data")
             temp_image_path = str(temp_image)
             original_resolver = mock_workspace.resolve_path_with_search.side_effect
-            mock_workspace.resolve_path_with_search.side_effect = lambda value: (
-                temp_image if value == temp_image_path else original_resolver(value)
+            mock_workspace.resolve_path_with_search.side_effect = (
+                lambda value, **kwargs: (
+                    temp_image
+                    if value == temp_image_path
+                    else original_resolver(value, **kwargs)
+                )
             )
 
             try:
@@ -1660,6 +1703,7 @@ class TestVisionToolDetectObjects:
                     result.marked_image_path
                     == "/workspace/output/marked_test_image.jpg"
                 )
+                assert result.image_processed == temp_image_path
                 assert result.box_color == "red"  # default color
 
                 # Verify _draw_bounding_boxes was called

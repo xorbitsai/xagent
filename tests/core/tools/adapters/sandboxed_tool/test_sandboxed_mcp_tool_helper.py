@@ -105,7 +105,21 @@ async def test_list_tools_in_sandbox_unwraps_lease_provider():
     # or dropped the result-file arg, would otherwise pass silently --
     # list_tools_in_sandbox's `except Exception: pass` around cleanup
     # means nothing else would surface it either.
-    primary_sandbox.exec.assert_any_await("rm", "-f", ANY)
+    primary_sandbox.exec.assert_any_await("rm", "-f", ANY, ANY)
+
+
+@pytest.mark.asyncio
+async def test_list_tools_in_sandbox_cleans_partial_connection_upload():
+    sandbox = _make_plain_sandbox([])
+    # The dependency manager writes requirements first; fail the subsequent
+    # connection payload write after the helper's cleanup scope has begun.
+    sandbox.write_file.side_effect = [None, RuntimeError("partial upload")]
+    connection = {"transport": "stdio", "command": "python", "args": ["server.py"]}
+
+    with pytest.raises(RuntimeError, match="partial upload"):
+        await list_tools_in_sandbox(sandbox, connection)
+
+    sandbox.exec.assert_any_await("rm", "-f", ANY, ANY)
 
 
 @pytest.mark.asyncio

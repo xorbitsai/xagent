@@ -91,6 +91,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     SandboxedMCPLoadResult,
     list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
+    requires_sandbox_mcp_connection,
     should_sandbox_mcp_connection,
 )
 from .signed_upload import (
@@ -5004,8 +5005,9 @@ async def load_mcp_tools_as_agent_tools(
         name_prefix: Prefix for tool names (default: "mcp_")
         visibility: Tool visibility setting
         allow_users: List of allowed user IDs
-        sandbox: Optional sandbox instance. When provided, stdio connections
-            using npx/uvx will be routed through the sandbox for isolation.
+        sandbox: Optional sandbox instance. When provided, eligible stdio
+            connections are routed through it. Connections explicitly marked
+            sandbox_required fail closed when it is unavailable.
         workspace: Current task workspace for durable FileRef upload staging.
 
     Returns:
@@ -5023,7 +5025,14 @@ async def load_mcp_tools_as_agent_tools(
     for server_name, connection in connection_map.items():
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
-            if sandbox is not None and should_sandbox_mcp_connection(connection):
+            sandbox_required = should_sandbox_mcp_connection(connection)
+            if requires_sandbox_mcp_connection(connection) and sandbox is None:
+                raise RuntimeError(
+                    "This stdio MCP connection requires a sandbox, but no sandbox "
+                    "is available"
+                )
+            if sandbox_required and sandbox is not None:
+                assert sandbox is not None
                 concurrency_safe, concurrent_tools = _connection_concurrency_config(
                     connection
                 )

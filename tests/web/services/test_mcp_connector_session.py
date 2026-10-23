@@ -116,12 +116,14 @@ class _Loader:
         )
 
 
-def _link(db, user: User, server: MCPServer, **fields: Any) -> None:
+def _link(
+    db, user: User, server: MCPServer, *, is_owner: bool = True, **fields: Any
+) -> None:
     db.add(
         UserMCPServer(
             user_id=user.id,
             mcpserver_id=server.id,
-            is_owner=True,
+            is_owner=is_owner,
             is_active=True,
             **fields,
         )
@@ -170,6 +172,7 @@ def _connect_stripe(db, user: User, *, env_source: str | None = "own") -> MCPSer
         db,
         user,
         server,
+        is_owner=False,
         env=encrypt_env_dict({"STRIPE_API_KEY": "user-key"}),
         env_source=env_source,
     )
@@ -251,6 +254,7 @@ async def _session_connection(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     loader = _Loader()
     monkeypatch.setattr(LOADER, loader)
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: _SandboxManager())
     result = await list_connector_tools(
         db, user=user, server_id=server.id, name_prefix="mcp_"
     )
@@ -366,6 +370,56 @@ async def test_plain_stdio_server_matches_the_task(db_users, monkeypatch):
 
     assert connection["args"] == ["-m", "custom_server", "--flag"]
     assert connection["env"]["CUSTOM_SETTING"] == "on"
+
+
+@pytest.mark.asyncio
+async def test_ownerless_custom_stdio_is_still_sandbox_required(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _connect_plain_stdio(db, user)
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_owner = False
+    db.commit()
+
+    connection, _refs = await _task_connection(db, user, server, monkeypatch)
+
+    assert connection["sandbox_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_custom_stdio_cannot_spoof_catalog_app_id(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _connect_plain_stdio(db, user)
+    app = mcp_apps.get_app_by_id(db, "google-maps")
+    assert app is not None
+    launch = app["launch_config"]
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_owner = False
+    server.name = "google-maps"
+    server.command = launch["command"]
+    server.args = launch["args"]
+    server.auth = {"app_id": "google-maps"}
+    server.cwd = "/tmp"
+    server.env = {"PYTHONPATH": "/attacker"}
+    db.commit()
+
+    connection, _refs = await _task_connection(db, user, server, monkeypatch)
+
+    assert connection["command"] == launch["command"]
+    assert connection["sandbox_required"] is True
 
 
 @pytest.mark.asyncio
@@ -501,6 +555,7 @@ async def test_load_results_are_classified(db_users, monkeypatch, load_result, o
     db, user, _ = db_users
     server = _connect_plain_stdio(db, user)
     monkeypatch.setattr(LOADER, _Loader(load_result))
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: _SandboxManager())
 
     result = await list_connector_tools(
         db, user=user, server_id=server.id, name_prefix="mcp_"
@@ -545,7 +600,7 @@ class _SandboxManager:
 
 def _connect_google_maps(db, user: User) -> MCPServer:
     server, _ = _ensure_catalog_app_server(db, "google-maps")
-    _link(db, user, server)
+    _link(db, user, server, is_owner=False)
     return server
 
 
@@ -563,6 +618,7 @@ async def test_npx_connector_runs_in_the_users_sandbox(db_users, monkeypatch):
     )
 
     assert result.outcome is ConnectorToolsOutcome.OK
+    assert "sandbox_required" not in loader.calls[0][0]["google-maps"]
     assert loader.calls[0][1]["sandbox"] is manager.lease
     assert manager.released == [("tools", str(user.id))]
 
@@ -611,7 +667,7 @@ async def test_npx_connector_fails_closed_without_a_sandbox_lease(
 
 
 @pytest.mark.asyncio
-async def test_npx_connector_runs_on_the_host_without_a_sandbox_manager(
+async def test_catalog_npx_connector_keeps_host_fallback_without_a_sandbox_manager(
     db_users, monkeypatch
 ):
     db, user, _ = db_users

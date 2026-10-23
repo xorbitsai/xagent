@@ -32,6 +32,7 @@ from tests.web.services.test_mcp_connector_session import (
     SANDBOX_MANAGER,
     _comparable,
     _Loader,
+    _SandboxManager,
 )
 from tests.web.tools.test_mcp_actor_owner_runtime import (
     _add_remote_grant,
@@ -351,6 +352,7 @@ async def test_team_owned_server_lists_with_the_team_like_the_task(
 
     loader = _Loader()
     monkeypatch.setattr(LOADER, loader)
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: _SandboxManager())
     result = await list_connector_tools(
         db,
         user=user,
@@ -670,6 +672,7 @@ async def test_server_id_call_never_starts_the_actor_stdio_app(
     db.commit()
     loader = _Loader()
     monkeypatch.setattr(LOADER, loader)
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: _SandboxManager())
 
     result = await list_connector_tools(
         db,

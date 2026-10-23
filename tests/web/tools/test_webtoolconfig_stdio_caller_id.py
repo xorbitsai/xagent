@@ -73,3 +73,19 @@ def test_build_mcp_server_config_merges_env_overrides_before_caller_id():
         "OVERRIDE": "own",
         "XAGENT_MCP_CALLER_ID": "7",
     }
+
+
+def test_user_owned_stdio_server_is_marked_sandbox_required():
+    cfg = WebToolConfig(db=None, request=None, user_id=7)
+
+    config = asyncio.run(
+        cfg._build_mcp_server_config(
+            server=_stdio_server(),
+            user_env_by_id={},
+            shared_env_by_id={},
+            env_source_by_id={},
+            custom_stdio=True,
+        )
+    )
+
+    assert config["config"]["sandbox_required"] is True

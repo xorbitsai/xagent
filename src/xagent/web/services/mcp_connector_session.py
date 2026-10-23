@@ -451,20 +451,22 @@ def _connection_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
 async def _task_sandbox(connection: Any, user_id: int) -> AsyncIterator[Any]:
     """Yield the sandbox a task would run this connection in, or None.
 
-    A task sandboxes only ``npx``/``uvx`` stdio connections, and only when a
-    sandbox manager is configured; every other connection runs on the host, as
-    it does in a task. When a sandbox is required but cannot be leased, this
-    fails closed instead of running the package on the host.
+    A task prefers the sandbox for ``npx``/``uvx`` stdio connections when a
+    manager is configured. Custom connections explicitly marked
+    ``sandbox_required`` fail closed instead of running on the host.
     """
     from ...core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
+        requires_sandbox_mcp_connection,
         should_sandbox_mcp_connection,
     )
     from ..sandbox_manager import get_sandbox_manager
 
-    manager = (
-        get_sandbox_manager() if should_sandbox_mcp_connection(connection) else None
-    )
+    sandbox_required = should_sandbox_mcp_connection(connection)
+    fail_closed = requires_sandbox_mcp_connection(connection)
+    manager = get_sandbox_manager() if sandbox_required else None
     if manager is None:
+        if fail_closed:
+            raise _SandboxUnavailable()
         yield None
         return
 

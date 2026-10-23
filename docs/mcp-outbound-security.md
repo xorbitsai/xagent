@@ -9,10 +9,12 @@ and private cloud addresses, including servers marked `managed: "internal"`.
 That label describes lifecycle/ownership, not permission to bypass SSRF policy.
 The model-only private allowlist does not authorize MCP endpoints.
 
-For an internal server, migrate to a trusted stdio connector when the server
+For an internal server, migrate to a reviewed stdio connector when the server
 supports that transport, or provide a public HTTPS endpoint with authentication
-and appropriate network controls. Stdio programs are trusted executable code,
-not a public-egress sandbox; review the command and deployment permissions.
+and appropriate network controls. Custom stdio programs run in the configured
+code sandbox as its unprivileged user and fail closed when no sandbox is
+available. Their commands, working directories, dependencies, and any private
+network access must therefore exist explicitly inside that sandbox.
 An HTTP-only private server that cannot use either option is not supported by
 this default transport. A future private MCP allowlist needs a separate design;
 do not disable validation or use the OAuth development flag as a runtime bypass.

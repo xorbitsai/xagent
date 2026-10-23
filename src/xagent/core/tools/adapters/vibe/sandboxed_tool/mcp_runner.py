@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 from pathlib import Path
 from typing import Any, cast
@@ -25,15 +24,14 @@ from xagent.core.tools.core.mcp.tools import (
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments for sandboxed MCP tool listing."""
     parser = argparse.ArgumentParser(description="List MCP tools in sandbox")
-    parser.add_argument("--connection-b64", required=True)
+    parser.add_argument("--connection-file", required=True)
     parser.add_argument("--result-file", required=True)
     return parser.parse_args()
 
 
-def _load_connection(connection_b64: str) -> Connection:
-    """Decode a base64-encoded connection config."""
-    connection_json = base64.b64decode(connection_b64).decode("utf-8")
-    return cast(Connection, json.loads(connection_json))
+def _load_connection(connection_file: str) -> Connection:
+    """Read a connection config from a private sandbox-side file."""
+    return cast(Connection, json.loads(Path(connection_file).read_text("utf-8")))
 
 
 async def _list_tools(connection: Connection) -> list[dict[str, Any]]:
@@ -64,7 +62,7 @@ def main() -> None:
     ensure_user_bin_in_path()
     try:
         parsed = _parse_args()
-        connection = _load_connection(parsed.connection_b64)
+        connection = _load_connection(parsed.connection_file)
     except Exception as e:
         print(f"Sandbox mcp config error: {e}")
         raise

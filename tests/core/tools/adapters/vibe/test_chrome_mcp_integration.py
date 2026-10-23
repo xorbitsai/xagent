@@ -140,7 +140,14 @@ async def test_generic_loader_does_not_route_by_chrome_server_name(monkeypatch):
     monkeypatch.setattr(mcp_adapter, "_load_direct_mcp_tools", direct)
     monkeypatch.setattr(mcp_adapter, "load_execution_scoped_chrome_tools", dedicated)
 
-    result = await load_mcp_tools_as_agent_tools({"chrome-devtools": _connection()})
+    # The server name alone must not select the dedicated Chrome runtime. Use
+    # a host-side command here so this assertion stays independent of the
+    # separate npx/uvx sandbox policy exercised by the sandbox integration
+    # tests.
+    connection = _connection()
+    connection["command"] = "python"
+    connection["args"] = ["server.py"]
+    result = await load_mcp_tools_as_agent_tools({"chrome-devtools": connection})
 
     assert len(result.tools) == 1
     direct.assert_awaited_once()

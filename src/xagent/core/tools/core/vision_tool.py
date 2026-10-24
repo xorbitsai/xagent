@@ -5,22 +5,26 @@ Standalone vision capabilities without framework dependencies
 
 import asyncio
 import base64
+import io
 import logging
 import math
 import mimetypes
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, NamedTuple, Optional, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Union
 from urllib.parse import unquote_to_bytes, urlsplit
 
 import httpx
 from pydantic import BaseModel, Field
 
+from ....config import get_media_download_max_bytes
 from ...model.chat.basic.base import BaseLLM
+from ...utils.media_download import resolve_workspace_media_path
 from ...utils.security import fetch_public_http_bytes
 from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes, validate_svg_bytes
 from .web_content import get_trusted_proxy_url, public_fetch_client
@@ -214,28 +218,119 @@ class DetectObjectsResult(BaseModel):
     box_color: Optional[str] = None
     raw_response: Optional[str] = None
     parsing_method: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
     error: Optional[str] = None
 
 
 class VisionCore:
     """
     Core vision functionality using vision-enabled LLM models.
-    No framework or workspace dependencies.
+    No framework dependencies; a workspace root is required for local reads.
     """
 
-    def __init__(self, vision_model: BaseLLM, output_directory: Optional[str] = None):
+    def __init__(
+        self,
+        vision_model: BaseLLM,
+        output_directory: Optional[str] = None,
+        workspace_root: str | Path | None = None,
+        allowed_local_media_roots: Sequence[str | Path] = (),
+    ):
         """
         Initialize with a vision-enabled LLM model.
 
         Args:
             vision_model: LLM model with vision capabilities
             output_directory: Optional directory for saving marked images
+            workspace_root: Root allowed for all local media reads
+            allowed_local_media_roots: Additional backend-private staging roots
         """
         self.vision_model = vision_model
         self.output_directory = (
             Path(output_directory) if output_directory else Path("./output")
         )
         self.output_directory.mkdir(parents=True, exist_ok=True)
+        self.workspace_root = Path(workspace_root) if workspace_root else None
+        self.allowed_local_media_roots = tuple(
+            Path(root).resolve() for root in allowed_local_media_roots
+        )
+
+    def add_allowed_local_media_root(self, root: str | Path) -> None:
+        """Authorize a private staging root created after initialization."""
+        resolved = Path(root).resolve()
+        if resolved not in self.allowed_local_media_roots:
+            self.allowed_local_media_roots = (
+                *self.allowed_local_media_roots,
+                resolved,
+            )
+
+    def _resolve_local_media_path(self, media_path: str) -> Path:
+        """Resolve a local media path without allowing workspace escapes."""
+        if self.workspace_root is None:
+            raise ValueError("Local media files require a task workspace")
+        path = Path(media_path)
+        try:
+            resolved = resolve_workspace_media_path(path, self.workspace_root)
+        except ValueError:
+            for root in self.allowed_local_media_roots:
+                try:
+                    resolved = resolve_workspace_media_path(path, root)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Media file not found: {media_path}")
+        return resolved
+
+    def _read_local_media_bytes(
+        self, media_path: str, *, max_bytes: int | None = None
+    ) -> tuple[Path, bytes]:
+        """Authorize and read a regular local file without following links."""
+        resolved = self._resolve_local_media_path(media_path)
+        absolute = resolved.absolute()
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(os.path.sep, directory_flags)
+        try:
+            for component in absolute.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            fd = os.open(
+                absolute.name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to read local media: {type(exc).__name__}"
+            ) from exc
+        finally:
+            os.close(current_fd)
+
+        try:
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise RuntimeError("Failed to read local media: not a regular file")
+            with os.fdopen(fd, "rb", closefd=True) as media_file:
+                fd = -1
+                if max_bytes is not None and file_stat.st_size > max_bytes:
+                    raise ValueError(
+                        f"Local media exceeds maximum size of {max_bytes} bytes"
+                    )
+                data = media_file.read(None if max_bytes is None else max_bytes + 1)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to read local media: {type(exc).__name__}"
+            ) from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ValueError(f"Local media exceeds maximum size of {max_bytes} bytes")
+        return resolved, data
 
     def _coerce_optional_float(self, value: Any, field_name: str) -> Optional[float]:
         """Normalize optional numeric tool arguments before model calls."""
@@ -285,16 +380,13 @@ class VisionCore:
             Base64 encoded image string with MIME type prefix
         """
         # If it's already a URL, return as-is
-        if image_path.startswith(("http://", "https://")):
+        if image_path.startswith(("http://", "https://", "data:")):
             return image_path
 
-        # Convert to absolute path if relative
-        if not os.path.isabs(image_path):
-            image_path = os.path.abspath(image_path)
-
-        # Check if file exists
-        if not os.path.exists(image_path):
-            raise FileNotFoundError(f"Image file not found: {image_path}")
+        resolved_path, image_data = self._read_local_media_bytes(
+            image_path, max_bytes=get_media_download_max_bytes("image")
+        )
+        image_path = str(resolved_path)
 
         # Get MIME type
         mime_type, _ = mimetypes.guess_type(image_path)
@@ -303,13 +395,11 @@ class VisionCore:
 
         # Read and encode file
         try:
-            with open(image_path, "rb") as image_file:
-                image_data = image_file.read()
-                if mime_type == "image/svg+xml" or image_path.lower().endswith(".svg"):
-                    image_data = rasterize_svg_bytes(image_data)
-                    mime_type = "image/png"
-                base64_data = base64.b64encode(image_data).decode("utf-8")
-                return f"data:{mime_type};base64,{base64_data}"
+            if mime_type == "image/svg+xml" or image_path.lower().endswith(".svg"):
+                image_data = rasterize_svg_bytes(image_data)
+                mime_type = "image/png"
+            base64_data = base64.b64encode(image_data).decode("utf-8")
+            return f"data:{mime_type};base64,{base64_data}"
         except Exception as e:
             raise RuntimeError(f"Failed to read image file {image_path}: {e}")
 
@@ -334,19 +424,12 @@ class VisionCore:
                     ".svg"
                 ):
                     return None, None
-                svg_path = Path(image_path)
-                if (
-                    await asyncio.to_thread(lambda: svg_path.stat().st_size)
-                    > MAX_SVG_BYTES
-                ):
-                    raise ValueError(
-                        f"SVG exceeds maximum size of {MAX_SVG_BYTES} bytes"
-                    )
-                source = await asyncio.to_thread(
-                    svg_path.read_text,
-                    encoding="utf-8-sig",
-                    errors="replace",
+                svg_path, svg_bytes = await asyncio.to_thread(
+                    self._read_local_media_bytes,
+                    image_path,
+                    max_bytes=MAX_SVG_BYTES,
                 )
+                source = svg_bytes.decode("utf-8-sig", errors="replace")
                 if "<svg" not in source[:4096].lower():
                     raise ValueError("SVG source does not contain an <svg> root")
                 label = svg_path.name
@@ -419,21 +502,16 @@ class VisionCore:
         if video_path.startswith(("http://", "https://", "data:")):
             return video_path
 
-        resolved_path = Path(video_path).resolve()
-        if not resolved_path.is_file():
-            raise FileNotFoundError(f"Video file not found: {video_path}")
-        if resolved_path.stat().st_size > _MAX_INLINE_VIDEO_BYTES:
-            raise ValueError(
-                "Local video is too large for inline native input; "
-                "falling back to sampled frames"
-            )
+        resolved_path, video_bytes = self._read_local_media_bytes(
+            video_path, max_bytes=_MAX_INLINE_VIDEO_BYTES
+        )
 
         mime_type = mimetypes.guess_type(str(resolved_path))[0] or "video/mp4"
         if not mime_type.startswith("video/"):
             raise ValueError(f"Unsupported video MIME type: {mime_type}")
 
         try:
-            encoded = base64.b64encode(resolved_path.read_bytes()).decode("ascii")
+            encoded = base64.b64encode(video_bytes).decode("ascii")
         except OSError as exc:
             raise RuntimeError(
                 f"Failed to read video file {video_path}: {exc}"
@@ -504,6 +582,7 @@ class VisionCore:
             raise RuntimeError(
                 "Video understanding requires ffprobe/ffmpeg to sample frames"
             )
+        resolved_path = str(self._resolve_local_media_path(video_path))
         try:
             completed = subprocess.run(
                 [
@@ -514,7 +593,7 @@ class VisionCore:
                     "format=duration",
                     "-of",
                     "default=noprint_wrappers=1:nokey=1",
-                    video_path,
+                    resolved_path,
                 ],
                 check=True,
                 capture_output=True,
@@ -542,9 +621,7 @@ class VisionCore:
                 "Video URLs and data URLs are not sampled directly; upload the video "
                 "or pass a workspace file_id"
             )
-        resolved_path = str(Path(video_path).resolve())
-        if not Path(resolved_path).is_file():
-            raise FileNotFoundError(f"Video file not found: {video_path}")
+        resolved_path = str(self._resolve_local_media_path(video_path))
 
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -1249,18 +1326,7 @@ class VisionCore:
                         prompt_sent=prompt,
                     )
 
-                # Convert to absolute path if relative
-                resolved_image_path = image_path
-                if not os.path.isabs(resolved_image_path):
-                    resolved_image_path = os.path.abspath(resolved_image_path)
-
-                if not os.path.exists(resolved_image_path):
-                    return DetectObjectsResult(
-                        success=False,
-                        error=f"Image file not found: {resolved_image_path}",
-                        confidence_threshold=confidence_threshold,
-                        prompt_sent=prompt,
-                    )
+                resolved_image_path = str(self._resolve_local_media_path(image_path))
 
                 try:
                     marked_image_path = self._draw_bounding_boxes(
@@ -1426,8 +1492,12 @@ class VisionCore:
                 "PIL (Pillow) library is required for image marking. Install with: pip install Pillow"
             )
 
+        resolved_path, image_bytes = self._read_local_media_bytes(
+            image_path, max_bytes=get_media_download_max_bytes("image")
+        )
+        image_path = str(resolved_path)
         try:
-            with Image.open(image_path) as img:
+            with Image.open(io.BytesIO(image_bytes)) as img:
                 if img.mode != "RGB":
                     img = img.convert("RGB")
 
@@ -1516,9 +1586,10 @@ async def understand_media(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     output_directory: Optional[str] = None,
+    workspace_root: str | Path | None = None,
 ) -> UnderstandMediaResult:
     """Analyze images, videos, or mixed media with a vision model."""
-    core = VisionCore(vision_model, output_directory)
+    core = VisionCore(vision_model, output_directory, workspace_root)
     return await core.understand_media(
         media,
         question,
@@ -1537,6 +1608,7 @@ async def understand_images(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     output_directory: Optional[str] = None,
+    workspace_root: str | Path | None = None,
 ) -> UnderstandImagesResult:
     """
     Analyze images and answer questions about their content.
@@ -1548,11 +1620,12 @@ async def understand_images(
         temperature: Controls randomness in the model's output. Higher values make output more random.
         max_tokens: Maximum number of tokens to generate in the response.
         output_directory: Directory path where output files should be saved.
+        workspace_root: Root allowed for local image reads.
 
     Returns:
         UnderstandImagesResult containing the model's understanding of the images.
     """
-    core = VisionCore(vision_model, output_directory)
+    core = VisionCore(vision_model, output_directory, workspace_root)
     return await core.understand_images(images, question, temperature, max_tokens)
 
 
@@ -1563,6 +1636,7 @@ async def describe_images(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     output_directory: Optional[str] = None,
+    workspace_root: str | Path | None = None,
 ) -> UnderstandImagesResult:
     """
     Generate descriptions for images.
@@ -1574,11 +1648,12 @@ async def describe_images(
         temperature: Controls randomness in the model's output. Higher values make output more random.
         max_tokens: Maximum number of tokens to generate in the response.
         output_directory: Directory path where output files should be saved.
+        workspace_root: Root allowed for local image reads.
 
     Returns:
         UnderstandImagesResult containing the descriptions of the images.
     """
-    core = VisionCore(vision_model, output_directory)
+    core = VisionCore(vision_model, output_directory, workspace_root)
     return await core.describe_images(images, detail_level, temperature, max_tokens)
 
 
@@ -1592,6 +1667,7 @@ async def detect_objects(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     output_directory: Optional[str] = None,
+    workspace_root: str | Path | None = None,
 ) -> DetectObjectsResult:
     """
     Detect objects in images with optional marking capability.
@@ -1606,11 +1682,12 @@ async def detect_objects(
         temperature: Controls randomness in the model's output. Higher values make output more random.
         max_tokens: Maximum number of tokens to generate in the response.
         output_directory: Directory path where output files should be saved.
+        workspace_root: Root allowed for local image reads.
 
     Returns:
         DetectObjectsResult containing information about detected objects.
     """
-    core = VisionCore(vision_model, output_directory)
+    core = VisionCore(vision_model, output_directory, workspace_root)
     return await core.detect_objects(
         images,
         task,

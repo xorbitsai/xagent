@@ -1,5 +1,4 @@
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from threading import Event, Lock, local
 from uuid import UUID
 
@@ -8,6 +7,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+import xagent.core.workspace as workspace_module
 from xagent.core.agent.service import AgentService
 from xagent.core.file_storage.factory import (
     get_unscoped_file_storage,
@@ -15,7 +15,11 @@ from xagent.core.file_storage.factory import (
 )
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.core.workspace import TaskWorkspace, WorkspaceManager
+from xagent.core.workspace import (
+    ExternalUploadStagingError,
+    TaskWorkspace,
+    WorkspaceManager,
+)
 from xagent.web.models import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -1565,18 +1569,28 @@ def test_stage_and_discard_external_upload_file(tmp_path, monkeypatch):
 
     assert staged.is_file()
     assert staged.read_bytes() == b"workbook"
-    assert staged.is_relative_to(workspace.temp_dir / ".xagent-internal" / "mcp-upload")
-    assert str(staged) not in workspace.get_allowed_dirs()
-    assert any(
-        staged.is_relative_to(Path(directory))
-        for directory in workspace.get_allowed_dirs()
-    )
+    assert staged.is_relative_to(workspace.temp_dir)
 
     workspace.discard_staged_external_upload(staged)
     assert not staged.exists()
     assert not staged.parent.exists()
     with pytest.raises(ValueError, match="outside the task staging area"):
         workspace.discard_staged_external_upload(tmp_path / "outside.txt")
+
+
+def test_host_private_external_upload_staging_is_outside_workspace(
+    tmp_path, monkeypatch
+):
+    workspace = TaskWorkspace(id="task_private_stage", base_dir=str(tmp_path))
+    source = workspace.input_dir / "image.png"
+    source.write_bytes(b"image")
+    monkeypatch.setattr(workspace, "resolve_file_id_detached", lambda _: source)
+
+    staged = workspace.stage_file_for_external_upload("file-id", host_private=True)
+
+    assert staged.is_file()
+    assert not staged.is_relative_to(workspace.workspace_dir)
+    workspace.discard_staged_external_upload(staged)
 
 
 def test_stage_external_upload_rejects_unregistered_file(tmp_path):
@@ -1586,16 +1600,15 @@ def test_stage_external_upload_rejects_unregistered_file(tmp_path):
         workspace.stage_file_for_external_upload("not-registered")
 
 
-def test_external_upload_staging_rejects_symlinked_internal_root(tmp_path):
+def test_external_upload_staging_rejects_symlinked_internal_root(tmp_path, monkeypatch):
     workspace = TaskWorkspace(id="task_stage_root", base_dir=str(tmp_path))
     escaped = tmp_path / "escaped"
     escaped.mkdir()
     workspace.internal_temp_dir.symlink_to(escaped, target_is_directory=True)
+    monkeypatch.setattr(workspace_module, "in_sandbox_tool_runner", lambda: True)
 
-    with pytest.raises(ValueError, match="outside temp directory"):
-        workspace.discard_staged_external_upload(
-            escaped / "mcp-upload" / "staged" / "file.xlsx"
-        )
+    with pytest.raises(ExternalUploadStagingError, match="staging area"):
+        workspace._external_upload_staging_root()
 
 
 def test_stage_external_upload_rejects_source_symlink_outside_storage(
@@ -1613,3 +1626,39 @@ def test_stage_external_upload_rejects_source_symlink_outside_storage(
             workspace.stage_file_for_external_upload("file-id")
     finally:
         outside.unlink(missing_ok=True)
+
+
+def test_registered_file_id_rejects_symlink_swap_outside_workspace(tmp_path):
+    workspace = TaskWorkspace(id="task_swap", base_dir=str(tmp_path / "workspaces"))
+    registered = workspace.output_dir / "report.txt"
+    registered.write_text("safe", encoding="utf-8")
+    workspace._file_id_to_path["file-id"] = registered
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    registered.unlink()
+    registered.symlink_to(outside)
+
+    assert workspace.resolve_file_id("file-id") is None
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        workspace.stage_file_for_external_upload("file-id")
+
+
+def test_registered_file_id_rejects_parent_directory_symlink_swap(tmp_path):
+    base_dir = tmp_path / "workspaces"
+    workspace = TaskWorkspace(id="task_swap_parent", base_dir=str(base_dir))
+    registered = workspace.output_dir / "report.txt"
+    registered.write_text("safe", encoding="utf-8")
+    workspace._file_id_to_path["file-id"] = registered
+
+    attacker_workspace = TaskWorkspace(id="other_task", base_dir=str(base_dir))
+    attacker_file = attacker_workspace.output_dir / registered.name
+    attacker_file.write_text("secret", encoding="utf-8")
+    original_output = workspace.workspace_dir / "original-output"
+    workspace.output_dir.rename(original_output)
+    workspace.output_dir.symlink_to(
+        attacker_workspace.output_dir, target_is_directory=True
+    )
+
+    assert workspace.resolve_file_id("file-id") is None
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        workspace.stage_file_for_external_upload("file-id")

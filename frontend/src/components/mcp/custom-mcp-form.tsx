@@ -12,6 +12,7 @@ import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
 import {
+  isSignedUploadTransport,
   parseMcpOAuthErrorMessage,
   type McpOAuthConnectResponse,
 } from "@/lib/mcp-utils"
@@ -19,6 +20,7 @@ import {
   RuntimeInputsForm,
   type RuntimeConfigErrorKey,
 } from "./runtime-inputs-form"
+import { SignedUploadsForm } from "./signed-uploads-form"
 
 interface CustomMcpFormProps {
   mcpFormData: MCPServerFormData
@@ -419,6 +421,10 @@ export function CustomMcpForm({
 
   // New servers default to owner (editable global); existing servers use the flag.
   const canEditGlobal = mcpFormData.can_edit_global ?? true
+  // Leaving sse or streamable_http clears stored upload settings (see signedUploadsMutation).
+  const hasSignedUploadsToClear =
+    (Array.isArray(mcpFormData.signed_uploads) && mcpFormData.signed_uploads.length > 0)
+    || typeof mcpFormData.signed_uploads_error === "string"
 
   // Per-user env overrides (top-level user_env, merged over global env at runtime).
   const userEnvObj = mcpFormData.user_env || {}
@@ -987,7 +993,18 @@ export function CustomMcpForm({
             </>
           )}
 
+          {isSignedUploadTransport(transport) && (
+            <SignedUploadsForm
+              formData={mcpFormData}
+              setFormData={setMcpFormData}
+              disabled={!canEditGlobal}
+            />
+          )}
         </>
+      )}
+
+      {canEditGlobal && !isSignedUploadTransport(transport) && hasSignedUploadsToClear && (
+        <p className="text-xs text-amber-700">{t('tools.mcp.signedUploads.willBeCleared')}</p>
       )}
 
       <RuntimeInputsForm

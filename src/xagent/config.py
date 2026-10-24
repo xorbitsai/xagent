@@ -220,6 +220,9 @@ CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
 CHECKPOINT_GATE_STALL_WARNING_SECONDS = "XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS"
 ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
 TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
+DB_WRITE_RETRY_ATTEMPTS = "XAGENT_DB_WRITE_RETRY_ATTEMPTS"
+DB_WRITE_RETRY_BASE_DELAY_MS = "XAGENT_DB_WRITE_RETRY_BASE_DELAY_MS"
+DB_WRITE_RETRY_MAX_DELAY_MS = "XAGENT_DB_WRITE_RETRY_MAX_DELAY_MS"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
@@ -3439,6 +3442,53 @@ def get_trace_db_max_inflight() -> int:
     clamp to leave one shared pooled connection where pool size permits.
     """
     return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)
+
+
+def get_db_write_retry_attempts() -> int:
+    """Get the total attempts for a V2 execution-event write, first try included.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_ATTEMPTS environment variable
+        2. Default of 3
+
+    A value of 1 disables retries. SQLite errors are capped at two attempts
+    regardless of this value, because SQLite reports BUSY only after waiting
+    out its busy timeout.
+
+    Returns:
+        Maximum number of attempts, at least 1
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_ATTEMPTS, 3)
+
+
+def get_db_write_retry_base_delay_ms() -> int:
+    """Get the base backoff, in milliseconds, between execution-event write retries.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_BASE_DELAY_MS environment variable
+        2. Default of 50
+
+    The ceiling doubles with each retry up to the maximum delay, and the
+    actual wait is jittered uniformly below that ceiling. Zero retries
+    immediately.
+
+    Returns:
+        Base delay in milliseconds, at least 0
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_BASE_DELAY_MS, 50, minimum=0)
+
+
+def get_db_write_retry_max_delay_ms() -> int:
+    """Get the backoff ceiling, in milliseconds, for execution-event write retries.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_MAX_DELAY_MS environment variable
+        2. Default of 1000
+
+    Returns:
+        Maximum delay in milliseconds, at least 0
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_MAX_DELAY_MS, 1000, minimum=0)
 
 
 def get_db_max_overflow() -> int:

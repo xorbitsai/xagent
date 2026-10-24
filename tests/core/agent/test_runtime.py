@@ -5,7 +5,7 @@ import contextlib
 import json
 import logging
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -656,11 +656,17 @@ class PatternWithState:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("during_materialization", [False, True])
 @pytest.mark.parametrize("via_checker", [False, True])
 async def test_runtime_does_not_start_llm_after_interrupt(
-    monkeypatch: pytest.MonkeyPatch, during_materialization: bool, via_checker: bool
+    monkeypatch: pytest.MonkeyPatch,
+    during_materialization: bool,
+    via_checker: bool,
+    streaming: bool,
 ) -> None:
+    # An interrupt that lands before the provider task exists cancels nothing,
+    # so each call path must check it before starting the provider call.
     runtime = PatternRuntime()
     checker_requested = False
 
@@ -687,10 +693,18 @@ async def test_runtime_does_not_start_llm_after_interrupt(
         return dict(kwargs["kwargs"])
 
     monkeypatch.setattr(runtime_module, "materialize_llm_kwargs", materialize)
-    llm = type("LLM", (), {"chat": AsyncMock(return_value="must not call")})()
+    llm = type(
+        "LLM",
+        (),
+        {
+            "chat": AsyncMock(return_value="must not call"),
+            "stream_chat": Mock(side_effect=AssertionError("must not stream")),
+        },
+    )()
     if not during_materialization:
         stop()
-    task = asyncio.create_task(runtime.run_llm_call(llm))
+    call = runtime.run_streaming_llm_call if streaming else runtime.run_llm_call
+    task = asyncio.create_task(call(llm))
     if during_materialization:
         await asyncio.wait_for(started.wait(), timeout=1)
         stop()
@@ -699,6 +713,7 @@ async def test_runtime_does_not_start_llm_after_interrupt(
     with pytest.raises(LLMCallInterrupted, match="stop before provider"):
         await task
     llm.chat.assert_not_called()
+    llm.stream_chat.assert_not_called()
     assert not runtime._active_llm_tasks
 
 

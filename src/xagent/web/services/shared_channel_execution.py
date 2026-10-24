@@ -681,8 +681,10 @@ class ChannelProgressForwarder(TraceHandler):
     async def handle_event(self, event: TraceEvent) -> None:
         async with self._condition:
             await self._condition.wait_for(
-                lambda: not self._accepting()
-                or len(self._pending) < self._MAX_PENDING_EVENTS
+                lambda: (
+                    not self._accepting()
+                    or len(self._pending) < self._MAX_PENDING_EVENTS
+                )
             )
             if not self._accepting():
                 return
@@ -759,121 +761,135 @@ async def execute_channel_background(
         task_owner_user_id=snapshot.task.user_id,
         connector_runtime_turn_id=command.command_id,
     )
-    service.set_conversation_history(
-        [dict(message) for message in snapshot.conversation_history],
-        watermark=snapshot.conversation_watermark,
-        event_watermark=snapshot.conversation_event_watermark,
-    )
-    recovery = await materialize_task_execution_recovery_state(
-        snapshot.execution_recovery
-    )
-    service.set_execution_context_messages(recovery.get("messages", []))
-    service.set_recovered_skill_context(recovery.get("skill_context"))
-    from .file_turn import resolve_turn_file_infos
-
-    def resolve_files() -> list[dict[str, Any]]:
-        with get_session_local()() as db:
-            infos, missing = resolve_turn_file_infos(
-                file_ids=list(payload.file_ids),
-                owner_user_id=snapshot.task.user_id,
-                task_id=command.task_id,
-                db=db,
-            )
-            if missing:
-                raise TaskTurnError("file_unavailable")
-            return infos
-
-    file_infos = (
-        await run_db_io_cancellation_safe(resolve_files) if payload.file_ids else []
-    )
-    from .task_execution import _register_uploaded_files_for_agent
-
-    await run_db_io_cancellation_safe(
-        lambda: _register_uploaded_files_for_agent(service, file_infos)
-    )
-    from .file_turn import normalize_attachments_for_persistence
-
-    context: dict[str, Any] = {
-        "turn_id": command.command_id,
-        "files": payload.attachments
-        or normalize_attachments_for_persistence(file_infos),
-        "display_message": payload.transcript_message,
-    }
-    if lease.run_id is not None:
-        # Server-owned execution identity, taken from the task row this
-        # command was admitted against and the lease it holds -- matching
-        # what the websocket turn path and the three channel bots' direct
-        # path bind. Both keys or neither: ``ToolCallExecutionContext``
-        # counts an execution complete only with ``run_id`` too, and a
-        # registered source presenting an incomplete identity is refused
-        # before dispatch, so a half binding would be worse than none.
-        context["task_source"] = snapshot.task.source
-        context["run_id"] = lease.run_id
-    if file_infos:
-        context.update(
-            {
-                "file_info": file_infos,
-                "uploaded_files": [info["path"] for info in file_infos],
-                "state": {"file_info": file_infos},
-            }
-        )
-    assert lease.run_id is not None
-    forwarder = ChannelProgressForwarder(command, lease.run_id)
-    service.tracer.add_handler(forwarder)
     try:
-        with UserContext(snapshot.task.user_id):
-            result = await manager.execute_task(
-                agent_service=service,
-                task=payload.for_agent,
-                context=context,
-                task_id=str(command.task_id),
-                tracking_task_id=str(command.task_id),
-                db_session=None,
-                manage_task_lease=False,
-                task_lease=lease,
-                task_lease_heartbeat_task=heartbeat_task,
-            )
-        # Drain before publishing the final state: observers must not treat
-        # queued progress as an opportunity to deliver the final reply early.
-        await forwarder.close(drain=True)
-        projection = project_execution_result_for_channel(result)
-        durable_result = channel_durable_result(result, projection)
+        service.set_conversation_history(
+            [dict(message) for message in snapshot.conversation_history],
+            watermark=snapshot.conversation_watermark,
+            event_watermark=snapshot.conversation_event_watermark,
+        )
+        recovery = await materialize_task_execution_recovery_state(
+            snapshot.execution_recovery
+        )
+        service.set_execution_context_messages(recovery.get("messages", []))
+        service.set_recovered_skill_context(recovery.get("skill_context"))
+        from .file_turn import resolve_turn_file_infos
 
-        report = SettlementReport()
-
-        def finalize() -> bool:
+        def resolve_files() -> list[dict[str, Any]]:
             with get_session_local()() as db:
-                return finalize_managed_task_lease_result(
-                    db,
-                    lease,
-                    status=projection.task_status,
-                    assistant_content=projection.transcript_content,
-                    turn_id=command.command_id,
-                    interactions=projection.interactions,
-                    message_type=projection.message_type,
-                    error_message=projection.diagnostic_error,
-                    execution_result=result,
-                    completion=(command.id, durable_result),
-                    # An interrupted run may rest PAUSED instead; its channel
-                    # then reads "interrupted", as after lease recovery, or
-                    # waits for the automatic resume the pause scheduled.
-                    settle_interruption=True,
-                    report=report,
+                infos, missing = resolve_turn_file_infos(
+                    file_ids=list(payload.file_ids),
+                    owner_user_id=snapshot.task.user_id,
+                    task_id=command.task_id,
+                    db=db,
                 )
+                if missing:
+                    raise TaskTurnError("file_unavailable")
+                return infos
 
-        if not await run_db_io_cancellation_safe(finalize):
-            raise TaskLeaseLostError("Channel result no longer owns its execution")
-        if report.paused:
-            # The channel has its "interrupted" reply, or waits for the
-            # automatic resume the pause scheduled; a web viewer of the
-            # task learns of the committed pause here. Best effort, as on
-            # the other settlement paths: a failed broadcast is only logged.
-            from .task_orchestrator import publish_settlement_pause
+        file_infos = (
+            await run_db_io_cancellation_safe(resolve_files) if payload.file_ids else []
+        )
+        from .task_execution import _register_uploaded_files_for_agent
 
-            await publish_settlement_pause(command.task_id, report)
-    finally:
-        service.tracer.remove_handler(forwarder)
+        # Run even without new attachments: the registration helper also
+        # replaces authorized legacy input symlinks with task-local copies.
+        await run_db_io_cancellation_safe(
+            lambda: _register_uploaded_files_for_agent(service, file_infos)
+        )
+        from .file_turn import normalize_attachments_for_persistence
+
+        context: dict[str, Any] = {
+            "turn_id": command.command_id,
+            "files": payload.attachments
+            or normalize_attachments_for_persistence(file_infos),
+            "display_message": payload.transcript_message,
+        }
+        if lease.run_id is not None:
+            # Server-owned execution identity, taken from the task row this
+            # command was admitted against and the lease it holds -- matching
+            # what the websocket turn path and the three channel bots' direct
+            # path bind. Both keys or neither: ``ToolCallExecutionContext``
+            # counts an execution complete only with ``run_id`` too, and a
+            # registered source presenting an incomplete identity is refused
+            # before dispatch, so a half binding would be worse than none.
+            context["task_source"] = snapshot.task.source
+            context["run_id"] = lease.run_id
+        if file_infos:
+            context.update(
+                {
+                    "file_info": file_infos,
+                    "uploaded_files": [info["path"] for info in file_infos],
+                    "state": {"file_info": file_infos},
+                }
+            )
+        assert lease.run_id is not None
+        forwarder = ChannelProgressForwarder(command, lease.run_id)
+        service.tracer.add_handler(forwarder)
         try:
-            await forwarder.close()
+            with UserContext(snapshot.task.user_id):
+                result = await manager.execute_task(
+                    agent_service=service,
+                    task=payload.for_agent,
+                    context=context,
+                    task_id=str(command.task_id),
+                    tracking_task_id=str(command.task_id),
+                    db_session=None,
+                    manage_task_lease=False,
+                    task_lease=lease,
+                    task_lease_heartbeat_task=heartbeat_task,
+                )
+            # Drain before publishing the final state: observers must not treat
+            # queued progress as an opportunity to deliver the final reply early.
+            await forwarder.close(drain=True)
+            projection = project_execution_result_for_channel(result)
+            durable_result = channel_durable_result(result, projection)
+
+            report = SettlementReport()
+
+            def finalize() -> bool:
+                with get_session_local()() as db:
+                    return finalize_managed_task_lease_result(
+                        db,
+                        lease,
+                        status=projection.task_status,
+                        assistant_content=projection.transcript_content,
+                        turn_id=command.command_id,
+                        interactions=projection.interactions,
+                        message_type=projection.message_type,
+                        error_message=projection.diagnostic_error,
+                        execution_result=result,
+                        completion=(command.id, durable_result),
+                        # An interrupted run may rest PAUSED instead; its channel
+                        # then reads "interrupted", as after lease recovery, or
+                        # waits for the automatic resume the pause scheduled.
+                        settle_interruption=True,
+                        report=report,
+                    )
+
+            if not await run_db_io_cancellation_safe(finalize):
+                raise TaskLeaseLostError("Channel result no longer owns its execution")
+            if report.paused:
+                # The channel has its "interrupted" reply, or waits for the
+                # automatic resume the pause scheduled; a web viewer of the
+                # task learns of the committed pause here. Best effort, as on
+                # the other settlement paths: a failed broadcast is only logged.
+                from .task_orchestrator import publish_settlement_pause
+
+                await publish_settlement_pause(command.task_id, report)
         finally:
-            get_task_event_bridge().discard_command(command.command_id, command.task_id)
+            service.tracer.remove_handler(forwarder)
+            try:
+                await forwarder.close()
+            finally:
+                get_task_event_bridge().discard_command(
+                    command.command_id, command.task_id
+                )
+    finally:
+        try:
+            manager.note_runtime_settled(command.task_id)
+        except Exception:
+            logger.warning(
+                "Settling the cached runtime for task %s failed",
+                command.task_id,
+                exc_info=True,
+            )

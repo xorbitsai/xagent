@@ -85,7 +85,7 @@ class SignedUploadBinding:
     # exact hostnames, no wildcards, no IP literals
     allowed_upload_hosts: frozenset[str]
     upload_path_prefix: str  # starts and ends with "/"
-    content_types: Mapping[str, str]  # lower-case suffix with dot -> MIME
+    content_types: Mapping[str, str]  # lower-case one-dot suffix -> MIME
 
 
 def _validate_hostname(host: Any, label: str) -> None:
@@ -178,6 +178,13 @@ def _validate_entry(
             raise ValueError(
                 f"{types_label} keys must not be longer than {_MAX_SUFFIX_LENGTH}"
             )
+        # The upload looks a file up by its last suffix only, so a key such
+        # as ".tar.gz" could never match. A key that is only a dot never
+        # matches either, because a file name ending in "." has no suffix.
+        if suffix.count(".") > 1:
+            raise ValueError(f"{types_label} keys must contain only one '.'")
+        if suffix == ".":
+            raise ValueError(f"{types_label} keys must have a suffix after '.'")
         if not isinstance(mime, str) or not mime:
             raise ValueError(f"{types_label} values must be non-empty")
         if len(mime) > _MAX_STRING_LENGTH:

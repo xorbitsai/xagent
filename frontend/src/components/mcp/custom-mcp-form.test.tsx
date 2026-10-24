@@ -813,3 +813,282 @@ describe("CustomMcpForm environment key identity", () => {
     expect(screen.queryByDisplayValue("DRAFT_TOKEN")).not.toBeInTheDocument()
   })
 })
+
+const SIGNED_UPLOADS = [
+  {
+    tool_name: "attach_document",
+    file_argument: "document_file_id",
+    issuing_tool_name: "request_upload",
+    allowed_upload_hosts: ["uploads.example.test"],
+    upload_path_prefix: "/staged/",
+    content_types: { ".pdf": "application/pdf" },
+  },
+]
+const SETTINGS_ERROR = "signed_uploads[0] must have exactly the documented keys"
+// Stored entries that cannot be used: the detail echoes them as they are.
+const BAD_SIGNED_UPLOADS = [{ tool_name: "attach_document", file_argument: "document_file_id" }]
+const NOT_A_LIST_ERROR = "signed_uploads must be a list"
+
+const UPLOAD_KEY = "tools.mcp.signedUploads"
+
+describe("CustomMcpForm file uploads", () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    translateMock.mockClear()
+    cleanup()
+  })
+
+  function renderUploadsForm(overrides: Partial<MCPServerFormData> = {}) {
+    const seen: MCPServerFormData[] = []
+    const initial: MCPServerFormData = {
+      name: "records_mcp",
+      transport: "streamable_http",
+      description: "",
+      config: { url: "https://mcp.example.com/mcp" },
+      can_edit_global: true,
+      signed_uploads: null,
+      signed_uploads_error: null,
+      ...overrides,
+    }
+
+    function Harness({ onChange }: { onChange: (data: MCPServerFormData) => void }) {
+      const [formData, setFormData] = React.useState<MCPServerFormData>(initial)
+      React.useEffect(() => {
+        onChange(formData)
+      }, [formData, onChange])
+      return (
+        <CustomMcpForm mcpFormData={formData} setMcpFormData={setFormData} serverId={42} />
+      )
+    }
+
+    render(<Harness onChange={(data) => seen.push(data)} />)
+    return { initial, latest: () => seen[seen.length - 1] }
+  }
+
+  it.each([
+    ["sse", true],
+    ["streamable_http", true],
+    ["stdio", false],
+    ["websocket", false],
+  ])("renders file uploads only for sse and streamable_http", (transport, shown) => {
+    renderUploadsForm({ transport })
+
+    if (shown) expect(screen.getByText(`${UPLOAD_KEY}.title`)).toBeInTheDocument()
+    else expect(screen.queryByText(`${UPLOAD_KEY}.title`)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["valid settings", SIGNED_UPLOADS, null],
+    ["entries that cannot be used", BAD_SIGNED_UPLOADS, SETTINGS_ERROR],
+    ["no settings", null, null],
+    ["a stored value that is not a list", null, NOT_A_LIST_ERROR],
+    ["an empty list", [], null],
+  ])("shows stored settings without writing to the form", async (_name, stored, error) => {
+    const { initial, latest } = renderUploadsForm({
+      signed_uploads: stored,
+      signed_uploads_error: error,
+    })
+    await act(async () => {
+      await flushPromises()
+    })
+
+    expect(latest()).toBe(initial)
+    expect(latest().signed_uploads).toBe(stored)
+    expect(latest().signed_uploads_error).toBe(error)
+    if (stored === SIGNED_UPLOADS) {
+      expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveValue("attach_document")
+      expect(screen.getByLabelText(`${UPLOAD_KEY}.allowedUploadHosts`)).toHaveValue(
+        "uploads.example.test",
+      )
+    }
+    if (stored === BAD_SIGNED_UPLOADS) {
+      expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveValue("attach_document")
+    }
+  })
+
+  it("disables the whole block for a viewer who cannot edit the shared config", () => {
+    renderUploadsForm({
+      can_edit_global: false,
+      signed_uploads: SIGNED_UPLOADS,
+      signed_uploads_error: null,
+    })
+
+    const block = screen.getByText(`${UPLOAD_KEY}.title`).closest("fieldset")
+    if (!block) throw new Error("File uploads block not found")
+    const fields = block.querySelectorAll("input, textarea")
+    expect(fields.length).toBeGreaterThan(0)
+    fields.forEach((field) => expect(field).toBeDisabled())
+    for (const name of ["addTool", "removeTool", "addContentType", "removeContentType"]) {
+      expect(screen.getByRole("button", { name: `${UPLOAD_KEY}.${name}` })).toBeDisabled()
+    }
+  })
+
+  it("disables Clear for a viewer who cannot edit the shared config", () => {
+    renderUploadsForm({
+      can_edit_global: false,
+      signed_uploads: BAD_SIGNED_UPLOADS,
+      signed_uploads_error: SETTINGS_ERROR,
+    })
+
+    expect(screen.getByRole("button", { name: "common.clear" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: `${UPLOAD_KEY}.addTool` })).toBeDisabled()
+    expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toBeDisabled()
+  })
+
+  it.each([
+    ["entries that cannot be used", BAD_SIGNED_UPLOADS, SETTINGS_ERROR],
+    ["a stored value that is not a list", null, NOT_A_LIST_ERROR],
+  ])("shows the settings error with Clear and clears to an empty list", (_name, stored, error) => {
+    const { latest } = renderUploadsForm({
+      signed_uploads: stored,
+      signed_uploads_error: error,
+    })
+
+    if (stored === null) {
+      expect(screen.getByText(`${UPLOAD_KEY}.empty`)).toBeInTheDocument()
+    } else {
+      expect(screen.getByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveValue("attach_document")
+    }
+    expect(screen.getByText(`${UPLOAD_KEY}.invalid`)).toBeInTheDocument()
+    expect(translateMock).toHaveBeenCalledWith(`${UPLOAD_KEY}.invalid`, { error })
+
+    fireEvent.click(screen.getByRole("button", { name: "common.clear" }))
+
+    expect(latest().signed_uploads).toEqual([])
+    expect(screen.queryByText(`${UPLOAD_KEY}.invalid`)).not.toBeInTheDocument()
+    expect(screen.getByText(`${UPLOAD_KEY}.willBeCleared`)).toBeInTheDocument()
+    expect(screen.getByText(`${UPLOAD_KEY}.empty`)).toBeInTheDocument()
+    expect(screen.queryByLabelText(`${UPLOAD_KEY}.toolName`)).not.toBeInTheDocument()
+  })
+
+  it("lets the owner complete an invalid entry in place", () => {
+    const { latest } = renderUploadsForm({
+      signed_uploads: BAD_SIGNED_UPLOADS,
+      signed_uploads_error: SETTINGS_ERROR,
+    })
+
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.issuingToolName`), {
+      target: { value: "request_upload" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.allowedUploadHosts`), {
+      target: { value: "uploads.example.test" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.uploadPathPrefix`), {
+      target: { value: "/staged/" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addContentType` }))
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.extension`), {
+      target: { value: ".pdf" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.contentType`), {
+      target: { value: "application/pdf" },
+    })
+
+    expect(latest().signed_uploads).toEqual(SIGNED_UPLOADS)
+  })
+
+  it.each([
+    [
+      "valid settings",
+      { signed_uploads: SIGNED_UPLOADS, signed_uploads_error: null },
+      true,
+      true,
+    ],
+    [
+      "a stored value that is not a list",
+      { signed_uploads: null, signed_uploads_error: NOT_A_LIST_ERROR },
+      true,
+      true,
+    ],
+    ["no settings", { signed_uploads: null, signed_uploads_error: null }, true, false],
+    [
+      "a viewer who cannot edit the shared config",
+      { transport: "stdio", can_edit_global: false, signed_uploads: SIGNED_UPLOADS },
+      false,
+      false,
+    ],
+  ])(
+    "warns that settings will be cleared when an owner leaves sse or streamable_http",
+    (_name, overrides, canSwitch, expected) => {
+      renderUploadsForm(overrides as Partial<MCPServerFormData>)
+      expect(screen.queryByText(`${UPLOAD_KEY}.willBeCleared`)).not.toBeInTheDocument()
+
+      if (canSwitch) fireEvent.click(screen.getByRole("button", { name: "STDIO" }))
+
+      if (expected) expect(screen.getByText(`${UPLOAD_KEY}.willBeCleared`)).toBeInTheDocument()
+      else expect(screen.queryByText(`${UPLOAD_KEY}.willBeCleared`)).not.toBeInTheDocument()
+    },
+  )
+
+  it("writes trimmed entries and drops blank host lines and empty rows", () => {
+    const { latest } = renderUploadsForm()
+
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addTool` }))
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.toolName`), {
+      target: { value: " attach_document " },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.fileArgument`), {
+      target: { value: " document_file_id " },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.issuingToolName`), {
+      target: { value: " request_upload " },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.allowedUploadHosts`), {
+      target: { value: "uploads.example.test\n\n  \n" },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.uploadPathPrefix`), {
+      target: { value: " /staged/ " },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.extension`), {
+      target: { value: " .pdf " },
+    })
+    fireEvent.change(screen.getByLabelText(`${UPLOAD_KEY}.contentType`), {
+      target: { value: " application/pdf " },
+    })
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addContentType` }))
+
+    expect(latest().signed_uploads).toEqual(SIGNED_UPLOADS)
+  })
+
+  it("keeps the later file type when two rows share an extension", () => {
+    const { latest } = renderUploadsForm()
+
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addTool` }))
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addContentType` }))
+    const extensions = screen.getAllByLabelText(`${UPLOAD_KEY}.extension`)
+    const contentTypes = screen.getAllByLabelText(`${UPLOAD_KEY}.contentType`)
+    fireEvent.change(extensions[0], { target: { value: ".pdf" } })
+    fireEvent.change(contentTypes[0], { target: { value: "application/pdf" } })
+    fireEvent.change(extensions[1], { target: { value: ".pdf" } })
+    fireEvent.change(contentTypes[1], { target: { value: "application/x-pdf" } })
+
+    const entries = latest().signed_uploads as Record<string, unknown>[]
+    expect(entries).toHaveLength(1)
+    expect(entries[0].content_types).toEqual({ ".pdf": "application/x-pdf" })
+  })
+
+  it("drops a tool entry whose fields are all empty", () => {
+    const { latest } = renderUploadsForm({
+      signed_uploads: SIGNED_UPLOADS,
+      signed_uploads_error: null,
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: `${UPLOAD_KEY}.addTool` }))
+
+    expect(screen.getAllByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveLength(2)
+    expect(latest().signed_uploads).toEqual(SIGNED_UPLOADS)
+  })
+
+  it("removes a tool", () => {
+    const second = { ...SIGNED_UPLOADS[0], tool_name: "attach_image" }
+    const { latest } = renderUploadsForm({
+      signed_uploads: [SIGNED_UPLOADS[0], second],
+      signed_uploads_error: null,
+    })
+
+    fireEvent.click(screen.getAllByRole("button", { name: `${UPLOAD_KEY}.removeTool` })[0])
+
+    expect(latest().signed_uploads).toEqual([second])
+    expect(screen.getAllByLabelText(`${UPLOAD_KEY}.toolName`)).toHaveLength(1)
+  })
+})

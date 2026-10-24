@@ -3585,7 +3585,13 @@ class ReActPattern(AgentPattern):
         step_id: str | None,
         data: dict[str, Any],
     ) -> bool:
-        """Require persistence and report whether the trace event landed."""
+        """Require persistence and report whether the trace event landed.
+
+        A failed execution-event commit stops the run like every other strict
+        fact: readers would otherwise keep the attempt's waiting outcome. The
+        ledger still owes the trace, so the resumed run replays it. Any other
+        tracer failure leaves the trace owed and the run going.
+        """
 
         execution_id = getattr(runtime, "execution_id", None)
         try:
@@ -3598,8 +3604,10 @@ class ReActPattern(AgentPattern):
             )
             if inspect.isawaitable(emitted):
                 await emitted
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
-            logger.debug("settlement trace event failed", exc_info=True)
+            logger.warning("settlement trace event failed", exc_info=True)
             return False
         return True
 

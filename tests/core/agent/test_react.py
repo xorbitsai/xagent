@@ -10393,6 +10393,46 @@ async def test_run_replays_pending_settlement_traces_at_entry(mocker: Any) -> No
 
 
 @pytest.mark.asyncio
+async def test_settlement_tracer_failure_keeps_the_trace_owed_and_the_run_going(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tracer failure that is not a fact commit is logged, not raised.
+
+    A failed fact commit raises instead; see
+    test_resumed_settlement_fact_failure_remains_replayable.
+    """
+
+    class FailingTracer:
+        async def trace_event(self, *_: Any, **__: Any) -> None:
+            raise RuntimeError("tracer failed")
+
+    pattern = ReActPattern()
+    [call] = pattern._normalize_tool_calls(
+        [{"function": {"name": "approval_gate", "arguments": "{}"}}]
+    )
+    pattern._record_tool_call(
+        call,
+        status="completed",
+        result={"success": True},
+        settlement_status="succeeded",
+        settlement_trace_pending=True,
+    )
+    record = pattern._tool_record_for_call(call)
+    settle = pattern._trace_tool_interaction_settlement(
+        record=record,
+        status="succeeded",
+        result={"success": True},
+        error=None,
+        runtime=PatternRuntime(execution_id="settle", tracer=FailingTracer()),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await settle
+    assert "settlement trace event failed" in caplog.text
+    assert pattern._tool_record_for_call(call).settlement_trace_pending
+
+
+@pytest.mark.asyncio
 async def test_legacy_settlement_keeps_original_time_unknown() -> None:
     pattern = ReActPattern()
     pattern._store_tool_record(
@@ -13801,11 +13841,18 @@ async def test_resumed_settlement_fact_failure_remains_replayable(
     runtime.active_turn_id = "approval-turn"
     mocker.patch.object(runtime, "checkpoint", new_callable=mocker.AsyncMock)
     tool = SettlementApprovalTool(resume_result=settlement)
-    await pattern._deliver_pending_tool_interaction_responses(
-        tools=[tool],
-        context=context,
-        runtime=runtime,
+    # The failed fact stops the run, after the settled ledger row was saved.
+    with pytest.raises(ExecutionEventPersistenceError):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=runtime,
+        )
+    runtime.checkpoint.assert_awaited_once()
+    assert runtime.checkpoint.await_args.args == (
+        "tool_interaction_response_delivered",
     )
+    assert pattern.pending_tool_interaction_responses == []
     assert failed_action in attempted
     assert len(tool.resume_calls) == 1
     record = pattern._record_for_tool_call_id("call-1")

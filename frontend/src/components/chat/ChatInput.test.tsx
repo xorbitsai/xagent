@@ -56,19 +56,24 @@ vi.mock("next/navigation", () => ({
   }),
 }))
 
+const useFileMentionCalls = vi.hoisted(() => [] as unknown[][])
+
 vi.mock("@/hooks/use-file-mention", () => ({
-  useFileMention: () => ({
-    checkTrigger: vi.fn(),
-    dropdownPosition: null,
-    fileList: [],
-    filteredFiles: [],
-    handleKeyDown: vi.fn(() => false),
-    insertFile: vi.fn(),
-    isLoadingFiles: false,
-    resetMention: resetMentionMock,
-    selectedFileIndex: 0,
-    showFilePicker: false,
-  }),
+  useFileMention: (...args: unknown[]) => {
+    useFileMentionCalls.push(args)
+    return {
+      checkTrigger: vi.fn(),
+      dropdownPosition: null,
+      fileList: [],
+      filteredFiles: [],
+      handleKeyDown: vi.fn(() => false),
+      insertFile: vi.fn(),
+      isLoadingFiles: false,
+      resetMention: resetMentionMock,
+      selectedFileIndex: 0,
+      showFilePicker: false,
+    }
+  },
 }))
 
 vi.mock("sonner", () => ({
@@ -2318,5 +2323,300 @@ describe("ChatInput", () => {
 
     expect(screen.getByText("custom.placeholder")).toBeInTheDocument()
     expect(screen.queryByText("chatPage.input.placeholder")).not.toBeInTheDocument()
+  })
+})
+
+describe("ChatInput upload-only attachments", () => {
+  const attachments = { accept: ".pdf,.png", maxFiles: 2, maxFileBytes: 100 }
+  const pdf = (name = "report.pdf", size = 10) => {
+    const file = new File(["x".repeat(size)], name, { type: "application/pdf" })
+    return file
+  }
+  let fetchSpy: ReturnType<typeof vi.fn>
+
+  beforeEach(() => {
+    useFileMentionCalls.length = 0
+    toastErrorMock.mockReset()
+    apiRequestMock.mockReset()
+    apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
+    fetchSpy = vi.fn(() => Promise.resolve(emptyJsonResponse()))
+    vi.stubGlobal("fetch", fetchSpy)
+    localStorage.setItem("token", "main-site-token")
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+    localStorage.clear()
+  })
+
+  type HarnessProps = Partial<React.ComponentProps<typeof ChatInput>> & {
+    initialFiles?: File[]
+    onFilesSeen?: (files: File[]) => void
+  }
+  function Harness({ initialFiles = [], onFilesSeen, ...props }: HarnessProps) {
+    const [files, setFiles] = React.useState<File[]>(initialFiles)
+    return (
+      <ChatInput
+        files={files}
+        filesDisabled
+        hideConfig
+        inputValue=""
+        onFilesChange={(next) => {
+          onFilesSeen?.(next)
+          setFiles(next)
+        }}
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        {...props}
+      />
+    )
+  }
+
+  const fileInput = (container: HTMLElement) =>
+    container.querySelector('input[type="file"]') as HTMLInputElement | null
+
+  it("keeps the upload control hidden when files are disabled and no attachments are offered", () => {
+    const { container } = render(<Harness />)
+    expect(fileInput(container)).toBeNull()
+  })
+
+  it("shows the upload control with the advertised accept list while files stay disabled", () => {
+    const { container } = render(<Harness attachments={attachments} />)
+
+    expect(fileInput(container)?.getAttribute("accept")).toBe(".pdf,.png")
+    expect(fileInput(container)?.multiple).toBe(true)
+  })
+
+  it("shows the upload control in the compact toolbar too", () => {
+    const { container } = render(<Harness attachments={attachments} compact />)
+
+    expect(fileInput(container)?.getAttribute("accept")).toBe(".pdf,.png")
+  })
+
+  it("collects files without uploading them and still hides file previews", () => {
+    const onFilesSeen = vi.fn()
+    const { container } = render(
+      <Harness attachments={attachments} onFilesSeen={onFilesSeen} />,
+    )
+    const file = pdf()
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, { target: { files: [file] } })
+
+    expect(onFilesSeen).toHaveBeenCalledWith([file])
+    expect(screen.getByText("report.pdf")).toBeInTheDocument()
+    expect(container.querySelector(".file-chip-preview")).toBeNull()
+  })
+
+  it("refuses an extension that is not advertised, case-insensitively accepting the advertised ones", () => {
+    const { container } = render(<Harness attachments={attachments} />)
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [pdf("script.exe"), pdf("noextension"), pdf("SHOUT.PDF")] },
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.typeNotSupported", expect.anything())
+    expect(screen.queryByText("script.exe")).not.toBeInTheDocument()
+    expect(screen.queryByText("noextension")).not.toBeInTheDocument()
+    expect(screen.getByText("SHOUT.PDF")).toBeInTheDocument()
+  })
+
+  it("refuses a file larger than the advertised limit", () => {
+    const { container } = render(<Harness attachments={attachments} />)
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [pdf("big.pdf", 101), pdf("fits.pdf", 100)] },
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("clientErrors.uploadTooLarge", expect.anything())
+    expect(screen.queryByText("big.pdf")).not.toBeInTheDocument()
+    expect(screen.getByText("fits.pdf")).toBeInTheDocument()
+  })
+
+  it("refuses files beyond the per-message count, counting files already collected", () => {
+    const { container } = render(
+      <Harness attachments={attachments} initialFiles={[pdf("one.pdf")]} />,
+    )
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [pdf("two.pdf"), pdf("three.pdf")] },
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.tooManyFiles", expect.anything())
+    expect(screen.getByText("one.pdf")).toBeInTheDocument()
+    expect(screen.getByText("two.pdf")).toBeInTheDocument()
+    expect(screen.queryByText("three.pdf")).not.toBeInTheDocument()
+  })
+
+  it("shows uploading and failed cards and retries only the failed file", () => {
+    const uploading = pdf("busy.pdf")
+    const failed = pdf("broken.pdf")
+    const done = pdf("done.pdf")
+    const onRetryAttachment = vi.fn()
+    render(
+      <Harness
+        attachments={attachments}
+        initialFiles={[uploading, failed, done]}
+        attachmentStatuses={new Map([
+          [uploading, "uploading"],
+          [failed, "failed"],
+          [done, "uploaded"],
+        ])}
+        onRetryAttachment={onRetryAttachment}
+      />,
+    )
+
+    expect(screen.getAllByText("widgetSession.attachments.uploading")).toHaveLength(1)
+    fireEvent.click(screen.getByText("widgetSession.attachments.uploadFailedRetry"))
+
+    expect(onRetryAttachment).toHaveBeenCalledTimes(1)
+    expect(onRetryAttachment).toHaveBeenCalledWith(failed)
+  })
+
+  it("disables the retry button of a failed file while attachments are busy and enables it again afterwards", () => {
+    const failed = pdf("broken.pdf")
+    const onRetryAttachment = vi.fn()
+    const props = {
+      attachments,
+      initialFiles: [failed],
+      attachmentStatuses: new Map([[failed, "failed" as const]]),
+      onRetryAttachment,
+    }
+    const { rerender } = render(<Harness {...props} attachmentsBusy />)
+    const retryButton = screen.getByRole("button", { name: "widgetSession.attachments.uploadFailedRetry" })
+
+    expect(retryButton).toBeDisabled()
+    fireEvent.click(retryButton)
+    expect(onRetryAttachment).not.toHaveBeenCalled()
+
+    rerender(<Harness {...props} attachmentsBusy={false} />)
+    const enabledButton = screen.getByRole("button", { name: "widgetSession.attachments.uploadFailedRetry" })
+    expect(enabledButton).toBeEnabled()
+    fireEvent.click(enabledButton)
+    expect(onRetryAttachment).toHaveBeenCalledTimes(1)
+    expect(onRetryAttachment).toHaveBeenCalledWith(failed)
+  })
+
+  it("does not let a draft with a file still uploading be submitted", () => {
+    const uploading = pdf("busy.pdf")
+    const onSend = vi.fn()
+    const { rerender } = render(
+      <Harness
+        attachments={attachments}
+        initialFiles={[uploading]}
+        attachmentStatuses={new Map([[uploading, "uploading"]])}
+        onSend={onSend}
+      />,
+    )
+    const editor = screen.getByRole("textbox")
+
+    fireEvent.keyDown(editor, { key: "Enter" })
+    expect(onSend).not.toHaveBeenCalled()
+
+    rerender(
+      <Harness
+        attachments={attachments}
+        initialFiles={[uploading]}
+        attachmentStatuses={new Map([[uploading, "uploaded"]])}
+        onSend={onSend}
+      />,
+    )
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" })
+    expect(onSend).toHaveBeenCalledTimes(1)
+  })
+
+  it("disables the upload button and refuses added files while answering a request", () => {
+    const onFilesSeen = vi.fn()
+    const { container } = render(
+      <Harness
+        attachments={attachments}
+        compact
+        currentInteractionRequestId="request-1"
+        onFilesSeen={onFilesSeen}
+      />,
+    )
+
+    expect(screen.getByTitle("chatPage.input.actions.upload")).toBeDisabled()
+    fireEvent.change(fileInput(container) as HTMLInputElement, { target: { files: [pdf()] } })
+
+    expect(onFilesSeen).not.toHaveBeenCalled()
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.noFilesOnAnswer", expect.anything())
+  })
+
+  it("collects pasted and dropped files through the same limits", () => {
+    const onFilesSeen = vi.fn()
+    const { container } = render(
+      <Harness attachments={attachments} onFilesSeen={onFilesSeen} />,
+    )
+    const good = pdf("pasted.pdf")
+    const bad = pdf("pasted.exe")
+    const editor = screen.getByRole("textbox")
+
+    fireEvent.paste(editor, {
+      clipboardData: { items: [{ kind: "file", type: "application/pdf", getAsFile: () => good }] },
+    })
+    expect(onFilesSeen).toHaveBeenLastCalledWith([good])
+
+    const form = container.querySelector("form") as HTMLFormElement
+    fireEvent.drop(form, {
+      dataTransfer: { types: ["Files"], items: [{ kind: "file", getAsFile: () => bad }], files: [bad] },
+    })
+    expect(onFilesSeen).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith("widgetSession.attachments.typeNotSupported", expect.anything())
+  })
+
+  describe.each([[true], [false]])("with deferFileUpload=%s", (deferFileUpload) => {
+    it("never reads or uploads a file on its own and keeps file mentions closed", () => {
+      const uploadFile = vi.fn()
+      const { container } = render(
+        <Harness
+          attachments={attachments}
+          deferFileUpload={deferFileUpload}
+          uploadFile={uploadFile}
+          voiceInputEnabled={false}
+        />,
+      )
+
+      fireEvent.change(fileInput(container) as HTMLInputElement, { target: { files: [pdf()] } })
+      const editor = screen.getByRole("textbox")
+      editor.textContent = "@"
+      fireEvent.input(editor)
+
+      expect(uploadFile).not.toHaveBeenCalled()
+      expect(apiRequestMock).not.toHaveBeenCalled()
+      const urls = fetchSpy.mock.calls.map((call) => String(call[0]))
+      expect(urls.filter((url) => url.includes("/api/files/"))).toEqual([])
+      const headers = JSON.stringify(fetchSpy.mock.calls.map((call) => call[1]?.headers ?? null))
+      expect(headers).not.toContain("main-site-token")
+      expect(useFileMentionCalls.length).toBeGreaterThan(0)
+      for (const call of useFileMentionCalls) expect(call[4]).toBe(true)
+    })
+  })
+
+  it("keeps the previous behaviour when no attachments option is passed", async () => {
+    const uploadFile = vi.fn().mockResolvedValue({ file_id: "file-1" })
+
+    function Plain() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          files={files}
+          hideConfig
+          inputValue=""
+          onFilesChange={setFiles}
+          onInputChange={vi.fn()}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+    const { container } = render(<Plain />)
+    expect(fileInput(container)?.getAttribute("accept")).toContain(".docx")
+
+    fireEvent.change(fileInput(container) as HTMLInputElement, {
+      target: { files: [new File(["x"], "plain.txt")] },
+    })
+
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(1))
   })
 })

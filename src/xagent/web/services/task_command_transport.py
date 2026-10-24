@@ -36,7 +36,11 @@ from ...config import (
 )
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.task_admission import TaskAdmissionTicket
-from ..models.task_command import TaskExecutionCommand
+from ..models.task_command import (
+    _CLAIMABLE_STATUS_CLAUSE,
+    CLAIMABLE_COMMAND_STATUSES,
+    TaskExecutionCommand,
+)
 from ..models.user import User
 from .db_runtime import (
     await_task_settlement,
@@ -874,7 +878,7 @@ def enqueue_task_command(
 def _claim_availability_predicate(now: datetime) -> Any:
     if get_shared_task_execution_enabled():
         return and_(
-            TaskExecutionCommand.status.in_((COMMAND_PENDING, COMMAND_PROCESSING)),
+            TaskExecutionCommand.status.in_(CLAIMABLE_COMMAND_STATUSES),
             or_(
                 TaskExecutionCommand.retry_available_at.is_(None),
                 TaskExecutionCommand.retry_available_at <= now,
@@ -893,6 +897,30 @@ def _claim_availability_predicate(now: datetime) -> Any:
             TaskExecutionCommand.claim_expires_at < now,
         ),
     )
+
+
+# Presence prechecks: whether any command in a claimable status exists, so an
+# idle scan builds no candidate query. The status set is a superset of what
+# ``_claim_availability_predicate`` accepts in either mode (a test guards
+# this), which makes the precheck a necessary condition for any candidate.
+# Both read ``TaskExecutionCommand`` through the ORM, so an unflushed command
+# in the session is flushed first, as it is for a ``Query.first()`` lookup, and
+# both can use the claimable partial indexes.
+_OPEN_COMMAND_PRESENCE = select(
+    exists(select(1).select_from(TaskExecutionCommand).where(_CLAIMABLE_STATUS_CLAUSE))
+)
+# The same, plus whether any of them is a reply (RESUME_INPUT) to a waiting task.
+_OPEN_COMMAND_AND_REPLY_PRESENCE = select(
+    exists(select(1).select_from(TaskExecutionCommand).where(_CLAIMABLE_STATUS_CLAUSE)),
+    exists(
+        select(1)
+        .select_from(TaskExecutionCommand)
+        .where(
+            _CLAIMABLE_STATUS_CLAUSE,
+            TaskExecutionCommand.kind == TaskCommandKind.RESUME_INPUT.value,
+        )
+    ),
+)
 
 
 def _command_routing_predicate(runner_id: str, now: datetime) -> Any:
@@ -1119,10 +1147,14 @@ def claim_task_command(
     """Atomically claim the oldest eligible command for this worker.
 
     ``cap`` is the snapshot the candidate was picked under; the lookup applies
-    the same narrowing to it.
+    the same narrowing to it. Without ``command_db_id``, one presence statement
+    first checks that any claimable-status command exists, and nothing else is
+    built when none does.
     """
 
     if not consumes_task_commands():
+        return None
+    if command_db_id is None and not db.execute(_OPEN_COMMAND_PRESENCE).scalar_one():
         return None
     resolved_runner_id = runner_id or get_runner_id()
     candidate = _claimable_query(
@@ -1873,8 +1905,15 @@ def _find_command_candidate(
     one database snapshot. What the process may select depends on ``cap``: with
     room, everything claimable; between its batch line and its limit, controls,
     commands of tasks it already runs, and interactive commands; at its limit,
-    controls and commands of tasks it already runs. Without ``command_db_id``,
-    a reply is looked for first whenever the process is not at its limit.
+    controls and commands of tasks it already runs. Without ``command_db_id``
+    and below the limit, one presence statement decides whether any
+    claimable-status command exists and whether any of them is a reply; nothing
+    is built when none exists, and the reply-first lookup runs only when a reply
+    is open. At the limit the scan runs its single narrow query as before. The
+    precheck is a necessary condition only: when commands are open but none is
+    claimable, the full scan still runs, adding one indexed round trip. A
+    command committed after the precheck is found by the next poll or the
+    in-process notify, within the bound ``stage_task_command`` documents.
     """
     from ..models.database import get_session_local
 
@@ -1899,7 +1938,12 @@ def _find_command_candidate(
             ).first()
 
         row = None
+        any_reply = False
         if command_db_id is None and (cap is None or not cap.closed):
+            any_open, any_reply = db.execute(_OPEN_COMMAND_AND_REPLY_PRESENCE).one()
+            if not any_open:
+                return None
+        if any_reply:
             # A reply to a waiting task is served before any other claimable
             # command, oldest first. That deliberately includes older pause
             # and cancel commands of other tasks; each waits behind at most

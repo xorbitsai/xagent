@@ -425,7 +425,7 @@ async def test_proxy_tls_uses_the_configured_ca_only_for_https(
     _, _, _, options = network
     context = Mock()
     monkeypatch.setattr(
-        "xagent.core.utils.public_http_transport.build_ca_bundle_ssl_context",
+        "xagent.core.utils.public_http_transport.shared_ca_bundle_ssl_context",
         lambda: context,
     )
     transport = PublicHttpTransport(proxy_url=f"{scheme}://proxy.test:3128")

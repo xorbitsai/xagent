@@ -63,7 +63,15 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     runtime_bindings_from_config,
 )
 from ...core.tools.adapters.vibe.db_session import tool_session_scope
-from ...core.tools.adapters.vibe.mcp_adapter import redact_urls_in_text
+from ...core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    mcp_load_failure_message,
+    redact_urls_in_text,
+)
+from ...core.tools.adapters.vibe.signed_upload import (
+    SIGNED_UPLOAD_TRANSPORTS,
+    signed_upload_settings_error,
+)
 from ...core.tools.core.web_content import get_trusted_proxy_url
 from ...core.utils.public_http_transport import create_public_async_client
 from ..services.actor_mcp_runtime import (
@@ -4725,6 +4733,45 @@ class WebToolConfig(BaseToolConfig):
                     "connector_runtime",
                 ):
                     config.pop(key, None)
+            # Signed-upload settings travel with the connector row and are
+            # checked here, before a token is resolved or a runtime connection
+            # is built.  Settings that cannot be used make the whole connector
+            # unavailable instead of being dropped: without them the issuing
+            # tool would reach the model and the replaced tool would forward
+            # file references unchanged.  That is also why an actor-run remote
+            # OAuth catalog connector, which runs only on its catalog
+            # definition, is unavailable when its row stores any settings,
+            # valid or not, while the runtime fields removed above are simply
+            # left out.  (A built-in catalog row has the oauth transport and
+            # never reaches this branch; under an actor, one that stores
+            # settings is not canonical and is already unavailable.)
+            signed_uploads = getattr(server, "signed_uploads", None)
+            if (
+                server.transport in SIGNED_UPLOAD_TRANSPORTS
+                and signed_uploads is not None
+                and signed_uploads != []
+            ):
+                if (
+                    actor_remote_oauth
+                    or signed_upload_settings_error(
+                        signed_uploads,
+                        transport=server.transport,
+                        url=getattr(server, "url", None),
+                    )
+                    is not None
+                ):
+                    logger.warning(
+                        "MCP server '%s' has signed upload settings it cannot use",
+                        server.name,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="invalid_configuration",
+                        message=mcp_load_failure_message(
+                            MCPFailurePhase.INVALID_CONFIGURATION
+                        ),
+                    )
+                config["signed_uploads"] = signed_uploads
             if actor_remote_oauth and (self._mcp_auth_context or {}).get(
                 str(server.id)
             ):

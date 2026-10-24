@@ -368,15 +368,16 @@ async def test_on_the_batch_line_a_scan_runs_the_open_cap_number_of_queries(
     fill(host, 2)
     batch_line = cap_of(host)
     assert batch_line.batch_closed and not batch_line.closed
-    # A reply lookup, then the general lookup.
+    # The presence precheck, then the general lookup.
     assert select_count(host, batch_line) == 2
     host.enqueue(
         host.new_task(status=TaskStatus.WAITING_FOR_USER),
         "resume_input",
         dispatch_class="interactive",
     )
-    # The reply lookup finds one and ends the scan.
-    assert select_count(host, batch_line) == 1
+    # The presence precheck, then the reply lookup, which finds one and ends
+    # the scan.
+    assert select_count(host, batch_line) == 2
 
 
 async def test_a_batch_command_of_a_running_task_is_taken_on_the_batch_line(

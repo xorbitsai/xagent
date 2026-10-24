@@ -10,7 +10,7 @@ import httpx
 
 from .public_policy import HttpDestinationPolicy
 from .security import (
-    build_ca_bundle_ssl_context,
+    shared_ca_bundle_ssl_context,
     validate_public_http_url,
     validate_public_http_url_sync,
 )
@@ -72,7 +72,7 @@ class PublicHttpTransport(httpx.AsyncBaseTransport):
     ) -> None:
         self._policy = _policy
         self._via_proxy = proxy_url is not None
-        ssl_context = build_ca_bundle_ssl_context()
+        ssl_context = shared_ca_bundle_ssl_context()
         proxy = (
             httpx.Proxy(proxy_url, ssl_context=ssl_context)
             if proxy_url and httpx.URL(proxy_url).scheme == "https"
@@ -148,7 +148,7 @@ class PublicSyncHttpTransport(httpx.BaseTransport):
     ) -> None:
         self._policy = _policy
         self._via_proxy = proxy_url is not None
-        ssl_context = build_ca_bundle_ssl_context()
+        ssl_context = shared_ca_bundle_ssl_context()
         proxy = (
             httpx.Proxy(proxy_url, ssl_context=ssl_context)
             if proxy_url and httpx.URL(proxy_url).scheme == "https"

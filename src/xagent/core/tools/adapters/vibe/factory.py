@@ -1274,6 +1274,7 @@ class ToolFactory:
                             "runtime_input_schema",
                             "connector_runtime",
                             "allow_delegated_authorization",
+                            "signed_uploads",
                         ):
                             if runtime_key in config:
                                 connection_config[runtime_key] = config[runtime_key]

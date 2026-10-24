@@ -11,6 +11,21 @@ const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 export const isCanonicalUuid = (value: unknown): value is string =>
   typeof value === "string" && CANONICAL_UUID.test(value)
 
+// Why an advertised capability refuses one file, or null when it accepts it.
+// `accept` lists lowercase extensions with a leading dot, separated by commas;
+// a file with no extension never matches. The per-message count is left to
+// the caller, which knows how many files the message already holds.
+export const capabilityRefusal = (
+  file: File,
+  limits: { accept: string; maxFileBytes: number },
+): "type" | "size" | null => {
+  const dot = file.name.lastIndexOf(".")
+  const extension = dot >= 0 ? file.name.slice(dot).toLowerCase() : ""
+  if (!limits.accept.split(",").includes(extension)) return "type"
+  if (file.size > limits.maxFileBytes) return "size"
+  return null
+}
+
 export class WidgetSessionUploadError extends Error {
   readonly errorCode: ClientErrorCode
 

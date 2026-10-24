@@ -13,6 +13,7 @@ import asyncio
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -6524,13 +6525,25 @@ async def test_deferred_not_accepted_real_runner_is_never_failed_or_resumed(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("canceller", ["a2a", "external", "internal"])
+@pytest.mark.parametrize(
+    ("canceller", "slow_outcome_write", "hung_client"),
+    [
+        ("a2a", False, False),
+        ("a2a", True, False),
+        ("a2a", True, True),
+        ("external", False, False),
+        ("internal", False, False),
+    ],
+    ids=["a2a", "a2a-slow", "a2a-slow-hung-client", "external", "internal"],
+)
 async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
-    db_session, canceller
+    db_session, monkeypatch, caplog, canceller, slow_outcome_write, hung_client
 ) -> None:
     """An explicit stop fails the task; only a non-explicit cancel pauses it.
 
-    Either way the uncertain delivery stays outcome_unknown.
+    Either way the uncertain delivery stays outcome_unknown. In the slow case
+    the write outlasts the A2A cancel's 0.5s wait, so cancel_task cancels the
+    resume again while it records the outcome; the client still hears it.
     """
     from xagent.web.models.agent import Agent
     from xagent.web.services.a2a_task_cancel import cancel_a2a_task
@@ -6539,6 +6552,7 @@ async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
         cancel_external_task_unserialized,
     )
 
+    caplog.set_level(logging.INFO, logger=task_execution_service.__name__)
     owner, task, turn_id = _seed_deferred_delivery(db_session, f"cancel-{canceller}")
     agent_row = Agent(user_id=int(owner.id), name=f"cancel-{canceller}")
     db_session.add(agent_row)
@@ -6558,9 +6572,31 @@ async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
         resume_execution_by_id=AsyncMock(),
     )
     notify = AsyncMock()
+    if hung_client:
+
+        async def never_sent(**_: Any) -> None:
+            # A client that stops reading: the send never completes.
+            await asyncio.Event().wait()
+
+        notify.side_effect = never_sent
+        monkeypatch.setattr(
+            task_execution_service, "_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS", 0.1
+        )
+    mark = task_execution_service.mark_user_message_delivery_sync
+
+    def mark_delivery(task_id, turn_id, status, *args, **kwargs):
+        if slow_outcome_write and status == DELIVERY_OUTCOME_UNKNOWN:
+            time.sleep(1.0)
+        return mark(task_id, turn_id, status, *args, **kwargs)
+
     manager = task_execution_service.BackgroundTaskManager()
     try:
-        with patch.object(task_execution_service, "background_task_manager", manager):
+        with (
+            patch.object(task_execution_service, "background_task_manager", manager),
+            patch.object(
+                task_execution_service, "mark_user_message_delivery_sync", mark_delivery
+            ),
+        ):
             assert (
                 manager.try_reserve_resume(
                     int(task.id), expected_run_id=task_execution_service.ANY_RESUME_RUN
@@ -6606,8 +6642,14 @@ async def test_explicit_cancel_wins_over_uncertain_deferred_injection(
             else:
                 # Shutdown or lease loss: not a stop request.
                 operation.cancel()
-            await asyncio.gather(operation, return_exceptions=True)
+            [outcome] = await asyncio.wait_for(
+                asyncio.gather(operation, return_exceptions=True), DB_PROGRESS_TIMEOUT
+            )
+        assert isinstance(outcome, asyncio.CancelledError)
+        if slow_outcome_write:
+            assert "Cancellation timeout for task" in caplog.text
         assert _delivery_status(db_session, turn_id) == DELIVERY_OUTCOME_UNKNOWN
+        notify.assert_awaited_once()
         assert notify.await_args.kwargs["rejection_outcome"] == "outcome_unknown"
         assert not notify.await_args.kwargs["retry_with_new_id"]
         agent.resume_execution_by_id.assert_not_awaited()

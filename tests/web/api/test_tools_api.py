@@ -1631,6 +1631,9 @@ class TestWebToolConfigMCPAuth:
         server.headers = {"X-Test": "true"}
         server.auth = {"type": "bearer", "bearer_token": "test-token-123"}
         server.managed = "external"
+        # A real row without upload settings reads None; an unset MagicMock
+        # attribute would read as stored settings and fail closed.
+        server.signed_uploads = None
         server._decrypt_auth_config.side_effect = lambda auth: auth
         server._merge_auth_headers.side_effect = lambda headers, auth: {
             **(headers or {}),

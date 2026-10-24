@@ -19,7 +19,7 @@ AUTH = {"type": "mcp_oauth"}
 _SERVER_IDENTITY_DDL = (
     ", transport VARCHAR(50), url VARCHAR(500), auth JSON, command VARCHAR(500),"
     " args JSON, cwd VARCHAR(500), env JSON, headers JSON, timeout INTEGER,"
-    " runtime_input_schema JSON, runtime_bindings JSON,"
+    " runtime_input_schema JSON, runtime_bindings JSON, signed_uploads JSON,"
     " concurrency_safe BOOLEAN NOT NULL DEFAULT 0, concurrent_tools JSON,"
     " allow_delegated_authorization BOOLEAN NOT NULL DEFAULT 0,"
     " managed VARCHAR(20) NOT NULL DEFAULT 'external',"
@@ -32,6 +32,7 @@ _JSON_COLUMNS = {
     "headers",
     "runtime_input_schema",
     "runtime_bindings",
+    "signed_uploads",
     "concurrent_tools",
 }
 
@@ -239,6 +240,7 @@ def test_refuses_unowned_row_whose_auth_differs_from_the_catalog_auth(
         {"args": ["--flag"]},
         {"cwd": "/srv/custom"},
         {"runtime_bindings": {"a": "b"}},
+        {"signed_uploads": [{"tool_name": "attach_document"}]},
         {"runtime_input_schema": {"type": "object"}},
         {"concurrency_safe": True},
         {"concurrent_tools": ["create_issue"]},

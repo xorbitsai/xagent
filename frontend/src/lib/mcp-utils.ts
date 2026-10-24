@@ -8,6 +8,16 @@ type JsonObject = Record<string, unknown>
 type RuntimeBindings = JsonObject[]
 const MASKED_SECRET_VALUE = "********"
 
+// Transports whose connectors may carry signed-upload settings. Must equal
+// SIGNED_UPLOAD_TRANSPORTS in
+// src/xagent/core/tools/adapters/vibe/signed_upload.py; a test compares them.
+// Narrower than the MCP OAuth transports: websocket is not one of them.
+export const SIGNED_UPLOAD_TRANSPORTS: ReadonlySet<string> = new Set(["sse", "streamable_http"])
+
+export function isSignedUploadTransport(transport: unknown): boolean {
+  return typeof transport === "string" && SIGNED_UPLOAD_TRANSPORTS.has(transport)
+}
+
 export interface CustomApiDetail {
   id: number
   name: string
@@ -53,6 +63,8 @@ export interface McpServerDetail {
   runtime_bindings: RuntimeBindings | null
   allow_delegated_authorization: boolean
   can_edit_global: boolean
+  signed_uploads: unknown[] | null
+  signed_uploads_error: string | null
 }
 
 export interface McpServerEditFormData {
@@ -65,6 +77,8 @@ export interface McpServerEditFormData {
   runtime_input_schema: JsonObject | null
   runtime_bindings: RuntimeBindings | null
   allow_delegated_authorization: boolean
+  signed_uploads: unknown[] | null
+  signed_uploads_error: string | null
 }
 
 export interface McpServerEditState {
@@ -95,6 +109,8 @@ type McpServerMutationPayload = Partial<{
   allow_delegated_authorization: boolean
 }>
 
+export type McpServerPayload = McpServerMutationPayload & { signed_uploads?: JsonObject[] }
+
 interface CustomApiPayloadFormData {
   name?: unknown
   description?: unknown
@@ -116,6 +132,7 @@ interface McpServerPayloadFormData {
   runtime_input_schema?: unknown
   runtime_bindings?: unknown
   allow_delegated_authorization?: unknown
+  signed_uploads?: unknown
 }
 
 export function isValidMcpName(name: string): boolean {
@@ -285,6 +302,12 @@ export function parseMcpServerDetail(value: unknown): McpServerDetail {
   if (!hasOwn(value, "can_edit_global")) invalidMcpDetail("can_edit_global is missing")
   if (typeof value.can_edit_global !== "boolean") invalidMcpDetail("can_edit_global")
 
+  if (!hasOwn(value, "signed_uploads")) invalidMcpDetail("signed_uploads is missing")
+  if (!hasOwn(value, "signed_uploads_error")) invalidMcpDetail("signed_uploads_error is missing")
+  if (value.signed_uploads_error !== null && typeof value.signed_uploads_error !== "string") {
+    invalidMcpDetail("signed_uploads_error")
+  }
+
   return {
     id: value.id as number,
     user_id: value.user_id as number,
@@ -297,6 +320,12 @@ export function parseMcpServerDetail(value: unknown): McpServerDetail {
     runtime_bindings: cloneJson(value.runtime_bindings as RuntimeBindings | null),
     allow_delegated_authorization: value.allow_delegated_authorization,
     can_edit_global: value.can_edit_global,
+    // The stored value is echoed as it is, valid or not; signed_uploads_error
+    // alone says whether the connector can use it. A value that is not a list
+    // cannot be shown as entries, so it reads as no settings and the editor
+    // still opens; clearing it still sends [] (see signedUploadsMutation).
+    signed_uploads: Array.isArray(value.signed_uploads) ? cloneJson(value.signed_uploads) : null,
+    signed_uploads_error: value.signed_uploads_error as string | null,
   }
 }
 
@@ -312,6 +341,8 @@ export function mcpServerDetailToEditState(detail: McpServerDetail): McpServerEd
       runtime_input_schema: cloneJson(detail.runtime_input_schema),
       runtime_bindings: cloneJson(detail.runtime_bindings),
       allow_delegated_authorization: detail.allow_delegated_authorization,
+      signed_uploads: cloneJson(detail.signed_uploads),
+      signed_uploads_error: detail.signed_uploads_error,
     },
   }
 }
@@ -519,25 +550,72 @@ export function buildCustomApiPayload(
 }
 
 /**
+ * The signed_uploads value an MCP save sends, or undefined to leave it out.
+ *
+ * Kept out of the field-by-field diff. A create sends the field only for sse
+ * and streamable_http connectors with at least one entry. An edit that moves
+ * a connector off those transports always sends [] so the stored settings are
+ * cleared, valid or not: the settings are usually untouched then, so a diff
+ * would leave them out and the server would refuse the move. A viewer who
+ * cannot edit the shared config never sends it. Otherwise an edit sends it
+ * only when it differs from the detail; null and [] are compared as they are,
+ * so clearing a stored value that is not a list, which the detail reads as
+ * null, still sends [].
+ */
+function signedUploadsMutation(
+  formDataValue: object,
+  transport: string,
+  baseline?: McpServerDetail,
+): JsonObject[] | undefined {
+  const formData = formDataValue as McpServerPayloadFormData
+  const value = formData.signed_uploads === undefined
+    ? baseline?.signed_uploads ?? null
+    : formData.signed_uploads
+  let next: unknown
+  if (!baseline) {
+    if (!isSignedUploadTransport(transport) || !Array.isArray(value) || value.length === 0) {
+      return undefined
+    }
+    next = value
+  } else if (!baseline.can_edit_global) {
+    return undefined
+  } else if (!isSignedUploadTransport(transport)) {
+    return isSignedUploadTransport(baseline.transport) ? [] : undefined
+  } else {
+    if (deepEqual(value, baseline.signed_uploads)) return undefined
+    next = value ?? []
+  }
+  if (!Array.isArray(next) || !next.every(isObject)) {
+    throw new Error("Invalid MCP server form data: signed_uploads")
+  }
+  return cloneJson(next)
+}
+
+/**
  * Build the single MCP mutation contract. Creation emits the full whitelist;
  * editing emits only changes from the authoritative detail baseline. Per-user
  * env remains a complete replacement whenever it changes, preserving masked
  * baseline entries that the backend resolves to their stored secret values.
+ * signed_uploads follows signedUploadsMutation instead of the diff.
  */
 export function buildMcpServerPayload(
   mcpFormData: object,
   baseline?: McpServerDetail,
-): McpServerMutationPayload {
+): McpServerPayload {
   const current = mcpMutationValues(mcpFormData, baseline)
-  if (!baseline) return current
+  const signedUploads = signedUploadsMutation(mcpFormData, current.transport, baseline)
+  if (!baseline) {
+    return signedUploads === undefined ? current : { ...current, signed_uploads: signedUploads }
+  }
 
   const original = baselineMcpMutationValues(baseline)
-  const payload: McpServerMutationPayload = {}
+  const payload: McpServerPayload = {}
   ;(Object.keys(current) as (keyof McpServerMutationPayload)[]).forEach((key) => {
     if (!deepEqual(current[key], original[key])) {
       ;(payload as Record<string, unknown>)[key] = current[key]
     }
   })
+  if (signedUploads !== undefined) payload.signed_uploads = signedUploads
   return payload
 }
 

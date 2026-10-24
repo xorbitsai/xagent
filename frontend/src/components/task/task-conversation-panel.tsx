@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
-import { ChatInput } from "@/components/chat/ChatInput"
+import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { CompactionNotice } from "@/components/chat/CompactionNotice"
@@ -15,7 +15,7 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp, type TaskAutoResume } from "@/contexts/app-context-chat"
+import { useApp, type SessionAttachmentsConfig, type TaskAutoResume } from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
@@ -43,6 +43,24 @@ interface TaskConversationPanelProps {
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>
   deferFileUpload?: boolean
   onSend?: (message: string, config?: any, files?: File[]) => Promise<void> | void
+  // Upload-only mode (see ChatInput): the composer collects files although
+  // file reads stay disabled, and hands them to `onSend`.
+  attachments?: SessionAttachmentsConfig
+  attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
+  onRetryAttachment?: (file: File) => void
+  // Attachment work is in progress (an upload, or a send with files until it
+  // has gone out and been accepted). It disables every file retry and counts
+  // as a message in flight, which locks the composer only while the task is
+  // pending or there is no task: while it is running, paused, waiting for an
+  // answer, completed or failed, the composer stays open.
+  attachmentsBusy?: boolean
+  // The collected files, when the caller holds them so that they outlive this
+  // panel. The panel then shows these and reports every change through
+  // `onAttachmentFilesChange`.
+  attachmentFiles?: File[]
+  // Called with the collected files every time they change: when the visitor
+  // adds or removes one, and once a send has completed.
+  onAttachmentFilesChange?: (files: File[]) => void
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
 }
 
@@ -243,6 +261,12 @@ export function TaskConversationPanel({
   uploadFile,
   deferFileUpload = false,
   onSend,
+  attachments,
+  attachmentStatuses,
+  onRetryAttachment,
+  attachmentsBusy = false,
+  attachmentFiles,
+  onAttachmentFilesChange,
   onAgentExecutionClick,
 }: TaskConversationPanelProps) {
   const {
@@ -324,10 +348,31 @@ export function TaskConversationPanel({
     setDagPreviewOpen(true)
   }, [closeFilePreview])
 
+  // Upload-only mode keeps collecting files although `filesDisabled` closes
+  // every request that reads a file back.
+  const filesBlocked = filesDisabled && !attachments
+
+  const selectedFiles = attachmentFiles ?? files
+  // The newest selection. A send reads it once it has completed, because the
+  // visitor may have changed the files while it was in flight.
+  const latestFilesRef = useRef(selectedFiles)
+  latestFilesRef.current = selectedFiles
+
+  const updateFiles = (next: File[]) => {
+    latestFilesRef.current = next
+    setFiles(next)
+    onAttachmentFilesChange?.(next)
+  }
+
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
-    const outboundFiles = filesDisabled ? [] : (filesToSend || files)
+    const outboundFiles = filesBlocked ? [] : (filesToSend || selectedFiles)
     await (onSend ?? sendMessage)(message, config, outboundFiles)
-    setFiles([])
+    // In session mode only the files this send carried leave the selection:
+    // files added while it was in flight, and files kept hidden while uploads
+    // are not offered, stay. Other modes clear the selection after a send.
+    updateFiles(filesDisabled
+      ? latestFilesRef.current.filter((file) => !outboundFiles.includes(file))
+      : [])
   }
 
   const messageItems = useMemo<CombinedItem[]>(() => {
@@ -1039,9 +1084,10 @@ export function TaskConversationPanel({
                 || isConversationResetPending
                 || isMessageDeliveryPending
                 || isSessionInteractionLocked
+                || attachmentsBusy
               }
-              files={filesDisabled ? [] : files}
-              onFilesChange={filesDisabled ? undefined : setFiles}
+              files={filesBlocked ? [] : selectedFiles}
+              onFilesChange={filesBlocked ? undefined : updateFiles}
               showModeToggle={false}
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
@@ -1058,8 +1104,12 @@ export function TaskConversationPanel({
               } : undefined}
               readOnlyConfig={true}
               filesDisabled={filesDisabled}
+              attachments={attachments}
+              attachmentStatuses={attachmentStatuses}
+              onRetryAttachment={onRetryAttachment}
+              attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
-              hideFileUpload={hideFileUpload || filesDisabled}
+              hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}
               autoFocus={autoFocusInput}

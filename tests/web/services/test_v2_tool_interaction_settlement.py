@@ -5,7 +5,11 @@ from dataclasses import replace
 
 import pytest
 
-from tests.core.agent.test_react import FakeLLM, SettlementApprovalTool
+from tests.core.agent.test_react import (
+    FakeLLM,
+    SettlementApprovalTool,
+    final_answer_response,
+)
 from tests.web.services.test_task_execution_event_writer import (
     canonical as canonical_fixture,
 )
@@ -17,10 +21,14 @@ from tests.web.services.test_task_execution_event_writer import (
     task_id as task_id_fixture,
 )
 from xagent.core.agent import ExecutionContext, ReActPattern
-from xagent.core.agent.checkpoint import TraceCheckpointStore
+from xagent.core.agent.checkpoint import (
+    ExecutionEventPersistenceError,
+    TraceCheckpointStore,
+)
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.user_interaction import ToolInteractionSettlement
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.services import task_execution_event_writer
 from xagent.web.services.task_event_context_service import load_task_event_context
 from xagent.web.services.task_event_display import load_event_display_snapshot
 from xagent.web.services.task_lease_service import (
@@ -267,3 +275,95 @@ async def test_settlement_from_a_ledger_without_identity_stays_unreadable(
         } == {None}
         with pytest.raises(ValueError, match="no attempt/batch identity"):
             load_task_event_context(db, task_id)
+
+
+@pytest.mark.asyncio
+async def test_settlement_commit_failure_stops_the_run_until_it_replays(
+    canonical, monkeypatch
+):
+    """A failed settlement commit stops the run; the resumed run replays it."""
+
+    factory, task_id = canonical
+    context = ExecutionContext(system_prompt="Publish")
+    context.add_user_message("Publish the post.", metadata={"turn_id": "turn-1"})
+    pattern = ReActPattern(max_iterations=3)
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        waiting = await pattern.run(
+            context=context,
+            tools=[SettlementApprovalTool()],
+            llm=FakeLLM(
+                [
+                    {
+                        "tool_calls": [
+                            _tool_call(
+                                "publish-call", "approval_gate", '{"expression":"go"}'
+                            )
+                        ]
+                    }
+                ]
+            ),
+            runtime=_runtime(task_id),
+        )
+    assert waiting["status"] == "waiting_for_user"
+
+    append = task_execution_event_writer.append_fact_no_commit
+
+    def fail_settlement_facts(db, *, key, **kwargs):
+        if ":settlement:" in key:
+            raise RuntimeError("database connection lost")
+        return append(db, key=key, **kwargs)
+
+    monkeypatch.setattr(
+        task_execution_event_writer, "append_fact_no_commit", fail_settlement_facts
+    )
+    context.add_user_message("Approve", metadata={"turn_id": "turn-2"})
+    tool = SettlementApprovalTool(
+        resume_result=ToolInteractionSettlement.succeeded(
+            {"success": True, "post_urn": "urn:li:share:123"}
+        )
+    )
+    llm = FakeLLM([final_answer_response("Published.")])
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        with pytest.raises(ExecutionEventPersistenceError):
+            await pattern.run(
+                context=context, tools=[tool], llm=llm, runtime=_runtime(task_id)
+            )
+    # The run stopped before asking the model anything with the settled result.
+    assert llm.calls == []
+    with factory() as db:
+        rows = facts(db, task_id)
+        assert _settlement_facts(rows) == []
+        state = next(row for row in reversed(rows) if row.kind == "recovery_state")
+        pattern_state = state.payload["data"]["snapshot"]["pattern_state"]
+    # The delivery was checkpointed before its trace: nothing is left to
+    # deliver, and the settled row still owes the trace.
+    assert pattern_state["pending_tool_interaction_responses"] == []
+    assert [
+        row["settlement_trace_pending"] for row in pattern_state["tool_ledger"].values()
+    ] == [True]
+
+    # The database recovers; the resumed run replays the owed settlement.
+    monkeypatch.setattr(task_execution_event_writer, "append_fact_no_commit", append)
+    resumed = ReActPattern(max_iterations=3)
+    resumed.load_state(json.loads(json.dumps(pattern_state)))
+    with bind_task_lease_context(_new_run(factory, task_id)):
+        result = await resumed.run(
+            context=context,
+            tools=[tool],
+            llm=FakeLLM([final_answer_response("Published.")]),
+            runtime=_runtime(task_id),
+        )
+    assert result["success"] is True
+    # The resume callback ran once: the replay does not dispatch again.
+    assert len(tool.resume_calls) == 1
+    with factory() as db:
+        assert [row.kind for row in _settlement_facts(facts(db, task_id))] == [
+            "tool_execution_start",
+            "tool_execution_end",
+        ]
+        [observation] = [
+            m
+            for m in load_task_event_context(db, task_id).messages
+            if m["role"] == "tool"
+        ]
+        assert observation["raw_result"]["post_urn"] == "urn:li:share:123"

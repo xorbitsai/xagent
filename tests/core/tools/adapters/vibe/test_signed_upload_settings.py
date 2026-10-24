@@ -335,6 +335,16 @@ REJECTED_SETTINGS = [
         id="suffix-too-long",
     ),
     pytest.param(
+        [_entry(content_types={".tar.gz": "application/gzip"})],
+        f"{TYPES} keys must contain only one '.'",
+        id="suffix-two-dots",
+    ),
+    pytest.param(
+        [_entry(content_types={".": "application/pdf"})],
+        f"{TYPES} keys must have a suffix after '.'",
+        id="content-type-key-dot-only",
+    ),
+    pytest.param(
         [_entry(content_types={".pdf": ""})],
         f"{TYPES} values must be non-empty",
         id="mime-empty",
@@ -1080,6 +1090,25 @@ async def test_settings_are_read_once_per_load(monkeypatch: pytest.MonkeyPatch) 
         "mcp_docs_other",
     ]
     assert len(reads) == 1
+
+
+@pytest.mark.asyncio
+async def test_loader_passes_each_tool_its_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve_tools(monkeypatch, *_ALL_TOOLS)
+    connection_a = _connection(signed_uploads=[_entry()])
+
+    result = await _load({"A": connection_a, "B": _connection()})
+
+    # The loader wraps each adapter in the approval gate; ``_target`` is the adapter.
+    adapters = {tool.name: tool._target for tool in result.tools}
+    assert "mcp_A_request_upload" not in adapters
+    expected = _binding_for(connection_a, "attach_document")
+    assert expected is not None
+    assert adapters["mcp_A_attach_document"]._signed_upload == expected
+    assert adapters["mcp_A_other"]._signed_upload is None
+    assert adapters["mcp_B_attach_document"]._signed_upload is None
 
 
 # ---------------------------------------------------------------------------

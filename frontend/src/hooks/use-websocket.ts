@@ -6,6 +6,7 @@ import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorFallback, readClientErrorCode, readServerRejectionCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import { isCanonicalUuid } from "@/lib/widget-session-upload"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 import { websocketAuthProtocols } from "@/lib/websocket-auth"
@@ -137,6 +138,14 @@ interface WebSocketMessage {
 interface MessageDeliveryAck {
   client_message_id: string
   turn_id: string
+}
+
+// Files that were already uploaded elsewhere and are attached to a chat frame
+// by id. Only connections that omit the task id (the Session transport) accept
+// them; the caller passes the server-advertised per-message limit.
+export interface ChatMessageFileIds {
+  fileIds?: readonly string[]
+  maxFileIds?: number
 }
 
 export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
@@ -1636,6 +1645,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     force: boolean = false,
     requestedClientMessageId?: string,
     requestId?: string,
+    attachments?: ChatMessageFileIds,
   ): Promise<MessageDeliveryAck> => {
     const timestamp = Date.now()
     const owner = socketOwnerRef.current
@@ -1654,8 +1664,30 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         { errorCode: "connection_not_ready" },
       )
     }
+    // Raw File objects cannot be delivered on this kind of connection; files
+    // uploaded beforehand travel as ids through `attachments`.
     if (connection.chatTaskIdMode === "omit" && files && files.length > 0) {
       throw deliveryError("File delivery is not supported for this connection.", "not_sent")
+    }
+    // The server closes the connection on a frame that carries file ids it
+    // cannot accept, so every shape it refuses is refused here first.
+    const fileIds = attachments?.fileIds && attachments.fileIds.length > 0
+      ? attachments.fileIds
+      : null
+    if (fileIds) {
+      const maxFileIds = attachments?.maxFileIds
+      if (connection.chatTaskIdMode !== "omit") {
+        throw deliveryError("File ids are not supported for this connection.", "not_sent")
+      }
+      if (requestId) {
+        throw deliveryError("Files cannot accompany an answer to a request.", "not_sent")
+      }
+      if (maxFileIds === undefined || fileIds.length > maxFileIds) {
+        throw deliveryError("Message not sent: too many files attached.", "not_sent")
+      }
+      if (!fileIds.every(isCanonicalUuid)) {
+        throw deliveryError("Message not sent: an attached file id is not valid.", "not_sent")
+      }
     }
 
     const currentTaskId = connection.taskId
@@ -1723,6 +1755,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         message,
         client_message_id: clientMessageId,
         ...(requestId ? { request_id: requestId } : {}),
+        ...(fileIds ? { file_ids: [...fileIds] } : {}),
         ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }

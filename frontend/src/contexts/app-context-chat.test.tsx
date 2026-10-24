@@ -5580,6 +5580,188 @@ describe("AppProvider websocket message routing", () => {
     )
   })
 
+  describe("Session upload-only attachments", () => {
+    function RenderedMessagesProbe() {
+      const { state } = useApp()
+      return (
+        <div data-testid="rendered-messages">
+          {state.messages.map((message) => <div key={message.id}>{message.content}</div>)}
+        </div>
+      )
+    }
+
+    const attachments = { accept: ".pdf,.png", maxFiles: 3, maxFileBytes: 1024 }
+    const uploaded = [
+      {
+        kind: "uploaded" as const,
+        fileId: "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c",
+        name: "report.pdf",
+        size: 11,
+        type: "application/pdf",
+      },
+      {
+        kind: "uploaded" as const,
+        fileId: "7d2f0c1a-8b3e-4c55-a1f0-2e9d4b6c8a10",
+        name: "chart.png",
+        size: 22,
+        type: "image/png",
+      },
+    ]
+    const withAttachments = () => {
+      const transport = makeSessionTransport()
+      return {
+        ...transport,
+        session: { ...transport.session, attachments },
+      }
+    }
+
+    it("keeps files disabled and previews closed with the attachments option", () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+
+      expect(screen.getByTestId("files-disabled").textContent).toBe("true")
+      expect(() => getSessionControls().getFilePreviewUrl("manual-file")).toThrow(
+        "Files are disabled for this conversation.",
+      )
+      expect(() => getSessionControls().getFileDownloadUrl("manual-file")).toThrow()
+    })
+
+    it("sends the uploaded file ids and the per-message limit and shows the file names in the bubble", async () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+          <RenderedMessagesProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await act(async () => {
+        await getSessionControls().sendMessage(
+          "see attached",
+          { clientMessageId: "with-files" },
+          [],
+          { uploadedFiles: uploaded },
+        )
+      })
+
+      expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+        "see attached",
+        [],
+        undefined,
+        "with-files",
+        undefined,
+        { fileIds: uploaded.map((file) => file.fileId), maxFileIds: 3 },
+      )
+      const bubbles = screen.getByTestId("rendered-messages").textContent ?? ""
+      expect(bubbles).toContain("report.pdf")
+      expect(bubbles).toContain("chart.png")
+    })
+
+    it("sends a plain Session turn without a sixth argument when nothing was uploaded", async () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await act(async () => {
+        await getSessionControls().sendMessage("plain", { clientMessageId: "plain-1" }, [], { uploadedFiles: [] })
+      })
+
+      expect(sendChatMessageMock.mock.calls.at(-1)).toHaveLength(5)
+    })
+
+    it("still rejects File objects while files are disabled", async () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      const file = new File(["x"], "x.pdf", { type: "application/pdf" })
+
+      await expect(getSessionControls().sendMessage("with file", {}, [file])).rejects.toThrow(
+        "Files are disabled for this conversation.",
+      )
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("refuses uploaded files from a send made before the transport withdrew attachments", async () => {
+      const { rerender } = render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      const sendFromEarlierRender = getSessionControls().sendMessage
+
+      rerender(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+
+      await expect(sendFromEarlierRender(
+        "late", { clientMessageId: "late-1" }, [], { uploadedFiles: uploaded },
+      )).rejects.toThrow("Attachments are not available")
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ["lowers the per-message limit", { ...attachments, maxFiles: 1 }, 1],
+      ["withdraws attachments", undefined, undefined],
+    ])("checks a resent frame against the attachments current at the resend when the new session %s", async (_name, next, limitAtResend) => {
+      sendChatMessageMock.mockRejectedValueOnce(
+        new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true }),
+      )
+      const tree = (identity: string, current?: typeof attachments) => {
+        const transport = makeSessionTransport(makeSessionConnection(identity))
+        return (
+          <AppProvider
+            token="token"
+            transport={{ ...transport, session: { ...transport.session, ...(current ? { attachments: current } : {}) } }}
+          >
+            <SessionControlsProbe />
+          </AppProvider>
+        )
+      }
+      const { rerender } = render(tree("session-one", attachments))
+      act(() => webSocketOptions.current?.onConnect?.())
+      const outcome = getSessionControls().sendMessage(
+        "see attached", { clientMessageId: "resent" }, [], { uploadedFiles: uploaded },
+      ).then(() => "ok", (error: Error) => error)
+      await act(async () => {})
+
+      rerender(tree("session-two", next))
+      act(() => webSocketOptions.current?.onConnect?.())
+      await act(async () => { await outcome })
+
+      const fileIds = uploaded.map((file) => file.fileId)
+      expect(sendChatMessageMock.mock.calls.map((call) => call[5])).toEqual([
+        { fileIds, maxFileIds: 3 },
+        { fileIds, maxFileIds: limitAtResend },
+      ])
+    })
+
+    it("rejects uploaded files when the transport does not offer attachments", async () => {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await expect(getSessionControls().sendMessage(
+        "sneaky", { clientMessageId: "no-cap" }, [], { uploadedFiles: uploaded },
+      )).rejects.toThrow("Attachments are not available")
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+  })
+
   it("forwards taskless Session files so unsupported delivery rejects instead of sending text alone", async () => {
     const transport = makeSessionTransport()
     // Exercise the branch-level contract independently from today's

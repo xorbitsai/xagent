@@ -434,6 +434,7 @@ def _connection_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
         "runtime_input_schema",
         "connector_runtime",
         "allow_delegated_authorization",
+        "signed_uploads",
     ):
         if runtime_key in config:
             connection[runtime_key] = config[runtime_key]

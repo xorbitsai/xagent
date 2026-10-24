@@ -20,6 +20,9 @@ PRODUCERS: dict[str, int | None] = {
     "finish_delivery_failure": 0,
     "finish_delivery": 1,
     "notify_deferred_delivery": 1,
+    # Records a failed or unknown deferred delivery, then forwards its message
+    # to notify_deferred_delivery.
+    "fail_deferred_delivery": 0,
     "send_message_delivery": None,  # keyword-only
     "delivery_notifier": None,  # transport callback, keyword-only
 }

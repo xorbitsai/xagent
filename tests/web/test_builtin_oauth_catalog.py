@@ -51,6 +51,7 @@ NONCANONICAL_SERVER_VALUES = {
     "timeout": 1,
     "runtime_input_schema": {"type": "object"},
     "runtime_bindings": {"token": "foreign"},
+    "signed_uploads": [{"tool_name": "foreign"}],
     "docker_url": "unix:///foreign.sock",
     "docker_image": "foreign/image",
     "docker_environment": {"FOREIGN": "value"},

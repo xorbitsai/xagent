@@ -38,3 +38,34 @@ handshakes share one connection budget; the established session is not limited
 to that short connection budget. Proxy policy, deployment isolation and arbitrary
 stdio/user code remain separate responsibilities. CASA #15 is not fully closed
 by these application-client changes alone.
+
+## Signed uploads
+
+An `sse` or `streamable_http` connector can carry `signed_uploads`, set with
+`POST /api/mcp/servers` or `PUT /api/mcp/servers/{server_id}`. The value is a
+list with one object per tool that takes a workspace file, each with exactly
+these keys; `null` and `[]` mean none:
+
+```json
+[{"tool_name": "attach_document", "file_argument": "document_file_id",
+  "issuing_tool_name": "request_upload",
+  "allowed_upload_hosts": ["uploads.example.test"],
+  "upload_path_prefix": "/staged/", "content_types": {".pdf": "application/pdf"}}]
+```
+
+When the model passes `file:<id>` in `file_argument`, the host calls
+`issuing_tool_name` itself (the model never sees that tool) and PUTs the bytes
+of that workspace file to the signed URL it returns. The setting therefore
+decides which outside hosts receive task files, so only the connector's owner
+or a platform administrator can change it. The URL must be
+HTTPS without a port or user info, on one of `allowed_upload_hosts`, under
+`upload_path_prefix`, and the request uses the public-address egress policy of
+remote MCP sessions.
+
+Settings that cannot be used fail closed: the web runtime marks the whole
+connector unavailable with reason `invalid_configuration`, and
+`signed_uploads_error` in the API response says why. A remote OAuth catalog
+connector run under an actor's authorization policy uses only its catalog
+definition, so if its row stores any settings it is unavailable with the same
+reason, even when `signed_uploads_error` is `null` because the settings
+themselves are valid.

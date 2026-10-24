@@ -42,6 +42,7 @@ from ...config import get_shared_task_execution_enabled
 from ..models.task import Task, TaskStatus
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
+from . import task_admission_pacing
 from .task_admission_observation import record_queue_full
 from .task_admission_pacing import (
     StartupPacing,
@@ -430,8 +431,41 @@ def _held_ticket(ticket: type[TaskAdmissionTicket]) -> ColumnElement[bool]:
     )
 
 
+_cached_admission_eligible: tuple[object, ColumnElement[bool]] | None = None
+
+
 def admission_eligible() -> ColumnElement[bool]:
-    """Advisory queue scan; the transaction below rechecks after locking."""
+    """Advisory queue scan; the transaction below rechecks after locking.
+
+    The expression is built once per process and shared by every caller. It is
+    immutable and holds no per-call state, so every time dependency inside it
+    must go through ``task_admission_pacing.database_time``; the cache is keyed
+    on that function object, read from the module on each call.
+
+    The cached expression is rebuilt only when
+    ``task_admission_pacing.database_time`` is replaced. Replacing the helper
+    functions in this module that build the predicate (``startup_eligible``,
+    ``_live_count``, ``_older_waiter``, ``_held_ticket``, ``_behind_own_task``,
+    ``_joins_running_execution``) does not rebuild it; call
+    ``reset_admission_eligible_cache()`` first. Replacing the clock must happen
+    on a single thread.
+    """
+    global _cached_admission_eligible
+    clock = task_admission_pacing.database_time
+    cached = _cached_admission_eligible
+    if cached is None or cached[0] is not clock:
+        cached = (clock, _build_admission_eligible())
+        _cached_admission_eligible = cached
+    return cached[1]
+
+
+def reset_admission_eligible_cache() -> None:
+    """Drop the cached expression so the next call rebuilds it."""
+    global _cached_admission_eligible
+    _cached_admission_eligible = None
+
+
+def _build_admission_eligible() -> ColumnElement[bool]:
     blocked = exists(
         select(1)
         .select_from(TaskAdmissionTicket)

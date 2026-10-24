@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { apiRequest } from "@/lib/api-wrapper"
 import {
   abortableSleep,
+  capabilityRefusal,
   isCanonicalUuid,
   uploadWidgetSessionFile,
   WidgetSessionUploadError,
@@ -68,6 +69,23 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.useRealTimers()
+})
+
+describe("capabilityRefusal", () => {
+  const limits = { accept: ".pdf,.png", maxFileBytes: 3 }
+  const file = (name: string, size = 3) => new File(["x".repeat(size)], name)
+
+  it.each([
+    ["a.pdf", 3, null],
+    ["Report.PDF", 3, null],
+    ["a.pdf", 4, "size"],
+    ["a.exe", 1, "type"],
+    ["a.exe", 4, "type"],
+    ["pdf", 1, "type"],
+    ["a.pdf.zip", 1, "type"],
+  ])("judges %s of %i bytes as %s", (name, size, refusal) => {
+    expect(capabilityRefusal(file(name, size), limits)).toBe(refusal)
+  })
 })
 
 describe("uploadWidgetSessionFile", () => {

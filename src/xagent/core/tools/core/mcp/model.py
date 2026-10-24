@@ -52,6 +52,8 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
         concurrent_tools = Column(JSON, nullable=True)  # List[str]
         runtime_input_schema = Column(JSON, nullable=True)
         runtime_bindings = Column(JSON, nullable=True)
+        # Signed-upload settings (a JSON list); NULL and [] both mean none.
+        signed_uploads = Column(JSON(none_as_null=True), nullable=True)
         allow_delegated_authorization = Column(
             Boolean, nullable=False, default=False, server_default="0"
         )

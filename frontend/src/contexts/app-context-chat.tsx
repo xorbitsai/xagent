@@ -397,6 +397,7 @@ import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTask
 import { apiRequest, classifyUploadError, getApiErrorMessage, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper"
 import { clientErrorTranslationKey, readClientErrorCode, type ClientErrorCode } from "@/lib/client-errors"
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids"
+import type { SessionUploadedFile } from "@/lib/widget-session-upload"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
@@ -2329,7 +2330,21 @@ interface PendingMessage {
   reject?: (error: Error) => void
 }
 
+// The upload-only capability of a Session transport: the composer may collect
+// files and the Session sends them by id, while previews, downloads and file
+// mentions stay off (filesDisabled is unaffected).
+export interface SessionAttachmentsConfig {
+  // Comma-separated, lowercase extensions with a leading dot, for an
+  // <input type="file"> accept attribute.
+  accept: string
+  maxFiles: number
+  maxFileBytes: number
+}
+
 interface SendMessageOptions {
+  // Files already uploaded to the Session; only a Session transport that
+  // offers `attachments` accepts them, and they travel on the chat frame by id.
+  uploadedFiles?: readonly SessionUploadedFile[]
   // UI ownership only, never serialized into task configuration. Checked
   // before adopting a create response; normal navigation after adoption must
   // not cancel delivery of that task's first message.
@@ -2426,7 +2441,10 @@ export interface AppProviderTransportConfig {
     allowTasklessChat: true
     supportsConversationReset: true
     history: "none"
+    // Stays "disabled": it also closes every request that reads a file back
+    // (previews, downloads, mentions). Uploading is `attachments` below.
     files: "disabled"
+    attachments?: SessionAttachmentsConfig
     agentCards: "disabled"
     voice: "disabled"
     taskControls: "disabled"
@@ -2574,6 +2592,12 @@ export function AppProvider({
     sessionTransport?.files,
     transport?.capabilities?.files,
   )
+  const sessionAttachments = sessionTransport?.attachments ?? null
+  // sendMessage reads the attachments through this ref, so a send that
+  // started under an earlier render checks its file ids against the ones
+  // current when its frame goes out.
+  const sessionAttachmentsRef = useRef(sessionAttachments)
+  sessionAttachmentsRef.current = sessionAttachments
   const rejectDisabledFileUpload = useCallback(async () => {
     throw new Error("Files are disabled for this conversation.")
   }, [])
@@ -7138,6 +7162,10 @@ export function AppProvider({
     ) {
       throw new Error("Files are disabled for this conversation.")
     }
+    const uploadedFiles = options?.uploadedFiles ?? []
+    if (uploadedFiles.length > 0 && !sessionAttachmentsRef.current) {
+      throw new Error("Attachments are not available for this conversation.")
+    }
     if (sessionTransport && sessionConversationRef.current.phase === "reset_requested") {
       throw new Error(
         "Message delivery is blocked while conversation reset is pending."
@@ -7204,15 +7232,15 @@ export function AppProvider({
         })
       }
       let content: React.ReactNode = message
-      if (files && files.length > 0) {
+      const bubbleFiles = [
+        ...(files ?? []).map(f => ({ name: f.name, type: f.type, size: f.size })),
+        ...uploadedFiles.map(f => ({ name: f.name, type: f.type, size: f.size })),
+      ]
+      if (bubbleFiles.length > 0) {
         content = (
           <UserMessageContent
             message={message}
-            files={files.map(f => ({
-              name: f.name,
-              type: f.type,
-              size: f.size,
-            }))}
+            files={bubbleFiles}
           />
         )
       }
@@ -7290,14 +7318,24 @@ export function AppProvider({
           taskId: state.taskId, clientMessageId, text: message, files: files ?? [],
         })
       }
+      const fileIds = uploadedFiles.map(file => file.fileId)
+      const chatArgs: Parameters<typeof sendChatMessage> =
+        [message, files, config?.force, clientMessageId, requestId]
       beginSessionMessageDelivery()
       try {
         await sendChatWithResend(
-          [message, files, config?.force, clientMessageId, requestId],
+          chatArgs,
           () => {
             // A resend runs on the connection that replaced the lost one.
             sessionDeliveryOwner.connectionIdentity =
               sessionConnectionIdentityRef.current ?? sessionDeliveryOwner.connectionIdentity
+            // The ids are checked against the attachments current at each
+            // attempt, a resend included: the session that replaced a lost
+            // connection may have lowered the limit or withdrawn attachments,
+            // and with no limit the frame check refuses the ids.
+            if (fileIds.length > 0) {
+              chatArgs[5] = { fileIds, maxFileIds: sessionAttachmentsRef.current?.maxFiles }
+            }
           },
         )
         if (startsReplacementConversation) {

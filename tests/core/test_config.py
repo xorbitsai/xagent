@@ -3369,6 +3369,50 @@ def test_trace_database_invalid_admission_limit_falls_back(monkeypatch, value):
     assert config.get_trace_db_max_inflight() == 4
 
 
+def test_db_write_retry_defaults(monkeypatch):
+    monkeypatch.delenv(config.DB_WRITE_RETRY_ATTEMPTS, raising=False)
+    monkeypatch.delenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, raising=False)
+    monkeypatch.delenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, raising=False)
+    assert config.get_db_write_retry_attempts() == 3
+    assert config.get_db_write_retry_base_delay_ms() == 50
+    assert config.get_db_write_retry_max_delay_ms() == 1000
+
+
+def test_db_write_retry_overrides(monkeypatch):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_ATTEMPTS, "5")
+    monkeypatch.setenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, "10")
+    monkeypatch.setenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, "250")
+    assert config.get_db_write_retry_attempts() == 5
+    assert config.get_db_write_retry_base_delay_ms() == 10
+    assert config.get_db_write_retry_max_delay_ms() == 250
+
+
+def test_db_write_retry_zero_delays_are_allowed(monkeypatch):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, "0")
+    monkeypatch.setenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, "0")
+    assert config.get_db_write_retry_base_delay_ms() == 0
+    assert config.get_db_write_retry_max_delay_ms() == 0
+
+
+def test_db_write_retry_one_attempt_disables_retries(monkeypatch):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_ATTEMPTS, "1")
+    assert config.get_db_write_retry_attempts() == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_db_write_retry_invalid_attempts_fall_back(monkeypatch, value):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_ATTEMPTS, value)
+    assert config.get_db_write_retry_attempts() == 3
+
+
+@pytest.mark.parametrize("value", ["-1", "abc"])
+def test_db_write_retry_invalid_delays_fall_back(monkeypatch, value):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, value)
+    monkeypatch.setenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, value)
+    assert config.get_db_write_retry_base_delay_ms() == 50
+    assert config.get_db_write_retry_max_delay_ms() == 1000
+
+
 @pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
 def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)

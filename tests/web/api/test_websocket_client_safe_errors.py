@@ -255,8 +255,11 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # A deferred resume that withdraws a fresh message from an ended run adds
     # one not-accepted, resend-with-new-id ack, and the handler's retry of a
     # message withdrawn from an ended run one more.
-    assert result.producers == 44, (
-        f"expected exactly 44 producers, matched {result.producers}; "
+    # The resume's except branches send their failed-delivery acks through
+    # fail_deferred_delivery: its call sites replace theirs, plus the one
+    # notify_deferred_delivery call it forwards the message to.
+    assert result.producers == 45, (
+        f"expected exactly 45 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
@@ -973,6 +976,16 @@ async def leak(websocket):
         await notify_deferred_delivery(False, str(e))
 """,
         id="wrapper-forwarded",
+    ),
+    pytest.param(
+        """
+async def leak():
+    try:
+        pass
+    except Exception as e:
+        await fail_deferred_delivery(str(e), rejection_outcome="not_accepted")
+""",
+        id="failed-delivery-wrapper",
     ),
     pytest.param(
         """

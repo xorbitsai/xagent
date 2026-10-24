@@ -33,6 +33,7 @@ _EXPECTED_FIELDS = {
     "user_env",
     "runtime_input_schema",
     "runtime_bindings",
+    "signed_uploads",
     "allow_delegated_authorization",
 }
 
@@ -111,3 +112,7 @@ def test_an_explicitly_null_definition_row_field_still_writes_the_definition_row
     (clearing it), distinct from omitting it (leave it alone) -- so it
     must still land on the locking side even though its value is falsy."""
     assert _writes_definition_row(MCPServerUpdate(runtime_input_schema=None)) is True
+
+
+def test_a_signed_uploads_only_payload_writes_the_definition_row() -> None:
+    assert _writes_definition_row(MCPServerUpdate(signed_uploads=[])) is True

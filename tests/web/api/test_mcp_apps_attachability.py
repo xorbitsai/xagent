@@ -716,9 +716,10 @@ def test_a_deactivated_association_stays_configurable(db_session):
 def test_a_team_owned_connector_without_a_personal_association_is_not_configurable(
     db_session,
 ):
-    """The overlay makes this connector attachable for the member, but the
-    edit routes require a row of the member's own, which does not exist here
-    -- so GET/PUT /api/mcp/servers/{id} would 404."""
+    """The overlay makes this connector attachable for the member, but saving
+    it needs a row of the member's own, which does not exist here -- so PUT
+    /api/mcp/servers/{id} would 404 (and, with no access hook installed here,
+    so would GET)."""
     db, _owner, member = db_session
     server = _add_oauth_server(db, None)
     _install_visibility(

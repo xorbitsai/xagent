@@ -541,6 +541,8 @@ class _Outcome:
     refresh_calls: dict[str, int]
     strict_401_calls: int
     public_output: str
+    # Label of the connection the issuing helper handed back with its result.
+    last_connection_label: str | None = None
 
 
 def _result_category(result: dict[str, Any]) -> str:
@@ -613,6 +615,7 @@ async def _run_side(
     caplog.clear()
 
     failure_code: str | None = None
+    last_connection_label: str | None = None
     if side == "outer":
         result = await adapter.run_json_async({})
         category = _result_category(result)
@@ -629,7 +632,10 @@ async def _run_side(
                 if not key.startswith("_")
             }
         try:
-            result = await adapter._call_issuing_tool_with_authorization_retry(
+            (
+                result,
+                last_connection,
+            ) = await adapter._call_issuing_tool_with_authorization_retry(
                 invocation_connection,
                 ISSUING_TOOL,
                 {"filename": "a.pdf"},
@@ -643,6 +649,7 @@ async def _run_side(
             category = _result_category(result)
             failure_code = result.get("failure_code")
             rendered = repr(result)
+            last_connection_label = _label(last_connection)
 
     return _Outcome(
         category=category,
@@ -652,6 +659,7 @@ async def _run_side(
         refresh_calls=dict(world.refresh_calls),
         strict_401_calls=world.strict_401_calls,
         public_output=rendered + caplog.text,
+        last_connection_label=last_connection_label,
     )
 
 
@@ -1102,6 +1110,9 @@ async def test_issuing_call_authorization_policy_matches_outer_call(
         assert outer.strict_401_calls == case.strict_401_calls
     assert set(outer.tools) == {OUTER_TOOL}
     assert set(issuing.tools) == {ISSUING_TOOL}
+    if issuing.category != "raised":
+        # The helper hands back the connection its last call was made with.
+        assert issuing.last_connection_label == issuing.labels[-1]
     for outcome in (outer, issuing):
         for secret in _FORBIDDEN_IN_PUBLIC_OUTPUT:
             assert secret not in outcome.public_output
@@ -1208,13 +1219,17 @@ async def test_issuing_call_succeeds_through_a_real_session_after_401_refresh(
         if side == "outer":
             result_value = await adapter.run_json_async({})
         else:
-            result_value = await adapter._call_issuing_tool_with_authorization_retry(
+            (
+                result_value,
+                last_connection,
+            ) = await adapter._call_issuing_tool_with_authorization_retry(
                 {k: v for k, v in connection.items() if not k.startswith("_")},
                 ISSUING_TOOL,
                 {"filename": "a.pdf"},
                 {},
                 was_refreshed=False,
             )
+            assert last_connection["headers"] == {"Authorization": FRESH_AUTH}
         return result_value, refreshed_tools, initial_methods, refresh_calls
 
     outer_result, outer_tools, outer_initial, outer_refreshes = await run("outer")
@@ -1339,9 +1354,10 @@ async def test_issuing_call_does_not_use_the_model_call_executor(
 
     monkeypatch.setattr(adapter, "_execute_mcp_call", _forbidden)
 
-    result = await adapter._call_issuing_tool_with_authorization_retry(
+    result, last_connection = await adapter._call_issuing_tool_with_authorization_retry(
         adapter.connection, ISSUING_TOOL, {}, {}, was_refreshed=False
     )
 
     assert result["is_error"] is False
+    assert last_connection is adapter.connection
     assert world.server_calls == [(ISSUING_TOOL, "initial")]

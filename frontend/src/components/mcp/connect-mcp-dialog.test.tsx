@@ -438,6 +438,8 @@ function mcpDetailResponse(id: number, name: string) {
       ],
       allow_delegated_authorization: true,
       can_edit_global: false,
+      signed_uploads: null,
+      signed_uploads_error: null,
       transport_display: "Streamable HTTP",
       created_at: null,
       updated_at: null,

@@ -23,6 +23,7 @@ from xagent.sandbox.base import (
     SANDBOX_RUNTIME_GID,
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
+    SandboxRuntimeConflictError,
     SandboxTemplate,
     SpecVerdict,
     spec_matches_inspection,
@@ -50,10 +51,13 @@ def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
         assert info.mode == 0o600
 
 
-def test_write_tar_local_path_normalizes_owner_and_mode(tmp_path) -> None:
+@pytest.mark.parametrize("source_mode", [0o400, 0o644, 0o755])
+def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
+    tmp_path, source_mode
+) -> None:
     source = tmp_path / "id_key"
     source.write_text("secret", encoding="utf-8")
-    source.chmod(0o400)
+    source.chmod(source_mode)
     archive = io.BytesIO()
 
     _write_tar_from_local_path(str(source), "id_key", archive)
@@ -62,14 +66,14 @@ def test_write_tar_local_path_normalizes_owner_and_mode(tmp_path) -> None:
         info = tar.getmember("id_key")
         assert info.uid == 1100
         assert info.gid == 1010
-        assert info.mode == 0o600
+        assert info.mode == source_mode
         extracted = tar.extractfile(info)
         assert extracted is not None
         assert extracted.read() == b"secret"
 
 
-@pytest.mark.parametrize("raw_pids_limit", [0, -1, None])
-def test_inspect_treats_nonpositive_pids_limit_as_unset(raw_pids_limit) -> None:
+@pytest.mark.parametrize("raw_pids_limit", [0, 1, 63, -1, None])
+def test_inspect_treats_unrealizable_pids_limit_as_unset(raw_pids_limit) -> None:
     container = _labeled_container({})
     container.attrs["HostConfig"]["PidsLimit"] = raw_pids_limit
 
@@ -164,6 +168,34 @@ class TestDockerSandboxServiceFailures:
 
         assert len(created_container.remove_calls) == 1
         assert created_container.remove_calls[0] is True
+
+    def test_host_workspace_readiness_probe_succeeds_and_cleans_up(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "fchown", lambda *_args: None)
+
+        service.validate_host_workspace_access()
+
+        assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    def test_host_workspace_readiness_probe_fails_closed(self, tmp_path, monkeypatch):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+
+        def reject_chown(*_args):
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(docker_sandbox_module.os, "fchown", reject_chown)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
+            service.validate_host_workspace_access()
+        assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
 
 
 class TestDockerSandboxRunCodeValidation:

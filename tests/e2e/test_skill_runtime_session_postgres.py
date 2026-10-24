@@ -449,10 +449,14 @@ def test_available_tools_route_uses_retained_models_before_request_db_reads(
             mutation_config,
             mutation_factory_counts,
         )
-        # Authentication and route dependencies may be the first stale
-        # post-handoff database reader. The contract under test is that the
-        # request fails with the pool timeout and still releases all retained
-        # state, not which best-effort decorator happens to log it first.
+        usage_errors = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "xagent.web.api.tools"
+            and record.getMessage().startswith("Failed to fetch tool usage stats:")
+        ]
+        assert len(usage_errors) == 1
+        assert "QueuePool limit of size 1 overflow 0 reached" in usage_errors[0]
 
         # Route cleanup must release the lazy checkout even after the timeout.
         assert mutation_config._retained_factory_model_state is None

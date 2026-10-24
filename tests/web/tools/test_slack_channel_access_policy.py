@@ -255,3 +255,32 @@ def test_policy_absence_preserves_legacy_user_id_posting(monkeypatch) -> None:
 
     assert result["status"] == "success"
     assert request.call_args.kwargs["json"]["channel"] == "U0123456789"
+
+
+@pytest.mark.parametrize("query", ["Chelsea", "chelsea@example.com", "U0123456789"])
+def test_policy_denies_workspace_member_lookup_before_io(monkeypatch, query) -> None:
+    """A channel allow-list cannot scope a workspace-wide directory read, and
+    a read-only runtime could never post the mention it is for."""
+    _install_policy(monkeypatch)
+    request = Mock()
+    monkeypatch.setattr(slack.requests, "request", request)
+
+    result = json.loads(slack.slack_lookup_user(query))
+
+    assert result == {
+        "status": "error",
+        "message": "Slack runtime policy does not allow workspace member lookups",
+    }
+    request.assert_not_called()
+
+
+def test_malformed_policy_denies_member_lookup_before_io(monkeypatch) -> None:
+    monkeypatch.setenv(slack._CHANNEL_ACCESS_POLICY_ENV_VAR, "not-json")
+    request = Mock()
+    monkeypatch.setattr(slack.requests, "request", request)
+
+    result = json.loads(slack.slack_lookup_user("Chelsea"))
+
+    assert result["status"] == "error"
+    assert "policy is unavailable or expired" in result["message"]
+    request.assert_not_called()

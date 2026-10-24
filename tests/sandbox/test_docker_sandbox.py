@@ -67,6 +67,7 @@ def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
         assert info.uid == 1100
         assert info.gid == 1010
         assert info.mode == source_mode
+        assert info.mtime == int(source.stat().st_mtime)
         extracted = tar.extractfile(info)
         assert extracted is not None
         assert extracted.read() == b"secret"
@@ -118,6 +119,9 @@ class _FakeDockerClient:
 
     def ping(self):
         return True
+
+    def info(self):
+        return {"SecurityOptions": []}
 
 
 class _FailingStartContainer:
@@ -176,6 +180,7 @@ class TestDockerSandboxServiceFailures:
             MemDockerStore(), namespace="test", client=_FakeDockerClient()
         )
         monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
         monkeypatch.setattr(docker_sandbox_module.os, "fchown", lambda *_args: None)
 
         service.validate_host_workspace_access()
@@ -187,6 +192,7 @@ class TestDockerSandboxServiceFailures:
             MemDockerStore(), namespace="test", client=_FakeDockerClient()
         )
         monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
 
         def reject_chown(*_args):
             raise PermissionError("not permitted")
@@ -196,6 +202,32 @@ class TestDockerSandboxServiceFailures:
         with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
             service.validate_host_workspace_access()
         assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    def test_host_workspace_readiness_requires_root_backend(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 1000)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="run as root"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_rejects_rootless_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": ["name=rootless"]}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="rootful Docker"):
+            service.validate_host_workspace_access()
 
 
 class TestDockerSandboxRunCodeValidation:

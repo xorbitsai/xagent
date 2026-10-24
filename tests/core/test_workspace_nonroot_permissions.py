@@ -132,7 +132,7 @@ def test_permission_marker_is_hidden_from_workspace_listing(workspace):
     )
 
 
-def test_permission_migration_continues_after_one_entry_fails(workspace, monkeypatch):
+def test_permission_migration_retries_after_one_entry_fails(workspace, monkeypatch):
     blocked = workspace.output_dir / "blocked.txt"
     blocked.write_text("blocked", encoding="utf-8")
     healthy = workspace.output_dir / "healthy.txt"
@@ -155,7 +155,7 @@ def test_permission_migration_continues_after_one_entry_fails(workspace, monkeyp
         os.close(workspace_fd)
 
     assert stat.S_IMODE(healthy.stat().st_mode) == 0o660
-    assert (workspace.workspace_dir / ".xagent-permissions-v2").is_file()
+    assert not (workspace.workspace_dir / ".xagent-permissions-v2").exists()
 
 
 def test_permission_migration_skips_hardlinked_files(workspace, monkeypatch):

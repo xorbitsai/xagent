@@ -13,6 +13,8 @@ end to end against the fake's small in-memory container/store model (see
 from __future__ import annotations
 
 import ast
+import os
+import stat
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +35,7 @@ from xagent.sandbox.base import (
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
+    grant_sandbox_runtime_access,
 )
 from xagent.web.sandbox_keys import USER_LIFECYCLE_TYPE, make_user_lifecycle_id
 from xagent.web.sandbox_manager import SandboxManager, check_sandbox_static_readiness
@@ -862,6 +865,7 @@ class TestProviderCacheMountIntentGate:
         )
         manager, service = _make_manager()
         monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
         intent = _intent(tmp_path, "user-root")
         user_root = tmp_path / "user-root"
 
@@ -888,6 +892,7 @@ class TestProviderCacheMountIntentGate:
         )
         manager, service = _make_manager()
         monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
         mount_root = tmp_path / "user-root"
         prepare_root = mount_root / "scopes" / "actor-a"
 
@@ -898,7 +903,47 @@ class TestProviderCacheMountIntentGate:
             prepare_root=str(prepare_root),
         )
 
-        assert grants == [(prepare_root, mount_root)]
+        assert grants == [
+            (mount_root, tmp_path),
+            (prepare_root, mount_root),
+        ]
+
+    def test_folded_mount_creates_and_prepares_missing_anchor(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        requested_modes: list[int] = []
+        real_fchmod = os.fchmod
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            requested_modes.append(mode)
+            real_fchmod(fd, mode)
+
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
+        mount_root = tmp_path / "user-root"
+        prepare_root = mount_root / "scopes" / "actor-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "1",
+            SandboxMountIntent(mount_root=str(mount_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert prepare_root.is_dir()
+        for path in (mount_root, mount_root / "scopes", prepare_root):
+            assert stat.S_IMODE(path.stat().st_mode) & 0o777 == 0o750
+        assert requested_modes == [0o2750, 0o2750, 0o2750]
 
     @pytest.mark.asyncio
     async def test_reused_container_still_prepares_managed_mount(
@@ -914,6 +959,7 @@ class TestProviderCacheMountIntentGate:
         )
         manager, service = _make_manager()
         monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
         intent = _intent(tmp_path, "mount-root")
         prepare_root = tmp_path / "mount-root" / "task"
         desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
@@ -935,7 +981,10 @@ class TestProviderCacheMountIntentGate:
             prepare_root=str(prepare_root),
         )
 
-        assert grants == [(prepare_root, tmp_path / "mount-root")]
+        assert grants == [
+            (tmp_path / "mount-root", tmp_path),
+            (prepare_root, tmp_path / "mount-root"),
+        ]
         service.start_existing.assert_awaited_once_with("user::1")
 
 

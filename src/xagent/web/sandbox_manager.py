@@ -645,6 +645,10 @@ class SandboxManager:
         # this manager is correct with or without that wiring.
         self._backend_probe: bool | None = None
 
+    def validate_host_workspace_access(self) -> None:
+        """Validate backend-specific host mount prerequisites."""
+        self._service.validate_host_workspace_access()
+
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
         """Build a sandbox name from lifecycle type and id."""
@@ -1041,6 +1045,14 @@ class SandboxManager:
                 trusted_root = (
                     backend_path if target != backend_path else get_uploads_dir()
                 )
+                if target != backend_path and not backend_path.exists():
+                    # The first task for a user can arrive before the managed
+                    # per-user mount anchor exists. Create and prepare that
+                    # anchor beneath uploads before using it as the no-follow
+                    # descriptor root for the folded task path.
+                    grant_sandbox_runtime_access(
+                        backend_path, trusted_root=get_uploads_dir()
+                    )
                 grant_sandbox_runtime_access(target, trusted_root=trusted_root)
             elif should_create or target.exists():
                 try:
@@ -2803,7 +2815,9 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     if not await sandbox_mgr._resolve_backend_probe():
         return
 
-    sandbox_mgr._service.validate_host_workspace_access()
+    validate_host_access = getattr(sandbox_mgr, "validate_host_workspace_access", None)
+    if validate_host_access is not None:
+        validate_host_access()
 
     external_dirs = get_external_upload_dirs()
     if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:

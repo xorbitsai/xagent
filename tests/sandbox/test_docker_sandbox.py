@@ -229,6 +229,20 @@ class TestDockerSandboxServiceFailures:
         with pytest.raises(SandboxRuntimeConflictError, match="rootful Docker"):
             service.validate_host_workspace_access()
 
+    def test_host_workspace_readiness_rejects_userns_remap(self, tmp_path, monkeypatch):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": ["name=userns"]}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(
+            SandboxRuntimeConflictError, match="user-namespace remapping"
+        ):
+            service.validate_host_workspace_access()
+
 
 class TestDockerSandboxRunCodeValidation:
     """Test lightweight run_code validation paths."""

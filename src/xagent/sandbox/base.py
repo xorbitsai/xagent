@@ -8,7 +8,6 @@ import abc
 import hashlib
 import os
 import posixpath
-import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -27,15 +26,15 @@ SANDBOX_RUNTIME_GID = 1010
 
 
 def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
-    """Make one sandbox mount root safely traversable by the sandbox identity.
+    """Make a managed mount suffix traversable by the sandbox identity.
 
-    This deliberately changes only the mount root.  The sandbox may traverse
-    that root but cannot create, rename, or replace task directories there;
-    descendants inherit gid 1010 through setgid and task directories add
-    group-write permission when they are created.  Avoiding a recursive
-    privileged walk makes lease cost constant and removes the opportunity for
-    a sandbox process to redirect a path-based walk through a concurrently
-    swapped symlink.
+    Every component between ``trusted_root`` and ``root`` is assigned gid 1010
+    and mode 2750.  ``trusted_root`` itself and its ancestors are never
+    changed.  Callers that use an operator-owned folded mount as the descriptor
+    anchor must therefore choose the first Xagent-managed descendant as
+    ``root``.  Avoiding a recursive privileged walk keeps lease cost bounded
+    by path depth and prevents a sandbox process from redirecting a path-based
+    walk through a concurrently swapped symlink.
 
     Every path component is opened relative to its parent with ``O_NOFOLLOW``
     before the final directory is changed through its file descriptor.  The
@@ -55,12 +54,14 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
             f"Docker workspace root is outside its trusted prefix: {root}"
         ) from exc
     resolved_trusted_root = Path(os.path.realpath(lexical_trusted_root))
-    flags = os.O_RDONLY | os.O_DIRECTORY
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    traversal_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY
     if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+        directory_flags |= os.O_NOFOLLOW
+        traversal_flags |= os.O_NOFOLLOW
 
     try:
-        current_fd = os.open(os.path.sep, flags)
+        current_fd = os.open(os.path.sep, traversal_flags)
     except OSError as exc:
         raise SandboxContractError(
             f"Cannot open Docker workspace root for gid preparation: {root}"
@@ -68,7 +69,7 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
     try:
         try:
             for component in resolved_trusted_root.parts[1:]:
-                next_fd = os.open(component, flags, dir_fd=current_fd)
+                next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
                 os.close(current_fd)
                 current_fd = next_fd
             for component in relative_parts:
@@ -76,7 +77,7 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
                     os.mkdir(component, mode=0o750, dir_fd=current_fd)
                 except FileExistsError:
                     pass
-                next_fd = os.open(component, flags, dir_fd=current_fd)
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
                 try:
                     os.fchown(next_fd, -1, SANDBOX_RUNTIME_GID)
                     os.fchmod(next_fd, 0o2750)
@@ -87,17 +88,15 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
                         "to run as root and assign gid "
                         f"{SANDBOX_RUNTIME_GID}: {root}"
                     ) from exc
+                except OSError:
+                    os.close(next_fd)
+                    raise
                 os.close(current_fd)
                 current_fd = next_fd
         except OSError as exc:
             raise SandboxContractError(
                 f"Cannot safely open Docker workspace root: {root}"
             ) from exc
-        root_stat = os.fstat(current_fd)
-        if not stat.S_ISDIR(root_stat.st_mode):
-            raise NotADirectoryError(str(root))
-        if not relative_parts:
-            return
     finally:
         os.close(current_fd)
 

@@ -2815,9 +2815,7 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     if not await sandbox_mgr._resolve_backend_probe():
         return
 
-    validate_host_access = getattr(sandbox_mgr, "validate_host_workspace_access", None)
-    if validate_host_access is not None:
-        validate_host_access()
+    sandbox_mgr.validate_host_workspace_access()
 
     external_dirs = get_external_upload_dirs()
     if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:

@@ -157,3 +157,15 @@ def test_overlay_keeps_nginx_storage_read_only_and_the_others_writable():
     assert _storage_mount("nginx")["read_only"] is True
     for service in ("backend", "worker", "scheduler"):
         assert not _storage_mount(service).get("read_only")
+
+
+def test_nginx_workers_use_sandbox_group_as_primary_group():
+    nginx = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text("utf-8"))[
+        "services"
+    ]["nginx"]
+    command = "\n".join(nginx["command"])
+
+    assert "group_add" not in nginx
+    assert "user nginx $${group_name};" in command
+    assert "$$3 == 1010" in command
+    assert "grep -q" in command

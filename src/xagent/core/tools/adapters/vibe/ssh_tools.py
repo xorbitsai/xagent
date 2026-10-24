@@ -435,9 +435,10 @@ async def create_ssh_tools(config: Any) -> list[AbstractBaseTool]:
     # materializes to a local private dir and connects from the backend.
     sandbox_lease = _make_ssh_sandbox_lease(numeric_task_id, agent_id)
     if sandbox_lease is not None:
-        # BoxLite still buffers complete command output at this stack level;
-        # keep SSH disabled there until the dependent bounded-streaming PR is
-        # merged. Docker and the in-process runner cap output incrementally.
+        # BoxLite still buffers complete command output in
+        # ``BoxliteSandbox.exec``. Keep SSH disabled there until that method
+        # provides bounded streaming; Docker and the in-process runner cap
+        # output incrementally.
         if os.getenv("SANDBOX_IMPLEMENTATION", "docker") == "boxlite":
             logger.info("ssh tools: skip (boxlite sandbox backend not supported)")
             return []

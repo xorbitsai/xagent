@@ -46,6 +46,7 @@ from unittest.mock import patch
 import pytest
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
+import xagent.web.sandbox_manager as sandbox_manager_module
 import xagent.web.services.workspace_binding as workspace_binding
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.workspace import scoped_user_root
@@ -118,6 +119,7 @@ def _uploads(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(workspace_binding, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
+    monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
     return tmp_path
 
 

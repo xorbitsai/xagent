@@ -6,6 +6,7 @@ ensuring that each agent has its own isolated workspace context.
 """
 
 import contextvars
+import errno
 import logging
 import mimetypes
 import os
@@ -66,6 +67,11 @@ _internal_path_registry: Dict[Tuple[str, str], str] = {}
 _internal_file_registry_lock = RLock()
 _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
 _SANDBOX_PERMISSION_MIGRATION_MARKER = ".xagent-permissions-v2"
+# A failed legacy migration is retried after a process restart or through an
+# explicit migration call, but ordinary TaskWorkspace reconstruction must not
+# repeat a synchronous tree walk on every tool call.
+_sandbox_permission_migrations_attempted: set[str] = set()
+_sandbox_permission_migrations_lock = Lock()
 # The name of the output subtree the engine owns for spilled tool results.
 # It is defined here, on the workspace side, and the spill module imports it
 # from here: tool modules import core.workspace, never the other way round.
@@ -1935,24 +1941,79 @@ class TaskWorkspace:
                     os.close(fd)
             temp_fd = os.open(self.temp_dir.name, flags, dir_fd=workspace_fd)
             try:
-                try:
-                    os.mkdir(_INTERNAL_TEMP_DIR_NAME, mode=0o770, dir_fd=temp_fd)
-                except FileExistsError:
-                    pass
-                internal_fd = os.open(_INTERNAL_TEMP_DIR_NAME, flags, dir_fd=temp_fd)
-                try:
-                    os.fchown(internal_fd, -1, 1010)
-                    os.fchmod(internal_fd, 0o2770)
-                finally:
-                    os.close(internal_fd)
+                self._ensure_internal_temp_directory(temp_fd, flags)
             finally:
                 os.close(temp_fd)
             if self._migrate_sandbox_permissions:
-                self._migrate_existing_sandbox_permissions(
-                    workspace_fd, flags, force=repaired_parent_chain
-                )
+                migration_key = str(self.workspace_dir)
+                with _sandbox_permission_migrations_lock:
+                    should_migrate = (
+                        repaired_parent_chain
+                        or migration_key not in _sandbox_permission_migrations_attempted
+                    )
+                    if should_migrate:
+                        _sandbox_permission_migrations_attempted.add(migration_key)
+                if should_migrate:
+                    try:
+                        self._migrate_existing_sandbox_permissions(
+                            workspace_fd, flags, force=repaired_parent_chain
+                        )
+                    except BaseException:
+                        with _sandbox_permission_migrations_lock:
+                            _sandbox_permission_migrations_attempted.discard(
+                                migration_key
+                            )
+                        raise
         finally:
             os.close(workspace_fd)
+
+    def _ensure_internal_temp_directory(
+        self, temp_fd: int, directory_flags: int
+    ) -> None:
+        """Create the reserved temp directory without trusting sandbox state.
+
+        ``temp/`` is writable by gid 1010. A sandbox can therefore replace the
+        reserved name between workspace constructions. Remove non-directory
+        entries descriptor-relatively and retry, but do not let a process that
+        continuously races the name make workspace construction or cleanup
+        impossible.
+        """
+        recoverable_open_errors = {errno.ENOTDIR, errno.ELOOP}
+        internal_flags = directory_flags | getattr(os, "O_NONBLOCK", 0)
+        for _attempt in range(3):
+            try:
+                os.mkdir(_INTERNAL_TEMP_DIR_NAME, mode=0o770, dir_fd=temp_fd)
+            except FileExistsError:
+                pass
+            try:
+                internal_fd = os.open(
+                    _INTERNAL_TEMP_DIR_NAME,
+                    internal_flags,
+                    dir_fd=temp_fd,
+                )
+            except OSError as exc:
+                if exc.errno not in recoverable_open_errors:
+                    raise
+                try:
+                    os.unlink(_INTERNAL_TEMP_DIR_NAME, dir_fd=temp_fd)
+                except FileNotFoundError:
+                    pass
+                except IsADirectoryError:
+                    # The entry changed after the failed open; retry it as a
+                    # directory rather than removing recursively.
+                    pass
+                continue
+            try:
+                os.fchown(internal_fd, -1, 1010)
+                os.fchmod(internal_fd, 0o2770)
+            finally:
+                os.close(internal_fd)
+            return
+        logger.warning(
+            "Sandbox kept replacing reserved temp entry %s; continuing without "
+            "repair so workspace cleanup remains available",
+            self.internal_temp_dir,
+        )
 
     @staticmethod
     def _sandbox_compatible_mode(mode: int, *, directory: bool) -> int:
@@ -2025,12 +2086,29 @@ class TaskWorkspace:
         os.close(marker_fd)
 
     def _migrate_sandbox_tree(self, directory_fd: int) -> bool:
-        """Repair a tree iteratively and report whether every entry succeeded."""
+        """Repair a tree iteratively without retaining one fd per directory."""
         succeeded = True
-        pending = [os.dup(directory_fd)]
+        pending: list[tuple[str, ...]] = [()]
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
         while pending:
-            current_fd = pending.pop()
+            relative_parts = pending.pop()
             try:
+                current_fd = os.dup(directory_fd)
+            except OSError:
+                logger.warning(
+                    "Failed to duplicate the legacy sandbox workspace root",
+                    exc_info=True,
+                )
+                return False
+            try:
+                try:
+                    for component in relative_parts:
+                        next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                        os.close(current_fd)
+                        current_fd = next_fd
+                except OSError:
+                    succeeded = False
+                    continue
                 try:
                     names = os.listdir(current_fd)
                 except OSError:
@@ -2089,7 +2167,7 @@ class TaskWorkspace:
                             succeeded = False
                             continue
                         if is_directory:
-                            pending.append(os.dup(entry_fd))
+                            pending.append((*relative_parts, name))
                     finally:
                         os.close(entry_fd)
             finally:
@@ -2555,6 +2633,8 @@ class TaskWorkspace:
         a failure would tell deletion the directory leaked when it did not.
         """
         self._forget_internal_files()
+        with _sandbox_permission_migrations_lock:
+            _sandbox_permission_migrations_attempted.discard(str(self.workspace_dir))
         if self.workspace_dir.exists():
             logger.info(f"Removing workspace directory: {self.workspace_dir}")
             try:

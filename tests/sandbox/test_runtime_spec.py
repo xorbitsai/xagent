@@ -160,6 +160,23 @@ def test_workspace_access_accepts_trusted_symlinked_ancestor(tmp_path, monkeypat
     assert requested_modes == [0o2750]
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="O_PATH is Linux-specific")
+def test_workspace_access_traverses_execute_only_ancestor(tmp_path, monkeypatch):
+    execute_only = tmp_path / "execute-only"
+    trusted_root = execute_only / "uploads"
+    workspace = trusted_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    execute_only.chmod(0o711)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
+
+    try:
+        grant_sandbox_runtime_access(workspace, trusted_root=trusted_root)
+    finally:
+        execute_only.chmod(0o755)
+
+    assert stat.S_IMODE(workspace.stat().st_mode) & 0o777 == 0o750
+
+
 def test_workspace_access_rejects_symlink_in_managed_suffix(tmp_path, monkeypatch):
     trusted_root = tmp_path / "uploads"
     trusted_root.mkdir()

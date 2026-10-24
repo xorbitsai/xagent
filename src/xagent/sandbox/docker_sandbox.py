@@ -1866,10 +1866,19 @@ class DockerSandboxService(SandboxService):
                 "Cannot inspect the Docker daemon security mode."
             ) from exc
         security_options = daemon_info.get("SecurityOptions", ())
-        if any("rootless" in str(option).lower() for option in security_options):
+        unsupported_daemon_mode = next(
+            (
+                str(option)
+                for option in security_options
+                if any(mode in str(option).lower() for mode in ("rootless", "userns"))
+            ),
+            None,
+        )
+        if unsupported_daemon_mode is not None:
             raise SandboxRuntimeConflictError(
-                "Docker sandbox writable mounts require a rootful Docker daemon; "
-                "rootless Docker is not supported."
+                "Docker sandbox writable mounts require a rootful Docker daemon "
+                "without user-namespace remapping; unsupported security option: "
+                f"{unsupported_daemon_mode}."
             )
         uploads_root = get_uploads_dir().expanduser()
         uploads_root.mkdir(parents=True, exist_ok=True)

@@ -1,3 +1,4 @@
+import errno
 import os
 import stat
 import threading
@@ -156,6 +157,107 @@ def test_permission_migration_retries_after_one_entry_fails(workspace, monkeypat
 
     assert stat.S_IMODE(healthy.stat().st_mode) == 0o660
     assert not (workspace.workspace_dir / ".xagent-permissions-v2").exists()
+
+    monkeypatch.setattr(workspace_module.os, "fchmod", real_fchmod)
+    workspace_fd = os.open(workspace.workspace_dir, flags)
+    try:
+        workspace._migrate_existing_sandbox_permissions(workspace_fd, flags)
+    finally:
+        os.close(workspace_fd)
+
+    assert stat.S_IMODE(blocked.stat().st_mode) == 0o660
+    assert (workspace.workspace_dir / ".xagent-permissions-v2").is_file()
+
+
+def test_workspace_recovers_replaced_internal_temp_entry(tmp_path, monkeypatch):
+    base_dir = tmp_path / "prepared"
+    base_dir.mkdir()
+    real_stat = Path.stat
+
+    def prepared_parent_stat(path: Path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == base_dir:
+            values = list(result)
+            values[5] = 1010
+            values[0] |= stat.S_ISGID
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(Path, "stat", prepared_parent_stat)
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
+
+    workspace = TaskWorkspace("task-internal", str(base_dir))
+    workspace.internal_temp_dir.rmdir()
+    workspace.internal_temp_dir.write_text("sandbox replacement", encoding="utf-8")
+
+    rebuilt = TaskWorkspace(
+        "task-internal", str(base_dir), migrate_sandbox_permissions=False
+    )
+
+    assert rebuilt.internal_temp_dir.is_dir()
+
+
+def test_workspace_migration_is_attempted_once_per_process(tmp_path, monkeypatch):
+    base_dir = tmp_path / "prepared-once"
+    base_dir.mkdir()
+    real_stat = Path.stat
+
+    def prepared_parent_stat(path: Path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == base_dir:
+            values = list(result)
+            values[5] = 1010
+            values[0] |= stat.S_ISGID
+            return os.stat_result(values)
+        return result
+
+    attempts: list[str] = []
+    monkeypatch.setattr(Path, "stat", prepared_parent_stat)
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
+    monkeypatch.setattr(
+        TaskWorkspace,
+        "_migrate_existing_sandbox_permissions",
+        lambda self, *_args, **_kwargs: attempts.append(str(self.workspace_dir)),
+    )
+
+    TaskWorkspace("task-once", str(base_dir))
+    TaskWorkspace("task-once", str(base_dir))
+
+    assert attempts == [str(base_dir / "task-once")]
+
+
+def test_permission_migration_does_not_retain_pending_directory_fds(
+    workspace, monkeypatch
+):
+    for index in range(20):
+        (workspace.output_dir / f"directory-{index}").mkdir()
+
+    real_dup = os.dup
+    real_close = os.close
+    duplicated_fds: set[int] = set()
+
+    def bounded_dup(fd: int) -> int:
+        if len(duplicated_fds) >= 2:
+            raise OSError(errno.EMFILE, "too many retained directory fds")
+        duplicated = real_dup(fd)
+        duplicated_fds.add(duplicated)
+        return duplicated
+
+    def tracked_close(fd: int) -> None:
+        duplicated_fds.discard(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(workspace_module.os, "dup", bounded_dup)
+    monkeypatch.setattr(workspace_module.os, "close", tracked_close)
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    output_fd = os.open(workspace.output_dir, flags)
+    try:
+        assert workspace._migrate_sandbox_tree(output_fd)
+    finally:
+        os.close(output_fd)
+
+    assert not duplicated_fds
 
 
 def test_permission_migration_skips_hardlinked_files(workspace, monkeypatch):

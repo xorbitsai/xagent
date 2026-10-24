@@ -432,7 +432,10 @@ jobs:
         shell: bash
         run: |
           set -e
-          sudo -E "$PWD/.venv/bin/python" -m pytest tests/web/test_sandbox_reconcile_e2e.py -q
+          sudo -E "$PWD/.venv/bin/python" -m pytest \
+            tests/web/test_sandbox_reconcile_e2e.py \
+            tests/sandbox/test_docker_sandbox.py \
+            -q
 
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})

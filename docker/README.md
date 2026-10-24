@@ -289,12 +289,16 @@ absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container. Read-write sources must be writable by
 the sandbox identity (uid 1100/gid 1010); do not make them world-writable.
 The backend process that prepares managed workspace bind roots must be able to
-assign gid 1010: run it as root, grant `CAP_CHOWN`, or add it to that
-supplementary group. Startup performs this ownership probe and fails before
-accepting tasks when the contract is unavailable. Managed user roots are
-group-traversable but not group-writable; only the task `input/`, `output/`,
-and `temp/` directories are writable by the sandbox identity. Other sandbox
-backends do not perform this host ownership change.
+assign gid 1010 and must run as root against a rootful Docker daemon without
+user-namespace remapping. `CAP_CHOWN` or gid-1010 membership alone is not
+sufficient. Startup probes this contract and fails before accepting tasks when
+it is unavailable. Managed user roots are group-traversable but not
+group-writable; only the task `input/`, `output/`, and `temp/` directories are
+writable by the sandbox identity. Other sandbox backends do not perform this
+host ownership change. The bundled Compose service starts nginx workers with
+gid 1010 as their primary group so authorized X-Accel delivery can traverse
+these roots; deployments that replace the nginx service must provide the same
+worker-group membership.
 
 Sandbox workspace guest paths are reserved below
 `<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or

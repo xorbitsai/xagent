@@ -197,6 +197,7 @@ class TestScopedWorkspace:
     def test_scoped_parent_chain_and_existing_contents_are_repaired(
         self, tmp_path, monkeypatch
     ):
+        monkeypatch.setattr("xagent.core.workspace.get_uploads_dir", lambda: tmp_path)
         prepared_root = tmp_path / "user_7"
         base = prepared_root / "tenant-a" / "proj-1"
         output = base / "web_task_5" / "output"

@@ -288,8 +288,10 @@ In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container. Read-write sources must be writable by
 the sandbox identity (uid 1100/gid 1010); do not make them world-writable.
-The backend process that prepares managed workspace bind roots must run as
-root or with `CAP_CHOWN` so it can assign gid 1010. Managed user roots are
+The backend process that prepares managed workspace bind roots must be able to
+assign gid 1010: run it as root, grant `CAP_CHOWN`, or add it to that
+supplementary group. Startup performs this ownership probe and fails before
+accepting tasks when the contract is unavailable. Managed user roots are
 group-traversable but not group-writable; only the task `input/`, `output/`,
 and `temp/` directories are writable by the sandbox identity. Other sandbox
 backends do not perform this host ownership change.
@@ -308,29 +310,9 @@ Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
 directory; replacing one with a symlink or changing that topology while the
 service is running is unsupported.
 
-Custom stdio MCP servers require a sandbox and fail closed when no sandbox
-lease is available; they are never launched in the backend process. Catalog
-`npx`/`uvx` connectors prefer the sandbox when sandboxing is enabled, while a
-deployment with `SANDBOX_ENABLED=false` keeps their legacy host execution.
-Catalog rows whose stored arguments predate the current registry are not
-treated as canonical until they are reconnected and healed from the catalog;
-reconnect those rows before relying on the legacy host path. This strict check
-prevents an ownerless custom row with modified arguments from being mistaken
-for a vetted catalog command.
-Before upgrading, enable and verify a sandbox backend for every existing
-custom stdio server; leaving `SANDBOX_ENABLED=false` makes those custom
-connections unavailable by design.
-Custom commands and `cwd` values are interpreted inside the sandbox, so
-host-only binaries and host paths must be installed or mounted there. Docker
-sandboxes run as uid 1100/gid 1010 with all Linux
+Docker sandboxes run as uid 1100/gid 1010 with all Linux
 capabilities dropped and `no-new-privileges`; `SANDBOX_PIDS_LIMIT` controls the
-per-sandbox process/thread limit (default `1024`, minimum `64`). BoxLite egress
-is public-only: loopback, link-local, private, carrier-grade NAT, multicast,
-documentation, benchmark, and otherwise non-global address ranges are denied.
-There is intentionally no private-CIDR allowlist override. Consequently,
-`XAGENT_SSH_ALLOW_CIDRS` cannot make a private SSH target reachable from a
-BoxLite sandbox; use the Docker backend with an explicitly reviewed network
-policy when private SSH access is required. Docker itself does not filter
+per-sandbox process/thread limit (default `1024`, minimum `64`). Docker does not filter
 private, metadata, or host-gateway destinations when networking is enabled;
 enforce public-only Docker egress in the host or network firewall.
 

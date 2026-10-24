@@ -22,6 +22,7 @@ TemplateType = Literal["image", "snapshot"]
 CodeType = Literal["python", "javascript"]
 """Supported code execution types."""
 
+SANDBOX_RUNTIME_UID = 1100
 SANDBOX_RUNTIME_GID = 1010
 
 
@@ -1080,6 +1081,9 @@ class SandboxService(abc.ABC):
         actually need the fixed in-container runtime group.
         """
         return None
+
+    def validate_host_workspace_access(self) -> None:
+        """Fail readiness if required host bind ownership cannot be prepared."""
 
     def runtime_security_profile(self) -> str | None:
         """Backend-specific hardening profile included in desired state."""

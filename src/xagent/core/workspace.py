@@ -547,6 +547,11 @@ class TaskWorkspace:
         """
 
         resolved_path = file_path.resolve()
+        if (
+            file_path.parent.resolve() == self.workspace_dir.resolve()
+            and file_path.name == _SANDBOX_PERMISSION_MIGRATION_MARKER
+        ):
+            return True
         # The reserved root is the name under temp/, not whatever that name
         # points at: resolve the parent, never the reserved segment itself.
         # Following it would put the failure, and the answer, in the hands of
@@ -726,7 +731,6 @@ class TaskWorkspace:
 
         for file_path, file_id in files:
             registration = self.describe_file_registration(file_path)
-            self._grant_registered_path_sandbox_access(registration)
             path_key = str(registration.path)
             requested_file_id = str(file_id).strip() if file_id is not None else None
             if not requested_file_id:
@@ -771,6 +775,19 @@ class TaskWorkspace:
             index_by_path[path_key] = unique_index
             unique.append((registration, requested_file_id))
             result_indexes.append(unique_index)
+
+        # Do not mutate paths until the complete batch passes validation.
+        # Permission repair remains best effort for concurrently removed or
+        # restricted legacy entries.
+        for registration, _file_id in unique:
+            try:
+                self._grant_registered_path_sandbox_access(registration)
+            except OSError:
+                logger.warning(
+                    "Failed to grant sandbox access to registered path %s",
+                    registration.path,
+                    exc_info=True,
+                )
 
         return tuple(unique), tuple(result_indexes)
 
@@ -1824,11 +1841,19 @@ class TaskWorkspace:
         a gid/setgid anchor is found, prepare every remaining component.
         """
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-        parent = self.workspace_dir.parent.absolute()
-        current_fd = os.open(os.path.sep, flags)
-        prepared_ancestor_found = False
+        parent = self.workspace_dir.parent.resolve()
+        uploads_root = get_uploads_dir().expanduser().resolve()
         try:
-            for component in parent.parts[1:]:
+            relative_parts = parent.relative_to(uploads_root).parts
+        except ValueError:
+            return False
+        current_fd = os.open(uploads_root, flags)
+        root_stat = os.fstat(current_fd)
+        prepared_ancestor_found = root_stat.st_gid == 1010 and bool(
+            root_stat.st_mode & stat.S_ISGID
+        )
+        try:
+            for component in relative_parts:
                 next_fd = os.open(component, flags, dir_fd=current_fd)
                 os.close(current_fd)
                 current_fd = next_fd
@@ -1976,35 +2001,67 @@ class TaskWorkspace:
         os.close(marker_fd)
 
     def _migrate_sandbox_tree(self, directory_fd: int) -> None:
-        for name in os.listdir(directory_fd):
+        try:
+            names = os.listdir(directory_fd)
+        except OSError:
+            logger.warning(
+                "Failed to list a legacy sandbox workspace directory",
+                exc_info=True,
+            )
+            return
+        for name in names:
+            try:
+                entry_stat = os.stat(
+                    name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                continue
+            is_directory = stat.S_ISDIR(entry_stat.st_mode)
+            is_regular = stat.S_ISREG(entry_stat.st_mode)
+            if not is_directory and not is_regular:
+                continue
+            if is_regular and entry_stat.st_nlink > 1:
+                continue
+            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+            if is_directory:
+                flags |= os.O_DIRECTORY
             try:
                 entry_fd = os.open(
                     name,
-                    os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0),
+                    flags,
                     dir_fd=directory_fd,
                 )
             except OSError:
                 # Symlinks and concurrently removed entries are never followed.
                 continue
             try:
-                entry_stat = os.fstat(entry_fd)
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    os.fchown(entry_fd, -1, 1010)
+                opened_stat = os.fstat(entry_fd)
+                if (
+                    opened_stat.st_dev != entry_stat.st_dev
+                    or opened_stat.st_ino != entry_stat.st_ino
+                ):
+                    continue
+                try:
+                    # CAP_CHOWN is enough: transfer ownership to the backend
+                    # euid before chmod so CAP_FOWNER is not also required.
+                    os.fchown(entry_fd, os.geteuid(), 1010)
                     os.fchmod(
                         entry_fd,
                         self._sandbox_compatible_mode(
-                            entry_stat.st_mode, directory=True
+                            opened_stat.st_mode, directory=is_directory
                         ),
                     )
+                except OSError:
+                    logger.warning(
+                        "Failed to migrate sandbox workspace entry %s",
+                        name,
+                        exc_info=True,
+                    )
+                    continue
+                if is_directory:
                     self._migrate_sandbox_tree(entry_fd)
-                elif stat.S_ISREG(entry_stat.st_mode):
-                    os.fchown(entry_fd, -1, 1010)
-                    os.fchmod(
-                        entry_fd,
-                        self._sandbox_compatible_mode(
-                            entry_stat.st_mode, directory=False
-                        ),
-                    )
             finally:
                 os.close(entry_fd)
 

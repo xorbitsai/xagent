@@ -1034,19 +1034,26 @@ class SandboxManager:
             ):
                 target = Path(prepare_root)
             if should_create and self._service.host_workspace_gid() is not None:
-                # Grant the actual bind root first. A sandbox cannot replace
-                # its own mount point, so it is a stable descriptor anchor for
-                # any deeper scoped prepare root. Using get_uploads_dir()
-                # directly as the anchor for that deeper grant is unsafe when
-                # mount folding exposes a writable ancestor that contains the
-                # uploads entry.
-                grant_sandbox_runtime_access(
-                    backend_path, trusted_root=get_uploads_dir()
+                # A folded external mount may be an operator-owned ancestor of
+                # the uploads tree. Use that actual bind root only as the
+                # descriptor anchor for the managed descendant; do not chgrp
+                # or chmod the operator-owned ancestor itself.
+                trusted_root = (
+                    backend_path if target != backend_path else get_uploads_dir()
                 )
-                if target != backend_path:
-                    grant_sandbox_runtime_access(target, trusted_root=backend_path)
+                grant_sandbox_runtime_access(target, trusted_root=trusted_root)
             elif should_create or target.exists():
-                os.makedirs(target, exist_ok=True)
+                try:
+                    os.makedirs(target, exist_ok=True)
+                except OSError:
+                    # Legacy/BoxLite preparation was historically best effort.
+                    # Docker takes the explicit grant path above and still
+                    # fails closed when its ownership contract cannot be met.
+                    logger.warning(
+                        "Failed to prepare sandbox workspace mount %s",
+                        target,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _config_equivalent(
@@ -2795,6 +2802,8 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     """
     if not await sandbox_mgr._resolve_backend_probe():
         return
+
+    sandbox_mgr._service.validate_host_workspace_access()
 
     external_dirs = get_external_upload_dirs()
     if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:

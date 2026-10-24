@@ -1,6 +1,7 @@
 """Tool statistics come from completion events rather than shared counters."""
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import event
@@ -13,6 +14,7 @@ from xagent.core.agent.trace import TraceEvent as CoreTraceEvent
 from xagent.web.api.tools import _tool_usage_query, get_tool_usage
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.models.tool_config import ToolUsage
+from xagent.web.models.user import User
 from xagent.web.services import task_lease_service
 from xagent.web.services.trace_handlers import DatabaseTraceHandler
 
@@ -24,8 +26,9 @@ task_id = task_id_fixture
 async def test_usage_aggregates_completed_events_across_tasks(engine, task_id):
     start = datetime(2026, 9, 8, tzinfo=timezone.utc)
     with Session(engine) as db:
-        assert await get_tool_usage(db) == []
         task = db.get(Task, task_id)
+        current_user = SimpleNamespace(id=task.user_id, is_admin=False)
+        assert await get_tool_usage(db, current_user) == []
         other = Task(user_id=task.user_id, title="Other task")
         db.add(other)
         db.flush()
@@ -59,7 +62,9 @@ async def test_usage_aggregates_completed_events_across_tasks(engine, task_id):
         db.commit()
         counts = {row.tool_name: row.usage_count for row in _tool_usage_query(db).all()}
         assert counts == {"search": 3, "计算器🔎": 1}
-        response = {row["tool_name"]: row for row in await get_tool_usage(db)}
+        response = {
+            row["tool_name"]: row for row in await get_tool_usage(db, current_user)
+        }
         assert {name: row["usage_count"] for name, row in response.items()} == counts
         assert response["search"]["success_count"] == 2
         assert response["search"]["error_count"] == 1
@@ -70,6 +75,50 @@ async def test_usage_aggregates_completed_events_across_tasks(engine, task_id):
         assert last_used == start + timedelta(seconds=3)
         assert response["计算器🔎"]["success_count"] == 0
         assert response["计算器🔎"]["error_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_usage_is_scoped_to_the_authenticated_non_admin(engine, task_id):
+    with Session(engine) as db:
+        own_task = db.get(Task, task_id)
+        other_user = User(username="other-tool-user", password_hash="unused")
+        db.add(other_user)
+        db.flush()
+        other_task = Task(user_id=other_user.id, title="Another user's task")
+        db.add(other_task)
+        db.flush()
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=own_task.id,
+                    event_id="own-usage",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": "own-tool", "success": True},
+                ),
+                TraceEvent(
+                    task_id=other_task.id,
+                    event_id="other-usage",
+                    event_type="tool_execution_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"tool_name": "other-tool", "success": True},
+                ),
+            ]
+        )
+        db.commit()
+
+        response = await get_tool_usage(
+            db, SimpleNamespace(id=own_task.user_id, is_admin=False)
+        )
+        assert {row["tool_name"] for row in response} == {"own-tool"}
+
+        admin_response = await get_tool_usage(
+            db, SimpleNamespace(id=own_task.user_id, is_admin=True)
+        )
+        assert {row["tool_name"] for row in admin_response} == {
+            "own-tool",
+            "other-tool",
+        }
 
 
 def test_tool_trace_persists_without_accessing_shared_counters(engine, task_id):

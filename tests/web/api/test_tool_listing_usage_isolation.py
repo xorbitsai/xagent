@@ -40,8 +40,9 @@ def _seed(db: Session, task_id: int) -> None:
     db.commit()
 
 
-def _broken_usage_query(db: Session):
+def _broken_usage_query(db: Session, user_id: int | None = None):
     # A real database error: on PostgreSQL it aborts the transaction.
+    del user_id
     return db.query(sa.literal_column("missing_column").label("tool_name"))
 
 
@@ -74,11 +75,19 @@ def test_usage_counts_are_read_without_touching_the_request_transaction(
 def test_failed_usage_query_leaves_tool_metadata_readable(
     engine, task_id, monkeypatch: pytest.MonkeyPatch
 ):
-    monkeypatch.setattr(tools_api, "_tool_usage_query", _broken_usage_query)
+    reached = False
+
+    def broken_usage_query(db: Session, user_id: int | None = None):
+        nonlocal reached
+        reached = True
+        return _broken_usage_query(db, user_id)
+
+    monkeypatch.setattr(tools_api, "_tool_usage_query", broken_usage_query)
     with Session(engine) as db:
         _seed(db, task_id)
 
         assert tools_api._load_tool_usage_counts(db) == {}
+        assert reached is True
         assert [row.tool_name for row in db.query(ToolConfig).all()] == ["search"]
 
 
@@ -87,7 +96,12 @@ def test_failed_usage_query_leaves_tool_metadata_readable(
 def test_slow_usage_query_is_cancelled_by_the_statistics_timeout(
     engine, task_id, monkeypatch: pytest.MonkeyPatch
 ):
-    def slow_usage_query(db: Session):
+    reached = False
+
+    def slow_usage_query(db: Session, user_id: int | None = None):
+        nonlocal reached
+        del user_id
+        reached = True
         return db.query(
             sa.literal("slow").label("tool_name"),
             sa.literal(1).label("usage_count"),
@@ -99,6 +113,7 @@ def test_slow_usage_query_is_cancelled_by_the_statistics_timeout(
         _seed(db, task_id)
 
         assert tools_api._load_tool_usage_counts(db) == {}
+        assert reached is True
         assert [row.tool_name for row in db.query(ToolConfig).all()] == ["search"]
 
 

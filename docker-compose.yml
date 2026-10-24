@@ -4,6 +4,8 @@ services:
     image: nginx:latest
     container_name: xagent_nginx
     restart: unless-stopped
+    group_add:
+      - "1010"
     ports:
       - "${PORT:-80}:80"
     volumes:

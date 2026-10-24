@@ -228,6 +228,8 @@ class FakeSandboxService(SandboxService):
             working_dir=config.working_dir,
             cpus=config.cpus,
             memory=config.memory,
+            pids_limit=config.pids_limit,
+            security_profile=config.security_profile,
             env=config.env,
             volumes=config.volumes,
             network_isolated=bool(config.network_isolated),

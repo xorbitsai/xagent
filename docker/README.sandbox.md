@@ -18,11 +18,14 @@ The Python set comes only from the dedicated `sandbox` dependency group in Xagen
 
 ## Isolation
 
-Sandboxing is opt-in: Xagent runs tool calls in the backend process unless `SANDBOX_ENABLED=true`, and falls back to the backend when no sandbox backend is available or a tool cannot be wrapped. What follows applies to work that does reach a sandbox.
+Sandboxing is opt-in: Xagent runs eligible tool calls in the backend process unless `SANDBOX_ENABLED=true`. What follows applies to work that does reach a sandbox.
 
-The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, CPU and memory limits, and optional network isolation; its Boxlite backend runs the sandbox inside a KVM microVM. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for the two modes and their trade-offs.
+The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, drops all Linux capabilities, and enforces CPU, memory, and PID limits. Docker does not itself filter private/metadata destinations when networking is enabled, so deployments using Docker must enforce public-only egress with host or network firewall policy. The backend stamps this policy into sandbox desired-state matching, so an existing sandbox created under a different profile is rebuilt before reuse. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for deployment details.
 
-The image itself defines an unprivileged `sandbox` user (uid 1100, gid 1010) as its default. Note that Xagent's Docker backend deliberately overrides this and runs the container as root, to match the file access behavior of the Boxlite backend.
+The image defines an unprivileged `sandbox` user (uid 1100, gid 1010), and both
+the Docker and BoxLite backends preserve that runtime identity. Replacement
+images must provide a writable `/home/sandbox`, which is the default working
+directory, as well as writable cache directories for that identity.
 
 ## Tags
 

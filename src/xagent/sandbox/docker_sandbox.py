@@ -1868,7 +1868,7 @@ class DockerSandboxService(SandboxService):
             raise SandboxRuntimeConflictError(
                 "Cannot inspect the Docker daemon security mode."
             ) from exc
-        security_options = daemon_info.get("SecurityOptions", ())
+        security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(
             (
                 str(option)

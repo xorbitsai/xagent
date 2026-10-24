@@ -7,6 +7,7 @@ and configuration management.
 
 # mypy: ignore-errors
 
+import asyncio
 import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
@@ -785,7 +786,7 @@ class ToolFactory:
                 else None
             )
             if workspace is None:
-                workspace = ToolFactory.create_workspace(config.get_workspace_config())
+                workspace = await ToolFactory.create_workspace_async(config)
             if workspace is not None:
                 directories = workspace.get_allowed_dirs()
                 # Mount coverage is sufficient only when the backend-side
@@ -986,6 +987,28 @@ class ToolFactory:
         return wrapped_tools
 
     # New unified tool creation methods
+    @staticmethod
+    async def create_workspace_async(
+        config: BaseToolConfig,
+    ) -> TaskWorkspace | None:
+        """Build a task workspace without blocking an async tool creator."""
+
+        workspace_getter = getattr(config, "get_task_runtime_workspace", None)
+        workspace = workspace_getter() if callable(workspace_getter) else None
+        if workspace is not None:
+            return workspace
+        workspace_config_getter = getattr(config, "get_workspace_config", None)
+        if not callable(workspace_config_getter):
+            return None
+        workspace = await asyncio.to_thread(
+            ToolFactory.create_workspace,
+            workspace_config_getter(),
+        )
+        workspace_setter = getattr(config, "set_task_runtime_workspace", None)
+        if callable(workspace_setter):
+            workspace_setter(workspace)
+        return workspace
+
     @staticmethod
     def create_workspace(
         workspace_config: dict[str, Any] | None,

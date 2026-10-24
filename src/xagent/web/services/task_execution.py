@@ -3855,6 +3855,13 @@ async def execute_resume_background(
                 )
             )
 
+        # Every resume route shares this point, including task commands and
+        # no-attachment channel turns. Materialize authorized pre-upgrade
+        # input symlinks before the non-root sandbox can observe them.
+        await run_db_io_cancellation_safe(
+            lambda: _prepare_workspace_inputs_for_agent(agent_service)
+        )
+
         # The task row can become RUNNING before the original AgentRunner has
         # created a context/checkpoint. Retry an early failed injection only
         # after that original execution has settled and persisted its state.
@@ -5542,17 +5549,18 @@ def _materialize_legacy_task_input_symlinks(
         )
 
 
-def _register_uploaded_files_for_agent(
+def _prepare_workspace_inputs_for_agent(
     agent_service: Any,
-    file_info_list: List[Dict[str, Any]],
-) -> None:
-    """Bind already-durable inputs to the workspace without another upload."""
-
+) -> tuple[Any, Path, int] | None:
+    """Prepare task-local inputs shared by starts, resumes, and channels."""
     workspace = getattr(agent_service, "workspace", None)
     if not workspace:
-        return
+        return None
 
-    input_dir = Path(workspace.input_dir)
+    raw_input_dir = getattr(workspace, "input_dir", None)
+    if not isinstance(raw_input_dir, (str, os.PathLike)):
+        return None
+    input_dir = Path(raw_input_dir)
     input_dir.mkdir(parents=True, exist_ok=True)
     copy_mode = _task_input_copy_mode(workspace)
     _materialize_legacy_task_input_symlinks(
@@ -5560,6 +5568,19 @@ def _register_uploaded_files_for_agent(
         input_dir,
         copy_mode=copy_mode,
     )
+    return workspace, input_dir, copy_mode
+
+
+def _register_uploaded_files_for_agent(
+    agent_service: Any,
+    file_info_list: List[Dict[str, Any]],
+) -> None:
+    """Bind already-durable inputs to the workspace without another upload."""
+
+    prepared = _prepare_workspace_inputs_for_agent(agent_service)
+    if prepared is None:
+        return
+    workspace, input_dir, copy_mode = prepared
 
     for file_info in file_info_list:
         file_id = str(file_info.get("file_id") or "")

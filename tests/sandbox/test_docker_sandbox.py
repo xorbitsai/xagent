@@ -219,11 +219,14 @@ class TestDockerSandboxServiceFailures:
         assert len(created_container.remove_calls) == 1
         assert created_container.remove_calls[0] is True
 
+    @pytest.mark.parametrize("security_options", [[], None])
     def test_host_workspace_readiness_probe_succeeds_and_cleans_up(
-        self, tmp_path, monkeypatch
+        self, tmp_path, monkeypatch, security_options
     ):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": security_options}
         service = DockerSandboxService(
-            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+            MemDockerStore(), namespace="test", client=client
         )
         monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
         monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)

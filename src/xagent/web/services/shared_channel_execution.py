@@ -786,12 +786,11 @@ async def execute_channel_background(
     file_infos = (
         await run_db_io_cancellation_safe(resolve_files) if payload.file_ids else []
     )
-    if file_infos:
-        from .task_execution import _register_uploaded_files_for_agent
+    from .task_execution import _register_uploaded_files_for_agent
 
-        await run_db_io_cancellation_safe(
-            lambda: _register_uploaded_files_for_agent(service, file_infos)
-        )
+    await run_db_io_cancellation_safe(
+        lambda: _register_uploaded_files_for_agent(service, file_infos)
+    )
     from .file_turn import normalize_attachments_for_persistence
 
     context: dict[str, Any] = {

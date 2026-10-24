@@ -657,6 +657,8 @@ class TestNamespaceIsolation:
 
     @pytest.mark.asyncio
     async def test_create_container_writes_v2_owner_labels(self, monkeypatch):
+        monkeypatch.delenv("SANDBOX_PIDS_LIMIT", raising=False)
+
         async def _noop_ensure_image(_client, _image):
             return None
 

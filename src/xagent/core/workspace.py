@@ -1870,31 +1870,43 @@ class TaskWorkspace:
         their repair. Walk the already-resolved parent by descriptor and, once
         a gid/setgid anchor is found, prepare every remaining component.
         """
-        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        traversal_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY
+        traversal_flags |= getattr(os, "O_NOFOLLOW", 0)
         parent = self.workspace_dir.parent.resolve()
         uploads_root = get_uploads_dir().expanduser().resolve()
         try:
             relative_parts = parent.relative_to(uploads_root).parts
         except ValueError:
             return False
-        current_fd = os.open(uploads_root, flags)
+        current_fd = os.open(uploads_root, traversal_flags)
         root_stat = os.fstat(current_fd)
         prepared_ancestor_found = root_stat.st_gid == 1010 and bool(
             root_stat.st_mode & stat.S_ISGID
         )
         try:
             for component in relative_parts:
-                next_fd = os.open(component, flags, dir_fd=current_fd)
+                next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
+                try:
+                    component_stat = os.fstat(next_fd)
+                    if prepared_ancestor_found:
+                        mutation_fd = os.open(
+                            component, directory_flags, dir_fd=current_fd
+                        )
+                        try:
+                            os.fchown(mutation_fd, -1, 1010)
+                            os.fchmod(mutation_fd, 0o2750)
+                        finally:
+                            os.close(mutation_fd)
+                    elif component_stat.st_gid == 1010 and (
+                        component_stat.st_mode & stat.S_ISGID
+                    ):
+                        prepared_ancestor_found = True
+                except BaseException:
+                    os.close(next_fd)
+                    raise
                 os.close(current_fd)
                 current_fd = next_fd
-                component_stat = os.fstat(current_fd)
-                if prepared_ancestor_found:
-                    os.fchown(current_fd, -1, 1010)
-                    os.fchmod(current_fd, 0o2750)
-                elif component_stat.st_gid == 1010 and (
-                    component_stat.st_mode & stat.S_ISGID
-                ):
-                    prepared_ancestor_found = True
             return prepared_ancestor_found
         finally:
             os.close(current_fd)
@@ -2044,8 +2056,6 @@ class TaskWorkspace:
                 marker_flags,
                 dir_fd=workspace_fd,
             )
-        except FileNotFoundError:
-            marker_fd = -1
         except OSError:
             marker_fd = -1
         if marker_fd >= 0:

@@ -411,6 +411,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
         image_digest=cast(Optional[str], attrs.get("Image")),
         raw_nano_cpus=cast(Optional[int], host_config.get("NanoCpus")),
         raw_memory_bytes=cast(Optional[int], host_config.get("Memory")),
+        raw_pids_limit=cast(Optional[int], host_config.get("PidsLimit")),
         env=env_map,
         volumes=tuple(volumes),
         ports=tuple(ports),
@@ -563,7 +564,7 @@ def _find_publish_mismatches(
     once the container has actually been created from it, so there is no
     need for a separate label-based check on the snapshot leg.
 
-    cpus/memory are re-checked here (immediately after start, in raw backend
+    cpus/memory/pids are re-checked here (immediately after start, in raw backend
     units) in addition to the live re-check ``spec_matches_inspection`` does
     later: this is the first opportunity to catch e.g. Docker silently
     clamping an out-of-range request, before the container is ever
@@ -577,7 +578,7 @@ def _find_publish_mismatches(
     ``LABEL_SPEC_FINGERPRINT`` over the *entire* desired spec before the
     container starts -- it has to, since Docker offers no way to add or
     change a label on an existing container -- and ``spec_matches_inspection``
-    trusts that one label for every field except cpus/memory, which it
+    trusts that one label for every field except cpus/memory/pids, which it
     re-reads live. Publishing a container whose ``working_dir`` was quietly
     accepted as different would therefore leave a label positively attesting
     a spec the container does not implement, and every later reconcile would
@@ -610,6 +611,11 @@ def _find_publish_mismatches(
         mismatches.append("cpus")
     if (facts.raw_memory_bytes or 0) != int(desired.memory * 1024 * 1024):
         mismatches.append("memory")
+    observed_pids_limit = facts.raw_pids_limit
+    if observed_pids_limit is not None and observed_pids_limit < 64:
+        observed_pids_limit = None
+    if observed_pids_limit != desired.pids_limit:
+        mismatches.append("pids_limit")
     return mismatches
 
 
@@ -646,8 +652,6 @@ def _write_tar_from_content(
     content: str,
     arcname: str,
     file_obj: io.BufferedRandom,
-    *,
-    mode: int = 0o600,
 ) -> None:
     """Pack in-memory text content into a tar stream for Docker put_archive."""
     data = content.encode("utf-8")
@@ -655,7 +659,7 @@ def _write_tar_from_content(
     info.size = len(data)
     info.uid = SANDBOX_RUNTIME_UID
     info.gid = SANDBOX_RUNTIME_GID
-    info.mode = mode
+    info.mode = 0o600
     with tarfile.open(fileobj=file_obj, mode="w") as tar:
         tar.addfile(info, io.BytesIO(data))
     file_obj.seek(0)
@@ -1515,7 +1519,7 @@ class DockerSandboxService(SandboxService):
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
-                pids_limit=config.pids_limit,
+                pids_limit=config.pids_limit or get_sandbox_pids_limit(),
                 security_profile=config.security_profile,
             )
             extra_labels = {

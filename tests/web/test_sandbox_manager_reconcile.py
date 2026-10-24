@@ -1017,6 +1017,64 @@ class TestProviderCacheMountIntentGate:
         assert stat.S_IMODE(protected.stat().st_mode) == 0o755
         assert not (protected / "scope-a").exists()
 
+    def test_folded_mount_rejects_symlink_at_uploads_root_component(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        physical_root = tmp_path / "physical-root"
+        physical_root.mkdir(mode=0o755)
+        trusted_alias = tmp_path / "trusted-alias"
+        trusted_alias.symlink_to(physical_root, target_is_directory=True)
+        protected = physical_root / "protected"
+        protected.mkdir(mode=0o755)
+        uploads_root = physical_root / "uploads"
+        uploads_root.symlink_to(protected, target_is_directory=True)
+        prepare_root = uploads_root / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+
+        with pytest.raises(SandboxContractError):
+            manager._prepare_workspace_mounts(
+                "user",
+                "42",
+                SandboxMountIntent(mount_root=str(trusted_alias)),
+                prepare_root=str(prepare_root),
+            )
+
+        assert stat.S_IMODE(protected.stat().st_mode) == 0o755
+        assert not (protected / "user_42").exists()
+
+    def test_legacy_mount_exists_error_remains_best_effort(
+        self, _env, tmp_path, monkeypatch, caplog
+    ) -> None:
+        manager, service = _make_manager()
+        blocked = tmp_path / "blocked"
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: None)
+        monkeypatch.setattr(
+            manager,
+            "_workspace_mount_paths",
+            lambda *_args, **_kwargs: [(blocked, False)],
+        )
+        real_exists = Path.exists
+
+        def restricted_exists(path: Path) -> bool:
+            if path == blocked:
+                raise PermissionError("restricted")
+            return real_exists(path)
+
+        monkeypatch.setattr(Path, "exists", restricted_exists)
+
+        manager._prepare_workspace_mounts("user", "42", None)
+
+        assert "Failed to prepare sandbox workspace mount" in caplog.text
+
     @pytest.mark.asyncio
     async def test_reused_container_still_prepares_managed_mount(
         self, _env, tmp_path, monkeypatch

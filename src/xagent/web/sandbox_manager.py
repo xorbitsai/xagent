@@ -1058,18 +1058,17 @@ class SandboxManager:
                     # Folding compares physical identities but deliberately
                     # retains the operator's lexical spelling for the bind.
                     lexical_target = Path(os.path.abspath(target))
-                    try:
-                        lexical_target.relative_to(Path(os.path.abspath(trusted_root)))
-                    except ValueError:
+                    lexical_trusted_root = Path(os.path.abspath(trusted_root))
+                    if not lexical_target.is_relative_to(lexical_trusted_root):
                         # Rebase a physical uploads spelling onto an
-                        # operator-controlled bind alias. Resolve only those
-                        # trusted prefixes; keep the sandbox-controlled suffix
-                        # lexical so the descriptor walk rejects planted links.
+                        # operator-controlled bind alias. Resolve only the
+                        # trusted bind prefix. In particular, never realpath
+                        # the uploads root: it is inside a writable mount and
+                        # may already have been replaced by sandbox code.
                         physical_trusted_root = Path(os.path.realpath(trusted_root))
                         uploads_root = Path(os.path.abspath(get_uploads_dir()))
-                        physical_uploads_root = Path(os.path.realpath(uploads_root))
                         try:
-                            uploads_suffix = physical_uploads_root.relative_to(
+                            uploads_suffix = uploads_root.relative_to(
                                 physical_trusted_root
                             )
                             managed_suffix = lexical_target.relative_to(uploads_root)
@@ -1080,9 +1079,10 @@ class SandboxManager:
                             ) from exc
                         grant_target = trusted_root / uploads_suffix / managed_suffix
                 grant_sandbox_runtime_access(grant_target, trusted_root=trusted_root)
-            elif should_create or target.exists():
+            else:
                 try:
-                    os.makedirs(target, exist_ok=True)
+                    if should_create or target.exists():
+                        os.makedirs(target, exist_ok=True)
                 except OSError:
                     # Legacy/BoxLite preparation was historically best effort.
                     # Docker takes the explicit grant path above and still

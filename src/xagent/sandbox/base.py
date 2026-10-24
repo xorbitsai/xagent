@@ -565,10 +565,10 @@ class ObservedRuntimeFacts:
     level: two instances compare by identity, never structurally, so nothing
     can accidentally treat one as a desired-state stand-in for the other.
 
-    ``raw_nano_cpus`` / ``raw_memory_bytes`` are the untouched values from the
-    backend (e.g. Docker's ``HostConfig.NanoCpus`` / ``HostConfig.Memory``),
-    not the divided-and-clamped values a display-facing parser would produce;
-    a live edit such as ``docker update --cpus 0.5`` must be observable here.
+    ``raw_nano_cpus`` / ``raw_memory_bytes`` / ``raw_pids_limit`` are the
+    untouched values from the backend (e.g. Docker's ``HostConfig``), not the
+    divided-and-clamped values a display-facing parser would produce; live
+    ``docker update`` edits must remain observable here.
 
     ``runtime_networks`` reflects network attachments at inspection time; it
     is not part of any spec comparison because network attachment can change
@@ -588,6 +588,7 @@ class ObservedRuntimeFacts:
     labels: Mapping[str, str]
     created_at: Optional[str]
     working_dir: Optional[str]
+    raw_pids_limit: Optional[int]
 
 
 @dataclass(eq=False)
@@ -750,8 +751,8 @@ def spec_matches_inspection(
       also immutable once written, so there is no backfill path that could
       turn a legacy container into a verified one.
     - A matching fingerprint label is followed by a live re-check of the
-      fields Docker allows to drift after creation (cpus/memory, compared in
-      their raw backend units) to catch e.g. ``docker update --cpus 0.5``.
+      fields Docker allows to drift after creation (cpus/memory/pids, compared
+      in their raw backend units) to catch e.g. ``docker update --cpus 0.5``.
       Disagreement there is ``MISMATCH`` even though the label matched.
     - A non-matching fingerprint label is always ``MISMATCH``.
     - ``env`` / ``volumes`` / ``ports`` / ``image`` are not independently
@@ -795,9 +796,16 @@ def spec_matches_inspection(
     desired_memory_bytes = int(desired.memory * 1024 * 1024)
     observed_nano_cpus = facts.raw_nano_cpus or 0
     observed_memory_bytes = facts.raw_memory_bytes or 0
+    observed_pids_limit = (
+        facts.raw_pids_limit
+        if facts.raw_pids_limit is not None and facts.raw_pids_limit >= 64
+        else None
+    )
     if observed_nano_cpus != desired_nano_cpus:
         return SpecVerdict.MISMATCH
     if observed_memory_bytes != desired_memory_bytes:
+        return SpecVerdict.MISMATCH
+    if observed_pids_limit != desired.pids_limit:
         return SpecVerdict.MISMATCH
     return SpecVerdict.MATCH
 

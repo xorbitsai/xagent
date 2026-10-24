@@ -2012,6 +2012,55 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     assert file_info["path"] == str(source_path)
 
 
+def test_register_uploaded_files_for_agent_reuses_existing_file_id_binding(
+    db_session,
+    tmp_path,
+):
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="repeat-file",
+        user_id=1,
+        task_id=10,
+        filename="repeat.txt",
+    )
+
+    class Workspace:
+        def __init__(self):
+            self.input_dir = str(tmp_path / "workspace" / "input")
+            self.bindings: dict[str, Path] = {}
+            self.bind_calls = 0
+
+        def resolve_file_id(self, file_id):
+            return self.bindings.get(file_id)
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(path=Path(path), is_workspace_file=True)
+
+        def bind_already_durable_file(self, registration, *, file_id):
+            self.bind_calls += 1
+            self.bindings[file_id] = registration.path
+
+    workspace = Workspace()
+    agent_service = SimpleNamespace(workspace=workspace)
+
+    first = {
+        "file_id": "repeat-file",
+        "name": "repeat.txt",
+        "path": str(upload.storage_path),
+        "workspace_path": None,
+    }
+    second = dict(first)
+    _register_uploaded_files_for_agent(agent_service, [first])
+    _register_uploaded_files_for_agent(agent_service, [second])
+
+    assert second["workspace_path"] == first["workspace_path"]
+    assert list(Path(workspace.input_dir).glob("repeat*.txt")) == [
+        Path(first["workspace_path"])
+    ]
+    assert workspace.bind_calls == 1
+
+
 def test_register_uploaded_files_materializes_legacy_symlink_without_new_attachment(
     db_session,
     tmp_path,

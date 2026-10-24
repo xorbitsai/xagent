@@ -193,6 +193,7 @@ class FakeSandboxService(SandboxService):
             image_digest=spec.image,
             raw_nano_cpus=int(spec.cpus * 1_000_000_000),
             raw_memory_bytes=int(spec.memory * 1024 * 1024),
+            raw_pids_limit=spec.pids_limit,
             env=dict(spec.env),
             volumes=spec.volumes,
             ports=spec.ports,

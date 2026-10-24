@@ -288,6 +288,10 @@ In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container. Read-write sources must be writable by
 the sandbox identity (uid 1100/gid 1010); do not make them world-writable.
+`XAGENT_EXTERNAL_UPLOAD_DIRS` sources are also mounted read-write and are not
+permission-repaired by Xagent; their host permissions must independently allow
+the required access by uid 1100/gid 1010.
+
 The backend process that prepares managed workspace bind roots must be able to
 assign gid 1010 and must run as root against a rootful Docker daemon without
 user-namespace remapping. `CAP_CHOWN` or gid-1010 membership alone is not
@@ -324,8 +328,11 @@ On first use after upgrading, each pre-existing task workspace is migrated once
 with a descriptor-safe walk: regular files and directories below `input/`,
 `output/`, and `temp/` are reassigned to gid 1010 and receive group permissions
 matching their owner permissions. Symlinks and special files are skipped. A
-private marker prevents repeating this potentially expensive task-local walk,
-and newly registered host-created deliverables are repaired individually.
+regular file with more than one hard link is also skipped so migration cannot
+change a shared inode; replace such a legacy entry with a separately managed
+copy if the sandbox must read it. A private marker prevents repeating this
+potentially expensive task-local walk, and newly registered host-created
+deliverables are repaired individually.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide

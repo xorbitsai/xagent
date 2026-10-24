@@ -60,6 +60,7 @@ def _make_facts(**overrides) -> ObservedRuntimeFacts:
         image_digest="sha256:deadbeef",
         raw_nano_cpus=1_000_000_000,
         raw_memory_bytes=512 * 1024 * 1024,
+        raw_pids_limit=1024,
         env={"FOO": "bar"},
         volumes=(("/host/a", "/guest/a", "ro"),),
         ports=((8080, 80),),
@@ -705,6 +706,24 @@ class TestSpecMatchesInspection:
             ),
         )
         assert spec_matches_inspection(desired, inspection) is SpecVerdict.MISMATCH
+
+    @pytest.mark.parametrize("raw_pids_limit", [2048, -1, 0, None])
+    def test_pids_limit_drift_is_mismatch(self, raw_pids_limit):
+        desired = _make_spec(pids_limit=1024)
+        inspection = _make_inspection(
+            fingerprint_label=desired.fingerprint(),
+            facts=_make_facts(raw_pids_limit=raw_pids_limit),
+        )
+        assert spec_matches_inspection(desired, inspection) is SpecVerdict.MISMATCH
+
+    @pytest.mark.parametrize("raw_pids_limit", [-1, 0, None])
+    def test_unlimited_pids_values_match_unlimited_desired(self, raw_pids_limit):
+        desired = _make_spec(pids_limit=None)
+        inspection = _make_inspection(
+            fingerprint_label=desired.fingerprint(),
+            facts=_make_facts(raw_pids_limit=raw_pids_limit),
+        )
+        assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
 
     def test_label_mismatch_is_mismatch_regardless_of_raw_units(self):
         desired = _make_spec(cpus=1, memory=512)

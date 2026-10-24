@@ -52,6 +52,45 @@ def test_permission_migration_repairs_nested_legacy_files(
     assert (workspace.workspace_dir / ".xagent-permissions-v2").is_file()
 
 
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="Linux O_PATH is required")
+def test_prepare_parent_traverses_search_only_component(tmp_path, monkeypatch):
+    uploads_root = tmp_path / "uploads"
+    search_only = uploads_root / "search-only"
+    workspace_parent = search_only / "actor"
+    workspace_parent.mkdir(parents=True)
+    search_only.chmod(0o711)
+    monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: uploads_root)
+    subject = object.__new__(TaskWorkspace)
+    subject.workspace_dir = workspace_parent / "task"
+
+    try:
+        assert subject._prepare_sandbox_workspace_parent() is False
+    finally:
+        search_only.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires real chown privileges")
+def test_permission_migration_assigns_real_sandbox_gid(tmp_path):
+    workspace = TaskWorkspace("privileged", str(tmp_path))
+    legacy = workspace.output_dir / "legacy.txt"
+    legacy.write_text("legacy", encoding="utf-8")
+    os.chown(legacy, 0, 0)
+    legacy.chmod(0o600)
+    marker = workspace.workspace_dir / ".xagent-permissions-v2"
+    marker.unlink(missing_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+
+    workspace_fd = os.open(workspace.workspace_dir, flags)
+    try:
+        workspace._migrate_existing_sandbox_permissions(workspace_fd, flags, force=True)
+    finally:
+        os.close(workspace_fd)
+
+    legacy_stat = legacy.stat()
+    assert legacy_stat.st_gid == 1010
+    assert stat.S_IMODE(legacy_stat.st_mode) == 0o660
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
 def test_permission_migration_marker_fifo_never_blocks(workspace, monkeypatch):
     marker = workspace.workspace_dir / ".xagent-permissions-v2"

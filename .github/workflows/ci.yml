@@ -435,6 +435,7 @@ jobs:
           sudo -E "$PWD/.venv/bin/python" -m pytest \
             tests/web/test_sandbox_reconcile_e2e.py \
             tests/sandbox/test_docker_sandbox.py \
+            tests/core/test_workspace_nonroot_permissions.py::test_permission_migration_assigns_real_sandbox_gid \
             -q
 
   pytest-fast-deepdoc:

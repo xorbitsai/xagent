@@ -5591,6 +5591,27 @@ def _register_uploaded_files_for_agent(
             )
             continue
 
+        candidate: Path | None = None
+        reused_candidate = False
+        resolve_file_id = getattr(workspace, "resolve_file_id", None)
+        if callable(resolve_file_id):
+            try:
+                previously_bound = resolve_file_id(file_id)
+                if isinstance(previously_bound, (str, os.PathLike)):
+                    bound_path = Path(previously_bound)
+                    if (
+                        bound_path.parent.resolve() == input_dir.resolve()
+                        and bound_path.is_file()
+                        and not bound_path.is_symlink()
+                    ):
+                        candidate = bound_path
+                        reused_candidate = True
+            except (OSError, ValueError):
+                # A stale or backend-specific binding must not make an
+                # otherwise valid durable upload unavailable. Fall back to
+                # collision-safe materialization below.
+                candidate = None
+
         normalized_file_name = normalize_filename(
             Path(str(file_info.get("name") or source_path.name)).name
         )
@@ -5602,27 +5623,42 @@ def _register_uploaded_files_for_agent(
             )
         except OSError:
             remembered_is_task_input = False
-        if remembered_is_task_input:
-            candidate = remembered_path
-        else:
-            candidate = input_dir / normalized_file_name
-            suffix_idx = 1
-            stem, ext = candidate.stem, candidate.suffix
-            while candidate.exists() or candidate.is_symlink():
-                try:
-                    if candidate.resolve() == source_path.resolve():
-                        break
-                except OSError:
-                    pass
-                candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
-                suffix_idx += 1
+        if candidate is None:
+            if remembered_is_task_input:
+                candidate = remembered_path
+            else:
+                candidate = input_dir / normalized_file_name
+                suffix_idx = 1
+                stem, ext = candidate.stem, candidate.suffix
+                while candidate.exists() or candidate.is_symlink():
+                    try:
+                        if candidate.resolve() == source_path.resolve():
+                            break
+                    except OSError:
+                        pass
+                    candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                    suffix_idx += 1
 
+        copied_candidate = False
+        if reused_candidate:
+            # ``resolve_file_id`` returned this task workspace's existing
+            # binding. It is already registered and permission-prepared; a
+            # second bind would only reopen a sandbox-writable pathname and
+            # create an avoidable check/use race.
+            file_info["workspace_path"] = str(candidate)
+            logger.info(
+                "Reused agent workspace file binding: file_id=%s input_path=%s",
+                file_id,
+                candidate,
+            )
+            continue
         try:
             _copy_durable_input_to_workspace(
                 source_path,
                 candidate,
                 mode=copy_mode,
             )
+            copied_candidate = True
         except (OSError, ValueError):
             if not source_path.exists():
                 logger.warning(
@@ -5639,14 +5675,15 @@ def _register_uploaded_files_for_agent(
                 file_id=file_id,
             )
         except BaseException:
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                logger.warning(
-                    "Failed to remove unbound durable workspace input %s",
-                    candidate,
-                    exc_info=True,
-                )
+            if copied_candidate:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove unbound durable workspace input %s",
+                        candidate,
+                        exc_info=True,
+                    )
             raise
         file_info["workspace_path"] = str(candidate)
         logger.info(

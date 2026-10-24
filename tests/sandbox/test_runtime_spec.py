@@ -132,7 +132,7 @@ def test_workspace_access_fails_closed_when_gid_cannot_be_assigned(
         raise PermissionError("not permitted")
 
     monkeypatch.setattr("xagent.sandbox.base.os.fchown", refuse_chown)
-    with pytest.raises(SandboxContractError, match="root or CAP_CHOWN"):
+    with pytest.raises(SandboxContractError, match="run as root"):
         grant_sandbox_runtime_access(workspace, trusted_root=tmp_path)
     assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
 

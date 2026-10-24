@@ -625,6 +625,7 @@ def _write_tar_from_local_path(
             raise ValueError("Sandbox uploads require a regular local file")
         info = tarfile.TarInfo(name=arcname)
         info.size = source_stat.st_size
+        info.mtime = int(source_stat.st_mtime)
         info.uid = SANDBOX_RUNTIME_UID
         info.gid = SANDBOX_RUNTIME_GID
         info.mode = stat.S_IMODE(source_stat.st_mode) & 0o755
@@ -1853,6 +1854,23 @@ class DockerSandboxService(SandboxService):
 
     def validate_host_workspace_access(self) -> None:
         """Exercise the ownership operations required by writable bind mounts."""
+        if os.geteuid() != 0:
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox workspace preparation requires the Xagent "
+                "backend process to run as root."
+            )
+        try:
+            daemon_info = self._client.info()
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                "Cannot inspect the Docker daemon security mode."
+            ) from exc
+        security_options = daemon_info.get("SecurityOptions", ())
+        if any("rootless" in str(option).lower() for option in security_options):
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox writable mounts require a rootful Docker daemon; "
+                "rootless Docker is not supported."
+            )
         uploads_root = get_uploads_dir().expanduser()
         uploads_root.mkdir(parents=True, exist_ok=True)
         probe = Path(
@@ -1867,8 +1885,7 @@ class DockerSandboxService(SandboxService):
         except OSError as exc:
             raise SandboxRuntimeConflictError(
                 "Docker sandbox workspace preparation requires the backend "
-                f"to assign gid {SANDBOX_RUNTIME_GID}. Run it as root, grant "
-                "CAP_CHOWN, or place it in that supplementary group."
+                f"to run as root and assign gid {SANDBOX_RUNTIME_GID}."
             ) from exc
         finally:
             if probe_fd >= 0:

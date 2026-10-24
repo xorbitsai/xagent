@@ -39,8 +39,8 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
 
     Every path component is opened relative to its parent with ``O_NOFOLLOW``
     before the final directory is changed through its file descriptor.  The
-    backend must therefore run as root or with CAP_CHOWN; failure is explicit
-    and never falls back to world-writable permissions.
+    backend must therefore run as root; failure is explicit and never falls
+    back to world-writable permissions.
     """
     # Deployment roots may legitimately sit behind an operator-controlled
     # symlink (for example /data -> /mnt/data). Resolve only that immutable
@@ -77,6 +77,16 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
                 except FileExistsError:
                     pass
                 next_fd = os.open(component, flags, dir_fd=current_fd)
+                try:
+                    os.fchown(next_fd, -1, SANDBOX_RUNTIME_GID)
+                    os.fchmod(next_fd, 0o2750)
+                except PermissionError as exc:
+                    os.close(next_fd)
+                    raise SandboxContractError(
+                        "Docker workspace preparation requires the backend "
+                        "to run as root and assign gid "
+                        f"{SANDBOX_RUNTIME_GID}: {root}"
+                    ) from exc
                 os.close(current_fd)
                 current_fd = next_fd
         except OSError as exc:
@@ -86,14 +96,8 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
         root_stat = os.fstat(current_fd)
         if not stat.S_ISDIR(root_stat.st_mode):
             raise NotADirectoryError(str(root))
-        try:
-            os.fchown(current_fd, -1, SANDBOX_RUNTIME_GID)
-            os.fchmod(current_fd, 0o2750)
-        except PermissionError as exc:
-            raise SandboxContractError(
-                "Docker workspace preparation requires root or CAP_CHOWN "
-                f"to assign gid {SANDBOX_RUNTIME_GID}: {root}"
-            ) from exc
+        if not relative_parts:
+            return
     finally:
         os.close(current_fd)
 

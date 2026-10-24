@@ -190,6 +190,7 @@ class TaskWorkspace:
         db_task_id: Optional[int] = None,
         scope_segments: Sequence[str] = (),
         durable_storage_segments: Sequence[str] | None = None,
+        migrate_sandbox_permissions: bool = True,
     ):
         self.id = id
         self.db_task_id = db_task_id
@@ -222,6 +223,7 @@ class TaskWorkspace:
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
+        self._migrate_sandbox_permissions = migrate_sandbox_permissions
         # Server-derived rollout policy for File Operation. ``None`` means the
         # exact upstream legacy path and therefore requires no policy query.
         # Public runtime construction sets version 1 only after loading a
@@ -266,6 +268,7 @@ class TaskWorkspace:
         """Restore a fresh registration owner in the receiving process."""
 
         self.__dict__.update(state)
+        self.__dict__.setdefault("_migrate_sandbox_permissions", True)
         self._registration_lock = RLock()
 
     @property
@@ -802,10 +805,8 @@ class TaskWorkspace:
         if root_stat.st_gid != 1010 or not root_stat.st_mode & stat.S_ISGID:
             return
         try:
-            relative = registration.path.resolve(strict=True).relative_to(
-                workspace_root
-            )
-        except (OSError, RuntimeError, ValueError):
+            relative = registration.path.absolute().relative_to(workspace_root)
+        except ValueError:
             return
 
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
@@ -813,20 +814,35 @@ class TaskWorkspace:
         try:
             for index, component in enumerate(relative.parts):
                 is_last = index == len(relative.parts) - 1
+                try:
+                    component_stat = os.stat(
+                        component, dir_fd=current_fd, follow_symlinks=False
+                    )
+                except OSError:
+                    return
+                is_directory = stat.S_ISDIR(component_stat.st_mode)
+                is_regular = stat.S_ISREG(component_stat.st_mode)
+                if not is_directory and not is_regular:
+                    return
+                if is_last and is_regular and component_stat.st_nlink > 1:
+                    return
                 flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
                 if not is_last:
                     flags |= os.O_DIRECTORY
-                next_fd = os.open(component, flags, dir_fd=current_fd)
-                if current_fd != -1:
-                    os.close(current_fd)
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except OSError:
+                    return
+                os.close(current_fd)
                 current_fd = next_fd
                 entry_stat = os.fstat(current_fd)
-                is_directory = stat.S_ISDIR(entry_stat.st_mode)
-                if not is_directory and not stat.S_ISREG(entry_stat.st_mode):
+                if (
+                    entry_stat.st_dev != component_stat.st_dev
+                    or entry_stat.st_ino != component_stat.st_ino
+                ):
                     return
-                # CAP_CHOWN is sufficient to transfer sandbox-created output
-                # back to the backend uid. Once it owns the entry, the backend
-                # does not also need CAP_FOWNER for the mode repair below.
+                # The root-running backend transfers sandbox-created output
+                # back to its own uid before repairing the mode below.
                 os.fchown(current_fd, os.geteuid(), 1010)
                 os.fchmod(
                     current_fd,
@@ -1891,13 +1907,10 @@ class TaskWorkspace:
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
 
-        parent = self.workspace_dir.parent.absolute()
-        parent_fd = os.open(os.path.sep, flags)
+        parent = self.workspace_dir.parent.resolve()
+        parent_open_flags = flags | getattr(os, "O_PATH", 0)
+        parent_fd = os.open(parent, parent_open_flags)
         try:
-            for component in parent.parts[1:]:
-                next_fd = os.open(component, flags, dir_fd=parent_fd)
-                os.close(parent_fd)
-                parent_fd = next_fd
             try:
                 os.mkdir(self.workspace_dir.name, mode=0o770, dir_fd=parent_fd)
             except FileExistsError:
@@ -1934,9 +1947,10 @@ class TaskWorkspace:
                     os.close(internal_fd)
             finally:
                 os.close(temp_fd)
-            self._migrate_existing_sandbox_permissions(
-                workspace_fd, flags, force=repaired_parent_chain
-            )
+            if self._migrate_sandbox_permissions:
+                self._migrate_existing_sandbox_permissions(
+                    workspace_fd, flags, force=repaired_parent_chain
+                )
         finally:
             os.close(workspace_fd)
 
@@ -1977,12 +1991,22 @@ class TaskWorkspace:
             finally:
                 os.close(marker_fd)
 
+        migration_succeeded = True
         for directory_name in ("input", "output", "temp"):
             directory_fd = os.open(directory_name, directory_flags, dir_fd=workspace_fd)
             try:
-                self._migrate_sandbox_tree(directory_fd)
+                migration_succeeded = (
+                    self._migrate_sandbox_tree(directory_fd) and migration_succeeded
+                )
             finally:
                 os.close(directory_fd)
+
+        if not migration_succeeded:
+            logger.warning(
+                "Sandbox permission migration remains incomplete for workspace %s",
+                self.workspace_dir,
+            )
+            return
 
         try:
             os.unlink(_SANDBOX_PERMISSION_MIGRATION_MARKER, dir_fd=workspace_fd)
@@ -2000,70 +2024,77 @@ class TaskWorkspace:
             return
         os.close(marker_fd)
 
-    def _migrate_sandbox_tree(self, directory_fd: int) -> None:
-        try:
-            names = os.listdir(directory_fd)
-        except OSError:
-            logger.warning(
-                "Failed to list a legacy sandbox workspace directory",
-                exc_info=True,
-            )
-            return
-        for name in names:
+    def _migrate_sandbox_tree(self, directory_fd: int) -> bool:
+        """Repair a tree iteratively and report whether every entry succeeded."""
+        succeeded = True
+        pending = [os.dup(directory_fd)]
+        while pending:
+            current_fd = pending.pop()
             try:
-                entry_stat = os.stat(
-                    name,
-                    dir_fd=directory_fd,
-                    follow_symlinks=False,
-                )
-            except OSError:
-                continue
-            is_directory = stat.S_ISDIR(entry_stat.st_mode)
-            is_regular = stat.S_ISREG(entry_stat.st_mode)
-            if not is_directory and not is_regular:
-                continue
-            if is_regular and entry_stat.st_nlink > 1:
-                continue
-            flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
-            if is_directory:
-                flags |= os.O_DIRECTORY
-            try:
-                entry_fd = os.open(
-                    name,
-                    flags,
-                    dir_fd=directory_fd,
-                )
-            except OSError:
-                # Symlinks and concurrently removed entries are never followed.
-                continue
-            try:
-                opened_stat = os.fstat(entry_fd)
-                if (
-                    opened_stat.st_dev != entry_stat.st_dev
-                    or opened_stat.st_ino != entry_stat.st_ino
-                ):
-                    continue
                 try:
-                    # CAP_CHOWN is enough: transfer ownership to the backend
-                    # euid before chmod so CAP_FOWNER is not also required.
-                    os.fchown(entry_fd, os.geteuid(), 1010)
-                    os.fchmod(
-                        entry_fd,
-                        self._sandbox_compatible_mode(
-                            opened_stat.st_mode, directory=is_directory
-                        ),
-                    )
+                    names = os.listdir(current_fd)
                 except OSError:
                     logger.warning(
-                        "Failed to migrate sandbox workspace entry %s",
-                        name,
+                        "Failed to list a legacy sandbox workspace directory",
                         exc_info=True,
                     )
+                    succeeded = False
                     continue
-                if is_directory:
-                    self._migrate_sandbox_tree(entry_fd)
+                for name in names:
+                    try:
+                        entry_stat = os.stat(
+                            name,
+                            dir_fd=current_fd,
+                            follow_symlinks=False,
+                        )
+                    except OSError:
+                        succeeded = False
+                        continue
+                    is_directory = stat.S_ISDIR(entry_stat.st_mode)
+                    is_regular = stat.S_ISREG(entry_stat.st_mode)
+                    if not is_directory and not is_regular:
+                        continue
+                    if is_regular and entry_stat.st_nlink > 1:
+                        continue
+                    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+                    if is_directory:
+                        flags |= os.O_DIRECTORY
+                    try:
+                        entry_fd = os.open(name, flags, dir_fd=current_fd)
+                    except OSError:
+                        succeeded = False
+                        continue
+                    try:
+                        opened_stat = os.fstat(entry_fd)
+                        if (
+                            opened_stat.st_dev != entry_stat.st_dev
+                            or opened_stat.st_ino != entry_stat.st_ino
+                        ):
+                            succeeded = False
+                            continue
+                        try:
+                            os.fchown(entry_fd, os.geteuid(), 1010)
+                            os.fchmod(
+                                entry_fd,
+                                self._sandbox_compatible_mode(
+                                    opened_stat.st_mode, directory=is_directory
+                                ),
+                            )
+                        except OSError:
+                            logger.warning(
+                                "Failed to migrate sandbox workspace entry %s",
+                                name,
+                                exc_info=True,
+                            )
+                            succeeded = False
+                            continue
+                        if is_directory:
+                            pending.append(os.dup(entry_fd))
+                    finally:
+                        os.close(entry_fd)
             finally:
-                os.close(entry_fd)
+                os.close(current_fd)
+        return succeeded
 
     def _warn_if_reserved_output_name_is_taken(self) -> None:
         """Log once per process and workspace that the reserved output name is taken."""

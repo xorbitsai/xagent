@@ -117,3 +117,60 @@ def test_registered_output_is_transferred_to_backend_uid(workspace, monkeypatch)
     workspace._grant_registered_path_sandbox_access(registration)
 
     assert chowns[-1] == (os.geteuid(), 1010)
+
+
+def test_permission_marker_is_hidden_from_workspace_listing(workspace):
+    marker = workspace.workspace_dir / ".xagent-permissions-v2"
+    marker.write_text("", encoding="utf-8")
+
+    listed = workspace.get_all_files()
+
+    assert all(
+        item["filename"] != marker.name
+        for entries in listed.values()
+        for item in entries
+    )
+
+
+def test_permission_migration_continues_after_one_entry_fails(workspace, monkeypatch):
+    blocked = workspace.output_dir / "blocked.txt"
+    blocked.write_text("blocked", encoding="utf-8")
+    healthy = workspace.output_dir / "healthy.txt"
+    healthy.write_text("healthy", encoding="utf-8")
+    blocked_inode = blocked.stat().st_ino
+    real_fchmod = os.fchmod
+
+    def selective_fchmod(fd: int, mode: int) -> None:
+        if os.fstat(fd).st_ino == blocked_inode:
+            raise PermissionError("legacy inode is restricted")
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
+    monkeypatch.setattr(workspace_module.os, "fchmod", selective_fchmod)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    workspace_fd = os.open(workspace.workspace_dir, flags)
+    try:
+        workspace._migrate_existing_sandbox_permissions(workspace_fd, flags)
+    finally:
+        os.close(workspace_fd)
+
+    assert stat.S_IMODE(healthy.stat().st_mode) == 0o660
+    assert (workspace.workspace_dir / ".xagent-permissions-v2").is_file()
+
+
+def test_permission_migration_skips_hardlinked_files(workspace, monkeypatch):
+    source = workspace.output_dir / "source.txt"
+    source.write_text("shared", encoding="utf-8")
+    linked = workspace.output_dir / "linked.txt"
+    os.link(source, linked)
+    source.chmod(0o600)
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    workspace_fd = os.open(workspace.workspace_dir, flags)
+    try:
+        workspace._migrate_existing_sandbox_permissions(workspace_fd, flags)
+    finally:
+        os.close(workspace_fd)
+
+    assert stat.S_IMODE(source.stat().st_mode) == 0o600

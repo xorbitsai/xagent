@@ -19,6 +19,7 @@ import textwrap
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -35,10 +36,12 @@ from ..config import (
     get_sandbox_image,
     get_sandbox_namespace,
     get_sandbox_pids_limit,
+    get_uploads_dir,
     validate_sandbox_namespace,
 )
 from .base import (
     SANDBOX_RUNTIME_GID,
+    SANDBOX_RUNTIME_UID,
     SPEC_CONTRACT_VERSION,
     CodeType,
     ExecResult,
@@ -314,7 +317,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
             type="image", image=str(config_data.get("Image") or "")
         )
     raw_pids_limit = cast(Optional[int], host_config.get("PidsLimit"))
-    pids_limit = raw_pids_limit if raw_pids_limit and raw_pids_limit > 0 else None
+    pids_limit = raw_pids_limit if raw_pids_limit and raw_pids_limit >= 64 else None
     config = SandboxConfig(
         working_dir=str(config_data.get("WorkingDir") or "/home/sandbox"),
         cpus=max(1, cpus),
@@ -622,9 +625,9 @@ def _write_tar_from_local_path(
             raise ValueError("Sandbox uploads require a regular local file")
         info = tarfile.TarInfo(name=arcname)
         info.size = source_stat.st_size
-        info.uid = 1100
-        info.gid = 1010
-        info.mode = 0o600
+        info.uid = SANDBOX_RUNTIME_UID
+        info.gid = SANDBOX_RUNTIME_GID
+        info.mode = stat.S_IMODE(source_stat.st_mode) & 0o755
         with os.fdopen(source_fd, "rb", closefd=True) as source:
             source_fd = -1
             with tarfile.open(fileobj=file_obj, mode="w") as tar:
@@ -646,8 +649,8 @@ def _write_tar_from_content(
     data = content.encode("utf-8")
     info = tarfile.TarInfo(name=arcname)
     info.size = len(data)
-    info.uid = 1100
-    info.gid = 1010
+    info.uid = SANDBOX_RUNTIME_UID
+    info.gid = SANDBOX_RUNTIME_GID
     info.mode = mode
     with tarfile.open(fileobj=file_obj, mode="w") as tar:
         tar.addfile(info, io.BytesIO(data))
@@ -1145,7 +1148,7 @@ async def _create_container(
         "detach": True,
         # Match Dockerfile.sandbox's dedicated runtime identity. Never let
         # user code or custom stdio MCP processes inherit container root.
-        "user": "1100:1010",
+        "user": f"{SANDBOX_RUNTIME_UID}:{SANDBOX_RUNTIME_GID}",
         "working_dir": config.working_dir,
         "environment": config.env,
         "volumes": volumes,
@@ -1847,6 +1850,30 @@ class DockerSandboxService(SandboxService):
 
     def host_workspace_gid(self) -> int | None:
         return SANDBOX_RUNTIME_GID
+
+    def validate_host_workspace_access(self) -> None:
+        """Exercise the ownership operations required by writable bind mounts."""
+        uploads_root = get_uploads_dir().expanduser()
+        uploads_root.mkdir(parents=True, exist_ok=True)
+        probe = Path(
+            tempfile.mkdtemp(prefix=".xagent-sandbox-ready-", dir=uploads_root)
+        )
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        probe_fd = -1
+        try:
+            probe_fd = os.open(probe, flags)
+            os.fchown(probe_fd, os.geteuid(), SANDBOX_RUNTIME_GID)
+            os.fchmod(probe_fd, 0o2750)
+        except OSError as exc:
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox workspace preparation requires the backend "
+                f"to assign gid {SANDBOX_RUNTIME_GID}. Run it as root, grant "
+                "CAP_CHOWN, or place it in that supplementary group."
+            ) from exc
+        finally:
+            if probe_fd >= 0:
+                os.close(probe_fd)
+            shutil.rmtree(probe, ignore_errors=True)
 
     def runtime_security_profile(self) -> str | None:
         # Docker currently provides non-root/capability hardening but relies

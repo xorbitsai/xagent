@@ -256,6 +256,31 @@ class TestReconcileMatrixUnverified:
         service.create.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_v1_store_row_without_hardening_fields_rebuilds(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        template, config = desired.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped", spec=desired, fingerprint_label=None, version_label=None
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1",
+            state="stopped",
+            template=template,
+            config=config.model_copy(
+                update={"pids_limit": None, "security_profile": None}
+            ),
+        )
+
+        await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_unverified_with_no_store_row_rebuilds(self, _env, tmp_path) -> None:
         manager, service = _make_manager()
         intent = _intent(tmp_path)
@@ -873,8 +898,45 @@ class TestProviderCacheMountIntentGate:
             prepare_root=str(prepare_root),
         )
 
-        assert grants[0][0] == mount_root
-        assert grants[1] == (prepare_root, mount_root)
+        assert grants == [(prepare_root, mount_root)]
+
+    @pytest.mark.asyncio
+    async def test_reused_container_still_prepares_managed_mount(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        grants: list[tuple[Path, Path]] = []
+
+        def record_grant(path: Path, *, trusted_root: Path) -> None:
+            grants.append((path, trusted_root))
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        intent = _intent(tmp_path, "mount-root")
+        prepare_root = tmp_path / "mount-root" / "task"
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        template, config = desired.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=desired,
+            fingerprint_label=desired.fingerprint(),
+            version_label=str(SPEC_CONTRACT_VERSION),
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1", state="stopped", template=template, config=config
+        )
+
+        await manager.get_or_create_lease_provider(
+            "user",
+            "1",
+            mount_intent=intent,
+            prepare_root=str(prepare_root),
+        )
+
+        assert grants == [(prepare_root, tmp_path / "mount-root")]
+        service.start_existing.assert_awaited_once_with("user::1")
 
 
 class TestReadinessReservedUploadsSubtree:

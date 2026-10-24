@@ -963,7 +963,7 @@ async def test_ssh_sandbox_lease_capacity_fails_closed(monkeypatch) -> None:
     assert exc.value.code == SshErrorCode.SANDBOX_UNAVAILABLE
 
 
-async def test_create_ssh_tools_are_available_on_boxlite_backend(monkeypatch) -> None:
+async def test_create_ssh_tools_are_disabled_on_boxlite_backend(monkeypatch) -> None:
     import xagent.web.sandbox_manager as sm
     from xagent.core.tools.adapters.vibe import ssh_tools
     from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
@@ -981,12 +981,7 @@ async def test_create_ssh_tools_are_available_on_boxlite_backend(monkeypatch) ->
     )
     try:
         tools = await ssh_tools.create_ssh_tools(config)
-        assert {tool.name for tool in tools} == {
-            "ssh_list_targets",
-            "ssh_execute",
-            "ssh_upload",
-            "ssh_download",
-        }
+        assert tools == []
     finally:
         set_ssh_target_provider_hook(None)
 

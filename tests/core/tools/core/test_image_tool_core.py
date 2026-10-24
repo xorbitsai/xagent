@@ -674,7 +674,7 @@ class TestImageGenerationToolCore:
         assert result["success"] is True
         workspace.stage_path_for_external_upload.assert_called_once_with(
             "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
-            max_bytes=64 * 1024 * 1024,
+            max_bytes=100 * 1024 * 1024,
             host_private=True,
         )
         workspace.stage_file_for_external_upload.assert_not_called()
@@ -762,7 +762,7 @@ class TestImageGenerationToolCore:
 
         workspace.stage_path_for_external_upload.assert_called_once_with(
             "/etc/passwd",
-            max_bytes=64 * 1024 * 1024,
+            max_bytes=100 * 1024 * 1024,
             host_private=True,
         )
         workspace.stage_file_for_external_upload.assert_not_called()

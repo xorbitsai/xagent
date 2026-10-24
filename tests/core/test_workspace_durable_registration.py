@@ -1641,3 +1641,24 @@ def test_registered_file_id_rejects_symlink_swap_outside_workspace(tmp_path):
     assert workspace.resolve_file_id("file-id") is None
     with pytest.raises(FileNotFoundError, match="File not found"):
         workspace.stage_file_for_external_upload("file-id")
+
+
+def test_registered_file_id_rejects_parent_directory_symlink_swap(tmp_path):
+    base_dir = tmp_path / "workspaces"
+    workspace = TaskWorkspace(id="task_swap_parent", base_dir=str(base_dir))
+    registered = workspace.output_dir / "report.txt"
+    registered.write_text("safe", encoding="utf-8")
+    workspace._file_id_to_path["file-id"] = registered
+
+    attacker_workspace = TaskWorkspace(id="other_task", base_dir=str(base_dir))
+    attacker_file = attacker_workspace.output_dir / registered.name
+    attacker_file.write_text("secret", encoding="utf-8")
+    original_output = workspace.workspace_dir / "original-output"
+    workspace.output_dir.rename(original_output)
+    workspace.output_dir.symlink_to(
+        attacker_workspace.output_dir, target_is_directory=True
+    )
+
+    assert workspace.resolve_file_id("file-id") is None
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        workspace.stage_file_for_external_upload("file-id")

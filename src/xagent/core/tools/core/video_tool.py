@@ -20,7 +20,7 @@ from urllib.request import url2pathname
 
 from pydantic import Field
 
-from ....config import get_media_download_max_bytes
+from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
@@ -449,7 +449,7 @@ The generated video URL is temporary on the provider side, so completed videos a
         def stage_image_reference() -> Path:
             return workspace.stage_path_for_external_upload(
                 ref_for_resolution,
-                max_bytes=get_media_download_max_bytes("image"),
+                max_bytes=get_max_upload_size_bytes(),
                 host_private=True,
             )
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib import parse
 
-from ....config import get_media_download_max_bytes
+from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, parse_file_id_ref
 from ...model.image.base import BaseImageModel
 from ...utils.media_download import (
@@ -543,7 +543,7 @@ Images are automatically saved to workspace.
         try:
             staged_path = self._workspace.stage_path_for_external_upload(
                 image_input,
-                max_bytes=get_media_download_max_bytes("image"),
+                max_bytes=get_max_upload_size_bytes(),
                 host_private=True,
             )
         except ExternalUploadStagingError:
@@ -558,7 +558,7 @@ Images are automatically saved to workspace.
                 ) from path_error
             staged_path = self._workspace.stage_file_for_external_upload(
                 file_id,
-                max_bytes=get_media_download_max_bytes("image"),
+                max_bytes=get_max_upload_size_bytes(),
                 host_private=True,
             )
         staged_paths.append(staged_path)

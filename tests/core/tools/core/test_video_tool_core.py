@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from xagent.config import get_media_download_max_bytes
+from xagent.config import get_max_upload_size_bytes
 from xagent.core.model.video.ark import ArkVideoModel
 from xagent.core.model.video.base import BaseVideoModel
 from xagent.core.model.video.xinference import XinferenceVideoModel
@@ -241,7 +241,7 @@ async def test_generate_video_converts_workspace_image_ref_to_data_url_for_ark(
     assert base64.b64decode(encoded) == b"image bytes"
     mock_workspace.stage_path_for_external_upload.assert_called_once_with(
         "file:image-file-id",
-        max_bytes=get_media_download_max_bytes("image"),
+        max_bytes=get_max_upload_size_bytes(),
         host_private=True,
     )
     mock_workspace.discard_staged_external_upload.assert_called_once_with(image_path)

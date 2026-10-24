@@ -386,21 +386,8 @@ class TaskWorkspace:
         source = self.resolve_file_id_detached(file_id)
         if source is None:
             raise FileNotFoundError(f"File not found: {file_id}")
-        raw_source = Path(source)
-        if raw_source.is_symlink():
-            raise FileNotFoundError(f"File not found: {file_id}")
-        try:
-            source = raw_source.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            # Python 3.11/3.12 raise RuntimeError for symlink loops. Treat
-            # both that case and a disappearing source as an unavailable file.
-            raise FileNotFoundError(f"File not found: {file_id}") from exc
-        if not source.is_file() or not self._file_operation_path_in_authorized_storage(
-            source
-        ):
-            raise FileNotFoundError(f"File not found: {file_id}")
         return self._stage_authorized_source(
-            source,
+            Path(source),
             file_id,
             max_bytes=max_bytes,
             host_private=host_private,
@@ -432,6 +419,14 @@ class TaskWorkspace:
             os.close(file_fd)
             raise FileNotFoundError(f"File not found: {selector}")
         return file_fd
+
+    @classmethod
+    def _validate_regular_file_nofollow(cls, source: Path, selector: str) -> Path:
+        """Validate a lexical file capability without following any symlink."""
+        absolute = source.absolute()
+        file_fd = cls._open_regular_file_nofollow(absolute, selector)
+        os.close(file_fd)
+        return absolute
 
     def _stage_authorized_source(
         self,
@@ -488,7 +483,10 @@ class TaskWorkspace:
         source = Path(self.resolve_path_with_search(file_path, detached_file_ids=True))
         if source.is_symlink():
             raise FileNotFoundError(f"File not found: {file_path}")
-        source = source.resolve(strict=True)
+        try:
+            source = source.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise FileNotFoundError(f"File not found: {file_path}") from exc
         if not source.is_absolute():
             raise FileNotFoundError(f"File not found: {file_path}")
         return self._stage_authorized_source(
@@ -510,7 +508,10 @@ class TaskWorkspace:
         raw_source = Path(source)
         if raw_source.is_symlink():
             raise FileNotFoundError(f"File not found: {selector}")
-        resolved = raw_source.resolve(strict=True)
+        try:
+            resolved = raw_source.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise FileNotFoundError(f"File not found: {selector}") from exc
         if not resolved.is_absolute():
             raise FileNotFoundError(f"File not found: {selector}")
         return self._stage_authorized_source(
@@ -532,18 +533,20 @@ class TaskWorkspace:
         except RuntimeError:
             # A symlink loop must not escape cleanup's confined-path check.
             candidate = Path(file_path)
-        staging_roots = [self.external_upload_staging_root()]
         private_root = self._host_external_upload_staging_root
-        if private_root is not None:
-            staging_roots.append(private_root)
-        staging_root = next(
-            (
-                root
-                for root in staging_roots
-                if candidate != root and candidate.is_relative_to(root)
-            ),
-            None,
-        )
+        staging_root = None
+        if private_root is not None and candidate != private_root:
+            if candidate.is_relative_to(private_root):
+                staging_root = private_root
+        if staging_root is None:
+            try:
+                sandbox_root = self.external_upload_staging_root()
+            except ExternalUploadStagingError as exc:
+                raise ValueError(
+                    "staged upload path is outside the task staging area"
+                ) from exc
+            if candidate != sandbox_root and candidate.is_relative_to(sandbox_root):
+                staging_root = sandbox_root
         if staging_root is None:
             raise ValueError("staged upload path is outside the task staging area")
         try:
@@ -1692,24 +1695,35 @@ class TaskWorkspace:
         with self._registration_lock:
             cached_path = self._file_id_to_path.get(file_id)
         if cached_path is not None:
-            if cached_path.is_symlink():
-                resolved_cached_path = None
-            else:
+            try:
+                resolved_cached_path = cached_path.resolve(strict=True)
                 try:
-                    resolved_cached_path = cached_path.resolve(strict=True)
-                except (OSError, RuntimeError):
-                    resolved_cached_path = None
-            if (
-                resolved_cached_path is not None
-                and resolved_cached_path.is_file()
-                and self._file_operation_path_in_authorized_storage(
-                    resolved_cached_path
-                )
+                    cached_path = self._validate_regular_file_nofollow(
+                        cached_path, file_id
+                    )
+                except FileNotFoundError:
+                    # A configured external root may itself be an
+                    # operator-controlled symlink. Its canonical target was
+                    # frozen when the workspace was constructed; only that
+                    # trusted-prefix case may retry with the canonical path.
+                    if not any(
+                        resolved_cached_path == root
+                        or resolved_cached_path.is_relative_to(root)
+                        for root in self.allowed_external_dirs
+                    ):
+                        raise
+                    cached_path = self._validate_regular_file_nofollow(
+                        resolved_cached_path, file_id
+                    )
+            except (FileNotFoundError, OSError, RuntimeError):
+                resolved_cached_path = None
+            if resolved_cached_path is not None and (
+                self._file_operation_path_in_authorized_storage(resolved_cached_path)
             ):
                 logger.debug(
                     f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
                 )
-                return resolved_cached_path
+                return cached_path
             else:
                 logger.warning(
                     f"resolve_file_id: Cached path doesn't exist: {cached_path}"
@@ -1762,30 +1776,16 @@ class TaskWorkspace:
                 )
                 if record and record.storage_path:
                     raw_path = Path(record.storage_path)
-                    if raw_path.is_symlink():
-                        resolved_path = raw_path
-                    else:
-                        try:
-                            resolved_path = raw_path.resolve(strict=True)
-                        except (OSError, RuntimeError):
-                            resolved_path = raw_path
-                    if (
-                        not raw_path.is_symlink()
-                        and resolved_path.exists()
-                        and resolved_path.is_file()
-                        and self._file_operation_path_in_authorized_storage(
-                            resolved_path
+                    if not self._file_record_allowed_for_workspace(record, raw_path):
+                        logger.warning(
+                            "Rejected file_id outside workspace scope: %s",
+                            file_id,
                         )
-                    ):
-                        if not self._file_record_allowed_for_workspace(
-                            record, resolved_path
-                        ):
-                            logger.warning(
-                                "Rejected file_id outside workspace scope: %s",
-                                file_id,
-                            )
-                            return None
-                        return resolved_path
+                        return None
+                    try:
+                        return self._validate_regular_file_nofollow(raw_path, file_id)
+                    except FileNotFoundError:
+                        pass
                 if (
                     record
                     and getattr(record, "storage_key", None)
@@ -1799,16 +1799,12 @@ class TaskWorkspace:
                         return None
                     from ..web.services.managed_file_ref import ManagedFileRef
 
-                    materialized = (
-                        ManagedFileRef(record).materialize().resolve(strict=True)
-                    )
-                    if (
-                        materialized.is_file()
-                        and self._file_operation_path_in_authorized_storage(
-                            materialized
+                    raw_materialized = ManagedFileRef(record).materialize()
+                    materialized = raw_materialized.resolve(strict=True)
+                    if self._file_operation_path_in_authorized_storage(materialized):
+                        return self._validate_regular_file_nofollow(
+                            raw_materialized, file_id
                         )
-                    ):
-                        return materialized
                     logger.warning(
                         "Rejected materialized file_id outside authorized storage: %s",
                         file_id,
@@ -1864,23 +1860,23 @@ class TaskWorkspace:
 
         storage_path = getattr(record, "storage_path", None)
         if storage_path:
-            local_path = Path(str(storage_path)).resolve()
-            if (
-                local_path.exists()
-                and local_path.is_file()
-                and self._file_operation_path_in_authorized_storage(local_path)
-            ):
-                return local_path
+            try:
+                local_path = self._validate_regular_file_nofollow(
+                    Path(str(storage_path)), str(getattr(record, "file_id", "file"))
+                )
+                if self._file_operation_path_in_authorized_storage(local_path):
+                    return local_path
+            except FileNotFoundError:
+                pass
         if storage_key and storage_status == "available":
             from ..web.services.managed_file_ref import ManagedFileRef
 
-            materialized = ManagedFileRef(record).materialize().resolve()
-            if (
-                materialized.exists()
-                and materialized.is_file()
-                and self._file_operation_path_in_authorized_storage(materialized)
-            ):
-                return materialized
+            raw_materialized = ManagedFileRef(record).materialize()
+            materialized = raw_materialized.resolve(strict=True)
+            if self._file_operation_path_in_authorized_storage(materialized):
+                return self._validate_regular_file_nofollow(
+                    raw_materialized, str(getattr(record, "file_id", "file"))
+                )
         return None
 
     def resolve_file_operation_path(self, file_path: str) -> Path:

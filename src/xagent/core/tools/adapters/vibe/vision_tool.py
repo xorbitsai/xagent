@@ -5,12 +5,11 @@ Framework wrapper around the pure vision core
 
 import asyncio
 import logging
-import mimetypes
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Union
 
-from xagent.config import get_media_download_max_bytes
+from xagent.config import get_max_upload_size_bytes
 from xagent.core.workspace import ExternalUploadSizeLimitError, TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
@@ -80,14 +79,10 @@ class VisionTool:
         source = Path(source)
         if not source.is_absolute():
             raise FileNotFoundError(f"File not found: {media_path}")
-        mime_type = mimetypes.guess_type(str(source))[0] or ""
-        media_kind: Literal["image", "video"] = (
-            "video" if mime_type.startswith("video/") else "image"
-        )
         return self.workspace.stage_resolved_path_for_external_upload(
             source,
             media_path,
-            max_bytes=get_media_download_max_bytes(media_kind),
+            max_bytes=get_max_upload_size_bytes(),
             host_private=True,
         )
 

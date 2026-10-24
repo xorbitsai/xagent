@@ -1262,6 +1262,14 @@ class TaskWorkspace:
         normalized_file_id = str(file_id).strip()
         if not normalized_file_id:
             raise ValueError("file_id is required for an already durable file")
+        try:
+            self._grant_registered_path_sandbox_access(registration)
+        except OSError:
+            logger.warning(
+                "Failed to grant sandbox access to durable workspace input %s",
+                registration.path,
+                exc_info=True,
+            )
         with self._registration_lock:
             self._remember_file_registration(normalized_file_id, registration.path)
         return normalized_file_id

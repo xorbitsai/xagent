@@ -1974,6 +1974,8 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
         task_id=10,
         filename="valid file.txt",
     )
+    source_path = Path(upload.storage_path)
+    source_path.chmod(0o600)
 
     class Workspace:
         def __init__(self):
@@ -1981,7 +1983,7 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
             self.registered_files = []
 
         def describe_file_registration(self, path):
-            return SimpleNamespace(path=Path(path))
+            return SimpleNamespace(path=Path(path), is_workspace_file=True)
 
         def bind_already_durable_file(self, registration, *, file_id):
             self.registered_files.append((registration.path, file_id))
@@ -2000,7 +2002,13 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     )
 
     assert [item[1] for item in workspace.registered_files] == ["valid-file"]
-    assert file_info["workspace_path"]
+    staged_path = Path(file_info["workspace_path"])
+    assert staged_path.parent == Path(workspace.input_dir)
+    assert staged_path.is_file()
+    assert not staged_path.is_symlink()
+    assert staged_path.read_text(encoding="utf-8") == "file content"
+    assert workspace.registered_files[0][0] == staged_path
+    assert file_info["path"] == str(source_path)
 
 
 def test_get_display_user_message_reads_agent_context_state():

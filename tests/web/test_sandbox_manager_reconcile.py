@@ -945,6 +945,40 @@ class TestProviderCacheMountIntentGate:
             assert stat.S_IMODE(path.stat().st_mode) & 0o777 == 0o750
         assert requested_modes == [0o2750, 0o2750, 0o2750]
 
+    def test_folded_mount_symlink_alias_prepares_physical_workspace(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        physical_uploads = tmp_path / "physical-uploads"
+        physical_uploads.mkdir(mode=0o755)
+        uploads_alias = tmp_path / "uploads-alias"
+        uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+        prepare_root = physical_uploads / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: physical_uploads
+        )
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(uploads_alias)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert prepare_root.is_dir()
+        assert stat.S_IMODE(physical_uploads.stat().st_mode) == 0o755
+        assert stat.S_IMODE((physical_uploads / "user_42").stat().st_mode) == 0o750
+        assert stat.S_IMODE(prepare_root.stat().st_mode) == 0o750
+
     @pytest.mark.asyncio
     async def test_reused_container_still_prepares_managed_mount(
         self, _env, tmp_path, monkeypatch

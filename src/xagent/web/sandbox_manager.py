@@ -1053,7 +1053,26 @@ class SandboxManager:
                     grant_sandbox_runtime_access(
                         backend_path, trusted_root=get_uploads_dir()
                     )
-                grant_sandbox_runtime_access(target, trusted_root=trusted_root)
+                grant_target = target
+                if target != backend_path:
+                    # Folding compares physical identities but deliberately
+                    # retains the operator's lexical spelling for the bind.
+                    # Rebase the managed suffix onto that spelling before the
+                    # descriptor walk so a supported symlink alias and its
+                    # physical uploads path use one containment domain.
+                    physical_trusted_root = Path(os.path.realpath(trusted_root))
+                    physical_target = Path(os.path.realpath(target))
+                    try:
+                        managed_suffix = physical_target.relative_to(
+                            physical_trusted_root
+                        )
+                    except ValueError as exc:
+                        raise SandboxContractError(
+                            "Docker workspace root is outside its folded bind "
+                            f"root: {target}"
+                        ) from exc
+                    grant_target = trusted_root / managed_suffix
+                grant_sandbox_runtime_access(grant_target, trusted_root=trusted_root)
             elif should_create or target.exists():
                 try:
                     os.makedirs(target, exist_ok=True)

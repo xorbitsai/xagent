@@ -617,7 +617,10 @@ def _write_tar_from_local_path(
     local_path: str, arcname: str, file_obj: io.BufferedRandom
 ) -> None:
     """Pack a local file into a tar stream for Docker put_archive."""
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # O_NOFOLLOW rejects symlinks, while O_NONBLOCK makes opening a FIFO or
+    # device return promptly so the regular-file check can reject it without
+    # blocking the async caller's event-loop thread.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
     source_fd = os.open(local_path, flags)
     try:
         source_stat = os.fstat(source_fd)

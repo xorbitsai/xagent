@@ -33,8 +33,11 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import re
 import shutil
+import stat
+import tempfile
 import time
 import uuid
 import weakref
@@ -5384,6 +5387,44 @@ class BackgroundTaskManager:
 background_task_manager = BackgroundTaskManager()
 
 
+def _copy_durable_input_to_workspace(source: Path, target: Path) -> None:
+    """Publish one regular durable input as a private task-local copy."""
+
+    source_flags = (
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_fd = os.open(source, source_flags)
+    temp_fd = -1
+    temp_path: Path | None = None
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Durable task inputs must be regular files")
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        os.fchmod(temp_fd, 0o600)
+        with (
+            os.fdopen(source_fd, "rb", closefd=True) as source_file,
+            os.fdopen(temp_fd, "wb", closefd=True) as target_file,
+        ):
+            source_fd = -1
+            temp_fd = -1
+            shutil.copyfileobj(source_file, target_file)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def _register_uploaded_files_for_agent(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
@@ -5400,7 +5441,7 @@ def _register_uploaded_files_for_agent(
     for file_info in file_info_list:
         file_id = str(file_info.get("file_id") or "")
         source_path = Path(str(file_info.get("path") or ""))
-        if not file_id or not source_path.exists():
+        if not file_id:
             logger.warning(
                 "Skipping unavailable uploaded file for workspace: %s", file_info
             )
@@ -5409,42 +5450,59 @@ def _register_uploaded_files_for_agent(
         normalized_file_name = normalize_filename(
             Path(str(file_info.get("name") or source_path.name)).name
         )
-        candidate = input_dir / normalized_file_name
-        suffix_idx = 1
-        stem, ext = candidate.stem, candidate.suffix
-        while candidate.exists() or candidate.is_symlink():
-            try:
-                if candidate.resolve() == source_path.resolve():
-                    break
-            except OSError:
-                pass
-            candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
-            suffix_idx += 1
-
-        workspace_link_path: Path | None
-        if candidate.exists() or candidate.is_symlink():
-            workspace_link_path = candidate
+        remembered_path = Path(str(file_info.get("workspace_path") or ""))
+        try:
+            remembered_is_task_input = (
+                remembered_path.name
+                and remembered_path.parent.resolve() == input_dir.resolve()
+            )
+        except OSError:
+            remembered_is_task_input = False
+        if remembered_is_task_input:
+            candidate = remembered_path
         else:
-            try:
-                candidate.symlink_to(source_path.resolve())
-                workspace_link_path = candidate
-            except OSError as link_err:
-                logger.warning(
-                    f"symlink failed ({link_err}); copying "
-                    f"{source_path.name} into workspace"
-                )
-                shutil.copy2(source_path, candidate)
-                workspace_link_path = candidate
+            candidate = input_dir / normalized_file_name
+            suffix_idx = 1
+            stem, ext = candidate.stem, candidate.suffix
+            while candidate.exists() or candidate.is_symlink():
+                try:
+                    if candidate.resolve() == source_path.resolve():
+                        break
+                except OSError:
+                    pass
+                candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                suffix_idx += 1
 
-        registration = workspace.describe_file_registration(str(source_path.resolve()))
-        workspace.bind_already_durable_file(
-            registration,
-            file_id=file_id,
-        )
-        file_info["path"] = str(registration.path)
-        file_info["workspace_path"] = str(workspace_link_path)
+        try:
+            _copy_durable_input_to_workspace(source_path, candidate)
+        except (OSError, ValueError):
+            if not source_path.exists():
+                logger.warning(
+                    "Skipping unavailable uploaded file for workspace: %s",
+                    file_info,
+                )
+                continue
+            raise
+
+        registration = workspace.describe_file_registration(str(candidate))
+        try:
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+        except BaseException:
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(
+                    "Failed to remove unbound durable workspace input %s",
+                    candidate,
+                    exc_info=True,
+                )
+            raise
+        file_info["workspace_path"] = str(candidate)
         logger.info(
-            "File registered for agent workspace: storage=%s input_link=%s",
-            registration.path,
-            workspace_link_path,
+            "File registered for agent workspace: storage=%s input_path=%s",
+            source_path,
+            candidate,
         )

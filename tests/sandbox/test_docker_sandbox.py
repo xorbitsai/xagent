@@ -12,7 +12,9 @@ import re
 import socket
 import tarfile
 import tempfile
+import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -71,6 +73,50 @@ def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
         extracted = tar.extractfile(info)
         assert extracted is not None
         assert extracted.read() == b"secret"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
+def test_write_tar_local_path_rejects_fifo_swap_without_blocking(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "upload.txt"
+    source.write_text("safe", encoding="utf-8")
+    real_open = os.open
+    swapped = False
+    opened_flags: list[int] = []
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == source and not swapped:
+            swapped = True
+            source.unlink()
+            os.mkfifo(source)
+            opened_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    with tempfile.TemporaryFile() as archive:
+        monkeypatch.setattr(docker_sandbox_module.os, "open", swap_before_open)
+        outcome: list[BaseException | None] = []
+
+        def pack() -> None:
+            try:
+                _write_tar_from_local_path(str(source), "upload.txt", archive)
+            except BaseException as exc:
+                outcome.append(exc)
+            else:
+                outcome.append(None)
+
+        worker = threading.Thread(target=pack, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        if worker.is_alive():
+            writer_fd = real_open(source, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer_fd)
+            worker.join(timeout=2)
+
+        assert not worker.is_alive(), "opening a swapped FIFO must never block"
+        assert opened_flags and opened_flags[0] & os.O_NONBLOCK
+        assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
 
 
 @pytest.mark.parametrize("raw_pids_limit", [0, 1, 63, -1, None])

@@ -120,6 +120,41 @@ def test_registered_output_is_transferred_to_backend_uid(workspace, monkeypatch)
     assert chowns[-1] == (os.geteuid(), 1010)
 
 
+def test_bound_durable_input_is_made_readable_by_sandbox(workspace, monkeypatch):
+    durable_input = workspace.input_dir / "restored.txt"
+    durable_input.write_text("restored", encoding="utf-8")
+    durable_input.chmod(0o600)
+    registration = WorkspaceFileRegistration(
+        path=durable_input.resolve(),
+        relative_path="input/restored.txt",
+        category="input",
+        is_workspace_file=True,
+    )
+    real_stat = Path.stat
+
+    def prepared_root_stat(path: Path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == workspace.workspace_dir:
+            values = list(result)
+            values[5] = 1010
+            values[0] |= stat.S_ISGID
+            return os.stat_result(values)
+        return result
+
+    chowns: list[tuple[int, int]] = []
+    monkeypatch.setattr(Path, "stat", prepared_root_stat)
+    monkeypatch.setattr(
+        workspace_module.os,
+        "fchown",
+        lambda _fd, uid, gid: chowns.append((uid, gid)),
+    )
+
+    workspace.bind_already_durable_file(registration, file_id="restored-file")
+
+    assert stat.S_IMODE(durable_input.stat().st_mode) == 0o660
+    assert chowns[-1] == (os.geteuid(), 1010)
+
+
 def test_permission_marker_is_hidden_from_workspace_listing(workspace):
     marker = workspace.workspace_dir / ".xagent-permissions-v2"
     marker.write_text("", encoding="utf-8")

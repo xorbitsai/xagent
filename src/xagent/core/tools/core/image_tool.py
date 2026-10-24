@@ -544,6 +544,7 @@ Images are automatically saved to workspace.
             staged_path = self._workspace.stage_path_for_external_upload(
                 image_input,
                 max_bytes=get_media_download_max_bytes("image"),
+                host_private=True,
             )
         except ExternalUploadStagingError:
             raise
@@ -558,14 +559,10 @@ Images are automatically saved to workspace.
             staged_path = self._workspace.stage_file_for_external_upload(
                 file_id,
                 max_bytes=get_media_download_max_bytes("image"),
+                host_private=True,
             )
-        try:
-            resolved = self._resolve_image_path(str(staged_path))
-        except BaseException:
-            self._workspace.discard_staged_external_upload(staged_path)
-            raise
         staged_paths.append(staged_path)
-        return resolved
+        return str(staged_path)
 
     async def _resolve_edit_image_path_async(
         self, image_input: str, staged_paths: list[Path]

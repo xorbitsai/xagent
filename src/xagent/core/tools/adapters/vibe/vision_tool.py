@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Union
 
 from xagent.config import get_media_download_max_bytes
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.workspace import ExternalUploadSizeLimitError, TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
 from ....model.chat.basic.adapter import attach_chat_retry_wrapper
@@ -60,7 +60,7 @@ class VisionTool:
 
         # Create core instance
         private_staging_roots = (
-            (workspace._external_upload_staging_root(),)
+            (workspace.external_upload_staging_root(host_private=True),)
             if isinstance(workspace, TaskWorkspace)
             else ()
         )
@@ -88,10 +88,11 @@ class VisionTool:
             source,
             media_path,
             max_bytes=get_media_download_max_bytes(media_kind),
+            host_private=True,
         )
 
     async def _resolve_media_path(
-        self, media_path: str, staged_sources: Optional[dict[str, str]] = None
+        self, media_path: str, staged_sources: dict[str, str]
     ) -> str:
         """Resolve an image or video path using the task workspace."""
         # If it's a URL, return as-is
@@ -119,11 +120,21 @@ class VisionTool:
                     break
             if not task.cancelled() and task.exception() is None:
                 completed_path = task.result()
-                if staged_sources is not None:
-                    staged_sources[str(completed_path)] = media_path
+                staged_sources[str(completed_path)] = media_path
             raise
-        if staged_sources is not None:
-            staged_sources[str(safe_path)] = media_path
+        except ExternalUploadSizeLimitError as exc:
+            logger.warning("Vision input exceeded its staging limit: %s", exc)
+            raise ValueError("Media exceeds the configured size limit") from None
+        except Exception as exc:
+            logger.warning("Rejected vision media selector %r: %s", media_path, exc)
+            raise ValueError(
+                "Media is unavailable or outside the task workspace"
+            ) from None
+        staged_sources[str(safe_path)] = media_path
+        if isinstance(self.workspace, TaskWorkspace):
+            self.core.add_allowed_local_media_root(
+                self.workspace.external_upload_staging_root(host_private=True)
+            )
         if not safe_path.is_file():
             raise FileNotFoundError(f"Media file not found: {media_path}")
         return str(safe_path)
@@ -131,7 +142,7 @@ class VisionTool:
     async def _resolve_media(
         self,
         media: Union[str, List[str]],
-        staged_sources: Optional[dict[str, str]] = None,
+        staged_sources: dict[str, str],
         resolution_warnings: Optional[list[str]] = None,
     ) -> str | list[str]:
         """Resolve all media paths using workspace."""
@@ -179,7 +190,7 @@ class VisionTool:
             result.image_processed = staged_sources.get(
                 result.image_processed, result.image_processed
             )
-        if isinstance(result, UnderstandMediaResult) and result.warnings:
+        if result.warnings:
             restored: list[str] = []
             for warning in result.warnings:
                 for staged, original in staged_sources.items():
@@ -333,10 +344,11 @@ class VisionTool:
             DetectObjectsResult with detected objects and optionally marked image path
         """
         staged_sources: dict[str, str] = {}
+        resolution_warnings: list[str] = []
         try:
             normalized_images = self._normalize_images(images)
             resolved_images = await self._resolve_media(
-                normalized_images, staged_sources
+                normalized_images, staged_sources, resolution_warnings
             )
         except asyncio.CancelledError:
             self._discard_staged_media(staged_sources)
@@ -371,6 +383,7 @@ class VisionTool:
                 )
         finally:
             if result is not None:
+                result.warnings = [*resolution_warnings, *result.warnings]
                 self._restore_media_selectors(result, staged_sources)
             self._discard_staged_media(staged_sources)
 

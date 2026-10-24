@@ -218,6 +218,7 @@ class DetectObjectsResult(BaseModel):
     box_color: Optional[str] = None
     raw_response: Optional[str] = None
     parsing_method: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
     error: Optional[str] = None
 
 
@@ -252,6 +253,15 @@ class VisionCore:
         self.allowed_local_media_roots = tuple(
             Path(root).resolve() for root in allowed_local_media_roots
         )
+
+    def add_allowed_local_media_root(self, root: str | Path) -> None:
+        """Authorize a private staging root created after initialization."""
+        resolved = Path(root).resolve()
+        if resolved not in self.allowed_local_media_roots:
+            self.allowed_local_media_roots = (
+                *self.allowed_local_media_roots,
+                resolved,
+            )
 
     def _resolve_local_media_path(self, media_path: str) -> Path:
         """Resolve a local media path without allowing workspace escapes."""

@@ -432,7 +432,7 @@ class TestVisionToolUnderstandImages:
         )
 
         assert result.success is True
-        staging_root = workspace._external_upload_staging_root()
+        staging_root = workspace.external_upload_staging_root(host_private=True)
         assert list(staging_root.iterdir()) == []
 
     def test_uploaded_file_id_under_symlinked_root_stages(
@@ -790,7 +790,7 @@ class TestVisionToolUnderstandImages:
         )
 
         assert result.success is False
-        assert "File not found: nonexistent_image.jpg" in result.error
+        assert result.error == "Media is unavailable or outside the task workspace"
 
     @pytest.mark.asyncio
     async def test_understand_no_model_available(self):
@@ -1616,6 +1616,30 @@ class TestVisionToolDetectObjects:
         assert obj2["class"] == "car"
         assert obj2["confidence"] == 0.87
         assert obj2["bbox"] == [0.7, 0.5, 0.95, 0.75]
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_reports_partial_resolution_failures(
+        self, mock_vision_model_with_detection, tmp_path
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        source = workspace.output_dir / "valid.jpg"
+        source.write_bytes(b"image")
+        tool = VisionTool(mock_vision_model_with_detection, workspace)
+        tool.core.detect_objects = AsyncMock(
+            return_value=DetectObjectsResult(success=True)
+        )
+
+        result = await tool.detect_objects(
+            ["output/valid.jpg", "output/missing.jpg"],
+            task="Find objects",
+        )
+
+        assert result.success is True
+        assert result.warnings == [
+            "Failed to resolve media output/missing.jpg: "
+            "Media is unavailable or outside the task workspace"
+        ]
+        assert str(workspace.workspace_dir) not in result.warnings[0]
 
     @pytest.mark.asyncio
     async def test_detect_objects_offloads_local_image_conversion(

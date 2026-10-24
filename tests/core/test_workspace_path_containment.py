@@ -74,7 +74,9 @@ def test_stage_path_uses_host_private_copy_and_cleanup(workspace):
     source = workspace.output_dir / "report.txt"
     source.write_text("original", encoding="utf-8")
 
-    staged = workspace.stage_path_for_external_upload("output/report.txt")
+    staged = workspace.stage_path_for_external_upload(
+        "output/report.txt", host_private=True
+    )
     source.write_text("changed", encoding="utf-8")
 
     assert staged.read_text(encoding="utf-8") == "original"

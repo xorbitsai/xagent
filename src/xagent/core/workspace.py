@@ -367,7 +367,11 @@ class TaskWorkspace:
         )
 
     def stage_file_for_external_upload(
-        self, file_id: str, *, max_bytes: int | None = None
+        self,
+        file_id: str,
+        *,
+        max_bytes: int | None = None,
+        host_private: bool = False,
     ) -> Path:
         """Materialize a durable file into this task's private staging area.
 
@@ -383,6 +387,8 @@ class TaskWorkspace:
         if source is None:
             raise FileNotFoundError(f"File not found: {file_id}")
         raw_source = Path(source)
+        if raw_source.is_symlink():
+            raise FileNotFoundError(f"File not found: {file_id}")
         try:
             source = raw_source.resolve(strict=True)
         except (OSError, RuntimeError) as exc:
@@ -393,7 +399,12 @@ class TaskWorkspace:
             source
         ):
             raise FileNotFoundError(f"File not found: {file_id}")
-        return self._stage_authorized_source(source, file_id, max_bytes=max_bytes)
+        return self._stage_authorized_source(
+            source,
+            file_id,
+            max_bytes=max_bytes,
+            host_private=host_private,
+        )
 
     @staticmethod
     def _open_regular_file_nofollow(source: Path, selector: str) -> int:
@@ -428,12 +439,13 @@ class TaskWorkspace:
         selector: str,
         *,
         max_bytes: int | None = None,
+        host_private: bool = False,
     ) -> Path:
         """Copy an already-authorized source fd into private task staging."""
         source_fd = self._open_regular_file_nofollow(source, selector)
         staging_dir: Path | None = None
         try:
-            staging_root = self._external_upload_staging_root()
+            staging_root = self.external_upload_staging_root(host_private=host_private)
             staging_dir = staging_root / uuid4().hex
             target = staging_dir / source.name
             source_size = os.fstat(source_fd).st_size
@@ -466,13 +478,25 @@ class TaskWorkspace:
         return target
 
     def stage_path_for_external_upload(
-        self, file_path: str, *, max_bytes: int | None = None
+        self,
+        file_path: str,
+        *,
+        max_bytes: int | None = None,
+        host_private: bool = False,
     ) -> Path:
         """Copy one workspace-authorized selector into private task staging."""
         source = Path(self.resolve_path_with_search(file_path, detached_file_ids=True))
+        if source.is_symlink():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        source = source.resolve(strict=True)
         if not source.is_absolute():
             raise FileNotFoundError(f"File not found: {file_path}")
-        return self._stage_authorized_source(source, file_path, max_bytes=max_bytes)
+        return self._stage_authorized_source(
+            source,
+            file_path,
+            max_bytes=max_bytes,
+            host_private=host_private,
+        )
 
     def stage_resolved_path_for_external_upload(
         self,
@@ -480,12 +504,21 @@ class TaskWorkspace:
         selector: str,
         *,
         max_bytes: int | None = None,
+        host_private: bool = False,
     ) -> Path:
         """Stage the capability returned by ``resolve_path_with_search`` once."""
-        resolved = Path(source)
+        raw_source = Path(source)
+        if raw_source.is_symlink():
+            raise FileNotFoundError(f"File not found: {selector}")
+        resolved = raw_source.resolve(strict=True)
         if not resolved.is_absolute():
             raise FileNotFoundError(f"File not found: {selector}")
-        return self._stage_authorized_source(resolved, selector, max_bytes=max_bytes)
+        return self._stage_authorized_source(
+            resolved,
+            selector,
+            max_bytes=max_bytes,
+            host_private=host_private,
+        )
 
     def discard_staged_external_upload(self, file_path: str | Path) -> None:
         """Remove a file previously returned by staging.
@@ -494,13 +527,24 @@ class TaskWorkspace:
         root, so a connector cannot cause arbitrary workspace deletion.
         """
 
-        staging_root = self._external_upload_staging_root()
         try:
             candidate = Path(file_path).resolve()
         except RuntimeError:
             # A symlink loop must not escape cleanup's confined-path check.
             candidate = Path(file_path)
-        if not candidate.is_relative_to(staging_root) or candidate == staging_root:
+        staging_roots = [self.external_upload_staging_root()]
+        private_root = self._host_external_upload_staging_root
+        if private_root is not None:
+            staging_roots.append(private_root)
+        staging_root = next(
+            (
+                root
+                for root in staging_roots
+                if candidate != root and candidate.is_relative_to(root)
+            ),
+            None,
+        )
+        if staging_root is None:
             raise ValueError("staged upload path is outside the task staging area")
         try:
             candidate.unlink(missing_ok=True)
@@ -513,10 +557,9 @@ class TaskWorkspace:
                     break
                 parent = parent.parent
 
-    def _external_upload_staging_root(self) -> Path:
-        """Return private host staging or sandbox-writable MCP staging."""
-        sandbox_runner = in_sandbox_tool_runner()
-        if not sandbox_runner:
+    def external_upload_staging_root(self, *, host_private: bool = False) -> Path:
+        """Return sandbox-visible connector staging or private media staging."""
+        if host_private and not in_sandbox_tool_runner():
             with self._registration_lock:
                 existing = self._host_external_upload_staging_root
                 if existing is not None and existing.is_dir():
@@ -565,6 +608,10 @@ class TaskWorkspace:
                 os.close(current_fd)
             os.close(parent_fd)
         return parent_root.joinpath(*_SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS)
+
+    def _external_upload_staging_root(self) -> Path:
+        """Backward-compatible accessor for sandbox-visible connector staging."""
+        return self.external_upload_staging_root()
 
     def register_internal_file(
         self,
@@ -1645,11 +1692,20 @@ class TaskWorkspace:
         with self._registration_lock:
             cached_path = self._file_id_to_path.get(file_id)
         if cached_path is not None:
-            try:
-                resolved_cached_path = cached_path.resolve(strict=True)
-            except (OSError, RuntimeError):
+            if cached_path.is_symlink():
                 resolved_cached_path = None
-            if resolved_cached_path is not None and resolved_cached_path.is_file():
+            else:
+                try:
+                    resolved_cached_path = cached_path.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    resolved_cached_path = None
+            if (
+                resolved_cached_path is not None
+                and resolved_cached_path.is_file()
+                and self._file_operation_path_in_authorized_storage(
+                    resolved_cached_path
+                )
+            ):
                 logger.debug(
                     f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
                 )
@@ -1706,11 +1762,21 @@ class TaskWorkspace:
                 )
                 if record and record.storage_path:
                     raw_path = Path(record.storage_path)
-                    try:
-                        resolved_path = raw_path.resolve(strict=True)
-                    except (OSError, RuntimeError):
+                    if raw_path.is_symlink():
                         resolved_path = raw_path
-                    if resolved_path.exists() and resolved_path.is_file():
+                    else:
+                        try:
+                            resolved_path = raw_path.resolve(strict=True)
+                        except (OSError, RuntimeError):
+                            resolved_path = raw_path
+                    if (
+                        not raw_path.is_symlink()
+                        and resolved_path.exists()
+                        and resolved_path.is_file()
+                        and self._file_operation_path_in_authorized_storage(
+                            resolved_path
+                        )
+                    ):
                         if not self._file_record_allowed_for_workspace(
                             record, resolved_path
                         ):
@@ -1733,7 +1799,21 @@ class TaskWorkspace:
                         return None
                     from ..web.services.managed_file_ref import ManagedFileRef
 
-                    return ManagedFileRef(record).materialize()
+                    materialized = (
+                        ManagedFileRef(record).materialize().resolve(strict=True)
+                    )
+                    if (
+                        materialized.is_file()
+                        and self._file_operation_path_in_authorized_storage(
+                            materialized
+                        )
+                    ):
+                        return materialized
+                    logger.warning(
+                        "Rejected materialized file_id outside authorized storage: %s",
+                        file_id,
+                    )
+                    return None
                 return None
             finally:
                 if should_close:

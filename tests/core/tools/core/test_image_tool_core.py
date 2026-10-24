@@ -10,7 +10,7 @@ import pytest
 
 from xagent.core.model.image.base import BaseImageModel
 from xagent.core.tools.core.image_tool import ImageGenerationToolCore
-from xagent.core.workspace import ExternalUploadStagingError
+from xagent.core.workspace import ExternalUploadStagingError, TaskWorkspace
 
 
 @pytest.fixture
@@ -675,11 +675,41 @@ class TestImageGenerationToolCore:
         workspace.stage_path_for_external_upload.assert_called_once_with(
             "file://355f1fee-48e4-4cb6-afd3-71654e2f5c7e",
             max_bytes=64 * 1024 * 1024,
+            host_private=True,
         )
         workspace.stage_file_for_external_upload.assert_not_called()
         model.edit_image.assert_awaited_once()
         assert model.edit_image.await_args.kwargs["image_url"] == str(staged_path)
         workspace.discard_staged_external_upload.assert_called_once_with(staged_path)
+
+    @pytest.mark.asyncio
+    async def test_edit_image_uses_private_staging_with_real_workspace(
+        self, mock_image_models, tmp_path
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        source = workspace.output_dir / "source.png"
+        source.write_bytes(b"image")
+        observed: dict[str, Path] = {}
+
+        async def edit_image(**kwargs):
+            staged = Path(kwargs["image_url"])
+            assert staged.is_file()
+            assert not staged.is_relative_to(workspace.workspace_dir)
+            observed["staged"] = staged
+            return {"image_url": None}
+
+        model = mock_image_models["model1"]
+        model.has_ability = Mock(return_value=True)
+        model.edit_image = AsyncMock(side_effect=edit_image)
+        tool = ImageGenerationToolCore({"model1": model}, workspace=workspace)
+
+        result = await tool.edit_image(
+            prompt="edit",
+            image_url="output/source.png",
+        )
+
+        assert result["success"] is True
+        assert not observed["staged"].exists()
 
     @pytest.mark.asyncio
     async def test_edit_image_discards_staged_input_when_provider_fails(
@@ -731,7 +761,9 @@ class TestImageGenerationToolCore:
             tool._resolve_edit_image_path("/etc/passwd", [])
 
         workspace.stage_path_for_external_upload.assert_called_once_with(
-            "/etc/passwd", max_bytes=64 * 1024 * 1024
+            "/etc/passwd",
+            max_bytes=64 * 1024 * 1024,
+            host_private=True,
         )
         workspace.stage_file_for_external_upload.assert_not_called()
 

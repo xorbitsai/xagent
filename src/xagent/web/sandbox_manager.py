@@ -26,6 +26,7 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_pids_limit,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
@@ -54,6 +55,7 @@ from ..sandbox.base import (
     SandboxTemplate,
     SpecVerdict,
     canonical_sandbox_path,
+    grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
 from .sandbox_keys import (
@@ -643,6 +645,10 @@ class SandboxManager:
         # this manager is correct with or without that wiring.
         self._backend_probe: bool | None = None
 
+    def validate_host_workspace_access(self) -> None:
+        """Validate backend-specific host mount prerequisites."""
+        self._service.validate_host_workspace_access()
+
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
         """Build a sandbox name from lifecycle type and id."""
@@ -875,6 +881,9 @@ class SandboxManager:
         if memory is not None:
             config.memory = memory
 
+        config.pids_limit = get_sandbox_pids_limit()
+        config.security_profile = self._service.runtime_security_profile()
+
         # ENV
         env = get_sandbox_env()
         if env:
@@ -988,10 +997,10 @@ class SandboxManager:
         The mount root is always created; each extra/allowlist mount is
         created only if it already exists (never freshly created) — same
         split as the historical base_dir(True)/allowed_external_dirs(False)
-        behavior. Called explicitly right before a creation attempt (never
-        on a cache hit or a plain reuse/start_existing), independent of
-        spec/volume-list construction: this is not a side effect threaded
-        through volume-list building.
+        behavior. Called explicitly before creation and before a reconciled
+        start_existing after process restart, but not on an in-process cache
+        hit. It is independent of spec/volume-list construction: this is not
+        a side effect threaded through volume-list building.
 
         ``prepare_root``, when given, overrides *only* the mount root's
         creation target (see ``ChatWorkspaceBinding.prepare_root``): folding
@@ -1001,6 +1010,7 @@ class SandboxManager:
         exist on disk, not necessarily the (possibly shallower) directory
         actually bind-mounted. Extra/allowlist mounts are unaffected.
         """
+
         for backend_path, should_create in self._workspace_mount_paths(
             lifecycle_type, lifecycle_id, mount_intent
         ):
@@ -1027,15 +1037,61 @@ class SandboxManager:
                 and str(backend_path) == mount_intent.mount_root
             ):
                 target = Path(prepare_root)
-            try:
-                if should_create or target.exists():
-                    os.makedirs(target, exist_ok=True)
-            except OSError as exc:
-                logger.warning(
-                    "Failed to prepare sandbox workspace mount %s: %s",
-                    target,
-                    exc,
+            if should_create and self._service.host_workspace_gid() is not None:
+                # A folded external mount may be an operator-owned ancestor of
+                # the uploads tree. Use that actual bind root only as the
+                # descriptor anchor for the managed descendant; do not chgrp
+                # or chmod the operator-owned ancestor itself.
+                trusted_root = (
+                    backend_path if target != backend_path else get_uploads_dir()
                 )
+                if target != backend_path and not backend_path.exists():
+                    # The first task for a user can arrive before the managed
+                    # per-user mount anchor exists. Create and prepare that
+                    # anchor beneath uploads before using it as the no-follow
+                    # descriptor root for the folded task path.
+                    grant_sandbox_runtime_access(
+                        backend_path, trusted_root=get_uploads_dir()
+                    )
+                grant_target = target
+                if target != backend_path:
+                    # Folding compares physical identities but deliberately
+                    # retains the operator's lexical spelling for the bind.
+                    lexical_target = Path(os.path.abspath(target))
+                    lexical_trusted_root = Path(os.path.abspath(trusted_root))
+                    if not lexical_target.is_relative_to(lexical_trusted_root):
+                        # Rebase a physical uploads spelling onto an
+                        # operator-controlled bind alias. Resolve only the
+                        # trusted bind prefix. In particular, never realpath
+                        # the uploads root: it is inside a writable mount and
+                        # may already have been replaced by sandbox code.
+                        physical_trusted_root = Path(os.path.realpath(trusted_root))
+                        uploads_root = Path(os.path.abspath(get_uploads_dir()))
+                        try:
+                            uploads_suffix = uploads_root.relative_to(
+                                physical_trusted_root
+                            )
+                            managed_suffix = lexical_target.relative_to(uploads_root)
+                        except ValueError as exc:
+                            raise SandboxContractError(
+                                "Docker workspace root is outside its folded bind "
+                                f"root: {target}"
+                            ) from exc
+                        grant_target = trusted_root / uploads_suffix / managed_suffix
+                grant_sandbox_runtime_access(grant_target, trusted_root=trusted_root)
+            else:
+                try:
+                    if should_create or target.exists():
+                        os.makedirs(target, exist_ok=True)
+                except OSError:
+                    # Legacy/BoxLite preparation was historically best effort.
+                    # Docker takes the explicit grant path above and still
+                    # fails closed when its ownership contract cannot be met.
+                    logger.warning(
+                        "Failed to prepare sandbox workspace mount %s",
+                        target,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _config_equivalent(
@@ -1081,6 +1137,8 @@ class SandboxManager:
             volumes=info.config.volumes,
             network_isolated=bool(info.config.network_isolated),
             ports=info.config.ports,
+            pids_limit=info.config.pids_limit,
+            security_profile=info.config.security_profile,
         )
 
     def _build_runtime_spec(
@@ -1115,6 +1173,8 @@ class SandboxManager:
             volumes=volumes,
             network_isolated=bool(config.network_isolated),
             ports=config.ports,
+            pids_limit=config.pids_limit,
+            security_profile=config.security_profile,
         )
 
     def _make_default_volumes(
@@ -1567,6 +1627,9 @@ class SandboxManager:
         ordinary absent-\\>create path instead, re-inspecting under the
         now-free gate and creating the (confirmed-absent) sandbox fresh.
         """
+        self._prepare_workspace_mounts(
+            lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
+        )
         cap = get_sandbox_max_containers()
         try:
             if cap is None:
@@ -1967,10 +2030,8 @@ class SandboxManager:
         (every pop site drops both together), so the comparison never
         degrades to "no cached spec, allow".
 
-        ``prepare_root``, when given, is only consulted on that cache miss
-        (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
-        and ``_prepare_workspace_mounts``; a cache hit never creates
-        directories at all.
+        ``prepare_root`` is used while initially creating or reconciling the
+        sandbox. Cached providers do not repeat mount preparation.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
@@ -2779,6 +2840,8 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     """
     if not await sandbox_mgr._resolve_backend_probe():
         return
+
+    sandbox_mgr.validate_host_workspace_access()
 
     external_dirs = get_external_upload_dirs()
     if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:

@@ -62,10 +62,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Chrome executable". --build-arg INSTALL_CHROME=false skips it (and the
 # npx cache below) for deployments that never enable the connector.
 #
-# Security posture matches Dockerfile.backend's, not a new risk: this
-# container always execs as root (docker_sandbox.py) and the connector's
-# launch_config passes --no-sandbox/--disable-setuid-sandbox, so Chrome
-# runs as UID 0 with its own sandbox disabled. Accepted only because the
+# Security posture matches Dockerfile.backend's, not a new risk: the
+# connector's launch_config passes --no-sandbox/--disable-setuid-sandbox, so
+# Chrome's own sandbox is disabled even though the process runs as uid 1100.
+# Accepted only because the
 # connector stays is_visible_in_connector: false pending the same
 # security review Dockerfile.backend's comment tracks.
 ARG INSTALL_CHROME=true
@@ -111,7 +111,7 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
 # Warm the npx cache for the version pinned in builtin_mcp_registry.py's
 # launch_config, mirroring Dockerfile.backend's identical step, to skip
 # the npm registry on launch. The execution-scoped Chrome controller passes
-# this cache path explicitly. Boxlite executes as the non-root `sandbox` user,
+# this cache path explicitly. Both runtimes execute as the non-root `sandbox` user,
 # so ownership is transferred below before its offline smoke check.
 #
 # `--help` exercises resolution without starting Chrome, so this needs

@@ -4,6 +4,22 @@ services:
     image: nginx:latest
     container_name: xagent_nginx
     restart: unless-stopped
+    # nginx drops privileges and calls initgroups(), which discards Docker's
+    # supplementary group_add entries. Resolve/create gid 1010 in the image's
+    # group database and make it the worker's primary group so X-Accel can
+    # traverse sandbox-managed 2750 directories.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        group_name="$$(awk -F: '$$3 == 1010 { print $$1; exit }' /etc/group)"
+        if [ -z "$${group_name}" ]; then
+          group_name=xagent_sandbox
+          printf '%s:x:1010:\n' "$${group_name}" >> /etc/group
+        fi
+        sed -i -E "s/^user[[:space:]]+[^;]+;/user nginx $${group_name};/" /etc/nginx/nginx.conf
+        grep -q "^user nginx $${group_name};" /etc/nginx/nginx.conf
+        exec nginx -g 'daemon off;'
     ports:
       - "${PORT:-80}:80"
     volumes:

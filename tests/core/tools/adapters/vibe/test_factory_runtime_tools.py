@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,33 @@ def _categorized_tool(name: str, category: ToolCategory) -> Any:
         name=name,
         metadata=SimpleNamespace(category=category),
     )
+
+
+@pytest.mark.asyncio
+async def test_async_workspace_creation_runs_off_event_loop(
+    tmp_path, monkeypatch
+) -> None:
+    event_loop_thread = threading.get_ident()
+    worker_threads = []
+    expected_workspace = object()
+
+    def create_workspace(_workspace_config):
+        worker_threads.append(threading.get_ident())
+        return expected_workspace
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        staticmethod(create_workspace),
+    )
+    config = ToolConfig(
+        {"workspace": {"base_dir": str(tmp_path), "task_id": "threaded-task"}}
+    )
+
+    workspace = await ToolFactory.create_workspace_async(config)
+
+    assert workspace is expected_workspace
+    assert worker_threads and worker_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

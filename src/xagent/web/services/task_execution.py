@@ -33,8 +33,11 @@ import asyncio
 import enum
 import json
 import logging
+import os
 import re
 import shutil
+import stat
+import tempfile
 import time
 import uuid
 import weakref
@@ -119,6 +122,7 @@ if TYPE_CHECKING:
 from ...core.file_storage.keys import (
     build_task_output_storage_key,
 )
+from ...sandbox.base import SANDBOX_RUNTIME_GID
 from ..user_isolated_memory import UserContext
 from ..utils.json_payload_sanitizer import sanitize_json_payload
 from .assistant_history_safety import (
@@ -163,6 +167,7 @@ from .file_turn import (
     build_prompt_context_block,
     normalize_filename,
     prompt_context_from_agent_config,
+    resolve_turn_file_infos,
 )
 from .mcp_runtime import (
     MCPActorExecutionIdentity,
@@ -3902,6 +3907,13 @@ async def execute_resume_background(
                 )
             )
 
+        # Every resume route shares this point, including task commands and
+        # no-attachment channel turns. Materialize authorized pre-upgrade
+        # input symlinks before the non-root sandbox can observe them.
+        await run_db_io_cancellation_safe(
+            lambda: _prepare_workspace_inputs_for_agent(agent_service)
+        )
+
         # The task row can become RUNNING before the original AgentRunner has
         # created a context/checkpoint. Retry an early failed injection only
         # after that original execution has settled and persisted its state.
@@ -5440,67 +5452,298 @@ class BackgroundTaskManager:
 background_task_manager = BackgroundTaskManager()
 
 
+def _copy_durable_input_to_workspace(source: Path, target: Path, *, mode: int) -> None:
+    """Publish one regular durable input as a private task-local copy."""
+
+    source_flags = (
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_fd = os.open(source, source_flags)
+    temp_fd = -1
+    temp_path: Path | None = None
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Durable task inputs must be regular files")
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        os.fchmod(temp_fd, mode)
+        with (
+            os.fdopen(source_fd, "rb", closefd=True) as source_file,
+            os.fdopen(temp_fd, "wb", closefd=True) as target_file,
+        ):
+            source_fd = -1
+            temp_fd = -1
+            shutil.copyfileobj(source_file, target_file)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _task_input_copy_mode(workspace: Any) -> int:
+    """Keep Docker inputs private while preserving legacy backend readability."""
+
+    workspace_dir = getattr(workspace, "workspace_dir", None)
+    if workspace_dir is None:
+        return 0o644
+    try:
+        root_stat = Path(workspace_dir).resolve().stat()
+    except OSError:
+        return 0o644
+    if root_stat.st_gid == SANDBOX_RUNTIME_GID and root_stat.st_mode & stat.S_ISGID:
+        return 0o600
+    return 0o644
+
+
+def _materialize_legacy_task_input_symlinks(
+    workspace: Any, input_dir: Path, *, copy_mode: int
+) -> None:
+    """Replace authorized pre-upgrade input symlinks with task-local copies."""
+
+    owner_user_id = getattr(workspace, "owner_user_id", None)
+    task_id = getattr(workspace, "db_task_id", None)
+    if task_id is None:
+        task_id = getattr(workspace, "current_task_id", None)
+    if (
+        not isinstance(owner_user_id, int)
+        or isinstance(owner_user_id, bool)
+        or not isinstance(task_id, int)
+        or isinstance(task_id, bool)
+    ):
+        return
+
+    legacy_links: dict[Path, Path] = {}
+    try:
+        entries = tuple(input_dir.iterdir())
+    except OSError:
+        logger.warning(
+            "Failed to inspect legacy task inputs in %s", input_dir, exc_info=True
+        )
+        return
+    for candidate in entries:
+        try:
+            if not candidate.is_symlink():
+                continue
+            raw_target = Path(os.readlink(candidate))
+        except OSError:
+            continue
+        if not raw_target.is_absolute():
+            raw_target = candidate.parent / raw_target
+        legacy_links[candidate] = Path(os.path.abspath(raw_target))
+    if not legacy_links:
+        return
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        linked_sources = set(legacy_links.values())
+        file_ids = [
+            str(row.file_id)
+            for row in db.query(UploadedFile.file_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id == owner_user_id,
+                UploadedFile.task_id == task_id,
+                UploadedFile.storage_status != "compensating",
+            )
+            .all()
+            if Path(os.path.realpath(str(row.storage_path))) in linked_sources
+        ]
+        if not file_ids:
+            return
+        file_infos, _missing = resolve_turn_file_infos(
+            file_ids=file_ids,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            db=db,
+        )
+
+    authorized_sources: dict[Path, dict[str, Any]] = {}
+    for file_info in file_infos:
+        raw_source_path = str(file_info.get("path") or "")
+        if not raw_source_path:
+            continue
+        source_path = Path(raw_source_path)
+        authorized_sources[Path(os.path.realpath(source_path))] = file_info
+
+    for candidate, linked_source in legacy_links.items():
+        matched_file_info = authorized_sources.get(linked_source)
+        if matched_file_info is None:
+            continue
+        source_path = Path(str(matched_file_info["path"]))
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            registration = workspace.describe_file_registration(str(candidate))
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=str(matched_file_info["file_id"]),
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to materialize legacy task input: storage=%s input_path=%s",
+                source_path,
+                candidate,
+                exc_info=True,
+            )
+            continue
+        logger.info(
+            "Materialized legacy task input: storage=%s input_path=%s",
+            source_path,
+            candidate,
+        )
+
+
+def _prepare_workspace_inputs_for_agent(
+    agent_service: Any,
+) -> tuple[Any, Path, int] | None:
+    """Prepare task-local inputs shared by starts, resumes, and channels."""
+    workspace = getattr(agent_service, "workspace", None)
+    if not workspace:
+        return None
+
+    raw_input_dir = getattr(workspace, "input_dir", None)
+    if not isinstance(raw_input_dir, (str, os.PathLike)):
+        return None
+    input_dir = Path(raw_input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    copy_mode = _task_input_copy_mode(workspace)
+    _materialize_legacy_task_input_symlinks(
+        workspace,
+        input_dir,
+        copy_mode=copy_mode,
+    )
+    return workspace, input_dir, copy_mode
+
+
 def _register_uploaded_files_for_agent(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
 ) -> None:
     """Bind already-durable inputs to the workspace without another upload."""
 
-    workspace = getattr(agent_service, "workspace", None)
-    if not workspace:
+    prepared = _prepare_workspace_inputs_for_agent(agent_service)
+    if prepared is None:
         return
-
-    input_dir = Path(workspace.input_dir)
-    input_dir.mkdir(parents=True, exist_ok=True)
+    workspace, input_dir, copy_mode = prepared
 
     for file_info in file_info_list:
         file_id = str(file_info.get("file_id") or "")
         source_path = Path(str(file_info.get("path") or ""))
-        if not file_id or not source_path.exists():
+        if not file_id:
             logger.warning(
                 "Skipping unavailable uploaded file for workspace: %s", file_info
             )
             continue
 
+        candidate: Path | None = None
+        reused_candidate = False
+        resolve_file_id = getattr(workspace, "resolve_file_id", None)
+        if callable(resolve_file_id):
+            try:
+                previously_bound = resolve_file_id(file_id)
+                if isinstance(previously_bound, (str, os.PathLike)):
+                    bound_path = Path(previously_bound)
+                    if (
+                        bound_path.parent.resolve() == input_dir.resolve()
+                        and bound_path.is_file()
+                        and not bound_path.is_symlink()
+                    ):
+                        candidate = bound_path
+                        reused_candidate = True
+            except (OSError, ValueError):
+                # A stale or backend-specific binding must not make an
+                # otherwise valid durable upload unavailable. Fall back to
+                # collision-safe materialization below.
+                candidate = None
+
         normalized_file_name = normalize_filename(
             Path(str(file_info.get("name") or source_path.name)).name
         )
-        candidate = input_dir / normalized_file_name
-        suffix_idx = 1
-        stem, ext = candidate.stem, candidate.suffix
-        while candidate.exists() or candidate.is_symlink():
-            try:
-                if candidate.resolve() == source_path.resolve():
-                    break
-            except OSError:
-                pass
-            candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
-            suffix_idx += 1
+        remembered_path = Path(str(file_info.get("workspace_path") or ""))
+        try:
+            remembered_is_task_input = (
+                remembered_path.name
+                and remembered_path.parent.resolve() == input_dir.resolve()
+            )
+        except OSError:
+            remembered_is_task_input = False
+        if candidate is None:
+            if remembered_is_task_input:
+                candidate = remembered_path
+            else:
+                candidate = input_dir / normalized_file_name
+                suffix_idx = 1
+                stem, ext = candidate.stem, candidate.suffix
+                while candidate.exists() or candidate.is_symlink():
+                    try:
+                        if candidate.resolve() == source_path.resolve():
+                            break
+                    except OSError:
+                        pass
+                    candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                    suffix_idx += 1
 
-        workspace_link_path: Path | None
-        if candidate.exists() or candidate.is_symlink():
-            workspace_link_path = candidate
-        else:
-            try:
-                candidate.symlink_to(source_path.resolve())
-                workspace_link_path = candidate
-            except OSError as link_err:
+        copied_candidate = False
+        if reused_candidate:
+            # ``resolve_file_id`` returned this task workspace's existing
+            # binding. It is already registered and permission-prepared; a
+            # second bind would only reopen a sandbox-writable pathname and
+            # create an avoidable check/use race.
+            file_info["workspace_path"] = str(candidate)
+            logger.info(
+                "Reused agent workspace file binding: file_id=%s input_path=%s",
+                file_id,
+                candidate,
+            )
+            continue
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            copied_candidate = True
+        except (OSError, ValueError):
+            if not source_path.exists():
                 logger.warning(
-                    f"symlink failed ({link_err}); copying "
-                    f"{source_path.name} into workspace"
+                    "Skipping unavailable uploaded file for workspace: %s",
+                    file_info,
                 )
-                shutil.copy2(source_path, candidate)
-                workspace_link_path = candidate
+                continue
+            raise
 
-        registration = workspace.describe_file_registration(str(source_path.resolve()))
-        workspace.bind_already_durable_file(
-            registration,
-            file_id=file_id,
-        )
-        file_info["path"] = str(registration.path)
-        file_info["workspace_path"] = str(workspace_link_path)
+        registration = workspace.describe_file_registration(str(candidate))
+        try:
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+        except BaseException:
+            if copied_candidate:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove unbound durable workspace input %s",
+                        candidate,
+                        exc_info=True,
+                    )
+            raise
+        file_info["workspace_path"] = str(candidate)
         logger.info(
-            "File registered for agent workspace: storage=%s input_link=%s",
-            registration.path,
-            workspace_link_path,
+            "File registered for agent workspace: storage=%s input_path=%s",
+            source_path,
+            candidate,
         )

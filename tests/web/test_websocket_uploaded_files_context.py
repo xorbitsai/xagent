@@ -2261,6 +2261,8 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
         task_id=10,
         filename="valid file.txt",
     )
+    source_path = Path(upload.storage_path)
+    source_path.chmod(0o600)
 
     class Workspace:
         def __init__(self):
@@ -2268,7 +2270,7 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
             self.registered_files = []
 
         def describe_file_registration(self, path):
-            return SimpleNamespace(path=Path(path))
+            return SimpleNamespace(path=Path(path), is_workspace_file=True)
 
         def bind_already_durable_file(self, registration, *, file_id):
             self.registered_files.append((registration.path, file_id))
@@ -2287,7 +2289,157 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     )
 
     assert [item[1] for item in workspace.registered_files] == ["valid-file"]
-    assert file_info["workspace_path"]
+    staged_path = Path(file_info["workspace_path"])
+    assert staged_path.parent == Path(workspace.input_dir)
+    assert staged_path.is_file()
+    assert not staged_path.is_symlink()
+    assert staged_path.read_text(encoding="utf-8") == "file content"
+    assert staged_path.stat().st_mode & 0o777 == 0o644
+    assert workspace.registered_files[0][0] == staged_path
+    assert file_info["path"] == str(source_path)
+
+
+def test_register_uploaded_files_for_agent_reuses_existing_file_id_binding(
+    db_session,
+    tmp_path,
+):
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="repeat-file",
+        user_id=1,
+        task_id=10,
+        filename="repeat.txt",
+    )
+
+    class Workspace:
+        def __init__(self):
+            self.input_dir = str(tmp_path / "workspace" / "input")
+            self.bindings: dict[str, Path] = {}
+            self.bind_calls = 0
+
+        def resolve_file_id(self, file_id):
+            return self.bindings.get(file_id)
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(path=Path(path), is_workspace_file=True)
+
+        def bind_already_durable_file(self, registration, *, file_id):
+            self.bind_calls += 1
+            self.bindings[file_id] = registration.path
+
+    workspace = Workspace()
+    agent_service = SimpleNamespace(workspace=workspace)
+
+    first = {
+        "file_id": "repeat-file",
+        "name": "repeat.txt",
+        "path": str(upload.storage_path),
+        "workspace_path": None,
+    }
+    second = dict(first)
+    _register_uploaded_files_for_agent(agent_service, [first])
+    _register_uploaded_files_for_agent(agent_service, [second])
+
+    assert second["workspace_path"] == first["workspace_path"]
+    assert list(Path(workspace.input_dir).glob("repeat*.txt")) == [
+        Path(first["workspace_path"])
+    ]
+    assert workspace.bind_calls == 1
+
+
+def test_register_uploaded_files_materializes_legacy_symlink_without_new_attachment(
+    db_session,
+    tmp_path,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="legacy-file",
+        user_id=owner.id,
+        task_id=task.id,
+        filename="legacy.txt",
+    )
+    source_path = Path(upload.storage_path).resolve()
+    source_path.chmod(0o600)
+    db_session.commit()
+
+    class Workspace:
+        def __init__(self):
+            self.input_dir = str(tmp_path / "workspace" / "input")
+            self.owner_user_id = owner.id
+            self.db_task_id = task.id
+            self.registered_files = []
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(path=Path(path), is_workspace_file=True)
+
+        def bind_already_durable_file(self, registration, *, file_id):
+            self.registered_files.append((registration.path, file_id))
+
+    workspace = Workspace()
+    input_dir = Path(workspace.input_dir)
+    input_dir.mkdir(parents=True)
+    legacy_input = input_dir / "legacy.txt"
+    legacy_input.symlink_to(source_path)
+    unrelated_source = tmp_path / "unrelated-secret.txt"
+    unrelated_source.write_text("secret", encoding="utf-8")
+    unrelated_source.chmod(0o600)
+    unrelated_link = input_dir / "unrelated.txt"
+    unrelated_link.symlink_to(unrelated_source)
+
+    _register_uploaded_files_for_agent(SimpleNamespace(workspace=workspace), [])
+
+    assert legacy_input.is_file()
+    assert not legacy_input.is_symlink()
+    assert legacy_input.read_text(encoding="utf-8") == "file content"
+    assert source_path.stat().st_mode & 0o777 == 0o600
+    assert workspace.registered_files == [(legacy_input, "legacy-file")]
+    assert unrelated_link.is_symlink()
+    assert unrelated_source.stat().st_mode & 0o777 == 0o600
+
+
+def test_legacy_input_materialization_failure_does_not_block_turn(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="legacy-file",
+        user_id=owner.id,
+        task_id=task.id,
+        filename="legacy.txt",
+    )
+    source_path = Path(upload.storage_path).resolve()
+    db_session.commit()
+
+    workspace = SimpleNamespace(
+        input_dir=str(tmp_path / "workspace" / "input"),
+        owner_user_id=owner.id,
+        db_task_id=task.id,
+    )
+    input_dir = Path(workspace.input_dir)
+    input_dir.mkdir(parents=True)
+    legacy_input = input_dir / "legacy.txt"
+    legacy_input.symlink_to(source_path)
+
+    def fail_copy(*_args, **_kwargs):
+        raise OSError("source disappeared")
+
+    monkeypatch.setattr(
+        "xagent.web.services.task_execution._copy_durable_input_to_workspace",
+        fail_copy,
+    )
+
+    _register_uploaded_files_for_agent(SimpleNamespace(workspace=workspace), [])
+
+    assert legacy_input.is_symlink()
 
 
 def test_get_display_user_message_reads_agent_context_state():

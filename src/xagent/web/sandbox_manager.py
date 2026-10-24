@@ -1057,21 +1057,28 @@ class SandboxManager:
                 if target != backend_path:
                     # Folding compares physical identities but deliberately
                     # retains the operator's lexical spelling for the bind.
-                    # Rebase the managed suffix onto that spelling before the
-                    # descriptor walk so a supported symlink alias and its
-                    # physical uploads path use one containment domain.
-                    physical_trusted_root = Path(os.path.realpath(trusted_root))
-                    physical_target = Path(os.path.realpath(target))
+                    lexical_target = Path(os.path.abspath(target))
                     try:
-                        managed_suffix = physical_target.relative_to(
-                            physical_trusted_root
-                        )
-                    except ValueError as exc:
-                        raise SandboxContractError(
-                            "Docker workspace root is outside its folded bind "
-                            f"root: {target}"
-                        ) from exc
-                    grant_target = trusted_root / managed_suffix
+                        lexical_target.relative_to(Path(os.path.abspath(trusted_root)))
+                    except ValueError:
+                        # Rebase a physical uploads spelling onto an
+                        # operator-controlled bind alias. Resolve only those
+                        # trusted prefixes; keep the sandbox-controlled suffix
+                        # lexical so the descriptor walk rejects planted links.
+                        physical_trusted_root = Path(os.path.realpath(trusted_root))
+                        uploads_root = Path(os.path.abspath(get_uploads_dir()))
+                        physical_uploads_root = Path(os.path.realpath(uploads_root))
+                        try:
+                            uploads_suffix = physical_uploads_root.relative_to(
+                                physical_trusted_root
+                            )
+                            managed_suffix = lexical_target.relative_to(uploads_root)
+                        except ValueError as exc:
+                            raise SandboxContractError(
+                                "Docker workspace root is outside its folded bind "
+                                f"root: {target}"
+                            ) from exc
+                        grant_target = trusted_root / uploads_suffix / managed_suffix
                 grant_sandbox_runtime_access(grant_target, trusted_root=trusted_root)
             elif should_create or target.exists():
                 try:

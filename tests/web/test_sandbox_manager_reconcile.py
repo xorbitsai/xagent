@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import os
 import stat
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -976,8 +977,45 @@ class TestProviderCacheMountIntentGate:
 
         assert prepare_root.is_dir()
         assert stat.S_IMODE(physical_uploads.stat().st_mode) == 0o755
-        assert stat.S_IMODE((physical_uploads / "user_42").stat().st_mode) == 0o750
-        assert stat.S_IMODE(prepare_root.stat().st_mode) == 0o750
+        for managed_path in (physical_uploads / "user_42", prepare_root):
+            managed_mode = stat.S_IMODE(managed_path.stat().st_mode)
+            assert managed_mode & 0o777 == 0o750
+            if sys.platform == "linux":
+                assert managed_mode & stat.S_ISGID
+
+    def test_folded_mount_rejects_symlink_in_managed_suffix(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        physical_uploads = tmp_path / "physical-uploads"
+        physical_uploads.mkdir(mode=0o755)
+        uploads_alias = tmp_path / "uploads-alias"
+        uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+        protected = physical_uploads / "protected"
+        protected.mkdir(mode=0o755)
+        redirected_component = physical_uploads / "user_42"
+        redirected_component.symlink_to(protected, target_is_directory=True)
+        prepare_root = redirected_component / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: physical_uploads
+        )
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+
+        with pytest.raises(SandboxContractError):
+            manager._prepare_workspace_mounts(
+                "user",
+                "42",
+                SandboxMountIntent(mount_root=str(uploads_alias)),
+                prepare_root=str(prepare_root),
+            )
+
+        assert stat.S_IMODE(protected.stat().st_mode) == 0o755
+        assert not (protected / "scope-a").exists()
 
     @pytest.mark.asyncio
     async def test_reused_container_still_prepares_managed_mount(

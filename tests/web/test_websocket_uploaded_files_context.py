@@ -2011,6 +2011,59 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     assert file_info["path"] == str(source_path)
 
 
+def test_register_uploaded_files_materializes_legacy_symlink_without_new_attachment(
+    db_session,
+    tmp_path,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="legacy-file",
+        user_id=owner.id,
+        task_id=task.id,
+        filename="legacy.txt",
+    )
+    source_path = Path(upload.storage_path).resolve()
+    source_path.chmod(0o600)
+    db_session.commit()
+
+    class Workspace:
+        def __init__(self):
+            self.input_dir = str(tmp_path / "workspace" / "input")
+            self.owner_user_id = owner.id
+            self.db_task_id = task.id
+            self.registered_files = []
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(path=Path(path), is_workspace_file=True)
+
+        def bind_already_durable_file(self, registration, *, file_id):
+            self.registered_files.append((registration.path, file_id))
+
+    workspace = Workspace()
+    input_dir = Path(workspace.input_dir)
+    input_dir.mkdir(parents=True)
+    legacy_input = input_dir / "legacy.txt"
+    legacy_input.symlink_to(source_path)
+    unrelated_source = tmp_path / "unrelated-secret.txt"
+    unrelated_source.write_text("secret", encoding="utf-8")
+    unrelated_source.chmod(0o600)
+    unrelated_link = input_dir / "unrelated.txt"
+    unrelated_link.symlink_to(unrelated_source)
+
+    _register_uploaded_files_for_agent(SimpleNamespace(workspace=workspace), [])
+
+    assert legacy_input.is_file()
+    assert not legacy_input.is_symlink()
+    assert legacy_input.read_text(encoding="utf-8") == "file content"
+    assert source_path.stat().st_mode & 0o777 == 0o600
+    assert workspace.registered_files == [(legacy_input, "legacy-file")]
+    assert unrelated_link.is_symlink()
+    assert unrelated_source.stat().st_mode & 0o777 == 0o600
+
+
 def test_get_display_user_message_reads_agent_context_state():
     context = SimpleNamespace(
         state={

@@ -166,6 +166,7 @@ from .file_turn import (
     build_prompt_context_block,
     normalize_filename,
     prompt_context_from_agent_config,
+    resolve_turn_file_infos,
 )
 from .mcp_runtime import (
     MCPActorExecutionIdentity,
@@ -5425,6 +5426,91 @@ def _copy_durable_input_to_workspace(source: Path, target: Path) -> None:
             temp_path.unlink(missing_ok=True)
 
 
+def _materialize_legacy_task_input_symlinks(workspace: Any, input_dir: Path) -> None:
+    """Replace authorized pre-upgrade input symlinks with task-local copies."""
+
+    owner_user_id = getattr(workspace, "owner_user_id", None)
+    task_id = getattr(workspace, "db_task_id", None)
+    if task_id is None:
+        task_id = getattr(workspace, "current_task_id", None)
+    if (
+        not isinstance(owner_user_id, int)
+        or isinstance(owner_user_id, bool)
+        or not isinstance(task_id, int)
+        or isinstance(task_id, bool)
+    ):
+        return
+
+    legacy_links: dict[Path, Path] = {}
+    try:
+        entries = tuple(input_dir.iterdir())
+    except OSError:
+        logger.warning(
+            "Failed to inspect legacy task inputs in %s", input_dir, exc_info=True
+        )
+        return
+    for candidate in entries:
+        try:
+            if not candidate.is_symlink():
+                continue
+            raw_target = Path(os.readlink(candidate))
+        except OSError:
+            continue
+        if not raw_target.is_absolute():
+            raw_target = candidate.parent / raw_target
+        legacy_links[candidate] = Path(os.path.abspath(raw_target))
+    if not legacy_links:
+        return
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        linked_sources = set(legacy_links.values())
+        file_ids = [
+            str(row.file_id)
+            for row in db.query(UploadedFile.file_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id == owner_user_id,
+                UploadedFile.task_id == task_id,
+                UploadedFile.storage_status != "compensating",
+            )
+            .all()
+            if Path(os.path.realpath(str(row.storage_path))) in linked_sources
+        ]
+        if not file_ids:
+            return
+        file_infos, _missing = resolve_turn_file_infos(
+            file_ids=file_ids,
+            owner_user_id=owner_user_id,
+            task_id=task_id,
+            db=db,
+        )
+
+    authorized_sources: dict[Path, dict[str, Any]] = {}
+    for file_info in file_infos:
+        raw_source_path = str(file_info.get("path") or "")
+        if not raw_source_path:
+            continue
+        source_path = Path(raw_source_path)
+        authorized_sources[Path(os.path.realpath(source_path))] = file_info
+
+    for candidate, linked_source in legacy_links.items():
+        matched_file_info = authorized_sources.get(linked_source)
+        if matched_file_info is None:
+            continue
+        source_path = Path(str(matched_file_info["path"]))
+        _copy_durable_input_to_workspace(source_path, candidate)
+        registration = workspace.describe_file_registration(str(candidate))
+        workspace.bind_already_durable_file(
+            registration,
+            file_id=str(matched_file_info["file_id"]),
+        )
+        logger.info(
+            "Materialized legacy task input: storage=%s input_path=%s",
+            source_path,
+            candidate,
+        )
+
+
 def _register_uploaded_files_for_agent(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
@@ -5437,6 +5523,7 @@ def _register_uploaded_files_for_agent(
 
     input_dir = Path(workspace.input_dir)
     input_dir.mkdir(parents=True, exist_ok=True)
+    _materialize_legacy_task_input_symlinks(workspace, input_dir)
 
     for file_info in file_info_list:
         file_id = str(file_info.get("file_id") or "")

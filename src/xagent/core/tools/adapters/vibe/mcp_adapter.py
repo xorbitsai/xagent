@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Annotated,
     Any,
     Dict,
@@ -100,6 +101,9 @@ from .signed_upload import (
     parse_signed_upload_response,
 )
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateResolution, MCPApprovalGateScope
 
 _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
 
@@ -4297,9 +4301,7 @@ async def load_execution_scoped_chrome_tools(
     allow_users: Optional[List[str]] = None,
 ) -> SandboxedMCPLoadResult:
     # Lazy web import preserves the existing core-only MCP adapter import path.
-    from .....web.services.chrome_mcp_runtime import (
-        get_chrome_execution_session_pool,
-    )
+    from .....web.services.chrome_mcp_runtime import get_chrome_execution_session_pool
 
     launch = ChromeDaemonLaunchSpec.from_connection(connection)
     pool = get_chrome_execution_session_pool()
@@ -4845,6 +4847,9 @@ async def load_mcp_tools_as_agent_tools(
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
     workspace: Any | None = None,
+    approval_scope: "MCPApprovalGateScope | None" = None,
+    approval_resolution: "MCPApprovalGateResolution | None" = None,
+    approval_supported: bool = True,
 ) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
@@ -5000,6 +5005,9 @@ async def load_mcp_tools_as_agent_tools(
                     server_tools,
                     connection=connection,
                     connector_ref=(connector_refs or {}).get(server_name),
+                    approval_scope=approval_scope,
+                    approval_resolution=approval_resolution,
+                    approval_supported=approval_supported,
                 )
             )
             if server_tools:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from xagent.core.agent.service import AgentService
+from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
 from xagent.core.tools.adapters.vibe.config import (
     MCPToolLoadSummary,
     MCPUnavailableSummary,
@@ -13,13 +16,59 @@ from xagent.core.tools.adapters.vibe.config import (
 )
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ConnectorRef,
     ConnectorRuntimeError,
+)
+from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+    MCPApprovalGateResolution,
+    gate_mcp_tools,
+    register_mcp_approval_gate,
+    unregister_mcp_approval_gate,
 )
 
 
 class NamedTool:
     def __init__(self, name: str) -> None:
         self.name = name
+
+
+class _MCPArgs(BaseModel):
+    text: str = ""
+
+
+class RefreshMCPTool(AbstractBaseTool):
+    def __init__(self, raw_name: str) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.mcp_tool = SimpleNamespace(name=raw_name)
+        self._metadata = ToolMetadata(
+            name=f"mcp_test_{raw_name}", concurrency_safe=True, read_only=True
+        )
+
+    @property
+    def metadata(self) -> ToolMetadata:
+        return self._metadata
+
+    @property
+    def name(self) -> str:
+        return self._metadata.name
+
+    @property
+    def description(self) -> str:
+        return "MCP cache refresh test tool"
+
+    def args_type(self) -> type[BaseModel]:
+        return _MCPArgs
+
+    def return_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"success": True}
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        self.calls.append(dict(args))
+        return {"success": True}
 
 
 class RefreshingToolConfig:
@@ -67,6 +116,15 @@ class AllowedToolsConfig:
 
     def get_allowed_tools(self) -> list[str] | None:
         return self.allowed_tools
+
+
+class ApprovalResolutionConfig(AllowedToolsConfig):
+    def __init__(self, resolution: MCPApprovalGateResolution) -> None:
+        super().__init__()
+        self.resolution = resolution
+
+    def get_mcp_approval_gate_resolution(self) -> MCPApprovalGateResolution:
+        return self.resolution
 
 
 class SnapshotRefreshingToolConfig(AllowedToolsConfig):
@@ -169,6 +227,114 @@ async def test_agent_service_refreshes_initialized_tools_when_policy_changes(
     await service._ensure_tools_initialized()
     assert {tool.name for tool in service.tools} == {"allowed"}
     assert tool_config.refresh_count == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_service_refreshes_unknown_tools_when_matcher_registers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolution = MCPApprovalGateResolution.unknown(
+        task_source="external", reason="registration_unavailable"
+    )
+    tool_config = ApprovalResolutionConfig(resolution)
+    built: list[tuple[RefreshMCPTool, RefreshMCPTool]] = []
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        write = RefreshMCPTool("create_post")
+        read = RefreshMCPTool("get_profile")
+        built.append((write, read))
+        return gate_mcp_tools(
+            [write, read],
+            connector_ref=ConnectorRef("mcp", 41),
+            approval_resolution=resolution,
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="mcp-approval-registration-refresh-test",
+        id="mcp-approval-registration-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+    initial_write, initial_read = built[0]
+    assert service.tools == [initial_write, initial_read]
+
+    async def unused_gate(_: Any) -> Any:
+        raise AssertionError("UNKNOWN fencing must not invoke the gate")
+
+    async def unused_resume(**_: Any) -> Any:
+        raise AssertionError("resume must not run")
+
+    registration = register_mcp_approval_gate(
+        task_source="external",
+        gate=unused_gate,
+        resume=unused_resume,
+        tool_matcher=lambda _ref, raw_name: raw_name == "create_post",
+        classifier=lambda _: True,
+    )
+    try:
+        await service._ensure_tools_initialized()
+        rebuilt_write, rebuilt_read = built[1]
+        assert len(built) == 2
+        assert service.tools[0] is not rebuilt_write
+        assert service.tools[1] is rebuilt_read
+        assert await service.tools[0].run_json_async({"text": "publish"}) == {
+            "success": False,
+            "status": "error",
+            "error": (
+                "The connector approval gate is unavailable. The call was not sent."
+            ),
+        }
+        assert rebuilt_write.calls == []
+        assert await service.tools[1].run_json_async({"text": "read"}) == {
+            "success": True
+        }
+        assert rebuilt_read.calls == [{"text": "read"}]
+    finally:
+        unregister_mcp_approval_gate(registration)
+
+
+@pytest.mark.asyncio
+async def test_agent_service_publishes_refreshed_approval_resolution_to_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unknown = MCPApprovalGateResolution.unknown(
+        task_source="external", reason="registration_unavailable"
+    )
+    tool_config = ApprovalResolutionConfig(unknown)
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        return []
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="mcp-approval-resolution-refresh-test",
+        id="mcp-approval-resolution-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+    await service._ensure_tools_initialized()
+    service._execution_adapter = service._build_execution_adapter()
+    first_runner, _ = service._execution_adapter._build_runner()
+    assert first_runner.agent.mcp_approval_resolution is unknown
+
+    off = MCPApprovalGateResolution.off(task_source="external")
+    tool_config.resolution = off
+    await service._ensure_tools_initialized()
+
+    assert service._execution_adapter.config.mcp_approval_resolution is off
+    refreshed_runner, _ = service._execution_adapter._build_runner()
+    assert refreshed_runner.agent.mcp_approval_resolution is off
 
 
 @pytest.mark.asyncio

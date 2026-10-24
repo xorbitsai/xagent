@@ -420,6 +420,15 @@ class _SigConfig:
         return self._allowlist
 
 
+class _ApprovalSigConfig(_SigConfig):
+    def __init__(self, resolution) -> None:
+        super().__init__(None)
+        self._resolution = resolution
+
+    def get_mcp_approval_gate_resolution(self):
+        return self._resolution
+
+
 def _signature(config):
     from xagent.core.agent.service import AgentService
 
@@ -459,3 +468,22 @@ def test_signature_backward_compatible_without_allowlist_methods():
     svc.tool_config = legacy
     # truthy config required; SimpleNamespace() is truthy.
     assert isinstance(svc._current_tool_policy_signature(), tuple)
+
+
+def test_signature_tracks_immutable_approval_resolution_identity():
+    from xagent.mcp_approval_gate import (
+        MCPApprovalGateResolution,
+        MCPApprovalGateScope,
+    )
+
+    on = MCPApprovalGateResolution.on(MCPApprovalGateScope("external", "scope-1"))
+    off = MCPApprovalGateResolution.off(task_source="external")
+    unknown = MCPApprovalGateResolution.unknown(
+        task_source="external", reason="provider_unavailable"
+    )
+
+    assert _signature(_ApprovalSigConfig(on)) != _signature(_ApprovalSigConfig(off))
+    assert _signature(_ApprovalSigConfig(off)) != _signature(
+        _ApprovalSigConfig(unknown)
+    )
+    assert _signature(_ApprovalSigConfig(on)) == _signature(_ApprovalSigConfig(on))

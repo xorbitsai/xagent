@@ -1964,6 +1964,9 @@ class AgentRunner:
             ),
             skill_manager=getattr(self.agent, "skill_manager", None),
             allowed_skills=getattr(self.agent, "allowed_skills", None),
+            mcp_approval_resolution=getattr(
+                self.agent, "mcp_approval_resolution", None
+            ),
         )
 
     async def _setup_tools(self, tools: list[Any], *, task_id: str) -> None:

@@ -13,7 +13,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypeGuard, TypeVar
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TypeGuard, TypeVar
+
+if TYPE_CHECKING:
+    from .mcp_approval_gate import MCPApprovalGateResolution
 
 from ..... import config as _root_config
 
@@ -303,6 +306,18 @@ class BaseToolConfig(ABC):
         """Return a workspace prepared by the task runtime, when present."""
 
         return None
+
+    def get_mcp_approval_gate_resolution(
+        self,
+    ) -> "MCPApprovalGateResolution | None":
+        """Return an explicit task approval resolution, or legacy absence."""
+
+        return None
+
+    def get_mcp_approval_supported(self) -> bool:
+        """Whether this execution can surface and resume approval prompts."""
+
+        return True
 
     @abstractmethod
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:

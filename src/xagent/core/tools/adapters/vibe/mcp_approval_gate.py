@@ -1,25 +1,25 @@
-"""Host-scoped approval boundary for deferred MCP calls.
+"""Task- and tool-scoped approval boundary for deferred MCP calls.
 
-The module has no web or ORM dependencies. A host registers async hooks for
-one exact task source, and the MCP loader wraps both direct and sandboxed tools
-at their common host-side boundary.
+The module has no web or ORM dependencies. A host registers policy hooks for
+one exact task source, mints immutable authority for a resolved task, and the
+MCP loader wraps matcher-selected direct and sandboxed tools at their common
+host-side boundary. Legacy source-wide registrations remain supported until
+their callers migrate to explicit :class:`MCPApprovalGateResolution` values.
 
 Scoping contract
 ----------------
-**An unregistered or absent ``task_source`` is not gated.** A call whose source
-has no registration dispatches to the wrapped tool exactly as it did before the
-wrapper existed, and :attr:`MCPApprovalGateTool.metadata` reports the wrapped
-tool's own metadata. Fail-closed behavior applies only to a call whose source
-*is* registered: such a call must present a complete execution identity and a
-connector ref, or it is refused before dispatch.
+Explicit ``OFF`` preserves the exact raw tools and metadata. Explicit ``ON``
+requires live authority and applies the static matcher before the per-call
+classifier. ``UNKNOWN`` maps to a rollback fence: while the live matcher is
+available only its selected tools are refused, and approved resumes remain
+pending for recovery. Without a live matcher ``UNKNOWN`` passes raw tools
+through because widening uncertainty into an all-tools outage is forbidden.
+Stale or forged explicit authority fails closed; when a live matcher exists,
+that closure is limited to matcher-selected tools.
 
-Hosts that need gating must therefore bind ``task_source`` at their own entry
-point. A host that registers a gate for ``"slack"`` but forgets to bind
-``task_source="slack"`` on its executions gets *no* approval prompt; it does
-not get a fleet-wide outage. This is deliberate: the wrapper sits on the single
-loader boundary shared by every execution entry point in the process, so a
-global fail-closed rule would take every other host's MCP traffic - read-only
-calls included - down with it the moment any one tenant registered a gate.
+Omitting a resolution and scope preserves the legacy path. An unregistered or
+absent legacy ``task_source`` is not gated, so unrelated traffic continues to
+dispatch exactly as it did before the wrapper existed.
 
 The one place the wrapper still fails closed without a matching registration is
 :meth:`MCPApprovalGateTool.resume_user_interaction` for an interaction that
@@ -60,55 +60,10 @@ incorrectness rather than an error.
    ledger froze at approval time, and refuse on mismatch. Until it does, the
    "approved call == executed call" property is *not* enforced anywhere.
 
-Host integration: which ``task_source`` to register
----------------------------------------------------
-The ``"slack"`` example above is deliberately a *host-stamped* value, not one
-this repository produces. Registering a source that no row carries silently
-gates nothing, and registering one that several producers share over-scopes
-the gate, so the real taxonomy matters. ``Task.source`` is ``String(20)``,
-``default="internal"``, nullable:
-
-=========================================  ====================================
-``Task.source``                            produced by
-=========================================  ====================================
-``"internal"``                             Web UI / WebSocket / REST chat
-                                           (``task_command_execution``) **and**
-                                           every Slack / Telegram / Feishu task,
-                                           direct and shared (``channel_runtime``)
-                                           - both construct ``Task(...)`` with no
-                                           ``source=`` and fall to the column
-                                           default
-``"sdk"``                                  SDK (``task_start``, ``api/v1``)
-``"a2a"``                                  A2A (``task_start``, ``task_resume``)
-``"trigger"``                              scheduled triggers
-``"widget"`` / ``"shared_link"``           public chat surfaces
-caller-supplied, lower-cased,              workforce runs
-``"internal"`` by default
-``"external"``                             stamped by the SaaS deployment for
-                                           its own session transports; never
-                                           written by this repository
-=========================================  ====================================
-
-Two consequences a host must plan for.
-
-**The channel bots do not have a source of their own.** There is no string
-that selects Slack/Telegram/Feishu without also selecting the web UI, because
-both are ``"internal"``. Registering ``"internal"`` gates the entire default
-surface of the deployment - every web chat turn as well as every channel turn.
-A host that wants to gate one tenant or one channel flow must therefore
-**stamp a distinct ``Task.source`` on the tasks it creates** and register that
-value. This is the supported way to scope the gate; there is no per-channel
-registration key.
-
-**A nested sub-agent run is not covered by the parent's registration.** An
-``AgentTool`` delegation builds a fresh execution context with no inherited
-``task_source``, and nested interactions are unsupported
-(``agent_tool._classify_delegated_child_failure`` turns a paused child into a
-failure), so a child cannot pause for approval even in principle. Rather than
-let a delegated run dispatch governed connector writes outside the parent's
-approval scope, ``AgentTool`` refuses to materialize MCP tools for a child
-whose parent source has a registration, and reports them to the model as
-unavailable. A parent whose source is unregistered is unaffected.
+This core deliberately does not define provider aggregation, source taxonomy,
+delegation propagation, web configuration, or production enrollment. Those
+layers consume the public resolution and scope contract without being coupled
+back into the generic gate.
 """
 
 from __future__ import annotations
@@ -123,6 +78,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from threading import BoundedSemaphore
 from threading import Event as ThreadEvent
 from threading import RLock
 from typing import Any, Literal, Optional, Type
@@ -138,6 +94,7 @@ logger = logging.getLogger(__name__)
 
 GateDecisionValue = Literal["allow", "require_approval", "deny"]
 ExecutionPattern = Literal["react", "dag"]
+MCPApprovalGateResolutionState = Literal["on", "off", "unknown"]
 
 _GATE_FAILURE = {
     "success": False,
@@ -149,6 +106,13 @@ _UNSUPPORTED_PATTERN = {
     "status": "denied",
     "error": "Deferred MCP approval is not supported for this execution pattern.",
 }
+_NESTED_APPROVAL_UNAVAILABLE = {
+    "success": False,
+    "status": "denied",
+    "failure_code": "nested_delegation_not_approvable",
+    "error": "Deferred MCP approval is unavailable in delegated execution.",
+}
+_ROLLBACK_FENCE_REGISTRATION_ID = "rollback-fence"
 # Default for how long the gate will wait to OBSERVE a connector write that
 # has already been dispatched - both on the ordinary success path and when
 # draining after a cancellation. Deliberately not the registration's
@@ -180,6 +144,9 @@ _DISPATCH_CLEANUP_SECONDS = 5.0
 # ``ensure_future`` result can be garbage collected mid-flight, which would
 # abandon exactly the teardown this set exists to guarantee.
 _ORPHANED_DISPATCH_CLEANUPS: set["asyncio.Task[None]"] = set()
+# Synchronous classifiers run outside the event loop. Bound detached workers so
+# one broken host policy cannot grow an unbounded executor queue.
+_SYNC_CLASSIFIER_SLOTS = BoundedSemaphore(4)
 
 
 @dataclass(frozen=True)
@@ -229,6 +196,9 @@ class GatedCall:
     canonical_arguments_json: str
     arguments_sha256: str
     execution_context: ToolCallExecutionContext
+    # Exact MCP-advertised name used by the static matcher. ``None`` preserves
+    # compatibility for hosts constructing snapshots outside the MCP loader.
+    raw_tool_name: str | None = None
 
     @classmethod
     def from_arguments(
@@ -238,6 +208,7 @@ class GatedCall:
         tool_name: str,
         arguments: Mapping[str, Any],
         execution_context: ToolCallExecutionContext,
+        raw_tool_name: str | None = None,
     ) -> GatedCall:
         canonical = json.dumps(
             dict(arguments),
@@ -255,6 +226,7 @@ class GatedCall:
             canonical_arguments_json=canonical,
             arguments_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
             execution_context=execution_context,
+            raw_tool_name=raw_tool_name,
         )
 
     @property
@@ -302,6 +274,8 @@ class GateDecision:
 
 GateHook = Callable[[GatedCall], Any]
 GateResumeHook = Callable[..., Any]
+GateClassifier = Callable[[GatedCall], Any]
+GateToolMatcher = Callable[[ConnectorRef, str], bool]
 
 
 @dataclass(frozen=True)
@@ -310,6 +284,100 @@ class MCPApprovalGateRegistration:
 
     task_source: str
     registration_id: str
+
+
+@dataclass(frozen=True)
+class MCPApprovalGateScope:
+    """Trusted task-scoped authority minted from one live registration."""
+
+    task_source: str
+    registration_id: str
+
+
+@dataclass(frozen=True)
+class MCPApprovalGateResolution:
+    """Explicit immutable ON/OFF/UNKNOWN task approval resolution.
+
+    ``None`` is deliberately not one of the states. Callers may still omit a
+    resolution entirely to preserve the legacy integration path, but a runtime
+    provider that answered must return one of these three exact values.
+    """
+
+    state: MCPApprovalGateResolutionState
+    task_source: str
+    scope: MCPApprovalGateScope | None = None
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_task_source(self.task_source)
+        if self.state == "on":
+            if (
+                not isinstance(self.scope, MCPApprovalGateScope)
+                or self.scope.task_source != self.task_source
+                or self.reason is not None
+            ):
+                raise ValueError(
+                    "an ON approval resolution requires a same-source scope and no reason"
+                )
+            return
+        if self.state == "off":
+            if self.scope is not None or self.reason is not None:
+                raise ValueError(
+                    "an OFF approval resolution cannot carry scope or reason"
+                )
+            return
+        if self.state == "unknown":
+            if self.scope is not None:
+                raise ValueError("an UNKNOWN approval resolution cannot carry a scope")
+            if (
+                not isinstance(self.reason, str)
+                or not self.reason
+                or self.reason.strip() != self.reason
+            ):
+                raise ValueError(
+                    "an UNKNOWN approval resolution requires a non-empty trimmed reason"
+                )
+            return
+        raise ValueError(f"invalid MCP approval resolution state: {self.state!r}")
+
+    @classmethod
+    def on(cls, scope: MCPApprovalGateScope) -> "MCPApprovalGateResolution":
+        if not isinstance(scope, MCPApprovalGateScope):
+            raise TypeError("scope must be an MCPApprovalGateScope")
+        return cls(state="on", task_source=scope.task_source, scope=scope)
+
+    @classmethod
+    def off(cls, *, task_source: str) -> "MCPApprovalGateResolution":
+        return cls(state="off", task_source=task_source)
+
+    @classmethod
+    def unknown(cls, *, task_source: str, reason: str) -> "MCPApprovalGateResolution":
+        return cls(state="unknown", task_source=task_source, reason=reason)
+
+    @property
+    def approval_scope(self) -> MCPApprovalGateScope | None:
+        """Map the explicit resolution onto the core loader authority seam."""
+
+        if self.state == "on":
+            return self.scope
+        if self.state == "unknown":
+            return mcp_approval_gate_rollback_fence(task_source=self.task_source)
+        return None
+
+    @property
+    def signature_identity(self) -> tuple[str, str, str | None, str | None]:
+        """Stable primitive identity for tool caches and rebuild signatures."""
+
+        return (
+            self.state,
+            self.task_source,
+            self.scope.registration_id if self.scope is not None else None,
+            self.reason,
+        )
+
+
+class MCPApprovalGateTemporarilyUnavailable(RuntimeError):
+    """A gated approval remains pending until trusted authority recovers."""
 
 
 @dataclass(frozen=True)
@@ -407,9 +475,12 @@ class _RegisteredHooks:
     resume: GateResumeHook
     timeout_seconds: float
     dispatch_observe_seconds: float
+    tool_matcher: GateToolMatcher | None = None
+    classifier: GateClassifier | None = None
 
 
 _REGISTRATIONS: dict[str, _RegisteredHooks] = {}
+_REGISTRATION_GENERATIONS: dict[str, int] = {}
 _REGISTRATIONS_LOCK = RLock()
 _CURRENT_TOOL_CALL_CONTEXT: ContextVar[ToolCallExecutionContext | None] = ContextVar(
     "xagent_mcp_gate_tool_call_context", default=None
@@ -419,6 +490,15 @@ _CURRENT_REPLAY_CONTEXT: ContextVar[MCPApprovalReplayContext | None] = ContextVa
 )
 
 
+def _validate_task_source(task_source: str) -> None:
+    if (
+        not isinstance(task_source, str)
+        or not task_source
+        or task_source.strip() != task_source
+    ):
+        raise ValueError("task_source must be a non-empty trimmed string")
+
+
 def register_mcp_approval_gate(
     *,
     task_source: str,
@@ -426,6 +506,8 @@ def register_mcp_approval_gate(
     resume: GateResumeHook,
     timeout_seconds: float = 10.0,
     dispatch_observe_seconds: float | None = None,
+    tool_matcher: GateToolMatcher | None = None,
+    classifier: GateClassifier | None = None,
 ) -> MCPApprovalGateRegistration:
     """Register async hooks for one task source; duplicate scopes are refused.
 
@@ -441,14 +523,15 @@ def register_mcp_approval_gate(
     as ``dispatch_unknown`` at an unrelated cutoff.
     """
 
-    if (
-        not isinstance(task_source, str)
-        or not task_source
-        or task_source.strip() != task_source
-    ):
-        raise ValueError("task_source must be a non-empty trimmed string")
+    _validate_task_source(task_source)
     if not callable(gate) or not callable(resume):
         raise TypeError("gate and resume hooks must be callable")
+    if (tool_matcher is None) != (classifier is None):
+        raise ValueError("tool_matcher and classifier must be supplied together")
+    if tool_matcher is not None and not callable(tool_matcher):
+        raise TypeError("tool_matcher must be callable")
+    if classifier is not None and not callable(classifier):
+        raise TypeError("classifier must be callable")
     if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be finite and positive")
     if dispatch_observe_seconds is not None and (
@@ -472,8 +555,34 @@ def register_mcp_approval_gate(
             resume=resume,
             timeout_seconds=float(timeout_seconds),
             dispatch_observe_seconds=resolved_observe_seconds,
+            tool_matcher=tool_matcher,
+            classifier=classifier,
+        )
+        _REGISTRATION_GENERATIONS[task_source] = (
+            _REGISTRATION_GENERATIONS.get(task_source, 0) + 1
         )
     return handle
+
+
+def mcp_approval_gate_scope(
+    handle: MCPApprovalGateRegistration,
+) -> MCPApprovalGateScope:
+    """Mint task authority from one active matcher/classifier registration."""
+
+    with _REGISTRATIONS_LOCK:
+        current = _REGISTRATIONS.get(handle.task_source)
+        if current is None or current.handle != handle:
+            raise ValueError("approval gate registration is not active")
+        if current.tool_matcher is None or current.classifier is None:
+            raise ValueError("legacy source-wide registrations have no task scope")
+    return MCPApprovalGateScope(handle.task_source, handle.registration_id)
+
+
+def mcp_approval_gate_rollback_fence(*, task_source: str) -> MCPApprovalGateScope:
+    """Represent UNKNOWN authority without confusing it with explicit OFF."""
+
+    _validate_task_source(task_source)
+    return MCPApprovalGateScope(task_source, _ROLLBACK_FENCE_REGISTRATION_ID)
 
 
 def unregister_mcp_approval_gate(handle: MCPApprovalGateRegistration) -> bool:
@@ -484,7 +593,18 @@ def unregister_mcp_approval_gate(handle: MCPApprovalGateRegistration) -> bool:
         if current is None or current.handle != handle:
             return False
         del _REGISTRATIONS[handle.task_source]
+        _REGISTRATION_GENERATIONS[handle.task_source] = (
+            _REGISTRATION_GENERATIONS.get(handle.task_source, 0) + 1
+        )
         return True
+
+
+def mcp_approval_gate_registration_generation(task_source: str) -> int:
+    """Return the monotonic approval-policy generation for one task source."""
+
+    _validate_task_source(task_source)
+    with _REGISTRATIONS_LOCK:
+        return _REGISTRATION_GENERATIONS.get(task_source, 0)
 
 
 def _registration_for(task_source: str | None) -> _RegisteredHooks | None:
@@ -492,8 +612,44 @@ def _registration_for(task_source: str | None) -> _RegisteredHooks | None:
         return _REGISTRATIONS.get(task_source) if task_source is not None else None
 
 
+def _registration_for_scope(
+    scope: MCPApprovalGateScope | None,
+) -> _RegisteredHooks | None:
+    if not isinstance(scope, MCPApprovalGateScope):
+        return None
+    with _REGISTRATIONS_LOCK:
+        current = _REGISTRATIONS.get(scope.task_source)
+        if (
+            current is None
+            or current.handle.registration_id != scope.registration_id
+            or current.tool_matcher is None
+            or current.classifier is None
+        ):
+            return None
+        return current
+
+
+def _scoped_registration_for_source(
+    task_source: str | None,
+) -> _RegisteredHooks | None:
+    registration = _registration_for(task_source)
+    if (
+        registration is None
+        or registration.tool_matcher is None
+        or registration.classifier is None
+    ):
+        return None
+    return registration
+
+
 def has_approval_gate_for_source(task_source: str | None) -> bool:
-    """Whether calls bound to ``task_source`` are subject to an approval gate.
+    """Backward-compatible alias for legacy source-wide gate discovery."""
+
+    return has_legacy_approval_gate_for_source(task_source)
+
+
+def has_legacy_approval_gate_for_source(task_source: str | None) -> bool:
+    """Whether calls bound to ``task_source`` use the legacy source-wide gate.
 
     Public because the host wiring has to answer one question this module
     cannot answer for it: may a *delegated* run materialize connectors that
@@ -503,12 +659,19 @@ def has_approval_gate_for_source(task_source: str | None) -> bool:
     parent's scope. ``None`` is never gated, matching dispatch.
     """
 
-    return _registration_for(task_source) is not None
+    registration = _registration_for(task_source)
+    return registration is not None and registration.tool_matcher is None
 
 
-def _has_registrations() -> bool:
+def has_scoped_approval_gate_for_source(task_source: str | None) -> bool:
+    """Whether ``task_source`` has a live task/tool-scoped registration."""
+
+    return _scoped_registration_for_source(task_source) is not None
+
+
+def _has_legacy_registrations() -> bool:
     with _REGISTRATIONS_LOCK:
-        return bool(_REGISTRATIONS)
+        return any(item.tool_matcher is None for item in _REGISTRATIONS.values())
 
 
 # Durable marker prefix for an interaction id this wrapper issued. The id is
@@ -548,9 +711,9 @@ def _gated_interaction_source(interaction_id: str) -> tuple[str, str] | None:
     keeps a never-gated interaction on the legacy resume path. This function
     parses untrusted-shaped input and must never raise: it is called at the top
     of ``resume_user_interaction``, outside any try, and ReAct invokes that
-    callback outside its own rollback block, so an exception here would escape
-    ``_deliver_pending_tool_interaction_responses`` with the pending entry
-    un-popped - i.e. a permanently stuck task.
+    callback outside its own rollback block. An accidental parser exception
+    would therefore abort the turn with the pending entry un-popped. Only the
+    explicit transient-authority exception uses that retry behavior on purpose.
     """
 
     parts = interaction_id.split(_GATED_INTERACTION_SEPARATOR, 2)
@@ -621,6 +784,58 @@ async def _call_async_hook(
 ) -> Any:
     returned = _ensure_awaitable(hook(*args, **kwargs))
     return await asyncio.wait_for(returned, timeout=timeout_seconds)
+
+
+async def _call_classifier(
+    classifier: GateClassifier,
+    timeout_seconds: float,
+    call: GatedCall,
+) -> Any:
+    """Run a side-effect-free classifier without blocking the event loop."""
+
+    if inspect.iscoroutinefunction(classifier) or inspect.iscoroutinefunction(
+        getattr(type(classifier), "__call__", None)
+    ):
+        return await asyncio.wait_for(classifier(call), timeout=timeout_seconds)
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    limiter = _SYNC_CLASSIFIER_SLOTS
+    while not limiter.acquire(blocking=False):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise TimeoutError("synchronous approval classifier capacity exhausted")
+        await asyncio.sleep(min(0.005, remaining))
+
+    task = asyncio.create_task(asyncio.to_thread(classifier, call))
+
+    def release_slot(completed: asyncio.Task[Any]) -> None:
+        limiter.release()
+        if not completed.cancelled():
+            completed.exception()
+
+    task.add_done_callback(release_slot)
+
+    def discard_late_awaitable(completed: asyncio.Task[Any]) -> None:
+        if completed.cancelled():
+            return
+        try:
+            late_result = completed.result()
+        except Exception:
+            return
+        if inspect.iscoroutine(late_result):
+            late_result.close()
+
+    try:
+        remaining = max(0.0, deadline - loop.time())
+        returned = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+    except (TimeoutError, asyncio.CancelledError):
+        task.add_done_callback(discard_late_awaitable)
+        raise
+    if not inspect.isawaitable(returned):
+        return returned
+    remaining = max(0.0, deadline - loop.time())
+    return await asyncio.wait_for(returned, timeout=remaining)
 
 
 def _connector_ref(connection: Mapping[str, Any]) -> ConnectorRef | None:
@@ -853,9 +1068,34 @@ class MCPApprovalGateTool(AbstractBaseTool):
         target: AbstractBaseTool,
         *,
         connector_ref: ConnectorRef | None,
+        scoped_registration: _RegisteredHooks | None = None,
+        approval_supported: bool = True,
+        invalid_scope: bool = False,
+        transient_fence: bool = False,
+        raw_tool_name: str | None = None,
     ) -> None:
         self._target = target
         self._connector_ref = connector_ref
+        self._scoped_registration = scoped_registration
+        self._approval_supported = approval_supported
+        self._invalid_scope = invalid_scope
+        self._transient_fence = transient_fence
+        self._raw_tool_name = raw_tool_name
+
+    def _registration(
+        self, context: ToolCallExecutionContext | None
+    ) -> _RegisteredHooks | None:
+        if self._scoped_registration is not None:
+            current = _registration_for(self._scoped_registration.handle.task_source)
+            if current is None or current.handle != self._scoped_registration.handle:
+                return None
+            return current
+        registration = _registration_for(context.task_source if context else None)
+        return (
+            registration
+            if registration is not None and registration.tool_matcher is None
+            else None
+        )
 
     @property
     def target(self) -> AbstractBaseTool:
@@ -876,7 +1116,12 @@ class MCPApprovalGateTool(AbstractBaseTool):
     @property
     def metadata(self) -> ToolMetadata:
         metadata = self._target.metadata
-        if not _has_registrations():
+        if (
+            self._scoped_registration is None
+            and not self._invalid_scope
+            and not self._transient_fence
+            and not _has_legacy_registrations()
+        ):
             return metadata
         # ReAct fans one user response out to every interaction paused in a
         # concurrent batch, so two gated calls batched together can both be
@@ -962,8 +1207,12 @@ class MCPApprovalGateTool(AbstractBaseTool):
         return True
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        if self._invalid_scope or self._transient_fence:
+            raise RuntimeError(f"MCP tool {self.name} has no usable approval authority")
         context = current_tool_call_execution_context()
-        registration = _registration_for(context.task_source if context else None)
+        registration = self._registration(context)
+        if self._scoped_registration is not None and registration is None:
+            raise RuntimeError(f"MCP tool {self.name} has a stale approval scope")
         if registration is None:
             # Unregistered or absent source: not this gate's business. Dispatch
             # exactly as the unwrapped tool would.
@@ -973,14 +1222,60 @@ class MCPApprovalGateTool(AbstractBaseTool):
         raise RuntimeError(f"MCP tool {self.name} requires async approval evaluation")
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        if self._invalid_scope or self._transient_fence:
+            return dict(_GATE_FAILURE)
         context = current_tool_call_execution_context()
-        registration = _registration_for(context.task_source if context else None)
+        registration = self._registration(context)
+        if self._scoped_registration is not None and registration is None:
+            return dict(_GATE_FAILURE)
         if registration is None:
             # Unregistered or absent source: transparent pass-through.
             return await self._target.run_json_async(args)
-        # From here the call's own source is registered, so every remaining
-        # exit fails closed.
-        if context is None or not context.is_complete() or self._connector_ref is None:
+        if self._scoped_registration is not None and (
+            context is None
+            or (
+                context.task_source != registration.handle.task_source
+                and not (not self._approval_supported and context.task_source is None)
+            )
+        ):
+            return dict(_GATE_FAILURE)
+        # Scoped registrations classify first. Only the gate hook below may
+        # create a durable prompt; the classifier must remain side-effect free.
+        if context is None or self._connector_ref is None:
+            return dict(_GATE_FAILURE)
+        try:
+            call = GatedCall.from_arguments(
+                connector_ref=self._connector_ref,
+                tool_name=self.name,
+                arguments=args,
+                execution_context=context,
+                raw_tool_name=self._raw_tool_name,
+            )
+            protected = True
+            if registration.classifier is not None:
+                protected = await _call_classifier(
+                    registration.classifier,
+                    registration.timeout_seconds,
+                    call,
+                )
+                if type(protected) is not bool:
+                    raise TypeError("approval classifier must return bool")
+        except Exception:
+            logger.warning(
+                "MCP approval classifier failed closed for tool=%s task_id=%s "
+                "tool_call_id=%s",
+                self.name,
+                context.task_id,
+                context.tool_call_id,
+                exc_info=True,
+            )
+            return dict(_GATE_FAILURE)
+
+        if not protected:
+            return await self._target.run_json_async(args)
+        if not self._approval_supported:
+            return dict(_NESTED_APPROVAL_UNAVAILABLE)
+        if not context.is_complete():
             return dict(_GATE_FAILURE)
         if context.pattern != "react":
             # Checked BEFORE the hook: a decision issued for an unsupported
@@ -989,12 +1284,6 @@ class MCPApprovalGateTool(AbstractBaseTool):
             return dict(_UNSUPPORTED_PATTERN)
 
         try:
-            call = GatedCall.from_arguments(
-                connector_ref=self._connector_ref,
-                tool_name=self.name,
-                arguments=args,
-                execution_context=context,
-            )
             decision = await _call_async_hook(
                 registration.gate,
                 registration.timeout_seconds,
@@ -1062,15 +1351,40 @@ class MCPApprovalGateTool(AbstractBaseTool):
         response: str,
     ) -> ToolInteractionSettlement | None:
         context = current_tool_call_execution_context()
-        registration = _registration_for(context.task_source if context else None)
         # What this wrapper itself recorded at pause time, carried durably in
         # the interaction id. ``None`` means the gate never gated this call.
         gated = _gated_interaction_source(interaction_id)
+        if self._transient_fence and gated is not None:
+            fence_source = (
+                self._scoped_registration.handle.task_source
+                if self._scoped_registration is not None
+                else None
+            )
+            if (
+                gated[0] == fence_source
+                and context is not None
+                and context.task_source == fence_source
+            ):
+                # Raising keeps ReAct's existing callback-delivery transaction
+                # intact: the pending response is not popped or terminally
+                # projected, so a later turn may retry after authority recovers.
+                raise MCPApprovalGateTemporarilyUnavailable(
+                    "MCP approval authority is temporarily unavailable"
+                )
+        registration = self._registration(context)
 
         if (
-            registration is None
+            self._invalid_scope
+            or registration is None
             or gated is None
             or gated[0] != registration.handle.task_source
+            or (
+                self._scoped_registration is not None
+                and (
+                    context is None
+                    or context.task_source != registration.handle.task_source
+                )
+            )
         ):
             if gated is not None:
                 # This interaction WAS gated, for source ``gated[0]``, but the
@@ -1131,6 +1445,7 @@ class MCPApprovalGateTool(AbstractBaseTool):
                 tool_name=self.name,
                 arguments=arguments,
                 execution_context=context,
+                raw_tool_name=self._raw_tool_name,
             )
             replay = MCPApprovalReplayContext(
                 interaction_id=host_interaction_id,
@@ -1205,13 +1520,186 @@ class MCPApprovalGateTool(AbstractBaseTool):
         await self._target.load_state_json(state)
 
 
+def _raw_mcp_tool_name(tool: AbstractBaseTool) -> str | None:
+    """Recover the MCP-advertised name without invoking dynamic attributes."""
+
+    current: Any = tool
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        try:
+            attributes = object.__getattribute__(current, "__dict__")
+        except (AttributeError, TypeError):
+            break
+        if not isinstance(attributes, dict):
+            break
+
+        mcp_tool = attributes.get("mcp_tool")
+        try:
+            mcp_attributes = object.__getattribute__(mcp_tool, "__dict__")
+        except (AttributeError, TypeError):
+            mcp_attributes = None
+        raw_name = (
+            mcp_attributes.get("name") if isinstance(mcp_attributes, dict) else None
+        )
+        if isinstance(raw_name, str) and raw_name:
+            return raw_name
+        current = attributes.get("_target")
+    return None
+
+
 def gate_mcp_tools(
     tools: Sequence[AbstractBaseTool],
     *,
     connection: Mapping[str, Any] | None = None,
     connector_ref: ConnectorRef | None = None,
+    approval_scope: MCPApprovalGateScope | None = None,
+    approval_resolution: MCPApprovalGateResolution | None = None,
+    approval_supported: bool = True,
 ) -> list[AbstractBaseTool]:
-    """Wrap tools where direct and sandboxed MCP transports converge."""
+    """Wrap exactly the MCP tools governed by explicit task authority.
+
+    No scope preserves legacy source-wide behavior. A valid scope wraps only
+    matcher-selected tools. Rollback fences use the live registration matcher
+    but keep approved resume pending; stale or forged authority closes selected
+    tools. UNKNOWN without a live matcher cannot safely infer protected targets
+    and therefore never expands into an all-tools outage.
+    """
+
+    if approval_resolution is not None:
+        if not isinstance(approval_resolution, MCPApprovalGateResolution):
+            raise TypeError("approval_resolution must be an MCPApprovalGateResolution")
+        if approval_scope is not None:
+            raise ValueError(
+                "approval_scope and approval_resolution are mutually exclusive"
+            )
+        if approval_resolution.state == "off":
+            return list(tools)
+        approval_scope = approval_resolution.approval_scope
+    if type(approval_supported) is not bool:
+        raise TypeError("approval_supported must be bool")
 
     ref = connector_ref or _connector_ref(connection or {})
-    return [MCPApprovalGateTool(tool, connector_ref=ref) for tool in tools]
+    if approval_scope is None:
+        return [
+            MCPApprovalGateTool(
+                tool,
+                connector_ref=ref,
+                approval_supported=approval_supported,
+                raw_tool_name=_raw_mcp_tool_name(tool),
+            )
+            for tool in tools
+        ]
+
+    if not isinstance(approval_scope, MCPApprovalGateScope):
+        return [
+            MCPApprovalGateTool(
+                tool,
+                connector_ref=ref,
+                approval_supported=approval_supported,
+                invalid_scope=True,
+                raw_tool_name=_raw_mcp_tool_name(tool),
+            )
+            for tool in tools
+        ]
+
+    live_registration = _scoped_registration_for_source(approval_scope.task_source)
+    transient_fence = approval_scope.registration_id == _ROLLBACK_FENCE_REGISTRATION_ID
+    registration = _registration_for_scope(approval_scope)
+
+    if live_registration is None:
+        if transient_fence:
+            # UNKNOWN may not disable unrelated reads when no live matcher can
+            # identify the protected subset. Higher layers retain the UNKNOWN
+            # resolution and retry authority discovery on the next turn.
+            return list(tools)
+        return [
+            MCPApprovalGateTool(
+                tool,
+                connector_ref=ref,
+                approval_supported=approval_supported,
+                invalid_scope=True,
+                raw_tool_name=_raw_mcp_tool_name(tool),
+            )
+            for tool in tools
+        ]
+
+    if ref is None:
+        if transient_fence:
+            return list(tools)
+        return [
+            MCPApprovalGateTool(
+                tool,
+                connector_ref=None,
+                scoped_registration=live_registration,
+                approval_supported=approval_supported,
+                invalid_scope=not transient_fence,
+                transient_fence=transient_fence,
+                raw_tool_name=_raw_mcp_tool_name(tool),
+            )
+            for tool in tools
+        ]
+
+    matcher = live_registration.tool_matcher
+    if matcher is None:  # pragma: no cover - guarded by helper invariant
+        raise AssertionError("scoped registration lost its tool matcher")
+
+    wrapped: list[AbstractBaseTool] = []
+    for tool in tools:
+        raw_tool_name = _raw_mcp_tool_name(tool)
+        if raw_tool_name is None:
+            logger.warning(
+                "MCP approval raw tool name unavailable; failing closed for "
+                "tool=%s connector=%s",
+                tool.name,
+                ref,
+            )
+            wrapped.append(
+                MCPApprovalGateTool(
+                    tool,
+                    connector_ref=ref,
+                    scoped_registration=live_registration,
+                    approval_supported=approval_supported,
+                    invalid_scope=not transient_fence,
+                    transient_fence=transient_fence,
+                )
+            )
+            continue
+        try:
+            matches = matcher(ref, raw_tool_name)
+            if type(matches) is not bool:
+                raise TypeError("approval tool matcher must return bool")
+        except Exception:
+            logger.warning(
+                "MCP approval tool matcher failed closed for tool=%s connector=%s",
+                tool.name,
+                ref,
+                exc_info=True,
+            )
+            wrapped.append(
+                MCPApprovalGateTool(
+                    tool,
+                    connector_ref=ref,
+                    scoped_registration=live_registration,
+                    approval_supported=approval_supported,
+                    invalid_scope=not transient_fence,
+                    transient_fence=transient_fence,
+                    raw_tool_name=raw_tool_name,
+                )
+            )
+            continue
+        if not matches:
+            wrapped.append(tool)
+            continue
+        wrapped.append(
+            MCPApprovalGateTool(
+                tool,
+                connector_ref=ref,
+                scoped_registration=live_registration,
+                approval_supported=approval_supported,
+                invalid_scope=registration is None and not transient_fence,
+                transient_fence=transient_fence,
+                raw_tool_name=raw_tool_name,
+            )
+        )
+    return wrapped

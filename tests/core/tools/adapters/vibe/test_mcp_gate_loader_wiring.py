@@ -15,6 +15,7 @@ Two guarantees are covered here, both of which the host wiring depends on:
 from __future__ import annotations
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -29,8 +30,13 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     load_mcp_tools_as_agent_tools,
 )
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
+    GatedCall,
     GateDecision,
+    MCPApprovalGateResolution,
+    ToolCallExecutionContext,
+    bind_tool_call_execution_context,
     gate_mcp_tools,
+    mcp_approval_gate_scope,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
@@ -55,6 +61,7 @@ class _McpTarget(AbstractBaseTool):
         self.calls: list[dict[str, Any]] = []
         self.sync_calls: list[dict[str, Any]] = []
         self.source_server = "linkedin"
+        self.mcp_tool = SimpleNamespace(name="create_post")
         self._metadata = ToolMetadata(
             name="mcp_LinkedIn_create_post",
             concurrency_safe=True,
@@ -108,6 +115,7 @@ async def _load_one_wrapped(
     target: _McpTarget,
     *,
     connector_refs: dict[str, ConnectorRef] | None = None,
+    approval_resolution: MCPApprovalGateResolution | None = None,
 ) -> Any:
     """Run the real loader boundary and return the single tool it produced."""
 
@@ -126,9 +134,22 @@ async def _load_one_wrapped(
         result = await load_mcp_tools_as_agent_tools(
             {"linkedin": {"transport": "sse", "url": "https://example.invalid"}},
             connector_refs=connector_refs,
+            approval_resolution=approval_resolution,
         )
     assert len(result.tools) == 1
     return result.tools[0]
+
+
+def _external_context() -> ToolCallExecutionContext:
+    return ToolCallExecutionContext(
+        task_source="external",
+        task_id="task-1",
+        run_id="run-1",
+        turn_id="turn-1",
+        tool_call_id="call-1",
+        pattern="react",
+        react_step_id="step-1",
+    )
 
 
 @pytest.mark.asyncio
@@ -204,6 +225,76 @@ async def test_loader_carries_the_connector_ref_for_its_own_server() -> None:
     )
 
     assert wrapped._connector_ref == ConnectorRef("mcp", 41)
+
+
+@pytest.mark.asyncio
+async def test_real_loader_applies_explicit_resolution_to_matcher_and_classifier() -> (
+    None
+):
+    seen: list[GatedCall] = []
+
+    async def gate(call: GatedCall) -> GateDecision:
+        seen.append(call)
+        return GateDecision.require_approval("approval-1")
+
+    async def resume(**_: Any) -> None:
+        raise AssertionError("resume must not run")
+
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=lambda ref, name: (
+            ref == ConnectorRef("mcp", 41) and name == "create_post"
+        ),
+        classifier=lambda call: call.arguments["text"] == "publish",
+    )
+    try:
+        target = _McpTarget()
+        tool = await _load_one_wrapped(
+            target,
+            connector_refs={"linkedin": ConnectorRef("mcp", 41)},
+            approval_resolution=MCPApprovalGateResolution.on(
+                mcp_approval_gate_scope(handle)
+            ),
+        )
+        with bind_tool_call_execution_context(_external_context()):
+            read_result = await tool.run_json_async({"text": "read"})
+            write_result = await tool.run_json_async({"text": "publish"})
+    finally:
+        unregister_mcp_approval_gate(handle)
+
+    assert read_result["success"] is True
+    assert write_result["status"] == "waiting_for_user"
+    assert seen[0].raw_tool_name == "create_post"
+
+
+@pytest.mark.asyncio
+async def test_factory_forwards_resolution_to_direct_loader_seam() -> None:
+    resolution = MCPApprovalGateResolution.off(task_source="external")
+    configs = [
+        {
+            "id": 12,
+            "name": "linkedin",
+            "transport": "sse",
+            "config": {"url": "https://example.invalid/sse"},
+        }
+    ]
+    load = AsyncMock(
+        return_value=MCPLoadResult(tools=(), loaded_servers=(), failures=())
+    )
+    with patch(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        new=load,
+    ):
+        await ToolFactory._create_mcp_tools_from_configs(
+            configs,
+            approval_resolution=resolution,
+            approval_supported=False,
+        )
+
+    assert load.await_args.kwargs["approval_resolution"] is resolution
+    assert load.await_args.kwargs["approval_supported"] is False
 
 
 @pytest.mark.asyncio
@@ -309,15 +400,28 @@ async def test_actor_stdio_session_tools_are_gated_with_their_connector_ref() ->
     load = AsyncMock(
         return_value=MCPLoadResult(tools=(), loaded_servers=(), failures=())
     )
-    with patch(
-        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
-        new=load,
-    ):
-        tools = await ToolFactory._create_mcp_tools_from_configs(
-            configs,
-            actor_stdio_session_identities={"chrome": object()},
-            actor_stdio_session_consumer=consumer,
-        )
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=lambda _: GateDecision.allow(),
+        resume=lambda **_: None,
+        tool_matcher=lambda _ref, name: name == "create_post",
+        classifier=lambda _: True,
+    )
+    try:
+        with patch(
+            "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+            new=load,
+        ):
+            tools = await ToolFactory._create_mcp_tools_from_configs(
+                configs,
+                actor_stdio_session_identities={"chrome": object()},
+                actor_stdio_session_consumer=consumer,
+                approval_resolution=MCPApprovalGateResolution.on(
+                    mcp_approval_gate_scope(handle)
+                ),
+            )
+    finally:
+        unregister_mcp_approval_gate(handle)
 
     assert consumed, "the consumer was never reached"
     # The consumer's own tools never go through the loader, so nothing else

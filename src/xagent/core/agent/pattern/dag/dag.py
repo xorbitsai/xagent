@@ -519,6 +519,7 @@ class DAGPattern(AgentPattern):
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),
+                mcp_approval_resolution=kwargs.get("mcp_approval_resolution"),
             )
             if result.get("failure_reason") == "step_failed":
                 result = await self._deliver_after_step_failure(
@@ -553,6 +554,7 @@ class DAGPattern(AgentPattern):
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
+        mcp_approval_resolution: Any | None = None,
     ) -> dict[str, Any]:
         if self.plan is None:
             self.status = "planning"
@@ -741,6 +743,7 @@ class DAGPattern(AgentPattern):
                 memory_similarity_threshold=memory_similarity_threshold,
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
+                mcp_approval_resolution=mcp_approval_resolution,
             )
             if step_result is not None:
                 return step_result
@@ -758,6 +761,7 @@ class DAGPattern(AgentPattern):
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
+        mcp_approval_resolution: Any | None = None,
     ) -> dict[str, Any] | None:
         if not steps:
             return None
@@ -774,6 +778,7 @@ class DAGPattern(AgentPattern):
                 memory_similarity_threshold=memory_similarity_threshold,
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
+                mcp_approval_resolution=mcp_approval_resolution,
             )
             if result is not None:
                 return result
@@ -815,6 +820,7 @@ class DAGPattern(AgentPattern):
                     memory_similarity_threshold=memory_similarity_threshold,
                     skill_manager=skill_manager,
                     allowed_skills=allowed_skills,
+                    mcp_approval_resolution=mcp_approval_resolution,
                 ),
                 name=f"dag_step_{step.id}",
             ): step.id
@@ -860,6 +866,7 @@ class DAGPattern(AgentPattern):
                         memory_similarity_threshold=memory_similarity_threshold,
                         skill_manager=skill_manager,
                         allowed_skills=allowed_skills,
+                        mcp_approval_resolution=mcp_approval_resolution,
                     ),
                     name=f"dag_step_{ready_step.id}",
                 )
@@ -1050,6 +1057,7 @@ class DAGPattern(AgentPattern):
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
+        mcp_approval_resolution: Any | None = None,
     ) -> dict[str, Any] | None:
         self.status = "running"
         self._mark_step_active(step.id)
@@ -1152,6 +1160,7 @@ class DAGPattern(AgentPattern):
                 memory_similarity_threshold=memory_similarity_threshold,
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
+                mcp_approval_resolution=mcp_approval_resolution,
             )
         except (ExecutionInterrupted, CheckpointPersistenceError):
             # A checkpoint that did not persist is a durability failure, not a

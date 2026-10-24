@@ -412,6 +412,14 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
         ):
             runtime_workspace = None
         create_kwargs: dict[str, Any] = {"sandbox": config.get_sandbox()}
+        approval_resolution_getter = getattr(
+            config, "get_mcp_approval_gate_resolution", None
+        )
+        if callable(approval_resolution_getter):
+            create_kwargs["approval_resolution"] = approval_resolution_getter()
+        approval_supported_getter = getattr(config, "get_mcp_approval_supported", None)
+        if callable(approval_supported_getter):
+            create_kwargs["approval_supported"] = approval_supported_getter()
         if runtime_workspace is not None:
             create_kwargs["workspace"] = runtime_workspace
         if session_identities:

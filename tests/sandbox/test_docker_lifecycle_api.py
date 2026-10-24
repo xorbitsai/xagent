@@ -25,6 +25,7 @@ import pytest
 from docker.errors import APIError
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
+from xagent.config import get_sandbox_pids_limit
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     SPEC_CONTRACT_VERSION,
@@ -68,6 +69,11 @@ def docker_service():
 
 def _unique_name(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _effective_pids_limit(config: SandboxConfig) -> int:
+    """Mirror Docker create's resolution of an omitted backend default."""
+    return config.pids_limit or get_sandbox_pids_limit()
 
 
 # --- Fakes for mock-layer tests (no Docker required) ---
@@ -529,6 +535,7 @@ class TestCreatePersistsCanonicalDesiredState:
         assert raw_config.working_dir == "/home/", "test input must be non-canonical"
         assert row.config.working_dir == "/home"
         assert row.config.volumes == [tuple(v) for v in canonical_volumes]
+        assert row.config.pids_limit == get_sandbox_pids_limit()
 
         # Same objects the container itself was built from.
         assert row.template == captured["template"]
@@ -872,6 +879,7 @@ class TestDockerCreate:
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
+                pids_limit=_effective_pids_limit(config),
             )
             assert inspection.fingerprint_label == desired.fingerprint()
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1069,6 +1077,7 @@ class TestDockerCreate:
                 working_dir=config.working_dir,
                 cpus=config.cpus,
                 memory=config.memory,
+                pids_limit=_effective_pids_limit(config),
             )
             assert desired.working_dir == "/home"
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1103,6 +1112,7 @@ class TestDockerCreate:
                 cpus=config.cpus,
                 memory=config.memory,
                 volumes=config.volumes,
+                pids_limit=_effective_pids_limit(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1138,6 +1148,7 @@ class TestDockerCreate:
                 cpus=config.cpus,
                 memory=config.memory,
                 volumes=config.volumes,
+                pids_limit=_effective_pids_limit(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1170,6 +1181,7 @@ class TestDockerCreate:
                 image=DEFAULT_SANDBOX_IMAGE,
                 cpus=config.cpus,
                 memory=config.memory,
+                pids_limit=_effective_pids_limit(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1251,6 +1263,7 @@ class TestDockerCreateFromSnapshot:
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
+                pids_limit=_effective_pids_limit(config),
             )
             assert inspection.fingerprint_label == desired.fingerprint()
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1829,6 +1842,7 @@ class TestCreateNetworkIsolatedSandbox:
                 cpus=config.cpus,
                 memory=config.memory,
                 network_isolated=True,
+                pids_limit=_effective_pids_limit(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:

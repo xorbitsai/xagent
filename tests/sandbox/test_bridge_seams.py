@@ -16,6 +16,7 @@ import uuid
 
 import pytest
 
+from xagent.config import get_sandbox_pids_limit
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     ResolvedSandboxRuntimeSpec,
@@ -64,6 +65,7 @@ def _spec_for(config: SandboxConfig, image: str = DEFAULT_SANDBOX_IMAGE):
         volumes=config.volumes,
         network_isolated=bool(config.network_isolated),
         ports=config.ports,
+        pids_limit=config.pids_limit or get_sandbox_pids_limit(),
     )
 
 

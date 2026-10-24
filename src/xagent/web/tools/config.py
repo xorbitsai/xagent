@@ -4358,6 +4358,7 @@ class WebToolConfig(BaseToolConfig):
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
         actor_builtin_invalid_reason: str = "config_load_failed",
+        custom_stdio: bool = False,
     ) -> Dict[str, Any]:
         """Build one MCP server config, preserving explicit unavailable outcomes."""
         actor_builtin = bool(
@@ -4671,6 +4672,8 @@ class WebToolConfig(BaseToolConfig):
                 config["transport"] = "stdio"
 
         if server.transport == "stdio":
+            if custom_stdio:
+                transport_config["sandbox_required"] = True
             if server.command:
                 transport_config["command"] = server.command
             if server.args:
@@ -4972,6 +4975,7 @@ class WebToolConfig(BaseToolConfig):
         actor_catalog_app_info: Mapping[str, Any] | None = None,
         actor_builtin_invalid: bool = False,
         actor_builtin_invalid_reason: str = "config_load_failed",
+        custom_stdio: bool = False,
     ) -> Dict[str, Any]:
         """Isolate unexpected failures while loading one MCP server config."""
         try:
@@ -4983,6 +4987,7 @@ class WebToolConfig(BaseToolConfig):
                 actor_catalog_app_info=actor_catalog_app_info,
                 actor_builtin_invalid=actor_builtin_invalid,
                 actor_builtin_invalid_reason=actor_builtin_invalid_reason,
+                custom_stdio=custom_stdio,
             )
         except ConnectorRuntimeError:
             raise
@@ -5088,6 +5093,82 @@ class WebToolConfig(BaseToolConfig):
                 self._user_id,
                 self._connector_team_id,
             )
+
+            custom_stdio_ids: set[int] = set()
+            catalog_required_env_by_id: dict[int, frozenset[str]] = {}
+            if servers:
+                from ...web.mcp_apps import get_app_for_mcp_server
+                from ...web.models.mcp import MCPServer, UserMCPServer
+
+                visible_server_ids = [
+                    int(server.id)
+                    for server in servers
+                    if isinstance(server, MCPServer)
+                ]
+                owned_server_ids = {
+                    int(row[0])
+                    for row in self.db.query(UserMCPServer.mcpserver_id)
+                    .filter(
+                        UserMCPServer.mcpserver_id.in_(visible_server_ids),
+                        UserMCPServer.is_owner.is_(True),
+                    )
+                    .all()
+                }
+
+                def is_canonical_catalog_stdio(server: Any) -> bool:
+                    # Actor-only tests and snapshot resolvers intentionally
+                    # expose stable identity fields only.  Runtime execution
+                    # classification applies to persisted MCP rows, not those
+                    # lightweight identity projections.
+                    if not isinstance(server, MCPServer):
+                        return False
+                    if str(server.transport or "").lower() != "stdio":
+                        return False
+                    if int(server.id) in owned_server_ids:
+                        return False
+                    app = get_app_for_mcp_server(self.db, server)
+                    if (
+                        app is None
+                        or str(app.get("transport") or "").lower() != "stdio"
+                    ):
+                        return False
+                    launch = app.get("launch_config")
+                    if not isinstance(launch, Mapping):
+                        return False
+                    expected_args = launch.get("args")
+                    if expected_args is None:
+                        expected_args = []
+                    marker = launch.get("builtin_provenance")
+                    expected_auth = (
+                        {"builtin_provenance": marker}
+                        if isinstance(marker, Mapping)
+                        else None
+                    )
+                    required_env = launch.get("required_env") or []
+                    if not isinstance(required_env, list) or not all(
+                        isinstance(key, str) for key in required_env
+                    ):
+                        return False
+                    catalog_required_env_by_id[int(server.id)] = frozenset(required_env)
+                    actual_env: Any = server.env or {}
+                    if not isinstance(actual_env, Mapping):
+                        return False
+                    return bool(
+                        str(server.name or "") == str(app.get("id") or "")
+                        and cast(Any, server.auth) == expected_auth
+                        and cast(Any, server.command) == launch.get("command")
+                        and cast(Any, server.args or []) == expected_args
+                        and not server.cwd
+                        and set(actual_env).issubset(required_env)
+                    )
+
+                custom_stdio_ids = {
+                    int(server.id)
+                    for server in servers
+                    if isinstance(server, MCPServer)
+                    if str(server.transport or "").lower() == "stdio"
+                    and not is_canonical_catalog_stdio(server)
+                }
 
             # Classify the complete personal ∪ governing-team visible set
             # before constructing any runtime config. Canonical builtins use
@@ -5214,6 +5295,24 @@ class WebToolConfig(BaseToolConfig):
                                 # and this pick -- the runner's own team's rows
                                 # never enter the computation.
                                 del env_source_by_id[server_id]
+
+            # A canonical catalog row is host-eligible only while every
+            # effective environment layer is limited to the catalog's
+            # required_env declaration. UserMCPServer.env is user-controlled
+            # and can otherwise inject PYTHONPATH (or equivalent loader
+            # variables) into a Python command that executes on the backend.
+            if catalog_required_env_by_id:
+                from ..services.mcp_runtime import resolve_stdio_env
+
+                for server_id, allowed_keys in catalog_required_env_by_id.items():
+                    effective_override = resolve_stdio_env(
+                        env_source_by_id.get(server_id),
+                        {},
+                        shared_env_by_id.get(server_id),
+                        user_env_by_id.get(server_id),
+                    )
+                    if not set(effective_override or {}).issubset(allowed_keys):
+                        custom_stdio_ids.add(server_id)
         except ConnectorRuntimeError:
             raise
         except Exception as error:
@@ -5238,6 +5337,7 @@ class WebToolConfig(BaseToolConfig):
                 actor_builtin_invalid_reason=actor_stdio_block_reasons.get(
                     int(server.id), "config_load_failed"
                 ),
+                custom_stdio=int(server.id) in custom_stdio_ids,
             )
             for server in servers
         ]

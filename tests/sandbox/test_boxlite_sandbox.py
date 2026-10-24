@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,6 +72,138 @@ class TestBoxliteSandboxRunCodeValidation:
 
         with pytest.raises(ValueError, match="Unsupported code type: ruby"):
             await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
+
+
+class _FakeStream:
+    def __init__(self, chunks):
+        self._chunks = chunks
+        self.drained = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.drained == len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self.drained]
+        self.drained += 1
+        return chunk
+
+
+class _FakeExecution:
+    def __init__(self, stdout, stderr):
+        self.stdout_stream = _FakeStream(stdout)
+        self.stderr_stream = _FakeStream(stderr)
+        self.killed = False
+
+    def stdout(self):
+        return self.stdout_stream
+
+    def stderr(self):
+        return self.stderr_stream
+
+    async def wait(self):
+        return SimpleNamespace(exit_code=0, error_message=None)
+
+    async def kill(self):
+        self.killed = True
+
+
+class _FakeNativeBox:
+    def __init__(self, execution):
+        self.execution = execution
+        self.call = None
+
+    async def exec(self, command, args, env, **kwargs):
+        self.call = (command, args, env, kwargs)
+        return self.execution
+
+
+@pytest.mark.asyncio
+async def test_exec_caps_output_while_draining_boxlite_streams():
+    execution = _FakeExecution([b"abc", b"def"], ["xy", "z"])
+    native_box = _FakeNativeBox(execution)
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=native_box)
+
+    result = await sandbox.exec(
+        "demo", "--flag", env={"KEY": "value"}, max_output_bytes=4
+    )
+
+    assert result.stdout == "abcd"
+    assert result.stderr == "xyz"
+    assert result.truncated is True
+    assert execution.stdout_stream.drained == 2
+    assert execution.stderr_stream.drained == 2
+    assert native_box.call == (
+        "demo",
+        ["--flag"],
+        [("KEY", "value")],
+        {"user": None, "timeout_secs": 3600, "cwd": None},
+    )
+
+
+@pytest.mark.asyncio
+async def test_exec_with_output_cap_kills_guest_when_cancelled():
+    release = asyncio.Event()
+
+    class BlockingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await release.wait()
+            raise StopAsyncIteration
+
+    execution = _FakeExecution([], [])
+    execution.stdout_stream = BlockingStream()
+    execution.stderr_stream = BlockingStream()
+    native_box = _FakeNativeBox(execution)
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=native_box)
+
+    task = asyncio.create_task(sandbox.exec("hang", max_output_bytes=4))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert execution.killed is True
+
+
+@pytest.mark.asyncio
+async def test_exec_cancellation_is_not_blocked_by_hung_guest_kill(monkeypatch):
+    never = asyncio.Event()
+
+    class BlockingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await never.wait()
+            raise StopAsyncIteration
+
+    execution = _FakeExecution([], [])
+    execution.stdout_stream = BlockingStream()
+    execution.stderr_stream = BlockingStream()
+
+    async def hung_kill():
+        await never.wait()
+
+    execution.kill = hung_kill
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=_FakeNativeBox(execution))
+    monkeypatch.setattr(
+        "xagent.sandbox.boxlite_sandbox._EXECUTION_KILL_TIMEOUT_SECONDS", 0.01
+    )
+
+    task = asyncio.create_task(sandbox.exec("hang", max_output_bytes=4))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
 
 
 @requires_boxlite

@@ -55,7 +55,7 @@ class SandboxTmpfsSecretMaterializer:
         known_hosts_path = f"{directory}/known_hosts"
         # 0700 private dir before any secret lands in it.
         result = await sb.exec("mkdir", "-p", "-m", "700", directory)
-        if getattr(result, "exit_code", 0) != 0:
+        if getattr(result, "exit_code", -1) != 0:
             raise SshError(
                 SshErrorCode.SANDBOX_UNAVAILABLE,
                 "could not create sandbox secret directory",
@@ -70,7 +70,12 @@ class SandboxTmpfsSecretMaterializer:
             await sb.write_file(
                 content=known_hosts, remote_path=known_hosts_path, overwrite=True
             )
-            await sb.exec("chmod", "600", key_path, known_hosts_path)
+            chmod_result = await sb.exec("chmod", "600", key_path, known_hosts_path)
+            if getattr(chmod_result, "exit_code", -1) != 0:
+                raise SshError(
+                    SshErrorCode.SANDBOX_UNAVAILABLE,
+                    "could not secure sandbox SSH credential files",
+                )
             yield MaterializedSshPaths(
                 private_key_path=key_path, known_hosts_path=known_hosts_path
             )

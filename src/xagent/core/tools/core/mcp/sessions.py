@@ -73,6 +73,9 @@ class StdioConnection(TypedDict):
     cwd: NotRequired[str | Path | None]
     """The working directory to use when spawning the process."""
 
+    sandbox_required: NotRequired[bool]
+    """Whether this user-controlled process must run in the code sandbox."""
+
     encoding: NotRequired[str]
     """The text encoding used when sending/receiving messages to the server.
 

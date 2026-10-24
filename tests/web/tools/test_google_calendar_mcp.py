@@ -8718,6 +8718,37 @@ def test_respond_to_event_writes_a_new_comment_when_the_response_changes(monkeyp
     }
 
 
+def test_respond_to_event_preserves_the_requested_existing_comment_on_new_response(
+    monkeypatch,
+):
+    own_entry = {
+        **_RSVP_ME,
+        "responseStatus": "tentative",
+        "comment": "Original note",
+    }
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    calendar.google_calendar_respond_to_event(
+        event_id="evt1", response="accepted", comment="Original note"
+    )
+
+    assert service.events.return_value.patch.call_args.kwargs["body"] == {
+        "attendees": [
+            {
+                **own_entry,
+                "responseStatus": "accepted",
+                "comment": "Original note",
+            }
+        ],
+        "attendeesOmitted": True,
+    }
+
+
 def test_respond_to_event_preserves_the_other_fields_of_the_own_entry(monkeypatch):
     own_entry = {
         "email": "me@example.com",
@@ -8948,7 +8979,9 @@ def test_respond_to_event_reports_a_non_not_found_http_error_from_get(
     monkeypatch, status
 ):
     """Only 404/410 get the friendly "not found" message; every other read
-    failure still becomes an error result and never reaches the patch."""
+    failure becomes a failed tool call and never reaches the patch."""
+    from mcp.server.fastmcp.exceptions import ToolError
+
     service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
     content = f'{{"error":{{"code":{status},"message":"Request failed"}}}}'.encode()
     service.events.return_value.get.return_value.execute.side_effect = HttpError(
@@ -8956,12 +8989,11 @@ def test_respond_to_event_reports_a_non_not_found_http_error_from_get(
     )
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
-    result = json.loads(
+    with pytest.raises(ToolError) as excinfo:
         calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
-    )
 
-    assert result["status"] == "error"
-    assert result["message"]
+    assert f"HTTP {status}" in str(excinfo.value)
+    assert "Request failed" in str(excinfo.value)
     service.events.return_value.get.assert_called_once()
     _assert_respond_wrote_nothing(service)
 
@@ -9098,20 +9130,78 @@ def test_respond_to_event_uses_the_given_id_for_an_occurrence_or_a_series(
     events.instances.assert_not_called()
 
 
-def test_respond_to_event_returns_an_error_when_the_patch_fails(monkeypatch):
-    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
-    service.events.return_value.patch.return_value.execute.side_effect = HttpError(
-        _HttpResponse(403), b'{"error":{"code":403,"message":"Forbidden"}}'
+async def _call_respond_to_event_over_mcp(arguments):
+    """Call the registered handler through a real MCP client session."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    async with create_connected_server_and_client_session(
+        calendar.mcp._mcp_server
+    ) as session:
+        return await session.call_tool("google_calendar_respond_to_event", arguments)
+
+
+@pytest.mark.parametrize("failure_point", ["get", "patch"])
+async def test_respond_to_event_provider_failure_is_a_safe_failed_mcp_call(
+    monkeypatch, failure_point
+):
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
     )
+
+    service = _fake_service({"id": "evt1"}, existing_event=_RSVP_INVITE)
+    provider_error = HttpError(
+        _HttpResponse(403),
+        b'{"error":{"code":403,"message":"Calendar permission denied"}}',
+        uri="https://www.googleapis.com/calendar/v3/events/evt1?key=private-value",
+    )
+    if failure_point == "get":
+        service.events.return_value.get.return_value.execute.side_effect = (
+            provider_error
+        )
+    else:
+        service.events.return_value.patch.return_value.execute.side_effect = (
+            provider_error
+        )
     monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
 
-    result = json.loads(
-        calendar.google_calendar_respond_to_event(event_id="evt1", response="accepted")
+    result = await _call_respond_to_event_over_mcp(
+        {"event_id": "evt1", "response": "accepted"}
     )
 
-    assert result["status"] == "error"
-    assert "Forbidden" in result["message"]
-    service.events.return_value.patch.assert_called_once()
+    assert result.isError is True
+    assert "HTTP 403" in result.content[0].text
+    assert "Calendar permission denied" in result.content[0].text
+    assert "private-value" not in result.content[0].text
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is False
+    if failure_point == "get":
+        _assert_respond_wrote_nothing(service)
+    else:
+        service.events.return_value.patch.assert_called_once()
+
+
+async def test_respond_to_event_duplicate_reply_is_a_successful_mcp_noop(monkeypatch):
+    own_entry = {**_RSVP_ME, "responseStatus": "accepted", "comment": "Sounds good"}
+    existing_event = {
+        **_RSVP_INVITE,
+        "attendees": [_RSVP_ALICE, own_entry, _RSVP_BOB],
+    }
+    service = _fake_service({"id": "evt1"}, existing_event=existing_event)
+    monkeypatch.setattr(calendar, "get_calendar_service", lambda: service)
+
+    result = await _call_respond_to_event_over_mcp(
+        {
+            "event_id": "evt1",
+            "response": "accepted",
+            "comment": "Sounds good",
+        }
+    )
+
+    assert result.isError is False
+    payload = json.loads(result.content[0].text)
+    assert payload["status"] == "success"
+    assert payload["changed"] is False
+    _assert_respond_wrote_nothing(service)
 
 
 def test_respond_to_event_is_registered_with_the_documented_parameters():

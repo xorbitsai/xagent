@@ -16,6 +16,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import (
     InsufficientScopeError,
@@ -1199,6 +1200,37 @@ def _error_message(exc: Exception, requested_conference: bool) -> str:
             " add_google_meet=False)"
         )
     return message
+
+
+def _rsvp_error_message(exc: Exception) -> str:
+    """Return an actionable RSVP failure without exposing request URLs.
+
+    ``HttpError.__str__`` includes the full provider request URI. Keep the
+    useful status and Google-provided message, but parse them from the response
+    instead so query parameters and other request details never reach the
+    agent. Unexpected exceptions are intentionally described by type only.
+    """
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        provider_message = ""
+        try:
+            payload = json.loads(exc.content.decode("utf-8"))
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                provider_message = " ".join(error["message"].split())[:500]
+        except (AttributeError, UnicodeDecodeError, ValueError):
+            pass
+        status_text = f" (HTTP {status})" if status is not None else ""
+        detail = f": {provider_message}" if provider_message else ""
+        return (
+            f"Google Calendar could not apply the RSVP{status_text}{detail}. "
+            "Check the event in Google Calendar before retrying."
+        )
+    return (
+        "Google Calendar could not apply the RSVP because an unexpected "
+        f"{type(exc).__name__} occurred. Check the event and connector before "
+        "retrying."
+    )
 
 
 def _event_response(event: dict[str, Any]) -> str:
@@ -2872,10 +2904,10 @@ def google_calendar_respond_to_event(
     new comment is given, an existing comment on that entry is cleared, so an
     old note cannot stay attached to a different reply; a non-empty comment is
     written as the new note. No other attendee entry is ever sent or modified.
-    If the caller's own attendee entry already has the requested
-    responseStatus and no new comment is given, the tool writes nothing and
-    returns the current event with "changed": false in the result, so a retry
-    cannot send the organizer a duplicate reply.
+    If the caller's own attendee entry already has the requested responseStatus
+    and the comment is omitted or unchanged, the tool writes nothing and returns
+    the current event with "changed": false in the result, so a retry cannot send
+    the organizer a duplicate reply.
     notify_organizer=True (the default) lets Google send its notification for
     this reply; pass False to send none.
     A reply only applies to an invitation someone else organized. When the user
@@ -2975,10 +3007,9 @@ def google_calendar_respond_to_event(
             )
 
         existing_comment = own_entry.get("comment") or ""
-        new_comment = (
-            comment_text if comment_text and comment_text != existing_comment else ""
-        )
-        if own_entry.get("responseStatus") == normalized_response and not new_comment:
+        response_unchanged = own_entry.get("responseStatus") == normalized_response
+        comment_unchanged = not comment_text or comment_text == existing_comment
+        if response_unchanged and comment_unchanged:
             # Patching the same reply again would send the organizer another
             # notification for a reply they already have. Reuse the normal
             # success envelope and mark the result as not written.
@@ -2986,7 +3017,7 @@ def google_calendar_respond_to_event(
             response_payload["changed"] = False
             response_payload["message"] = (
                 "No reply was sent: the caller's attendee entry already has "
-                "this response and no new comment was given. Nothing was "
+                "this response and no comment change was requested. Nothing was "
                 "written."
             )
             return json.dumps(response_payload)
@@ -2999,8 +3030,8 @@ def google_calendar_respond_to_event(
         # drop or revert someone else's reply.
         own = copy.deepcopy(own_entry)
         own["responseStatus"] = normalized_response
-        if new_comment:
-            own["comment"] = new_comment
+        if comment_text:
+            own["comment"] = comment_text
         elif existing_comment:
             # The response changed and no replacement note was given, so clear
             # the old note explicitly: under attendeesOmitted an omitted
@@ -3022,9 +3053,12 @@ def google_calendar_respond_to_event(
         )
         return _event_response(updated_event)
 
-    except Exception as e:
-        logger.error(f"Error responding to event: {e}")
+    except ValueError as e:
+        logger.error("Invalid calendar RSVP request: %s", e)
         return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        logger.error("Error responding to event: %s", type(e).__name__)
+        raise ToolError(_rsvp_error_message(e)) from e
 
 
 if __name__ == "__main__":

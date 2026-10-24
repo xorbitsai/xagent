@@ -7,12 +7,15 @@ focusing on JSON and CSV workspace writes and reads.
 
 import logging
 import os
+import stat
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+import xagent.core.workspace as workspace_module
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
@@ -193,6 +196,45 @@ class TestWorkspaceFileOperations:
         test_file.write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
 
         assert ops.read_file("notes.txt", start_line=2, end_line=3) == "two\nthree\n"
+
+    def test_create_directory_grants_nonroot_sandbox_write_access(
+        self, tmp_path, monkeypatch
+    ):
+        workspace = TaskWorkspace("test_mkdir_permissions", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+        real_stat = Path.stat
+
+        def prepared_root_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == workspace.workspace_dir:
+                values = list(result)
+                values[5] = 1010
+                values[0] |= stat.S_ISGID
+                return os.stat_result(values)
+            return result
+
+        chowns = []
+        requested_modes = []
+        real_fchmod = os.fchmod
+
+        def record_fchmod(fd, mode):
+            requested_modes.append(mode)
+            real_fchmod(fd, mode)
+
+        monkeypatch.setattr(Path, "stat", prepared_root_stat)
+        monkeypatch.setattr(
+            workspace_module.os,
+            "fchown",
+            lambda _fd, uid, gid: chowns.append((uid, gid)),
+        )
+        monkeypatch.setattr(workspace_module.os, "fchmod", record_fchmod)
+
+        assert ops.create_directory("reports/nested") is True
+
+        created = workspace.output_dir / "reports" / "nested"
+        assert stat.S_IMODE(created.stat().st_mode) & 0o777 == 0o770
+        assert requested_modes[-1] == 0o2770
+        assert chowns[-1] == (os.geteuid(), 1010)
 
     def test_read_json_file_delegation(self, tmp_path):
         """Test that read_json_file correctly delegates to basic file_tool function."""

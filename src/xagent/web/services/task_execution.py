@@ -122,6 +122,7 @@ if TYPE_CHECKING:
 from ...core.file_storage.keys import (
     build_task_output_storage_key,
 )
+from ...sandbox.base import SANDBOX_RUNTIME_GID
 from ..user_isolated_memory import UserContext
 from ..utils.json_payload_sanitizer import sanitize_json_payload
 from .assistant_history_safety import (
@@ -5388,7 +5389,7 @@ class BackgroundTaskManager:
 background_task_manager = BackgroundTaskManager()
 
 
-def _copy_durable_input_to_workspace(source: Path, target: Path) -> None:
+def _copy_durable_input_to_workspace(source: Path, target: Path, *, mode: int) -> None:
     """Publish one regular durable input as a private task-local copy."""
 
     source_flags = (
@@ -5407,7 +5408,7 @@ def _copy_durable_input_to_workspace(source: Path, target: Path) -> None:
             suffix=".tmp",
         )
         temp_path = Path(temp_name)
-        os.fchmod(temp_fd, 0o600)
+        os.fchmod(temp_fd, mode)
         with (
             os.fdopen(source_fd, "rb", closefd=True) as source_file,
             os.fdopen(temp_fd, "wb", closefd=True) as target_file,
@@ -5426,7 +5427,24 @@ def _copy_durable_input_to_workspace(source: Path, target: Path) -> None:
             temp_path.unlink(missing_ok=True)
 
 
-def _materialize_legacy_task_input_symlinks(workspace: Any, input_dir: Path) -> None:
+def _task_input_copy_mode(workspace: Any) -> int:
+    """Keep Docker inputs private while preserving legacy backend readability."""
+
+    workspace_dir = getattr(workspace, "workspace_dir", None)
+    if workspace_dir is None:
+        return 0o644
+    try:
+        root_stat = Path(workspace_dir).resolve().stat()
+    except OSError:
+        return 0o644
+    if root_stat.st_gid == SANDBOX_RUNTIME_GID and root_stat.st_mode & stat.S_ISGID:
+        return 0o600
+    return 0o644
+
+
+def _materialize_legacy_task_input_symlinks(
+    workspace: Any, input_dir: Path, *, copy_mode: int
+) -> None:
     """Replace authorized pre-upgrade input symlinks with task-local copies."""
 
     owner_user_id = getattr(workspace, "owner_user_id", None)
@@ -5498,12 +5516,25 @@ def _materialize_legacy_task_input_symlinks(workspace: Any, input_dir: Path) -> 
         if matched_file_info is None:
             continue
         source_path = Path(str(matched_file_info["path"]))
-        _copy_durable_input_to_workspace(source_path, candidate)
-        registration = workspace.describe_file_registration(str(candidate))
-        workspace.bind_already_durable_file(
-            registration,
-            file_id=str(matched_file_info["file_id"]),
-        )
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            registration = workspace.describe_file_registration(str(candidate))
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=str(matched_file_info["file_id"]),
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to materialize legacy task input: storage=%s input_path=%s",
+                source_path,
+                candidate,
+                exc_info=True,
+            )
+            continue
         logger.info(
             "Materialized legacy task input: storage=%s input_path=%s",
             source_path,
@@ -5523,7 +5554,12 @@ def _register_uploaded_files_for_agent(
 
     input_dir = Path(workspace.input_dir)
     input_dir.mkdir(parents=True, exist_ok=True)
-    _materialize_legacy_task_input_symlinks(workspace, input_dir)
+    copy_mode = _task_input_copy_mode(workspace)
+    _materialize_legacy_task_input_symlinks(
+        workspace,
+        input_dir,
+        copy_mode=copy_mode,
+    )
 
     for file_info in file_info_list:
         file_id = str(file_info.get("file_id") or "")
@@ -5561,7 +5597,11 @@ def _register_uploaded_files_for_agent(
                 suffix_idx += 1
 
         try:
-            _copy_durable_input_to_workspace(source_path, candidate)
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
         except (OSError, ValueError):
             if not source_path.exists():
                 logger.warning(

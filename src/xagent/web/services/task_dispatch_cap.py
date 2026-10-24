@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ...config import (
@@ -74,10 +75,17 @@ class DispatchCapSnapshot:
     interactive command may take a slot while fewer than ``limit`` tasks are
     active, a batch command only while fewer than ``limit - interactive_reserve``
     are.
+
+    ``occupancy`` is how many slots each tenant key holds in this process, filled
+    by ``BackgroundTaskManager.dispatch_cap_snapshot``; a snapshot built anywhere
+    else, such as the one that only observes the cap state, leaves it empty.
     """
 
     policy: DispatchPolicy
     active_ids: frozenset[int]
+    occupancy: Mapping[str, int] = field(
+        default_factory=dict, hash=False, compare=False
+    )
 
     @property
     def limit(self) -> int:

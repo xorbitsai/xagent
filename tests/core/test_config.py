@@ -4106,6 +4106,39 @@ def test_dispatcher_interactive_reserve_env_parsing(
 
 
 @pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, False, False),
+        ("true", True, False),
+        ("false", False, False),
+        # A blank value states nothing, as when a compose file interpolates an
+        # unset variable: unlike the numeric settings above, it does not warn.
+        ("", False, False),
+        ("garbage", False, True),
+    ],
+)
+def test_dispatcher_fair_share_env_parsing(monkeypatch, caplog, raw, expected, warns):
+    env_var = config.DISPATCHER_FAIR_SHARE
+    assert env_var == "XAGENT_DISPATCHER_FAIR_SHARE"
+    if raw is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, raw)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        assert config.get_dispatcher_fair_share_enabled() is expected
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
+
+
+@pytest.mark.parametrize(
     "name,value",
     [
         ("XAGENT_EXECUTION_BUDGET_DEFAULT_TOKENS", "-1"),

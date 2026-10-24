@@ -58,6 +58,7 @@ on:
       - 'tests/web/services/test_task_admission_guidance.py'
       - 'tests/migrations/test_task_admission_pacing_schema.py'
       - 'tests/web/services/test_queued_channel_pause_admission.py'
+      - 'tests/web/services/test_dispatch_fair_selection_postgresql.py'
       - 'tests/web/services/test_queued_start_cancel_admission.py'
       - 'tests/web/services/test_shared_channel_execution.py'
       - 'src/xagent/web/services/shared_channel_execution.py'
@@ -281,6 +282,7 @@ jobs:
             tests/web/services/test_task_admission_guidance.py
             tests/migrations/test_task_admission_pacing_schema.py
             tests/web/services/test_queued_channel_pause_admission.py
+            tests/web/services/test_dispatch_fair_selection_postgresql.py
             tests/web/services/test_queued_start_cancel_admission.py
             tests/web/services/test_shared_channel_execution.py
             src/xagent/web/services/shared_channel_execution.py
@@ -676,6 +678,19 @@ jobs:
         shell: bash
         run: |
           pytest tests/alembic/test_20261022_task_command_claimable_fair_index.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test fair-share dispatch queries use the tenant index (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/web/services/test_dispatch_fair_selection_postgresql.py -m postgresql 2>&1 | tee pg.log
           if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
             echo "::error::Postgres-only cells were skipped; skipped is not passed"
             exit 1

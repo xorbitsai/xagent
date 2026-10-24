@@ -12,6 +12,7 @@ from types import ModuleType
 import pytest
 
 from xagent.web.services import process_diagnostics
+from xagent.web.services import task_command_transport as transport
 from xagent.web.services.task_dispatch_cap import DispatchPolicy
 from xagent.web.services.task_execution import BackgroundTaskManager
 
@@ -576,6 +577,7 @@ def _counters(**overrides) -> process_diagnostics.ExecutionCounters:
         "slot_top": 0,
         "loop_lag_max_ms": 0.0,
         "loop_lag_samples": 0,
+        "fair_misses": 0,
     }
     fields.update(overrides)
     return process_diagnostics.ExecutionCounters(**fields)
@@ -615,3 +617,26 @@ async def test_a_process_that_dispatches_nothing_reports_no_slot_tenants(
 
     assert (counters.slot_tenants, counters.slot_top) == (0, 0)
     assert " slot_tenants=0 slot_top=0 " in counters.format_line()
+
+
+def test_the_line_ends_with_the_fair_misses_of_the_window():
+    line = _counters(fair_misses=2).format_line()
+    assert line.endswith(" loop_lag_samples=0 fair_misses=2")
+
+
+@pytest.mark.asyncio
+async def test_a_window_reports_the_fair_misses_since_the_last_one(
+    manager, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_TASK_EXECUTION_ROLE", "combined")
+    monkeypatch.setattr(process_diagnostics._window, "started_at", 0.0)
+    monkeypatch.setattr(transport, "_fair_state", transport._FairState())
+    transport._fair_record_miss("team:1", "batch")
+    transport._fair_record_miss("team:1", "interactive")
+
+    first = process_diagnostics.drain_execution_counters(now=10.0)
+    second = process_diagnostics.drain_execution_counters(now=20.0)
+
+    assert (first.fair_misses, second.fair_misses) == (2, 0)
+    assert first.format_line().endswith(" fair_misses=2")
+    assert second.format_line().endswith(" fair_misses=0")

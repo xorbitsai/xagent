@@ -82,6 +82,14 @@ class TestEnsureDependencies:
 
         sandbox.write_file.assert_called_once()
         sandbox.exec.assert_called_once()
+        assert sandbox.exec.await_args.args == (
+            "pip",
+            "install",
+            "--user",
+            "--break-system-packages",
+            "-r",
+            "/tmp/requirements.txt",
+        )
         assert SandboxDependencyManager._sandbox_installed_requirements.get(
             "sb-install"
         ) == set(SANDBOX_BASE_DEPENDENCIES)

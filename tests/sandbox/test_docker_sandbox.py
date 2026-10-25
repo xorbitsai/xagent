@@ -689,6 +689,7 @@ class TestNamespaceIsolation:
             # stop-time drop was verified manually, not gated by a CI timer.
             assert captured["init"] is True
             assert captured["user"] == "1100:1010"
+            assert captured["environment"]["HOME"] == "/home/sandbox"
             assert captured["cap_drop"] == ["ALL"]
             assert captured["pids_limit"] == 1024
 
@@ -701,10 +702,12 @@ class TestNamespaceIsolation:
             SandboxTemplate(type="image", image="img"),
             SandboxConfig(
                 pids_limit=2048,
+                env={"HOME": "/tmp/custom-home"},
                 volumes=[("/host/workspace", "/root/.xagent/user_1", "rw")],
             ),
         )
         assert captured["pids_limit"] == 2048
+        assert captured["environment"]["HOME"] == "/tmp/custom-home"
         assert captured["tmpfs"]["/root"].endswith("mode=0711,uid=1100,gid=1010")
 
 
@@ -1488,7 +1491,7 @@ class TestDockerSandbox:
             )
 
             result = await sandbox.exec(
-                "pip", "install", "--break-system-packages", "pytest"
+                "pip", "install", "--user", "--break-system-packages", "pytest"
             )
             print(f"Output:\n{result.stdout}")
 

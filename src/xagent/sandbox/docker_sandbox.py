@@ -1158,7 +1158,10 @@ async def _create_container(
         # user code or custom stdio MCP processes inherit container root.
         "user": f"{SANDBOX_RUNTIME_UID}:{SANDBOX_RUNTIME_GID}",
         "working_dir": config.working_dir,
-        "environment": config.env,
+        # Docker does not synthesize HOME when `user` overrides the image
+        # default. Supply the fixed runtime account's home unless an operator
+        # intentionally configured another value.
+        "environment": {"HOME": "/home/sandbox", **(config.env or {})},
         "volumes": volumes,
         "ports": ports,
         "nano_cpus": int((config.cpus or 1) * _CPU_NANOS),

@@ -12,7 +12,7 @@ This image is that starting template. It has no service of its own: its `CMD` is
 - **`uv` / `uvx`**, for sandboxed `uvx` MCP server connections
 - A deliberately small, lockfile-pinned Python set: `pydantic`, `pydantic-settings`, `cloudpickle`, `mcp`, `pandas`, `numpy`, `matplotlib`, `openpyxl`, `python-docx`, `fsspec`
 - `ca-certificates`, `tzdata`, `netbase`, and `openssh-client`
-- `pip install` permitted without `--break-system-packages`, so tools can pull their own declared dependencies after the container starts
+- user-site `pip install` support, so tools can pull their own declared dependencies without writing system packages
 
 The Python set comes only from the dedicated `sandbox` dependency group in Xagent's `pyproject.toml`, exported from `uv.lock` at build time. It intentionally does not inherit the backend image's much larger dependency set, and the build fails if any supported package is missing from the result.
 
@@ -22,7 +22,10 @@ Sandboxing is opt-in: Xagent runs tool calls in the backend process unless `SAND
 
 The isolation comes from how the sandbox is run, not from this image. Xagent's Docker backend applies `no-new-privileges`, CPU and memory limits, and optional network isolation; its Boxlite backend runs the sandbox inside a KVM microVM. See [docker/README.md](https://github.com/xorbitsai/xagent/blob/main/docker/README.md) for the two modes and their trade-offs.
 
-The image itself defines an unprivileged `sandbox` user (uid 1100, gid 1010) as its default. Note that Xagent's Docker backend deliberately overrides this and runs the container as root, to match the file access behavior of the Boxlite backend.
+The image defines an unprivileged `sandbox` user (uid 1100, gid 1010), and both
+the Docker and Boxlite backends execute sandboxed code as that identity. The
+Docker backend also drops every Linux capability, enables
+`no-new-privileges`, and applies CPU, memory, and process-count limits.
 
 ## Tags
 
@@ -57,6 +60,11 @@ A replacement image has to stay runtime-compatible with [`docker/Dockerfile.sand
 - `cat`, `rm`, `mkdir`, `/bin/sh`, and a writable `/tmp` — staging input, reading results back, cleanup
 - `tail` — the Docker backend replaces the image's `CMD` with `tail -f /dev/null` to hold the container open
 - `test`, `cp`, `mv`, and a writable `/var/tmp` — the Boxlite backend stages every file transfer there before moving it into place, because `/tmp` is a tmpfs mount it cannot copy into
+
+The image must define uid 1100 and gid 1010, provide a writable home directory
+at `/home/sandbox`, and allow that identity to use Python's user site-packages.
+The Docker backend enforces this identity even if the image declares another
+`USER`.
 
 Only if you use the matching feature:
 

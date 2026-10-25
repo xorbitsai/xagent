@@ -21,6 +21,9 @@ TemplateType = Literal["image", "snapshot"]
 CodeType = Literal["python", "javascript"]
 """Supported code execution types."""
 
+SANDBOX_RUNTIME_UID = 1100
+SANDBOX_RUNTIME_GID = 1010
+
 
 def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
     """Make a managed mount suffix traversable by the sandbox identity.

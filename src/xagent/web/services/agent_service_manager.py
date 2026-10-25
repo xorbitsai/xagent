@@ -3088,7 +3088,11 @@ class AgentServiceManager:
                         memory_availability_reason=memory_policy.public_availability_reason,
                         execution_metadata=memory_policy.execution_metadata(),
                         system_prompt=system_prompt,  # Pass agent builder instructions
-                        workspace=tool_config.get_task_runtime_workspace(),
+                        workspace=(
+                            tool_config.get_task_runtime_workspace()
+                            if tool_config is not None
+                            else None
+                        ),
                     )
                     try:
                         self._sweep_idle_runtimes(
@@ -4463,7 +4467,11 @@ class AgentServiceManager:
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
                     execution_metadata=memory_policy.execution_metadata(),
-                    workspace=tool_config.get_task_runtime_workspace(),
+                    workspace=(
+                        tool_config.get_task_runtime_workspace()
+                        if tool_config is not None
+                        else None
+                    ),
                 )
             try:
                 self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)

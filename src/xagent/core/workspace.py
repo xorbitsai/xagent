@@ -271,6 +271,12 @@ class TaskWorkspace:
         self.output_dir = self.workspace_dir / "output"
         self.temp_dir = self.workspace_dir / "temp"
 
+        # Create the workspace tree before validating external roots.  The
+        # configured base directory is also the canonical per-user upload root
+        # in web runtimes, so an eagerly-created workspace must not discard it
+        # merely because no upload has created that root yet.
+        self._ensure_directories()
+
         # Allowed external directories (e.g., user upload directories with knowledge base files)
         self.allowed_external_dirs: List[Path] = []
         if allowed_external_dirs:
@@ -283,8 +289,6 @@ class TaskWorkspace:
                         f"Allowed external directory does not exist: {dir_path}"
                     )
 
-        # Create directory structure
-        self._ensure_directories()
         self._warn_if_reserved_output_name_is_taken()
 
     def __getstate__(self) -> dict[str, Any]:

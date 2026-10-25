@@ -201,6 +201,26 @@ class TestWorkspaceExternalDirs(unittest.TestCase):
         self.assertEqual(len(workspace.allowed_external_dirs), 0)
         print("✓ Nonexistent external directories are skipped")
 
+    def test_workspace_allows_new_base_dir_as_external_root(self):
+        """An eagerly created workspace keeps its future upload root allowed."""
+        user_upload_dir = Path(self.temp_dir) / "uploads" / "user_123"
+        self.assertFalse(user_upload_dir.exists())
+
+        workspace = TaskWorkspace(
+            id="web_task_1",
+            base_dir=str(user_upload_dir),
+            allowed_external_dirs=[str(user_upload_dir)],
+        )
+
+        source_file = user_upload_dir / "file_uuid" / "source.txt"
+        source_file.parent.mkdir()
+        source_file.write_text("channel upload")
+
+        self.assertIn(user_upload_dir.resolve(), workspace.allowed_external_dirs)
+        self.assertEqual(
+            workspace.resolve_path(str(source_file)), source_file.resolve()
+        )
+
     def test_workspace_security_path_traversal_protection(self):
         """Test that path traversal attacks are blocked even with external dirs"""
         # Try to access parent of external directory

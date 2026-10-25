@@ -341,6 +341,9 @@ class TestAgentServiceManagerReconstruction:
             ) as mock_tool_factory,
         ):
             mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_tool_factory.create_workspace_async = AsyncMock(
+                return_value=MagicMock()
+            )
             mock_agent_service = MagicMock()
             mock_agent_service_class.return_value = mock_agent_service
 
@@ -411,6 +414,9 @@ class TestAgentServiceManagerReconstruction:
             mock_resolve_llms.return_value = (MagicMock(), None, None, None)
             mock_get_memory.return_value = MagicMock()
             mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_tool_factory.create_workspace_async = AsyncMock(
+                return_value=MagicMock()
+            )
             mock_agent_service = MagicMock()
             mock_agent_service_class.return_value = mock_agent_service
 
@@ -501,6 +507,9 @@ class TestAgentServiceManagerReconstruction:
             mock_resolve_llms.return_value = (MagicMock(), None, None, None)
             mock_get_memory.return_value = MagicMock()
             mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_tool_factory.create_workspace_async = AsyncMock(
+                return_value=MagicMock()
+            )
             mock_agent_service = MagicMock()
             mock_agent_service_class.return_value = mock_agent_service
 
@@ -599,6 +608,9 @@ class TestAgentServiceManagerReconstruction:
             mock_resolve_llms.return_value = (MagicMock(), None, None, None)
             mock_get_memory.return_value = MagicMock()
             mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_tool_factory.create_workspace_async = AsyncMock(
+                return_value=MagicMock()
+            )
             mock_agent_service_class.return_value = MagicMock()
             # No execution has run on this cached instance, so invalidation
             # below must not treat it as in-flight and defer eviction.
@@ -852,10 +864,12 @@ class TestAgentServiceManagerReconstruction:
             dag_execution=sample_dag_execution,
             task_llm=runtime_llm,
         )
+        tool_config = MagicMock()
+        tool_config.get_task_runtime_workspace.return_value = None
         with (
             patch(
                 "xagent.web.services.agent_service_manager.create_default_tools",
-                new=AsyncMock(return_value=(["tool"], "tool_config")),
+                new=AsyncMock(return_value=(["tool"], tool_config)),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
             patch(
@@ -888,7 +902,7 @@ class TestAgentServiceManagerReconstruction:
         request = resolve_budget.await_args.args[0]
         assert (request.user_id, request.task_id, request.scope) == (1, "1", None)
         assert agent_kwargs["tools"] == ["tool"]
-        assert agent_kwargs["tool_config"] == "tool_config"
+        assert agent_kwargs["tool_config"] is tool_config
 
     @pytest.mark.asyncio
     async def test_reconstruct_agent_from_history_uses_shared_runtime_config(
@@ -921,11 +935,13 @@ class TestAgentServiceManagerReconstruction:
         agent_manager._resolve_task_runtime_config = MagicMock(
             side_effect=AssertionError("reconstruction re-read runtime config")
         )
+        tool_config = MagicMock()
+        tool_config.get_task_runtime_workspace.return_value = None
 
         with (
             patch(
                 "xagent.web.services.agent_service_manager.create_default_tools",
-                new=AsyncMock(return_value=(["tool"], "tool_config")),
+                new=AsyncMock(return_value=(["tool"], tool_config)),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
             patch(
@@ -978,11 +994,13 @@ class TestAgentServiceManagerReconstruction:
             agent_config=agent_config,
             voice="warm",
         )
+        tool_config = MagicMock()
+        tool_config.get_task_runtime_workspace.return_value = None
 
         with (
             patch(
                 "xagent.web.services.agent_service_manager.create_default_tools",
-                new=AsyncMock(return_value=(["tool"], "tool_config")),
+                new=AsyncMock(return_value=(["tool"], tool_config)),
             ),
             patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
             patch(

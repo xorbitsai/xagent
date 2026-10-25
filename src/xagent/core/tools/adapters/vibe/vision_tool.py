@@ -3,11 +3,14 @@ Vision tool for xagent
 Framework wrapper around the pure vision core
 """
 
+import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Optional, Union
 
-from xagent.core.workspace import TaskWorkspace
+from xagent.config import get_max_upload_size_bytes
+from xagent.core.workspace import ExternalUploadSizeLimitError, TaskWorkspace
 
 from ....file_ref import build_workspace_file_ref
 from ....model.chat.basic.adapter import attach_chat_retry_wrapper
@@ -55,35 +58,140 @@ class VisionTool:
         output_dir = str(workspace.output_dir) if workspace else "./output"
 
         # Create core instance
-        self.core = VisionCore(vision_model, output_directory=output_dir)
+        private_staging_roots = (
+            (workspace.external_upload_staging_root(host_private=True),)
+            if isinstance(workspace, TaskWorkspace)
+            else ()
+        )
+        self.core = VisionCore(
+            vision_model,
+            output_directory=output_dir,
+            workspace_root=workspace.workspace_dir if workspace else None,
+            allowed_local_media_roots=private_staging_roots,
+        )
 
-    def _resolve_media_path(self, media_path: str) -> str:
+    def _stage_media_path_sync(self, media_path: str) -> Path:
+        if self.workspace is None:
+            raise ValueError("Local media files require a task workspace")
+        source = self.workspace.resolve_path_with_search(
+            media_path, detached_file_ids=True
+        )
+        source = Path(source)
+        if not source.is_absolute():
+            raise FileNotFoundError(f"File not found: {media_path}")
+        return self.workspace.stage_resolved_path_for_external_upload(
+            source,
+            media_path,
+            max_bytes=get_max_upload_size_bytes(),
+            host_private=True,
+        )
+
+    async def _resolve_media_path(
+        self, media_path: str, staged_sources: dict[str, str]
+    ) -> str:
         """Resolve an image or video path using the task workspace."""
         # If it's a URL, return as-is
         if media_path.startswith(("http://", "https://", "data:")):
             return media_path
 
-        # Try to resolve using workspace
-        if self.workspace:
-            try:
-                resolved_path = self.workspace.resolve_path_with_search(media_path)
-                return str(resolved_path)
-            except (ValueError, FileNotFoundError):
-                pass
+        # The core owns the final read boundary as defense in depth. Keeping
+        # an unresolved value here lets it still validate arguments before a
+        # local read and preserves callers that mock the media conversion.
+        if self.workspace is None:
+            return media_path
 
-        # Return original path
-        return media_path
+        task = asyncio.create_task(
+            asyncio.to_thread(self._stage_media_path_sync, media_path)
+        )
+        try:
+            safe_path = await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not task.cancelled() and task.exception() is None:
+                completed_path = task.result()
+                staged_sources[str(completed_path)] = media_path
+            raise
+        except ExternalUploadSizeLimitError as exc:
+            logger.warning("Vision input exceeded its staging limit: %s", exc)
+            raise ValueError("Media exceeds the configured size limit") from None
+        except Exception as exc:
+            logger.warning("Rejected vision media selector %r: %s", media_path, exc)
+            raise ValueError(
+                "Media is unavailable or outside the task workspace"
+            ) from None
+        staged_sources[str(safe_path)] = media_path
+        if isinstance(self.workspace, TaskWorkspace):
+            self.core.add_allowed_local_media_root(
+                self.workspace.external_upload_staging_root(host_private=True)
+            )
+        if not safe_path.is_file():
+            raise FileNotFoundError(f"Media file not found: {media_path}")
+        return str(safe_path)
 
-    def _resolve_media(
+    async def _resolve_media(
         self,
         media: Union[str, List[str]],
+        staged_sources: dict[str, str],
+        resolution_warnings: Optional[list[str]] = None,
     ) -> str | list[str]:
         """Resolve all media paths using workspace."""
         if isinstance(media, str):
-            return self._resolve_media_path(media)
+            return await self._resolve_media_path(media, staged_sources)
         if isinstance(media, list):
-            return [self._resolve_media_path(item) for item in media]
+            resolved: list[str] = []
+            failures: list[Exception] = []
+            for item in media:
+                try:
+                    resolved.append(
+                        await self._resolve_media_path(item, staged_sources)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures.append(exc)
+                    if resolution_warnings is not None:
+                        resolution_warnings.append(
+                            f"Failed to resolve media {item}: {exc}"
+                        )
+            if not resolved and failures:
+                raise failures[0]
+            return resolved
         return media
+
+    def _discard_staged_media(self, staged_sources: dict[str, str]) -> None:
+        if self.workspace is None:
+            return
+        for path in staged_sources:
+            try:
+                self.workspace.discard_staged_external_upload(path)
+            except Exception as exc:
+                logger.warning("Failed to discard staged vision input: %s", exc)
+
+    @staticmethod
+    def _restore_media_selectors(
+        result: UnderstandMediaResult | DetectObjectsResult,
+        staged_sources: dict[str, str],
+    ) -> None:
+        if result.error:
+            for staged, original in staged_sources.items():
+                result.error = result.error.replace(staged, original)
+        if isinstance(result, DetectObjectsResult) and result.image_processed:
+            result.image_processed = staged_sources.get(
+                result.image_processed, result.image_processed
+            )
+        if result.warnings:
+            restored: list[str] = []
+            for warning in result.warnings:
+                for staged, original in staged_sources.items():
+                    warning = warning.replace(staged, original)
+                restored.append(warning)
+            result.warnings = restored
 
     def _normalize_media(
         self,
@@ -103,9 +211,6 @@ class VisionTool:
             raise ValueError("all items in media must be strings")
         raise TypeError("media must be a string or a list of strings")
 
-    # Internal compatibility helpers for image-specific operations.
-    _resolve_image_path = _resolve_media_path
-    _resolve_images = _resolve_media
     _normalize_images = _normalize_media
 
     async def understand_media(
@@ -119,21 +224,30 @@ class VisionTool:
         max_tokens: Optional[int] = None,
     ) -> UnderstandMediaResult:
         """Analyze images, videos, or mixed media with one public tool."""
+        staged_sources: dict[str, str] = {}
+        resolution_warnings: list[str] = []
         try:
             normalized_media = self._normalize_media(media)
-            resolved_media = self._resolve_media(normalized_media)
+            resolved_media = await self._resolve_media(
+                normalized_media, staged_sources, resolution_warnings
+            )
+            result = await self.core.understand_media(
+                resolved_media,
+                question,
+                start_time,
+                end_time,
+                max_frames,
+                temperature,
+                max_tokens,
+            )
+            result.warnings = [*resolution_warnings, *result.warnings]
+            self._restore_media_selectors(result, staged_sources)
+            return result
         except Exception as e:
             logger.error("understand_media: error resolving media: %s", e)
             return UnderstandMediaResult(success=False, error=str(e))
-        return await self.core.understand_media(
-            resolved_media,
-            question,
-            start_time,
-            end_time,
-            max_frames,
-            temperature,
-            max_tokens,
-        )
+        finally:
+            self._discard_staged_media(staged_sources)
 
     async def understand_images(
         self,
@@ -180,15 +294,24 @@ class VisionTool:
         Returns:
             UnderstandImagesResult with descriptions and metadata
         """
+        staged_sources: dict[str, str] = {}
+        resolution_warnings: list[str] = []
         try:
             normalized_images = self._normalize_images(images)
-            resolved_images = self._resolve_images(normalized_images)
+            resolved_images = await self._resolve_media(
+                normalized_images, staged_sources, resolution_warnings
+            )
+            result = await self.core.describe_images(
+                resolved_images, detail_level, temperature, max_tokens
+            )
+            result.warnings = [*resolution_warnings, *result.warnings]
+            self._restore_media_selectors(result, staged_sources)
+            return result
         except Exception as e:
             logger.error(f"describe_images: Error in resolving images: {e}")
             return UnderstandImagesResult(success=False, error=str(e))
-        return await self.core.describe_images(
-            resolved_images, detail_level, temperature, max_tokens
-        )
+        finally:
+            self._discard_staged_media(staged_sources)
 
     async def detect_objects(
         self,
@@ -215,16 +338,35 @@ class VisionTool:
         Returns:
             DetectObjectsResult with detected objects and optionally marked image path
         """
+        staged_sources: dict[str, str] = {}
+        resolution_warnings: list[str] = []
         try:
             normalized_images = self._normalize_images(images)
-            resolved_images = self._resolve_images(normalized_images)
+            resolved_images = await self._resolve_media(
+                normalized_images, staged_sources, resolution_warnings
+            )
+        except asyncio.CancelledError:
+            self._discard_staged_media(staged_sources)
+            raise
         except Exception as e:
             logger.error(f"detect_objects: Error in resolving images: {e}")
+            self._discard_staged_media(staged_sources)
             return DetectObjectsResult(success=False, error=str(e))
-
-        # Execute within auto_register context when marking
-        if mark_objects and self.workspace:
-            with self.workspace.auto_register_files():
+        result: DetectObjectsResult | None = None
+        try:
+            # Execute within auto_register context when marking
+            if mark_objects and self.workspace:
+                with self.workspace.auto_register_files():
+                    result = await self.core.detect_objects(
+                        resolved_images,
+                        task,
+                        mark_objects,
+                        box_color,
+                        confidence_threshold,
+                        temperature,
+                        max_tokens,
+                    )
+            else:
                 result = await self.core.detect_objects(
                     resolved_images,
                     task,
@@ -234,16 +376,13 @@ class VisionTool:
                     temperature,
                     max_tokens,
                 )
-        else:
-            result = await self.core.detect_objects(
-                resolved_images,
-                task,
-                mark_objects,
-                box_color,
-                confidence_threshold,
-                temperature,
-                max_tokens,
-            )
+        finally:
+            if result is not None:
+                result.warnings = [*resolution_warnings, *result.warnings]
+                self._restore_media_selectors(result, staged_sources)
+            self._discard_staged_media(staged_sources)
+
+        assert result is not None
 
         if (
             mark_objects
@@ -293,6 +432,8 @@ localization and marked-image generation belong to detect_objects instead.
 Parameters:
 - media (required): One image/video path or file_id, or a list of them. Always use
   the exact file_id or filename from uploaded/generated file metadata.
+- Local paths must belong to the current task workspace or its authorized uploads;
+  absolute host paths, traversal, and symlink escapes are rejected.
 - question (required): Question to ask about the media
 - start_time/end_time (optional): Video time range in seconds
 - max_frames (optional): Maximum sampled frames per video when the model has no
@@ -337,6 +478,7 @@ This unified tool can both detect objects and optionally create marked images wi
 
 Parameters:
 - images (required): The image parameter name is "images". Provide a single image file path, URL, or a list of multiple image paths/URLs. For best results, use single images. Supports local file paths or file IDs (e.g., MUST use the exact `file_id` or filename from the uploaded files list in the system prompt).
+- Local paths must belong to the current task workspace or its authorized uploads; arbitrary host paths, traversal, and symlink escapes are rejected.
 - task (required): Describe what you want to detect in plain language. Examples:
   * "Find all people in the image"
   * "Detect workers not wearing safety helmets"

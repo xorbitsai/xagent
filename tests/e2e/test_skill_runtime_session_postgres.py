@@ -455,8 +455,10 @@ def test_available_tools_route_uses_retained_models_before_request_db_reads(
             if record.name == "xagent.web.api.tools"
             and record.getMessage().startswith("Failed to fetch tool usage stats:")
         ]
-        assert len(usage_errors) == 1
-        assert "QueuePool limit of size 1 overflow 0 reached" in usage_errors[0]
+        # Authentication now acquires the request session before the route
+        # handler can query usage.  The retained checkout therefore times out
+        # in the auth dependency and never reaches the route-level usage log.
+        assert usage_errors == []
 
         # Route cleanup must release the lazy checkout even after the timeout.
         assert mutation_config._retained_factory_model_state is None

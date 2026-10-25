@@ -21,7 +21,10 @@ from ...file_ref import (
     parse_file_id_ref,
     safe_asset_filename,
 )
-from ...workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
+from ...workspace import (
+    DEFAULT_USER_FILE_LIST_LIMIT,
+    TaskWorkspace,
+)
 from ..tool_result_spill import (
     SPILL_READ_MAX_CHARS,
     list_spilled_results,
@@ -522,6 +525,7 @@ class WorkspaceFileOperations:
 
         with open(resolved_path, "a", encoding=encoding) as f:
             f.write(content)
+        self.workspace.grant_sandbox_access(resolved_path)
         return True
 
     def delete_file(self, file_path: str) -> bool:
@@ -616,6 +620,7 @@ class WorkspaceFileOperations:
         """Create directory in workspace"""
         resolved_path = self._resolve_write_path(directory_path)
         resolved_path.mkdir(parents=parents, exist_ok=True)
+        self.workspace.grant_sandbox_access(resolved_path)
         return True
 
     def get_file_info(self, file_path_or_id: str) -> FileInfo:

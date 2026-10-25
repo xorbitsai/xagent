@@ -128,6 +128,7 @@ from ..services.public_trace_events import (
     public_audience_frame,
     public_task_trace_filter,
 )
+from ..services.release_hold import release_hold
 from ..services.task_auto_recovery import (
     current_auto_recovery_view,
     is_auto_resume_command_id,
@@ -1507,10 +1508,25 @@ async def handle_chat_message(
     if enqueued is None:
         # Legacy recovery path for a client still connected to a task that was
         # deleted. The existing handler creates the replacement task first;
-        # subsequent commands use the durable transport normally.
-        await command_execution_service.handle_missing_task_message(
-            _make_command_reply(websocket), task_id, message_data
-        )
+        # subsequent commands use the durable transport normally. It executes
+        # directly rather than through a durable command, so it is admitted
+        # like any other new execution: refused before its side effects while
+        # a planned restart holds execution, counted until it returns.
+        admitted = release_hold.try_admit("ws_missing_task_chat", f"task:{task_id}")
+        if admitted is None:
+            client_message_id = command_execution_service._client_message_id(
+                message_data.get("client_message_id")
+            )
+            await send_execution_paused(
+                websocket,
+                client_message_id=client_message_id,
+                turn_id=client_message_id or str(uuid.uuid4()),
+            )
+            return
+        with admitted:
+            await command_execution_service.handle_missing_task_message(
+                _make_command_reply(websocket), task_id, message_data
+            )
         return
     if not enqueued.payload_matches:
         await send_message_delivery(
@@ -1945,7 +1961,56 @@ def _load_legacy_execute_task_request_sync(
         )
 
 
+async def send_execution_paused(
+    websocket: WebSocket,
+    *,
+    client_message_id: str | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Tell one client its new execution was not accepted during a restart hold.
+
+    A frame that carries a message id gets the delivery protocol's explicit
+    ``not_accepted`` outcome (safe to resend as is); every refusal also gets a
+    plain ``error`` frame, so a client that did not tag the frame still learns
+    nothing was started. The socket stays open.
+    """
+
+    code = ClientErrorCode.EXECUTION_PAUSED
+    message = client_error_message(code)
+    if client_message_id is not None:
+        await send_message_delivery(
+            websocket,
+            client_message_id=client_message_id,
+            turn_id=turn_id or client_message_id,
+            accepted=False,
+            message=message,
+            error_code=code.value,
+            rejection_outcome="not_accepted",
+        )
+    await manager.send_personal_message(
+        {"type": "error", "error_code": code.value, "message": message},
+        websocket,
+    )
+
+
 async def handle_execute_task(
+    websocket: WebSocket, task_id: int, message_data: dict
+) -> None:
+    """Admit the legacy direct execution command, then run it.
+
+    ``execute_task`` starts an execution directly (no durable command), so a
+    planned restart's hold refuses it before the legacy acknowledgement or any
+    lookup, and an admitted one is counted until the execution is registered.
+    """
+    admitted = release_hold.try_admit("ws_execute_task", f"task:{task_id}")
+    if admitted is None:
+        await send_execution_paused(websocket)
+        return
+    with admitted:
+        await _handle_admitted_execute_task(websocket, task_id, message_data)
+
+
+async def _handle_admitted_execute_task(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
     """Handle the legacy execution command without retaining a DB Session."""
@@ -3946,9 +4011,6 @@ async def handle_build_preview_execution(
     user: Union[User, WebSocketPrincipal],
 ) -> None:
     """Create a normal preview task and schedule it through the chat task flow."""
-    from ..schemas.chat import TaskCreateRequest
-    from .chat import create_task
-
     user_message = message_data.get("message", "")
     files_data = message_data.get("files", [])
     if not user_message and not files_data:
@@ -3991,49 +4053,84 @@ async def handle_build_preview_execution(
         isinstance(preview_task_id, (int, str)) and str(preview_task_id).isdigit()
     )
     if not has_preview_task:
-        task_request = TaskCreateRequest(
-            title=(user_message or "Build preview")[:80],
-            description=user_message,
-            agent_id=None,
-            files=None,
-            llm_ids=llm_ids,
-            agent_config=agent_config,
-            execution_mode=execution_mode,
-            is_visible=False,
-        )
-
-        from ..models import database as database_module
-
-        db_gen = database_module.get_db()
-        preview_db = next(db_gen)
-        try:
-            # create_task's implementation only consumes ``user.id``; keep its
-            # HTTP dependency annotation local instead of widening the
-            # WebSocket principal back into an ORM object.
-            task_response = await create_task(
-                task_request,
-                db=preview_db,
-                user=cast(User, user),
+        # A new preview run lives only in this socket's state and cannot be
+        # handed to another process, so while a planned restart holds new
+        # execution it is refused outright rather than queued for a successor
+        # nobody is watching. A follow-up to an existing preview task goes
+        # through the durable chat command below like any chat message.
+        admitted = release_hold.try_admit("ws_preview", f"user:{user.id}")
+        if admitted is None:
+            await send_execution_paused(websocket)
+            return
+        with admitted:
+            preview_task_id = await _create_preview_task(
+                user,
+                user_message=user_message,
+                agent_config=agent_config,
+                llm_ids=llm_ids,
+                execution_mode=execution_mode,
             )
-            preview_task_id = int(task_response.task_id)
-        finally:
-            preview_db.close()
+            websocket.state.preview_task_id = preview_task_id
+            manager.register_connection(websocket, preview_task_id)
+            await _send_preview_chat(websocket, preview_task_id, user, message_data)
+        return
+    await _send_preview_chat(websocket, int(str(preview_task_id)), user, message_data)
 
-        websocket.state.preview_task_id = preview_task_id
-        manager.register_connection(websocket, preview_task_id)
-    else:
-        preview_task_id = int(str(preview_task_id))
 
+async def _create_preview_task(
+    user: Union[User, WebSocketPrincipal],
+    *,
+    user_message: str,
+    agent_config: dict[str, Any],
+    llm_ids: list[Optional[str]],
+    execution_mode: Any,
+) -> int:
+    """Create the hidden task one preview socket runs its turns on."""
+    from ..models import database as database_module
+    from ..schemas.chat import TaskCreateRequest
+    from .chat import create_task
+
+    task_request = TaskCreateRequest(
+        title=(user_message or "Build preview")[:80],
+        description=user_message,
+        agent_id=None,
+        files=None,
+        llm_ids=llm_ids,
+        agent_config=agent_config,
+        execution_mode=execution_mode,
+        is_visible=False,
+    )
+    db_gen = database_module.get_db()
+    preview_db = next(db_gen)
+    try:
+        # create_task's implementation only consumes ``user.id``; keep its
+        # HTTP dependency annotation local instead of widening the
+        # WebSocket principal back into an ORM object.
+        task_response = await create_task(
+            task_request,
+            db=preview_db,
+            user=cast(User, user),
+        )
+        return int(task_response.task_id)
+    finally:
+        preview_db.close()
+
+
+async def _send_preview_chat(
+    websocket: WebSocket,
+    preview_task_id: int,
+    user: Union[User, WebSocketPrincipal],
+    message_data: dict,
+) -> None:
     await handle_chat_message(
         websocket,
         preview_task_id,
         {
             "type": "chat",
-            "message": user_message,
-            "files": files_data,
+            "message": message_data.get("message", ""),
+            "files": message_data.get("files", []),
             "user": user,
             "user_id": user.id,
             "context": {},
         },
     )
-    return

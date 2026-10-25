@@ -89,6 +89,16 @@ class AdmissionQueueFull(RuntimeError):
     """The host must translate this retryable refusal at its ingress boundary."""
 
 
+class ExecutionHeld(AdmissionQueueFull):
+    """New execution is paused on this process for a planned restart.
+
+    Raised by ``release_hold.admit`` before any side effect. A subclass of the
+    queue-full refusal on purpose: every ingress that already projects that
+    retryable "not accepted" outcome onto its own protocol handles this one
+    the same way, without a new wire code. The argument names the entry kind.
+    """
+
+
 @dataclass(frozen=True, kw_only=True)
 class CommandClassification:
     """What a deployment decided for one new execution command at acceptance.

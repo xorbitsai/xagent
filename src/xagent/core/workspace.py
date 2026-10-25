@@ -67,6 +67,7 @@ _internal_path_registry: Dict[Tuple[str, str], str] = {}
 _internal_file_registry_lock = RLock()
 _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
 _SANDBOX_PERMISSION_MIGRATION_MARKER = ".xagent-permissions-v2"
+_SANDBOX_RUNTIME_GID = 1010
 # A failed legacy migration is retried after a process restart or through an
 # explicit migration call, but ordinary TaskWorkspace reconstruction must not
 # repeat a synchronous tree walk on every tool call.
@@ -81,6 +82,14 @@ SPILL_DIR_NAME = "tool-results"
 # family, per call on some paths -- announces the same collision once.
 _announced_reserved_names: set[str] = set()
 _announced_reserved_names_lock = Lock()
+
+
+def _is_sandbox_prepared(entry_stat: os.stat_result) -> bool:
+    """Return whether a directory carries the sandbox group contract."""
+
+    return entry_stat.st_gid == _SANDBOX_RUNTIME_GID and bool(
+        entry_stat.st_mode & stat.S_ISGID
+    )
 
 
 def scoped_user_root(
@@ -683,6 +692,12 @@ class TaskWorkspace:
         if require_persistence and any(not plan.should_persist for plan in plans):
             raise ValueError("Attachment registration requires a persisted task owner")
 
+        # Grant access only after the complete batch has passed path, ownership,
+        # and persistence validation. Permission repair is best effort because a
+        # caller may concurrently remove an otherwise valid path.
+        for registration, _file_id in registrations:
+            self._grant_sandbox_access_best_effort(registration)
+
         prepared: list[PreparedWorkspaceFileRegistration] = []
         try:
             for plan in plans:
@@ -785,19 +800,6 @@ class TaskWorkspace:
             unique.append((registration, requested_file_id))
             result_indexes.append(unique_index)
 
-        # Do not mutate paths until the complete batch passes validation.
-        # Permission repair remains best effort for concurrently removed or
-        # restricted legacy entries.
-        for registration, _file_id in unique:
-            try:
-                self._grant_registered_path_sandbox_access(registration)
-            except OSError:
-                logger.warning(
-                    "Failed to grant sandbox access to registered path %s",
-                    registration.path,
-                    exc_info=True,
-                )
-
         return tuple(unique), tuple(result_indexes)
 
     def _grant_registered_path_sandbox_access(
@@ -808,7 +810,7 @@ class TaskWorkspace:
             return
         workspace_root = self.workspace_dir.resolve()
         root_stat = workspace_root.stat()
-        if root_stat.st_gid != 1010 or not root_stat.st_mode & stat.S_ISGID:
+        if not _is_sandbox_prepared(root_stat):
             return
         try:
             relative = registration.path.absolute().relative_to(workspace_root)
@@ -847,9 +849,10 @@ class TaskWorkspace:
                     or entry_stat.st_ino != component_stat.st_ino
                 ):
                     return
-                # The root-running backend transfers sandbox-created output
-                # back to its own uid before repairing the mode below.
-                os.fchown(current_fd, os.geteuid(), 1010)
+                # Preserve the creating uid. In particular, sandbox-created
+                # files must stay owned by uid 1100 so chmod/utime/copy2 keep
+                # working on later sandbox calls.
+                os.fchown(current_fd, -1, _SANDBOX_RUNTIME_GID)
                 os.fchmod(
                     current_fd,
                     self._sandbox_compatible_mode(
@@ -860,8 +863,22 @@ class TaskWorkspace:
             if current_fd != -1:
                 os.close(current_fd)
 
-    def grant_host_created_path_sandbox_access(self, file_path: str) -> None:
-        """Make one host-created workspace file editable by the sandbox.
+    def _grant_sandbox_access_best_effort(
+        self, registration: WorkspaceFileRegistration
+    ) -> None:
+        """Best-effort permission repair for an already validated path."""
+
+        try:
+            self._grant_registered_path_sandbox_access(registration)
+        except OSError:
+            logger.warning(
+                "Failed to grant sandbox access to workspace path %s",
+                registration.path,
+                exc_info=True,
+            )
+
+    def grant_sandbox_access(self, path: Union[str, Path]) -> None:
+        """Best-effort sandbox access for one host-created file or directory.
 
         Some host-side tools create files without registering them as user
         deliverables.  They still need the same descriptor-relative
@@ -869,8 +886,22 @@ class TaskWorkspace:
         workspace is prepared for uid 1100/gid 1010.
         """
 
-        registration = self.describe_file_registration(file_path)
-        self._grant_registered_path_sandbox_access(registration)
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self.workspace_dir / candidate
+        candidate = Path(os.path.abspath(candidate))
+        workspace_root = self.workspace_dir.resolve()
+        try:
+            relative = candidate.relative_to(workspace_root)
+        except ValueError:
+            return
+        registration = WorkspaceFileRegistration(
+            path=candidate,
+            relative_path=relative.as_posix(),
+            category=relative.parts[0] if relative.parts else "workspace",
+            is_workspace_file=True,
+        )
+        self._grant_sandbox_access_best_effort(registration)
 
     @staticmethod
     def _release_registration_session_if_clean(db: Any) -> None:
@@ -1274,14 +1305,7 @@ class TaskWorkspace:
         normalized_file_id = str(file_id).strip()
         if not normalized_file_id:
             raise ValueError("file_id is required for an already durable file")
-        try:
-            self._grant_registered_path_sandbox_access(registration)
-        except OSError:
-            logger.warning(
-                "Failed to grant sandbox access to durable workspace input %s",
-                registration.path,
-                exc_info=True,
-            )
+        self._grant_sandbox_access_best_effort(registration)
         with self._registration_lock:
             self._remember_file_registration(normalized_file_id, registration.path)
         return normalized_file_id
@@ -1891,43 +1915,35 @@ class TaskWorkspace:
             relative_parts = parent.relative_to(uploads_root).parts
         except ValueError:
             return False
-        current_fd = os.open(uploads_root, traversal_flags)
-        root_stat = os.fstat(current_fd)
-        prepared_ancestor_found = root_stat.st_gid == 1010 and bool(
-            root_stat.st_mode & stat.S_ISGID
-        )
+        try:
+            current_fd = os.open(uploads_root, traversal_flags)
+            prepared_ancestor_found = _is_sandbox_prepared(os.fstat(current_fd))
+        except OSError:
+            return False
         try:
             for component in relative_parts:
-                next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
+                next_fd = -1
                 try:
+                    next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
                     component_stat = os.fstat(next_fd)
                     if prepared_ancestor_found:
+                        mutation_fd = os.open(
+                            component, directory_flags, dir_fd=current_fd
+                        )
                         try:
-                            mutation_fd = os.open(
-                                component, directory_flags, dir_fd=current_fd
+                            os.fchown(mutation_fd, -1, _SANDBOX_RUNTIME_GID)
+                            os.fchmod(
+                                mutation_fd,
+                                stat.S_IMODE(component_stat.st_mode) | 0o2050,
                             )
-                        except PermissionError:
-                            # O_PATH can traverse an owner-search-only
-                            # component that cannot be reopened for reading.
-                            # That layout is valid for non-Docker local/
-                            # BoxLite workspaces.  Decline the Docker-specific
-                            # group repair and let _ensure_directories use its
-                            # legacy creation path instead of aborting
-                            # workspace construction.
-                            os.close(next_fd)
-                            return False
-                        try:
-                            os.fchown(mutation_fd, -1, 1010)
-                            os.fchmod(mutation_fd, 0o2750)
                         finally:
                             os.close(mutation_fd)
-                    elif component_stat.st_gid == 1010 and (
-                        component_stat.st_mode & stat.S_ISGID
-                    ):
+                    elif _is_sandbox_prepared(component_stat):
                         prepared_ancestor_found = True
-                except BaseException:
-                    os.close(next_fd)
-                    raise
+                except OSError:
+                    if next_fd >= 0:
+                        os.close(next_fd)
+                    return False
                 os.close(current_fd)
                 current_fd = next_fd
             return prepared_ancestor_found
@@ -1937,20 +1953,60 @@ class TaskWorkspace:
     def _ensure_directories(self) -> None:
         """Ensure task directories inherit writable sandbox-group access."""
         self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
-        parent_stat = self.workspace_dir.parent.stat()
-        parent_is_prepared = parent_stat.st_gid == 1010 and bool(
-            parent_stat.st_mode & stat.S_ISGID
+        parent = self.workspace_dir.parent.resolve()
+        uploads_root = get_uploads_dir().expanduser().resolve()
+        parent_is_managed = parent == uploads_root or parent.is_relative_to(
+            uploads_root
         )
+        parent_is_prepared = parent_is_managed and _is_sandbox_prepared(parent.stat())
         repaired_parent_chain = False
         if not parent_is_prepared:
             repaired_parent_chain = self._prepare_sandbox_workspace_parent()
             parent_is_prepared = repaired_parent_chain
         if not parent_is_prepared:
-            self.workspace_dir.mkdir(exist_ok=True)
-            self.input_dir.mkdir(exist_ok=True)
-            self.output_dir.mkdir(exist_ok=True)
-            self.temp_dir.mkdir(exist_ok=True)
+            self._ensure_legacy_directories()
             return
+
+        try:
+            self._ensure_prepared_sandbox_directories(repaired_parent_chain)
+        except OSError:
+            logger.warning(
+                "Failed to repair prepared sandbox workspace %s; using legacy layout",
+                self.workspace_dir,
+                exc_info=True,
+            )
+            self._ensure_legacy_directories()
+
+    def _ensure_legacy_directories(self) -> None:
+        self.workspace_dir.mkdir(exist_ok=True)
+        self.input_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(exist_ok=True)
+        self.temp_dir.mkdir(exist_ok=True)
+
+    @staticmethod
+    def _open_prepared_directory(
+        parent_fd: int,
+        name: str,
+        flags: int,
+        *,
+        create_mode: int,
+        final_mode: int,
+    ) -> int:
+        try:
+            os.mkdir(name, mode=create_mode, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            os.fchown(directory_fd, -1, _SANDBOX_RUNTIME_GID)
+            os.fchmod(directory_fd, final_mode)
+        except BaseException:
+            os.close(directory_fd)
+            raise
+        return directory_fd
+
+    def _ensure_prepared_sandbox_directories(self, repaired_parent_chain: bool) -> None:
+        """Create and repair one workspace beneath a trusted prepared parent."""
 
         flags = os.O_RDONLY | os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
@@ -1960,28 +2016,26 @@ class TaskWorkspace:
         parent_open_flags = flags | getattr(os, "O_PATH", 0)
         parent_fd = os.open(parent, parent_open_flags)
         try:
-            try:
-                os.mkdir(self.workspace_dir.name, mode=0o770, dir_fd=parent_fd)
-            except FileExistsError:
-                pass
-            workspace_fd = os.open(self.workspace_dir.name, flags, dir_fd=parent_fd)
+            workspace_fd = self._open_prepared_directory(
+                parent_fd,
+                self.workspace_dir.name,
+                flags,
+                create_mode=0o750,
+                final_mode=0o2750,
+            )
         finally:
             os.close(parent_fd)
 
         try:
-            os.fchown(workspace_fd, -1, 1010)
-            os.fchmod(workspace_fd, 0o2750)
             for directory in (self.input_dir, self.output_dir, self.temp_dir):
-                try:
-                    os.mkdir(directory.name, mode=0o770, dir_fd=workspace_fd)
-                except FileExistsError:
-                    pass
-                fd = os.open(directory.name, flags, dir_fd=workspace_fd)
-                try:
-                    os.fchown(fd, -1, 1010)
-                    os.fchmod(fd, 0o2770)
-                finally:
-                    os.close(fd)
+                fd = self._open_prepared_directory(
+                    workspace_fd,
+                    directory.name,
+                    flags,
+                    create_mode=0o770,
+                    final_mode=0o2770,
+                )
+                os.close(fd)
             temp_fd = os.open(self.temp_dir.name, flags, dir_fd=workspace_fd)
             try:
                 self._ensure_internal_temp_directory(temp_fd, flags)
@@ -2015,17 +2069,16 @@ class TaskWorkspace:
     ) -> None:
         """Create the reserved temp directory without trusting sandbox state.
 
-        ``temp/`` is writable by gid 1010. A sandbox can therefore replace the
-        reserved name between workspace constructions. Remove non-directory
-        entries descriptor-relatively and retry, but do not let a process that
-        continuously races the name make workspace construction or cleanup
-        impossible.
+        Legacy ``temp/`` layouts may have allowed the sandbox to replace the
+        reserved name. Remove non-directory entries descriptor-relatively and
+        retry, but do not let a process that continuously races the name make
+        workspace construction or cleanup impossible.
         """
         recoverable_open_errors = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}
         internal_flags = directory_flags | getattr(os, "O_NONBLOCK", 0)
         for _attempt in range(3):
             try:
-                os.mkdir(_INTERNAL_TEMP_DIR_NAME, mode=0o770, dir_fd=temp_fd)
+                os.mkdir(_INTERNAL_TEMP_DIR_NAME, mode=0o750, dir_fd=temp_fd)
             except FileExistsError:
                 pass
             try:
@@ -2051,8 +2104,8 @@ class TaskWorkspace:
                     pass
                 continue
             try:
-                os.fchown(internal_fd, -1, 1010)
-                os.fchmod(internal_fd, 0o2770)
+                os.fchown(internal_fd, -1, _SANDBOX_RUNTIME_GID)
+                os.fchmod(internal_fd, 0o2750)
             finally:
                 os.close(internal_fd)
             return
@@ -2066,7 +2119,7 @@ class TaskWorkspace:
     def _sandbox_compatible_mode(mode: int, *, directory: bool) -> int:
         owner_permissions = (stat.S_IMODE(mode) >> 6) & 0o7
         # Do not copy setuid/setgid bits from legacy files into a sandbox bind
-        # mount. Directories need only setgid so new entries inherit gid 1010.
+        # mount. Directories need only setgid so new entries inherit the sandbox gid.
         special = stat.S_ISGID if directory else 0
         return special | (owner_permissions << 6) | (owner_permissions << 3)
 
@@ -2102,7 +2155,15 @@ class TaskWorkspace:
             directory_fd = os.open(directory_name, directory_flags, dir_fd=workspace_fd)
             try:
                 migration_succeeded = (
-                    self._migrate_sandbox_tree(directory_fd) and migration_succeeded
+                    self._migrate_sandbox_tree(
+                        directory_fd,
+                        skip_names=(
+                            frozenset({_INTERNAL_TEMP_DIR_NAME})
+                            if directory_name == "temp"
+                            else None
+                        ),
+                    )
+                    and migration_succeeded
                 )
             finally:
                 os.close(directory_fd)
@@ -2118,6 +2179,16 @@ class TaskWorkspace:
             os.unlink(_SANDBOX_PERMISSION_MIGRATION_MARKER, dir_fd=workspace_fd)
         except FileNotFoundError:
             pass
+        except OSError:
+            # Never recursively remove an unexpected entry at this reserved
+            # name. A directory or protected inode can safely leave migration
+            # incomplete without breaking workspace reconstruction.
+            logger.warning(
+                "Cannot replace sandbox permission migration marker for %s",
+                self.workspace_dir,
+                exc_info=True,
+            )
+            return
         try:
             marker_fd = os.open(
                 _SANDBOX_PERMISSION_MIGRATION_MARKER,
@@ -2130,7 +2201,9 @@ class TaskWorkspace:
             return
         os.close(marker_fd)
 
-    def _migrate_sandbox_tree(self, directory_fd: int) -> bool:
+    def _migrate_sandbox_tree(
+        self, directory_fd: int, *, skip_names: Optional[frozenset[str]] = None
+    ) -> bool:
         """Repair a tree iteratively without retaining one fd per directory."""
         succeeded = True
         pending: list[tuple[str, ...]] = [()]
@@ -2151,6 +2224,9 @@ class TaskWorkspace:
                         next_fd = os.open(component, directory_flags, dir_fd=current_fd)
                         os.close(current_fd)
                         current_fd = next_fd
+                except FileNotFoundError:
+                    # A concurrently removed directory no longer needs repair.
+                    continue
                 except OSError:
                     succeeded = False
                     continue
@@ -2164,12 +2240,17 @@ class TaskWorkspace:
                     succeeded = False
                     continue
                 for name in names:
+                    if not relative_parts and skip_names and name in skip_names:
+                        continue
                     try:
                         entry_stat = os.stat(
                             name,
                             dir_fd=current_fd,
                             follow_symlinks=False,
                         )
+                    except FileNotFoundError:
+                        # A vanished entry no longer needs repair.
+                        continue
                     except OSError:
                         succeeded = False
                         continue
@@ -2184,6 +2265,9 @@ class TaskWorkspace:
                         flags |= os.O_DIRECTORY
                     try:
                         entry_fd = os.open(name, flags, dir_fd=current_fd)
+                    except FileNotFoundError:
+                        # A vanished entry no longer needs repair.
+                        continue
                     except OSError:
                         succeeded = False
                         continue
@@ -2196,7 +2280,7 @@ class TaskWorkspace:
                             succeeded = False
                             continue
                         try:
-                            os.fchown(entry_fd, os.geteuid(), 1010)
+                            os.fchown(entry_fd, -1, _SANDBOX_RUNTIME_GID)
                             os.fchmod(
                                 entry_fd,
                                 self._sandbox_compatible_mode(

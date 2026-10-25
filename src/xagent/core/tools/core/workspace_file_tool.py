@@ -24,7 +24,6 @@ from ...file_ref import (
 from ...workspace import (
     DEFAULT_USER_FILE_LIST_LIMIT,
     TaskWorkspace,
-    WorkspaceFileRegistration,
 )
 from ..tool_result_spill import (
     SPILL_READ_MAX_CHARS,
@@ -526,6 +525,7 @@ class WorkspaceFileOperations:
 
         with open(resolved_path, "a", encoding=encoding) as f:
             f.write(content)
+        self.workspace.grant_sandbox_access(resolved_path)
         return True
 
     def delete_file(self, file_path: str) -> bool:
@@ -620,24 +620,7 @@ class WorkspaceFileOperations:
         """Create directory in workspace"""
         resolved_path = self._resolve_write_path(directory_path)
         resolved_path.mkdir(parents=parents, exist_ok=True)
-        # Directories are not durable file records, but they still need the
-        # descriptor-safe permission walk used by registered files.
-        workspace_root = self.workspace.workspace_dir.resolve()
-        relative_path = resolved_path.absolute().relative_to(workspace_root)
-        registration = WorkspaceFileRegistration(
-            path=resolved_path.absolute(),
-            relative_path=relative_path.as_posix(),
-            category=relative_path.parts[0] if relative_path.parts else "workspace",
-            is_workspace_file=True,
-        )
-        try:
-            self.workspace._grant_registered_path_sandbox_access(registration)
-        except OSError:
-            logger.warning(
-                "Failed to grant sandbox access to workspace directory %s",
-                resolved_path,
-                exc_info=True,
-            )
+        self.workspace.grant_sandbox_access(resolved_path)
         return True
 
     def get_file_info(self, file_path_or_id: str) -> FileInfo:

@@ -222,6 +222,7 @@ class TestWorkspaceFileOperations:
             real_fchmod(fd, mode)
 
         monkeypatch.setattr(Path, "stat", prepared_root_stat)
+        monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: tmp_path)
         monkeypatch.setattr(
             workspace_module.os,
             "fchown",
@@ -234,7 +235,19 @@ class TestWorkspaceFileOperations:
         created = workspace.output_dir / "reports" / "nested"
         assert stat.S_IMODE(created.stat().st_mode) & 0o777 == 0o770
         assert requested_modes[-1] == 0o2770
-        assert chowns[-1] == (os.geteuid(), 1010)
+        assert chowns[-1] == (-1, 1010)
+
+    def test_append_hidden_file_grants_sandbox_access(self, tmp_path, monkeypatch):
+        workspace = TaskWorkspace("test_append_permissions", str(tmp_path))
+        ops = WorkspaceFileOperations(workspace)
+        granted_paths: list[Path] = []
+        monkeypatch.setattr(workspace, "grant_sandbox_access", granted_paths.append)
+        hidden = workspace.output_dir / ".notes"
+        hidden.write_text("existing", encoding="utf-8")
+
+        assert ops.append_file(".notes", "hidden") is True
+
+        assert granted_paths == [hidden]
 
     def test_read_json_file_delegation(self, tmp_path):
         """Test that read_json_file correctly delegates to basic file_tool function."""

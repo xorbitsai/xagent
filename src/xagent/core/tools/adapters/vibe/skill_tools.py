@@ -312,7 +312,7 @@ class SkillTools:
             destination = self.workspace.output_dir / dest
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
-            self.workspace.grant_host_created_path_sandbox_access(str(destination))
+            self.workspace.grant_sandbox_access(destination)
             return {
                 "source": f"{record.path or record.source}/{path}",
                 "destination": str(
@@ -341,7 +341,7 @@ class SkillTools:
 
         # Copy file to workspace
         shutil.copy2(source, destination)
-        self.workspace.grant_host_created_path_sandbox_access(str(destination))
+        self.workspace.grant_sandbox_access(destination)
 
         return {
             "source": str(source),

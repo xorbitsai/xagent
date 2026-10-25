@@ -192,7 +192,7 @@ class TestSkillFileAccess:
         granted_paths: list[str] = []
         monkeypatch.setattr(
             mock_workspace,
-            "grant_host_created_path_sandbox_access",
+            "grant_sandbox_access",
             granted_paths.append,
         )
         skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
@@ -205,9 +205,7 @@ class TestSkillFileAccess:
         # Normalize path separators for comparison
         dest_normalized = result["destination"].replace("\\", "/")
         assert "config/schema.json" in dest_normalized
-        assert granted_paths == [
-            str(mock_workspace.output_dir / "config" / "schema.json")
-        ]
+        assert granted_paths == [mock_workspace.output_dir / "config" / "schema.json"]
 
     def test_fetch_skill_file_not_found(self, temp_skills_dir, mock_workspace):
         """Test FileNotFoundError when file doesn't exist."""

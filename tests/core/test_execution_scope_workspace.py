@@ -154,6 +154,7 @@ class TestScopedWorkspace:
     def test_task_directories_inherit_sandbox_group_write(self, tmp_path, monkeypatch):
         base = tmp_path / "user_7"
         base.mkdir()
+        monkeypatch.setattr("xagent.core.workspace.get_uploads_dir", lambda: tmp_path)
         real_stat = Path.stat
 
         def sandbox_root_stat(path: Path, *args, **kwargs):
@@ -189,10 +190,13 @@ class TestScopedWorkspace:
             workspace.temp_dir,
         ):
             assert stat.S_IMODE(real_stat(directory).st_mode) & 0o777 == 0o770
-        # workspace + input/output/temp + the private runtime temp directory;
-        # the latter is visited once more by the legacy-content migration.
-        assert assigned_gids == [1010] * 6
-        assert requested_modes == [0o2750, *([0o2770] * 5)]
+        assert (
+            stat.S_IMODE(real_stat(workspace.internal_temp_dir).st_mode) & 0o777
+            == 0o750
+        )
+        # workspace + input/output/temp + the private runtime temp directory.
+        assert assigned_gids == [1010] * 5
+        assert requested_modes == [0o2750, *([0o2770] * 3), 0o2750]
 
     def test_scoped_parent_chain_and_existing_contents_are_repaired(
         self, tmp_path, monkeypatch
@@ -242,9 +246,9 @@ class TestScopedWorkspace:
         TaskWorkspace("web_task_5", str(base), scope_segments=SEGMENTS, db_task_id=5)
 
         assert (
-            stat.S_IMODE((prepared_root / "tenant-a").stat().st_mode) & 0o777 == 0o750
+            stat.S_IMODE((prepared_root / "tenant-a").stat().st_mode) & 0o777 == 0o755
         )
-        assert stat.S_IMODE(base.stat().st_mode) & 0o777 == 0o750
+        assert stat.S_IMODE(base.stat().st_mode) & 0o777 == 0o755
         assert stat.S_IMODE(legacy.stat().st_mode) == 0o660
         assert assigned_gids
         assert requested_modes.count(0o2750) >= 2

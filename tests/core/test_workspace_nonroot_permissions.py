@@ -52,7 +52,10 @@ def test_permission_migration_repairs_nested_legacy_files(
     assert (workspace.workspace_dir / ".xagent-permissions-v2").is_file()
 
 
-@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="Linux O_PATH is required")
+@pytest.mark.skipif(
+    not hasattr(os, "O_PATH") or os.geteuid() == 0,
+    reason="Linux O_PATH and an unprivileged user are required",
+)
 def test_prepare_parent_traverses_search_only_component(tmp_path, monkeypatch):
     uploads_root = tmp_path / "uploads"
     search_only = uploads_root / "search-only"
@@ -69,7 +72,10 @@ def test_prepare_parent_traverses_search_only_component(tmp_path, monkeypatch):
         search_only.chmod(0o755)
 
 
-@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="Linux O_PATH is required")
+@pytest.mark.skipif(
+    not hasattr(os, "O_PATH") or os.geteuid() == 0,
+    reason="Linux O_PATH and an unprivileged user are required",
+)
 def test_prepare_parent_falls_back_when_search_only_component_cannot_reopen(
     tmp_path, monkeypatch
 ):
@@ -157,7 +163,112 @@ def test_permission_migration_marker_fifo_never_blocks(workspace, monkeypatch):
     assert marker.is_file()
 
 
-def test_registered_output_is_transferred_to_backend_uid(workspace, monkeypatch):
+def test_permission_migration_marker_directory_does_not_break_workspace(
+    workspace, monkeypatch
+):
+    marker = workspace.workspace_dir / ".xagent-permissions-v2"
+    marker.mkdir()
+    monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+
+    workspace_fd = os.open(workspace.workspace_dir, flags)
+    try:
+        workspace._migrate_existing_sandbox_permissions(workspace_fd, flags)
+    finally:
+        os.close(workspace_fd)
+
+    assert marker.is_dir()
+
+
+def test_permission_migration_treats_vanished_entry_as_complete(workspace, monkeypatch):
+    vanishing = workspace.output_dir / "vanishing.txt"
+    vanishing.write_text("temporary", encoding="utf-8")
+    real_stat = os.stat
+
+    def remove_before_stat(path, *args, dir_fd=None, **kwargs):
+        if path == vanishing.name and dir_fd is not None:
+            os.unlink(path, dir_fd=dir_fd)
+            raise FileNotFoundError(errno.ENOENT, "entry vanished", path)
+        return real_stat(path, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(workspace_module.os, "stat", remove_before_stat)
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    output_fd = os.open(workspace.output_dir, flags)
+    try:
+        assert workspace._migrate_sandbox_tree(output_fd)
+    finally:
+        os.close(output_fd)
+
+
+def test_failed_registration_validation_does_not_mutate_permissions(
+    workspace, monkeypatch
+):
+    output = workspace.output_dir / "invalid.txt"
+    output.write_text("invalid", encoding="utf-8")
+    grants: list[WorkspaceFileRegistration] = []
+    monkeypatch.setattr(
+        workspace,
+        "_grant_sandbox_access_best_effort",
+        grants.append,
+    )
+    monkeypatch.setattr(
+        workspace,
+        "_load_file_registration_plans",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("invalid owner")),
+    )
+
+    with pytest.raises(ValueError, match="invalid owner"):
+        workspace._register_files_locked(((str(output), None),), db_session=None)
+
+    assert grants == []
+
+
+def test_grant_sandbox_access_is_best_effort(workspace, monkeypatch):
+    output = workspace.output_dir / "host-created.txt"
+    output.write_text("host", encoding="utf-8")
+    monkeypatch.setattr(
+        workspace,
+        "_grant_registered_path_sandbox_access",
+        lambda _registration: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    workspace.grant_sandbox_access(output)
+
+
+def test_prepared_directory_outside_upload_root_uses_legacy_layout(
+    tmp_path, monkeypatch
+):
+    configured_uploads = tmp_path / "configured-uploads"
+    configured_uploads.mkdir()
+    external_base = tmp_path / "external"
+    external_base.mkdir()
+    real_stat = Path.stat
+
+    def accidentally_prepared_stat(path: Path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if path == external_base:
+            values = list(result)
+            values[5] = 1010
+            values[0] |= stat.S_ISGID
+            return os.stat_result(values)
+        return result
+
+    chowns: list[tuple[int, int]] = []
+    monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: configured_uploads)
+    monkeypatch.setattr(Path, "stat", accidentally_prepared_stat)
+    monkeypatch.setattr(
+        workspace_module.os,
+        "fchown",
+        lambda _fd, uid, gid: chowns.append((uid, gid)),
+    )
+
+    workspace = TaskWorkspace("external-task", str(external_base))
+
+    assert chowns == []
+    assert stat.S_IMODE(real_stat(workspace.workspace_dir).st_mode) == 0o755
+
+
+def test_registered_output_preserves_creating_uid(workspace, monkeypatch):
     output = workspace.output_dir / "sandbox.txt"
     output.write_text("result", encoding="utf-8")
     registration = WorkspaceFileRegistration(
@@ -188,7 +299,7 @@ def test_registered_output_is_transferred_to_backend_uid(workspace, monkeypatch)
 
     workspace._grant_registered_path_sandbox_access(registration)
 
-    assert chowns[-1] == (os.geteuid(), 1010)
+    assert chowns[-1] == (-1, 1010)
 
 
 def test_bound_durable_input_is_made_readable_by_sandbox(workspace, monkeypatch):
@@ -223,7 +334,7 @@ def test_bound_durable_input_is_made_readable_by_sandbox(workspace, monkeypatch)
     workspace.bind_already_durable_file(registration, file_id="restored-file")
 
     assert stat.S_IMODE(durable_input.stat().st_mode) == 0o660
-    assert chowns[-1] == (os.geteuid(), 1010)
+    assert chowns[-1] == (-1, 1010)
 
 
 def test_permission_marker_is_hidden_from_workspace_listing(workspace):
@@ -290,6 +401,7 @@ def test_workspace_recovers_replaced_internal_temp_entry(tmp_path, monkeypatch):
         return result
 
     monkeypatch.setattr(Path, "stat", prepared_parent_stat)
+    monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
 
     workspace = TaskWorkspace("task-internal", str(base_dir))
@@ -327,6 +439,7 @@ def test_workspace_retries_internal_temp_directory_enoent(tmp_path, monkeypatch)
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(Path, "stat", prepared_parent_stat)
+    monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
     monkeypatch.setattr(workspace_module.os, "open", disappear_once)
 
@@ -362,6 +475,7 @@ def test_workspace_tolerates_repeated_internal_temp_enoent(tmp_path, monkeypatch
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(Path, "stat", prepared_parent_stat)
+    monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
     monkeypatch.setattr(workspace_module.os, "open", keep_disappearing)
 
@@ -389,6 +503,7 @@ def test_workspace_migration_is_attempted_once_per_process(tmp_path, monkeypatch
 
     attempts: list[str] = []
     monkeypatch.setattr(Path, "stat", prepared_parent_stat)
+    monkeypatch.setattr(workspace_module, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_module.os, "fchown", lambda *_args: None)
     monkeypatch.setattr(
         TaskWorkspace,

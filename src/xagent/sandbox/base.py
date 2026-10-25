@@ -6,9 +6,11 @@ from __future__ import annotations
 
 import abc
 import hashlib
+import os
 import posixpath
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Literal, Mapping, Optional, Sequence
 
 from pydantic import BaseModel, Field
@@ -18,6 +20,82 @@ TemplateType = Literal["image", "snapshot"]
 
 CodeType = Literal["python", "javascript"]
 """Supported code execution types."""
+
+
+def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
+    """Make a managed mount suffix traversable by the sandbox identity.
+
+    Every component between ``trusted_root`` and ``root`` is assigned gid 1010
+    and mode 2750.  ``trusted_root`` itself and its ancestors are never
+    changed.  Callers that use an operator-owned folded mount as the descriptor
+    anchor must therefore choose the first Xagent-managed descendant as
+    ``root``.  Avoiding a recursive privileged walk keeps lease cost bounded
+    by path depth and prevents a sandbox process from redirecting a path-based
+    walk through a concurrently swapped symlink.
+
+    Every path component is opened relative to its parent with ``O_NOFOLLOW``
+    before the final directory is changed through its file descriptor.  The
+    backend must therefore run as root; failure is explicit and never falls
+    back to world-writable permissions.
+    """
+    # Deployment roots may legitimately sit behind an operator-controlled
+    # symlink (for example /data -> /mnt/data). Resolve only that immutable
+    # prefix. The sandbox-controlled suffix must stay lexical and is then
+    # created/opened descriptor-relatively without following links.
+    lexical_root = Path(os.path.abspath(root))
+    lexical_trusted_root = Path(os.path.abspath(trusted_root))
+    try:
+        relative_parts = lexical_root.relative_to(lexical_trusted_root).parts
+    except ValueError as exc:
+        raise SandboxContractError(
+            f"Docker workspace root is outside its trusted prefix: {root}"
+        ) from exc
+    resolved_trusted_root = Path(os.path.realpath(lexical_trusted_root))
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    traversal_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+        traversal_flags |= os.O_NOFOLLOW
+
+    try:
+        current_fd = os.open(os.path.sep, traversal_flags)
+    except OSError as exc:
+        raise SandboxContractError(
+            f"Cannot open Docker workspace root for gid preparation: {root}"
+        ) from exc
+    try:
+        try:
+            for component in resolved_trusted_root.parts[1:]:
+                next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            for component in relative_parts:
+                try:
+                    os.mkdir(component, mode=0o750, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                try:
+                    os.fchown(next_fd, -1, SANDBOX_RUNTIME_GID)
+                    os.fchmod(next_fd, 0o2750)
+                except PermissionError as exc:
+                    os.close(next_fd)
+                    raise SandboxContractError(
+                        "Docker workspace preparation requires the backend "
+                        "to run as root and assign gid "
+                        f"{SANDBOX_RUNTIME_GID}: {root}"
+                    ) from exc
+                except OSError:
+                    os.close(next_fd)
+                    raise
+                os.close(current_fd)
+                current_fd = next_fd
+        except OSError as exc:
+            raise SandboxContractError(
+                f"Cannot safely open Docker workspace root: {root}"
+            ) from exc
+    finally:
+        os.close(current_fd)
 
 
 class ExactGenerationProbe(str, Enum):
@@ -139,11 +217,22 @@ class SandboxConfig(BaseModel):
     Configuration parameters for creating a sandbox.
     """
 
-    working_dir: Optional[str] = Field(default="/home", description="Working dir")
+    working_dir: Optional[str] = Field(
+        default="/home/sandbox", description="Working dir"
+    )
 
     cpus: Optional[int] = Field(default=1, ge=1, description="CPU core limit")
 
     memory: Optional[int] = Field(default=512, ge=128, description="Memory limit in MB")
+
+    pids_limit: Optional[int] = Field(
+        default=None, ge=64, description="Container process/thread limit"
+    )
+
+    security_profile: Optional[str] = Field(
+        default=None,
+        description="Runtime hardening profile included in desired-state matching",
+    )
 
     env: Optional[dict[str, str]] = Field(
         default=None, description="Environment variables to inject"
@@ -225,7 +314,7 @@ class ExecResult(BaseModel):
 # untrustworthy for matching against a newly-desired spec. Not part of the
 # fingerprint itself (see ResolvedSandboxRuntimeSpec.fingerprint), so bumping
 # it does not change any existing fingerprint value.
-SPEC_CONTRACT_VERSION = 1
+SPEC_CONTRACT_VERSION = 2
 
 # Realizable bounds for a resolved spec, mirroring the `ge=` constraints
 # SandboxConfig declares for the same two fields. Kept here so an
@@ -301,6 +390,8 @@ class ResolvedSandboxRuntimeSpec:
     volumes: tuple[tuple[str, str, str], ...]
     network_isolated: bool
     ports: tuple[tuple[int, int], ...]
+    pids_limit: Optional[int] = None
+    security_profile: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.template_type == "image":
@@ -332,6 +423,10 @@ class ResolvedSandboxRuntimeSpec:
                 f"memory must be >= {_MIN_SPEC_MEMORY_MB} MB to be realizable, "
                 f"got {self.memory!r}"
             )
+        if self.pids_limit is not None and self.pids_limit < 64:
+            raise ValueError(
+                f"pids_limit must be >= 64 to be realizable, got {self.pids_limit!r}"
+            )
 
     @classmethod
     def from_parts(
@@ -347,6 +442,8 @@ class ResolvedSandboxRuntimeSpec:
         volumes: Optional[Sequence[tuple[str, str, str]]] = None,
         network_isolated: bool = False,
         ports: Optional[Sequence[tuple[int, int]]] = None,
+        pids_limit: Optional[int] = None,
+        security_profile: Optional[str] = None,
     ) -> "ResolvedSandboxRuntimeSpec":
         """Build a spec, normalizing all collection fields.
 
@@ -356,7 +453,8 @@ class ResolvedSandboxRuntimeSpec:
         ``cpus``/``memory`` fall back to the same defaults the Docker backend
         applies at container creation (``cpus or 1``, ``memory or 512``) so a
         resolved spec never carries a 0/None value the backend would silently
-        have upgraded on its own. ``working_dir`` defaults to ``"/home"`` and
+        have upgraded on its own. ``working_dir`` defaults to
+        ``"/home/sandbox"`` and
         is canonicalized the same way.
         """
         normalized_env = tuple(sorted((env or {}).items()))
@@ -380,7 +478,7 @@ class ResolvedSandboxRuntimeSpec:
             image=image,
             snapshot_id=snapshot_id,
             working_dir=(
-                canonical_sandbox_path(working_dir) if working_dir else "/home"
+                canonical_sandbox_path(working_dir) if working_dir else "/home/sandbox"
             ),
             cpus=cpus or 1,
             memory=memory or 512,
@@ -388,6 +486,8 @@ class ResolvedSandboxRuntimeSpec:
             volumes=normalized_volumes,
             network_isolated=network_isolated,
             ports=normalized_ports,
+            pids_limit=pids_limit,
+            security_profile=security_profile,
         )
 
     def to_backend_config(self) -> tuple["SandboxTemplate", "SandboxConfig"]:
@@ -409,6 +509,8 @@ class ResolvedSandboxRuntimeSpec:
             volumes=[tuple(volume) for volume in self.volumes] or None,
             network_isolated=self.network_isolated,
             ports=[tuple(port) for port in self.ports] or None,
+            pids_limit=self.pids_limit,
+            security_profile=self.security_profile,
         )
         return template, config
 
@@ -431,6 +533,8 @@ class ResolvedSandboxRuntimeSpec:
                 self.volumes,
                 self.network_isolated,
                 self.ports,
+                self.pids_limit,
+                self.security_profile,
             )
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -458,10 +562,10 @@ class ObservedRuntimeFacts:
     level: two instances compare by identity, never structurally, so nothing
     can accidentally treat one as a desired-state stand-in for the other.
 
-    ``raw_nano_cpus`` / ``raw_memory_bytes`` are the untouched values from the
-    backend (e.g. Docker's ``HostConfig.NanoCpus`` / ``HostConfig.Memory``),
-    not the divided-and-clamped values a display-facing parser would produce;
-    a live edit such as ``docker update --cpus 0.5`` must be observable here.
+    ``raw_nano_cpus`` / ``raw_memory_bytes`` / ``raw_pids_limit`` are the
+    untouched values from the backend (e.g. Docker's ``HostConfig``), not the
+    divided-and-clamped values a display-facing parser would produce; live
+    ``docker update`` edits must remain observable here.
 
     ``runtime_networks`` reflects network attachments at inspection time; it
     is not part of any spec comparison because network attachment can change
@@ -481,6 +585,7 @@ class ObservedRuntimeFacts:
     labels: Mapping[str, str]
     created_at: Optional[str]
     working_dir: Optional[str]
+    raw_pids_limit: Optional[int]
 
 
 @dataclass(eq=False)
@@ -643,8 +748,8 @@ def spec_matches_inspection(
       also immutable once written, so there is no backfill path that could
       turn a legacy container into a verified one.
     - A matching fingerprint label is followed by a live re-check of the
-      fields Docker allows to drift after creation (cpus/memory, compared in
-      their raw backend units) to catch e.g. ``docker update --cpus 0.5``.
+      fields Docker allows to drift after creation (cpus/memory/pids, compared
+      in their raw backend units) to catch e.g. ``docker update --cpus 0.5``.
       Disagreement there is ``MISMATCH`` even though the label matched.
     - A non-matching fingerprint label is always ``MISMATCH``.
     - ``env`` / ``volumes`` / ``ports`` / ``image`` are not independently
@@ -688,9 +793,16 @@ def spec_matches_inspection(
     desired_memory_bytes = int(desired.memory * 1024 * 1024)
     observed_nano_cpus = facts.raw_nano_cpus or 0
     observed_memory_bytes = facts.raw_memory_bytes or 0
+    observed_pids_limit = (
+        facts.raw_pids_limit
+        if facts.raw_pids_limit is not None and facts.raw_pids_limit >= 64
+        else None
+    )
     if observed_nano_cpus != desired_nano_cpus:
         return SpecVerdict.MISMATCH
     if observed_memory_bytes != desired_memory_bytes:
+        return SpecVerdict.MISMATCH
+    if observed_pids_limit != desired.pids_limit:
         return SpecVerdict.MISMATCH
     return SpecVerdict.MATCH
 
@@ -968,6 +1080,22 @@ class SandboxService(abc.ABC):
         this to return True.
         """
         return False
+
+    def host_workspace_gid(self) -> int | None:
+        """Host gid required for writable bind mounts, if any.
+
+        Backends such as BoxLite do not need host ownership changes.  Docker
+        overrides this so the web layer prepares only the bind roots that
+        actually need the fixed in-container runtime group.
+        """
+        return None
+
+    def validate_host_workspace_access(self) -> None:
+        """Fail readiness if required host bind ownership cannot be prepared."""
+
+    def runtime_security_profile(self) -> str | None:
+        """Backend-specific hardening profile included in desired state."""
+        return None
 
     async def inspect(self, name: str) -> Optional[SandboxInspection]:
         """Observe a sandbox's current state and runtime facts.

@@ -78,6 +78,11 @@ class DispatchCapSnapshot:
 
     policy: DispatchPolicy
     active_ids: frozenset[int]
+    # A planned restart holds new execution (``release_hold``): the cap then
+    # reads as closed whatever the count, so exactly the existing closed-cap
+    # rules apply -- controls of any task and commands of tasks that already
+    # hold a slot pass, everything that would open a new execution waits.
+    held: bool = False
 
     @property
     def limit(self) -> int:
@@ -85,11 +90,13 @@ class DispatchCapSnapshot:
 
     @property
     def closed(self) -> bool:
-        return len(self.active_ids) >= self.limit
+        return self.held or len(self.active_ids) >= self.limit
 
     @property
     def batch_closed(self) -> bool:
-        return len(self.active_ids) >= self.limit - self.policy.interactive_reserve
+        return self.held or (
+            len(self.active_ids) >= self.limit - self.policy.interactive_reserve
+        )
 
     def admits(self, task_id: int, *, interactive: bool) -> bool:
         """Whether a command of ``task_id`` may open an execution.

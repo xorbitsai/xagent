@@ -20,7 +20,7 @@ from urllib.request import url2pathname
 
 from pydantic import Field
 
-from ....config import get_media_download_max_bytes
+from ....config import get_max_upload_size_bytes, get_media_download_max_bytes
 from ...file_ref import build_workspace_file_ref, guess_mime_type, parse_file_id_ref
 from ...model.video.ark import ArkVideoModel
 from ...model.video.base import BaseVideoModel
@@ -434,6 +434,7 @@ The generated video URL is temporary on the provider side, so completed videos a
                 "Ark image-to-video local references require a workspace so they can "
                 "be converted to base64 data URLs"
             )
+        workspace = self._workspace
 
         if parsed_ref.scheme and not image_ref.startswith("file:"):
             raise ValueError(
@@ -445,20 +446,42 @@ The generated video URL is temporary on the provider side, so completed videos a
         if image_ref.startswith("file://") and parse_file_id_ref(image_ref) is None:
             ref_for_resolution = url2pathname(parsed_ref.path)
 
-        resolved_path = await asyncio.to_thread(
-            self._workspace.resolve_path_with_search,
-            ref_for_resolution,
-        )
-        if not await asyncio.to_thread(resolved_path.is_file):
-            raise ValueError(f"Ark image reference is not a file: {image_ref}")
-
-        mime_type = guess_mime_type(str(resolved_path))
-        if not mime_type.startswith("image/"):
-            raise ValueError(
-                f"Ark image reference must resolve to an image file: {image_ref}"
+        def stage_image_reference() -> Path:
+            return workspace.stage_path_for_external_upload(
+                ref_for_resolution,
+                max_bytes=get_max_upload_size_bytes(),
+                host_private=True,
             )
 
-        image_bytes = await asyncio.to_thread(resolved_path.read_bytes)
+        stage_task = asyncio.create_task(asyncio.to_thread(stage_image_reference))
+        try:
+            staged_path = await asyncio.shield(stage_task)
+        except asyncio.CancelledError:
+            while not stage_task.done():
+                try:
+                    await asyncio.shield(stage_task)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not stage_task.cancelled() and stage_task.exception() is None:
+                await asyncio.to_thread(
+                    workspace.discard_staged_external_upload,
+                    stage_task.result(),
+                )
+            raise
+        try:
+            mime_type = guess_mime_type(str(staged_path))
+            if not mime_type.startswith("image/"):
+                raise ValueError(
+                    f"Ark image reference must resolve to an image file: {image_ref}"
+                )
+            image_bytes = await asyncio.to_thread(staged_path.read_bytes)
+        finally:
+            await asyncio.to_thread(
+                workspace.discard_staged_external_upload,
+                staged_path,
+            )
         encoded = base64.b64encode(image_bytes).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
 

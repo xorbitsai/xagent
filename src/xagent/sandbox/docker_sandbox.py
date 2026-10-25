@@ -319,7 +319,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
             type="image", image=str(config_data.get("Image") or "")
         )
     raw_pids_limit = cast(Optional[int], host_config.get("PidsLimit"))
-    pids_limit = raw_pids_limit if raw_pids_limit and raw_pids_limit >= 64 else None
+    pids_limit = normalize_sandbox_pids_limit(raw_pids_limit)
     config = SandboxConfig(
         working_dir=str(config_data.get("WorkingDir") or "/home/sandbox"),
         cpus=max(1, cpus),

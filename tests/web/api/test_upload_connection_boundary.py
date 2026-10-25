@@ -1159,8 +1159,7 @@ def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
     )
 
     assert put_calls == 1
-    assert workspace._recently_registered_files[str(Path(storage_path).resolve())] == (
-        file_id
-    )
-    assert Path(str(file_info["workspace_path"])).exists()
+    workspace_path = Path(str(file_info["workspace_path"])).resolve()
+    assert workspace.resolve_file_id(file_id) == workspace_path
+    assert workspace_path.read_bytes() == b"payload"
     assert tmp_path.exists()

@@ -25,6 +25,7 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_events
+from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services.task_execution import (
     background_task_manager,
     execute_resume_background,
@@ -119,6 +120,12 @@ async def test_resume_installs_outbound_handler_so_follow_up_question_persists(
 
     sink = AsyncMock()
     monkeypatch.setattr(task_events, "_task_event_sink", sink)
+    prepared_workspaces = []
+    monkeypatch.setattr(
+        task_execution_service,
+        "_prepare_workspace_inputs_for_agent",
+        lambda service: prepared_workspaces.append(service),
+    )
 
     try:
         _register_current_resume(task_id)
@@ -131,6 +138,7 @@ async def test_resume_installs_outbound_handler_so_follow_up_question_persists(
         background_task_manager.resume_tasks.pop(task_id, None)
 
     agent.set_outbound_message_handler.assert_called_once()
+    assert prepared_workspaces == [agent]
 
     # Persisted to the transcript.
     db_session.expire_all()

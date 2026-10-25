@@ -2029,11 +2029,22 @@ async def fire_trigger(
         received_at=received_at,
     )
     if created:
-        await start_prepared_trigger_run(
-            db,
-            run=run,
-            wait_for_completion=wait_for_completion,
-        )
+        from .release_hold import release_hold
+
+        # The committed PENDING run (and its PENDING task) is this entry's
+        # durable deferral: while a planned restart holds new execution it is
+        # not started here, and the trigger dispatcher of this process (after
+        # an abort) or of its successor starts it. A deferral is not a failure,
+        # so nothing marks the run FAILED. Once admitted, the start is counted
+        # until the task execution is registered or the start has failed.
+        admitted = release_hold.try_admit("trigger_run", f"run:{run.id}")
+        if admitted is not None:
+            with admitted:
+                await start_prepared_trigger_run(
+                    db,
+                    run=run,
+                    wait_for_completion=wait_for_completion,
+                )
         db.refresh(run)
     return run, created
 

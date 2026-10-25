@@ -53,6 +53,12 @@ async def test_workspace_local_media_is_preserved(kind, media_tools):
     assert Path(result).read_bytes() == b"provider result"
 
 
+def test_inline_image_payload_does_not_require_workspace_path_resolution(media_tools):
+    image, _, _ = media_tools
+    payload = "data:image/png;base64,aQ=="
+    assert image._resolve_image_path(payload) == payload
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["image", "video"])
 async def test_provider_metadata_url_rejected_without_a_connection(

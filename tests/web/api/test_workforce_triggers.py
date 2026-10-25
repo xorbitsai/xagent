@@ -697,3 +697,28 @@ def test_workforce_reattach_is_idempotent_on_replay() -> None:
         )
     finally:
         db.close()
+
+
+def test_held_workforce_trigger_test_route_defers_durably(
+    mock_bg_scheduler, monkeypatch
+) -> None:
+    """A planned-restart hold leaves the workforce run PENDING, not FAILED."""
+    from .release_hold_helpers import (
+        assert_deferred_then_started,
+        install_private_hold,
+    )
+
+    headers = _admin_headers()
+    workforce_id = _create_workforce(headers, publish=True)
+    trigger = _create_workforce_webhook_trigger(headers, workforce_id)
+    hold = install_private_hold(monkeypatch)
+    hold.close("release r1")
+    fired = client.post(
+        f"/api/workforces/{workforce_id}/triggers/{trigger['id']}/test",
+        headers=headers,
+        json={"payload": {"subject": "hello"}},
+    )
+    assert fired.status_code == 200, fired.text
+    run = fired.json()["trigger_run"]
+    assert run["status"] == TriggerRunStatus.PENDING.value
+    assert_deferred_then_started(mock_bg_scheduler, hold, run["id"])

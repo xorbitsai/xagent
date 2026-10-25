@@ -90,6 +90,7 @@ from ..models.database import (
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
+from .release_hold import release_hold
 from .task_auto_recovery import (
     InterruptionDecision,
     InterruptionSettlementDeferred,
@@ -4902,7 +4903,9 @@ class BackgroundTaskManager:
             return
         self._record_cap_state(
             DispatchCapSnapshot(
-                policy=policy, active_ids=self._active_task_ids()
+                policy=policy,
+                active_ids=self._active_task_ids(),
+                held=release_hold.closed,
             ).closed,
             now,
         )
@@ -4932,7 +4935,9 @@ class BackgroundTaskManager:
         active = self._active_task_ids()
         for task_id in [t for t in self._slot_keys if t not in active]:
             del self._slot_keys[task_id]
-        snapshot = DispatchCapSnapshot(policy=policy, active_ids=active)
+        snapshot = DispatchCapSnapshot(
+            policy=policy, active_ids=active, held=release_hold.closed
+        )
         self._cap_last_policy = policy
         self._record_cap_state(snapshot.closed, self._cap_clock())
         return snapshot
@@ -5241,6 +5246,28 @@ class BackgroundTaskManager:
             self._window_finished_failed += 1
         else:
             self._window_finished_ok += 1
+
+    def release_counts(self) -> dict[str, int]:
+        """Everything this manager still owns, for a planned-restart idle check.
+
+        Read-only. Live handles count until their own done callback runs, so
+        an execution is counted until it has finished unwinding; resume
+        coordinators also count while they wait for the execution they will
+        replace, and reservations cover the window before registration. The
+        tables overlap (a registered coordinator is also a live handle), which
+        is harmless: only "all zero" is used as evidence.
+        """
+
+        return {
+            "live_executions": sum(
+                len(handles) for handles in self._live_executions.values()
+            ),
+            "resume_coordinators": sum(
+                1 for task in self.resume_tasks.values() if not task.done()
+            ),
+            "resume_reservations": len(self._resume_reservations),
+            "dispatch_reservations": sum(self._dispatch_reservations.values()),
+        }
 
     def inflight_counts(self) -> tuple[int, int]:
         """Return (executions in flight, resume coordinators not yet executing).

@@ -119,6 +119,10 @@ class ClientErrorCode(StrEnum):
     # builder as ``asserted_code``.
     EXTERNAL_STOP_NOT_APPLIED = "external_stop_not_applied"
     MODEL_ERROR = "model_error"
+    # New execution is briefly paused on this server for a planned restart
+    # (``release_hold``); nothing was accepted, and the same request may be
+    # sent again shortly.
+    EXECUTION_PAUSED = "execution_paused"
 
 
 def client_error_message(code: ClientErrorCode) -> str:
@@ -195,6 +199,10 @@ def client_error_message(code: ClientErrorCode) -> str:
             "Stopping this response didn't go through — please try again."
         ),
         ClientErrorCode.MODEL_ERROR: CLIENT_SAFE_MODEL_ERROR,
+        ClientErrorCode.EXECUTION_PAUSED: (
+            "New work is briefly paused for a service update. "
+            "Nothing was started; please try again in a moment."
+        ),
     }[code]
 
 

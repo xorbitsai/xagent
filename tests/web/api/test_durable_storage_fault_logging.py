@@ -884,7 +884,9 @@ _SWALLOWED_DISPATCH_TYPES = {"execute_task", "intervention"}
 # pins the report-before-re-raise shape against the handler's own arms.
 _INNER_REPORTED_DISPATCH_TYPES = {"chat"}
 _SWALLOWING_HANDLERS = {
-    "execute_task": "handle_execute_task",
+    # ``handle_execute_task`` only admits (release hold) and delegates; the
+    # admitted body owns the fault arms.
+    "execute_task": "_handle_admitted_execute_task",
     "intervention": "handle_intervention",
 }
 

@@ -114,6 +114,9 @@ _CACHE_MISS = "(needs.prepare-deepdoc-cache.outputs.cache-hit != 'true')"
 # silently skips a workload step (PR #1848 review).
 STEP_GUARD_EXTRAS = {
     ("pytest-fast", "Pre-pull the sandbox image"): "(matrix.name == 'web')",
+    ("pytest-fast", "Run privileged writable sandbox tests"): (
+        "(matrix.name == 'web')"
+    ),
     ("pytest-fast-deepdoc", "Pre-pull the sandbox image"): "(matrix.name == 'core')",
     ("pytest-fast-deepdoc", "Restore Deepdoc cache"): _CACHE_HIT,
     ("pytest-fast-deepdoc", "Download Deepdoc cache artifact"): _CACHE_MISS,

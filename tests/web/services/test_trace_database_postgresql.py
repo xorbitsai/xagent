@@ -151,9 +151,9 @@ async def test_large_checkpoint_preparation_offloads_payload_work(storage):
         bound_messages.append(result)
         return result
 
-    def checked_prepare(event):
+    def checked_prepare(event, **kwargs):
         assert threading.get_ident() != loop_thread
-        transaction = prepare(event)
+        transaction = prepare(event, **kwargs)
         loop.call_soon_threadsafe(prepared.set)
         # A deadlock watchdog, not a machine-speed/runner-scheduling SLA.
         assert release.wait(30), "event loop did not release preparation worker"
@@ -190,7 +190,7 @@ async def test_checkpoint_retention_dedup_pointer_and_required_data(
     source, runtime, handler, task_id = storage
     if runtime.engine is not None:
 
-        def no_sync_worker(*args):
+        def no_sync_worker(*args, **kwargs):
             pytest.fail("Async persistence must not submit a synchronous worker")
 
         monkeypatch.setattr(handler, "_sync_save_to_database", no_sync_worker)

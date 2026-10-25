@@ -5699,8 +5699,11 @@ def _persist_durable_input_workspace_binding(
         )
         if record is None:
             raise ValueError("Durable task input metadata is unavailable")
-        record.workspace_relative_path = relative_path
-        record.workspace_category = category
+        # UploadedFile still uses legacy SQLAlchemy ``Column`` declarations,
+        # so mypy sees these instance attributes as Column[str]. Runtime
+        # assignment is the intended ORM operation.
+        setattr(record, "workspace_relative_path", relative_path)
+        setattr(record, "workspace_category", category)
         db.commit()
 
 

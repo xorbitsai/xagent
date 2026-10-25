@@ -31,6 +31,7 @@ names must keep it importable from this module.
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
 import os
@@ -86,6 +87,7 @@ from ...core.execution_scope import (
     resolve_execution_scope,
 )
 from ...core.file_ref import build_file_ref
+from ...core.workspace import _is_sandbox_prepared
 from ..models.database import (
     get_db,
     get_session_local,
@@ -201,6 +203,7 @@ from .uploaded_file_store import (
     SupersededObjectCleanupClaim,
     UploadedFileStore,
     UploadedFileVersionSnapshot,
+    _uploaded_file_version_match_predicates,
     cleanup_superseded_uploaded_file_objects,
     compensate_staged_uploaded_files,
     snapshot_uploaded_file_version,
@@ -220,9 +223,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-# Match TaskWorkspace's fixed writable-group contract without coupling the
-# attachment lifecycle to a particular sandbox backend implementation.
-_SANDBOX_RUNTIME_GID = 1010
 
 # A deferred delivery's notice is sent even while its resume is being
 # cancelled; a client that stops reading must not hold the canceller longer.
@@ -5520,7 +5520,7 @@ def _copy_durable_input_to_workspace(source: Path, target: Path, *, mode: int) -
 
 
 def _task_input_copy_mode(workspace: Any) -> int:
-    """Keep Docker inputs private while preserving legacy backend readability."""
+    """Use sandbox-prepared permissions before the workspace widens group read."""
 
     workspace_dir = getattr(workspace, "workspace_dir", None)
     if workspace_dir is None:
@@ -5529,15 +5529,13 @@ def _task_input_copy_mode(workspace: Any) -> int:
         root_stat = Path(workspace_dir).resolve().stat()
     except OSError:
         return 0o644
-    if root_stat.st_gid == _SANDBOX_RUNTIME_GID and root_stat.st_mode & stat.S_ISGID:
+    if _is_sandbox_prepared(root_stat):
         return 0o600
     return 0o644
 
 
-def _materialize_legacy_task_input_symlinks(
-    workspace: Any, input_dir: Path, *, copy_mode: int
-) -> None:
-    """Replace authorized pre-upgrade input symlinks with task-local copies."""
+def _workspace_owner_and_task(workspace: Any) -> tuple[int, int] | None:
+    """Return the validated durable owner/task identity for a workspace."""
 
     owner_user_id = getattr(workspace, "owner_user_id", None)
     task_id = getattr(workspace, "db_task_id", None)
@@ -5549,7 +5547,19 @@ def _materialize_legacy_task_input_symlinks(
         or not isinstance(task_id, int)
         or isinstance(task_id, bool)
     ):
+        return None
+    return owner_user_id, task_id
+
+
+def _materialize_legacy_task_input_symlinks(
+    workspace: Any, input_dir: Path, *, copy_mode: int
+) -> None:
+    """Replace authorized pre-upgrade input symlinks with task-local copies."""
+
+    owner_and_task = _workspace_owner_and_task(workspace)
+    if owner_and_task is None:
         return
+    owner_user_id, task_id = owner_and_task
 
     legacy_links: dict[Path, Path] = {}
     try:
@@ -5568,7 +5578,7 @@ def _materialize_legacy_task_input_symlinks(
             continue
         if not raw_target.is_absolute():
             raw_target = candidate.parent / raw_target
-        legacy_links[candidate] = Path(os.path.abspath(raw_target))
+        legacy_links[candidate] = Path(os.path.realpath(raw_target))
     if not legacy_links:
         return
 
@@ -5586,14 +5596,14 @@ def _materialize_legacy_task_input_symlinks(
             .all()
             if Path(os.path.realpath(str(row.storage_path))) in linked_sources
         ]
-        if not file_ids:
-            return
-        file_infos, _missing = resolve_turn_file_infos(
-            file_ids=file_ids,
-            owner_user_id=owner_user_id,
-            task_id=task_id,
-            db=db,
-        )
+        file_infos: List[Dict[str, Any]] = []
+        if file_ids:
+            file_infos, _missing = resolve_turn_file_infos(
+                file_ids=file_ids,
+                owner_user_id=owner_user_id,
+                task_id=task_id,
+                db=db,
+            )
 
     authorized_sources: dict[Path, dict[str, Any]] = {}
     for file_info in file_infos:
@@ -5606,6 +5616,11 @@ def _materialize_legacy_task_input_symlinks(
     for candidate, linked_source in legacy_links.items():
         matched_file_info = authorized_sources.get(linked_source)
         if matched_file_info is None:
+            logger.warning(
+                "Leaving unmatched legacy task input symlink unchanged: %s -> %s",
+                candidate,
+                linked_source,
+            )
             continue
         source_path = Path(str(matched_file_info["path"]))
         try:
@@ -5619,7 +5634,7 @@ def _materialize_legacy_task_input_symlinks(
                 registration,
                 file_id=str(matched_file_info["file_id"]),
             )
-            _persist_durable_input_workspace_binding(
+            _try_persist_durable_input_workspace_binding(
                 workspace,
                 registration,
                 file_id=str(matched_file_info["file_id"]),
@@ -5666,20 +5681,13 @@ def _persist_durable_input_workspace_binding(
     registration: Any,
     *,
     file_id: str,
-) -> None:
+) -> bool:
     """Persist a task-local input path so cold workspaces can reuse it."""
 
-    owner_user_id = getattr(workspace, "owner_user_id", None)
-    task_id = getattr(workspace, "db_task_id", None)
-    if task_id is None:
-        task_id = getattr(workspace, "current_task_id", None)
-    if (
-        not isinstance(owner_user_id, int)
-        or isinstance(owner_user_id, bool)
-        or not isinstance(task_id, int)
-        or isinstance(task_id, bool)
-    ):
-        return
+    owner_and_task = _workspace_owner_and_task(workspace)
+    if owner_and_task is None:
+        return False
+    owner_user_id, task_id = owner_and_task
     relative_path = str(getattr(registration, "relative_path", "") or "")
     category = str(getattr(registration, "category", "") or "")
     if category != "input" or not relative_path.startswith("input/"):
@@ -5693,18 +5701,103 @@ def _persist_durable_input_workspace_binding(
                 UploadedFile.file_id == file_id,
                 UploadedFile.user_id == owner_user_id,
                 UploadedFile.task_id == task_id,
+                UploadedFile.detached_reason.is_(None),
                 UploadedFile.storage_status != "compensating",
             )
             .one_or_none()
         )
         if record is None:
             raise ValueError("Durable task input metadata is unavailable")
-        # UploadedFile still uses legacy SQLAlchemy ``Column`` declarations,
-        # so mypy sees these instance attributes as Column[str]. Runtime
-        # assignment is the intended ORM operation.
-        setattr(record, "workspace_relative_path", relative_path)
-        setattr(record, "workspace_category", category)
+        existing_category = (
+            str(record.workspace_category)
+            if record.workspace_category is not None
+            else None
+        )
+        if existing_category not in (None, "input"):
+            return False
+        snapshot = snapshot_uploaded_file_version(record)
+        updated = (
+            db.query(UploadedFile)
+            .filter(*_uploaded_file_version_match_predicates(snapshot))
+            .update(
+                {
+                    UploadedFile.workspace_relative_path: relative_path,
+                    UploadedFile.workspace_category: category,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            raise RuntimeError("Durable task input metadata changed concurrently")
         db.commit()
+        return True
+
+
+def _try_persist_durable_input_workspace_binding(
+    workspace: Any,
+    registration: Any,
+    *,
+    file_id: str,
+) -> None:
+    """Best-effort cold-start optimization after the in-memory bind succeeds."""
+
+    try:
+        _persist_durable_input_workspace_binding(
+            workspace,
+            registration,
+            file_id=file_id,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to persist durable workspace input binding: file_id=%s path=%s",
+            file_id,
+            getattr(registration, "relative_path", None),
+            exc_info=True,
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _existing_input_path(
+    candidate: Path,
+    *,
+    input_dir: Path,
+    source_path: Path,
+    file_info: Dict[str, Any],
+) -> Path | None:
+    """Return a reusable input only when it still contains the durable bytes."""
+
+    try:
+        candidate_stat = candidate.lstat()
+        if (
+            candidate.parent.resolve() != input_dir.resolve()
+            or not stat.S_ISREG(candidate_stat.st_mode)
+            or candidate.is_symlink()
+        ):
+            return None
+        raw_expected_size = file_info.get("size")
+        expected_size = (
+            int(raw_expected_size)
+            if raw_expected_size is not None
+            else source_path.stat().st_size
+        )
+        if candidate_stat.st_size != expected_size:
+            return None
+        expected_checksum = str(file_info.get("checksum") or "").removeprefix("sha256:")
+        candidate_checksum = _sha256_file(candidate)
+        if len(expected_checksum) == 64:
+            return (
+                candidate if candidate_checksum == expected_checksum.lower() else None
+            )
+        return candidate if candidate_checksum == _sha256_file(source_path) else None
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _register_uploaded_files_for_agent(
@@ -5735,13 +5828,13 @@ def _register_uploaded_files_for_agent(
             try:
                 previously_bound = resolve_file_id(file_id)
                 if isinstance(previously_bound, (str, os.PathLike)):
-                    bound_path = Path(previously_bound)
-                    if (
-                        bound_path.parent.resolve() == input_dir.resolve()
-                        and bound_path.is_file()
-                        and not bound_path.is_symlink()
-                    ):
-                        candidate = bound_path
+                    candidate = _existing_input_path(
+                        Path(previously_bound),
+                        input_dir=input_dir,
+                        source_path=source_path,
+                        file_info=file_info,
+                    )
+                    if candidate is not None:
                         reused_candidate = True
             except (OSError, ValueError):
                 # A stale or backend-specific binding must not make an
@@ -5768,43 +5861,38 @@ def _register_uploaded_files_for_agent(
                 and relative_candidate.parts[:1] == ("input",)
             ):
                 restored_path = input_dir.parent / relative_candidate
-                try:
-                    if (
-                        restored_path.parent.resolve() == input_dir.resolve()
-                        and restored_path.is_file()
-                        and not restored_path.is_symlink()
-                    ):
-                        candidate = restored_path
-                        restored_candidate = True
-                except OSError:
-                    candidate = None
+                candidate = _existing_input_path(
+                    restored_path,
+                    input_dir=input_dir,
+                    source_path=source_path,
+                    file_info=file_info,
+                )
+                if candidate is not None:
+                    restored_candidate = True
 
-        remembered_path = Path(str(file_info.get("workspace_path") or ""))
-        try:
-            remembered_is_task_input = (
-                remembered_path.name
-                and remembered_path.parent.resolve() == input_dir.resolve()
-            )
-        except OSError:
-            remembered_is_task_input = False
         if candidate is None:
-            if remembered_is_task_input:
-                candidate = remembered_path
-            else:
-                candidate = input_dir / normalized_file_name
-                suffix_idx = 1
-                stem, ext = candidate.stem, candidate.suffix
-                while candidate.exists() or candidate.is_symlink():
-                    try:
-                        if candidate.resolve() == source_path.resolve():
-                            break
-                    except OSError:
-                        pass
-                    candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
-                    suffix_idx += 1
+            candidate = input_dir / normalized_file_name
+            suffix_idx = 1
+            stem, ext = candidate.stem, candidate.suffix
+            while candidate.exists() or candidate.is_symlink():
+                try:
+                    if candidate.resolve() == source_path.resolve():
+                        break
+                except OSError:
+                    pass
+                candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                suffix_idx += 1
 
         copied_candidate = False
         if reused_candidate:
+            # Re-attempt the best-effort persistence so a transient database
+            # failure on the first turn does not cause a cold-start duplicate.
+            registration = workspace.describe_file_registration(str(candidate))
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=file_id,
+            )
             # ``resolve_file_id`` returned this task workspace's existing
             # binding. It is already registered and permission-prepared; a
             # second bind would only reopen a sandbox-writable pathname and
@@ -5819,6 +5907,11 @@ def _register_uploaded_files_for_agent(
         if restored_candidate:
             registration = workspace.describe_file_registration(str(candidate))
             workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+            _try_persist_durable_input_workspace_binding(
+                workspace,
                 registration,
                 file_id=file_id,
             )
@@ -5862,7 +5955,7 @@ def _register_uploaded_files_for_agent(
                         exc_info=True,
                     )
             raise
-        _persist_durable_input_workspace_binding(
+        _try_persist_durable_input_workspace_binding(
             workspace,
             registration,
             file_id=file_id,

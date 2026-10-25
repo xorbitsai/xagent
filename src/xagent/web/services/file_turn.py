@@ -284,6 +284,7 @@ def _turn_file_info(
         "name": normalize_filename(original_name),
         "original_name": original_name,
         "size": snapshot.file_size,
+        "checksum": snapshot.checksum,
         "type": snapshot.mime_type,
         "path": str(source_path),
         "workspace_path": None,

@@ -2304,6 +2304,146 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     assert file_info["path"] == str(source_path)
 
 
+def test_register_uploaded_file_removes_fresh_copy_when_bind_fails(tmp_path):
+    source = tmp_path / "durable.txt"
+    source.write_text("durable", encoding="utf-8")
+
+    class Workspace:
+        input_dir = str(tmp_path / "workspace" / "input")
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(
+                path=Path(path),
+                relative_path=f"input/{Path(path).name}",
+                category="input",
+            )
+
+        def bind_already_durable_file(self, _registration, *, file_id):
+            raise RuntimeError(f"bind failed for {file_id}")
+
+    workspace = Workspace()
+    with pytest.raises(RuntimeError, match="bind failed"):
+        _register_uploaded_files_for_agent(
+            SimpleNamespace(workspace=workspace),
+            [
+                {
+                    "file_id": "bind-failure",
+                    "name": "durable.txt",
+                    "size": source.stat().st_size,
+                    "path": str(source),
+                    "workspace_path": None,
+                }
+            ],
+        )
+
+    assert list(Path(workspace.input_dir).iterdir()) == []
+
+
+def test_register_uploaded_file_skips_missing_durable_source(tmp_path):
+    workspace = SimpleNamespace(input_dir=str(tmp_path / "workspace" / "input"))
+    file_info = {
+        "file_id": "missing-source",
+        "name": "missing.txt",
+        "size": 10,
+        "path": str(tmp_path / "missing.txt"),
+        "workspace_path": None,
+    }
+
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace),
+        [file_info],
+    )
+
+    assert file_info["workspace_path"] is None
+    assert list(Path(workspace.input_dir).iterdir()) == []
+
+
+def test_register_uploaded_file_uses_private_sandbox_copy_mode(
+    tmp_path,
+    monkeypatch,
+):
+    source = tmp_path / "private.txt"
+    source.write_text("private", encoding="utf-8")
+
+    class Workspace:
+        def __init__(self):
+            self.workspace_dir = tmp_path / "workspace"
+            self.input_dir = str(self.workspace_dir / "input")
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(
+                path=Path(path),
+                relative_path=f"input/{Path(path).name}",
+                category="input",
+            )
+
+        def bind_already_durable_file(self, _registration, *, file_id):
+            assert file_id == "private-file"
+
+    workspace = Workspace()
+    workspace.workspace_dir.mkdir()
+    monkeypatch.setattr(task_execution_service, "_is_sandbox_prepared", lambda _s: True)
+    file_info = {
+        "file_id": "private-file",
+        "name": "private.txt",
+        "size": source.stat().st_size,
+        "path": str(source),
+        "workspace_path": None,
+    }
+
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace),
+        [file_info],
+    )
+
+    assert Path(file_info["workspace_path"]).stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    "persisted_path",
+    ["/tmp/outside.txt", "../escape.txt", "output/wrong.txt", "input/nested.txt"],
+)
+def test_register_uploaded_file_rejects_untrusted_persisted_input_path(
+    tmp_path,
+    persisted_path,
+):
+    source = tmp_path / "durable.txt"
+    source.write_text("durable", encoding="utf-8")
+
+    class Workspace:
+        input_dir = str(tmp_path / "workspace" / "input")
+
+        def describe_file_registration(self, path):
+            return SimpleNamespace(
+                path=Path(path),
+                relative_path=f"input/{Path(path).name}",
+                category="input",
+            )
+
+        def bind_already_durable_file(self, _registration, *, file_id):
+            assert file_id == "untrusted-path"
+
+    workspace = Workspace()
+    file_info = {
+        "file_id": "untrusted-path",
+        "name": "durable.txt",
+        "size": source.stat().st_size,
+        "path": str(source),
+        "workspace_path": None,
+        "workspace_relative_path": persisted_path,
+        "workspace_category": "input",
+    }
+
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace),
+        [file_info],
+    )
+
+    assert (
+        Path(file_info["workspace_path"]) == Path(workspace.input_dir) / "durable.txt"
+    )
+
+
 def test_register_uploaded_files_for_agent_reuses_existing_file_id_binding(
     db_session,
     tmp_path,
@@ -2418,9 +2558,175 @@ def test_register_uploaded_files_reuses_persisted_binding_after_cold_start(
         SimpleNamespace(workspace=cold_workspace), cold_infos
     )
 
-    assert cold_infos[0]["workspace_path"] == str(staged_path)
+    restored_path = Path(cold_infos[0]["workspace_path"])
+    assert restored_path != staged_path
     assert staged_path.read_text(encoding="utf-8") == "sandbox edit"
-    assert list(cold_workspace.input_dir.glob("cold*.txt")) == [staged_path]
+    assert restored_path.read_text(encoding="utf-8") == "file content"
+    assert sorted(cold_workspace.input_dir.glob("cold*.txt")) == sorted(
+        [staged_path, restored_path]
+    )
+
+
+def test_register_uploaded_files_does_not_reuse_another_same_name_upload(
+    db_session,
+    tmp_path,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    first = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="first-file",
+        user_id=owner.id,
+        task_id=task.id,
+        filename="same.txt",
+    )
+    second = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="second-file",
+        user_id=owner.id,
+        task_id=task.id,
+        filename="same.txt",
+    )
+    Path(first.storage_path).write_text("alpha", encoding="utf-8")
+    Path(second.storage_path).write_text("bravo", encoding="utf-8")
+    first.file_size = second.file_size = 5
+    db_session.commit()
+
+    workspace = TaskWorkspace(
+        id="agent_1_same_name",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=task.id,
+    )
+    workspace.owner_user_id = owner.id
+    first_infos, _ = resolve_turn_file_infos(
+        file_ids=[first.file_id],
+        owner_user_id=owner.id,
+        task_id=task.id,
+        db=db_session,
+    )
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace), first_infos
+    )
+    first_path = Path(first_infos[0]["workspace_path"])
+    first_path.unlink()
+
+    second_infos, _ = resolve_turn_file_infos(
+        file_ids=[second.file_id],
+        owner_user_id=owner.id,
+        task_id=task.id,
+        db=db_session,
+    )
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace), second_infos
+    )
+    second_path = Path(second_infos[0]["workspace_path"])
+    assert second_path.name == "same.txt"
+
+    restored_workspace = TaskWorkspace(
+        id="agent_1_same_name",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=task.id,
+    )
+    restored_workspace.owner_user_id = owner.id
+    restored_infos, _ = resolve_turn_file_infos(
+        file_ids=[first.file_id],
+        owner_user_id=owner.id,
+        task_id=task.id,
+        db=db_session,
+    )
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=restored_workspace), restored_infos
+    )
+
+    restored_path = Path(restored_infos[0]["workspace_path"])
+    assert restored_path.name == "same_1.txt"
+    assert restored_path.read_text(encoding="utf-8") == "alpha"
+    assert second_path.read_text(encoding="utf-8") == "bravo"
+
+
+def test_register_uploaded_output_does_not_rewrite_output_metadata(
+    db_session,
+    tmp_path,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="output-file",
+        user_id=owner.id,
+        task_id=task.id,
+        filename="report.txt",
+    )
+    upload.workspace_relative_path = "output/report.txt"
+    upload.workspace_category = "output"
+    db_session.commit()
+
+    workspace = TaskWorkspace(
+        id="agent_1_output_reattach",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=task.id,
+    )
+    workspace.owner_user_id = owner.id
+    infos, _ = resolve_turn_file_infos(
+        file_ids=[upload.file_id],
+        owner_user_id=owner.id,
+        task_id=task.id,
+        db=db_session,
+    )
+
+    _register_uploaded_files_for_agent(SimpleNamespace(workspace=workspace), infos)
+
+    db_session.expire_all()
+    persisted = db_session.get(UploadedFile, upload.id)
+    assert persisted is not None
+    assert persisted.workspace_relative_path == "output/report.txt"
+    assert persisted.workspace_category == "output"
+    assert Path(infos[0]["workspace_path"]).parent == workspace.input_dir
+
+
+def test_register_uploaded_file_treats_binding_persistence_as_best_effort(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="persist-failure",
+        user_id=1,
+        task_id=10,
+        filename="persist.txt",
+    )
+    workspace = TaskWorkspace(
+        id="agent_1_persist_failure",
+        base_dir=str(tmp_path / "workspaces"),
+        db_task_id=10,
+    )
+    workspace.owner_user_id = 1
+    monkeypatch.setattr(
+        task_execution_service,
+        "_persist_durable_input_workspace_binding",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
+    )
+    file_info = {
+        "file_id": upload.file_id,
+        "name": upload.filename,
+        "size": upload.file_size,
+        "path": upload.storage_path,
+        "workspace_path": None,
+    }
+
+    _register_uploaded_files_for_agent(
+        SimpleNamespace(workspace=workspace),
+        [file_info],
+    )
+
+    assert (
+        Path(file_info["workspace_path"]).read_text(encoding="utf-8") == "file content"
+    )
 
 
 def test_register_uploaded_files_materializes_legacy_symlink_without_new_attachment(
@@ -2479,6 +2785,11 @@ def test_register_uploaded_files_materializes_legacy_symlink_without_new_attachm
     assert workspace.registered_files == [(legacy_input, "legacy-file")]
     assert unrelated_link.is_symlink()
     assert unrelated_source.stat().st_mode & 0o777 == 0o600
+    db_session.expire_all()
+    persisted = db_session.get(UploadedFile, upload.id)
+    assert persisted is not None
+    assert persisted.workspace_relative_path == "input/legacy.txt"
+    assert persisted.workspace_category == "input"
 
 
 def test_legacy_input_materialization_failure_does_not_block_turn(

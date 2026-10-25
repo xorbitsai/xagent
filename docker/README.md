@@ -259,6 +259,13 @@ create sibling sandbox containers through the host Docker daemon. Treat this as
 a privileged deployment mode: Docker socket access is effectively host-level
 container control.
 
+The backend process itself must run as effective uid 0, and the Docker daemon
+must be rootful with user-namespace remapping disabled. Xagent uses that host
+privilege only to prepare managed writable bind directories for sandbox uid
+1100/gid 1010; rootless Docker/Podman and non-root backend processes are not
+supported by this overlay. Existing deployments must satisfy these conditions
+before upgrading or readiness will fail before traffic is accepted.
+
 Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
 overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
 and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent` in
@@ -286,7 +293,21 @@ docker compose \
 
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
-expanded inside the backend container.
+expanded inside the backend container. A custom writable source must not equal
+or contain the managed uploads source, because that would let sandbox code
+replace an uploads path before the backend's privileged permission grant. This
+check is based on host sources, not guest destinations.
+
+Xagent changes ownership and mode only for the per-user/per-scope directories
+it manages below uploads. It does not change `XAGENT_EXTERNAL_UPLOAD_DIRS` or
+custom `SANDBOX_VOLUMES` sources. Before startup, operators must make every
+writable external source accessible to uid 1100/gid 1010 (normally group 1010,
+group `rwx`, and setgid on directories); otherwise tools fail when they first
+write there.
+
+`SANDBOX_PIDS_LIMIT` defaults to 1024 and accepts enabled values of 64 or more.
+Set it to `0` only on a Docker host without a pids cgroup controller to omit the
+limit; other invalid values fall back to 1024.
 
 Sandbox workspace guest paths are reserved below
 `<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or

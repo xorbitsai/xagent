@@ -29,7 +29,10 @@ class _ProbeStub:
         return self._supports
 
     def validate_host_workspace_access(self) -> None:
-        return None
+        raise AssertionError("non-Docker backends must not run the host access probe")
+
+    def requires_host_workspace_access(self) -> bool:
+        return False
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import errno
 import io
 import logging
 import os
@@ -58,6 +59,7 @@ from .base import (
     SandboxSnapshot,
     SandboxTemplate,
     canonical_sandbox_path,
+    normalize_sandbox_pids_limit,
 )
 from .keyed_lock import KeyedLockRegistry
 
@@ -611,9 +613,7 @@ def _find_publish_mismatches(
         mismatches.append("cpus")
     if (facts.raw_memory_bytes or 0) != int(desired.memory * 1024 * 1024):
         mismatches.append("memory")
-    observed_pids_limit = facts.raw_pids_limit
-    if observed_pids_limit is not None and observed_pids_limit < 64:
-        observed_pids_limit = None
+    observed_pids_limit = normalize_sandbox_pids_limit(facts.raw_pids_limit)
     if observed_pids_limit != desired.pids_limit:
         mismatches.append("pids_limit")
     return mismatches
@@ -627,7 +627,12 @@ def _write_tar_from_local_path(
     # device return promptly so the regular-file check can reject it without
     # blocking the async caller's event-loop thread.
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
-    source_fd = os.open(local_path, flags)
+    try:
+        source_fd = os.open(local_path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("Sandbox uploads require a regular local file") from exc
+        raise
     try:
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
@@ -1146,6 +1151,9 @@ async def _create_container(
     if extra_labels:
         labels.update(extra_labels)
 
+    effective_pids_limit = (
+        config.pids_limit if config.pids_limit is not None else get_sandbox_pids_limit()
+    )
     kwargs: dict[str, Any] = {
         "image": image,
         "name": _container_name(name, namespace),
@@ -1170,9 +1178,10 @@ async def _create_container(
         # Security config
         "security_opt": ["no-new-privileges:true"],
         "cap_drop": ["ALL"],
-        "pids_limit": config.pids_limit or get_sandbox_pids_limit(),
         "labels": labels,
     }
+    if effective_pids_limit is not None:
+        kwargs["pids_limit"] = effective_pids_limit
     guest_paths = [guest for _, guest, _ in (config.volumes or [])]
     if any(path.startswith("/root/") for path in guest_paths):
         # The stock image keeps /root at 0700. A private tmpfs supplies only
@@ -1522,8 +1531,14 @@ class DockerSandboxService(SandboxService):
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
-                pids_limit=config.pids_limit or get_sandbox_pids_limit(),
-                security_profile=config.security_profile,
+                pids_limit=(
+                    config.pids_limit
+                    if config.pids_limit is not None
+                    else get_sandbox_pids_limit()
+                ),
+                security_profile=(
+                    config.security_profile or self.runtime_security_profile()
+                ),
             )
             extra_labels = {
                 LABEL_SPEC_FINGERPRINT: desired.fingerprint(),
@@ -1891,13 +1906,14 @@ class DockerSandboxService(SandboxService):
                 f"{unsupported_daemon_mode}."
             )
         uploads_root = get_uploads_dir().expanduser()
-        uploads_root.mkdir(parents=True, exist_ok=True)
-        probe = Path(
-            tempfile.mkdtemp(prefix=".xagent-sandbox-ready-", dir=uploads_root)
-        )
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        probe: Path | None = None
         probe_fd = -1
         try:
+            uploads_root.mkdir(parents=True, exist_ok=True)
+            probe = Path(
+                tempfile.mkdtemp(prefix=".xagent-sandbox-ready-", dir=uploads_root)
+            )
             probe_fd = os.open(probe, flags)
             os.fchown(probe_fd, os.geteuid(), SANDBOX_RUNTIME_GID)
             os.fchmod(probe_fd, 0o2750)
@@ -1909,7 +1925,8 @@ class DockerSandboxService(SandboxService):
         finally:
             if probe_fd >= 0:
                 os.close(probe_fd)
-            shutil.rmtree(probe, ignore_errors=True)
+            if probe is not None:
+                shutil.rmtree(probe, ignore_errors=True)
 
     def runtime_security_profile(self) -> str | None:
         # Docker currently provides non-root/capability hardening but relies

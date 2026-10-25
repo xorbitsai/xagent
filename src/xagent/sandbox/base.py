@@ -23,16 +23,28 @@ CodeType = Literal["python", "javascript"]
 
 SANDBOX_RUNTIME_UID = 1100
 SANDBOX_RUNTIME_GID = 1010
+MIN_SANDBOX_PIDS_LIMIT = 64
 
 
-def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
+def normalize_sandbox_pids_limit(value: int | None) -> int | None:
+    """Normalize Docker's unset/unrealizable pids-limit representations."""
+    return value if value is not None and value >= MIN_SANDBOX_PIDS_LIMIT else None
+
+
+def grant_sandbox_runtime_access(
+    root: Path,
+    *,
+    trusted_root: Path,
+    preserve_through: Path | None = None,
+) -> None:
     """Make a managed mount suffix traversable by the sandbox identity.
 
-    Every component between ``trusted_root`` and ``root`` is assigned gid 1010
-    and mode 2750.  ``trusted_root`` itself and its ancestors are never
-    changed.  Callers that use an operator-owned folded mount as the descriptor
-    anchor must therefore choose the first Xagent-managed descendant as
-    ``root``.  Avoiding a recursive privileged walk keeps lease cost bounded
+    Every component after ``preserve_through`` through ``root`` is assigned
+    gid 1010 and mode 2750. ``preserve_through`` defaults to ``trusted_root``;
+    it, ``trusted_root``, and their ancestors are never changed. This lets an
+    operator-owned folded mount remain the descriptor anchor while the walk
+    traverses to an Xagent-managed subtree without changing the intervening
+    directories. Avoiding a recursive privileged walk keeps lease cost bounded
     by path depth and prevents a sandbox process from redirecting a path-based
     walk through a concurrently swapped symlink.
 
@@ -47,11 +59,20 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
     # created/opened descriptor-relatively without following links.
     lexical_root = Path(os.path.abspath(root))
     lexical_trusted_root = Path(os.path.abspath(trusted_root))
+    lexical_preserve_through = Path(
+        os.path.abspath(preserve_through or lexical_trusted_root)
+    )
     try:
         relative_parts = lexical_root.relative_to(lexical_trusted_root).parts
+        preserved_parts = lexical_preserve_through.relative_to(
+            lexical_trusted_root
+        ).parts
+        lexical_root.relative_to(lexical_preserve_through)
     except ValueError as exc:
         raise SandboxContractError(
-            f"Docker workspace root is outside its trusted prefix: {root}"
+            "Docker workspace grant paths are not nested under their trusted "
+            f"prefix: root={root}, preserve_through={preserve_through}, "
+            f"trusted_root={trusted_root}"
         ) from exc
     resolved_trusted_root = Path(os.path.realpath(lexical_trusted_root))
     directory_flags = os.O_RDONLY | os.O_DIRECTORY
@@ -72,25 +93,29 @@ def grant_sandbox_runtime_access(root: Path, *, trusted_root: Path) -> None:
                 next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
                 os.close(current_fd)
                 current_fd = next_fd
-            for component in relative_parts:
-                try:
-                    os.mkdir(component, mode=0o750, dir_fd=current_fd)
-                except FileExistsError:
-                    pass
-                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
-                try:
-                    os.fchown(next_fd, -1, SANDBOX_RUNTIME_GID)
-                    os.fchmod(next_fd, 0o2750)
-                except PermissionError as exc:
-                    os.close(next_fd)
-                    raise SandboxContractError(
-                        "Docker workspace preparation requires the backend "
-                        "to run as root and assign gid "
-                        f"{SANDBOX_RUNTIME_GID}: {root}"
-                    ) from exc
-                except OSError:
-                    os.close(next_fd)
-                    raise
+            for index, component in enumerate(relative_parts):
+                should_grant = index >= len(preserved_parts)
+                if should_grant:
+                    try:
+                        os.mkdir(component, mode=0o750, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                flags = directory_flags if should_grant else traversal_flags
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+                if should_grant:
+                    try:
+                        os.fchown(next_fd, -1, SANDBOX_RUNTIME_GID)
+                        os.fchmod(next_fd, 0o2750)
+                    except PermissionError as exc:
+                        os.close(next_fd)
+                        raise SandboxContractError(
+                            "Docker workspace preparation requires the backend "
+                            "to run as root and assign gid "
+                            f"{SANDBOX_RUNTIME_GID}: {root}"
+                        ) from exc
+                    except OSError:
+                        os.close(next_fd)
+                        raise
                 os.close(current_fd)
                 current_fd = next_fd
         except OSError as exc:
@@ -426,9 +451,11 @@ class ResolvedSandboxRuntimeSpec:
                 f"memory must be >= {_MIN_SPEC_MEMORY_MB} MB to be realizable, "
                 f"got {self.memory!r}"
             )
-        if self.pids_limit is not None and self.pids_limit < 64:
+        if self.pids_limit is not None and self.pids_limit < MIN_SANDBOX_PIDS_LIMIT:
             raise ValueError(
-                f"pids_limit must be >= 64 to be realizable, got {self.pids_limit!r}"
+                "pids_limit must be >= "
+                f"{MIN_SANDBOX_PIDS_LIMIT} to be realizable, got "
+                f"{self.pids_limit!r}"
             )
 
     @classmethod
@@ -796,11 +823,7 @@ def spec_matches_inspection(
     desired_memory_bytes = int(desired.memory * 1024 * 1024)
     observed_nano_cpus = facts.raw_nano_cpus or 0
     observed_memory_bytes = facts.raw_memory_bytes or 0
-    observed_pids_limit = (
-        facts.raw_pids_limit
-        if facts.raw_pids_limit is not None and facts.raw_pids_limit >= 64
-        else None
-    )
+    observed_pids_limit = normalize_sandbox_pids_limit(facts.raw_pids_limit)
     if observed_nano_cpus != desired_nano_cpus:
         return SpecVerdict.MISMATCH
     if observed_memory_bytes != desired_memory_bytes:

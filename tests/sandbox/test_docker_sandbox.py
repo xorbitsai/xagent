@@ -119,6 +119,17 @@ def test_write_tar_local_path_rejects_fifo_swap_without_blocking(
         assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
 
 
+def test_write_tar_local_path_rejects_symlink_consistently(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("secret", encoding="utf-8")
+    source = tmp_path / "source.txt"
+    source.symlink_to(target)
+
+    with tempfile.TemporaryFile() as archive:
+        with pytest.raises(ValueError, match="regular local file"):
+            _write_tar_from_local_path(str(source), "source.txt", archive)
+
+
 @pytest.mark.parametrize("raw_pids_limit", [0, 1, 63, -1, None])
 def test_inspect_treats_unrealizable_pids_limit_as_unset(raw_pids_limit) -> None:
     container = _labeled_container({})
@@ -251,6 +262,26 @@ class TestDockerSandboxServiceFailures:
         with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
             service.validate_host_workspace_access()
         assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    def test_host_workspace_readiness_wraps_upload_root_creation_failure(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        uploads_root = tmp_path / "missing" / "uploads"
+        monkeypatch.setattr(
+            docker_sandbox_module, "get_uploads_dir", lambda: uploads_root
+        )
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        def reject_mkdir(*_args, **_kwargs):
+            raise PermissionError("read-only parent")
+
+        monkeypatch.setattr(Path, "mkdir", reject_mkdir)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
+            service.validate_host_workspace_access()
 
     def test_host_workspace_readiness_requires_root_backend(
         self, tmp_path, monkeypatch
@@ -709,6 +740,47 @@ class TestNamespaceIsolation:
         assert captured["pids_limit"] == 2048
         assert captured["environment"]["HOME"] == "/tmp/custom-home"
         assert captured["tmpfs"]["/root"].endswith("mode=0711,uid=1100,gid=1010")
+
+        monkeypatch.setenv("SANDBOX_PIDS_LIMIT", "0")
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(),
+        )
+        assert "pids_limit" not in captured
+
+    @pytest.mark.asyncio
+    async def test_create_defaults_runtime_security_profile(self, monkeypatch):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        captured: dict[str, object] = {}
+
+        class _StopAfterDesiredSpec(Exception):
+            pass
+
+        def capture_spec(**kwargs):
+            captured.update(kwargs)
+            raise _StopAfterDesiredSpec
+
+        monkeypatch.setattr(
+            docker_sandbox_module.ResolvedSandboxRuntimeSpec,
+            "from_parts",
+            staticmethod(capture_spec),
+        )
+
+        with pytest.raises(_StopAfterDesiredSpec):
+            await service.create(
+                "user::1",
+                SandboxTemplate(type="image", image="img"),
+                SandboxConfig(),
+            )
+
+        assert captured["security_profile"] == service.runtime_security_profile()
 
 
 class TestManagerPathsRespectNamespace:

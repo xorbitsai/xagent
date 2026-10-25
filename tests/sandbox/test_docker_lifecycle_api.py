@@ -71,7 +71,7 @@ def _unique_name(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
 
 
-def _effective_pids_limit(config: SandboxConfig) -> int:
+def _effective_pids_limit(config: SandboxConfig) -> int | None:
     """Mirror Docker create's resolution of an omitted backend default."""
     return config.pids_limit or get_sandbox_pids_limit()
 

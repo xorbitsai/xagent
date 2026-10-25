@@ -68,10 +68,6 @@ from xagent.web.services.workspace_binding import build_chat_workspace_binding
 requires_docker = pytest.mark.skipif(
     not is_docker_available(), reason="Requires reachable Docker daemon"
 )
-requires_workspace_chown = pytest.mark.skipif(
-    os.geteuid() != 0,
-    reason="writable fixed-gid Docker workspace tests require host CAP_CHOWN",
-)
 
 OWNER_ID = 4242
 
@@ -120,6 +116,26 @@ def _uploads(tmp_path, monkeypatch):
     monkeypatch.setattr(workspace_binding, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
     monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+    if os.geteuid() != 0:
+        # These classes exercise reconciliation against a real daemon, not the
+        # root-only gid grant itself (covered by unit tests). Keep them active
+        # on non-root CI runners by replacing that seam with test-only,
+        # world-writable directories that uid 1100 can use in the container.
+        tmp_path.chmod(0o777)
+
+        def prepare_test_mount(root: Path, *, trusted_root: Path, **_kwargs) -> None:
+            root.mkdir(parents=True, exist_ok=True)
+            current = root
+            trusted = Path(trusted_root)
+            while current != trusted:
+                current.chmod(0o777)
+                current = current.parent
+
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            prepare_test_mount,
+        )
     return tmp_path
 
 
@@ -151,7 +167,6 @@ async def _delete_lifecycle(service, lifecycle_type: str, lifecycle_id: str) -> 
 
 
 @requires_docker
-@requires_workspace_chown
 class TestSameCAConflictFreeReuse:
     """#296's fix, asserted directly against real containers: two Actors
     under the same CA fold to a byte-identical mount intent and share
@@ -251,7 +266,6 @@ class TestSameCAConflictFreeReuse:
 
 
 @requires_docker
-@requires_workspace_chown
 class TestLegacyContainerMigration:
     """A container built the way the pre-1b sandbox layer built it (managed
     + name labels only, no spec attestation, the Actor subtree mounted as a
@@ -374,7 +388,6 @@ class TestLegacyContainerMigration:
 
 
 @requires_docker
-@requires_workspace_chown
 class TestLegacyMatchingStoreRowStaysUnverified:
     """A legacy-shaped container whose store row's recorded spec already
     equals the new desired spec reuses via UNVERIFIED-equal convergence: no
@@ -453,7 +466,6 @@ class TestLegacyMatchingStoreRowStaysUnverified:
 
 
 @requires_docker
-@requires_workspace_chown
 class TestReconcileBudgetExhaustion:
     """The per-key reconcile rebuild budget (default 1) rejects a second
     drift for the same lifecycle key instead of rebuilding again."""
@@ -538,7 +550,6 @@ class TestReconcileBudgetExhaustion:
 
 
 @requires_docker
-@requires_workspace_chown
 class TestProviderABAAcrossReleaseToZero:
     """A provider handle obtained before release-to-zero must never
     re-attach once release installed no provider (and a later

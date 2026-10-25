@@ -858,7 +858,7 @@ class TestProviderCacheMountIntentGate:
     ) -> None:
         prepared: list[Path] = []
 
-        def record_grant(path: Path, *, trusted_root: Path) -> None:
+        def record_grant(path: Path, **_kwargs) -> None:
             prepared.append(path)
 
         monkeypatch.setattr(
@@ -885,7 +885,9 @@ class TestProviderCacheMountIntentGate:
     ) -> None:
         grants: list[tuple[Path, Path]] = []
 
-        def record_grant(path: Path, *, trusted_root: Path) -> None:
+        def record_grant(
+            path: Path, *, trusted_root: Path, preserve_through: Path | None = None
+        ) -> None:
             grants.append((path, trusted_root))
 
         monkeypatch.setattr(
@@ -908,6 +910,49 @@ class TestProviderCacheMountIntentGate:
             (mount_root, tmp_path),
             (prepare_root, mount_root),
         ]
+
+    def test_folded_ancestor_preserves_operator_owned_uploads_ancestry(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        operator_root = tmp_path / "data"
+        operator_parent = operator_root / "xagent"
+        uploads_root = operator_parent / "uploads"
+        uploads_root.mkdir(parents=True)
+        operator_root.chmod(0o775)
+        operator_parent.chmod(0o771)
+        uploads_root.chmod(0o777)
+        original_modes = {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (operator_root, operator_parent, uploads_root)
+        }
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+        prepare_root = uploads_root / "user_42" / "scope-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(operator_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (operator_root, operator_parent, uploads_root)
+        } == original_modes
+        for managed_path in (uploads_root / "user_42", prepare_root):
+            assert stat.S_IMODE(managed_path.stat().st_mode) & 0o777 == 0o750
 
     def test_folded_mount_creates_and_prepares_missing_anchor(
         self, _env, tmp_path, monkeypatch
@@ -1114,7 +1159,9 @@ class TestProviderCacheMountIntentGate:
     ) -> None:
         grants: list[tuple[Path, Path]] = []
 
-        def record_grant(path: Path, *, trusted_root: Path) -> None:
+        def record_grant(
+            path: Path, *, trusted_root: Path, preserve_through: Path | None = None
+        ) -> None:
             grants.append((path, trusted_root))
 
         monkeypatch.setattr(
@@ -1335,7 +1382,7 @@ class TestReadinessReservedUploadsSubtree:
                 "os.environ",
                 {
                     "XAGENT_UPLOADS_DIR": str(uploads_dir),
-                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{uploads_dir}:rw",
+                    "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:rw",
                 },
                 clear=True,
             ),
@@ -1357,7 +1404,7 @@ class TestReadinessReservedUploadsSubtree:
             "os.environ",
             {
                 "XAGENT_UPLOADS_DIR": str(uploads_dir),
-                "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{tmp_path}:rw",
+                "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:rw",
             },
             clear=True,
         ):
@@ -1388,7 +1435,31 @@ class TestReadinessReservedUploadsSubtree:
                 "os.environ",
                 {
                     "XAGENT_UPLOADS_DIR": str(uploads_dir),
-                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{tmp_path}:ro",
+                    "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:ro",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_allows_unrelated_source_with_guest_target_covering_uploads(
+        self, tmp_path
+    ) -> None:
+        uploads_dir = tmp_path / "uploads"
+        unrelated_source = tmp_path / "unrelated"
+        unrelated_source.mkdir()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": (f"{unrelated_source}:{tmp_path}:rw"),
                 },
                 clear=True,
             ),

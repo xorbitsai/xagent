@@ -3794,14 +3794,32 @@ def get_sandbox_memory() -> int | None:
     return None
 
 
-def get_sandbox_pids_limit() -> int:
+def get_sandbox_pids_limit() -> int | None:
     """Get the process/thread limit for sandbox containers.
+
+    Priority:
+        1. SANDBOX_PIDS_LIMIT environment variable
+        2. 1024 by default
 
     Linux counts threads against the pids cgroup. The default therefore
     leaves enough room for Chrome and numeric libraries while still bounding
-    fork bombs. Invalid values fall back to 1024.
+    fork bombs. Set the value to 0 to omit the Docker pids limit on hosts
+    without a pids cgroup controller. Other values below 64 and invalid values
+    fall back to 1024.
     """
-    return _get_positive_int_env(SANDBOX_PIDS_LIMIT, 1024, minimum=64)
+    value = os.getenv(SANDBOX_PIDS_LIMIT)
+    if value is None or not value.strip():
+        return 1024
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = -1
+    if parsed == 0:
+        return None
+    if parsed >= 64:
+        return parsed
+    logger.warning("Invalid %s=%r; falling back to 1024", SANDBOX_PIDS_LIMIT, value)
+    return 1024
 
 
 def get_sandbox_env() -> dict[str, str]:

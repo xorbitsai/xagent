@@ -1900,12 +1900,18 @@ class TestGetSandboxPidsLimit:
         monkeypatch.setenv(SANDBOX_PIDS_LIMIT, "2048")
         assert get_sandbox_pids_limit() == 2048
 
-    @pytest.mark.parametrize("value", ["invalid", "0", "63"])
+    @pytest.mark.parametrize("value", ["invalid", "-1", "63"])
     def test_invalid_or_too_small_value_uses_default(self, monkeypatch, value):
         from xagent.config import SANDBOX_PIDS_LIMIT, get_sandbox_pids_limit
 
         monkeypatch.setenv(SANDBOX_PIDS_LIMIT, value)
         assert get_sandbox_pids_limit() == 1024
+
+    def test_zero_disables_limit(self, monkeypatch):
+        from xagent.config import SANDBOX_PIDS_LIMIT, get_sandbox_pids_limit
+
+        monkeypatch.setenv(SANDBOX_PIDS_LIMIT, "0")
+        assert get_sandbox_pids_limit() is None
 
 
 class TestGetSandboxEnv:

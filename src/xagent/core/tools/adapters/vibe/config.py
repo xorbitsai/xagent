@@ -297,10 +297,10 @@ class BaseToolConfig(ABC):
         return None
 
     def set_task_runtime_workspace(self, workspace: Any) -> None:
-        """Retain a workspace shared by task-runtime and sandbox setup."""
+        """Retain the workspace shared by tool creators and AgentService."""
 
     def get_task_runtime_workspace(self) -> Any:
-        """Return a workspace prepared by the task runtime, when present."""
+        """Return the workspace shared by tool creators and AgentService."""
 
         return None
 
@@ -679,6 +679,7 @@ class ToolConfig(BaseToolConfig):
             pass
 
         self.workspace_config: Optional[Dict[str, Any]] = workspace_config
+        self._task_runtime_workspace: Any = None
         self.vision_model: Optional[Any] = (
             None  # Standalone usage typically doesn't have web context
         )
@@ -729,6 +730,16 @@ class ToolConfig(BaseToolConfig):
 
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         return self.workspace_config
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain the workspace shared by tool creators and AgentService."""
+
+        self._task_runtime_workspace = workspace
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return the workspace shared by tool creators and AgentService."""
+
+        return self._task_runtime_workspace
 
     def get_vision_model(self) -> Optional[Any]:
         return self.vision_model

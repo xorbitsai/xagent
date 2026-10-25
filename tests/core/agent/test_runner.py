@@ -1488,6 +1488,7 @@ async def test_runner_stops_on_llm_call_interrupt(tmp_path: Path) -> None:
 async def test_runner_restores_context_and_pattern_from_checkpoint(
     tmp_path: Path,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     checkpoint_context = ExecutionContext(execution_id="exec-resume")
     checkpoint_context.add_user_message("Original task")
     checkpoint_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["text"]
@@ -1498,9 +1499,10 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
     }
     pattern = StatefulPattern()
     agent = Agent(name="writer", patterns=[pattern])
+    workspace_manager = FakeWorkspaceManager(tmp_path)
     runner = AgentRunner(
         agent=agent,
-        workspace_manager=FakeWorkspaceManager(tmp_path),
+        workspace_manager=workspace_manager,
     )
 
     result = await runner.run(
@@ -1521,6 +1523,8 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
         "Original task",
         "restored",
     ]
+    assert len(workspace_manager.thread_ids) == 1
+    assert workspace_manager.thread_ids[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

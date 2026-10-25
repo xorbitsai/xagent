@@ -2621,12 +2621,12 @@ class WebToolConfig(BaseToolConfig):
         return self._task_runtime_contribution
 
     def set_task_runtime_workspace(self, workspace: Any) -> None:
-        """Retain the workspace already prepared for runtime providers."""
+        """Retain the workspace shared by tool creators and AgentService."""
 
         self._task_runtime_workspace = workspace
 
     def get_task_runtime_workspace(self) -> Any:
-        """Return the workspace shared by providers and sandbox setup."""
+        """Return the workspace shared by tool creators and AgentService."""
 
         return self._task_runtime_workspace
 

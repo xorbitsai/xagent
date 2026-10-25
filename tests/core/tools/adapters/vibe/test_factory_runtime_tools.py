@@ -50,9 +50,50 @@ async def test_async_workspace_creation_runs_off_event_loop(
     )
 
     workspace = await ToolFactory.create_workspace_async(config)
+    cached_workspace = await ToolFactory.create_workspace_async(config)
 
     assert workspace is expected_workspace
-    assert worker_threads and worker_threads[0] != event_loop_thread
+    assert cached_workspace is expected_workspace
+    assert len(worker_threads) == 1
+    assert worker_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_all_tool_creators_share_prepared_workspace(
+    tmp_path, monkeypatch
+) -> None:
+    expected_workspace = object()
+    create_calls = 0
+    creator_workspaces = []
+
+    def create_workspace(_workspace_config):
+        nonlocal create_calls
+        create_calls += 1
+        return expected_workspace
+
+    async def create_registered_tools(config: Any) -> list[Any]:
+        creator_workspaces.append(await ToolFactory.create_workspace_async(config))
+        creator_workspaces.append(await ToolFactory.create_workspace_async(config))
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_workspace",
+        staticmethod(create_workspace),
+    )
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        create_registered_tools,
+    )
+    config = ToolConfig(
+        {"workspace": {"base_dir": str(tmp_path), "task_id": "shared-task"}}
+    )
+
+    await ToolFactory.create_all_tools(config)
+
+    assert create_calls == 1
+    assert creator_workspaces == [expected_workspace, expected_workspace]
 
 
 @pytest.mark.asyncio

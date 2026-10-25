@@ -750,10 +750,20 @@ async def create_default_tools(
 
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
+    workspace_config_getter = getattr(tool_config, "get_workspace_config", None)
+    workspace_config = (
+        workspace_config_getter() if callable(workspace_config_getter) else None
+    )
+    try:
+        workspace = await ToolFactory.create_workspace_async(tool_config, strict=True)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}") from exc
+    if workspace_config and workspace is None:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}")
+
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
     if task_runtime_context is not None and registered_task_extensions():
         try:
-            workspace = await ToolFactory.create_workspace_async(tool_config)
             runtime_contribution = await build_task_runtime(
                 task_runtime_context.with_workspace(workspace)
             )
@@ -778,36 +788,9 @@ async def create_default_tools(
 
     # Use ToolFactory to create proper xagent tools
     tools = await ToolFactory.create_all_tools(tool_config)
-    # AgentService is constructed by async request/worker paths. Prepare its
-    # workspace here so its synchronous constructor never performs the first
-    # legacy permission walk on the event-loop thread.
-    workspace_config_getter = getattr(tool_config, "get_workspace_config", None)
-    workspace_config = (
-        workspace_config_getter() if callable(workspace_config_getter) else None
-    )
-    workspace = _prepared_workspace_from_tool_config(tool_config)
-    if workspace is None and workspace_config:
-        workspace = await asyncio.to_thread(
-            ToolFactory.create_workspace,
-            workspace_config,
-        )
-        workspace_setter = getattr(tool_config, "set_task_runtime_workspace", None)
-        if callable(workspace_setter):
-            workspace_setter(workspace)
-    if workspace_config and workspace is None:
-        # Do not let AgentService retry workspace creation synchronously in
-        # its constructor after an off-thread preparation failure.
-        raise RuntimeError(f"Failed to prepare workspace for task {task_id}")
 
     logger.info(f"Created {len(tools)} default tools using ToolFactory")
     return tools, tool_config
-
-
-def _prepared_workspace_from_tool_config(tool_config: Any) -> Any:
-    """Read the optional workspace cache without requiring a concrete config."""
-
-    workspace_getter = getattr(tool_config, "get_task_runtime_workspace", None)
-    return workspace_getter() if callable(workspace_getter) else None
 
 
 def _task_runtime_context(
@@ -3105,7 +3088,7 @@ class AgentServiceManager:
                         memory_availability_reason=memory_policy.public_availability_reason,
                         execution_metadata=memory_policy.execution_metadata(),
                         system_prompt=system_prompt,  # Pass agent builder instructions
-                        workspace=_prepared_workspace_from_tool_config(tool_config),
+                        workspace=tool_config.get_task_runtime_workspace(),
                     )
                     try:
                         self._sweep_idle_runtimes(
@@ -4480,7 +4463,7 @@ class AgentServiceManager:
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
                     execution_metadata=memory_policy.execution_metadata(),
-                    workspace=_prepared_workspace_from_tool_config(tool_config),
+                    workspace=tool_config.get_task_runtime_workspace(),
                 )
             try:
                 self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)

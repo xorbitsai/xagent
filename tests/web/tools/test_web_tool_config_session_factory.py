@@ -420,6 +420,37 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
 
 
 @pytest.mark.asyncio
+async def test_create_default_tools_chains_workspace_preparation_failure(
+    monkeypatch,
+) -> None:
+    from xagent.web.services.agent_service_manager import create_default_tools
+
+    class _FakeToolConfig:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_workspace_config(self):
+            return {"task_id": "web_task_11"}
+
+    async def fail_workspace(_config, *, strict=False):
+        assert strict is True
+        raise PermissionError("workspace denied")
+
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr("xagent.web.models.database._SessionLocal", object())
+    monkeypatch.setattr(ToolFactory, "create_workspace_async", fail_workspace)
+
+    with pytest.raises(RuntimeError, match="task web_task_11") as exc_info:
+        await create_default_tools(
+            None,
+            user=SimpleNamespace(id=7, is_admin=False),
+            task_id="web_task_11",
+        )
+
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("agent_config", ["malformed", ["malformed"]])
 async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
     monkeypatch,
@@ -581,7 +612,7 @@ async def test_create_default_tools_degrades_when_runtime_provider_build_fails(
     monkeypatch.setattr(
         ToolFactory,
         "create_workspace",
-        lambda _config: SimpleNamespace(id="workspace"),
+        lambda _config, **_kwargs: SimpleNamespace(id="workspace"),
     )
     monkeypatch.setattr(agent_runtime_service, "build_task_runtime", fail_runtime)
     monkeypatch.setattr(
@@ -676,7 +707,7 @@ async def test_create_default_tools_isolates_runtime_tool_name_collision(
     monkeypatch.setattr(
         ToolFactory,
         "create_workspace",
-        lambda _config: SimpleNamespace(id="workspace"),
+        lambda _config, **_kwargs: SimpleNamespace(id="workspace"),
     )
     monkeypatch.setattr(agent_runtime_service, "build_task_runtime", build_runtime)
     monkeypatch.setattr(

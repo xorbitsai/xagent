@@ -88,16 +88,21 @@ def _tool_turn_llm() -> FakeLLM:
 
 
 def _fail_once(monkeypatch, kind: str) -> list[str]:
-    """Fail the first commit of ``kind`` without writing it; later ones pass."""
+    """Fail the first commit of ``kind`` without writing it; later ones pass.
 
+    In-run retries are disabled: these tests cover what settlement does with a
+    commit failure that outlasted them.
+    """
+
+    monkeypatch.setenv("XAGENT_DB_WRITE_RETRY_ATTEMPTS", "1")
     original = ExecutionEventTraceAdapter._save_to_database
     failed: list[str] = []
 
-    async def save(self, event):
+    async def save(self, event, **kwargs):
         if not failed and get_event_type_mapping(event) == kind:
             failed.append(kind)
             raise OperationalError("COMMIT", {}, Exception("connection reset"))
-        return await original(self, event)
+        return await original(self, event, **kwargs)
 
     monkeypatch.setattr(ExecutionEventTraceAdapter, "_save_to_database", save)
     return failed

@@ -83,7 +83,7 @@ async def test_handler_cancellation_drains_before_releasing_admission(
     started = []
     handler = trace_handlers.DatabaseTraceHandler(42)
 
-    def write(event):
+    def write(event, **_kwargs):
         started.append(event.id)
         release.wait(WORKER_RELEASE_BOUND)
 
@@ -176,7 +176,7 @@ async def test_preparation_is_bounded_drained_and_precedes_connection(
     token = context.set("lease")
     handler = trace_handlers.DatabaseTraceHandler(1)
 
-    def prepare(trace):
+    def prepare(trace, **_kwargs):
         prepared.append(context.get())
         started.set()
         release.wait(WORKER_RELEASE_BOUND)

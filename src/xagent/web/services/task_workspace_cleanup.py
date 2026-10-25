@@ -218,7 +218,10 @@ def remove_task_workspace(target: WorkspaceCleanupTarget) -> None:
             continue
 
         workspace = TaskWorkspace(
-            workspace_id, base_dir, allowed_external_dirs=allowed_external_dirs
+            workspace_id,
+            base_dir,
+            allowed_external_dirs=allowed_external_dirs,
+            migrate_sandbox_permissions=False,
         )
         workspace_path = str(workspace.workspace_dir)
         logger.info(

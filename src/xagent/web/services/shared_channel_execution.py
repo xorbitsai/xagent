@@ -681,8 +681,10 @@ class ChannelProgressForwarder(TraceHandler):
     async def handle_event(self, event: TraceEvent) -> None:
         async with self._condition:
             await self._condition.wait_for(
-                lambda: not self._accepting()
-                or len(self._pending) < self._MAX_PENDING_EVENTS
+                lambda: (
+                    not self._accepting()
+                    or len(self._pending) < self._MAX_PENDING_EVENTS
+                )
             )
             if not self._accepting():
                 return
@@ -787,12 +789,13 @@ async def execute_channel_background(
         file_infos = (
             await run_db_io_cancellation_safe(resolve_files) if payload.file_ids else []
         )
-        if file_infos:
-            from .task_execution import _register_uploaded_files_for_agent
+        from .task_execution import _register_uploaded_files_for_agent
 
-            await run_db_io_cancellation_safe(
-                lambda: _register_uploaded_files_for_agent(service, file_infos)
-            )
+        # Run even without new attachments: the registration helper also
+        # replaces authorized legacy input symlinks with task-local copies.
+        await run_db_io_cancellation_safe(
+            lambda: _register_uploaded_files_for_agent(service, file_infos)
+        )
         from .file_turn import normalize_attachments_for_persistence
 
         context: dict[str, Any] = {

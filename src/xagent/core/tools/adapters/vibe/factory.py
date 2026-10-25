@@ -7,6 +7,7 @@ and configuration management.
 
 # mypy: ignore-errors
 
+import asyncio
 import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
@@ -388,6 +389,11 @@ class ToolFactory:
             try:
                 if callable(prepare_factory_runtime):
                     await prepare_factory_runtime(config)
+                # Prepare one shared workspace before invoking any registered
+                # creator.  In particular, MCP-only selections must receive
+                # the same workspace as full tool selections regardless of
+                # creator registration order.
+                await ToolFactory.create_workspace_async(config)
                 resolved_additional_tools = additional_tools
                 if resolved_additional_tools is None:
                     contribution = (
@@ -785,7 +791,7 @@ class ToolFactory:
                 else None
             )
             if workspace is None:
-                workspace = ToolFactory.create_workspace(config.get_workspace_config())
+                workspace = await ToolFactory.create_workspace_async(config)
             if workspace is not None:
                 directories = workspace.get_allowed_dirs()
                 # Mount coverage is sufficient only when the backend-side
@@ -987,8 +993,44 @@ class ToolFactory:
 
     # New unified tool creation methods
     @staticmethod
+    async def create_workspace_async(
+        config: BaseToolConfig,
+        *,
+        strict: bool = False,
+    ) -> TaskWorkspace | None:
+        """Build a task workspace without blocking an async tool creator."""
+
+        workspace_getter = getattr(config, "get_task_runtime_workspace", None)
+        workspace = workspace_getter() if callable(workspace_getter) else None
+        if workspace is not None:
+            return workspace
+        workspace_config_getter = getattr(config, "get_workspace_config", None)
+        if not callable(workspace_config_getter):
+            return None
+        workspace_config = workspace_config_getter()
+        if strict:
+            workspace = await asyncio.to_thread(
+                ToolFactory.create_workspace,
+                workspace_config,
+                strict=True,
+            )
+        else:
+            # Keep the ordinary call signature compatible with integrations
+            # that monkeypatch the legacy one-argument factory.
+            workspace = await asyncio.to_thread(
+                ToolFactory.create_workspace,
+                workspace_config,
+            )
+        workspace_setter = getattr(config, "set_task_runtime_workspace", None)
+        if callable(workspace_setter):
+            workspace_setter(workspace)
+        return workspace
+
+    @staticmethod
     def create_workspace(
         workspace_config: dict[str, Any] | None,
+        *,
+        strict: bool = False,
     ) -> TaskWorkspace | None:
         """Create a workspace from a tool configuration.
 
@@ -1038,7 +1080,9 @@ class ToolFactory:
             )
             return workspace
         except Exception as e:
-            logger.warning(f"Failed to create workspace: {e}")
+            logger.warning("Failed to create workspace: %s", e, exc_info=True)
+            if strict:
+                raise
             return None
 
     @staticmethod

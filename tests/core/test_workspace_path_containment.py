@@ -10,12 +10,19 @@ which do not delegate to one another).
 """
 
 import os
+import stat
+import threading
 from pathlib import Path
 
 import pytest
 
+import xagent.core.workspace as workspace_module
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
-from xagent.core.workspace import SPILL_DIR_NAME, TaskWorkspace
+from xagent.core.workspace import (
+    SPILL_DIR_NAME,
+    ExternalUploadStagingError,
+    TaskWorkspace,
+)
 
 # Relative inputs that resolve outside the workspace and must be rejected.
 # ``plain`` climbs out directly; ``prefixed`` starts under a legit "output/"
@@ -61,6 +68,128 @@ def test_resolve_path_allows_legitimate_relative_path(workspace):
 
     assert resolved.is_relative_to(workspace.workspace_dir.resolve())
     assert resolved == (workspace.output_dir / "report.txt").resolve()
+
+
+def test_stage_path_uses_host_private_copy_and_cleanup(workspace):
+    source = workspace.output_dir / "report.txt"
+    source.write_text("original", encoding="utf-8")
+
+    staged = workspace.stage_path_for_external_upload(
+        "output/report.txt", host_private=True
+    )
+    source.write_text("changed", encoding="utf-8")
+
+    assert staged.read_text(encoding="utf-8") == "original"
+    assert stat.S_IMODE(staged.stat().st_mode) == 0o600
+    assert not staged.is_relative_to(workspace.workspace_dir)
+    assert stat.S_IMODE(staged.parents[1].stat().st_mode) == 0o700
+    workspace.discard_staged_external_upload(staged)
+    assert not staged.exists()
+
+
+def test_stage_path_accepts_authorized_external_symlink(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    source = external / "image.png"
+    source.write_bytes(b"authorized")
+    workspace = TaskWorkspace(
+        "task7",
+        str(tmp_path / "uploads"),
+        allowed_external_dirs=[str(external)],
+    )
+    (workspace.output_dir / "image.png").symlink_to(source)
+
+    staged = workspace.stage_path_for_external_upload("output/image.png")
+
+    assert staged.read_bytes() == b"authorized"
+    workspace.discard_staged_external_upload(staged)
+
+
+def test_stage_path_rejects_symlink_escape(tmp_path):
+    workspace = TaskWorkspace("task7", str(tmp_path / "uploads"))
+    outside = tmp_path / "secret.png"
+    outside.write_bytes(b"secret")
+    (workspace.output_dir / "image.png").symlink_to(outside)
+
+    with pytest.raises((ValueError, FileNotFoundError)):
+        workspace.stage_path_for_external_upload("output/image.png")
+
+
+def test_stage_path_rejects_swap_after_authorization(workspace, tmp_path, monkeypatch):
+    source = workspace.output_dir / "report.txt"
+    source.write_text("authorized", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    real_resolve = workspace.resolve_path_with_search
+
+    def resolve_then_swap(selector: str, **kwargs):
+        resolved = real_resolve(selector, **kwargs)
+        source.unlink()
+        source.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(workspace, "resolve_path_with_search", resolve_then_swap)
+
+    with pytest.raises(FileNotFoundError):
+        workspace.stage_path_for_external_upload("output/report.txt")
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
+def test_stage_path_rejects_fifo_without_blocking(workspace):
+    fifo = workspace.output_dir / "pipe"
+    os.mkfifo(fifo)
+    outcome: list[BaseException | None] = []
+
+    def stage_fifo() -> None:
+        try:
+            workspace.stage_path_for_external_upload("output/pipe")
+        except BaseException as exc:
+            outcome.append(exc)
+        else:
+            outcome.append(None)
+
+    worker = threading.Thread(target=stage_fifo, daemon=True)
+    worker.start()
+    worker.join(timeout=2)
+    try:
+        assert not worker.is_alive(), "opening a FIFO must not block the worker"
+    finally:
+        if worker.is_alive():
+            writer_fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer_fd)
+            worker.join(timeout=2)
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], FileNotFoundError)
+
+
+def test_sandbox_staging_root_closes_fds_when_chmod_fails(workspace, monkeypatch):
+    monkeypatch.setattr(workspace_module, "in_sandbox_tool_runner", lambda: True)
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+    closed: list[int] = []
+
+    def record_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def record_close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(workspace_module.os, "open", record_open)
+    monkeypatch.setattr(workspace_module.os, "close", record_close)
+    monkeypatch.setattr(
+        workspace_module.os,
+        "fchmod",
+        lambda *_args: (_ for _ in ()).throw(OSError("read-only")),
+    )
+
+    with pytest.raises(ExternalUploadStagingError):
+        workspace._external_upload_staging_root()
+
+    assert set(opened).issubset(closed)
 
 
 def test_resolve_path_with_search_rejects_existing_sibling_via_traversal(

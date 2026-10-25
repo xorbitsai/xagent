@@ -20,7 +20,7 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
         return []
 
     tools: List[Any] = []
-    workspace = ToolFactory.create_workspace(config.get_workspace_config())
+    workspace = await ToolFactory.create_workspace_async(config)
 
     def credentials(tool_name: str, *fields: str) -> list[str | None]:
         try:

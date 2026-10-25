@@ -750,14 +750,20 @@ async def create_default_tools(
 
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
+    workspace_config_getter = getattr(tool_config, "get_workspace_config", None)
+    workspace_config = (
+        workspace_config_getter() if callable(workspace_config_getter) else None
+    )
+    try:
+        workspace = await ToolFactory.create_workspace_async(tool_config, strict=True)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}") from exc
+    if workspace_config and workspace is None:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}")
+
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
     if task_runtime_context is not None and registered_task_extensions():
         try:
-            workspace = await asyncio.to_thread(
-                ToolFactory.create_workspace,
-                tool_config.get_workspace_config(),
-            )
-            tool_config.set_task_runtime_workspace(workspace)
             runtime_contribution = await build_task_runtime(
                 task_runtime_context.with_workspace(workspace)
             )
@@ -3051,7 +3057,7 @@ class AgentServiceManager:
                         scope=scope,
                     )
 
-                    # Create AgentService first (this creates the workspace)
+                    # Reuse the workspace prepared off the event-loop thread.
                     self._agents[task_id] = AgentService(
                         budget_policy_provider=budget_policy_provider(
                             user_id=int(runtime_user.id),
@@ -3082,6 +3088,11 @@ class AgentServiceManager:
                         memory_availability_reason=memory_policy.public_availability_reason,
                         execution_metadata=memory_policy.execution_metadata(),
                         system_prompt=system_prompt,  # Pass agent builder instructions
+                        workspace=(
+                            tool_config.get_task_runtime_workspace()
+                            if tool_config is not None
+                            else None
+                        ),
                     )
                     try:
                         self._sweep_idle_runtimes(
@@ -4456,6 +4467,11 @@ class AgentServiceManager:
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
                     execution_metadata=memory_policy.execution_metadata(),
+                    workspace=(
+                        tool_config.get_task_runtime_workspace()
+                        if tool_config is not None
+                        else None
+                    ),
                 )
             try:
                 self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)

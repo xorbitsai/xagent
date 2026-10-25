@@ -4643,3 +4643,94 @@ def test_trigger_run_history_tells_an_expired_conversation_from_a_deleted_one() 
     assert detail.status_code == 200, detail.text
     assert detail.json()["status"] == "completed"
     assert detail.json()["task_expired_at"] == expired["task_expired_at"]
+
+
+# --- planned-restart hold (release_hold) -------------------------------------
+
+
+@pytest.fixture
+def held(monkeypatch):
+    from .release_hold_helpers import install_private_hold
+
+    hold = install_private_hold(monkeypatch)
+    hold.close("release r1")
+    return hold
+
+
+def test_held_trigger_test_route_defers_durably(mock_bg_scheduler, held) -> None:
+    from .release_hold_helpers import assert_deferred_then_started
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    trigger_id = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "t", "prompt_template": "Handle {{payload}}"},
+    ).json()["id"]
+    fired = client.post(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+        headers=headers,
+        json={"payload": {"subject": "hello"}},
+    )
+    assert fired.status_code == 200, fired.text
+    run = fired.json()["trigger_run"]
+    assert run["status"] == TriggerRunStatus.PENDING.value
+    assert held.snapshot()["refused"] == {"trigger_run": 1}
+    assert_deferred_then_started(mock_bg_scheduler, held, run["id"])
+
+
+def test_held_provider_callback_defers_durably(mock_bg_scheduler, held) -> None:
+    from .release_hold_helpers import assert_deferred_then_started
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    body = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Public webhook"},
+    ).json()
+    raw = b'{"subject": "hello"}'
+    accepted = client.post(
+        f"/api/triggers/callback/webhook/{body['callback_id']}",
+        headers=_signed_webhook_headers(body["webhook_secret"], raw, event_id="e1"),
+        content=raw,
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["outcome"] == "accepted"
+    (run_id,) = accepted.json()["trigger_run_ids"]
+    assert_deferred_then_started(mock_bg_scheduler, held, run_id)
+
+
+def test_held_legacy_webhook_defers_durably(mock_bg_scheduler, held) -> None:
+    import bcrypt
+
+    from .release_hold_helpers import assert_deferred_then_started
+
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    trigger_id = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Legacy webhook"},
+    ).json()["id"]
+    db = _direct_db_session()
+    try:
+        trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+        trigger.webhook_token = "legacy-hold-token"
+        trigger.secret_hash = bcrypt.hashpw(b"s3", bcrypt.gensalt(rounds=4)).decode()
+        trigger.callback_id = None
+        trigger.secret_encrypted = None
+        trigger.provider = None
+        db.commit()
+    finally:
+        db.close()
+    accepted = client.post(
+        "/api/triggers/webhook/legacy-hold-token",
+        json={"subject": "hello"},
+        headers={"x-xagent-trigger-secret": "s3"},
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["status"] == TriggerRunStatus.PENDING.value
+    assert_deferred_then_started(
+        mock_bg_scheduler, held, accepted.json()["trigger_run_id"]
+    )

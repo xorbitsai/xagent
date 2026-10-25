@@ -88,6 +88,21 @@ def test_explicit_true_overrides_default_inference():
     assert service._tools_initialized is True
 
 
+def test_prepared_workspace_is_not_replaced_by_constructor_setup():
+    """A workspace prepared off-thread remains the service workspace."""
+
+    workspace = object()
+    service = AgentService(
+        name="test-service",
+        id="test-id",
+        tools=[],
+        workspace=workspace,
+        enable_workspace=True,
+    )
+
+    assert service.workspace is workspace
+
+
 def test_tools_list_is_copied_not_aliased():
     """The constructor materializes ``self.tools`` from the caller's
     list so mutating the caller-side list after construction can't

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from ..core.agent.checkpoint import (
@@ -19,7 +20,13 @@ from ..core.agent.trace import (
 )
 from ..core.tracing import create_agent_tracer
 from .models.user import User
-from .services.trace_handlers import DatabaseTraceHandler
+from .services.db_write_retry import (
+    is_retryable_database_error,
+    retry_db_write_async,
+)
+from .services.trace_handlers import CommitState, DatabaseTraceHandler
+
+logger = logging.getLogger(__name__)
 
 
 class EphemeralCheckpointTraceHandler(BaseTraceHandler):
@@ -167,9 +174,27 @@ class ExecutionEventTraceAdapter(DatabaseTraceHandler):
     async def commit_event(self, event: CoreTraceEvent) -> None:
         required = event.require_persisted
         event.require_persisted = True
+        # A retryable failure may have committed. Every attempt reruns the
+        # whole transaction for this same event, so its fact identity is
+        # unchanged and a committed first attempt replays instead of
+        # appending again. Backoff runs outside the trace runtime's slot.
+        commit_state = CommitState()
+
+        async def attempt() -> None:
+            commit_state.attempt += 1
+            await self._save_to_database(event, commit_state=commit_state)
+
         try:
-            await self._save_to_database(event)
+            await retry_db_write_async(attempt, site="trace_fact")
         except Exception as exc:
+            if is_retryable_database_error(exc):
+                # Its attempts were only warned about; report the write once.
+                logger.error(
+                    "Required trace event persistence failed for task %s after "
+                    "retries: %s",
+                    self.task_id,
+                    exc,
+                )
             raise ExecutionEventPersistenceError(
                 "Conversation event commit failed"
             ) from exc

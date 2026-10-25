@@ -81,7 +81,7 @@ async def test_create_default_tools_prefers_out_of_tree_computer_runtime(
     monkeypatch.setattr(
         ToolFactory,
         "create_workspace",
-        lambda _config: SimpleNamespace(id="workspace"),
+        lambda _config, **_kwargs: SimpleNamespace(id="workspace"),
     )
     monkeypatch.setattr(agent_runtime_service, "build_task_runtime", build_runtime)
     monkeypatch.setattr(

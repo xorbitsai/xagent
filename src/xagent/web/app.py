@@ -431,10 +431,25 @@ async def _run_trigger_dispatcher(
         finally:
             db.close()
 
+    from .services.release_hold import release_hold
+
     loop = asyncio.get_running_loop()
     next_gmail_watch_scan_at = 0.0
     next_preview_run_reap_at = 0.0
+    tick_paused = False
     while True:
+        # Trigger production pauses at the tick boundary while a planned
+        # restart holds new execution: a tick already past this point runs to
+        # its end (and is counted until then), a later one neither scans due
+        # schedules nor starts PENDING runs. Those stay PENDING for this
+        # process after an abort, or for its successor.
+        tick = None if release_hold.closed else release_hold.track("trigger_tick")
+        if (tick is None) != tick_paused:
+            tick_paused = tick is None
+            logger.info(
+                "Trigger dispatcher %s new runs",
+                "paused before starting" if tick_paused else "resumed starting",
+            )
         try:
             now = loop.time()
             if now >= next_gmail_watch_scan_at:
@@ -459,11 +474,12 @@ async def _run_trigger_dispatcher(
                         now + get_gmail_watch_renewal_interval_seconds()
                     )
 
-            processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
-            if processed:
-                logger.info(
-                    "Trigger dispatcher processed %s due schedule(s)", processed
-                )
+            if tick is not None:
+                processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
+                if processed:
+                    logger.info(
+                        "Trigger dispatcher processed %s due schedule(s)", processed
+                    )
 
             # Gated on its own, much coarser timer (matching the Gmail
             # watch-renewal gating above): the staleness threshold this
@@ -490,18 +506,24 @@ async def _run_trigger_dispatcher(
                         now + get_background_job_sweep_interval_seconds()
                     )
 
-            SessionLocal = get_session_local()
-            db = SessionLocal()
-            try:
-                started = await dispatch_pending_trigger_runs(db, limit=batch_size)
-                if started:
-                    logger.info("Trigger dispatcher started %s trigger run(s)", started)
-            finally:
-                db.close()
+            if tick is not None:
+                SessionLocal = get_session_local()
+                db = SessionLocal()
+                try:
+                    started = await dispatch_pending_trigger_runs(db, limit=batch_size)
+                    if started:
+                        logger.info(
+                            "Trigger dispatcher started %s trigger run(s)", started
+                        )
+                finally:
+                    db.close()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Trigger dispatcher tick failed: %s", exc, exc_info=True)
+        finally:
+            if tick is not None:
+                tick.release()
 
         await asyncio.sleep(poll_interval_seconds)
 

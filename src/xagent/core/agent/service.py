@@ -198,10 +198,10 @@ class AgentService:
         self.workspace = workspace
 
         if (
-            tool_config
+            self.workspace is None
+            and tool_config
             and hasattr(tool_config, "_workspace_config")
             and tool_config._workspace_config
-            and not workspace
         ):
             from ..workspace import WorkspaceManager
 
@@ -223,7 +223,7 @@ class AgentService:
             self.workspace.file_operation_access_version = ws_config.get(
                 FILE_OPERATION_ACCESS_VERSION_KEY
             )
-        elif self.enable_workspace:
+        elif self.workspace is None and self.enable_workspace:
             self._setup_workspace()
 
         if self.enable_default_tools and not self.tools and not self.tool_config:

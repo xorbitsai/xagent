@@ -483,7 +483,8 @@ class AgentRunner:
                     workspace_base = base_dir or self.workspace_base_dir
                     if context.workspace_path:
                         workspace_base = str(Path(context.workspace_path).parent)
-                    workspace = self.workspace_manager.get_or_create_workspace(
+                    workspace = await asyncio.to_thread(
+                        self.workspace_manager.get_or_create_workspace,
                         base_dir=workspace_base,
                         task_id=context.workspace_id or workspace_id or execution_id,
                         allowed_external_dirs=allowed_external_dirs,
@@ -1596,7 +1597,8 @@ class AgentRunner:
         workspace = None
         context_kwargs: dict[str, Any] = {}
         if self.workspace_enabled:
-            workspace = self.workspace_manager.get_or_create_workspace(
+            workspace = await asyncio.to_thread(
+                self.workspace_manager.get_or_create_workspace,
                 base_dir=base_dir or self.workspace_base_dir,
                 task_id=workspace_id or execution_id,
                 allowed_external_dirs=allowed_external_dirs,

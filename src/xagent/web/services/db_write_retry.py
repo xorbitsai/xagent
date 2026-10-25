@@ -154,6 +154,10 @@ async def retry_db_write_async(
         attempt += 1
         try:
             result = await operation()
+        except asyncio.CancelledError:
+            if attempt > 1:
+                _count(site, "failed")
+            raise
         except Exception as exc:
             task = asyncio.current_task()
             if (
@@ -165,7 +169,11 @@ async def retry_db_write_async(
                     _count(site, "failed")
                 raise
             _count(site, "retried")
-            await asyncio.sleep(policy.delay(attempt))
+            try:
+                await asyncio.sleep(policy.delay(attempt))
+            except asyncio.CancelledError:
+                _count(site, "failed")
+                raise
         else:
             if attempt > 1:
                 _count(site, "recovered")

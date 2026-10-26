@@ -845,14 +845,8 @@ const clearStaleAutoRecovery = (task: Task | null): Task | null => {
 const mergeTaskSnapshot = (current: Task, incoming: Task): Task => {
   const sameFence = current.runId === incoming.runId
     && current.stateVersion === incoming.stateVersion
-  const incomingHasAutoRecovery = Object.prototype.hasOwnProperty.call(
-    incoming,
-    "autoRecovery",
-  )
-  const incomingHasAutoResume = Object.prototype.hasOwnProperty.call(
-    incoming,
-    "autoResume",
-  )
+  const incomingHasAutoRecovery = hasOwn(incoming, "autoRecovery")
+  const incomingHasAutoResume = hasOwn(incoming, "autoResume")
   const merged: Task = {
     ...current,
     ...incoming,
@@ -867,10 +861,13 @@ const mergeTaskSnapshot = (current: Task, incoming: Task): Task => {
   }
 
   if (!incomingHasAutoRecovery) merged.autoRecovery = current.autoRecovery
-  if (!incomingHasAutoResume || incoming.autoResume === undefined) {
-    // An absent view, an overall null ``auto_recovery``, or a same-fence
-    // manual-only snapshot cannot prove a live notice is stale.
+  if (!incomingHasAutoResume) {
+    // An absent view or an overall null ``auto_recovery`` cannot prove a
+    // live notice is stale.
     merged.autoResume = current.autoResume
+  } else if (incoming.autoResume === undefined) {
+    // A present, fence-matching ``auto_resume: null`` is authoritative.
+    merged.autoResume = undefined
   } else {
     merged.autoResume = newerAutoResume(current.autoResume, incoming.autoResume)
   }
@@ -1102,15 +1099,18 @@ const taskFromTaskInfoData = (
     && recoveryRunId === runId
     && recoveryStateVersion === stateVersion
   )
-  const hasAutoResumeView = recoveryFenceMatchesTask
+  const hasAutoResumeField = recoveryFenceMatchesTask
     && hasOwn(autoRecoveryView, "auto_resume")
-  const autoResume = hasAutoResumeView
+  const autoResumeValue = autoRecoveryView.auto_resume
+  const autoResume = hasAutoResumeField
     ? parseAutoResumeAtFence(
-      autoRecoveryView.auto_resume,
+      autoResumeValue,
       recoveryRunId,
       recoveryStateVersion,
     )
     : undefined
+  const hasUsableAutoResumeView = hasAutoResumeField
+    && (autoResumeValue === null || autoResume !== undefined)
 
   return {
     id: String(taskId),
@@ -1144,13 +1144,9 @@ const taskFromTaskInfoData = (
     controlState: taskData.control_state as TaskControlState | undefined,
     // ``null`` means the read could not provide a recovery view, so it must
     // not erase a newer live notice. A non-null view is usable only at the
-    // task's current fence; legacy reason-only views remain displayable.
-    ...(autoRecovery && (
-      recoveryRunId === undefined
-      || recoveryStateVersion === undefined
-      || recoveryFenceMatchesTask
-    ) ? { autoRecovery } : {}),
-    ...(hasAutoResumeView ? { autoResume } : {}),
+    // task's current fence.
+    ...(autoRecovery && recoveryFenceMatchesTask ? { autoRecovery } : {}),
+    ...(hasUsableAutoResumeView ? { autoResume } : {}),
   }
 }
 
@@ -3748,22 +3744,24 @@ export function AppProvider({
     // skill_select_start) optimistically infer "the task is running" from the
     // fact that work is happening. During a history load those same events
     // are REPLAYED for work that already finished - letting them flip an
-    // authoritative terminal task back to "running" makes the page briefly
-    // believe a finished task is live again (clearing dagTerminatedAt,
-    // unfreezing the Progress panel's elapsed clock, and passing the panel's
-    // auto-open terminal gate) until the terminal event replays. A terminal
-    // task's status during history load comes from task_info/terminal
-    // events, never from inferred liveness. Keyed off the REF, not
+    // authoritative terminal or paused task back to "running" makes the page
+    // briefly believe historical work is live again. For a paused task this
+    // also clears its restored auto-resume notice before task_paused is
+    // reasserted. Their status during history load comes from task_info and
+    // explicit status events, never from inferred liveness. Keyed off the REF, not
     // state.isHistoryLoading: several handlers clear the state flag early
     // (to show live UI as soon as anything renders) while the ref stays true
     // until historical_data_complete actually arrives. Scoped to terminal
-    // tasks only, so a stuck ref (a backend that never sends
+    // and paused tasks only, so a stuck ref (a backend that never sends
     // historical_data_complete) can't permanently suppress liveness for a
-    // task that was never finished in the first place.
+    // task that was never finished or paused in the first place.
     const dispatchInferredRunningStatus = () => {
       if (
         isHistoricalDataLoadingRef.current
-        && isTerminalTaskStatus(currentState.currentTask?.status)
+        && (
+          isTerminalTaskStatus(currentState.currentTask?.status)
+          || currentState.currentTask?.status === "paused"
+        )
       ) return
       dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
       dispatch({ type: "SET_PROCESSING", payload: true })

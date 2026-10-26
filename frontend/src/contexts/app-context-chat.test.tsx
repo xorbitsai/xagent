@@ -3437,6 +3437,8 @@ describe("AppProvider websocket message routing", () => {
         auto_recovery: {
           reason: "lease_expired",
           interrupted_at: "2026-05-27T04:59:00+00:00",
+          run_id: "run-1",
+          state_version: 4,
         },
       }))
     })
@@ -3597,6 +3599,18 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(pausedInfo(null))
     })
     expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 2 })
+
+    // Unlike an unavailable whole recovery view, an explicit same-fence
+    // null ends the held notice.
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: null,
+      }))
+    })
+    expect(autoResume()).toBeNull()
   })
 
   it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {
@@ -3615,7 +3629,12 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(taskInfoMessage(1, {
         status: "paused",
         ...pausedState,
-        auto_recovery: { reason: "llm_unavailable", interrupted_at: "2026-05-27T04:59:00+00:00" },
+        auto_recovery: {
+          reason: "llm_unavailable",
+          interrupted_at: "2026-05-27T04:59:00+00:00",
+          run_id: "run-1",
+          state_version: 4,
+        },
       }))
     })
     await waitFor(() => {
@@ -3656,6 +3675,79 @@ describe("AppProvider websocket message routing", () => {
     expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
   })
 
+  it("keeps a restored auto-resume notice through replayed activity and the reasserted pause", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    const autoResume = () => JSON.parse(screen.getByTestId("task-auto-resume").textContent || "null")
+    const pausedState = { run_id: "run-1", state_version: 4, control_state: "paused" }
+
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+      onMessage?.(taskInfoMessage(1, {
+        status: "paused",
+        ...pausedState,
+        auto_recovery: {
+          reason: "llm_unavailable",
+          run_id: "run-1",
+          state_version: 4,
+          auto_resume: {
+            status: "scheduled",
+            stop_reason: null,
+            reason: "llm_unavailable",
+            attempt: 1,
+            next_attempt_at: "2026-05-27T05:00:15+00:00",
+          },
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        data: {
+          event_id: "replayed-dag-start",
+          event_type: "dag_execute_start",
+          data: { iteration: 1 },
+        },
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "history-done",
+          event_type: "historical_data_complete",
+          data: {},
+        },
+      })
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        status: "paused",
+        ...pausedState,
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+  })
+
   it("keeps the known interruption when task_info temporarily reports auto_recovery as null", async () => {
     render(
       <AppProvider token="token">
@@ -3674,7 +3766,11 @@ describe("AppProvider websocket message routing", () => {
     })
 
     act(() => {
-      onMessage?.(pausedInfo({ reason: "persistence_failure" }))
+      onMessage?.(pausedInfo({
+        reason: "persistence_failure",
+        run_id: "run-1",
+        state_version: 4,
+      }))
     })
     await waitFor(() => {
       expect(screen.getByTestId("task-auto-recovery").textContent).toContain("persistence_failure")

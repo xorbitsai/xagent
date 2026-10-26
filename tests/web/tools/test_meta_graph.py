@@ -137,6 +137,19 @@ def test_graph_request_rejects_data_and_json_body_together(monkeypatch):
     request.assert_not_called()
 
 
+def test_graph_request_rejects_files_and_json_body_together(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    request = Mock()
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    with pytest.raises(ValueError, match="either json_body or form/multipart data"):
+        meta_graph.graph_request(
+            "POST", "/x", json_body={"a": 1}, files={"source": object()}
+        )
+
+    request.assert_not_called()
+
+
 def test_graph_request_sends_multipart_without_content_type(monkeypatch):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     seen = {}

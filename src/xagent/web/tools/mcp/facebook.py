@@ -1,5 +1,6 @@
 import logging
-import mimetypes
+import os
+import stat
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -26,6 +27,16 @@ setup_proxy_env()
 mcp = FastMCP("facebook-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
 _UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS"
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_IMAGE_MEDIA_TYPES = {
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
 
 
 def _allowed_image_dirs() -> list[Path]:
@@ -36,31 +47,50 @@ def _allowed_image_dirs() -> list[Path]:
         raise ValueError("Upload directory configuration is invalid") from None
 
 
-def _resolve_allowed_image_path(image_path: str) -> tuple[Path, str]:
-    if not isinstance(image_path, str) or not image_path.strip():
+def _read_allowed_image(image_path: str) -> tuple[str, bytes, str]:
+    if not image_path.strip():
         raise ValueError("file_path must be a non-empty path")
 
     candidate = Path(image_path).expanduser()
     if not candidate.is_absolute():
         candidate = Path.cwd() / candidate
     try:
-        local_path = candidate.resolve(strict=True)
-    except (OSError, RuntimeError):
-        raise FileNotFoundError("Image file was not found") from None
-    if not local_path.is_file():
-        raise FileNotFoundError("Image file was not found")
-    if not any(
-        local_path == allowed_dir or local_path.is_relative_to(allowed_dir)
-        for allowed_dir in _allowed_image_dirs()
-    ):
-        raise PermissionError("Image file is outside the allowed directories")
-    if local_path.stat().st_size <= 0:
-        raise ValueError("Image file must not be empty")
+        local_path = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Could not resolve Facebook image path %r: %s", image_path, exc)
+        raise ValueError("Could not resolve file_path") from None
 
-    media_type = mimetypes.guess_type(local_path.name)[0]
-    if not media_type or not media_type.startswith("image/"):
-        raise ValueError("file_path must reference an image file")
-    return local_path, media_type
+    if not any(local_path.is_relative_to(root) for root in _allowed_image_dirs()):
+        logger.warning("Rejected Facebook image path outside allowed directories")
+        raise PermissionError("Image file is outside the allowed directories")
+
+    media_type = _IMAGE_MEDIA_TYPES.get(local_path.suffix.lower())
+    if media_type is None:
+        raise ValueError("file_path must reference a supported image file")
+
+    try:
+        with local_path.open("rb") as image_file:
+            file_stat = os.fstat(image_file.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("The given path is not a regular file")
+            if file_stat.st_size == 0:
+                raise ValueError("Image file must not be empty")
+            if file_stat.st_size > _MAX_IMAGE_BYTES:
+                raise ValueError(
+                    "Image file exceeds the local upload limit of "
+                    f"{_MAX_IMAGE_BYTES} bytes"
+                )
+            content = image_file.read(file_stat.st_size)
+    except FileNotFoundError:
+        raise FileNotFoundError("Image file was not found") from None
+    except IsADirectoryError:
+        raise ValueError("The given path is not a regular file") from None
+    except OSError as exc:
+        logger.warning("Could not read Facebook image file: %s", exc)
+        raise ValueError("Could not read the image file") from None
+    if len(content) != file_stat.st_size:
+        raise ValueError("Image file changed while it was being read")
+    return local_path.name, content, media_type
 
 
 def _graph_path(value: Any, name: str, suffix: str) -> str:
@@ -276,9 +306,8 @@ def facebook_publish_image_post(
 ) -> str:
     """Publish an image post from a public URL or a workspace image file.
 
-    Provide exactly one of image_url and file_path. A registered workspace
-    file_id (or file:<id>) may be supplied for file_path; the host stages it
-    into the current task workspace before this connector runs.
+    Provide exactly one of image_url and file_path. file_path must be an
+    absolute path inside the current task workspace.
     """
     try:
         url_value = (
@@ -293,7 +322,7 @@ def facebook_publish_image_post(
             raise ValueError("Provide exactly one of image_url or file_path")
         if url_value is not None and not _is_public_image_url(url_value):
             raise ValueError("image_url must be a public http or https URL")
-        local_image = _resolve_allowed_image_path(file_value) if file_value else None
+        local_image = _read_allowed_image(file_value) if file_value else None
 
         page_token = _page_access_token(page_id)
         data: dict[str, Any] = {
@@ -308,15 +337,14 @@ def facebook_publish_image_post(
             result = _graph_request("POST", path, token=page_token, data=data)
         else:
             assert local_image is not None
-            local_path, media_type = local_image
-            with local_path.open("rb") as image_file:
-                result = _graph_request(
-                    "POST",
-                    path,
-                    token=page_token,
-                    data=data,
-                    files={"source": (local_path.name, image_file, media_type)},
-                )
+            filename, content, media_type = local_image
+            result = _graph_request(
+                "POST",
+                path,
+                token=page_token,
+                data=data,
+                files={"source": (filename, content, media_type)},
+            )
         return _success(photo_id=result.get("id"), post_id=result.get("post_id"))
     except GraphAPIError as e:
         logger.error("Error publishing Facebook Page image post for %s: %s", page_id, e)

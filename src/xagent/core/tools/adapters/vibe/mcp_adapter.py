@@ -471,6 +471,7 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("google-drive", "google_drive_update_file_content"): ("file_path",),
     ("slack", "slack_upload_file"): ("file_path",),
     ("jira", "jira_add_attachment"): ("file_path",),
+    ("facebook-pages", "facebook_publish_image_post"): ("file_path",),
 }
 
 # Tools above whose own ``file_id`` argument names something other than a

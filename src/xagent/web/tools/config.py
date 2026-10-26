@@ -3930,6 +3930,7 @@ class WebToolConfig(BaseToolConfig):
                 # parser also accepts the legacy comma-delimited form for
                 # manually configured standalone deployments.
                 allowed_file_dirs = json.dumps(allowed_file_dir_paths)
+                env["XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_SLACK_FILE_ALLOWED_DIRS"] = allowed_file_dirs
                 env["XAGENT_GMAIL_FILE_ALLOWED_DIRS"] = allowed_file_dirs

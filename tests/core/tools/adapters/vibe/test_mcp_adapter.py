@@ -518,6 +518,7 @@ def test_build_mcp_tool_adapter_marks_all_tools_safe_when_server_opts_in():
         ("Google Drive", "google_drive_update_file_content", "file_path"),
         ("Slack", "slack_upload_file", "file_path"),
         ("Jira", "jira_add_attachment", "file_path"),
+        ("Facebook Pages", "facebook_publish_image_post", "file_path"),
     ],
 )
 def test_durable_upload_mapping_covers_builtin_connectors(

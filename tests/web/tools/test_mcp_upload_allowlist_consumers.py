@@ -8,6 +8,7 @@ import pytest
 @pytest.mark.parametrize(
     "module_name, helper_name, env_var",
     [
+        ("facebook", "_allowed_image_dirs", "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS"),
         ("gmail", "_allowed_file_dirs", "XAGENT_GMAIL_FILE_ALLOWED_DIRS"),
         ("slack", "_allowed_file_dirs", "XAGENT_SLACK_FILE_ALLOWED_DIRS"),
         ("linkedin", "_allowed_image_dirs", "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"),
@@ -40,6 +41,7 @@ def test_connectors_delegate_configured_upload_roots_to_shared_parser(
 @pytest.mark.parametrize(
     "module_name, helper_name, env_var",
     [
+        ("facebook", "_allowed_image_dirs", "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS"),
         ("gmail", "_allowed_file_dirs", "XAGENT_GMAIL_FILE_ALLOWED_DIRS"),
         ("slack", "_allowed_file_dirs", "XAGENT_SLACK_FILE_ALLOWED_DIRS"),
         ("linkedin", "_allowed_image_dirs", "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"),

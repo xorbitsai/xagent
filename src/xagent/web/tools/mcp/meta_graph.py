@@ -108,6 +108,7 @@ def graph_request(
     params: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
+    files: dict[str, Any] | None = None,
 ) -> Any:
     """Issue a Graph API request and return the decoded JSON body.
 
@@ -115,16 +116,20 @@ def graph_request(
     take). ``json_body`` is sent as an ``application/json`` body instead --
     the WhatsApp Cloud API's ``/{phone_number_id}/messages`` endpoint takes
     nested objects (``template.components``, ``text.body``) that
-    form-encoding can't express. The two are mutually exclusive, and only
-    whichever one is actually given is passed on to ``requests`` -- not
-    relying on ``requests``' own ``if not data and json is not None``
-    precedence rule to sort out an unused one.
+    form-encoding can't express. ``files`` enables multipart uploads and may
+    accompany ``data``; requests must generate that body's boundary, so this
+    helper deliberately omits an explicit Content-Type for multipart calls.
+    JSON cannot be combined with either form data or files.
     """
-    if data is not None and json_body is not None:
-        raise ValueError("graph_request takes either data or json_body, not both")
+    if json_body is not None and (data is not None or files is not None):
+        raise ValueError(
+            "graph_request takes either json_body or form/multipart data, not both"
+        )
     request_token = token or user_token()
     if json_body is not None:
         content_type = "application/json"
+    elif files is not None:
+        content_type = None
     elif method.upper() != "GET":
         content_type = "application/x-www-form-urlencoded"
     else:
@@ -134,6 +139,8 @@ def graph_request(
         body_kwargs["data"] = data
     if json_body is not None:
         body_kwargs["json"] = json_body
+    if files is not None:
+        body_kwargs["files"] = files
     response = requests.request(
         method=method,
         url=f"{GRAPH_BASE_URL}{path}",

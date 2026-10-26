@@ -3296,6 +3296,12 @@ describe("AppProvider websocket message routing", () => {
 
     update(7, { status: "stopped", stop_reason: "limit_reached" })
     expect(autoResume()).toMatchObject({ status: "stopped", stopReason: "limit_reached" })
+    // A terminal phase wins over late non-terminal phases from the same
+    // attempt, including a legacy notice with no comparable attempt number.
+    update(7, { status: "scheduled" })
+    update(7, { status: "resuming" })
+    update(7, { status: "scheduled", attempt: undefined })
+    expect(autoResume()).toMatchObject({ status: "stopped", stopReason: "limit_reached" })
 
     // A new pause at a later fence starts without a notice.
     act(() => {
@@ -3611,6 +3617,65 @@ describe("AppProvider websocket message routing", () => {
       }))
     })
     expect(autoResume()).toBeNull()
+
+    // The null view is terminal for this fence, so a delayed notice cannot
+    // resurrect it. Moving to a newer fence releases the marker.
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:19Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: { auto_resume: { status: "resuming", attempt: 3 } },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toBeNull()
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:20Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        data: { auto_resume: { status: "scheduled", attempt: 1 } },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 5 })
+  })
+
+  it("merges a same-task session adoption without regressing its recovery notice", () => {
+    const task = {
+      id: "1",
+      title: "Test task",
+      status: "paused" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      runId: "run-1",
+      stateVersion: 4,
+      autoResume: {
+        status: "resuming" as const,
+        attempt: 1,
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    let state = projectAppState(createInitialState(), {
+      type: "SET_CURRENT_TASK",
+      payload: task,
+    })
+    state = projectAppState(state, {
+      type: "ADOPT_SESSION_TASK",
+      payload: {
+        taskId: 1,
+        task: {
+          ...task,
+          autoResume: { ...task.autoResume, status: "scheduled" },
+        },
+      },
+    })
+    expect(state.currentTask?.autoResume).toMatchObject({ status: "resuming", attempt: 1 })
   })
 
   it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {

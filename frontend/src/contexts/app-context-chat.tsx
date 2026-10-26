@@ -832,14 +832,24 @@ const autoResumeAtFence = (task: Task): TaskAutoResume | undefined =>
     ? task.autoResume
     : undefined
 
+const autoResumeEndedAtFence = (task: Task): Task["autoResumeEndedAt"] =>
+  task.status === "paused"
+  && task.autoResumeEndedAt?.stateVersion === task.stateVersion
+  && task.autoResumeEndedAt?.runId === task.runId
+    ? task.autoResumeEndedAt
+    : undefined
+
 // A task's interruption only describes it while it rests paused.
 const clearStaleAutoRecovery = (task: Task | null): Task | null => {
   if (!task) return task
   const autoRecovery = task.status === "paused" ? task.autoRecovery : undefined
   const autoResume = autoResumeAtFence(task)
-  return autoRecovery === task.autoRecovery && autoResume === task.autoResume
+  const autoResumeEndedAt = autoResumeEndedAtFence(task)
+  return autoRecovery === task.autoRecovery
+    && autoResume === task.autoResume
+    && autoResumeEndedAt === task.autoResumeEndedAt
     ? task
-    : { ...task, autoRecovery, autoResume }
+    : { ...task, autoRecovery, autoResume, autoResumeEndedAt }
 }
 
 const mergeTaskSnapshot = (current: Task, incoming: Task): Task => {
@@ -847,6 +857,7 @@ const mergeTaskSnapshot = (current: Task, incoming: Task): Task => {
     && current.stateVersion === incoming.stateVersion
   const incomingHasAutoRecovery = hasOwn(incoming, "autoRecovery")
   const incomingHasAutoResume = hasOwn(incoming, "autoResume")
+  const incomingHasAutoResumeEndedAt = hasOwn(incoming, "autoResumeEndedAt")
   const merged: Task = {
     ...current,
     ...incoming,
@@ -857,11 +868,16 @@ const mergeTaskSnapshot = (current: Task, incoming: Task): Task => {
   if (!sameFence) {
     if (!incomingHasAutoRecovery) merged.autoRecovery = undefined
     if (!incomingHasAutoResume) merged.autoResume = undefined
+    if (!incomingHasAutoResumeEndedAt) merged.autoResumeEndedAt = undefined
     return merged
   }
 
   if (!incomingHasAutoRecovery) merged.autoRecovery = current.autoRecovery
-  if (!incomingHasAutoResume) {
+  const endedAt = incoming.autoResumeEndedAt ?? current.autoResumeEndedAt
+  if (endedAt) {
+    merged.autoResume = undefined
+    merged.autoResumeEndedAt = endedAt
+  } else if (!incomingHasAutoResume) {
     // An absent view or an overall null ``auto_recovery`` cannot prove a
     // live notice is stale.
     merged.autoResume = current.autoResume
@@ -906,6 +922,9 @@ export interface Task {
   controlState?: TaskControlState
   autoRecovery?: TaskAutoRecovery
   autoResume?: TaskAutoResume
+  // A fence-matching ``auto_resume: null`` is terminal for that fence. Keep
+  // this marker so delayed same-fence events cannot resurrect the notice.
+  autoResumeEndedAt?: { runId: string; stateVersion: number }
   // Frontend-only, distinct from updatedAt: stamped once by UPDATE_TASK_STATUS
   // when this run actually terminates (completed/failed), cleared when it
   // starts running again, and deliberately preserved across SET_CURRENT_TASK
@@ -970,7 +989,7 @@ type SessionTaskBinding =
   | { present: true; valid: true; taskId: number }
 
 const hasOwn = (
-  record: Record<string, unknown>,
+  record: object,
   key: string,
 ): boolean => Object.prototype.hasOwnProperty.call(record, key)
 
@@ -1101,16 +1120,19 @@ const taskFromTaskInfoData = (
   )
   const hasAutoResumeField = recoveryFenceMatchesTask
     && hasOwn(autoRecoveryView, "auto_resume")
-  const autoResumeValue = autoRecoveryView.auto_resume
   const autoResume = hasAutoResumeField
     ? parseAutoResumeAtFence(
-      autoResumeValue,
+      autoRecoveryView.auto_resume,
       recoveryRunId,
       recoveryStateVersion,
     )
     : undefined
-  const hasUsableAutoResumeView = hasAutoResumeField
-    && (autoResumeValue === null || autoResume !== undefined)
+  const autoResumeEndedAt = hasAutoResumeField
+    && autoRecoveryView.auto_resume === null
+    && typeof recoveryRunId === "string"
+    && recoveryStateVersion !== undefined
+    ? { runId: recoveryRunId, stateVersion: recoveryStateVersion }
+    : undefined
 
   return {
     id: String(taskId),
@@ -1142,11 +1164,14 @@ const taskFromTaskInfoData = (
     runId,
     stateVersion,
     controlState: taskData.control_state as TaskControlState | undefined,
-    // ``null`` means the read could not provide a recovery view, so it must
-    // not erase a newer live notice. A non-null view is usable only at the
-    // task's current fence.
+    // A whole ``null`` says nothing about recovery at this fence (failed
+    // read, no row, fence mismatch, or not paused), so keep what is held
+    // until the fence changes. A non-null view is usable only at that fence.
     ...(autoRecovery && recoveryFenceMatchesTask ? { autoRecovery } : {}),
-    ...(hasUsableAutoResumeView ? { autoResume } : {}),
+    ...(hasAutoResumeField && (autoRecoveryView.auto_resume === null || autoResume)
+      ? { autoResume }
+      : {}),
+    ...(autoResumeEndedAt ? { autoResumeEndedAt } : {}),
   }
 }
 
@@ -2066,6 +2091,12 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
             runId: action.payload.runId ?? state.currentTask.runId,
             stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
           }),
+          autoResumeEndedAt: autoResumeEndedAtFence({
+            ...state.currentTask,
+            status: nextStatus,
+            runId: action.payload.runId ?? state.currentTask.runId,
+            stateVersion: action.payload.stateVersion ?? state.currentTask.stateVersion,
+          }),
         },
       }
     }
@@ -2076,23 +2107,15 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
       if (!task || task.id !== String(taskId)) return state
       // The task's own version, else the last one a versioned event set.
       const known = task.stateVersion ?? knownVersion
-      if (known === undefined) {
+      if (
+        task.autoResumeEndedAt?.runId === notice.runId
+        && task.autoResumeEndedAt.stateVersion === notice.stateVersion
+      ) return state
+      if (known !== undefined && notice.stateVersion < known) return state
+      if (known === undefined || notice.stateVersion === known) {
         // Nothing to order it against: only annotate a pause already shown,
-        // never move a running or finished task.
-        if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
-          return state
-        }
-        return {
-          ...state,
-          currentTask: {
-            ...task,
-            autoResume: newerAutoResume(task.autoResume, notice),
-          },
-        }
-      }
-      if (notice.stateVersion < known) return state
-      if (notice.stateVersion === known) {
-        // Same fence: annotate the pause the client already shows.
+        // never move a running or finished task. At the known version this
+        // is the same fence and follows the same rule.
         if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
           return state
         }

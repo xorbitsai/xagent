@@ -69,6 +69,7 @@ class AgentExecutionConfig:
     preferred_input_modalities: tuple[str, ...] = ()
     execution_metadata: dict[str, Any] = field(default_factory=dict)
     budget_policy_provider: BudgetPolicyProvider | None = None
+    mcp_approval_resolution: Any | None = None
 
 
 class AgentExecutionAdapter:
@@ -195,6 +196,9 @@ class AgentExecutionAdapter:
             # AgentService may have rebuilt the tool objects after a connection
             # or policy change. A paused runner still holds the previous list.
             handle.runner.agent.tools = self.config.tools
+            handle.runner.agent.mcp_approval_resolution = (
+                self.config.mcp_approval_resolution
+            )
             handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
@@ -306,6 +310,7 @@ class AgentExecutionAdapter:
             allowed_skills=(
                 self.config.allowed_skills if self.config.skills_enabled else None
             ),
+            mcp_approval_resolution=self.config.mcp_approval_resolution,
         )
         return (
             AgentRunner(

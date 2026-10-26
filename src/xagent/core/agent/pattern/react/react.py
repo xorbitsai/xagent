@@ -90,8 +90,12 @@ from ....tools.adapters.vibe.interaction_types import (
     lacks_required_options,
 )
 from ....tools.adapters.vibe.mcp_approval_gate import (
+    MCPApprovalGateResolution,
+    MCPApprovalGateTemporarilyUnavailable,
     ToolCallExecutionContext,
+    _gated_interaction_source,
     bind_tool_call_execution_context,
+    is_gate_issued_interaction_id,
 )
 from ....tools.tool_result_spill import (
     SPILL_READ_TOOL_NAME,
@@ -915,6 +919,7 @@ class ReActPattern(AgentPattern):
                 tools=context_tools,
                 context=context,
                 runtime=runtime,
+                mcp_approval_resolution=kwargs.get("mcp_approval_resolution"),
             )
             await self._replay_unemitted_settlement_traces(runtime=runtime)
             result = await self._run_tool_calling_loop(
@@ -3119,7 +3124,12 @@ class ReActPattern(AgentPattern):
                 tool = self._find_tool(tool_name, tools)
             except ValueError:
                 continue
-            if user_interaction_resume_callable(tool) is None:
+            interaction_id = str(
+                request.get("interaction_id") or request.get("tool_call_id") or ""
+            )
+            if user_interaction_resume_callable(
+                tool
+            ) is None and not is_gate_issued_interaction_id(interaction_id):
                 # Callback-less tools resume through the normal ReAct replan. The
                 # user's answer remains in context with waiting-response metadata.
                 continue
@@ -3129,9 +3139,7 @@ class ReActPattern(AgentPattern):
                 "invocation_id": self._normalized_invocation_id(
                     request.get("invocation_id")
                 ),
-                "interaction_id": str(
-                    request.get("interaction_id") or request.get("tool_call_id") or ""
-                ),
+                "interaction_id": interaction_id,
                 "response": response,
             }
             self.pending_tool_interaction_responses.append(queued)
@@ -3142,6 +3150,7 @@ class ReActPattern(AgentPattern):
         tools: list[Any],
         context: Any,
         runtime: PatternRuntime,
+        mcp_approval_resolution: MCPApprovalGateResolution | None = None,
     ) -> None:
         """Deliver checkpointed replies to their exact suspended interactions.
 
@@ -3167,17 +3176,45 @@ class ReActPattern(AgentPattern):
             resume = (
                 user_interaction_resume_callable(tool) if tool is not None else None
             )
+            policy_retirement_reason: str | None = None
+            policy_settlement: ToolInteractionSettlement | None = None
             if resume is None:
-                # Legacy checkpoints may contain callback delivery for a tool that
-                # no longer exists or never implemented the optional capability.
-                # The annotated user message is sufficient for the model to replan.
-                await self._skip_pending_tool_interaction_response(
-                    pending=pending,
-                    context=context,
-                    runtime=runtime,
-                    reason="resume_callback_unavailable",
-                )
-                continue
+                if is_gate_issued_interaction_id(
+                    str(pending.get("interaction_id") or "")
+                ):
+                    policy_retirement_reason = (
+                        self._gate_interaction_policy_retirement_reason(
+                            mcp_approval_resolution,
+                            interaction_id=str(pending.get("interaction_id") or ""),
+                        )
+                    )
+                    if policy_retirement_reason is None:
+                        # A supported UNKNOWN rebuild may expose the raw tool
+                        # while no live matcher can identify fresh protected
+                        # calls. Retain the earlier gate-issued response until
+                        # trusted authority recovers.
+                        raise MCPApprovalGateTemporarilyUnavailable(
+                            "MCP approval authority is temporarily unavailable"
+                        )
+                    policy_settlement = ToolInteractionSettlement.rejected(
+                        error=(
+                            "The pending tool call was not dispatched because "
+                            "the current approval policy no longer authorizes "
+                            "this suspended interaction."
+                        )
+                    )
+                else:
+                    # Legacy checkpoints may contain callback delivery for a
+                    # tool that no longer exists or never implemented the
+                    # optional capability. The annotated user message is
+                    # sufficient for the model to replan.
+                    await self._skip_pending_tool_interaction_response(
+                        pending=pending,
+                        context=context,
+                        runtime=runtime,
+                        reason="resume_callback_unavailable",
+                    )
+                    continue
 
             try:
                 record = self._validate_tool_interaction_settlement_target(
@@ -3207,41 +3244,45 @@ class ReActPattern(AgentPattern):
             # The resumed call re-enters the same execution slot that issued
             # it, so the MCP approval gate sees the original identity (source,
             # turn, ReAct step) instead of inventing a new one.
-            resume_call = {
-                "id": str(pending.get("tool_call_id") or ""),
-                "invocation_id": record.invocation_id,
-                "name": tool_name,
-                "turn_id": record.turn_id,
-                "step_id": record.step_id,
-            }
-            with bind_tool_call_execution_context(
-                self._mcp_gate_execution_context(resume_call, context, runtime)
-            ):
-                resumed = resume(
-                    interaction_id=pending.get("interaction_id", ""),
-                    response=pending.get("response", ""),
-                )
-                if inspect.isawaitable(resumed):
-                    resumed = await resumed
-            if resumed is not None and not isinstance(
-                resumed, ToolInteractionSettlement
-            ):
-                logger.error(
-                    "resume_user_interaction must return "
-                    "ToolInteractionSettlement or None; treating the outcome as "
-                    "dispatch_unknown. tool=%r interaction_id=%r",
-                    tool_name,
-                    pending.get("interaction_id", ""),
-                )
-                resumed = ToolInteractionSettlement.dispatch_unknown(
-                    error=(
-                        "The resume callback returned an invalid settlement. The "
-                        "external outcome is unknown and automatic retry is disabled."
+            settlement = policy_settlement
+            if settlement is None:
+                if resume is None:  # pragma: no cover - guarded above
+                    raise AssertionError("resumable interaction lost its callback")
+                resume_call = {
+                    "id": str(pending.get("tool_call_id") or ""),
+                    "invocation_id": record.invocation_id,
+                    "name": tool_name,
+                    "turn_id": record.turn_id,
+                    "step_id": record.step_id,
+                }
+                with bind_tool_call_execution_context(
+                    self._mcp_gate_execution_context(resume_call, context, runtime)
+                ):
+                    resumed = resume(
+                        interaction_id=pending.get("interaction_id", ""),
+                        response=pending.get("response", ""),
                     )
+                    if inspect.isawaitable(resumed):
+                        resumed = await resumed
+                if resumed is not None and not isinstance(
+                    resumed, ToolInteractionSettlement
+                ):
+                    logger.error(
+                        "resume_user_interaction must return "
+                        "ToolInteractionSettlement or None; treating the outcome as "
+                        "dispatch_unknown. tool=%r interaction_id=%r",
+                        tool_name,
+                        pending.get("interaction_id", ""),
+                    )
+                    resumed = ToolInteractionSettlement.dispatch_unknown(
+                        error=(
+                            "The resume callback returned an invalid settlement. The "
+                            "external outcome is unknown and automatic retry is disabled."
+                        )
+                    )
+                settlement = (
+                    resumed if isinstance(resumed, ToolInteractionSettlement) else None
                 )
-            settlement = (
-                resumed if isinstance(resumed, ToolInteractionSettlement) else None
-            )
 
             popped = False
             try:
@@ -3271,6 +3312,7 @@ class ReActPattern(AgentPattern):
                         "settlement_status": (
                             settlement.status if settlement is not None else None
                         ),
+                        "reason": policy_retirement_reason,
                     },
                 )
             except BaseException:
@@ -3298,6 +3340,31 @@ class ReActPattern(AgentPattern):
                     error=settled_record.error,
                     runtime=runtime,
                 )
+
+    @staticmethod
+    def _gate_interaction_policy_retirement_reason(
+        resolution: MCPApprovalGateResolution | None,
+        *,
+        interaction_id: str,
+    ) -> str | None:
+        """Return why a gate-issued interaction is definitively obsolete.
+
+        No resolution preserves the legacy recovery path. UNKNOWN is likewise
+        retryable. Under OFF the task no longer uses approval; under ON, a raw
+        current tool is authoritative evidence that the live scope does not
+        cover this tool (selected tools carry the resume callback wrapper).
+        """
+
+        if not isinstance(resolution, MCPApprovalGateResolution):
+            return None
+        issued = _gated_interaction_source(interaction_id)
+        if issued is None or issued[0] != resolution.task_source:
+            return None
+        if resolution.state == "off":
+            return "approval_policy_disabled"
+        if resolution.state == "on":
+            return "approval_scope_no_longer_matches"
+        return None
 
     async def _abandon_invalid_settlement_target(
         self,

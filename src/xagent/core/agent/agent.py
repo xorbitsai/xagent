@@ -31,6 +31,10 @@ class Agent:
     memory_similarity_threshold: float | None = None
     skill_manager: "SkillManager | None" = None
     allowed_skills: list[str] | None = None
+    # Trusted current policy supplied by AgentService. It is deliberately not
+    # restored from checkpoints or request metadata: a resumed run must use
+    # the policy resolved for this execution attempt.
+    mcp_approval_resolution: Any | None = None
     created_at: datetime = field(default_factory=_utcnow)
 
     def get_runner(self, **kwargs: Any) -> "AgentRunner":

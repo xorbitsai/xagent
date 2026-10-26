@@ -7,6 +7,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import replace
 from threading import Event as ThreadEvent
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,10 +15,14 @@ from pydantic import BaseModel
 
 from xagent.core.tools.adapters.vibe import mcp_approval_gate as approval_gate_module
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool, ToolMetadata
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.core.tools.adapters.vibe.interaction_types import TYPES_REQUIRING_OPTIONS
 from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     GatedCall,
     GateDecision,
+    MCPApprovalGateResolution,
+    MCPApprovalGateScope,
+    MCPApprovalGateTemporarilyUnavailable,
     MCPApprovalReplayExecutor,
     ToolCallExecutionContext,
     _gated_interaction_id,
@@ -25,6 +30,8 @@ from xagent.core.tools.adapters.vibe.mcp_approval_gate import (
     bind_tool_call_execution_context,
     current_mcp_approval_replay_context,
     gate_mcp_tools,
+    mcp_approval_gate_registration_generation,
+    mcp_approval_gate_scope,
     register_mcp_approval_gate,
     unregister_mcp_approval_gate,
 )
@@ -118,6 +125,358 @@ async def _unused_resume(**_: Any) -> None:
     raise AssertionError("resume hook should not run")
 
 
+def _register_scoped(
+    registrations: list[Any],
+    *,
+    gate: Any,
+    resume: Any = _unused_resume,
+    matcher: Any = lambda ref, name: (
+        ref == ConnectorRef("mcp", 41) and name == "create_post"
+    ),
+    classifier: Any = lambda _: True,
+) -> MCPApprovalGateScope:
+    handle = register_mcp_approval_gate(
+        task_source="external",
+        gate=gate,
+        resume=resume,
+        tool_matcher=matcher,
+        classifier=classifier,
+        timeout_seconds=1,
+    )
+    registrations.append(handle)
+    return mcp_approval_gate_scope(handle)
+
+
+def _mcp_target(*, raw_name: str, concurrency_safe: bool = True) -> _Target:
+    target = _Target(concurrency_safe=concurrency_safe)
+    target.mcp_tool = SimpleNamespace(name=raw_name)
+    return target
+
+
+def test_task_resolution_has_strict_states_and_stable_signature() -> None:
+    scope = MCPApprovalGateScope("external", "registration-1")
+
+    assert MCPApprovalGateResolution.on(scope).signature_identity == (
+        "on",
+        "external",
+        "registration-1",
+        None,
+    )
+    assert MCPApprovalGateResolution.off(task_source="external").signature_identity == (
+        "off",
+        "external",
+        None,
+        None,
+    )
+    unknown = MCPApprovalGateResolution.unknown(
+        task_source="external", reason="provider_unavailable"
+    )
+    assert unknown.signature_identity == (
+        "unknown",
+        "external",
+        None,
+        "provider_unavailable",
+    )
+    assert (
+        unknown.approval_scope
+        == approval_gate_module.mcp_approval_gate_rollback_fence(task_source="external")
+    )
+
+    with pytest.raises(ValueError, match="same-source scope"):
+        MCPApprovalGateResolution(
+            state="on",
+            task_source="external",
+            scope=MCPApprovalGateScope("other", "registration-1"),
+        )
+    with pytest.raises(ValueError, match="requires a non-empty trimmed reason"):
+        MCPApprovalGateResolution.unknown(task_source="external", reason="")
+
+
+def test_raw_name_lookup_never_invokes_dynamic_proxy_attributes() -> None:
+    class DynamicProxy:
+        def __getattr__(self, name: str) -> Any:
+            raise AssertionError(f"dynamic attribute probe: {name}")
+
+    assert approval_gate_module._raw_mcp_tool_name(DynamicProxy()) is None
+
+
+def test_explicit_off_preserves_raw_tool_and_metadata(
+    registrations: list[Any],
+) -> None:
+    _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+    )
+    target = _mcp_target(raw_name="create_post")
+
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.off(task_source="external"),
+    )
+
+    assert tool is target
+    assert tool.metadata is target.metadata
+
+
+@pytest.mark.asyncio
+async def test_scoped_matcher_uses_raw_name_and_non_target_passes_through(
+    registrations: list[Any],
+) -> None:
+    matcher_calls: list[tuple[ConnectorRef, str]] = []
+    classifier_calls: list[GatedCall] = []
+
+    def matcher(ref: ConnectorRef, raw_name: str) -> bool:
+        matcher_calls.append((ref, raw_name))
+        return raw_name == "create_post"
+
+    def classifier(call: GatedCall) -> bool:
+        classifier_calls.append(call)
+        return call.arguments["text"] == "publish"
+
+    scope = _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.require_approval("approval-1"),
+        matcher=matcher,
+        classifier=classifier,
+    )
+    write = _mcp_target(raw_name="create_post")
+    read = _mcp_target(raw_name="get_profile")
+    write_tool, read_tool = gate_mcp_tools(
+        [write, read],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.on(scope),
+    )
+
+    assert read_tool is read
+    with bind_tool_call_execution_context(
+        _context(task_source="external", pattern="dag")
+    ):
+        passthrough = await write_tool.run_json_async({"text": "read"})
+        refused = await write_tool.run_json_async({"text": "publish"})
+
+    assert passthrough["success"] is True
+    assert refused["status"] == "denied"
+    assert matcher_calls == [
+        (ConnectorRef("mcp", 41), "create_post"),
+        (ConnectorRef("mcp", 41), "get_profile"),
+    ]
+    assert [call.raw_tool_name for call in classifier_calls] == [
+        "create_post",
+        "create_post",
+    ]
+
+
+def test_scoped_non_target_ignores_unrelated_legacy_registration(
+    registrations: list[Any],
+) -> None:
+    scope = _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+        matcher=lambda _ref, raw_name: raw_name == "create_post",
+    )
+    _register(registrations, lambda _: None, _unused_resume)
+    target = _mcp_target(raw_name="get_profile", concurrency_safe=True)
+
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.on(scope),
+    )
+
+    assert tool is target
+    assert tool.metadata is target.metadata
+    assert tool.metadata.concurrency_safe is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_result", [0, None, "yes"])
+async def test_malformed_classifier_result_fails_closed_without_gate(
+    registrations: list[Any], bad_result: Any
+) -> None:
+    gate_calls: list[GatedCall] = []
+
+    async def gate(call: GatedCall) -> GateDecision:
+        gate_calls.append(call)
+        return GateDecision.allow()
+
+    scope = _register_scoped(
+        registrations,
+        gate=gate,
+        classifier=lambda _: bad_result,
+    )
+    target = _mcp_target(raw_name="create_post")
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_scope=scope,
+    )
+
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        result = await tool.run_json_async({"text": "publish"})
+
+    assert result == approval_gate_module._GATE_FAILURE
+    assert gate_calls == []
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_resolution_fences_only_live_matcher_targets(
+    registrations: list[Any],
+) -> None:
+    _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+        matcher=lambda _ref, raw_name: raw_name == "create_post",
+    )
+    write = _mcp_target(raw_name="create_post")
+    read = _mcp_target(raw_name="get_profile")
+    write_tool, read_tool = gate_mcp_tools(
+        [write, read],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.unknown(
+            task_source="external", reason="provider_timeout"
+        ),
+    )
+
+    assert read_tool is read
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        result = await write_tool.run_json_async({"text": "publish"})
+
+    assert result == approval_gate_module._GATE_FAILURE
+    assert write.calls == []
+
+
+def test_unknown_without_live_matcher_never_becomes_all_tools_refusal() -> None:
+    target = _mcp_target(raw_name="create_post")
+
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.unknown(
+            task_source="external", reason="registration_unavailable"
+        ),
+    )
+
+    assert tool is target
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority_kind", ["stale", "forged"])
+async def test_invalid_scope_uses_live_matcher_and_closes_only_target(
+    registrations: list[Any], authority_kind: str
+) -> None:
+    live_scope = _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+        matcher=lambda _ref, raw_name: raw_name == "create_post",
+    )
+    if authority_kind == "stale":
+        assert unregister_mcp_approval_gate(registrations.pop()) is True
+        stale_scope = live_scope
+        _register_scoped(
+            registrations,
+            gate=lambda _: GateDecision.allow(),
+            matcher=lambda _ref, raw_name: raw_name == "create_post",
+        )
+        invalid_scope = stale_scope
+    else:
+        invalid_scope = MCPApprovalGateScope("external", "forged-registration")
+    write = _mcp_target(raw_name="create_post")
+    read = _mcp_target(raw_name="get_profile")
+    write_tool, read_tool = gate_mcp_tools(
+        [write, read],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_scope=invalid_scope,
+    )
+
+    assert read_tool is read
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        result = await write_tool.run_json_async({"text": "publish"})
+
+    assert result == approval_gate_module._GATE_FAILURE
+    assert write.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stale_explicit_scope_without_live_matcher_fails_closed() -> None:
+    write = _mcp_target(raw_name="create_post")
+    read = _mcp_target(raw_name="get_profile")
+    tools = gate_mcp_tools(
+        [write, read],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_scope=MCPApprovalGateScope("external", "stale-registration"),
+    )
+
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        results = [await tool.run_json_async({"text": "publish"}) for tool in tools]
+
+    assert results == [approval_gate_module._GATE_FAILURE] * 2
+    assert write.calls == []
+    assert read.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approved_resume_waits_through_fence_then_recovers(
+    registrations: list[Any],
+) -> None:
+    approved = {"text": "approved"}
+
+    async def gate(_: GatedCall) -> GateDecision:
+        return GateDecision.require_approval("interaction-1")
+
+    async def resume(
+        *, executor: MCPApprovalReplayExecutor, **_: Any
+    ) -> ToolInteractionSettlement:
+        executor.acknowledge_dispatch()
+        return ToolInteractionSettlement.succeeded(await executor(approved))
+
+    scope = _register_scoped(registrations, gate=gate, resume=resume)
+    target = _mcp_target(raw_name="create_post")
+    (on_tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.on(scope),
+    )
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        paused = await on_tool.run_json_async(approved)
+
+    (fenced_tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.unknown(
+            task_source="external", reason="provider_timeout"
+        ),
+    )
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        with pytest.raises(MCPApprovalGateTemporarilyUnavailable):
+            await fenced_tool.resume_user_interaction(
+                interaction_id=paused["interaction_id"], response="approve"
+            )
+    assert target.calls == []
+
+    (recovered_tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_resolution=MCPApprovalGateResolution.on(scope),
+    )
+    with bind_tool_call_execution_context(_context(task_source="external")):
+        settlement = await recovered_tool.resume_user_interaction(
+            interaction_id=paused["interaction_id"], response="approve"
+        )
+
+    assert settlement is not None and settlement.status == "succeeded"
+    assert target.calls == [approved]
+
+
+def test_public_facade_exports_resolution_contract() -> None:
+    from xagent.mcp_approval_gate import MCPApprovalGateResolution as PublicResolution
+    from xagent.mcp_approval_gate import MCPApprovalGateScope as PublicScope
+
+    assert PublicResolution is MCPApprovalGateResolution
+    assert PublicScope is MCPApprovalGateScope
+
+
 @pytest.mark.asyncio
 async def test_no_matching_hook_preserves_legacy_execution() -> None:
     target = _Target()
@@ -127,6 +486,54 @@ async def test_no_matching_hook_preserves_legacy_execution() -> None:
 
     assert result["success"] is True
     assert target.calls == [{"text": "publish"}]
+
+
+@pytest.mark.asyncio
+async def test_unscoped_tool_observes_late_legacy_registration(
+    registrations: list[Any],
+) -> None:
+    _register_scoped(
+        registrations,
+        gate=lambda _: GateDecision.allow(),
+    )
+    target = _mcp_target(raw_name="create_post")
+    (tool,) = gate_mcp_tools([target], connector_ref=ConnectorRef("mcp", 41))
+
+    async def deny(_: GatedCall) -> GateDecision:
+        return GateDecision.deny(message="late legacy policy")
+
+    _register(registrations, deny, _unused_resume)
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result["status"] == "denied"
+    assert target.calls == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_path_preserves_approval_unsupported_capability(
+    registrations: list[Any],
+) -> None:
+    reached: list[GatedCall] = []
+
+    async def allow(call: GatedCall) -> GateDecision:
+        reached.append(call)
+        return GateDecision.allow()
+
+    _register(registrations, allow, _unused_resume)
+    target = _mcp_target(raw_name="create_post")
+    (tool,) = gate_mcp_tools(
+        [target],
+        connector_ref=ConnectorRef("mcp", 41),
+        approval_supported=False,
+    )
+
+    with bind_tool_call_execution_context(_context()):
+        result = await tool.run_json_async({"text": "must not publish"})
+
+    assert result == approval_gate_module._NESTED_APPROVAL_UNAVAILABLE
+    assert reached == []
+    assert target.calls == []
 
 
 @pytest.mark.asyncio
@@ -1558,6 +1965,23 @@ def test_unregister_refuses_a_stale_handle() -> None:
         assert unregister_mcp_approval_gate(handle) is False
     finally:
         assert unregister_mcp_approval_gate(replacement) is True
+
+
+def test_registration_generation_tracks_only_successful_source_changes() -> None:
+    source = "generation-test"
+    before = mcp_approval_gate_registration_generation(source)
+    handle = register_mcp_approval_gate(
+        task_source=source, gate=lambda _: None, resume=lambda **_: None
+    )
+    after_register = mcp_approval_gate_registration_generation(source)
+    assert after_register == before + 1
+
+    assert unregister_mcp_approval_gate(handle) is True
+    after_unregister = mcp_approval_gate_registration_generation(source)
+    assert after_unregister == after_register + 1
+
+    assert unregister_mcp_approval_gate(handle) is False
+    assert mcp_approval_gate_registration_generation(source) == after_unregister
 
 
 def test_execution_context_requires_a_tool_call_id() -> None:

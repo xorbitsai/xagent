@@ -128,6 +128,7 @@ class AgentService:
             if callable(handoff_factory_runtime):
                 handoff_factory_runtime()
         self.tool_config = tool_config
+        self._mcp_approval_resolution: Any | None = None
         self.tracer = tracer or Tracer()
         # Default infer: if the caller passed ``tools`` (even ``[]``) the
         # constructed AgentService already has its final tool list, so
@@ -680,6 +681,7 @@ class AgentService:
                 user_interaction_enabled=self.user_interaction_enabled,
                 preferred_input_modalities=self.preferred_input_modalities,
                 execution_metadata=dict(self.execution_metadata),
+                mcp_approval_resolution=self._mcp_approval_resolution,
             )
         )
 
@@ -883,6 +885,9 @@ class AgentService:
                     self._execution_adapter.config.preferred_input_modalities = (
                         self.preferred_input_modalities
                     )
+                    self._execution_adapter.config.mcp_approval_resolution = (
+                        self._mcp_approval_resolution
+                    )
                 self._tools_initialized = True
                 self._tool_policy_signature = policy_signature
             except ConnectorRuntimeError:
@@ -986,6 +991,22 @@ class AgentService:
         agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
         mcp_failure_policy = _get_conf("get_mcp_failure_policy")
         mcp_failure_policy_value = getattr(mcp_failure_policy, "value", None)
+        approval_resolution = _get_conf("get_mcp_approval_gate_resolution")
+        self._mcp_approval_resolution = approval_resolution
+        approval_resolution_identity = getattr(
+            approval_resolution, "signature_identity", None
+        )
+        approval_registration_generation = None
+        if getattr(approval_resolution, "state", None) in {"on", "unknown"}:
+            from ..tools.adapters.vibe.mcp_approval_gate import (
+                mcp_approval_gate_registration_generation,
+            )
+
+            approval_registration_generation = (
+                mcp_approval_gate_registration_generation(
+                    approval_resolution.task_source
+                )
+            )
 
         return (
             override_items,
@@ -999,6 +1020,8 @@ class AgentService:
             parent_tracer_identity,
             agent_call_stack_items,
             mcp_failure_policy_value,
+            approval_resolution_identity,
+            approval_registration_generation,
         )
 
     def _execution_type(self) -> str:

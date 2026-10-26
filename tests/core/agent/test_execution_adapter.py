@@ -1859,6 +1859,8 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
 ) -> None:
     old_tool = FakeTool()
     new_tool = FakeTool()
+    old_approval_resolution = object()
+    new_approval_resolution = object()
     llm = FakeLLM(
         [
             {
@@ -1882,6 +1884,7 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
             tools=[old_tool],
             tracer=TracerCheckpointStore(),
             skill_manager=NoSkillManager(),
+            mcp_approval_resolution=old_approval_resolution,
         )
     )
     waiting = await adapter.execute(task="Read data", task_id="refresh-tools-exec")
@@ -1889,6 +1892,7 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     handle = adapter.registry.get("refresh-tools-exec")
     assert handle is not None
     assert handle.runner.agent.tools == [old_tool]
+    assert handle.runner.agent.mcp_approval_resolution is old_approval_resolution
 
     await adapter.post_user_message(
         "refresh-tools-exec", "Connection settings updated.", request_interrupt=False
@@ -1896,6 +1900,7 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     # AgentService rebuilds its tools before resuming an existing runner.
     # The refreshed objects (including removals) must reach that runner too.
     adapter.config.tools = [] if remove_tool else [new_tool]
+    adapter.config.mcp_approval_resolution = new_approval_resolution
     # Even if the model repeats the old tool name, a removed tool must not run.
     llm.responses.append(
         {"tool_calls": [{"id": "call-noop", "name": "noop", "args": {}}]}
@@ -1911,6 +1916,7 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     assert old_tool.teardown_calls == ["refresh-tools-exec"]
     assert new_tool.calls == ([] if remove_tool else [{}])
     assert handle.runner.agent.tools == adapter.config.tools
+    assert handle.runner.agent.mcp_approval_resolution is new_approval_resolution
     resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
     assert ("noop" in resumed_names) is not remove_tool
 

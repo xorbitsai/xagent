@@ -1,54 +1,66 @@
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
+from xagent.web import models
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import external_media
 
 
-class _Query:
-    def __init__(self, record):
-        self.record = record
-
-    def filter(self, *conditions):
-        return self
-
-    def first(self):
-        return self.record
-
-
 class _DB:
-    def __init__(self, record):
-        self.record = record
+    """Small real SQLite session holder used by service-level tests."""
+
+    def __init__(self, record: UploadedFile):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        models.Base.metadata.create_all(bind=self.engine)
+        self.session = sessionmaker(bind=self.engine)()
+        self.record = self.session.merge(record)
+        self.session.commit()
 
     def query(self, model):
-        return _Query(self.record)
+        return self.session.query(model)
 
 
-def _record(file_id: str, *, mime_type: str = "image/png"):
-    return SimpleNamespace(
+def _record(
+    file_id: str,
+    *,
+    filename: str = "launch.png",
+    mime_type: str = "image/png",
+) -> UploadedFile:
+    return UploadedFile(
         file_id=file_id,
         user_id=7,
         task_id=11,
-        filename="launch.png",
+        filename=filename,
         mime_type=mime_type,
         storage_status="available",
         storage_path="/unused/launch.png",
         storage_key="users/7/launch.png",
         checksum="a" * 64,
+        file_size=1,
     )
 
 
 def test_issue_uses_direct_durable_url_when_available(monkeypatch):
     file_id = str(uuid4())
     record = _record(file_id)
+    monkeypatch.delenv("XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS", raising=False)
+    monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
     monkeypatch.setattr(
         external_media.ManagedFileRef,
         "signed_access_url",
-        lambda self,
-        **kwargs: "https://objects.example.test/launch.png?signature=secret",
+        lambda self, **kwargs: (
+            "https://objects.example.test/launch.png?signature=secret"
+        ),
     )
 
     issued = external_media.issue_external_media_url(
@@ -86,12 +98,11 @@ def test_issue_falls_back_to_public_ticket_url(monkeypatch):
     ticket = parse_qs(parsed.query)["ticket"][0]
     assert issued.direct_object_url is False
     assert parsed.path == f"/api/files/external-media/{file_id}"
-    assert (
-        external_media.redeem_external_media_ticket(
-            _DB(record), file_id=file_id, ticket=ticket
-        )
-        is record
+    redeemed = external_media.redeem_external_media_ticket(
+        _DB(record), file_id=file_id, ticket=ticket
     )
+    assert redeemed.record.file_id == record.file_id
+    assert redeemed.media_type == "image/png"
 
 
 def test_issue_requires_public_base_for_local_storage(monkeypatch):
@@ -134,7 +145,7 @@ def test_issue_rejects_non_image_record():
 
     with pytest.raises(external_media.ExternalMediaNotFound):
         external_media.issue_external_media_url(
-            _DB(_record(file_id, mime_type="text/plain")),
+            _DB(_record(file_id, filename="payload.svg", mime_type="image/svg+xml")),
             file_id=file_id,
             user_id=7,
             task_id=11,
@@ -208,14 +219,23 @@ def test_external_media_endpoint_serves_inline_without_caching(monkeypatch, tmp_
     monkeypatch.setattr(
         files,
         "redeem_external_media_ticket",
-        lambda db, **kwargs: record,
+        lambda db, **kwargs: external_media.RedeemedExternalMedia(
+            record=record,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+            media_type="image/png",
+        ),
     )
 
     class _FileRef:
         def __init__(self, value):
             assert value is record
 
-        def ensure_local(self):
+        @property
+        def local_path(self):
+            return image_path
+
+        def materialize(self, *, allow_existing_local):
+            assert allow_existing_local is False
             return image_path
 
     monkeypatch.setattr(files, "ManagedFileRef", _FileRef)

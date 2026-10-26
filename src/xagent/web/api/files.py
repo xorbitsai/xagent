@@ -1715,7 +1715,7 @@ def external_media_file(
     """Serve one registered image to the external service named by its ticket."""
 
     try:
-        record = redeem_external_media_ticket(
+        redeemed = redeem_external_media_ticket(
             db,
             file_id=file_id,
             ticket=ticket,
@@ -1726,13 +1726,20 @@ def external_media_file(
             detail="Invalid or expired external media ticket",
         ) from None
 
+    record = redeemed.record
     file_ref = ManagedFileRef(record)
-    media_type = str(record.mime_type or guess_media_type(str(record.filename)))
     try:
-        path = file_ref.ensure_local()
+        path = file_ref.materialize(
+            allow_existing_local=_is_under_uploads(
+                file_ref.local_path,
+                int(record.user_id),
+            )
+        )
     except DurableObjectIntegrityError as exc:
         raise _file_integrity_failed() from exc
-    except (DurableObjectMissingError, DurableStorageOperationError) as exc:
+    except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    except DurableStorageOperationError as exc:
         _raise_durable_storage_unavailable(
             exc,
             "external media delivery",
@@ -1741,7 +1748,7 @@ def external_media_file(
 
     return FileResponse(
         path,
-        media_type=media_type,
+        media_type=redeemed.media_type,
         headers={
             "Cache-Control": "no-store, max-age=0",
             "Content-Disposition": _content_disposition_header(

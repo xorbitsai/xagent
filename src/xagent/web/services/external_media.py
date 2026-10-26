@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_media_url_ttl_seconds,
+    get_file_delivery_redirect_enabled,
     get_public_api_base_url,
 )
 from ...core.file_ref import parse_file_id_ref
@@ -24,11 +26,15 @@ from .managed_file_ref import (
     DurableObjectIntegrityError,
     DurableStorageOperationError,
     ManagedFileRef,
-    guess_media_type,
 )
 
 EXTERNAL_MEDIA_TICKET_TYPE = "external_media_ticket"
 EXTERNAL_MEDIA_ROUTE_PREFIX = "/api/files/external-media"
+_IMAGE_MEDIA_TYPES = {
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+}
 
 
 class ExternalMediaPurpose(str, Enum):
@@ -60,6 +66,13 @@ class ExternalMediaURL:
     direct_object_url: bool
 
 
+@dataclass(frozen=True)
+class RedeemedExternalMedia:
+    record: UploadedFile
+    purpose: ExternalMediaPurpose
+    media_type: str
+
+
 def _normalized_file_id(value: str) -> str:
     raw = str(value).strip()
     normalized = parse_file_id_ref(raw) or raw
@@ -70,9 +83,9 @@ def _normalized_file_id(value: str) -> str:
 
 
 def _image_media_type(record: Any) -> str:
-    recorded = str(getattr(record, "mime_type", "") or "").strip().lower()
-    media_type = recorded or guess_media_type(str(record.filename)).lower()
-    if not media_type.startswith("image/"):
+    filename = str(getattr(record, "filename", "") or "").strip().lower()
+    media_type = _IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
+    if media_type is None:
         raise ExternalMediaNotFound("Registered image was not found")
     return media_type
 
@@ -146,15 +159,17 @@ def issue_external_media_url(
     )
     media_type = _image_media_type(record)
     ttl = get_external_media_url_ttl_seconds()
-    try:
-        signed_url = ManagedFileRef(record).signed_access_url(
-            expires=ttl,
-            content_type=media_type,
-        )
-    except (DurableObjectIntegrityError, DurableStorageOperationError) as exc:
-        raise ExternalMediaUnavailable(
-            "Registered image could not be prepared for external delivery"
-        ) from exc
+    signed_url = None
+    if get_file_delivery_redirect_enabled():
+        try:
+            signed_url = ManagedFileRef(record).signed_access_url(
+                expires=ttl,
+                content_type=media_type,
+            )
+        except (DurableObjectIntegrityError, DurableStorageOperationError) as exc:
+            raise ExternalMediaUnavailable(
+                "Registered image could not be prepared for external delivery"
+            ) from exc
     if signed_url and urlsplit(signed_url).scheme == "https":
         return ExternalMediaURL(
             url=signed_url,
@@ -188,18 +203,18 @@ def redeem_external_media_ticket(
     *,
     file_id: str,
     ticket: str,
-) -> UploadedFile:
+) -> RedeemedExternalMedia:
     """Validate a public ticket and return its exact registered image."""
 
-    normalized_file_id = _normalized_file_id(file_id)
     try:
+        normalized_file_id = _normalized_file_id(file_id)
         claims = jwt.decode(
             ticket,
             JWT_SECRET_KEY,
             algorithms=[JWT_ALGORITHM],
             options={"verify_sub": False},
         )
-    except JWTError:
+    except (ExternalMediaNotFound, JWTError):
         raise ExternalMediaTicketRejected(
             "Invalid or expired external media ticket"
         ) from None
@@ -220,7 +235,7 @@ def redeem_external_media_ticket(
         raise ExternalMediaTicketRejected("Invalid or expired external media ticket")
 
     try:
-        return _load_record(
+        record = _load_record(
             db,
             file_id=normalized_file_id,
             user_id=user_id,
@@ -230,3 +245,8 @@ def redeem_external_media_ticket(
         raise ExternalMediaTicketRejected(
             "Invalid or expired external media ticket"
         ) from None
+    return RedeemedExternalMedia(
+        record=record,
+        purpose=purpose,
+        media_type=_image_media_type(record),
+    )

@@ -402,13 +402,18 @@ def google_analytics_run_report(
     The response always requests GA4's TOTAL metric aggregation. Use totals
     for headline totals; never replace them by summing rows. A metric can be
     non-additive across dimensions, so if the row sum differs from totals,
-    report the difference without inventing a cause. The response echoes the
-    normalized query so values from concurrent calls cannot be attributed to
-    the wrong property or date range.
+    report the difference and consult metadata for GA4-reported causes. With
+    multiple date_ranges, totals contains one row per range, identified by
+    the dateRange dimension value (the supplied name or date_range_N); do not
+    interpret totals[0] as a grand total across ranges. The response echoes
+    the normalized property ID and the other request inputs as supplied so
+    values from concurrent calls cannot be attributed to the wrong query.
 
     Pagination fields distinguish an incomplete GA4 page from local output
-    trimming. When output_truncated is true, retry the same offset with a
-    smaller limit; advancing to a new offset would skip rows removed locally.
+    trimming. When output_truncated is true and next_offset is present,
+    continue there because the retained rows are a prefix of the API page. If
+    next_offset is absent, no row fit; retry the same offset with a narrower
+    query.
     """
     try:
         normalized_property_id = _normalize_property_id(property_id)
@@ -454,6 +459,7 @@ def google_analytics_run_report(
         dimension_headers = result.get("dimensionHeaders") or []
         metric_headers = result.get("metricHeaders") or []
         totals = result.get("totals") or []
+        metadata = result.get("metadata") or {}
         rows = list(result.get("rows") or [])
         row_count = int(result.get("rowCount") or 0)
         api_returned_count = len(rows)
@@ -528,17 +534,26 @@ def google_analytics_run_report(
             # Prepended (not appended) so it isn't the first thing an
             # output-length truncation cuts off a large report's response.
             extra_kwargs["note"] = " ".join(notes)
-        if dimensions:
+        # Multiple ranges add GA4's implicit dateRange dimension even when
+        # the caller did not request any dimensions explicitly.
+        if dimensions or len(date_ranges) > 1:
             if totals:
                 extra_kwargs["aggregation_note"] = (
                     "Use totals for headline totals; do not replace totals by "
                     "summing rows. If the row sum differs, report the delta "
-                    "without inventing a cause."
+                    "and use metadata for GA4-reported thresholding, sampling, "
+                    "or (other) row effects; do not invent another cause."
                 )
             else:
                 extra_kwargs["aggregation_note"] = (
                     "GA4 returned no totals even though TOTAL was requested. "
                     "Do not invent a total by summing rows."
+                )
+            if len(date_ranges) > 1 and totals:
+                extra_kwargs["aggregation_note"] += (
+                    " Multiple date_ranges produce one totals row per range; "
+                    "match each total by its dateRange dimension value and do "
+                    "not treat totals[0] as a grand total across ranges."
                 )
 
         # RUN_REPORT_MAX_LIMIT bounds row count, not bytes: several long
@@ -553,10 +568,11 @@ def google_analytics_run_report(
             pagination_hint = None
             if output_truncated:
                 if rows:
+                    next_offset = offset + len(rows)
                     pagination_hint = (
-                        "Response rows were trimmed for output size. Retry the "
-                        f"same offset={offset} with a smaller limit (try "
-                        f"{len(rows)} or less); do not advance the offset."
+                        "Response rows were trimmed for output size. The rows "
+                        "returned are the API page prefix; continue with "
+                        f"offset={next_offset}."
                     )
                 else:
                     pagination_hint = (
@@ -577,6 +593,7 @@ def google_analytics_run_report(
                 dimension_headers=dimension_headers,
                 metric_headers=metric_headers,
                 totals=totals,
+                metadata=metadata,
                 rows=rows,
                 row_count=row_count,
                 returned_count=len(rows),

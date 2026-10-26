@@ -841,8 +841,10 @@ export function TaskConversationPanel({
     && state.currentTask.status === "paused"
     ? state.currentTask.autoResume
     : undefined
+  const isSupersededAutoResume = autoResume?.status === "stopped"
+    && autoResume.stopReason === "superseded"
   const showStoppedResumeAction = autoResume?.status === "stopped"
-    && autoResume.stopReason !== "superseded"
+    && !isSupersededAutoResume
     && taskControlsEnabled
   // The virtual message belongs to the latest turn, so it follows that turn's
   // stopped record the same way the process groups above do, including taking
@@ -887,8 +889,8 @@ export function TaskConversationPanel({
           </div>
         )}
         {(autoResume || interruptionReason) && (
-          <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 flex items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-            <span className="flex-1">
+          <div data-testid="task-interruption-notice" className="mx-4 mt-3 flex items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            <span role="status" className="flex-1">
               {autoResume
                 ? autoResumeNotice(autoResume, t, locale)
                 : t(interruptionNoticeKey(interruptionReason as string))}
@@ -1065,7 +1067,7 @@ export function TaskConversationPanel({
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
               onPause={taskControlsEnabled ? pauseTask : undefined}
-              onResume={taskControlsEnabled ? resumeTask : undefined}
+              onResume={taskControlsEnabled && !isSupersededAutoResume ? resumeTask : undefined}
               onStop={canStopTask ? stopTask : undefined}
               stopState={stopState}
               taskConfig={state.currentTask ? {

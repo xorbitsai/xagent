@@ -23,7 +23,7 @@ const en = {
     leaseExpired: "This task was paused because the server running it stopped. Click resume to continue.",
     persistenceFailure: "This task was paused because the database was unavailable. Click resume to continue.",
     llmUnavailable: "This task was paused because the model provider was unavailable. Click resume to continue.",
-    modelOutputInvalid: "The model returned an invalid response. Regenerating automatically.",
+    modelOutputInvalid: "This task was paused because the model returned an invalid response. Click resume to continue.",
     autoResumeScheduled: "This task was paused by a system interruption and will resume automatically.",
     autoResumeScheduledAt: "This task was paused by a system interruption and will resume automatically at about {time}.",
     autoResumeResuming: "Resuming this task automatically after a system interruption.",

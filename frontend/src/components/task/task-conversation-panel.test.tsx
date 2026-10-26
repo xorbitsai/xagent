@@ -366,7 +366,59 @@ describe("TaskConversationPanel", () => {
     expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
   })
 
-  it("offers manual resume after automatic resume stops, except when superseded", () => {
+  it.each([
+    "limit_reached",
+    "expired",
+    "failed",
+    "disabled",
+    "cancelled",
+    "ineligible",
+    "other",
+  ])("offers manual resume after automatic resume stops with %s", (stopReason) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: {
+        status: "stopped",
+        stopReason,
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    render(<TaskConversationPanel mode="page" />)
+    fireEvent.click(screen.getByRole("button", { name: "agent.input.actions.resumeTask" }))
+    expect(resumeTaskMock).toHaveBeenCalledTimes(1)
+    expect(chatInputProps.current?.onResume).toBe(resumeTaskMock)
+  })
+
+  it("suppresses every manual resume entry point when a run was superseded", () => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: {
+        status: "stopped",
+        stopReason: "superseded",
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
+    expect(chatInputProps.current?.onResume).toBeUndefined()
+  })
+
+  it.each(["scheduled", "resuming"])("does not add a notice action while automatic resume is %s", (status) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status, runId: "run-1", stateVersion: 4 },
+    }
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
+  })
+
+  it("does not offer manual resume when task controls are disabled", () => {
+    appControls.taskControlsEnabled = false
     appState.currentTask = {
       id: "42",
       status: "paused",
@@ -377,21 +429,26 @@ describe("TaskConversationPanel", () => {
         stateVersion: 4,
       },
     }
-    const { rerender } = render(<TaskConversationPanel mode="page" />)
-    fireEvent.click(screen.getByRole("button", { name: "agent.input.actions.resumeTask" }))
-    expect(resumeTaskMock).toHaveBeenCalledTimes(1)
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
+    expect(chatInputProps.current?.onResume).toBeUndefined()
+  })
 
+  it("keeps the resume button outside the interruption live region", () => {
     appState.currentTask = {
-      ...appState.currentTask,
+      id: "42",
+      status: "paused",
       autoResume: {
         status: "stopped",
-        stopReason: "superseded",
+        stopReason: "expired",
         runId: "run-1",
         stateVersion: 4,
       },
     }
-    rerender(<TaskConversationPanel mode="page" />)
-    expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
+    render(<TaskConversationPanel mode="page" />)
+    const liveRegion = screen.getByRole("status")
+    expect(liveRegion).toHaveTextContent("taskInterruption.autoResumeStoppedExpired")
+    expect(liveRegion.querySelector("button")).toBeNull()
   })
 
   it("does not show the previous task's automatic-resume notice after a switch", () => {

@@ -37,7 +37,7 @@ MEDIA_FIELDS = (
     "id,caption,media_type,media_url,permalink,timestamp,username,thumbnail_url"
 )
 MEDIA_CONTAINER_STATUS_FIELDS = "status_code,status"
-MEDIA_CONTAINER_MAX_POLLS = 10
+MEDIA_CONTAINER_MAX_POLLS = 30
 MEDIA_CONTAINER_POLL_INTERVAL_SECONDS = 1.0
 _MEDIA_CONTAINER_READY_STATUSES = frozenset({"FINISHED", "PUBLISHED"})
 _MEDIA_CONTAINER_FAILED_STATUSES = frozenset({"ERROR", "EXPIRED"})
@@ -107,10 +107,14 @@ def _wait_for_media_container(container_id: str) -> None:
         if status_code in _MEDIA_CONTAINER_READY_STATUSES:
             return
         if status_code in _MEDIA_CONTAINER_FAILED_STATUSES:
-            raise ValueError("Instagram media processing failed")
+            raise ValueError(
+                f"Instagram media processing failed for container {container_id}"
+            )
         if attempt + 1 < MEDIA_CONTAINER_MAX_POLLS:
             time.sleep(MEDIA_CONTAINER_POLL_INTERVAL_SECONDS)
-    raise TimeoutError("Instagram media processing timed out")
+    raise TimeoutError(
+        f"Instagram media processing timed out for container {container_id}"
+    )
 
 
 @mcp.tool()
@@ -248,6 +252,7 @@ def instagram_publish_image(
     except GraphAPIError as e:
         if resolved_image_url:
             e.sensitive_values.add(resolved_image_url)
+            e.sensitive_values.add(resolved_image_url.replace("/", r"\/"))
         logger.error(
             "Instagram Graph API rejected image publishing for %s",
             instagram_account_id,

@@ -52,17 +52,17 @@ def _record(
     )
 
 
-def test_issue_uses_direct_durable_url_when_available(monkeypatch):
+def test_issue_instagram_uses_ticket_even_when_durable_url_is_available(monkeypatch):
     file_id = str(uuid4())
     record = _record(file_id, mime_type="image/jpeg")
     monkeypatch.delenv("XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS", raising=False)
     monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+    signed_access_url = Mock(
+        return_value="https://objects.example.test/launch.jpg?signature=secret"
+    )
     monkeypatch.setattr(
-        external_media.ManagedFileRef,
-        "signed_access_url",
-        lambda self, **kwargs: (
-            "https://objects.example.test/launch.png?signature=secret"
-        ),
+        external_media.ManagedFileRef, "signed_access_url", signed_access_url
     )
 
     issued = external_media.issue_external_media_url(
@@ -73,37 +73,10 @@ def test_issue_uses_direct_durable_url_when_available(monkeypatch):
         purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
     )
 
-    assert issued.direct_object_url is True
+    assert issued.direct_object_url is False
     assert issued.expires_in == 600
-    assert issued.url.startswith("https://objects.example.test/")
-
-
-def test_issue_reports_direct_url_integrity_failure(monkeypatch):
-    file_id = str(uuid4())
-    record = _record(file_id, mime_type="image/jpeg")
-    monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
-    monkeypatch.setattr(
-        external_media.ManagedFileRef,
-        "signed_access_url",
-        Mock(
-            side_effect=external_media.DurableObjectIntegrityError(
-                "checksum mismatch",
-                storage_key="users/7/launch.jpg",
-            )
-        ),
-    )
-
-    with pytest.raises(
-        external_media.ExternalMediaUnavailable,
-        match="integrity verification",
-    ):
-        external_media.issue_external_media_url(
-            _DB(record),
-            file_id=file_id,
-            user_id=7,
-            task_id=11,
-            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
-        )
+    assert issued.url.startswith("https://api.example.test/")
+    signed_access_url.assert_not_called()
 
 
 def test_issue_falls_back_to_public_ticket_url(monkeypatch):
@@ -295,4 +268,107 @@ def test_instagram_jpeg_conversion_flattens_alpha_and_pads_aspect_ratio(tmp_path
         assert image.format == "JPEG"
         assert image.mode == "RGB"
         assert image.width >= 320
-        assert image.width / image.height == pytest.approx(0.8, rel=0.01)
+        assert image.width / image.height >= external_media.INSTAGRAM_MIN_ASPECT_RATIO
+
+
+def test_instagram_conversion_resizes_before_padding_extreme_tall_image(tmp_path):
+    source = tmp_path / "extreme-tall.png"
+    Image.new("RGB", (10, 50_000), "blue").save(source)
+
+    converted = external_media.instagram_jpeg_bytes(source)
+    output = tmp_path / "extreme-tall.jpg"
+    output.write_bytes(converted)
+
+    with Image.open(output) as image:
+        assert image.width <= external_media.INSTAGRAM_MAX_WIDTH
+        assert image.width / image.height >= external_media.INSTAGRAM_MIN_ASPECT_RATIO
+
+
+def test_instagram_conversion_pads_wide_image_and_downscales_width(tmp_path):
+    source = tmp_path / "wide.png"
+    Image.new("RGB", (2000, 500), "blue").save(source)
+
+    converted = external_media.instagram_jpeg_bytes(source)
+    output = tmp_path / "wide.jpg"
+    output.write_bytes(converted)
+
+    with Image.open(output) as image:
+        assert image.width == external_media.INSTAGRAM_MAX_WIDTH
+        assert image.width / image.height <= external_media.INSTAGRAM_MAX_ASPECT_RATIO
+
+
+def test_instagram_conversion_flattens_palette_transparency(tmp_path):
+    source = tmp_path / "palette.png"
+    image = Image.new("P", (640, 640))
+    image.putpalette([255, 0, 0, 0, 0, 0] + [0, 0, 0] * 254)
+    image.info["transparency"] = 0
+    image.save(source)
+
+    converted = external_media.instagram_jpeg_bytes(source)
+    output = tmp_path / "palette.jpg"
+    output.write_bytes(converted)
+
+    with Image.open(output) as normalized:
+        assert normalized.mode == "RGB"
+        assert normalized.getpixel((0, 0)) == pytest.approx((255, 255, 255), abs=3)
+
+
+def test_instagram_conversion_applies_exif_orientation(tmp_path):
+    source = tmp_path / "oriented.jpg"
+    exif = Image.Exif()
+    exif[274] = 6
+    Image.new("RGB", (400, 800), "blue").save(source, exif=exif)
+
+    assert external_media.instagram_image_requires_normalization(source) is True
+    converted = external_media.instagram_jpeg_bytes(source)
+    output = tmp_path / "oriented-normalized.jpg"
+    output.write_bytes(converted)
+
+    with Image.open(output) as image:
+        assert image.width > image.height
+        assert image.getexif().get(274, 1) == 1
+
+
+def test_instagram_conforming_jpeg_does_not_require_normalization(tmp_path):
+    source = tmp_path / "ready.jpg"
+    Image.new("RGB", (1080, 1080), "blue").save(source)
+
+    assert external_media.instagram_image_requires_normalization(source) is False
+
+
+def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_path):
+    source = tmp_path / "oversized.png"
+    source.write_bytes(b"placeholder")
+
+    class OversizedImage:
+        width = 5001
+        height = 5001
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def load(self):
+            raise AssertionError("pixel data must not be loaded")
+
+    monkeypatch.setattr(
+        external_media.Image, "open", lambda *args, **kwargs: OversizedImage()
+    )
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="pixel limit"):
+        external_media.instagram_image_requires_normalization(source)
+
+
+def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):
+    source = tmp_path / "image.png"
+    Image.new("RGB", (640, 640), "blue").save(source)
+    monkeypatch.setattr(
+        external_media.ImageOps,
+        "exif_transpose",
+        Mock(side_effect=MemoryError),
+    )
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="normalized"):
+        external_media.instagram_jpeg_bytes(source)

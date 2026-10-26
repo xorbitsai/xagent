@@ -76,6 +76,7 @@ from ..services.external_media import (
     ExternalMediaPurpose,
     ExternalMediaTicketRejected,
     ExternalMediaUnavailable,
+    instagram_image_requires_normalization,
     instagram_jpeg_bytes,
     redeem_external_media_ticket,
 )
@@ -1730,7 +1731,6 @@ def external_media_file(
         ) from None
 
     record = redeemed.record
-    media_type = redeemed.media_type
     file_ref = ManagedFileRef(record)
     try:
         path = file_ref.materialize(
@@ -1755,10 +1755,14 @@ def external_media_file(
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
     }
-    if (
-        redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
-        and media_type.lower() not in {"image/jpeg", "image/jpg"}
-    ):
+    try:
+        normalize_for_instagram = (
+            redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            and instagram_image_requires_normalization(path)
+        )
+    except ExternalMediaUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if normalize_for_instagram:
         try:
             content = instagram_jpeg_bytes(path)
         except ExternalMediaUnavailable as exc:

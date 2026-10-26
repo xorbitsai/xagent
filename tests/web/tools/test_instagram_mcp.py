@@ -278,8 +278,64 @@ def test_publish_image_stops_when_container_processing_fails(monkeypatch):
 
     assert result == {
         "status": "error",
-        "message": "Instagram media processing failed",
+        "message": "Instagram media processing failed for container container-1",
     }
+    assert not any(url.endswith("/media_publish") for url in requests_seen)
+
+
+def test_publish_image_timeout_includes_reusable_container_id(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setattr(instagram, "MEDIA_CONTAINER_MAX_POLLS", 2)
+    sleep = Mock()
+    monkeypatch.setattr(instagram.time, "sleep", sleep)
+
+    def request(method, url, **kwargs):
+        if url.endswith("/ig-1/media"):
+            return MockResponse({"id": "container-timeout"})
+        return MockResponse({"status_code": "IN_PROGRESS"})
+
+    monkeypatch.setattr(instagram.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        instagram.instagram_publish_image("ig-1", "https://example.com/image.jpg")
+    )
+
+    assert result == {
+        "status": "error",
+        "message": (
+            "Instagram media processing timed out for container container-timeout"
+        ),
+    }
+    sleep.assert_called_once_with(instagram.MEDIA_CONTAINER_POLL_INTERVAL_SECONDS)
+
+
+def test_publish_image_redacts_graph_error_while_polling(monkeypatch, caplog):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    signed_url = "https://api.example.test/media?ticket=temporary-secret"
+    escaped_url = signed_url.replace("/", r"\/")
+    requests_seen = []
+
+    def request(method, url, **kwargs):
+        requests_seen.append(url)
+        if url.endswith("/ig-1/media"):
+            return MockResponse({"id": "container-1"})
+        body = {"error": {"message": f"Could not fetch {signed_url}", "code": 9004}}
+        return MockResponse(
+            body,
+            text=f'{{"error":{{"message":"Could not fetch {escaped_url}"}}}}',
+            status_code=400,
+        )
+
+    monkeypatch.setattr(instagram.requests, "request", Mock(side_effect=request))
+
+    result = _payload(instagram.instagram_publish_image("ig-1", signed_url))
+
+    serialized = json.dumps(result)
+    assert result["status"] == "error"
+    assert signed_url not in serialized
+    assert escaped_url not in serialized
+    assert signed_url not in caplog.text
+    assert escaped_url not in caplog.text
     assert not any(url.endswith("/media_publish") for url in requests_seen)
 
 
@@ -323,6 +379,7 @@ def test_publish_image_file_ref_requires_host_resolution(monkeypatch):
 def test_publish_error_redacts_temporary_image_url(monkeypatch, caplog):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     signed_url = "https://api.example.test/media?ticket=temporary-secret"
+    escaped_url = signed_url.replace("/", r"\/")
     body = {"error": {"message": f"Could not fetch {signed_url}", "code": 9004}}
     monkeypatch.setattr(
         instagram.requests,
@@ -330,7 +387,7 @@ def test_publish_error_redacts_temporary_image_url(monkeypatch, caplog):
         Mock(
             return_value=MockResponse(
                 body,
-                text=json.dumps(body),
+                text=f'{{"error":{{"message":"Could not fetch {escaped_url}"}}}}',
                 status_code=400,
             )
         ),
@@ -340,7 +397,9 @@ def test_publish_error_redacts_temporary_image_url(monkeypatch, caplog):
 
     assert result["status"] == "error"
     assert signed_url not in json.dumps(result)
+    assert escaped_url not in json.dumps(result)
     assert signed_url not in caplog.text
+    assert escaped_url not in caplog.text
     assert "[redacted]" in json.dumps(result)
 
 

@@ -540,12 +540,34 @@ def test_external_media_mapping_is_limited_to_builtin_instagram():
     assert _external_media_binding("Instagram", "instagram_get_profile") is None
 
 
+def _instagram_adapter_for_workspace(workspace):
+    return _build_mcp_tool_adapter(
+        "Instagram",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="instagram_publish_image",
+            description="Publish an image",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instagram_account_id": {"type": "string"},
+                    "image_url": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+                "required": ["instagram_account_id"],
+            },
+        ),
+        workspace=workspace,
+    )
+
+
 @pytest.mark.asyncio
 async def test_instagram_file_ref_is_substituted_and_temporary_url_redacted(
     monkeypatch,
 ):
     file_id = "31218a9f-1497-4216-9f75-1fc8d51368c4"
     temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+    escaped_temporary_url = temporary_url.replace("/", r"\/")
     captured = {}
 
     class FakeWorkspace:
@@ -584,7 +606,7 @@ async def test_instagram_file_ref_is_substituted_and_temporary_url_redacted(
                 content=[
                     TextContent(
                         type="text",
-                        text=f"Provider could not fetch {temporary_url}",
+                        text=f"Provider could not fetch {escaped_temporary_url}",
                     )
                 ],
                 isError=True,
@@ -608,8 +630,62 @@ async def test_instagram_file_ref_is_substituted_and_temporary_url_redacted(
         "image_url": temporary_url,
     }
     assert temporary_url not in result["content"][0]["text"]
+    assert escaped_temporary_url not in result["content"][0]["text"]
     assert f"file:{file_id}" in result["content"][0]["text"]
-    assert "temporary access" in adapter.description
+    assert "TTL-bound access" in adapter.description
+
+
+@pytest.mark.asyncio
+async def test_instagram_external_media_rejects_duplicate_sources():
+    class FakeWorkspace:
+        def issue_external_media_url_detached(self, file_id, purpose):
+            raise AssertionError("duplicate sources must fail before URL issuance")
+
+    adapter = _instagram_adapter_for_workspace(FakeWorkspace())
+
+    result = await adapter.run_json_async(
+        {
+            "instagram_account_id": "ig-1",
+            "image_url": "https://example.com/image.jpg",
+            "file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4",
+        }
+    )
+
+    assert result == {
+        "content": [{"text": "Provide exactly one of image_url or file_path."}],
+        "is_error": True,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            FileNotFoundError("missing"),
+            "file_id not found or not accessible.",
+        ),
+        (
+            ValueError("A public HTTPS base URL is required"),
+            "A public HTTPS base URL is required",
+        ),
+    ],
+)
+async def test_instagram_external_media_maps_workspace_errors(error, expected):
+    class FakeWorkspace:
+        def issue_external_media_url_detached(self, file_id, purpose):
+            raise error
+
+    adapter = _instagram_adapter_for_workspace(FakeWorkspace())
+
+    result = await adapter.run_json_async(
+        {
+            "instagram_account_id": "ig-1",
+            "file_path": "file:31218a9f-1497-4216-9f75-1fc8d51368c4",
+        }
+    )
+
+    assert result == {"content": [{"text": expected}], "is_error": True}
 
 
 @pytest.mark.asyncio

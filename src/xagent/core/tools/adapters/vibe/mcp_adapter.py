@@ -490,8 +490,8 @@ class _ExternalMediaBinding:
 
 
 # These built-in tools do not upload bytes themselves. The host converts one
-# exact registered FileRef into a purpose-bound URL and substitutes that URL
-# only for the duration of the MCP call.
+# exact registered FileRef into a purpose-bound, TTL-bound URL and substitutes
+# that URL only as an argument to the MCP call.
 _EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
     ("instagram", "instagram_publish_image"): _ExternalMediaBinding(
         file_argument="file_path",
@@ -2340,7 +2340,7 @@ class MCPToolAdapter(AbstractBaseTool):
             description += (
                 " A registered workspace image (file:<id>) may be supplied for "
                 f"`{self._external_media_binding.file_argument}`; the host gives "
-                "the provider temporary access only while this tool runs."
+                "the provider short-lived, TTL-bound access."
             )
         if self._workspace is not None and self._signed_upload is not None:
             description += (
@@ -3174,7 +3174,12 @@ class MCPToolAdapter(AbstractBaseTool):
 
         prepared.pop(binding.file_argument, None)
         prepared[binding.url_argument] = external_url
-        return prepared, {external_url: f"file:{file_id}"}
+        replacement = f"file:{file_id}"
+        escaped_url = external_url.replace("/", r"\/")
+        replacements = {external_url: replacement}
+        if escaped_url != external_url:
+            replacements[escaped_url] = replacement
+        return prepared, replacements
 
     async def _discard_external_upload_args(self, staged: list[Any]) -> None:
         workspace = self._workspace

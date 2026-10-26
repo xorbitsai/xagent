@@ -252,3 +252,48 @@ def test_internal_workspace_file_ref_fails_closed(tmp_path: Path) -> None:
         )
 
     assert workspace.register_calls == 0
+
+
+def test_workspace_issues_scoped_instagram_media_url(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from xagent.core.storage import manager
+    from xagent.web.services import external_media
+
+    workspace = TaskWorkspace("web_task_11", str(tmp_path), db_task_id=11)
+    workspace.owner_user_id = 7
+    captured = {}
+
+    class FakeDB:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    db = FakeDB()
+
+    def issue(db_session, **kwargs):
+        captured.update(kwargs)
+        assert db_session is db
+        return external_media.ExternalMediaURL(
+            url="https://api.example.test/media?ticket=short-lived",
+            expires_in=600,
+            direct_object_url=False,
+        )
+
+    monkeypatch.setattr(manager, "create_db_session", lambda: db)
+    monkeypatch.setattr(external_media, "issue_external_media_url", issue)
+
+    result = workspace.issue_external_media_url_detached(
+        "31218a9f-1497-4216-9f75-1fc8d51368c4",
+        "instagram-publish",
+    )
+
+    assert result == "https://api.example.test/media?ticket=short-lived"
+    assert captured == {
+        "file_id": "31218a9f-1497-4216-9f75-1fc8d51368c4",
+        "user_id": 7,
+        "task_id": 11,
+        "purpose": external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+    }
+    assert db.closed is True

@@ -732,19 +732,78 @@ const normalizeAutoRecovery = (value: unknown): TaskAutoRecovery | undefined =>
     ? { reason: value.reason }
     : undefined
 
-// Automatic resume of a paused task, from the latest ``task_recovery_update``
-// event: scheduled, under way, or stopped (``stopReason`` says why). It is
-// tied to the fence it was announced at and kept only while the task rests
-// there.
+// Automatic resume of a paused task, from task_info or the latest
+// ``task_recovery_update`` event: scheduled, under way, or stopped
+// (``stopReason`` says why). It is tied to the fence it was announced at and
+// kept only while the task rests there.
 export interface TaskAutoResume {
   status: "scheduled" | "resuming" | "stopped"
   stopReason?: string
   nextAttemptAt?: string
+  attempt?: number
   runId: string
   stateVersion: number
 }
 
 const AUTO_RESUME_STATUSES = new Set(["scheduled", "resuming", "stopped"])
+
+const parseAutoResumeAtFence = (
+  value: unknown,
+  runId: unknown,
+  stateVersion: unknown,
+): TaskAutoResume | undefined => {
+  const view = asMessageRecord(value)
+  const parsedStateVersion = parseInteger(stateVersion)
+  const status = view.status
+  if (
+    typeof runId !== "string"
+    || parsedStateVersion === undefined
+    || typeof status !== "string"
+    || !AUTO_RESUME_STATUSES.has(status)
+  ) return undefined
+
+  const attempt = parseInteger(view.attempt)
+  return {
+    status: status as TaskAutoResume["status"],
+    stopReason: typeof view.stop_reason === "string" ? view.stop_reason : undefined,
+    nextAttemptAt: typeof view.next_attempt_at === "string" ? view.next_attempt_at : undefined,
+    ...(attempt !== undefined ? { attempt } : {}),
+    runId,
+    stateVersion: parsedStateVersion,
+  }
+}
+
+const autoResumeSortKey = (notice: TaskAutoResume): [number, number] | undefined => {
+  if (notice.attempt === undefined) return undefined
+  switch (notice.status) {
+    case "resuming":
+      return [notice.attempt, 0]
+    case "scheduled":
+      return [notice.attempt - 1, 1]
+    case "stopped":
+      return [notice.attempt, 2]
+  }
+}
+
+const newerAutoResume = (
+  current: TaskAutoResume | undefined,
+  incoming: TaskAutoResume | undefined,
+): TaskAutoResume | undefined => {
+  if (!current || !incoming) return incoming ?? current
+  if (
+    current.runId !== incoming.runId
+    || current.stateVersion !== incoming.stateVersion
+  ) return incoming
+
+  const currentKey = autoResumeSortKey(current)
+  const incomingKey = autoResumeSortKey(incoming)
+  if (!currentKey) return incoming
+  if (!incomingKey) return current
+  if (incomingKey[0] !== currentKey[0]) {
+    return incomingKey[0] > currentKey[0] ? incoming : current
+  }
+  return incomingKey[1] >= currentKey[1] ? incoming : current
+}
 
 // ``task_recovery_update`` -> the task it is for and its notice, or nothing
 // for a malformed event.
@@ -756,25 +815,12 @@ export const parseAutoResumeNotice = (
   // the control envelope (task_id, run_id, state_version) at the root.
   const view = asMessageRecord(root.auto_resume ?? asMessageRecord(root.data).auto_resume)
   const taskId = parseInteger(root.task_id)
-  const stateVersion = parseInteger(root.state_version)
-  const status = view.status
-  if (
-    taskId === undefined
-    || stateVersion === undefined
-    || typeof root.run_id !== "string"
-    || typeof status !== "string"
-    || !AUTO_RESUME_STATUSES.has(status)
-  ) return undefined
+  const notice = parseAutoResumeAtFence(view, root.run_id, root.state_version)
+  if (taskId === undefined || !notice) return undefined
   return {
     taskId,
     reason: typeof view.reason === "string" && view.reason ? view.reason : undefined,
-    notice: {
-      status: status as TaskAutoResume["status"],
-      stopReason: typeof view.stop_reason === "string" ? view.stop_reason : undefined,
-      nextAttemptAt: typeof view.next_attempt_at === "string" ? view.next_attempt_at : undefined,
-      runId: root.run_id,
-      stateVersion,
-    },
+    notice,
   }
 }
 
@@ -794,6 +840,41 @@ const clearStaleAutoRecovery = (task: Task | null): Task | null => {
   return autoRecovery === task.autoRecovery && autoResume === task.autoResume
     ? task
     : { ...task, autoRecovery, autoResume }
+}
+
+const mergeTaskSnapshot = (current: Task, incoming: Task): Task => {
+  const sameFence = current.runId === incoming.runId
+    && current.stateVersion === incoming.stateVersion
+  const incomingHasAutoRecovery = Object.prototype.hasOwnProperty.call(
+    incoming,
+    "autoRecovery",
+  )
+  const incomingHasAutoResume = Object.prototype.hasOwnProperty.call(
+    incoming,
+    "autoResume",
+  )
+  const merged: Task = {
+    ...current,
+    ...incoming,
+    agentName: incoming.agentName || current.agentName,
+    agentLogoUrl: incoming.agentLogoUrl || current.agentLogoUrl,
+  }
+
+  if (!sameFence) {
+    if (!incomingHasAutoRecovery) merged.autoRecovery = undefined
+    if (!incomingHasAutoResume) merged.autoResume = undefined
+    return merged
+  }
+
+  if (!incomingHasAutoRecovery) merged.autoRecovery = current.autoRecovery
+  if (!incomingHasAutoResume || incoming.autoResume === undefined) {
+    // An absent view, an overall null ``auto_recovery``, or a same-fence
+    // manual-only snapshot cannot prove a live notice is stale.
+    merged.autoResume = current.autoResume
+  } else {
+    merged.autoResume = newerAutoResume(current.autoResume, incoming.autoResume)
+  }
+  return merged
 }
 
 export interface Task {
@@ -1007,42 +1088,71 @@ const getStringArray = (value: unknown): string[] => Array.isArray(value) ? valu
 const taskFromTaskInfoData = (
   taskData: Record<string, unknown>,
   taskId: number,
-): Task => ({
-  id: String(taskId),
-  title: taskData.title as string,
-  description: taskData.description as string,
-  status: normalizeTaskStatus(taskData.status) || "pending",
-  completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
-  ...(taskData.conversation_storage_version !== undefined
-    ? { conversationStorageVersion: taskData.conversation_storage_version as number }
-    : {}),
-  createdAt: taskData.created_at as string | number,
-  updatedAt: taskData.updated_at as string | number,
-  modelId: taskData.model_id as string | undefined,
-  smallFastModelId: taskData.small_fast_model_id as string | undefined,
-  visualModelId: taskData.visual_model_id as string | undefined,
-  compactModelId: taskData.compact_model_id as string | undefined,
-  modelName: taskData.model_name as string | undefined,
-  smallFastModelName: taskData.small_fast_model_name as string | undefined,
-  visualModelName: taskData.visual_model_name as string | undefined,
-  compactModelName: taskData.compact_model_name as string | undefined,
-  executionMode: taskData.execution_mode as Task["executionMode"],
-  isDag: taskData.is_dag as boolean | undefined,
-  agentId: taskData.agent_id as number | undefined,
-  agentName: taskData.agent_name as string | undefined,
-  agentLogoUrl: taskData.agent_logo_url as string | undefined,
-  runtimeExtensionBindings: getStringArray(taskData.runtime_extension_bindings),
-  waitingQuestion: taskData.waiting_question as string | undefined,
-  waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
-  runId: taskData.run_id as string | null | undefined,
-  stateVersion: parseInteger(taskData.state_version),
-  controlState: taskData.control_state as TaskControlState | undefined,
-  // Only a frame that reports the view (history replay's) may replace or
-  // clear one already held; live task_info frames do not carry it.
-  ...(hasOwn(taskData, "auto_recovery")
-    ? { autoRecovery: normalizeAutoRecovery(taskData.auto_recovery) }
-    : {}),
-})
+): Task => {
+  const runId = taskData.run_id as string | null | undefined
+  const stateVersion = parseInteger(taskData.state_version)
+  const autoRecoveryValue = taskData.auto_recovery
+  const autoRecoveryView = asMessageRecord(autoRecoveryValue)
+  const autoRecovery = normalizeAutoRecovery(autoRecoveryValue)
+  const recoveryRunId = autoRecoveryView.run_id
+  const recoveryStateVersion = parseInteger(autoRecoveryView.state_version)
+  const recoveryFenceMatchesTask = (
+    typeof runId === "string"
+    && stateVersion !== undefined
+    && recoveryRunId === runId
+    && recoveryStateVersion === stateVersion
+  )
+  const hasAutoResumeView = recoveryFenceMatchesTask
+    && hasOwn(autoRecoveryView, "auto_resume")
+  const autoResume = hasAutoResumeView
+    ? parseAutoResumeAtFence(
+      autoRecoveryView.auto_resume,
+      recoveryRunId,
+      recoveryStateVersion,
+    )
+    : undefined
+
+  return {
+    id: String(taskId),
+    title: taskData.title as string,
+    description: taskData.description as string,
+    status: normalizeTaskStatus(taskData.status) || "pending",
+    completionOutcome: normalizeCompletionOutcome(taskData.completion_outcome),
+    ...(taskData.conversation_storage_version !== undefined
+      ? { conversationStorageVersion: taskData.conversation_storage_version as number }
+      : {}),
+    createdAt: taskData.created_at as string | number,
+    updatedAt: taskData.updated_at as string | number,
+    modelId: taskData.model_id as string | undefined,
+    smallFastModelId: taskData.small_fast_model_id as string | undefined,
+    visualModelId: taskData.visual_model_id as string | undefined,
+    compactModelId: taskData.compact_model_id as string | undefined,
+    modelName: taskData.model_name as string | undefined,
+    smallFastModelName: taskData.small_fast_model_name as string | undefined,
+    visualModelName: taskData.visual_model_name as string | undefined,
+    compactModelName: taskData.compact_model_name as string | undefined,
+    executionMode: taskData.execution_mode as Task["executionMode"],
+    isDag: taskData.is_dag as boolean | undefined,
+    agentId: taskData.agent_id as number | undefined,
+    agentName: taskData.agent_name as string | undefined,
+    agentLogoUrl: taskData.agent_logo_url as string | undefined,
+    runtimeExtensionBindings: getStringArray(taskData.runtime_extension_bindings),
+    waitingQuestion: taskData.waiting_question as string | undefined,
+    waitingInteractions: normalizeInteractions(taskData.waiting_interactions),
+    runId,
+    stateVersion,
+    controlState: taskData.control_state as TaskControlState | undefined,
+    // ``null`` means the read could not provide a recovery view, so it must
+    // not erase a newer live notice. A non-null view is usable only at the
+    // task's current fence; legacy reason-only views remain displayable.
+    ...(autoRecovery && (
+      recoveryRunId === undefined
+      || recoveryStateVersion === undefined
+      || recoveryFenceMatchesTask
+    ) ? { autoRecovery } : {}),
+    ...(hasAutoResumeView ? { autoResume } : {}),
+  }
+}
 
 const getWebSocketErrorCodeField = (message: WebSocketMessage): {
   present: boolean
@@ -1561,16 +1671,19 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
       console.log('🔄 Reducer returning new state:', newState)
       return newState
 
-    case "ADOPT_SESSION_TASK":
+    case "ADOPT_SESSION_TASK": {
       // A session can adopt a task that's already terminal (e.g. a fast
       // single-call turn that finishes before the adoption handshake
       // completes) - route through the same dagTerminatedAt rules
       // SET_CURRENT_TASK applies, or the Progress panel's elapsed clock would
       // never freeze for it (isDagFinished true, progressEndedAt undefined).
+      const adoptedTask = state.currentTask?.id === action.payload.task.id
+        ? mergeTaskSnapshot(state.currentTask, action.payload.task)
+        : action.payload.task
       return {
         ...state,
         taskId: action.payload.taskId,
-        currentTask: clearStaleAutoRecovery(withDagTerminatedAt(action.payload.task)),
+        currentTask: clearStaleAutoRecovery(withDagTerminatedAt(adoptedTask)),
         taskRuntimeExtensions: {},
         // The server re-sends task_info for the same task at the start of
         // every turn, so adopting the task already bound must keep the record
@@ -1578,6 +1691,7 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         stoppedTurnAnchorIds:
           state.taskId === action.payload.taskId ? state.stoppedTurnAnchorIds : [],
       }
+    }
 
     case "MARK_TURN_STOPPED":
       return state.stoppedTurnAnchorIds.includes(action.payload.anchorMessageId)
@@ -1826,7 +1940,7 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         : null
 
       const mergedTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
-        ? { ...state.currentTask, ...incomingTask, agentName: incomingTask.agentName || state.currentTask.agentName, agentLogoUrl: incomingTask.agentLogoUrl || state.currentTask.agentLogoUrl }
+        ? mergeTaskSnapshot(state.currentTask, incomingTask)
         : incomingTask
       // A task can arrive here already terminal without ever passing through
       // UPDATE_TASK_STATUS (loading a finished task fresh - page load,
@@ -1972,7 +2086,13 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
           return state
         }
-        return { ...state, currentTask: { ...task, autoResume: notice } }
+        return {
+          ...state,
+          currentTask: {
+            ...task,
+            autoResume: newerAutoResume(task.autoResume, notice),
+          },
+        }
       }
       if (notice.stateVersion < known) return state
       if (notice.stateVersion === known) {
@@ -1980,7 +2100,13 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         if (task.status !== "paused" || (task.runId != null && task.runId !== notice.runId)) {
           return state
         }
-        return { ...state, currentTask: { ...task, autoResume: notice } }
+        return {
+          ...state,
+          currentTask: {
+            ...task,
+            autoResume: newerAutoResume(task.autoResume, notice),
+          },
+        }
       }
       // A newer fence: the server rests the task paused there (a lease-expiry
       // pause announces nothing else), so apply that pause first.

@@ -3251,6 +3251,7 @@ describe("AppProvider websocket message routing", () => {
     expect(autoResume()).toEqual({
       status: "scheduled",
       nextAttemptAt: "2026-05-27T05:00:15+00:00",
+      attempt: 1,
       runId: "run-1",
       stateVersion: 4,
     })
@@ -3471,6 +3472,133 @@ describe("AppProvider websocket message routing", () => {
     expect(autoRecovery()).toBeNull()
   })
 
+  it("restores automatic resume from task_info without letting a stale snapshot replace a live notice", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    const autoResume = () => JSON.parse(screen.getByTestId("task-auto-resume").textContent || "null")
+    const pausedInfo = (autoRecovery: unknown) => taskInfoMessage(1, {
+      status: "paused",
+      run_id: "run-1",
+      state_version: 4,
+      control_state: "paused",
+      auto_recovery: autoRecovery,
+    })
+
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: {
+          status: "scheduled",
+          stop_reason: null,
+          reason: "llm_unavailable",
+          attempt: 1,
+          next_attempt_at: "2026-05-27T05:00:15+00:00",
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(autoResume()).toEqual({
+        status: "scheduled",
+        nextAttemptAt: "2026-05-27T05:00:15+00:00",
+        attempt: 1,
+        runId: "run-1",
+        stateVersion: 4,
+      })
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:16Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: {
+          auto_resume: {
+            status: "resuming",
+            stop_reason: null,
+            reason: "llm_unavailable",
+            attempt: 1,
+            next_attempt_at: null,
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toMatchObject({ status: "resuming", attempt: 1 })
+
+    // A slower task read still describing the scheduled phase must not move
+    // the same attempt backwards from resuming to scheduled.
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: {
+          status: "scheduled",
+          attempt: 1,
+          next_attempt_at: "2026-05-27T05:00:15+00:00",
+        },
+      }))
+    })
+    expect(autoResume()).toMatchObject({ status: "resuming", attempt: 1 })
+
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:17Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: {
+          auto_resume: {
+            status: "scheduled",
+            reason: "llm_unavailable",
+            attempt: 2,
+            next_attempt_at: "2026-05-27T05:00:30+00:00",
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+      // A late phase from the prior attempt is older than attempt 2's
+      // scheduled state under the backend's ordering contract.
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:18Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: {
+          auto_resume: {
+            status: "resuming",
+            reason: "llm_unavailable",
+            attempt: 1,
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 2 })
+
+    // A recovery view for another fence and a transient null read are both
+    // non-authoritative for the live notice already held.
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "lease_expired",
+        run_id: "run-0",
+        state_version: 3,
+        auto_resume: { status: "stopped", stop_reason: "expired", attempt: 1 },
+      }))
+      onMessage?.(pausedInfo(null))
+    })
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 2 })
+  })
+
   it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {
     render(
       <AppProvider token="token">
@@ -3528,7 +3656,7 @@ describe("AppProvider websocket message routing", () => {
     expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
   })
 
-  it("lets a task_info that reports no interruption clear a stale one", async () => {
+  it("keeps the known interruption when task_info temporarily reports auto_recovery as null", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -3555,7 +3683,7 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(pausedInfo(null))
     })
     await waitFor(() => {
-      expect(screen.getByTestId("task-auto-recovery").textContent).toBe("null")
+      expect(screen.getByTestId("task-auto-recovery").textContent).toContain("persistence_failure")
     })
   })
 

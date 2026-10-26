@@ -3262,7 +3262,7 @@ describe("AppProvider websocket message routing", () => {
 
     update(4, { status: "resuming" })
     expect(autoResume()).toMatchObject({ status: "resuming" })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
     act(() => {
       onMessage?.({
@@ -3291,7 +3291,7 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
     expect(screen.getByTestId("task-state-version").textContent).toBe("7")
-    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoRecovery()).toMatchObject({ reason: "lease_expired", runId: "run-1", stateVersion: 7 })
     expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 7 })
 
     update(7, { status: "stopped", stop_reason: "limit_reached" })
@@ -3302,6 +3302,14 @@ describe("AppProvider websocket message routing", () => {
     update(7, { status: "resuming" })
     update(7, { status: "scheduled", attempt: undefined })
     expect(autoResume()).toMatchObject({ status: "stopped", stopReason: "limit_reached" })
+
+    // A held legacy notice with no attempt number must not block a newer,
+    // orderable phase at that fence.
+    update(8, { status: "scheduled", attempt: undefined })
+    expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 8 })
+    expect(autoResume()).not.toHaveProperty("attempt")
+    update(8, { status: "resuming", attempt: 1 })
+    expect(autoResume()).toMatchObject({ status: "resuming", attempt: 1, stateVersion: 8 })
 
     // A new pause at a later fence starts without a notice.
     act(() => {
@@ -3347,7 +3355,7 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-auto-resume").textContent).toBe("null")
   })
 
-  it("keeps a task_paused event's interruption reason until the task leaves paused", async () => {
+  it("keeps a task_paused event's interruption reason only at its fence", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -3373,7 +3381,7 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
     // History replay re-announces the pause without a reason: keep it.
     act(() => {
@@ -3387,7 +3395,7 @@ describe("AppProvider websocket message routing", () => {
         control_state: "paused",
       })
     })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
     act(() => {
       onMessage?.({
@@ -3420,10 +3428,10 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "user_pause" })
+    expect(autoRecovery()).toMatchObject({ reason: "user_pause", runId: "run-1", stateVersion: 6 })
   })
 
-  it("loads a paused task's interruption from task_info and clears it when a new run starts", async () => {
+  it("loads a paused task's interruption from task_info and clears it when the fence changes", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -3451,7 +3459,7 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoRecovery()).toMatchObject({ reason: "lease_expired", runId: "run-1", stateVersion: 4 })
 
     // A live task_info frame does not carry the view: keep the known one.
     act(() => {
@@ -3462,7 +3470,19 @@ describe("AppProvider websocket message routing", () => {
         control_state: "paused",
       }))
     })
-    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoRecovery()).toMatchObject({ reason: "lease_expired", runId: "run-1", stateVersion: 4 })
+
+    // A later paused fence with no recovery row must not inherit the old
+    // fence's reason.
+    act(() => {
+      onMessage?.(taskInfoMessage(1, {
+        status: "paused",
+        run_id: "run-1",
+        state_version: 6,
+        control_state: "paused",
+      }))
+    })
+    expect(autoRecovery()).toBeNull()
 
     // A new run's task_info (``task_started`` itself carries no status
     // update) moves the task off paused.
@@ -3470,7 +3490,7 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(taskInfoMessage(1, {
         status: "running",
         run_id: "run-2",
-        state_version: 5,
+        state_version: 7,
         control_state: "running",
       }))
     })
@@ -3632,6 +3652,15 @@ describe("AppProvider websocket message routing", () => {
     })
     expect(autoResume()).toBeNull()
     act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: { status: "scheduled", attempt: 4 },
+      }))
+    })
+    expect(autoResume()).toBeNull()
+    act(() => {
       onMessage?.({
         type: "task_recovery_update",
         timestamp: "2026-05-27T05:00:20Z",
@@ -3645,7 +3674,7 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it("merges a same-task session adoption without regressing its recovery notice", () => {
-    const task = {
+    const baseTask = {
       id: "1",
       title: "Test task",
       status: "paused" as const,
@@ -3654,6 +3683,10 @@ describe("AppProvider websocket message routing", () => {
       updatedAt: "2026-05-27T05:00:01Z",
       runId: "run-1",
       stateVersion: 4,
+    }
+    const task = {
+      ...baseTask,
+      waitingRequestId: "stale-request",
       autoResume: {
         status: "resuming" as const,
         attempt: 1,
@@ -3670,12 +3703,50 @@ describe("AppProvider websocket message routing", () => {
       payload: {
         taskId: 1,
         task: {
-          ...task,
-          autoResume: { ...task.autoResume, status: "scheduled" },
+          ...baseTask,
+          title: "Fresh task record",
+          updatedAt: "2026-05-27T05:00:02Z",
         },
       },
     })
     expect(state.currentTask?.autoResume).toMatchObject({ status: "resuming", attempt: 1 })
+    expect(state.currentTask?.waitingRequestId).toBeUndefined()
+    expect(state.currentTask?.title).toBe("Fresh task record")
+  })
+
+  it("does not carry non-recovery fields into a same-task session adoption", () => {
+    const currentTask = {
+      id: "1",
+      title: "Old task record",
+      status: "completed" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      waitingRequestId: "stale-request",
+      dagTerminatedAt: "2026-05-27T05:00:01Z",
+    }
+    const state = projectAppState({
+      ...createInitialState(),
+      taskId: 1,
+      currentTask,
+    }, {
+      type: "ADOPT_SESSION_TASK",
+      payload: {
+        taskId: 1,
+        task: {
+          id: "1",
+          title: "Fresh task record",
+          status: "completed",
+          description: "Test task",
+          createdAt: "2026-05-27T05:00:00Z",
+          updatedAt: "2026-05-27T05:00:05Z",
+        },
+      },
+    })
+
+    expect(state.currentTask?.waitingRequestId).toBeUndefined()
+    expect(state.currentTask?.dagTerminatedAt).toBe("2026-05-27T05:00:05Z")
+    expect(state.currentTask?.dagTerminatedAtProvisional).toBe(true)
   })
 
   it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {
@@ -3703,10 +3774,11 @@ describe("AppProvider websocket message routing", () => {
       }))
     })
     await waitFor(() => {
-      expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+      expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
     })
 
-    // Replayed activity infers running, which drops the reason...
+    // Replayed activity infers running, but must not erase the fenced reason
+    // before the reasserted pause arrives.
     act(() => {
       onMessage?.({
         type: "trace_event",
@@ -3721,9 +3793,9 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
-    expect(autoRecovery()).toBeNull()
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
-    // ...and the pause history reasserts last restores it.
+    // The pause history reassertion leaves the held reason intact.
     act(() => {
       onMessage?.({
         type: "task_paused",
@@ -3737,7 +3809,7 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
   })
 
   it("keeps a restored auto-resume notice through replayed activity and the reasserted pause", async () => {
@@ -3810,6 +3882,24 @@ describe("AppProvider websocket message routing", () => {
       })
     })
     expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+
+    // Once replay is complete, the same trace kind is live and may infer
+    // running. The notice stays fenced so a later pause at this fence can
+    // show it again.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:04Z",
+        task_id: 1,
+        data: {
+          event_id: "live-dag-start",
+          event_type: "dag_execute_start",
+          data: { iteration: 2 },
+        },
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
     expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
   })
 

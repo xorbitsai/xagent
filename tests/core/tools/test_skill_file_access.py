@@ -185,8 +185,16 @@ class TestSkillFileAccess:
         copied_content = (mock_workspace.output_dir / "schema.json").read_text()
         assert original_content == copied_content
 
-    def test_fetch_skill_file_with_custom_dest(self, temp_skills_dir, mock_workspace):
+    def test_fetch_skill_file_with_custom_dest(
+        self, temp_skills_dir, mock_workspace, monkeypatch
+    ):
         """Test fetching file with custom destination path."""
+        granted_paths: list[str] = []
+        monkeypatch.setattr(
+            mock_workspace,
+            "grant_sandbox_access",
+            granted_paths.append,
+        )
         skill_tools = SkillTools(mock_workspace, skills_roots=[str(temp_skills_dir)])
         result = skill_tools.fetch_skill_file(
             "test_skill", "schema.json", "config/schema.json"
@@ -197,6 +205,7 @@ class TestSkillFileAccess:
         # Normalize path separators for comparison
         dest_normalized = result["destination"].replace("\\", "/")
         assert "config/schema.json" in dest_normalized
+        assert granted_paths == [mock_workspace.output_dir / "config" / "schema.json"]
 
     def test_fetch_skill_file_not_found(self, temp_skills_dir, mock_workspace):
         """Test FileNotFoundError when file doesn't exist."""

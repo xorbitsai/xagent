@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,7 @@ class FakeWorkspaceManager:
     def __init__(self, tmp_path: Path) -> None:
         self.tmp_path = tmp_path
         self.calls: list[dict[str, Any]] = []
+        self.thread_ids: list[int] = []
 
     def get_or_create_workspace(
         self,
@@ -75,6 +77,7 @@ class FakeWorkspaceManager:
         allowed_external_dirs: list[str] | None = None,
         scope_segments: tuple[str, ...] = (),
     ) -> FakeWorkspace:
+        self.thread_ids.append(threading.get_ident())
         self.calls.append(
             {
                 "base_dir": base_dir,
@@ -497,6 +500,7 @@ async def test_inject_rejection_leaves_no_dedupe_residue() -> None:
 
 @pytest.mark.asyncio
 async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None:
+    event_loop_thread = threading.get_ident()
     workspace_manager = FakeWorkspaceManager(tmp_path)
     memory_manager = FakeMemoryManager()
     callback = TrackingCallback()
@@ -551,6 +555,7 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
     assert pattern_call["llm"] == "fake-llm"
     assert isinstance(pattern_call["runtime"], PatternRuntime)
     assert workspace_manager.calls[0]["task_id"] == "exec-1"
+    assert workspace_manager.thread_ids[0] != event_loop_thread
     assert callback.events == [("start", "exec-1"), ("end", "exec-1")]
 
 
@@ -1483,6 +1488,7 @@ async def test_runner_stops_on_llm_call_interrupt(tmp_path: Path) -> None:
 async def test_runner_restores_context_and_pattern_from_checkpoint(
     tmp_path: Path,
 ) -> None:
+    event_loop_thread = threading.get_ident()
     checkpoint_context = ExecutionContext(execution_id="exec-resume")
     checkpoint_context.add_user_message("Original task")
     checkpoint_context.metadata[PREFERRED_INPUT_MODALITIES_METADATA_KEY] = ["text"]
@@ -1493,9 +1499,10 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
     }
     pattern = StatefulPattern()
     agent = Agent(name="writer", patterns=[pattern])
+    workspace_manager = FakeWorkspaceManager(tmp_path)
     runner = AgentRunner(
         agent=agent,
-        workspace_manager=FakeWorkspaceManager(tmp_path),
+        workspace_manager=workspace_manager,
     )
 
     result = await runner.run(
@@ -1516,6 +1523,8 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
         "Original task",
         "restored",
     ]
+    assert len(workspace_manager.thread_ids) == 1
+    assert workspace_manager.thread_ids[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

@@ -258,8 +258,10 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # The resume's except branches send their failed-delivery acks through
     # fail_deferred_delivery: its call sites replace theirs, plus the one
     # notify_deferred_delivery call it forwards the message to.
-    assert result.producers == 45, (
-        f"expected exactly 45 producers, matched {result.producers}; "
+    # A planned-restart hold refusal (``send_execution_paused``) adds one
+    # not-accepted ack built from the fixed EXECUTION_PAUSED message.
+    assert result.producers == 46, (
+        f"expected exactly 46 producers, matched {result.producers}; "
         "review the changed sites and bump deliberately"
     )
     # #1658 removed ``_resync_client_to_running_task``'s stale-client ``error``
@@ -278,8 +280,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # The external cancel's terminal broadcast sends one of two frames, one
     # per wording, so only the "didn't go through" one asserts a code: 57.
     # The pause pre-check's not-applicable reply adds one: 58.
-    assert result.error_payloads == 58, (
-        f"expected exactly 58 error payloads, matched {result.error_payloads}; "
+    # The planned-restart hold refusal's plain error frame adds one: 59.
+    assert result.error_payloads == 59, (
+        f"expected exactly 59 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

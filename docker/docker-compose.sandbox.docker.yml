@@ -4,7 +4,7 @@ services:
       - SANDBOX_ENABLED=true
       - SANDBOX_IMPLEMENTATION=docker
       - DOCKER_HOST=unix:///var/run/docker.sock
-      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.8.3
+      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.8.4
       - SANDBOX_CPUS=1
       - SANDBOX_MEMORY=512
       - XAGENT_SANDBOX_HOST_PROJECT_ROOT=${XAGENT_SANDBOX_HOST_PROJECT_ROOT:-${PWD}}
@@ -22,6 +22,45 @@ services:
           create_host_path: false
 
   nginx:
+    # nginx drops privileges and calls initgroups(), which discards Docker's
+    # supplementary group_add entries. Resolve/create gid 1010 in the image's
+    # group database and make it the worker's primary group so X-Accel can
+    # traverse sandbox-managed 2750 directories. Keep this override scoped to
+    # the Docker sandbox deployment, which is the only mode that needs it.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        group_file="$${XAGENT_NGINX_GROUP_FILE:-/etc/group}"
+        nginx_conf="$${XAGENT_NGINX_CONF:-/etc/nginx/nginx.conf}"
+        group_name="$$(awk -F: '$$3 == 1010 { print $$1; exit }' "$${group_file}")"
+        if [ -z "$${group_name}" ]; then
+          group_name=xagent_sandbox
+          printf '%s:x:1010:\n' "$${group_name}" >> "$${group_file}"
+        fi
+        tmp_conf="$${nginx_conf}.xagent.tmp"
+        if ! awk -v group_name="$${group_name}" '
+          BEGIN { replaced = 0 }
+          /^user[[:space:]]+[^;]+;/ {
+            print "user nginx " group_name ";"
+            replaced = 1
+            next
+          }
+          { print }
+          END { if (!replaced) exit 1 }
+        ' "$${nginx_conf}" > "$${tmp_conf}"; then
+          rm -f "$${tmp_conf}"
+          echo "failed to find nginx user directive" >&2
+          exit 1
+        fi
+        cat "$${tmp_conf}" > "$${nginx_conf}"
+        rm -f "$${tmp_conf}"
+        grep -q "^user nginx $${group_name};" "$${nginx_conf}" || {
+          echo "failed to configure nginx primary group $${group_name}" >&2
+          exit 1
+        }
+        exec nginx -g 'daemon off;'
     volumes:
       - type: bind
         source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}

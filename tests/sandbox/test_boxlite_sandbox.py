@@ -550,7 +550,7 @@ class TestBoxliteSandbox:
             )
 
             result = await sandbox.exec(
-                "pip", "install", "--break-system-packages", "pytest"
+                "pip", "install", "--user", "--break-system-packages", "pytest"
             )
             print(f"Output:\n{result.stdout}")
 

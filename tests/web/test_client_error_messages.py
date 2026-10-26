@@ -121,6 +121,10 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "Stopping this response didn't go through — please try again."
         ),
         "model_error": "Model provider call failed.",
+        "execution_paused": (
+            "New work is briefly paused for a service update. "
+            "Nothing was started; please try again in a moment."
+        ),
     }
 
 

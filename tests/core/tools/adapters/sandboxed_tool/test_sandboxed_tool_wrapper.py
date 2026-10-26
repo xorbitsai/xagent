@@ -338,7 +338,12 @@ class TestTools:
 
             # Install pytest in sandbox
             install_result = await sb.exec(
-                "pip", "install", "--break-system-packages", "pytest", "pytest-asyncio"
+                "pip",
+                "install",
+                "--user",
+                "--break-system-packages",
+                "pytest",
+                "pytest-asyncio",
             )
             assert install_result.exit_code == 0, (
                 f"Failed to install pytest: {install_result.stderr}"
@@ -414,7 +419,7 @@ class TestTools:
 
             # Install pytest and Node.js dependencies in sandbox
             install_result = await sb.exec(
-                "pip", "install", "--break-system-packages", "pytest"
+                "pip", "install", "--user", "--break-system-packages", "pytest"
             )
             assert install_result.exit_code == 0, (
                 f"Failed to install pytest: {install_result.stderr}"
@@ -493,7 +498,12 @@ class TestTools:
 
             # Install pytest in sandbox
             install_result = await sb.exec(
-                "pip", "install", "--break-system-packages", "pytest", "pytest-asyncio"
+                "pip",
+                "install",
+                "--user",
+                "--break-system-packages",
+                "pytest",
+                "pytest-asyncio",
             )
             assert install_result.exit_code == 0, (
                 f"Failed to install pytest: {install_result.stderr}"

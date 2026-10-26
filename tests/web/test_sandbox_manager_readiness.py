@@ -28,6 +28,12 @@ class _ProbeStub:
     async def _resolve_backend_probe(self) -> bool:
         return self._supports
 
+    def validate_host_workspace_access(self) -> None:
+        raise AssertionError("non-Docker backends must not run the host access probe")
+
+    def requires_host_workspace_access(self) -> bool:
+        return False
+
 
 @pytest.mark.asyncio
 async def test_readiness_skipped_when_backend_does_not_support_reconciliation():

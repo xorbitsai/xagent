@@ -95,7 +95,9 @@ async def test_database_trace_handler_emits_write_outcome(monkeypatch, metric_re
     monkeypatch.setattr(trace_database, "get_engine", lambda: object())
     handler = DatabaseTraceHandler(42)
     saved = []
-    monkeypatch.setattr(handler, "_sync_save_to_database", saved.append)
+    monkeypatch.setattr(
+        handler, "_sync_save_to_database", lambda event, **_: saved.append(event)
+    )
     event = TraceEvent(
         event_type=TASK_START_GENERAL, task_id="42", data={}, require_persisted=True
     )

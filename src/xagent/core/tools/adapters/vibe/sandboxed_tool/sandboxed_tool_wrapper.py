@@ -216,6 +216,7 @@ class SandboxDependencyManager:
                         sandbox.exec(
                             "pip",
                             "install",
+                            "--user",
                             "--break-system-packages",
                             "-r",
                             "/tmp/requirements.txt",

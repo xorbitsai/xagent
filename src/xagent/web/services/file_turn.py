@@ -71,6 +71,8 @@ class _TurnFileRecordSnapshot:
     storage_status: str | None
     checksum: str | None
     etag: str | None
+    workspace_relative_path: str | None
+    workspace_category: str | None
 
 
 def _task_execution_scope_in_session(
@@ -241,6 +243,16 @@ def _load_turn_file_snapshots(
                     str(record.checksum) if record.checksum is not None else None
                 ),
                 etag=str(record.etag) if record.etag is not None else None,
+                workspace_relative_path=(
+                    str(record.workspace_relative_path)
+                    if record.workspace_relative_path is not None
+                    else None
+                ),
+                workspace_category=(
+                    str(record.workspace_category)
+                    if record.workspace_category is not None
+                    else None
+                ),
             )
         )
 
@@ -272,9 +284,12 @@ def _turn_file_info(
         "name": normalize_filename(original_name),
         "original_name": original_name,
         "size": snapshot.file_size,
+        "checksum": snapshot.checksum,
         "type": snapshot.mime_type,
         "path": str(source_path),
         "workspace_path": None,
+        "workspace_relative_path": snapshot.workspace_relative_path,
+        "workspace_category": snapshot.workspace_category,
     }
 
 

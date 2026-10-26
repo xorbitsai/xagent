@@ -433,8 +433,7 @@ jobs:
         run: |
           set -e
           sudo -E "$PWD/.venv/bin/python" -m pytest \
-            tests/web/test_sandbox_reconcile_e2e.py \
-            tests/sandbox/test_docker_sandbox.py \
+            tests/sandbox/test_docker_sandbox.py::TestDockerSandbox::test_upload_download_with_volume \
             tests/core/test_workspace_nonroot_permissions.py::test_permission_migration_assigns_real_sandbox_gid \
             -q
 

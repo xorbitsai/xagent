@@ -90,6 +90,10 @@ from .db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .db_write_retry import (
+    bound_rerun_lock_wait_no_commit,
+    retry_db_write_async,
+)
 from .external_task_cancel import (
     EXTERNAL_TASK_SOURCE,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
@@ -1173,7 +1177,11 @@ def _task_requires_actor_policy_sync(
 
 
 def _accept_existing_event_input_sync(
-    lease: TaskLease, task_owner_user_id: int, payload: TaskTurnPayload
+    lease: TaskLease,
+    task_owner_user_id: int,
+    payload: TaskTurnPayload,
+    *,
+    rerun: bool = False,
 ) -> None:
     """Record a local V2 execute input before invoking its runtime."""
     from ..models.database import get_session_local
@@ -1181,6 +1189,8 @@ def _accept_existing_event_input_sync(
     from .task_lease_service import lock_task_lease_no_commit
 
     with get_session_local()() as db:
+        if rerun:
+            bound_rerun_lock_wait_no_commit(db)
         if not lock_task_lease_no_commit(db, lease):
             raise TaskLeaseLostError("Lease changed before existing input acceptance")
         append_fact_no_commit(
@@ -1201,6 +1211,29 @@ def _accept_existing_event_input_sync(
             },
         )
         db.commit()
+
+
+async def _accept_existing_event_input(
+    lease: TaskLease, task_owner_user_id: int, payload: TaskTurnPayload
+) -> None:
+    """Record a local V2 execute input, rerunning transient failures.
+
+    The fact's key and payload are fixed by the turn, so a rerun after a lost
+    acknowledgement replays the committed fact instead of appending another.
+    """
+    attempts = 0
+
+    async def attempt() -> None:
+        nonlocal attempts
+        attempts += 1
+        rerun = attempts > 1
+        await run_db_io_cancellation_safe(
+            lambda: _accept_existing_event_input_sync(
+                lease, task_owner_user_id, payload, rerun=rerun
+            )
+        )
+
+    await retry_db_write_async(attempt, site="input_accept")
 
 
 def reserve_task_start_no_commit(
@@ -2560,10 +2593,8 @@ def _schedule_bg(
                         # Local execute has no START acceptance transaction.
                         # Its prior-history snapshot is already fixed; persist
                         # this input under the exact lease before runtime starts.
-                        await run_db_io_cancellation_safe(
-                            lambda: _accept_existing_event_input_sync(
-                                lease, task_owner_user_id, payload
-                            )
+                        await _accept_existing_event_input(
+                            lease, task_owner_user_id, payload
                         )
 
                     scope = await run_db_io_cancellation_safe(

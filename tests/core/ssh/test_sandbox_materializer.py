@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from xagent.core.ssh.errors import SshError
 from xagent.core.ssh.sandbox_materializer import SandboxTmpfsSecretMaterializer
 from xagent.core.ssh.types import SensitiveSshCredential
 from xagent.sandbox.base import ExecResult
@@ -19,10 +20,11 @@ _KNOWN_HOSTS = "host.example ssh-ed25519 AAAABBBB\n"
 
 
 class _FakeSandbox:
-    def __init__(self, *, fail_mkdir: bool = False) -> None:
+    def __init__(self, *, fail_mkdir: bool = False, fail_chmod: bool = False) -> None:
         self.execs: list[tuple[str, ...]] = []
         self.writes: list[tuple[str, str]] = []
         self._fail_mkdir = fail_mkdir
+        self._fail_chmod = fail_chmod
 
     async def exec(
         self, command: str, *args: str, env=None, max_output_bytes=None
@@ -30,6 +32,8 @@ class _FakeSandbox:
         self.execs.append((command, *args))
         if self._fail_mkdir and command == "mkdir":
             return ExecResult(exit_code=1, stdout="", stderr="cannot create")
+        if self._fail_chmod and command == "chmod":
+            return ExecResult(exit_code=1, stdout="", stderr="cannot chmod")
         return ExecResult(exit_code=0, stdout="", stderr="")
 
     async def write_file(
@@ -108,10 +112,22 @@ async def test_dir_removed_on_exception() -> None:
 
 async def test_mkdir_failure_raises_before_yield() -> None:
     sandbox = _FakeSandbox(fail_mkdir=True)
-    with pytest.raises(Exception):  # noqa: B017,PT011
+    with pytest.raises(SshError, match="could not create sandbox secret directory"):
         async with SandboxTmpfsSecretMaterializer().materialize_ssh(
             sandbox, _cred(), _KNOWN_HOSTS
         ):
             pass
     # No secret was written if the private dir could not be created.
     assert sandbox.writes == []
+
+
+async def test_chmod_failure_fails_closed_and_removes_secret_dir() -> None:
+    sandbox = _FakeSandbox(fail_chmod=True)
+
+    with pytest.raises(SshError, match="could not secure sandbox SSH credential files"):
+        async with SandboxTmpfsSecretMaterializer().materialize_ssh(
+            sandbox, _cred(), _KNOWN_HOSTS
+        ):
+            pass
+
+    assert any(call[0] == "rm" for call in sandbox.execs)

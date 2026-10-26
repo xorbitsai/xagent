@@ -304,7 +304,7 @@ async def test_cancellation_during_backoff_stops_retrying(
         await task
 
     assert calls == 1
-    assert _outcomes(counters) == ["retried"]
+    assert _outcomes(counters) == ["retried", "failed"]
 
 
 @pytest.mark.asyncio

@@ -312,6 +312,7 @@ class SkillTools:
             destination = self.workspace.output_dir / dest
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
+            self.workspace.grant_sandbox_access(destination)
             return {
                 "source": f"{record.path or record.source}/{path}",
                 "destination": str(
@@ -340,6 +341,7 @@ class SkillTools:
 
         # Copy file to workspace
         shutil.copy2(source, destination)
+        self.workspace.grant_sandbox_access(destination)
 
         return {
             "source": str(source),
@@ -402,7 +404,7 @@ if TYPE_CHECKING:
 @register_tool(categories={"skill"})
 async def create_skill_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     """Create skill documentation access tools from configuration."""
-    workspace = ToolFactory.create_workspace(config.get_workspace_config())
+    workspace = await ToolFactory.create_workspace_async(config)
     if not workspace:
         return []
 

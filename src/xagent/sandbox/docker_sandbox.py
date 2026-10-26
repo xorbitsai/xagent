@@ -6,18 +6,21 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import errno
 import io
 import logging
 import os
 import posixpath
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 import textwrap
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -28,16 +31,18 @@ from typing import (
     cast,
 )
 
-from docker.errors import APIError, ImageNotFound, NotFound
-
-import docker
+from docker import errors, from_env
 
 from ..config import (
     get_sandbox_image,
     get_sandbox_namespace,
+    get_sandbox_pids_limit,
+    get_uploads_dir,
     validate_sandbox_namespace,
 )
 from .base import (
+    SANDBOX_RUNTIME_GID,
+    SANDBOX_RUNTIME_UID,
     SPEC_CONTRACT_VERSION,
     CodeType,
     ExecResult,
@@ -54,6 +59,7 @@ from .base import (
     SandboxSnapshot,
     SandboxTemplate,
     canonical_sandbox_path,
+    normalize_sandbox_pids_limit,
 )
 from .keyed_lock import KeyedLockRegistry
 
@@ -84,6 +90,14 @@ MANAGED_LABEL_VALUE = "v2"
 CONTAINER_NAME_PREFIX = "xagent_sandbox_"
 SNAPSHOT_REPOSITORY = "xagent-sandbox-snapshot"
 _CPU_NANOS = 1_000_000_000
+_DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-egress-unfiltered-v1"
+
+
+def _effective_pids_limit(config: SandboxConfig) -> int | None:
+    """Resolve Docker's configured default when a caller omits the limit."""
+    if config.pids_limit is not None:
+        return config.pids_limit
+    return get_sandbox_pids_limit()
 
 
 def _ownership_label_filters(namespace: str) -> list[str]:
@@ -169,7 +183,7 @@ def _create_docker_client() -> Any:
     The Docker SDK can also talk to Docker-compatible runtimes such as Podman
     when ``DOCKER_HOST`` points at a compatible socket/service.
     """
-    return cast(Any, docker.from_env())
+    return cast(Any, from_env())
 
 
 def is_docker_available() -> bool:
@@ -312,10 +326,13 @@ def _parse_container_config(container: Container) -> SandboxInfo:
         template = SandboxTemplate(
             type="image", image=str(config_data.get("Image") or "")
         )
+    raw_pids_limit = cast(Optional[int], host_config.get("PidsLimit"))
+    pids_limit = normalize_sandbox_pids_limit(raw_pids_limit)
     config = SandboxConfig(
-        working_dir=str(config_data.get("WorkingDir") or "/home"),
+        working_dir=str(config_data.get("WorkingDir") or "/home/sandbox"),
         cpus=max(1, cpus),
         memory=max(128, memory),
+        pids_limit=pids_limit,
         env=env_map or None,
         volumes=volumes or None,
         network_isolated=bool(
@@ -404,6 +421,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
         image_digest=cast(Optional[str], attrs.get("Image")),
         raw_nano_cpus=cast(Optional[int], host_config.get("NanoCpus")),
         raw_memory_bytes=cast(Optional[int], host_config.get("Memory")),
+        raw_pids_limit=cast(Optional[int], host_config.get("PidsLimit")),
         env=env_map,
         volumes=tuple(volumes),
         ports=tuple(ports),
@@ -556,7 +574,7 @@ def _find_publish_mismatches(
     once the container has actually been created from it, so there is no
     need for a separate label-based check on the snapshot leg.
 
-    cpus/memory are re-checked here (immediately after start, in raw backend
+    cpus/memory/pids are re-checked here (immediately after start, in raw backend
     units) in addition to the live re-check ``spec_matches_inspection`` does
     later: this is the first opportunity to catch e.g. Docker silently
     clamping an out-of-range request, before the container is ever
@@ -570,7 +588,7 @@ def _find_publish_mismatches(
     ``LABEL_SPEC_FINGERPRINT`` over the *entire* desired spec before the
     container starts -- it has to, since Docker offers no way to add or
     change a label on an existing container -- and ``spec_matches_inspection``
-    trusts that one label for every field except cpus/memory, which it
+    trusts that one label for every field except cpus/memory/pids, which it
     re-reads live. Publishing a container whose ``working_dir`` was quietly
     accepted as different would therefore leave a label positively attesting
     a spec the container does not implement, and every later reconcile would
@@ -603,6 +621,9 @@ def _find_publish_mismatches(
         mismatches.append("cpus")
     if (facts.raw_memory_bytes or 0) != int(desired.memory * 1024 * 1024):
         mismatches.append("memory")
+    observed_pids_limit = normalize_sandbox_pids_limit(facts.raw_pids_limit)
+    if observed_pids_limit != desired.pids_limit:
+        mismatches.append("pids_limit")
     return mismatches
 
 
@@ -610,18 +631,48 @@ def _write_tar_from_local_path(
     local_path: str, arcname: str, file_obj: io.BufferedRandom
 ) -> None:
     """Pack a local file into a tar stream for Docker put_archive."""
-    with tarfile.open(fileobj=file_obj, mode="w") as tar:
-        tar.add(local_path, arcname=arcname)
+    # O_NOFOLLOW rejects symlinks, while O_NONBLOCK makes opening a FIFO or
+    # device return promptly so the regular-file check can reject it without
+    # blocking the async caller's event-loop thread.
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(local_path, flags)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError("Sandbox uploads require a regular local file") from exc
+        raise
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Sandbox uploads require a regular local file")
+        info = tarfile.TarInfo(name=arcname)
+        info.size = source_stat.st_size
+        info.mtime = int(source_stat.st_mtime)
+        info.uid = SANDBOX_RUNTIME_UID
+        info.gid = SANDBOX_RUNTIME_GID
+        info.mode = stat.S_IMODE(source_stat.st_mode) & 0o755
+        with os.fdopen(source_fd, "rb", closefd=True) as source:
+            source_fd = -1
+            with tarfile.open(fileobj=file_obj, mode="w") as tar:
+                tar.addfile(info, source)
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
     file_obj.seek(0)
 
 
 def _write_tar_from_content(
-    content: str, arcname: str, file_obj: io.BufferedRandom
+    content: str,
+    arcname: str,
+    file_obj: io.BufferedRandom,
 ) -> None:
     """Pack in-memory text content into a tar stream for Docker put_archive."""
     data = content.encode("utf-8")
     info = tarfile.TarInfo(name=arcname)
     info.size = len(data)
+    info.uid = SANDBOX_RUNTIME_UID
+    info.gid = SANDBOX_RUNTIME_GID
+    info.mode = 0o600
     with tarfile.open(fileobj=file_obj, mode="w") as tar:
         tar.addfile(info, io.BytesIO(data))
     file_obj.seek(0)
@@ -698,7 +749,7 @@ def _archive_path_exists(container: Container, remote_path: str) -> bool:
     try:
         container.get_archive(remote_path)
         return True
-    except NotFound:
+    except errors.NotFound:
         return False
 
 
@@ -801,7 +852,7 @@ class DockerSandbox(Sandbox):
         """Return the managed container or raise if it has been deleted."""
         try:
             await asyncio.to_thread(self._container.reload)
-        except NotFound as e:
+        except errors.NotFound as e:
             raise SandboxNotFoundError(
                 f"Sandbox container not found: {self._name}"
             ) from e
@@ -967,7 +1018,7 @@ class DockerSandbox(Sandbox):
                     stream, _ = await asyncio.to_thread(
                         container.get_archive, remote_path
                     )
-                except NotFound as e:
+                except errors.NotFound as e:
                     raise FileNotFoundError(
                         f"Remote file not found: {remote_path}"
                     ) from e
@@ -1021,7 +1072,7 @@ class DockerSandbox(Sandbox):
                     stream, _ = await asyncio.to_thread(
                         container.get_archive, remote_path
                     )
-                except NotFound as e:
+                except errors.NotFound as e:
                     raise FileNotFoundError(
                         f"Remote file not found: {remote_path}"
                     ) from e
@@ -1036,7 +1087,7 @@ async def _ensure_image(client: Any, image: str) -> None:
     """Ensure the requested image exists locally before container creation."""
     try:
         await asyncio.to_thread(client.images.get, image)
-    except ImageNotFound:
+    except errors.ImageNotFound:
         logger.info("Start pulling sandbox image: %s", image)
         await asyncio.to_thread(client.images.pull, image)
         logger.info("Finish pulling sandbox image: %s", image)
@@ -1108,6 +1159,7 @@ async def _create_container(
     if extra_labels:
         labels.update(extra_labels)
 
+    effective_pids_limit = _effective_pids_limit(config)
     kwargs: dict[str, Any] = {
         "image": image,
         "name": _container_name(name, namespace),
@@ -1116,10 +1168,14 @@ async def _create_container(
         # PID-1 tini forwards SIGTERM so tail exits fast, not on a SIGKILL timeout.
         "init": True,
         "detach": True,
-        # Run as root to match the file access behavior of Boxlite.
-        "user": "root",
+        # Match Dockerfile.sandbox's dedicated runtime identity. Never let
+        # user code or custom stdio MCP processes inherit container root.
+        "user": f"{SANDBOX_RUNTIME_UID}:{SANDBOX_RUNTIME_GID}",
         "working_dir": config.working_dir,
-        "environment": config.env,
+        # Docker does not synthesize HOME when `user` overrides the image
+        # default. Supply the fixed runtime account's home unless an operator
+        # intentionally configured another value.
+        "environment": {"HOME": "/home/sandbox", **(config.env or {})},
         "volumes": volumes,
         "ports": ports,
         "nano_cpus": int((config.cpus or 1) * _CPU_NANOS),
@@ -1127,8 +1183,22 @@ async def _create_container(
         "network_disabled": bool(config.network_isolated),
         # Security config
         "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
         "labels": labels,
     }
+    if effective_pids_limit is not None:
+        kwargs["pids_limit"] = effective_pids_limit
+    guest_paths = [guest for _, guest, _ in (config.volumes or [])]
+    if any(path.startswith("/root/") for path in guest_paths):
+        # The stock image keeps /root at 0700. A private tmpfs supplies only
+        # traversable parents for nested workspace bind mounts; it exposes no
+        # host files and is discarded with the container.
+        kwargs["tmpfs"] = {
+            "/root": (
+                "rw,nosuid,nodev,noexec,size=64k,mode=0711,"
+                f"uid={SANDBOX_RUNTIME_UID},gid={SANDBOX_RUNTIME_GID}"
+            )
+        }
     return cast(
         "Container", await asyncio.to_thread(client.containers.create, **kwargs)
     )
@@ -1470,6 +1540,10 @@ class DockerSandboxService(SandboxService):
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=(
+                    config.security_profile or self.runtime_security_profile()
+                ),
             )
             extra_labels = {
                 LABEL_SPEC_FINGERPRINT: desired.fingerprint(),
@@ -1493,7 +1567,7 @@ class DockerSandboxService(SandboxService):
                     backend_config,
                     extra_labels=extra_labels,
                 )
-            except APIError as exc:
+            except errors.APIError as exc:
                 if exc.status_code == 409 or "already in use" in str(exc):
                     raise SandboxAlreadyExistsError(
                         f"Sandbox already exists: {name!r}"
@@ -1793,14 +1867,78 @@ class DockerSandboxService(SandboxService):
         if image_tag:
             try:
                 await asyncio.to_thread(self._client.images.remove, image=image_tag)
-            except (ImageNotFound, NotFound):
+            except (errors.ImageNotFound, errors.NotFound):
                 logger.info(
                     "Snapshot image already absent during delete: snapshot_id=%s tag=%s",
                     snapshot_id,
                     image_tag,
                 )
-            except APIError as exc:
+            except errors.APIError as exc:
                 raise RuntimeError(
                     f"Failed to delete snapshot {snapshot_id}: {exc}"
                 ) from exc
         self._store.delete_snapshot(snapshot_id)
+
+    def host_workspace_gid(self) -> int | None:
+        return SANDBOX_RUNTIME_GID
+
+    def validate_host_workspace_access(self) -> None:
+        """Exercise the ownership operations required by writable bind mounts."""
+        if os.geteuid() != 0:
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox workspace preparation requires the Xagent "
+                "backend process to run as root."
+            )
+        try:
+            daemon_info = self._client.info()
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                "Cannot inspect the Docker daemon security mode. If a "
+                "docker-socket-proxy is in use, allow the /info endpoint "
+                "(for Tecnativa/docker-socket-proxy, set INFO=1)."
+            ) from exc
+        security_options = daemon_info.get("SecurityOptions") or ()
+        unsupported_daemon_mode = next(
+            (
+                str(option)
+                for option in security_options
+                if any(mode in str(option).lower() for mode in ("rootless", "userns"))
+            ),
+            None,
+        )
+        if unsupported_daemon_mode is not None:
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox writable mounts require a rootful Docker daemon "
+                "without user-namespace remapping; unsupported security option: "
+                f"{unsupported_daemon_mode}."
+            )
+        uploads_root = get_uploads_dir().expanduser()
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        probe: Path | None = None
+        probe_fd = -1
+        try:
+            uploads_root.mkdir(parents=True, exist_ok=True)
+            probe = Path(
+                tempfile.mkdtemp(prefix=".xagent-sandbox-ready-", dir=uploads_root)
+            )
+            probe_fd = os.open(probe, flags)
+            os.fchown(probe_fd, os.geteuid(), SANDBOX_RUNTIME_GID)
+            os.fchmod(probe_fd, 0o2750)
+        except OSError as exc:
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox workspace preparation requires the backend "
+                f"to run as root and assign gid {SANDBOX_RUNTIME_GID}."
+            ) from exc
+        finally:
+            if probe_fd >= 0:
+                os.close(probe_fd)
+            if probe is not None:
+                shutil.rmtree(probe, ignore_errors=True)
+
+    def runtime_security_profile(self) -> str | None:
+        # Docker currently provides non-root/capability hardening but relies
+        # on deployment firewalling for public-only egress.
+        return _DOCKER_RUNTIME_SECURITY_PROFILE
+
+    def runtime_pids_limit(self) -> int | None:
+        return get_sandbox_pids_limit()

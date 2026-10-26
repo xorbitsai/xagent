@@ -6,6 +6,10 @@ scoped keys), the workspace's scoped canonical roots, and the allowed-path
 enforcement confining scoped executions.
 """
 
+import os
+import stat
+from pathlib import Path
+
 import pytest
 
 from xagent.core.execution_scope import (
@@ -146,6 +150,108 @@ class TestScopedWorkspace:
             workspace.workspace_dir
             == (tmp_path / "user_7" / "tenant-a" / "proj-1" / "web_task_5").resolve()
         )
+
+    def test_task_directories_inherit_sandbox_group_write(self, tmp_path, monkeypatch):
+        base = tmp_path / "user_7"
+        base.mkdir()
+        monkeypatch.setattr("xagent.core.workspace.get_uploads_dir", lambda: tmp_path)
+        real_stat = Path.stat
+
+        def sandbox_root_stat(path: Path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == base:
+                values = list(result)
+                values[0] |= stat.S_ISGID
+                values[5] = 1010
+                return os.stat_result(values)
+            return result
+
+        assigned_gids: list[int] = []
+        requested_modes: list[int] = []
+        real_fchmod = os.fchmod
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            requested_modes.append(mode)
+            real_fchmod(fd, mode)
+
+        monkeypatch.setattr(Path, "stat", sandbox_root_stat)
+        monkeypatch.setattr(
+            "xagent.core.workspace.os.fchown",
+            lambda _fd, _uid, gid: assigned_gids.append(gid),
+        )
+        monkeypatch.setattr("xagent.core.workspace.os.fchmod", record_fchmod)
+
+        workspace = TaskWorkspace("web_task_5", str(base))
+
+        assert stat.S_IMODE(real_stat(workspace.workspace_dir).st_mode) & 0o777 == 0o750
+        for directory in (
+            workspace.input_dir,
+            workspace.output_dir,
+            workspace.temp_dir,
+        ):
+            assert stat.S_IMODE(real_stat(directory).st_mode) & 0o777 == 0o770
+        assert (
+            stat.S_IMODE(real_stat(workspace.internal_temp_dir).st_mode) & 0o777
+            == 0o750
+        )
+        # workspace + input/output/temp + the private runtime temp directory.
+        assert assigned_gids == [1010] * 5
+        assert requested_modes == [0o2750, *([0o2770] * 3), 0o2750]
+
+    def test_scoped_parent_chain_and_existing_contents_are_repaired(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr("xagent.core.workspace.get_uploads_dir", lambda: tmp_path)
+        prepared_root = tmp_path / "user_7"
+        base = prepared_root / "tenant-a" / "proj-1"
+        output = base / "web_task_5" / "output"
+        output.mkdir(parents=True)
+        (base / "web_task_5" / "input").mkdir()
+        (base / "web_task_5" / "temp").mkdir()
+        legacy = output / "legacy.txt"
+        legacy.write_text("legacy", encoding="utf-8")
+        legacy.chmod(0o600)
+        (base / "web_task_5" / ".xagent-permissions-v2").write_text("")
+
+        prepared_inode = prepared_root.stat().st_ino
+        real_fstat = os.fstat
+
+        def sandbox_anchor_fstat(fd: int):
+            result = real_fstat(fd)
+            if result.st_ino == prepared_inode:
+                values = list(result)
+                values[0] |= stat.S_ISGID
+                values[5] = 1010
+                return os.stat_result(values)
+            return result
+
+        assigned_gids: list[int] = []
+        requested_modes: list[int] = []
+        real_fchmod = os.fchmod
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            requested_modes.append(mode)
+            real_fchmod(fd, mode)
+
+        monkeypatch.setattr("xagent.core.workspace.os.fstat", sandbox_anchor_fstat)
+        monkeypatch.setattr(
+            "xagent.core.workspace.os.fchown",
+            lambda _fd, _uid, gid: assigned_gids.append(gid),
+        )
+        monkeypatch.setattr(
+            "xagent.core.workspace.os.fchmod",
+            record_fchmod,
+        )
+
+        TaskWorkspace("web_task_5", str(base), scope_segments=SEGMENTS, db_task_id=5)
+
+        assert (
+            stat.S_IMODE((prepared_root / "tenant-a").stat().st_mode) & 0o777 == 0o755
+        )
+        assert stat.S_IMODE(base.stat().st_mode) & 0o777 == 0o755
+        assert stat.S_IMODE(legacy.stat().st_mode) == 0o660
+        assert assigned_gids
+        assert requested_modes.count(0o2750) >= 2
 
     def test_two_scopes_produce_disjoint_workspace_dirs(self, tmp_path):
         ws_a = self._scoped_workspace(tmp_path, ("tenant-a",))

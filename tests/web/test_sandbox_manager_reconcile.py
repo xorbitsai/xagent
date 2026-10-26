@@ -13,6 +13,9 @@ end to end against the fake's small in-memory container/store model (see
 from __future__ import annotations
 
 import ast
+import os
+import stat
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,6 +36,7 @@ from xagent.sandbox.base import (
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
+    grant_sandbox_runtime_access,
 )
 from xagent.web.sandbox_keys import USER_LIFECYCLE_TYPE, make_user_lifecycle_id
 from xagent.web.sandbox_manager import SandboxManager, check_sandbox_static_readiness
@@ -48,6 +52,7 @@ def _env(tmp_path):
             "xagent.web.sandbox_manager.build_code_mount_volumes",
             return_value=[("/repo/src", "/app/src", "ro")],
         ),
+        patch("xagent.web.sandbox_manager.grant_sandbox_runtime_access"),
     ):
         yield
 
@@ -62,6 +67,18 @@ def _make_manager() -> tuple[SandboxManager, FakeSandboxService]:
 
 
 class TestBackendProbeRouting:
+    def test_desired_spec_omits_limits_not_enforced_by_backend(
+        self, _env, tmp_path
+    ) -> None:
+        manager, _service = _make_manager()
+
+        desired = manager._build_runtime_spec(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert desired.pids_limit is None
+        assert desired.security_profile is None
+
     @pytest.mark.asyncio
     async def test_probe_resolved_once_and_cached(self, _env, tmp_path) -> None:
         manager, service = _make_manager()
@@ -255,6 +272,33 @@ class TestReconcileMatrixUnverified:
         service.create.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_v1_store_row_without_hardening_fields_rebuilds(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        service.runtime_pids_limit = lambda: 1024
+        service.runtime_security_profile = lambda: "fake-hardening-v1"
+        intent = _intent(tmp_path)
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        template, config = desired.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped", spec=desired, fingerprint_label=None, version_label=None
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1",
+            state="stopped",
+            template=template,
+            config=config.model_copy(
+                update={"pids_limit": None, "security_profile": None}
+            ),
+        )
+
+        await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_unverified_with_no_store_row_rebuilds(self, _env, tmp_path) -> None:
         manager, service = _make_manager()
         intent = _intent(tmp_path)
@@ -423,7 +467,7 @@ class TestReconcileBudget:
                 state="stopped",
                 spec=stale_spec,
                 fingerprint_label=stale_spec.fingerprint(),
-                version_label="1",
+                version_label=str(SPEC_CONTRACT_VERSION),
             )
 
         _seed_stale()
@@ -506,7 +550,7 @@ class TestReconcileBudget:
             state="stopped",
             spec=stale_spec,
             fingerprint_label=stale_spec.fingerprint(),
-            version_label="1",
+            version_label=str(SPEC_CONTRACT_VERSION),
         )
         await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
         assert manager._reconcile_budget["user::1"] == 0
@@ -605,7 +649,7 @@ class TestReconcileBudget:
             state="stopped",
             spec=stale_spec,
             fingerprint_label=stale_spec.fingerprint(),
-            version_label="1",
+            version_label=str(SPEC_CONTRACT_VERSION),
         )
         with pytest.raises(SandboxRuntimeConflictError):
             await manager.get_or_create_sandbox(
@@ -655,6 +699,47 @@ class TestProviderABA:
 
 
 class TestWorkerReconcileDegradation:
+    @pytest.mark.asyncio
+    async def test_worker_reuses_primary_workspace_preparation_root(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        """A folded external bind must prepare the managed scope, not its
+        operator-owned ancestor, for both the primary and every worker."""
+        operator_root = tmp_path / "data"
+        uploads_root = operator_root / "xagent" / "uploads"
+        uploads_root.mkdir(parents=True)
+        prepare_root = uploads_root / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        grants: list[tuple[Path, Path, Path | None]] = []
+
+        def record_grant(
+            path: Path, *, trusted_root: Path, preserve_through: Path | None = None
+        ) -> None:
+            grants.append((path, trusted_root, preserve_through))
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        provider = await manager.get_or_create_lease_provider(
+            "user",
+            "42",
+            mount_intent=SandboxMountIntent(mount_root=str(operator_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        worker = await provider.get_worker_sandbox(0)
+
+        assert worker is not provider.primary_sandbox
+        assert worker.name == "user::42::worker::0"
+        assert grants == [
+            (prepare_root, operator_root, uploads_root),
+            (prepare_root, operator_root, uploads_root),
+        ]
+
     @pytest.mark.asyncio
     async def test_worker_mismatch_degrades_to_primary(self, _env, tmp_path) -> None:
         """A worker whose reconciliation hits a runtime-config conflict
@@ -822,6 +907,390 @@ class TestProviderCacheMountIntentGate:
         assert second is first
         assert set(service._containers) == {"user::1"}
 
+    @pytest.mark.asyncio
+    async def test_cached_provider_does_not_repeat_mount_preparation(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        prepared: list[Path] = []
+
+        def record_grant(path: Path, **_kwargs) -> None:
+            prepared.append(path)
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        intent = _intent(tmp_path, "user-root")
+        user_root = tmp_path / "user-root"
+
+        first = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent, prepare_root=str(user_root)
+        )
+        second = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent, prepare_root=str(user_root)
+        )
+
+        assert second is first
+        assert prepared == [user_root]
+
+    def test_folded_mount_root_is_the_trusted_grant_anchor(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        grants: list[tuple[Path, Path]] = []
+
+        def record_grant(
+            path: Path, *, trusted_root: Path, preserve_through: Path | None = None
+        ) -> None:
+            grants.append((path, trusted_root))
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        mount_root = tmp_path / "user-root"
+        prepare_root = mount_root / "scopes" / "actor-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "1",
+            SandboxMountIntent(mount_root=str(mount_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert grants == [
+            (mount_root, tmp_path),
+            (prepare_root, mount_root),
+        ]
+
+    def test_folded_ancestor_preserves_operator_owned_uploads_ancestry(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        operator_root = tmp_path / "data"
+        operator_parent = operator_root / "xagent"
+        uploads_root = operator_parent / "uploads"
+        uploads_root.mkdir(parents=True)
+        operator_root.chmod(0o775)
+        operator_parent.chmod(0o771)
+        uploads_root.chmod(0o777)
+        original_modes = {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (operator_root, operator_parent, uploads_root)
+        }
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+        prepare_root = uploads_root / "user_42" / "scope-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(operator_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert {
+            path: stat.S_IMODE(path.stat().st_mode)
+            for path in (operator_root, operator_parent, uploads_root)
+        } == original_modes
+        for managed_path in (uploads_root / "user_42", prepare_root):
+            assert stat.S_IMODE(managed_path.stat().st_mode) & 0o777 == 0o750
+
+    def test_folded_ancestor_uses_physical_suffix_across_symlink(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        operator_root = tmp_path / "data"
+        physical_parent = operator_root / "real"
+        physical_uploads = physical_parent / "uploads"
+        physical_uploads.mkdir(parents=True)
+        uploads_alias_parent = operator_root / "link"
+        uploads_alias_parent.symlink_to(physical_parent, target_is_directory=True)
+        uploads_root = uploads_alias_parent / "uploads"
+        prepare_root = uploads_root / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(operator_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert (physical_uploads / "user_42" / "scope-a").is_dir()
+        assert uploads_alias_parent.is_symlink()
+        assert stat.S_IMODE(operator_root.stat().st_mode) == 0o755
+
+    def test_folded_mount_creates_and_prepares_missing_anchor(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        requested_modes: list[int] = []
+        real_fchmod = os.fchmod
+
+        def record_fchmod(fd: int, mode: int) -> None:
+            requested_modes.append(mode)
+            real_fchmod(fd, mode)
+
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
+        mount_root = tmp_path / "user-root"
+        prepare_root = mount_root / "scopes" / "actor-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "1",
+            SandboxMountIntent(mount_root=str(mount_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert prepare_root.is_dir()
+        for path in (mount_root, mount_root / "scopes", prepare_root):
+            assert stat.S_IMODE(path.stat().st_mode) & 0o777 == 0o750
+        assert requested_modes == [0o2750, 0o2750, 0o2750]
+
+    def test_folded_mount_symlink_alias_prepares_physical_workspace(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        physical_uploads = tmp_path / "physical-uploads"
+        physical_uploads.mkdir(mode=0o755)
+        uploads_alias = tmp_path / "uploads-alias"
+        uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+        prepare_root = physical_uploads / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: physical_uploads
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(uploads_alias)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert prepare_root.is_dir()
+        assert stat.S_IMODE(physical_uploads.stat().st_mode) == 0o755
+        for managed_path in (physical_uploads / "user_42", prepare_root):
+            managed_mode = stat.S_IMODE(managed_path.stat().st_mode)
+            assert managed_mode & 0o777 == 0o750
+            if sys.platform == "linux":
+                assert managed_mode & stat.S_ISGID
+
+    def test_folded_mount_supports_distinct_aliases_to_same_uploads_root(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        physical_uploads = tmp_path / "physical-uploads"
+        physical_uploads.mkdir(mode=0o755)
+        uploads_alias = tmp_path / "uploads-alias"
+        external_alias = tmp_path / "external-alias"
+        uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+        external_alias.symlink_to(physical_uploads, target_is_directory=True)
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_alias
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+        prepare_root = uploads_alias / "user_42" / "scope-a"
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(external_alias)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert (physical_uploads / "user_42" / "scope-a").is_dir()
+
+    def test_folded_mount_rejects_symlink_in_managed_suffix(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        physical_uploads = tmp_path / "physical-uploads"
+        physical_uploads.mkdir(mode=0o755)
+        uploads_alias = tmp_path / "uploads-alias"
+        uploads_alias.symlink_to(physical_uploads, target_is_directory=True)
+        protected = physical_uploads / "protected"
+        protected.mkdir(mode=0o755)
+        redirected_component = physical_uploads / "user_42"
+        redirected_component.symlink_to(protected, target_is_directory=True)
+        prepare_root = redirected_component / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: physical_uploads
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+
+        with pytest.raises(SandboxContractError):
+            manager._prepare_workspace_mounts(
+                "user",
+                "42",
+                SandboxMountIntent(mount_root=str(uploads_alias)),
+                prepare_root=str(prepare_root),
+            )
+
+        assert stat.S_IMODE(protected.stat().st_mode) == 0o755
+        assert not (protected / "scope-a").exists()
+
+    def test_folded_mount_pins_physical_uploads_root_across_symlink(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        physical_root = tmp_path / "physical-root"
+        physical_root.mkdir(mode=0o755)
+        trusted_alias = tmp_path / "trusted-alias"
+        trusted_alias.symlink_to(physical_root, target_is_directory=True)
+        protected = physical_root / "protected"
+        protected.mkdir(mode=0o755)
+        uploads_root = physical_root / "uploads"
+        uploads_root.symlink_to(protected, target_is_directory=True)
+        prepare_root = uploads_root / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(trusted_alias)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert stat.S_IMODE(protected.stat().st_mode) == 0o755
+        assert (protected / "user_42" / "scope-a").is_dir()
+        assert uploads_root.is_symlink()
+
+    def test_legacy_mount_exists_error_remains_best_effort(
+        self, _env, tmp_path, monkeypatch, caplog
+    ) -> None:
+        manager, service = _make_manager()
+        blocked = tmp_path / "blocked"
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: None)
+        monkeypatch.setattr(
+            manager,
+            "_workspace_mount_paths",
+            lambda *_args, **_kwargs: [(blocked, False)],
+        )
+        real_exists = Path.exists
+
+        def restricted_exists(path: Path) -> bool:
+            if path == blocked:
+                raise PermissionError("restricted")
+            return real_exists(path)
+
+        monkeypatch.setattr(Path, "exists", restricted_exists)
+
+        manager._prepare_workspace_mounts("user", "42", None)
+
+        assert "Failed to prepare sandbox workspace mount" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reused_container_still_prepares_managed_mount(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        grants: list[tuple[Path, Path]] = []
+
+        def record_grant(
+            path: Path, *, trusted_root: Path, preserve_through: Path | None = None
+        ) -> None:
+            grants.append((path, trusted_root))
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        intent = _intent(tmp_path, "mount-root")
+        prepare_root = tmp_path / "mount-root" / "task"
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        template, config = desired.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=desired,
+            fingerprint_label=desired.fingerprint(),
+            version_label=str(SPEC_CONTRACT_VERSION),
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1", state="stopped", template=template, config=config
+        )
+
+        await manager.get_or_create_lease_provider(
+            "user",
+            "1",
+            mount_intent=intent,
+            prepare_root=str(prepare_root),
+        )
+
+        assert grants == [
+            (tmp_path / "mount-root", tmp_path),
+            (prepare_root, tmp_path / "mount-root"),
+        ]
+        service.start_existing.assert_awaited_once_with("user::1")
+
 
 class TestReadinessReservedUploadsSubtree:
     """``check_sandbox_static_readiness`` must also reject a static mount
@@ -906,17 +1375,14 @@ class TestReadinessReservedUploadsSubtree:
             with pytest.raises(SandboxRuntimeConflictError):
                 await check_sandbox_static_readiness(manager)
 
-    @pytest.mark.parametrize("guest_path", ["/", "/shared"])
     @pytest.mark.asyncio
-    async def test_root_uploads_dir_allows_non_reserved_mounts(
-        self, tmp_path, guest_path
-    ) -> None:
+    async def test_root_uploads_dir_allows_descendant_mount(self, tmp_path) -> None:
         with (
             patch.dict(
                 "os.environ",
                 {
                     "XAGENT_UPLOADS_DIR": "/",
-                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{guest_path}:rw",
+                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:/shared:rw",
                 },
                 clear=True,
             ),
@@ -1003,17 +1469,91 @@ class TestReadinessReservedUploadsSubtree:
             await check_sandbox_static_readiness(manager)
 
     @pytest.mark.asyncio
-    async def test_allows_mounting_the_uploads_root_itself(self, tmp_path) -> None:
-        """The uploads root itself is an ancestor of every per-user
-        directory, not one of them, so mounting it directly is not a
-        reserved-subtree conflict."""
+    async def test_rejects_writable_mount_covering_uploads_root(self, tmp_path) -> None:
         uploads_dir = tmp_path / "uploads"
         with (
             patch.dict(
                 "os.environ",
                 {
                     "XAGENT_UPLOADS_DIR": str(uploads_dir),
-                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{uploads_dir}:rw",
+                    "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:rw",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            with pytest.raises(SandboxRuntimeConflictError, match="covers"):
+                await check_sandbox_static_readiness(manager)
+
+    def test_rejects_covering_mount_before_workspace_permission_grant(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        uploads_dir = tmp_path / "uploads"
+        prepared: list[Path] = []
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:rw",
+            },
+            clear=True,
+        ):
+            manager, service = _make_manager()
+            monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+            monkeypatch.setattr(
+                sandbox_manager_module,
+                "grant_sandbox_runtime_access",
+                lambda path, **_kwargs: prepared.append(path),
+            )
+
+            with pytest.raises(SandboxRuntimeConflictError, match="covers"):
+                manager._prepare_workspace_mounts(
+                    "user",
+                    "42",
+                    SandboxMountIntent(mount_root=str(uploads_dir)),
+                    prepare_root=str(uploads_dir / "user_42"),
+                )
+
+        assert prepared == []
+        assert not (uploads_dir / "user_42").exists()
+
+    @pytest.mark.asyncio
+    async def test_allows_read_only_mount_covering_uploads_root(self, tmp_path) -> None:
+        uploads_dir = tmp_path / "uploads"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": f"{tmp_path}:{tmp_path / 'guest'}:ro",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_allows_unrelated_source_with_guest_target_covering_uploads(
+        self, tmp_path
+    ) -> None:
+        uploads_dir = tmp_path / "uploads"
+        unrelated_source = tmp_path / "unrelated"
+        unrelated_source.mkdir()
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": (f"{unrelated_source}:{tmp_path}:rw"),
                 },
                 clear=True,
             ),

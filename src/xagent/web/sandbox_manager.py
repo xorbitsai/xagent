@@ -54,6 +54,7 @@ from ..sandbox.base import (
     SandboxTemplate,
     SpecVerdict,
     canonical_sandbox_path,
+    grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
 from .sandbox_keys import (
@@ -158,12 +159,14 @@ class SandboxLeaseProvider:
         lifecycle_id: str,
         primary_sandbox: Sandbox,
         mount_intent: SandboxMountIntent | None,
+        prepare_root: str | None,
         max_concurrency: int,
     ) -> None:
         self._manager = manager
         self._lifecycle_type = lifecycle_type
         self._lifecycle_id = lifecycle_id
         self._mount_intent = mount_intent
+        self._prepare_root = prepare_root
         self._available_slots: asyncio.Queue[int] = asyncio.Queue()
         self._worker_locks: dict[int, asyncio.Lock] = {}
         self._workers: dict[int, Sandbox] = {}
@@ -251,6 +254,7 @@ class SandboxLeaseProvider:
                     self._lifecycle_type,
                     f"{self._lifecycle_id}::worker::{slot}",
                     mount_intent=self._mount_intent,
+                    prepare_root=self._prepare_root,
                 )
             except (SandboxCapacityError, SandboxContractError) as exc:
                 logger.warning(
@@ -642,6 +646,19 @@ class SandboxManager:
         # stage; every entry point here resolves it lazily on first use so
         # this manager is correct with or without that wiring.
         self._backend_probe: bool | None = None
+        # Pin the uploads root's physical identity before any sandbox can
+        # mutate a writable ancestor.  Later grant rebasing must never
+        # realpath the configured uploads spelling after guest code has run.
+        self._uploads_root_lexical = Path(os.path.abspath(get_uploads_dir()))
+        self._uploads_root_physical = Path(os.path.realpath(self._uploads_root_lexical))
+
+    def validate_host_workspace_access(self) -> None:
+        """Validate backend-specific host mount prerequisites."""
+        self._service.validate_host_workspace_access()
+
+    def requires_host_workspace_access(self) -> bool:
+        """Whether this backend needs privileged host bind preparation."""
+        return self._service.host_workspace_gid() is not None
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -875,6 +892,9 @@ class SandboxManager:
         if memory is not None:
             config.memory = memory
 
+        config.pids_limit = self._service.runtime_pids_limit()
+        config.security_profile = self._service.runtime_security_profile()
+
         # ENV
         env = get_sandbox_env()
         if env:
@@ -885,6 +905,11 @@ class SandboxManager:
             host_side_sources=path_mapper.uses_host_storage_root
         )
         if volumes:
+            if self.requires_host_workspace_access():
+                _validate_custom_volumes_for_uploads(
+                    volumes,
+                    path_mapper,
+                )
             config.volumes = volumes
 
         return image, config
@@ -988,10 +1013,10 @@ class SandboxManager:
         The mount root is always created; each extra/allowlist mount is
         created only if it already exists (never freshly created) — same
         split as the historical base_dir(True)/allowed_external_dirs(False)
-        behavior. Called explicitly right before a creation attempt (never
-        on a cache hit or a plain reuse/start_existing), independent of
-        spec/volume-list construction: this is not a side effect threaded
-        through volume-list building.
+        behavior. Called explicitly before creation and before a reconciled
+        start_existing after process restart, but not on an in-process cache
+        hit. It is independent of spec/volume-list construction: this is not
+        a side effect threaded through volume-list building.
 
         ``prepare_root``, when given, overrides *only* the mount root's
         creation target (see ``ChatWorkspaceBinding.prepare_root``): folding
@@ -1001,6 +1026,14 @@ class SandboxManager:
         exist on disk, not necessarily the (possibly shallower) directory
         actually bind-mounted. Extra/allowlist mounts are unaffected.
         """
+
+        if self.requires_host_workspace_access():
+            path_mapper = SandboxPathMapper.from_env()
+            custom_volumes = get_sandbox_volumes(
+                host_side_sources=path_mapper.uses_host_storage_root
+            )
+            _validate_custom_volumes_for_uploads(custom_volumes, path_mapper)
+
         for backend_path, should_create in self._workspace_mount_paths(
             lifecycle_type, lifecycle_id, mount_intent
         ):
@@ -1027,15 +1060,98 @@ class SandboxManager:
                 and str(backend_path) == mount_intent.mount_root
             ):
                 target = Path(prepare_root)
-            try:
-                if should_create or target.exists():
-                    os.makedirs(target, exist_ok=True)
-            except OSError as exc:
-                logger.warning(
-                    "Failed to prepare sandbox workspace mount %s: %s",
-                    target,
-                    exc,
+            if should_create and self.requires_host_workspace_access():
+                # A folded external mount may be an operator-owned ancestor of
+                # the uploads tree. Use that actual bind root only as the
+                # descriptor anchor for the managed descendant; do not chgrp
+                # or chmod the operator-owned ancestor itself.
+                trusted_root = (
+                    backend_path if target != backend_path else get_uploads_dir()
                 )
+                if target != backend_path and not backend_path.exists():
+                    # The first task for a user can arrive before the managed
+                    # per-user mount anchor exists. Create and prepare that
+                    # anchor beneath uploads before using it as the no-follow
+                    # descriptor root for the folded task path.
+                    grant_sandbox_runtime_access(
+                        backend_path, trusted_root=get_uploads_dir()
+                    )
+                grant_target = target
+                preserve_through = trusted_root
+                if target != backend_path:
+                    # Folding compares physical identities but deliberately
+                    # retains the operator's lexical spelling for the bind.
+                    lexical_target = Path(os.path.abspath(target))
+                    uploads_root = self._uploads_root_lexical
+                    managed_uploads_root = (
+                        uploads_root
+                        if lexical_target.is_relative_to(uploads_root)
+                        else self._uploads_root_physical
+                        if lexical_target.is_relative_to(self._uploads_root_physical)
+                        else None
+                    )
+                    if managed_uploads_root is not None:
+                        # The folded bind can be a strict operator-owned
+                        # ancestor of uploads. Walk from that trusted anchor,
+                        # but preserve every component through uploads itself;
+                        # only the managed user/scope suffix may be changed.
+                        physical_trusted_root = Path(os.path.realpath(trusted_root))
+                        try:
+                            managed_suffix = lexical_target.relative_to(
+                                managed_uploads_root
+                            )
+                            if physical_trusted_root.is_relative_to(
+                                self._uploads_root_physical
+                            ):
+                                trusted_managed_suffix = (
+                                    physical_trusted_root.relative_to(
+                                        self._uploads_root_physical
+                                    )
+                                )
+                                remaining_suffix = managed_suffix.relative_to(
+                                    trusted_managed_suffix
+                                )
+                                uploads_suffix = None
+                            else:
+                                uploads_suffix = (
+                                    self._uploads_root_physical.relative_to(
+                                        physical_trusted_root
+                                    )
+                                )
+                        except ValueError as exc:
+                            raise SandboxContractError(
+                                "Docker uploads root is outside its folded bind "
+                                f"root: {target}"
+                            ) from exc
+                        else:
+                            if uploads_suffix is None:
+                                grant_target = trusted_root / remaining_suffix
+                            else:
+                                preserve_through = trusted_root / uploads_suffix
+                                grant_target = preserve_through / managed_suffix
+                    else:
+                        raise SandboxContractError(
+                            "Docker workspace root is outside the managed uploads "
+                            f"tree: {target}"
+                        )
+                grant_sandbox_runtime_access(
+                    grant_target,
+                    trusted_root=trusted_root,
+                    preserve_through=preserve_through,
+                )
+            else:
+                try:
+                    if should_create or target.exists():
+                        os.makedirs(target, exist_ok=True)
+                except OSError:
+                    # Legacy/BoxLite preparation was historically best effort.
+                    # Docker takes the explicit grant path above and still
+                    # fails closed when its ownership contract cannot be met.
+                    logger.warning(
+                        "Failed to prepare sandbox workspace mount %s",
+                        target,
+                        exc_info=True,
+                    )
 
     @staticmethod
     def _config_equivalent(
@@ -1081,6 +1197,8 @@ class SandboxManager:
             volumes=info.config.volumes,
             network_isolated=bool(info.config.network_isolated),
             ports=info.config.ports,
+            pids_limit=info.config.pids_limit,
+            security_profile=info.config.security_profile,
         )
 
     def _build_runtime_spec(
@@ -1097,8 +1215,9 @@ class SandboxManager:
         reconciliation routes compare against this same spec via the
         process-local ``_config_cache``, and the reconciliation route also
         hands it straight to ``service.create()`` / ``spec_matches_inspection()``.
-        Pure — no directory creation or other side effects; see
-        ``_prepare_workspace_mounts`` for that.
+        It does not create directories or mutate the filesystem; it may reject
+        an unsafe custom-volume topology. See ``_prepare_workspace_mounts``
+        for host directory preparation.
         """
         image, config = self._get_sandbox_image_and_config()
         volumes = list(config.volumes) if config.volumes else []
@@ -1115,6 +1234,8 @@ class SandboxManager:
             volumes=volumes,
             network_isolated=bool(config.network_isolated),
             ports=config.ports,
+            pids_limit=config.pids_limit,
+            security_profile=config.security_profile,
         )
 
     def _make_default_volumes(
@@ -1176,6 +1297,7 @@ class SandboxManager:
         lifecycle_id: str,
         *,
         mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Get or create the sandbox for one exact lifecycle name.
 
@@ -1191,7 +1313,10 @@ class SandboxManager:
             async with self._activity_guard:
                 self._touch_locked(base_name)
             return await self._get_or_create_sandbox_locked(
-                lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
 
     async def _get_or_create_sandbox_locked(
@@ -1567,6 +1692,9 @@ class SandboxManager:
         ordinary absent-\\>create path instead, re-inspecting under the
         now-free gate and creating the (confirmed-absent) sandbox fresh.
         """
+        self._prepare_workspace_mounts(
+            lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
+        )
         cap = get_sandbox_max_containers()
         try:
             if cap is None:
@@ -1769,6 +1897,7 @@ class SandboxManager:
             lifecycle_id=lifecycle_id,
             primary_sandbox=primary,
             mount_intent=mount_intent,
+            prepare_root=prepare_root,
             max_concurrency=get_sandbox_max_concurrency(),
         )
 
@@ -1967,10 +2096,8 @@ class SandboxManager:
         (every pop site drops both together), so the comparison never
         degrades to "no cached spec, allow".
 
-        ``prepare_root``, when given, is only consulted on that cache miss
-        (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
-        and ``_prepare_workspace_mounts``; a cache hit never creates
-        directories at all.
+        ``prepare_root`` is used while initially creating or reconciling the
+        sandbox. Cached providers do not repeat mount preparation.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
@@ -2728,6 +2855,56 @@ def _check_no_reserved_uploads_conflict(
             )
 
 
+def _check_no_writable_volume_covering_uploads(
+    volumes: Sequence[tuple[str, str, str]],
+    host_uploads_root: str,
+    *,
+    resolve_host_paths: bool,
+) -> None:
+    """Reject custom rw sources that let a guest replace the uploads root.
+
+    ``SANDBOX_VOLUMES`` is independent of the manager-generated workspace
+    bind. If a custom writable host source covers the uploads root, sandbox
+    code can replace an uploads path component through that other mount before
+    the root backend's next permission grant. Compare sources in the host path
+    domain; a guest destination by itself neither grants nor removes access to
+    the managed host tree. Local sources are resolved to physical identity.
+    Docker-host-only paths retain their lexical spelling because the backend
+    cannot resolve names in the daemon's filesystem namespace.
+    """
+
+    normalize = os.path.realpath if resolve_host_paths else canonical_sandbox_path
+    normalized_uploads = Path(normalize(host_uploads_root))
+    for host_path, _guest_path, mode in volumes:
+        if mode != "rw":
+            continue
+        normalized_host = Path(normalize(host_path))
+        if normalized_uploads == normalized_host or normalized_uploads.is_relative_to(
+            normalized_host
+        ):
+            raise SandboxRuntimeConflictError(
+                "Writable SANDBOX_VOLUMES source "
+                f"{host_path!r} covers the managed uploads source "
+                f"{host_uploads_root!r}. Use a read-only mount or move the "
+                "source outside the uploads ancestry."
+            )
+
+
+def _validate_custom_volumes_for_uploads(
+    volumes: Sequence[tuple[str, str, str]],
+    path_mapper: "SandboxPathMapper",
+) -> tuple[str, str]:
+    """Validate custom mounts and return the reserved guest subtree shape."""
+    backend_uploads_root = absolute_backend_mount_path(get_uploads_dir())
+    uploads_projection = path_mapper.project(backend_uploads_root)
+    _check_no_writable_volume_covering_uploads(
+        volumes,
+        str(uploads_projection.host_source),
+        resolve_host_paths=not path_mapper.uses_host_storage_root,
+    )
+    return _reserved_uploads_user_subtree(path_mapper)
+
+
 async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     """Validate static sandbox mount configuration before serving traffic.
 
@@ -2780,14 +2957,22 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     if not await sandbox_mgr._resolve_backend_probe():
         return
 
+    if sandbox_mgr.requires_host_workspace_access():
+        sandbox_mgr.validate_host_workspace_access()
+
     external_dirs = get_external_upload_dirs()
     if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:
         return
 
     path_mapper = SandboxPathMapper.from_env()
-    volumes = list(
+    custom_volumes = list(
         get_sandbox_volumes(host_side_sources=path_mapper.uses_host_storage_root)
     )
+    guest_uploads_root, reserved_prefix = _validate_custom_volumes_for_uploads(
+        custom_volumes,
+        path_mapper,
+    )
+    volumes = list(custom_volumes)
     volumes.extend(build_code_mount_volumes())
 
     folded_external = dedupe_backend_mount_paths(external_dirs)
@@ -2795,7 +2980,6 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
 
     _check_no_conflicting_readiness_volumes(volumes)
-    guest_uploads_root, reserved_prefix = _reserved_uploads_user_subtree(path_mapper)
     _check_no_reserved_uploads_conflict(volumes, guest_uploads_root, reserved_prefix)
 
 

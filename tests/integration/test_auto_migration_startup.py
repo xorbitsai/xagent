@@ -1357,6 +1357,12 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         async def _resolve_backend_probe(self) -> bool:
             return True
 
+        def requires_host_workspace_access(self) -> bool:
+            return True
+
+        def validate_host_workspace_access(self) -> None:
+            return None
+
         async def cleanup(self) -> None:
             return None
 
@@ -1639,6 +1645,12 @@ async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
         async def _resolve_backend_probe(self) -> bool:
             call_order.append("probe")
             return True
+
+        def requires_host_workspace_access(self) -> bool:
+            return True
+
+        def validate_host_workspace_access(self) -> None:
+            return None
 
         async def cleanup(self) -> None:
             call_order.append("cleanup")

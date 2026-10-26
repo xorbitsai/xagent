@@ -49,6 +49,7 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .release_hold import release_hold
 from .task_admission_execution import (
     AdmissionWaiting,
     admission_execution,
@@ -2031,7 +2032,16 @@ async def dispatch_one_task_command(
     command_db_id: int | None = None,
 ) -> bool:
     if not get_shared_task_execution_enabled():
-        return await _dispatch_task_command(executor, command_db_id=command_db_id)
+        # Combined mode dispatches without a cap, except while a planned
+        # restart holds new execution: the held snapshot then applies the
+        # closed-cap claim rules, so commands that would open an execution
+        # stay pending for the next process while controls and commands of
+        # active tasks are still applied here.
+        return await _dispatch_task_command(
+            executor,
+            command_db_id=command_db_id,
+            cap=build_dispatch_cap_snapshot() if release_hold.closed else None,
+        )
     if not consumes_task_commands():
         return False
     from types import SimpleNamespace
@@ -2117,6 +2127,26 @@ async def dispatch_one_task_command(
 
 
 async def _dispatch_task_command(
+    executor: CommandExecutor,
+    *,
+    command_db_id: int | None = None,
+    cap: DispatchCapSnapshot | None = None,
+) -> bool:
+    """Claim one command and apply it, counted as a release responsibility.
+
+    Counted from before the claim: the claim commits in a worker thread, and
+    the command it claims -- for example input to a task that is active when
+    the cap snapshot was taken -- can open an execution only after that
+    execution's predecessor has already left the manager's tables. Counting
+    the whole attempt leaves no window where a claimed command is invisible.
+    """
+    with release_hold.track("command_dispatch", str(command_db_id or "next")):
+        return await _claim_and_apply_task_command(
+            executor, command_db_id=command_db_id, cap=cap
+        )
+
+
+async def _claim_and_apply_task_command(
     executor: CommandExecutor,
     *,
     command_db_id: int | None = None,
@@ -2331,6 +2361,12 @@ async def dispatch_task_command_promptly(
         _prompt_dispatch_tasks.add(task)
         task.add_done_callback(_consume_prompt_dispatch_result)
         return
+
+
+def prompt_dispatch_count() -> int:
+    """Detached prompt dispatches still running (``dispatch_task_command_promptly``)."""
+
+    return sum(1 for task in _prompt_dispatch_tasks if not task.done())
 
 
 def _consume_prompt_dispatch_result(task: asyncio.Task[bool]) -> None:

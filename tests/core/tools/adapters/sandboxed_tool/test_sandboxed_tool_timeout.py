@@ -157,6 +157,52 @@ async def test_private_payloads_are_removed_when_tool_execution_fails():
     assert any(path.endswith(".b64") for path in cleanup_command[2:])
 
 
+@pytest.mark.asyncio
+async def test_cancellation_drains_init_upload_before_payload_cleanup():
+    class DelayedInitUploadSandbox(RecordingSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upload_started = asyncio.Event()
+            self.release_upload = asyncio.Event()
+            self.upload_count = 0
+            self.events: list[str] = []
+
+        async def write_file(
+            self, content: str, remote_path: str, overwrite: bool = False
+        ) -> None:
+            self.upload_count += 1
+            if self.upload_count == 2:
+                self.upload_started.set()
+                await self.release_upload.wait()
+                self.events.append("upload_finished")
+            await super().write_file(content, remote_path, overwrite)
+
+        async def exec(self, command: str, *args: str, **kwargs: object):
+            if command == "rm":
+                self.events.append("cleanup")
+                for path in args[1:]:
+                    self.files.pop(path, None)
+            return await super().exec(command, *args, **kwargs)
+
+    sandbox = DelayedInitUploadSandbox()
+    wrapper = SandboxedToolWrapper(SecretInitTool("connection-secret"), sandbox)
+    invocation = asyncio.create_task(_run(wrapper, code="argument-secret"))
+
+    await sandbox.upload_started.wait()
+    invocation.cancel()
+    await asyncio.sleep(0)
+
+    assert not invocation.done()
+    assert sandbox.events == []
+
+    sandbox.release_upload.set()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    assert sandbox.events == ["upload_finished", "cleanup"]
+    assert sandbox.files == {}
+
+
 # `timeout -s KILL` also kills itself with the process group, so the exec
 # reports a SIGKILL death: 137 from docker, -9 from boxlite.
 @pytest.mark.asyncio

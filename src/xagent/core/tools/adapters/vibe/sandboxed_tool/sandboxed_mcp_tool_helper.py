@@ -25,6 +25,7 @@ from .sandboxed_tool_wrapper import (
     SANDBOX_SRC_ROOT,
     SandboxDependencyManager,
     _SandboxLeaseProviderLike,
+    _write_sandbox_file_cancellation_safe,
     create_sandboxed_tool,
     resolve_primary_sandbox,
 )
@@ -118,8 +119,11 @@ async def list_tools_in_sandbox(
         # Cleanup still runs if the backend creates the file and then reports
         # an upload failure, so a partially written credential payload cannot
         # survive this listing attempt.
-        await target_sandbox.write_file(
-            _serialize_connection(connection), connection_file, overwrite=False
+        await _write_sandbox_file_cancellation_safe(
+            target_sandbox,
+            _serialize_connection(connection),
+            connection_file,
+            overwrite=False,
         )
         try:
             result = await asyncio.wait_for(

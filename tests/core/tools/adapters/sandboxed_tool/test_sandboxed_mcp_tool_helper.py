@@ -4,6 +4,7 @@ Uses plain mocks instead of boxlite: these exercise only the
 Sandbox-vs-SandboxLeaseProvider unwrap logic, not real sandbox execution.
 """
 
+import asyncio
 import json
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -120,6 +121,51 @@ async def test_list_tools_in_sandbox_cleans_partial_connection_upload():
         await list_tools_in_sandbox(sandbox, connection)
 
     sandbox.exec.assert_any_await("rm", "-f", ANY, ANY)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drains_connection_upload_before_cleanup():
+    sandbox = _make_plain_sandbox([])
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+    uploaded_paths: set[str] = set()
+    events: list[str] = []
+
+    async def delayed_write(
+        _content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
+        assert not overwrite
+        upload_started.set()
+        await release_upload.wait()
+        uploaded_paths.add(remote_path)
+        events.append("upload_finished")
+
+    async def exec_with_cleanup(command: str, *args: str, **_kwargs: object):
+        if command == "rm":
+            events.append("cleanup")
+            for path in args[1:]:
+                uploaded_paths.discard(path)
+        return _make_exec_result()
+
+    sandbox.write_file.side_effect = delayed_write
+    sandbox.exec.side_effect = exec_with_cleanup
+    connection = {"transport": "stdio", "command": "python", "args": ["server.py"]}
+
+    with patch.object(SandboxDependencyManager, "ensure_requirements", new=AsyncMock()):
+        listing = asyncio.create_task(list_tools_in_sandbox(sandbox, connection))
+        await upload_started.wait()
+        listing.cancel()
+        await asyncio.sleep(0)
+
+        assert not listing.done()
+        assert events == []
+
+        release_upload.set()
+        with pytest.raises(asyncio.CancelledError):
+            await listing
+
+    assert events == ["upload_finished", "cleanup"]
+    assert uploaded_paths == set()
 
 
 @pytest.mark.asyncio

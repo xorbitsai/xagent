@@ -58,6 +58,50 @@ SANDBOX_BASE_DEPENDENCIES = [
 ]
 
 
+async def _write_sandbox_file_cancellation_safe(
+    sandbox: Sandbox,
+    content: str,
+    remote_path: str,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Finish an in-flight upload before propagating caller cancellation.
+
+    Docker file writes use ``asyncio.to_thread`` internally. Cancelling the
+    await does not stop that worker, so cleanup could otherwise delete the
+    destination before the worker recreates it. Shield and drain the owned
+    upload task first; its own failure still propagates normally when the
+    caller was not cancelled.
+    """
+    upload = asyncio.create_task(
+        sandbox.write_file(content, remote_path, overwrite=overwrite)
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(upload)
+        except asyncio.CancelledError as error:
+            current = asyncio.current_task()
+            caller_is_cancelling = current is not None and current.cancelling() > 0
+            if not caller_is_cancelling:
+                raise
+            if cancellation is None:
+                cancellation = error
+            if not upload.done():
+                continue
+            try:
+                upload.result()
+            except BaseException as upload_error:
+                raise cancellation from upload_error
+        except BaseException as upload_error:
+            if cancellation is not None:
+                raise cancellation from upload_error
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return
+
+
 class _StaticSandboxLease:
     """Async context manager that exposes one fixed sandbox."""
 
@@ -681,13 +725,15 @@ class SandboxedToolWrapper(AbstractBaseTool):
                 # Ensure dependencies are installed
                 await self._ensure_dependencies(sandbox)
                 try:
-                    await sandbox.write_file(
+                    await _write_sandbox_file_cancellation_safe(
+                        sandbox,
                         json.dumps(dict(args), ensure_ascii=False),
                         args_file,
                         overwrite=False,
                     )
                     if self._init_params_b64 is not None:
-                        await sandbox.write_file(
+                        await _write_sandbox_file_cancellation_safe(
+                            sandbox,
                             self._init_params_b64,
                             init_params_file,
                             overwrite=False,

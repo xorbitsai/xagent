@@ -910,6 +910,48 @@ def test_run_report_trims_rows_and_flags_truncated_when_still_over_budget(monkey
     assert "still-processing" in result["note"]
 
 
+def test_run_report_returns_bounded_error_when_query_envelope_exceeds_budget(
+    monkeypatch,
+):
+    """A large but valid filter can make the required query echo exceed the
+    output cap even when GA4 returns no rows. The query and totals identify
+    the report and must not be silently truncated, so return a compact error
+    rather than an oversized success payload that the platform would cut into
+    invalid JSON."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "totals": [{"metricValues": [{"value": "0"}]}],
+                "rowCount": 0,
+            }
+        )
+    )
+    monkeypatch.setattr(google_analytics.requests, "request", mock_request)
+    monkeypatch.setattr(google_analytics, "get_tool_max_output_length", lambda: 4096)
+    dimension_filter = {
+        "filter": {
+            "fieldName": "pagePath",
+            "inListFilter": {"values": [f"/{i:02d}-" + "x" * 124 for i in range(40)]},
+        }
+    }
+
+    response = google_analytics.google_analytics_run_report(
+        "42",
+        metrics=["sessions"],
+        date_ranges=[{"start_date": "7daysAgo", "end_date": "yesterday"}],
+        dimensions=["pagePath"],
+        dimension_filter=dimension_filter,
+    )
+
+    result = json.loads(response)
+    assert result["status"] == "error"
+    assert "cannot fit the configured output limit" in result["message"]
+    assert len(response) <= 4096
+    body = mock_request.call_args.kwargs["json"]
+    assert body["dimensionFilter"] == dimension_filter
+    assert body["metricAggregations"] == ["TOTAL"]
+
+
 def test_run_report_passes_metric_filter_and_offset(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"rowCount": 0}))
     monkeypatch.setattr(google_analytics.requests, "request", mock_request)

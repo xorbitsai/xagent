@@ -602,6 +602,22 @@ def google_analytics_run_report(
                 f"{api_returned_count} to {len(rows)} rows to stay under "
                 f"the {max_output_length}-char output limit"
             )
+        if len(response) > max_output_length:
+            # Rows are the only optional part we can safely discard. The
+            # echoed query identifies which property/range/filter produced
+            # the totals, so truncating either query or totals would make the
+            # result ambiguous or incorrect. Return a small, valid JSON error
+            # instead of letting the platform cut an oversized success
+            # response at an arbitrary character boundary.
+            logger.warning(
+                "Google Analytics run_report metadata and totals exceed the "
+                f"{max_output_length}-char output limit after all rows were removed"
+            )
+            return _error(
+                "Google Analytics report metadata and totals cannot fit the "
+                "configured output limit even with all rows removed. Narrow "
+                "the filters or request fewer metrics and dimensions."
+            )
         return response
     except Exception as e:
         # !r escapes embedded newlines, keeping a crafted property_id from

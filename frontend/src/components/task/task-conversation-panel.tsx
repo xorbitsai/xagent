@@ -69,6 +69,7 @@ const INTERRUPTION_NOTICE_KEYS = {
   lease_expired: "taskInterruption.leaseExpired",
   persistence_failure: "taskInterruption.persistenceFailure",
   llm_unavailable: "taskInterruption.llmUnavailable",
+  model_output_invalid: "taskInterruption.modelOutputInvalid",
 } as const
 
 const interruptionNoticeKey = (reason: string) =>
@@ -85,6 +86,8 @@ const AUTO_RESUME_STOPPED_KEYS = {
   superseded: "taskInterruption.autoResumeStoppedSuperseded",
   failed: "taskInterruption.autoResumeStoppedFailed",
   disabled: "taskInterruption.autoResumeStoppedDisabled",
+  cancelled: "taskInterruption.autoResumeStoppedCancelled",
+  ineligible: "taskInterruption.autoResumeStoppedIneligible",
 } as const
 
 const autoResumeNotice = (
@@ -838,6 +841,9 @@ export function TaskConversationPanel({
     && state.currentTask.status === "paused"
     ? state.currentTask.autoResume
     : undefined
+  const showStoppedResumeAction = autoResume?.status === "stopped"
+    && autoResume.stopReason !== "superseded"
+    && taskControlsEnabled
   // The virtual message belongs to the latest turn, so it follows that turn's
   // stopped record the same way the process groups above do, including taking
   // no task-id failure reference. It only appears while the turn has no answer
@@ -881,10 +887,23 @@ export function TaskConversationPanel({
           </div>
         )}
         {(autoResume || interruptionReason) && (
-          <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-            {autoResume
-              ? autoResumeNotice(autoResume, t, locale)
-              : t(interruptionNoticeKey(interruptionReason as string))}
+          <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 flex items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            <span className="flex-1">
+              {autoResume
+                ? autoResumeNotice(autoResume, t, locale)
+                : t(interruptionNoticeKey(interruptionReason as string))}
+            </span>
+            {showStoppedResumeAction && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={resumeTask}
+                className="shrink-0 border-amber-400 bg-transparent hover:bg-amber-100 dark:hover:bg-amber-900"
+              >
+                {t("agent.input.actions.resumeTask")}
+              </Button>
+            )}
           </div>
         )}
         <div className="flex-1 overflow-y-auto">

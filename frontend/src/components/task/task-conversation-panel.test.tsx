@@ -327,6 +327,7 @@ describe("TaskConversationPanel", () => {
     ["lease_expired", "taskInterruption.leaseExpired"],
     ["persistence_failure", "taskInterruption.persistenceFailure"],
     ["llm_unavailable", "taskInterruption.llmUnavailable"],
+    ["model_output_invalid", "taskInterruption.modelOutputInvalid"],
     ["shutdown", "taskInterruption.paused"],
   ])("explains a %s pause and drops the notice once the task leaves paused", (reason, key) => {
     appState.currentTask = { id: "42", status: "paused", autoRecovery: { reason } }
@@ -346,9 +347,11 @@ describe("TaskConversationPanel", () => {
     [{ status: "stopped", stopReason: "expired" }, "taskInterruption.autoResumeStoppedExpired"],
     [{ status: "stopped", stopReason: "superseded" }, "taskInterruption.autoResumeStoppedSuperseded"],
     [{ status: "stopped", stopReason: "failed" }, "taskInterruption.autoResumeStoppedFailed"],
+    [{ status: "stopped", stopReason: "cancelled" }, "taskInterruption.autoResumeStoppedCancelled"],
+    [{ status: "stopped", stopReason: "ineligible" }, "taskInterruption.autoResumeStoppedIneligible"],
     // A time that does not parse falls back to the plain scheduled copy.
     [{ status: "scheduled", nextAttemptAt: "not a time" }, "taskInterruption.autoResumeScheduled"],
-    [{ status: "stopped", stopReason: "ineligible" }, "taskInterruption.autoResumeStopped"],
+    [{ status: "stopped", stopReason: "other" }, "taskInterruption.autoResumeStopped"],
   ])("says what automatic resume is doing (%o)", (autoResume, key) => {
     appState.currentTask = {
       id: "42",
@@ -361,6 +364,34 @@ describe("TaskConversationPanel", () => {
     appState.currentTask = { ...appState.currentTask, status: "running" }
     rerender(<TaskConversationPanel mode="page" />)
     expect(screen.queryByTestId("task-interruption-notice")).not.toBeInTheDocument()
+  })
+
+  it("offers manual resume after automatic resume stops, except when superseded", () => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: {
+        status: "stopped",
+        stopReason: "expired",
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+    fireEvent.click(screen.getByRole("button", { name: "agent.input.actions.resumeTask" }))
+    expect(resumeTaskMock).toHaveBeenCalledTimes(1)
+
+    appState.currentTask = {
+      ...appState.currentTask,
+      autoResume: {
+        status: "stopped",
+        stopReason: "superseded",
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
   })
 
   it("does not show the previous task's automatic-resume notice after a switch", () => {

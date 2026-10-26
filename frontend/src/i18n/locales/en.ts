@@ -23,6 +23,7 @@ const en = {
     leaseExpired: "This task was paused because the server running it stopped. Click resume to continue.",
     persistenceFailure: "This task was paused because the database was unavailable. Click resume to continue.",
     llmUnavailable: "This task was paused because the model provider was unavailable. Click resume to continue.",
+    modelOutputInvalid: "The model returned an invalid response. Regenerating automatically.",
     autoResumeScheduled: "This task was paused by a system interruption and will resume automatically.",
     autoResumeScheduledAt: "This task was paused by a system interruption and will resume automatically at about {time}.",
     autoResumeResuming: "Resuming this task automatically after a system interruption.",
@@ -32,6 +33,8 @@ const en = {
     autoResumeStoppedSuperseded: "Automatic resume stopped because a later scheduled run replaced this one.",
     autoResumeStoppedFailed: "Automatic resume could not be started. Click resume to continue.",
     autoResumeStoppedDisabled: "Automatic resume is turned off. Click resume to continue.",
+    autoResumeStoppedCancelled: "Automatic resume was cancelled. Click resume to continue.",
+    autoResumeStoppedIneligible: "This task cannot resume automatically. Click resume to continue.",
   },
   clientErrors: {
     executionQueueFull: "The team execution queue is full. Please retry shortly.",

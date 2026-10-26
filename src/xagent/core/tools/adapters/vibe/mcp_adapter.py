@@ -481,6 +481,35 @@ _DURABLE_UPLOAD_OWN_FILE_ID_TOOLS: frozenset[tuple[str, str]] = frozenset(
     {("google-drive", "google_drive_update_file_content")}
 )
 
+
+@dataclass(frozen=True)
+class _ExternalMediaBinding:
+    file_argument: str
+    url_argument: str
+    purpose: str
+
+
+# These built-in tools do not upload bytes themselves. The host converts one
+# exact registered FileRef into a purpose-bound URL and substitutes that URL
+# only for the duration of the MCP call.
+_EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
+    ("instagram", "instagram_publish_image"): _ExternalMediaBinding(
+        file_argument="file_path",
+        url_argument="image_url",
+        purpose="instagram-publish",
+    ),
+}
+_EXTERNAL_MEDIA_FILE_NOT_FOUND = "file_id not found or not accessible."
+_EXTERNAL_MEDIA_FILE_REF_REQUIRED = (
+    "file_path must be a registered file_id or file:<id>."
+)
+_EXTERNAL_MEDIA_EXCLUSIVE_SOURCE = "Provide exactly one of image_url or file_path."
+
+
+class _ExternalMediaPreparationError(ValueError):
+    """A public-safe external-media preparation failure."""
+
+
 # Built-in connector tools that create a real binary under the current task
 # workspace. Their result is annotated with a durable FileRef at the host
 # boundary, so later turns and connectors can use the registered artifact even
@@ -552,6 +581,16 @@ def _workspace_download_field(server_name: str, tool_name: str) -> str | None:
     from .....builtin_identity import canonicalize_builtin_identity
 
     return _WORKSPACE_DOWNLOAD_FIELDS.get(
+        (canonicalize_builtin_identity(server_name) or "", tool_name)
+    )
+
+
+def _external_media_binding(
+    server_name: str, tool_name: str
+) -> _ExternalMediaBinding | None:
+    from .....builtin_identity import canonicalize_builtin_identity
+
+    return _EXTERNAL_MEDIA_BINDINGS.get(
         (canonicalize_builtin_identity(server_name) or "", tool_name)
     )
 
@@ -2145,6 +2184,7 @@ class MCPToolAdapter(AbstractBaseTool):
         workspace: Any | None = None,
         durable_upload_fields: tuple[str, ...] = (),
         durable_upload_own_file_id: bool = False,
+        external_media_binding: _ExternalMediaBinding | None = None,
         workspace_download_field: str | None = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
@@ -2170,6 +2210,8 @@ class MCPToolAdapter(AbstractBaseTool):
             durable_upload_own_file_id: Whether the tool's own ``file_id``
                 argument is not a workspace file, so the FileRef wording names
                 ``durable_upload_fields`` instead of "file_id".
+            external_media_binding: Host-owned contract that converts a
+                registered image FileRef into a purpose-bound provider URL.
             workspace_download_field: Host-owned result field for a built-in
                 connector download that should be registered as a durable
                 FileRef.
@@ -2203,6 +2245,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self._workspace = workspace
         self._durable_upload_fields = durable_upload_fields
         self._durable_upload_own_file_id = durable_upload_own_file_id
+        self._external_media_binding = external_media_binding
         self._workspace_download_field = workspace_download_field
         self._is_excel_tool = (
             self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
@@ -2292,6 +2335,12 @@ class MCPToolAdapter(AbstractBaseTool):
             description += _durable_upload_note(
                 self._durable_upload_fields,
                 own_file_id=self._durable_upload_own_file_id,
+            )
+        if self._workspace is not None and self._external_media_binding is not None:
+            description += (
+                " A registered workspace image (file:<id>) may be supplied for "
+                f"`{self._external_media_binding.file_argument}`; the host gives "
+                "the provider temporary access only while this tool runs."
             )
         if self._workspace is not None and self._signed_upload is not None:
             description += (
@@ -3089,6 +3138,44 @@ class MCPToolAdapter(AbstractBaseTool):
             await self._discard_external_upload_args(staged)
             raise
 
+    async def _substitute_external_media_args(
+        self, tool_args: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        binding = self._external_media_binding
+        workspace = self._workspace
+        prepared = dict(tool_args)
+        if binding is None or workspace is None:
+            return prepared, {}
+
+        raw_file = prepared.get(binding.file_argument)
+        if raw_file is None or (isinstance(raw_file, str) and not raw_file.strip()):
+            return prepared, {}
+        raw_url = prepared.get(binding.url_argument)
+        if raw_url is not None and (
+            not isinstance(raw_url, str) or bool(raw_url.strip())
+        ):
+            raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_EXCLUSIVE_SOURCE)
+
+        file_id = _file_ref_value(raw_file)
+        if file_id is None:
+            raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_FILE_REF_REQUIRED)
+        try:
+            external_url = await self._run_upload_staging_operation(
+                workspace.issue_external_media_url_detached,
+                file_id,
+                binding.purpose,
+            )
+        except FileNotFoundError:
+            raise _ExternalMediaPreparationError(
+                _EXTERNAL_MEDIA_FILE_NOT_FOUND
+            ) from None
+        except ValueError as exc:
+            raise _ExternalMediaPreparationError(str(exc)) from None
+
+        prepared.pop(binding.file_argument, None)
+        prepared[binding.url_argument] = external_url
+        return prepared, {external_url: f"file:{file_id}"}
+
     async def _discard_external_upload_args(self, staged: list[Any]) -> None:
         workspace = self._workspace
         if workspace is None:
@@ -3284,6 +3371,14 @@ class MCPToolAdapter(AbstractBaseTool):
                     own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
+            try:
+                (
+                    tool_args,
+                    external_media_replacements,
+                ) = await self._substitute_external_media_args(tool_args)
+            except _ExternalMediaPreparationError as exc:
+                await self._discard_external_upload_args(staged_uploads)
+                return {"content": [{"text": str(exc)}], "is_error": True}
 
             # Pydantic inserts declared defaults before this point. Validate
             # only values supplied by the model. Runtime-bound fields are
@@ -3385,7 +3480,13 @@ class MCPToolAdapter(AbstractBaseTool):
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
                     return _replace_exact_string_values(
-                        _replace_staged_upload_paths(result, staged_upload_sources),
+                        _replace_staged_upload_paths(
+                            result,
+                            {
+                                **staged_upload_sources,
+                                **external_media_replacements,
+                            },
+                        ),
                         replacements,
                     )
             finally:
@@ -4391,6 +4492,7 @@ def _build_mcp_tool_adapter(
         durable_upload_own_file_id=_durable_upload_has_own_file_id(
             server_name, mcp_tool.name
         ),
+        external_media_binding=_external_media_binding(server_name, mcp_tool.name),
         workspace_download_field=_workspace_download_field(server_name, mcp_tool.name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,

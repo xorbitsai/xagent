@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -209,7 +210,7 @@ def test_route_issues_and_redeems_get_and_head(
     uploads_dir = tmp_path / "uploads"
     image_path = uploads_dir / "user_7" / "web_task_11" / "launch.png"
     image_path.parent.mkdir(parents=True)
-    image_path.write_bytes(b"image-bytes")
+    Image.new("RGB", (640, 640), "blue").save(image_path)
     monkeypatch.setattr(files, "get_uploads_dir", lambda: uploads_dir)
     file_id = str(uuid4())
     _record(
@@ -227,10 +228,11 @@ def test_route_issues_and_redeems_get_and_head(
     head = client.head(path)
 
     assert response.status_code == 200
-    assert response.content == b"image-bytes"
-    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\xff\xd8")
+    assert response.headers["content-type"] == "image/jpeg"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert response.headers["content-disposition"].startswith("inline;")
+    assert "launch.jpg" in response.headers["content-disposition"]
     assert response.headers["referrer-policy"] == "no-referrer"
     assert head.status_code == 200
     assert head.content == b""

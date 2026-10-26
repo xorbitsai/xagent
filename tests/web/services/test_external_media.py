@@ -1,9 +1,9 @@
-from pathlib import Path
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 import pytest
+from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -34,9 +34,10 @@ class _DB:
 def _record(
     file_id: str,
     *,
-    filename: str = "launch.png",
+    filename: str | None = None,
     mime_type: str = "image/png",
 ) -> UploadedFile:
+    filename = filename or ("launch.jpg" if mime_type == "image/jpeg" else "launch.png")
     return UploadedFile(
         file_id=file_id,
         user_id=7,
@@ -53,7 +54,7 @@ def _record(
 
 def test_issue_uses_direct_durable_url_when_available(monkeypatch):
     file_id = str(uuid4())
-    record = _record(file_id)
+    record = _record(file_id, mime_type="image/jpeg")
     monkeypatch.delenv("XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS", raising=False)
     monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
     monkeypatch.setattr(
@@ -112,7 +113,9 @@ def test_issue_falls_back_to_public_ticket_url(monkeypatch):
     monkeypatch.setattr(
         external_media.ManagedFileRef,
         "signed_access_url",
-        lambda self, **kwargs: None,
+        lambda self, **kwargs: (
+            "https://objects.example.test/launch.png?signature=secret"
+        ),
     )
 
     issued = external_media.issue_external_media_url(
@@ -131,6 +134,7 @@ def test_issue_falls_back_to_public_ticket_url(monkeypatch):
         _DB(record), file_id=file_id, ticket=ticket
     )
     assert redeemed.record.file_id == record.file_id
+    assert redeemed.purpose is external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH
     assert redeemed.media_type == "image/png"
 
 
@@ -243,7 +247,7 @@ def test_external_media_endpoint_serves_inline_without_caching(monkeypatch, tmp_
     file_id = str(uuid4())
     record = _record(file_id)
     image_path = tmp_path / "launch.png"
-    image_path.write_bytes(b"image-bytes")
+    Image.new("RGB", (640, 640), "blue").save(image_path)
 
     monkeypatch.setattr(
         files,
@@ -271,8 +275,24 @@ def test_external_media_endpoint_serves_inline_without_caching(monkeypatch, tmp_
 
     response = files.external_media_file(file_id, ticket="ticket", db=_DB(record))
 
-    assert Path(response.path) == image_path
-    assert response.media_type == "image/png"
+    assert response.body.startswith(b"\xff\xd8")
+    assert response.media_type == "image/jpeg"
     assert response.headers["cache-control"] == "no-store, max-age=0"
     assert response.headers["content-disposition"].startswith("inline;")
+    assert "launch.jpg" in response.headers["content-disposition"]
     assert response.headers["referrer-policy"] == "no-referrer"
+
+
+def test_instagram_jpeg_conversion_flattens_alpha_and_pads_aspect_ratio(tmp_path):
+    source = tmp_path / "tall.png"
+    Image.new("RGBA", (100, 300), (255, 0, 0, 128)).save(source)
+
+    converted = external_media.instagram_jpeg_bytes(source)
+    output = tmp_path / "converted.jpg"
+    output.write_bytes(converted)
+
+    with Image.open(output) as image:
+        assert image.format == "JPEG"
+        assert image.mode == "RGB"
+        assert image.width >= 320
+        assert image.width / image.height == pytest.approx(0.8, rel=0.01)

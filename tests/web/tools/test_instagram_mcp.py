@@ -213,6 +213,10 @@ def test_publish_image_creates_container_then_publishes(monkeypatch):
                 "caption": "Launch visual",
             }
             return MockResponse({"id": "container-1"})
+        if url == "https://graph.facebook.com/v25.0/container-1":
+            assert method == "GET"
+            assert kwargs["params"] == {"fields": "status_code,status"}
+            return MockResponse({"status_code": "FINISHED"})
         assert url == "https://graph.facebook.com/v25.0/ig-1/media_publish"
         assert method == "POST"
         assert kwargs["data"] == {"creation_id": "container-1"}
@@ -231,6 +235,113 @@ def test_publish_image_creates_container_then_publishes(monkeypatch):
         "container_id": "container-1",
         "media_id": "media-1",
     }
+
+
+def test_publish_image_waits_for_container_processing(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    statuses = iter(["IN_PROGRESS", "IN_PROGRESS", "FINISHED"])
+    sleep = Mock()
+    monkeypatch.setattr(instagram.time, "sleep", sleep)
+
+    def request(method, url, **kwargs):
+        if url.endswith("/ig-1/media"):
+            return MockResponse({"id": "container-1"})
+        if url.endswith("/container-1"):
+            return MockResponse({"status_code": next(statuses)})
+        return MockResponse({"id": "media-1"})
+
+    monkeypatch.setattr(instagram.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        instagram.instagram_publish_image("ig-1", "https://example.com/image.jpg")
+    )
+
+    assert result["status"] == "success"
+    assert sleep.call_count == 2
+
+
+def test_publish_image_stops_when_container_processing_fails(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    requests_seen = []
+
+    def request(method, url, **kwargs):
+        requests_seen.append(url)
+        if url.endswith("/ig-1/media"):
+            return MockResponse({"id": "container-1"})
+        return MockResponse({"status_code": "ERROR"})
+
+    monkeypatch.setattr(instagram.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        instagram.instagram_publish_image("ig-1", "https://example.com/image.jpg")
+    )
+
+    assert result == {
+        "status": "error",
+        "message": "Instagram media processing failed",
+    }
+    assert not any(url.endswith("/media_publish") for url in requests_seen)
+
+
+def test_publish_image_requires_exactly_one_source(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    missing = _payload(instagram.instagram_publish_image("ig-1"))
+    duplicate = _payload(
+        instagram.instagram_publish_image(
+            "ig-1",
+            "https://example.com/image.jpg",
+            file_path="file:31218a9f-1497-4216-9f75-1fc8d51368c4",
+        )
+    )
+
+    expected = {
+        "status": "error",
+        "message": "Provide exactly one of image_url or file_path",
+    }
+    assert missing == expected
+    assert duplicate == expected
+    mock_request.assert_not_called()
+
+
+def test_publish_image_file_ref_requires_host_resolution(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(instagram.requests, "request", mock_request)
+
+    result = _payload(
+        instagram.instagram_publish_image(
+            "ig-1", file_path="file:31218a9f-1497-4216-9f75-1fc8d51368c4"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "resolved by the Xagent host" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_publish_error_redacts_temporary_image_url(monkeypatch, caplog):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    signed_url = "https://api.example.test/media?ticket=temporary-secret"
+    body = {"error": {"message": f"Could not fetch {signed_url}", "code": 9004}}
+    monkeypatch.setattr(
+        instagram.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                body,
+                text=json.dumps(body),
+                status_code=400,
+            )
+        ),
+    )
+
+    result = _payload(instagram.instagram_publish_image("ig-1", signed_url))
+
+    assert result["status"] == "error"
+    assert signed_url not in json.dumps(result)
+    assert signed_url not in caplog.text
+    assert "[redacted]" in json.dumps(result)
 
 
 def test_publish_image_rejects_non_public_url(monkeypatch):

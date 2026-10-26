@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
+from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -71,6 +73,13 @@ class RedeemedExternalMedia:
     record: UploadedFile
     purpose: ExternalMediaPurpose
     media_type: str
+
+
+INSTAGRAM_MAX_JPEG_BYTES = 8 * 1024 * 1024
+INSTAGRAM_MIN_ASPECT_RATIO = 4 / 5
+INSTAGRAM_MAX_ASPECT_RATIO = 1.91
+INSTAGRAM_MIN_WIDTH = 320
+INSTAGRAM_MAX_WIDTH = 1440
 
 
 def _normalized_file_id(value: str) -> str:
@@ -174,7 +183,15 @@ def issue_external_media_url(
             raise ExternalMediaUnavailable(
                 "Registered image could not be prepared for external delivery"
             ) from exc
-    if signed_url and urlsplit(signed_url).scheme == "https":
+    direct_format_supported = not (
+        purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+        and media_type not in {"image/jpeg", "image/jpg"}
+    )
+    if (
+        direct_format_supported
+        and signed_url
+        and urlsplit(signed_url).scheme == "https"
+    ):
         return ExternalMediaURL(
             url=signed_url,
             expires_in=ttl,
@@ -253,4 +270,65 @@ def redeem_external_media_ticket(
         record=record,
         purpose=purpose,
         media_type=_image_media_type(record),
+    )
+
+
+def instagram_jpeg_bytes(path: Path) -> bytes:
+    """Normalize a local image to Instagram's JPEG and aspect-ratio contract."""
+
+    try:
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.load()
+    except (OSError, UnidentifiedImageError, Image.DecompressionBombError) as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be decoded for Instagram"
+        ) from exc
+
+    if image.width <= 0 or image.height <= 0:
+        raise ExternalMediaUnavailable("Registered image has invalid dimensions")
+
+    if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        flattened = Image.new("RGB", rgba.size, "white")
+        flattened.paste(rgba, mask=rgba.getchannel("A"))
+        image = flattened
+    else:
+        image = image.convert("RGB")
+
+    ratio = image.width / image.height
+    if ratio < INSTAGRAM_MIN_ASPECT_RATIO:
+        canvas_size = (round(image.height * INSTAGRAM_MIN_ASPECT_RATIO), image.height)
+    elif ratio > INSTAGRAM_MAX_ASPECT_RATIO:
+        canvas_size = (image.width, round(image.width / INSTAGRAM_MAX_ASPECT_RATIO))
+    else:
+        canvas_size = image.size
+    if canvas_size != image.size:
+        canvas = Image.new("RGB", canvas_size, "white")
+        offset = (
+            (canvas.width - image.width) // 2,
+            (canvas.height - image.height) // 2,
+        )
+        canvas.paste(image, offset)
+        image = canvas
+
+    if image.width > INSTAGRAM_MAX_WIDTH:
+        target_height = max(1, round(image.height * INSTAGRAM_MAX_WIDTH / image.width))
+        image = image.resize(
+            (INSTAGRAM_MAX_WIDTH, target_height), Image.Resampling.LANCZOS
+        )
+    elif image.width < INSTAGRAM_MIN_WIDTH:
+        target_height = max(1, round(image.height * INSTAGRAM_MIN_WIDTH / image.width))
+        image = image.resize(
+            (INSTAGRAM_MIN_WIDTH, target_height), Image.Resampling.LANCZOS
+        )
+
+    for quality in (92, 85, 75, 65):
+        output = BytesIO()
+        image.save(output, format="JPEG", quality=quality, optimize=True)
+        data = output.getvalue()
+        if len(data) <= INSTAGRAM_MAX_JPEG_BYTES:
+            return data
+    raise ExternalMediaUnavailable(
+        "Registered image remains too large for Instagram after JPEG conversion"
     )

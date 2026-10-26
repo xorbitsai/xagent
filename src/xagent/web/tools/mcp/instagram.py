@@ -1,4 +1,5 @@
 import logging
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -35,6 +36,11 @@ PROFILE_FIELDS = (
 MEDIA_FIELDS = (
     "id,caption,media_type,media_url,permalink,timestamp,username,thumbnail_url"
 )
+MEDIA_CONTAINER_STATUS_FIELDS = "status_code,status"
+MEDIA_CONTAINER_MAX_POLLS = 10
+MEDIA_CONTAINER_POLL_INTERVAL_SECONDS = 1.0
+_MEDIA_CONTAINER_READY_STATUSES = frozenset({"FINISHED", "PUBLISHED"})
+_MEDIA_CONTAINER_FAILED_STATUSES = frozenset({"ERROR", "EXPIRED"})
 
 
 def _graph_path(object_id: str, suffix: str | None = None) -> str:
@@ -88,6 +94,23 @@ def _list_pages_with_instagram_accounts() -> list[dict[str, Any]]:
         if account:
             accounts.append(account)
     return accounts
+
+
+def _wait_for_media_container(container_id: str) -> None:
+    for attempt in range(MEDIA_CONTAINER_MAX_POLLS):
+        status = _graph_request(
+            "GET",
+            _graph_path(container_id),
+            params={"fields": MEDIA_CONTAINER_STATUS_FIELDS},
+        )
+        status_code = str(status.get("status_code") or "").upper()
+        if status_code in _MEDIA_CONTAINER_READY_STATUSES:
+            return
+        if status_code in _MEDIA_CONTAINER_FAILED_STATUSES:
+            raise ValueError("Instagram media processing failed")
+        if attempt + 1 < MEDIA_CONTAINER_MAX_POLLS:
+            time.sleep(MEDIA_CONTAINER_POLL_INTERVAL_SECONDS)
+    raise TimeoutError("Instagram media processing timed out")
 
 
 @mcp.tool()
@@ -174,14 +197,35 @@ def instagram_list_media(instagram_account_id: str, limit: int = 10) -> str:
 @mcp.tool()
 def instagram_publish_image(
     instagram_account_id: str,
-    image_url: str,
+    image_url: str | None = None,
     caption: str | None = None,
+    file_path: str | None = None,
 ) -> str:
-    """Create and publish an Instagram image media container from a public image URL."""
+    """Create and publish an Instagram image from a URL or workspace FileRef.
+
+    Provide exactly one of image_url and file_path. The Xagent host resolves a
+    registered file_id (or file:<id>) supplied as file_path into a short-lived
+    provider URL before this connector runs.
+    """
+    resolved_image_url: str | None = None
     try:
-        if not _is_public_image_url(image_url):
+        url_value = (
+            image_url if isinstance(image_url, str) and image_url.strip() else None
+        )
+        file_value = (
+            file_path if isinstance(file_path, str) and file_path.strip() else None
+        )
+        if (url_value is None) == (file_value is None):
+            raise ValueError("Provide exactly one of image_url or file_path")
+        if file_value is not None:
+            raise ValueError(
+                "file_path must be a registered file_id or file:<id> resolved by "
+                "the Xagent host"
+            )
+        if url_value is None or not _is_public_image_url(url_value):
             raise ValueError("image_url must be a public http or https URL")
-        data = {"image_url": image_url}
+        resolved_image_url = url_value
+        data = {"image_url": resolved_image_url}
         if caption:
             data["caption"] = caption
 
@@ -194,6 +238,7 @@ def instagram_publish_image(
         if not container_id:
             raise ValueError("Instagram media container response did not include id")
 
+        _wait_for_media_container(str(container_id))
         published = _graph_request(
             "POST",
             _graph_path(instagram_account_id, "media_publish"),
@@ -201,8 +246,11 @@ def instagram_publish_image(
         )
         return _success(container_id=container_id, media_id=published.get("id"))
     except GraphAPIError as e:
+        if resolved_image_url:
+            e.sensitive_values.add(resolved_image_url)
         logger.error(
-            "Error publishing Instagram image for %s: %s", instagram_account_id, e
+            "Instagram Graph API rejected image publishing for %s",
+            instagram_account_id,
         )
         return _graph_error(e)
     except Exception as e:

@@ -416,6 +416,49 @@ class TaskWorkspace:
             host_private=host_private,
         )
 
+    def issue_external_media_url_detached(self, file_id: str, purpose: str) -> str:
+        """Issue a purpose-bound URL for one exact task-owned registered image.
+
+        This host-only bridge is deliberately separate from local-path staging:
+        connectors such as Instagram ask their provider to fetch a URL rather
+        than accepting uploaded bytes. The URL is never persisted in workspace
+        state or returned to the model.
+        """
+
+        if self.owner_user_id is None or self.db_task_id is None:
+            raise FileNotFoundError("Registered image was not found")
+
+        from ..web.services.external_media import (
+            ExternalMediaNotFound,
+            ExternalMediaPurpose,
+            ExternalMediaUnavailable,
+            issue_external_media_url,
+        )
+        from .storage.manager import create_db_session
+
+        try:
+            external_purpose = ExternalMediaPurpose(purpose)
+        except ValueError:
+            raise ValueError("External media purpose is not supported") from None
+
+        db = create_db_session()
+        try:
+            try:
+                issued = issue_external_media_url(
+                    db,
+                    file_id=file_id,
+                    user_id=self.owner_user_id,
+                    task_id=self.db_task_id,
+                    purpose=external_purpose,
+                )
+            except ExternalMediaNotFound:
+                raise FileNotFoundError("Registered image was not found") from None
+            except ExternalMediaUnavailable as exc:
+                raise ValueError(str(exc)) from None
+            return issued.url
+        finally:
+            db.close()
+
     @staticmethod
     def _open_regular_file_nofollow(source: Path, selector: str) -> int:
         """Open an absolute file without following any path component."""

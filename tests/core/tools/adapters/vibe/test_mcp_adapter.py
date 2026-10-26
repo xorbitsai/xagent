@@ -46,6 +46,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _durable_upload_fields,
     _excel_failure_code,
     _exception_indicates_http_401,
+    _external_media_binding,
     _mcp_return_value_as_string,
     _normalized_mcp_call_result,
     _split_url_token,
@@ -526,6 +527,124 @@ def test_durable_upload_mapping_covers_builtin_connectors(
 ):
     assert _durable_upload_fields(server_name, tool_name) == (field_name,)
     assert _durable_upload_fields("Google_Drive", "google_drive_upload_file") == ()
+
+
+def test_external_media_mapping_is_limited_to_builtin_instagram():
+    binding = _external_media_binding("Instagram", "instagram_publish_image")
+
+    assert binding is not None
+    assert binding.file_argument == "file_path"
+    assert binding.url_argument == "image_url"
+    assert binding.purpose == "instagram-publish"
+    assert _external_media_binding("INSTAGRAM", "instagram_publish_image") is binding
+    assert _external_media_binding("Instagram", "instagram_get_profile") is None
+
+
+@pytest.mark.asyncio
+async def test_instagram_file_ref_is_substituted_and_temporary_url_redacted(
+    monkeypatch,
+):
+    file_id = "31218a9f-1497-4216-9f75-1fc8d51368c4"
+    temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+    captured = {}
+
+    class FakeWorkspace:
+        def issue_external_media_url_detached(self, requested_file_id, purpose):
+            assert requested_file_id == file_id
+            assert purpose == "instagram-publish"
+            return temporary_url
+
+    mcp_tool = SimpleNamespace(
+        name="instagram_publish_image",
+        description="Publish an image",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "instagram_account_id": {"type": "string"},
+                "image_url": {"type": "string"},
+                "file_path": {"type": "string"},
+            },
+            "required": ["instagram_account_id"],
+        },
+    )
+    adapter = _build_mcp_tool_adapter(
+        "Instagram",
+        {"transport": "stdio", "command": "python", "args": []},
+        mcp_tool,
+        workspace=FakeWorkspace(),
+    )
+
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["arguments"] = arguments
+            return CallToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"Provider could not fetch {temporary_url}",
+                    )
+                ],
+                isError=True,
+            )
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+
+    result = await adapter.run_json_async(
+        {
+            "instagram_account_id": "ig-1",
+            "file_path": f"file:{file_id}",
+        }
+    )
+
+    assert captured["arguments"] == {
+        "instagram_account_id": "ig-1",
+        "image_url": temporary_url,
+    }
+    assert temporary_url not in result["content"][0]["text"]
+    assert f"file:{file_id}" in result["content"][0]["text"]
+    assert "temporary access" in adapter.description
+
+
+@pytest.mark.asyncio
+async def test_instagram_external_media_requires_file_ref():
+    class FakeWorkspace:
+        def issue_external_media_url_detached(self, file_id, purpose):
+            raise AssertionError("must not issue a URL for an unregistered path")
+
+    adapter = _build_mcp_tool_adapter(
+        "Instagram",
+        {"transport": "stdio", "command": "python", "args": []},
+        SimpleNamespace(
+            name="instagram_publish_image",
+            description="Publish an image",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "instagram_account_id": {"type": "string"},
+                    "image_url": {"type": "string"},
+                    "file_path": {"type": "string"},
+                },
+                "required": ["instagram_account_id"],
+            },
+        ),
+        workspace=FakeWorkspace(),
+    )
+
+    result = await adapter.run_json_async(
+        {"instagram_account_id": "ig-1", "file_path": "/tmp/image.png"}
+    )
+
+    assert result == {
+        "content": [{"text": "file_path must be a registered file_id or file:<id>."}],
+        "is_error": True,
+    }
 
 
 @pytest.mark.asyncio

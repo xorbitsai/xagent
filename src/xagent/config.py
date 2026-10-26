@@ -143,6 +143,7 @@ FILE_DELIVERY_SIGNED_URL_TTL_SECONDS = "XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECO
 FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
 FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
 FILE_STREAM_TICKET_TTL_SECONDS = "XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"
+EXTERNAL_MEDIA_URL_TTL_SECONDS = "XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
@@ -2936,6 +2937,35 @@ def get_file_stream_ticket_ttl_seconds() -> int:
             "Value must be positive."
         )
 
+    return ttl
+
+
+def get_external_media_url_ttl_seconds() -> int:
+    """Get the lifetime of an external-service media URL.
+
+    These URLs let a named external provider fetch one registered image. They
+    are deliberately short-lived because the credential appears in the URL.
+
+    Priority:
+        1. XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS environment variable
+        2. Default of 600 (10 minutes)
+    """
+    env_value = os.getenv(EXTERNAL_MEDIA_URL_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 600
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {EXTERNAL_MEDIA_URL_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl < 60 or ttl > 3600:
+        raise ValueError(
+            f"Invalid {EXTERNAL_MEDIA_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be between 60 and 3600 seconds."
+        )
     return ttl
 
 

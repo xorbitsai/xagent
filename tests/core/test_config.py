@@ -37,6 +37,7 @@ from xagent.config import (
     DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
     DEEPDOC_XINFERENCE_URL,
     DEEPDOC_XINFERENCE_USERNAME,
+    EXTERNAL_MEDIA_URL_TTL_SECONDS,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -1210,6 +1211,23 @@ class TestFileStorageConfig:
 
         with pytest.raises(ValueError, match="XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"):
             get_file_stream_ticket_ttl_seconds()
+
+    def test_external_media_url_ttl_defaults_to_600(self, monkeypatch):
+        monkeypatch.delenv(EXTERNAL_MEDIA_URL_TTL_SECONDS, raising=False)
+
+        assert config.get_external_media_url_ttl_seconds() == 600
+
+    def test_external_media_url_ttl_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(EXTERNAL_MEDIA_URL_TTL_SECONDS, "900")
+
+        assert config.get_external_media_url_ttl_seconds() == 900
+
+    @pytest.mark.parametrize("value", ["0", "59", "3601", "abc"])
+    def test_external_media_url_ttl_rejects_invalid(self, monkeypatch, value):
+        monkeypatch.setenv(EXTERNAL_MEDIA_URL_TTL_SECONDS, value)
+
+        with pytest.raises(ValueError, match="XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS"):
+            config.get_external_media_url_ttl_seconds()
 
     def test_file_delivery_accel_redirect_enabled_defaults_false(self, monkeypatch):
         monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, raising=False)

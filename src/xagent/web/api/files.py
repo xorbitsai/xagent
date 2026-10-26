@@ -72,6 +72,10 @@ from ..services.db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from ..services.external_media import (
+    ExternalMediaTicketRejected,
+    redeem_external_media_ticket,
+)
 from ..services.kb_file_service import (
     KB_RETAINED_DIR,
     aggregate_uploaded_file_statuses,
@@ -1695,6 +1699,58 @@ FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
 # media element auto-fetches on render too, so preview_file below reuses
 # that same constant/rationale as ``cache_headers`` whenever a ticket
 # authenticated the request, rather than a second identical constant.
+
+
+@file_router.api_route(
+    "/external-media/{file_id}",
+    methods=["GET", "HEAD"],
+    response_model=None,
+    include_in_schema=False,
+)
+def external_media_file(
+    file_id: str,
+    ticket: str = Query(...),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve one registered image to the external service named by its ticket."""
+
+    try:
+        record = redeem_external_media_ticket(
+            db,
+            file_id=file_id,
+            ticket=ticket,
+        )
+    except ExternalMediaTicketRejected:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired external media ticket",
+        ) from None
+
+    file_ref = ManagedFileRef(record)
+    media_type = str(record.mime_type or guess_media_type(str(record.filename)))
+    try:
+        path = file_ref.ensure_local()
+    except DurableObjectIntegrityError as exc:
+        raise _file_integrity_failed() from exc
+    except (DurableObjectMissingError, DurableStorageOperationError) as exc:
+        _raise_durable_storage_unavailable(
+            exc,
+            "external media delivery",
+            file_id=record.file_id,
+        )
+
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Content-Disposition": _content_disposition_header(
+                "inline", str(record.filename)
+            ),
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:

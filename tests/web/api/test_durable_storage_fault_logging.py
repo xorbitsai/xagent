@@ -36,7 +36,7 @@ from xagent.web.api import websocket as websocket_api
 from xagent.web.models.agent import Agent
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
-from xagent.web.services import task_command_execution, task_start
+from xagent.web.services import external_media, task_command_execution, task_start
 from xagent.web.services.managed_file_ref import (
     _MAX_LOG_VALUE_LENGTH,
     DURABLE_FAULT_LOG_PREFIX,
@@ -206,7 +206,7 @@ def _assert_cause_chain_recorded(rendered: str, *, wrap_key: bool = True) -> Non
 def test_durable_storage_unavailable_logs_cause_and_keeps_body_detail_free(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The shared 503 helper is where all nine file-API sites get their log.
+    """The shared 503 helper is where all file-API sites get their log.
 
     Asserting on the helper rather than on each endpoint is deliberate: the
     exception is a required positional argument and the helper is ``NoReturn``,
@@ -495,6 +495,7 @@ _FAULT_SITES = (
     ("public download", ("file_id",)),
     ("public preview", ("file_id",)),
     ("public preview task asset", ("file_id",)),
+    ("external media delivery", ("file_id",)),
     ("durable cleanup before row delete", ("file_id", "storage_key")),
 )
 
@@ -996,8 +997,9 @@ def test_a_type_is_unlabelled_only_because_its_handler_swallows(
 # where the subclass is unreachable -- which is why the count must be declared,
 # not derived.)
 _MODULES_WITH_DURABLE_ARM_PAIRS = (
-    ("web/api/files.py", 7, lambda: files_api),
+    ("web/api/files.py", 8, lambda: files_api),
     ("web/api/websocket.py", 1, lambda: websocket_api),
+    ("web/services/external_media.py", 1, lambda: external_media),
     ("web/services/task_command_execution.py", 2, lambda: task_command_execution),
     ("web/services/task_start.py", 1, lambda: task_start),
     (
@@ -1237,7 +1239,7 @@ def _file_ingestion_tool() -> Any:
 def test_the_integrity_arm_precedes_its_parent_at_every_site(
     label: str, expected: int, loader: Any
 ) -> None:
-    """Checked at all twelve pairs, because five of them have no other guard.
+    """Checked at every declared pair, including sites without another guard.
 
     Measured, not estimated -- an earlier version of this docstring put the
     unguarded count at more than twice the truth. Neutralising each integrity

@@ -1,4 +1,5 @@
 from pathlib import Path
+from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
@@ -74,6 +75,34 @@ def test_issue_uses_direct_durable_url_when_available(monkeypatch):
     assert issued.direct_object_url is True
     assert issued.expires_in == 600
     assert issued.url.startswith("https://objects.example.test/")
+
+
+def test_issue_reports_direct_url_integrity_failure(monkeypatch):
+    file_id = str(uuid4())
+    record = _record(file_id, mime_type="image/jpeg")
+    monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+    monkeypatch.setattr(
+        external_media.ManagedFileRef,
+        "signed_access_url",
+        Mock(
+            side_effect=external_media.DurableObjectIntegrityError(
+                "checksum mismatch",
+                storage_key="users/7/launch.jpg",
+            )
+        ),
+    )
+
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="integrity verification",
+    ):
+        external_media.issue_external_media_url(
+            _DB(record),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        )
 
 
 def test_issue_falls_back_to_public_ticket_url(monkeypatch):

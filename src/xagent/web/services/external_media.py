@@ -166,7 +166,11 @@ def issue_external_media_url(
                 expires=ttl,
                 content_type=media_type,
             )
-        except (DurableObjectIntegrityError, DurableStorageOperationError) as exc:
+        except DurableObjectIntegrityError as exc:
+            raise ExternalMediaUnavailable(
+                "Registered image failed integrity verification"
+            ) from exc
+        except DurableStorageOperationError as exc:
             raise ExternalMediaUnavailable(
                 "Registered image could not be prepared for external delivery"
             ) from exc

@@ -17,6 +17,7 @@ from xagent.web.models.database import get_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services import external_media
 from xagent.web.services.managed_file_ref import (
+    DurableObjectIntegrityError,
     DurableObjectMissingError,
     DurableStorageOperationError,
 )
@@ -247,6 +248,13 @@ def test_route_requires_and_validates_ticket(client: TestClient):
 @pytest.mark.parametrize(
     ("error", "expected_status"),
     [
+        (
+            DurableObjectIntegrityError(
+                "checksum mismatch",
+                storage_key="users/7/launch.png",
+            ),
+            409,
+        ),
         (DurableObjectMissingError(Path("missing")), 404),
         (FilePublicationUnavailable("unavailable"), 404),
         (

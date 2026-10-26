@@ -149,7 +149,7 @@ RUN groupadd --gid 1010 sandbox \
 USER sandbox
 WORKDIR /home/sandbox
 
-# Prove the warmed package is usable by Boxlite's actual uid without network
+# Prove the warmed package is usable by the sandbox runtime uid without network
 # access. This also catches root-owned cache metadata before the image ships.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 NPM_CONFIG_OFFLINE=true \

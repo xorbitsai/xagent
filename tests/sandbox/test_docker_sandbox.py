@@ -23,6 +23,7 @@ import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     SANDBOX_RUNTIME_GID,
+    SANDBOX_RUNTIME_UID,
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
     SandboxRuntimeConflictError,
@@ -1771,6 +1772,41 @@ class TestDockerSandbox:
 
             print("✅ File upload and download test passed")
 
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_runtime_user_can_write_to_prepared_bind_mount(
+        self, docker_service, tmp_path_factory
+    ):
+        """The fixed non-root identity can write to an operator-prepared RW
+        mount even when the test runner itself has no CAP_CHOWN."""
+        name = f"test_nonroot_bind_write_{uuid.uuid4().hex[:8]}"
+        service = docker_service
+        host_dir = tmp_path_factory.mktemp("sandbox-bind-write")
+        host_dir.chmod(0o733)
+        try:
+            sandbox = await service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(
+                    cpus=1,
+                    memory=256,
+                    volumes=[(str(host_dir), "/mnt/data", "rw")],
+                ),
+            )
+
+            identity = await sandbox.exec("id", "-u")
+            assert identity.exit_code == 0, identity.stderr
+            assert identity.stdout.strip() == str(SANDBOX_RUNTIME_UID)
+            runtime_write = await sandbox.exec(
+                "sh", "-c", "printf runtime-write > /mnt/data/from-runtime.txt"
+            )
+            assert runtime_write.exit_code == 0, runtime_write.stderr
+            assert (host_dir / "from-runtime.txt").read_text() == "runtime-write"
         finally:
             try:
                 await service.delete(name)

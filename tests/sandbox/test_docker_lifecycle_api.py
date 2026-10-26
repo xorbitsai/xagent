@@ -73,7 +73,17 @@ def _unique_name(prefix: str) -> str:
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
     """Mirror Docker create's resolution of an omitted backend default."""
-    return config.pids_limit or get_sandbox_pids_limit()
+    if config.pids_limit is not None:
+        return config.pids_limit
+    return get_sandbox_pids_limit()
+
+
+def _effective_security_profile(config: SandboxConfig) -> str:
+    """Mirror Docker create's attested runtime-hardening profile."""
+    return (
+        config.security_profile
+        or docker_sandbox_module._DOCKER_RUNTIME_SECURITY_PROFILE
+    )
 
 
 # --- Fakes for mock-layer tests (no Docker required) ---
@@ -556,6 +566,7 @@ class TestCreatePersistsCanonicalDesiredState:
             network_isolated=bool(row.config.network_isolated),
             ports=row.config.ports,
             pids_limit=row.config.pids_limit,
+            security_profile=row.config.security_profile,
         )
         assert (
             spec_from_row.fingerprint()
@@ -880,6 +891,7 @@ class TestDockerCreate:
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert inspection.fingerprint_label == desired.fingerprint()
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1078,6 +1090,7 @@ class TestDockerCreate:
                 cpus=config.cpus,
                 memory=config.memory,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert desired.working_dir == "/home"
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1113,6 +1126,7 @@ class TestDockerCreate:
                 memory=config.memory,
                 volumes=config.volumes,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1149,6 +1163,7 @@ class TestDockerCreate:
                 memory=config.memory,
                 volumes=config.volumes,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1182,6 +1197,7 @@ class TestDockerCreate:
                 cpus=config.cpus,
                 memory=config.memory,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1264,6 +1280,7 @@ class TestDockerCreateFromSnapshot:
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert inspection.fingerprint_label == desired.fingerprint()
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1843,6 +1860,7 @@ class TestCreateNetworkIsolatedSandbox:
                 memory=config.memory,
                 network_isolated=True,
                 pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:

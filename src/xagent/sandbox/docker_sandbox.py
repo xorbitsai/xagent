@@ -90,6 +90,14 @@ MANAGED_LABEL_VALUE = "v2"
 CONTAINER_NAME_PREFIX = "xagent_sandbox_"
 SNAPSHOT_REPOSITORY = "xagent-sandbox-snapshot"
 _CPU_NANOS = 1_000_000_000
+_DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-egress-unfiltered-v1"
+
+
+def _effective_pids_limit(config: SandboxConfig) -> int | None:
+    """Resolve Docker's configured default when a caller omits the limit."""
+    if config.pids_limit is not None:
+        return config.pids_limit
+    return get_sandbox_pids_limit()
 
 
 def _ownership_label_filters(namespace: str) -> list[str]:
@@ -1151,9 +1159,7 @@ async def _create_container(
     if extra_labels:
         labels.update(extra_labels)
 
-    effective_pids_limit = (
-        config.pids_limit if config.pids_limit is not None else get_sandbox_pids_limit()
-    )
+    effective_pids_limit = _effective_pids_limit(config)
     kwargs: dict[str, Any] = {
         "image": image,
         "name": _container_name(name, namespace),
@@ -1188,7 +1194,10 @@ async def _create_container(
         # traversable parents for nested workspace bind mounts; it exposes no
         # host files and is discarded with the container.
         kwargs["tmpfs"] = {
-            "/root": "rw,nosuid,nodev,noexec,size=64k,mode=0711,uid=1100,gid=1010"
+            "/root": (
+                "rw,nosuid,nodev,noexec,size=64k,mode=0711,"
+                f"uid={SANDBOX_RUNTIME_UID},gid={SANDBOX_RUNTIME_GID}"
+            )
         }
     return cast(
         "Container", await asyncio.to_thread(client.containers.create, **kwargs)
@@ -1531,11 +1540,7 @@ class DockerSandboxService(SandboxService):
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
-                pids_limit=(
-                    config.pids_limit
-                    if config.pids_limit is not None
-                    else get_sandbox_pids_limit()
-                ),
+                pids_limit=_effective_pids_limit(config),
                 security_profile=(
                     config.security_profile or self.runtime_security_profile()
                 ),
@@ -1888,7 +1893,9 @@ class DockerSandboxService(SandboxService):
             daemon_info = self._client.info()
         except Exception as exc:
             raise SandboxRuntimeConflictError(
-                "Cannot inspect the Docker daemon security mode."
+                "Cannot inspect the Docker daemon security mode. If a "
+                "docker-socket-proxy is in use, allow the /info endpoint "
+                "(for Tecnativa/docker-socket-proxy, set INFO=1)."
             ) from exc
         security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(
@@ -1931,4 +1938,7 @@ class DockerSandboxService(SandboxService):
     def runtime_security_profile(self) -> str | None:
         # Docker currently provides non-root/capability hardening but relies
         # on deployment firewalling for public-only egress.
-        return "nonroot-docker-egress-unfiltered-v1"
+        return _DOCKER_RUNTIME_SECURITY_PROFILE
+
+    def runtime_pids_limit(self) -> int | None:
+        return get_sandbox_pids_limit()

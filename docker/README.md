@@ -259,6 +259,11 @@ create sibling sandbox containers through the host Docker daemon. Treat this as
 a privileged deployment mode: Docker socket access is effectively host-level
 container control.
 
+When `DOCKER_HOST` points at a restricted Docker socket proxy instead, the
+proxy must permit daemon inspection through `GET /info`. For
+Tecnativa/docker-socket-proxy, set `INFO=1`; readiness fails closed if Xagent
+cannot verify the daemon's security mode.
+
 The backend process itself must run as effective uid 0, and the Docker daemon
 must be rootful with user-namespace remapping disabled. Xagent uses that host
 privilege only to prepare managed writable bind directories for sandbox uid
@@ -327,8 +332,12 @@ service is running is unsupported.
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
 > `XAGENT_SANDBOX_NAMESPACE` before upgrading. The Compose overlay below sets
 > it automatically; pip/systemd deployments must set their own stable, unique
-> deployment identifier (see `example.env`). Missing values stop backend
-> startup rather than falling back to unsafe daemon-global ownership.
+> deployment identifier (see `example.env`). The backend must also run with
+> effective uid 0 against a rootful Docker daemon with user-namespace
+> remapping disabled; a Docker socket proxy must permit `GET /info`
+> (`INFO=1` for Tecnativa/docker-socket-proxy). Missing or incompatible
+> settings stop backend startup rather than falling back to unsafe ownership
+> or an unverifiable daemon mode.
 
 The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
 `scheduler` from the resolved `${COMPOSE_PROJECT_NAME}`. Docker sibling mode

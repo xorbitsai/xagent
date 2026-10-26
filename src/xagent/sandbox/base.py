@@ -1123,6 +1123,10 @@ class SandboxService(abc.ABC):
         """Backend-specific hardening profile included in desired state."""
         return None
 
+    def runtime_pids_limit(self) -> int | None:
+        """Backend-enforced process limit included in desired state, if any."""
+        return None
+
     async def inspect(self, name: str) -> Optional[SandboxInspection]:
         """Observe a sandbox's current state and runtime facts.
 

@@ -1012,24 +1012,21 @@ class TestAdminFileAccess:
 
         client = TestClient(test_app)
         user_headers = create_auth_headers(regular_user)
-        before_mint = time.time()
         ticket_response = client.get(
             f"/api/files/stream-tickets/{uploaded_file.file_id}",
             headers=user_headers,
         )
         assert ticket_response.status_code == 200
+        after_mint = time.time()
         ticket = ticket_response.json()["path"].split("ticket=")[1]
 
         claims = pyjwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
 
-        # Bounded rather than exact: real wall-clock elapses between
-        # before_mint and the token's own iat/exp computation, and
-        # PyJWT floors exp to an integer second (timegm), so a naive
-        # ..120 upper bound flakes whenever that floor rounds up relative to
-        # before_mint's own fractional second -- tightened to 119..121 (0
-        # failures simulated across 400k runs) rather than widened, to keep
-        # the lower bound meaningfully close to the configured 120s.
-        assert 119 <= claims["exp"] - before_mint <= 121
+        # Measure after the response: CI may leave the request queued for a
+        # long time before the endpoint mints the token. PyJWT stores integer
+        # seconds, so allow its one-second truncation plus a small response
+        # scheduling margin while still pinning the configured 120-second TTL.
+        assert 115 <= claims["exp"] - after_mint <= 120
 
     def test_preview_rejects_an_access_token_used_as_a_ticket(
         self, test_db, temp_uploads_dir

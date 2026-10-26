@@ -16,7 +16,7 @@ import uuid
 
 import pytest
 
-from xagent.config import get_sandbox_pids_limit
+import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     ResolvedSandboxRuntimeSpec,
@@ -65,7 +65,11 @@ def _spec_for(config: SandboxConfig, image: str = DEFAULT_SANDBOX_IMAGE):
         volumes=config.volumes,
         network_isolated=bool(config.network_isolated),
         ports=config.ports,
-        pids_limit=config.pids_limit or get_sandbox_pids_limit(),
+        pids_limit=docker_sandbox_module._effective_pids_limit(config),
+        security_profile=(
+            config.security_profile
+            or docker_sandbox_module._DOCKER_RUNTIME_SECURITY_PROFILE
+        ),
     )
 
 

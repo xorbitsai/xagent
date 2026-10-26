@@ -26,7 +26,6 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
-    get_sandbox_pids_limit,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
@@ -160,12 +159,14 @@ class SandboxLeaseProvider:
         lifecycle_id: str,
         primary_sandbox: Sandbox,
         mount_intent: SandboxMountIntent | None,
+        prepare_root: str | None,
         max_concurrency: int,
     ) -> None:
         self._manager = manager
         self._lifecycle_type = lifecycle_type
         self._lifecycle_id = lifecycle_id
         self._mount_intent = mount_intent
+        self._prepare_root = prepare_root
         self._available_slots: asyncio.Queue[int] = asyncio.Queue()
         self._worker_locks: dict[int, asyncio.Lock] = {}
         self._workers: dict[int, Sandbox] = {}
@@ -253,6 +254,7 @@ class SandboxLeaseProvider:
                     self._lifecycle_type,
                     f"{self._lifecycle_id}::worker::{slot}",
                     mount_intent=self._mount_intent,
+                    prepare_root=self._prepare_root,
                 )
             except (SandboxCapacityError, SandboxContractError) as exc:
                 logger.warning(
@@ -890,7 +892,7 @@ class SandboxManager:
         if memory is not None:
             config.memory = memory
 
-        config.pids_limit = get_sandbox_pids_limit()
+        config.pids_limit = self._service.runtime_pids_limit()
         config.security_profile = self._service.runtime_security_profile()
 
         # ENV
@@ -1080,7 +1082,6 @@ class SandboxManager:
                     # Folding compares physical identities but deliberately
                     # retains the operator's lexical spelling for the bind.
                     lexical_target = Path(os.path.abspath(target))
-                    lexical_trusted_root = Path(os.path.abspath(trusted_root))
                     uploads_root = self._uploads_root_lexical
                     managed_uploads_root = (
                         uploads_root
@@ -1112,21 +1113,11 @@ class SandboxManager:
                                 )
                                 uploads_suffix = None
                             else:
-                                try:
-                                    uploads_suffix = uploads_root.relative_to(
-                                        lexical_trusted_root
+                                uploads_suffix = (
+                                    self._uploads_root_physical.relative_to(
+                                        physical_trusted_root
                                     )
-                                except ValueError:
-                                    try:
-                                        uploads_suffix = uploads_root.relative_to(
-                                            physical_trusted_root
-                                        )
-                                    except ValueError:
-                                        uploads_suffix = (
-                                            self._uploads_root_physical.relative_to(
-                                                physical_trusted_root
-                                            )
-                                        )
+                                )
                         except ValueError as exc:
                             raise SandboxContractError(
                                 "Docker uploads root is outside its folded bind "
@@ -1138,25 +1129,6 @@ class SandboxManager:
                             else:
                                 preserve_through = trusted_root / uploads_suffix
                                 grant_target = preserve_through / managed_suffix
-                    elif not lexical_target.is_relative_to(lexical_trusted_root):
-                        # Rebase a physical uploads spelling onto an
-                        # operator-controlled bind alias. Resolve only the
-                        # trusted bind prefix. In particular, never realpath
-                        # the uploads root: it is inside a writable mount and
-                        # may already have been replaced by sandbox code.
-                        physical_trusted_root = Path(os.path.realpath(trusted_root))
-                        try:
-                            uploads_suffix = self._uploads_root_physical.relative_to(
-                                physical_trusted_root
-                            )
-                            managed_suffix = lexical_target.relative_to(uploads_root)
-                        except ValueError as exc:
-                            raise SandboxContractError(
-                                "Docker workspace root is outside its folded bind "
-                                f"root: {target}"
-                            ) from exc
-                        preserve_through = trusted_root / uploads_suffix
-                        grant_target = preserve_through / managed_suffix
                     else:
                         raise SandboxContractError(
                             "Docker workspace root is outside the managed uploads "
@@ -1325,6 +1297,7 @@ class SandboxManager:
         lifecycle_id: str,
         *,
         mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Get or create the sandbox for one exact lifecycle name.
 
@@ -1340,7 +1313,10 @@ class SandboxManager:
             async with self._activity_guard:
                 self._touch_locked(base_name)
             return await self._get_or_create_sandbox_locked(
-                lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
 
     async def _get_or_create_sandbox_locked(
@@ -1921,6 +1897,7 @@ class SandboxManager:
             lifecycle_id=lifecycle_id,
             primary_sandbox=primary,
             mount_intent=mount_intent,
+            prepare_root=prepare_root,
             max_concurrency=get_sandbox_max_concurrency(),
         )
 

@@ -67,6 +67,18 @@ def _make_manager() -> tuple[SandboxManager, FakeSandboxService]:
 
 
 class TestBackendProbeRouting:
+    def test_desired_spec_omits_limits_not_enforced_by_backend(
+        self, _env, tmp_path
+    ) -> None:
+        manager, _service = _make_manager()
+
+        desired = manager._build_runtime_spec(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert desired.pids_limit is None
+        assert desired.security_profile is None
+
     @pytest.mark.asyncio
     async def test_probe_resolved_once_and_cached(self, _env, tmp_path) -> None:
         manager, service = _make_manager()
@@ -264,6 +276,8 @@ class TestReconcileMatrixUnverified:
         self, _env, tmp_path
     ) -> None:
         manager, service = _make_manager()
+        service.runtime_pids_limit = lambda: 1024
+        service.runtime_security_profile = lambda: "fake-hardening-v1"
         intent = _intent(tmp_path)
         desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
         template, config = desired.to_backend_config()
@@ -686,6 +700,47 @@ class TestProviderABA:
 
 class TestWorkerReconcileDegradation:
     @pytest.mark.asyncio
+    async def test_worker_reuses_primary_workspace_preparation_root(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        """A folded external bind must prepare the managed scope, not its
+        operator-owned ancestor, for both the primary and every worker."""
+        operator_root = tmp_path / "data"
+        uploads_root = operator_root / "xagent" / "uploads"
+        uploads_root.mkdir(parents=True)
+        prepare_root = uploads_root / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        grants: list[tuple[Path, Path, Path | None]] = []
+
+        def record_grant(
+            path: Path, *, trusted_root: Path, preserve_through: Path | None = None
+        ) -> None:
+            grants.append((path, trusted_root, preserve_through))
+
+        monkeypatch.setattr(
+            sandbox_manager_module, "grant_sandbox_runtime_access", record_grant
+        )
+        provider = await manager.get_or_create_lease_provider(
+            "user",
+            "42",
+            mount_intent=SandboxMountIntent(mount_root=str(operator_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        worker = await provider.get_worker_sandbox(0)
+
+        assert worker is not provider.primary_sandbox
+        assert worker.name == "user::42::worker::0"
+        assert grants == [
+            (prepare_root, operator_root, uploads_root),
+            (prepare_root, operator_root, uploads_root),
+        ]
+
+    @pytest.mark.asyncio
     async def test_worker_mismatch_degrades_to_primary(self, _env, tmp_path) -> None:
         """A worker whose reconciliation hits a runtime-config conflict
         degrades to the primary sandbox instead of failing the tool
@@ -954,6 +1009,42 @@ class TestProviderCacheMountIntentGate:
         for managed_path in (uploads_root / "user_42", prepare_root):
             assert stat.S_IMODE(managed_path.stat().st_mode) & 0o777 == 0o750
 
+    def test_folded_ancestor_uses_physical_suffix_across_symlink(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        operator_root = tmp_path / "data"
+        physical_parent = operator_root / "real"
+        physical_uploads = physical_parent / "uploads"
+        physical_uploads.mkdir(parents=True)
+        uploads_alias_parent = operator_root / "link"
+        uploads_alias_parent.symlink_to(physical_parent, target_is_directory=True)
+        uploads_root = uploads_alias_parent / "uploads"
+        prepare_root = uploads_root / "user_42" / "scope-a"
+        monkeypatch.setattr(
+            sandbox_manager_module, "get_uploads_dir", lambda: uploads_root
+        )
+        manager, service = _make_manager()
+        monkeypatch.setattr(service, "host_workspace_gid", lambda: 1010)
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            grant_sandbox_runtime_access,
+        )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
+
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(operator_root)),
+            prepare_root=str(prepare_root),
+        )
+
+        assert (physical_uploads / "user_42" / "scope-a").is_dir()
+        assert uploads_alias_parent.is_symlink()
+        assert stat.S_IMODE(operator_root.stat().st_mode) == 0o755
+
     def test_folded_mount_creates_and_prepares_missing_anchor(
         self, _env, tmp_path, monkeypatch
     ) -> None:
@@ -1095,7 +1186,7 @@ class TestProviderCacheMountIntentGate:
         assert stat.S_IMODE(protected.stat().st_mode) == 0o755
         assert not (protected / "scope-a").exists()
 
-    def test_folded_mount_rejects_symlink_at_uploads_root_component(
+    def test_folded_mount_pins_physical_uploads_root_across_symlink(
         self, _env, tmp_path, monkeypatch
     ) -> None:
         physical_root = tmp_path / "physical-root"
@@ -1117,17 +1208,20 @@ class TestProviderCacheMountIntentGate:
             "grant_sandbox_runtime_access",
             grant_sandbox_runtime_access,
         )
+        monkeypatch.setattr(
+            "xagent.sandbox.base.os.fchown", lambda *_args, **_kwargs: None
+        )
 
-        with pytest.raises(SandboxContractError):
-            manager._prepare_workspace_mounts(
-                "user",
-                "42",
-                SandboxMountIntent(mount_root=str(trusted_alias)),
-                prepare_root=str(prepare_root),
-            )
+        manager._prepare_workspace_mounts(
+            "user",
+            "42",
+            SandboxMountIntent(mount_root=str(trusted_alias)),
+            prepare_root=str(prepare_root),
+        )
 
         assert stat.S_IMODE(protected.stat().st_mode) == 0o755
-        assert not (protected / "user_42").exists()
+        assert (protected / "user_42" / "scope-a").is_dir()
+        assert uploads_root.is_symlink()
 
     def test_legacy_mount_exists_error_remains_best_effort(
         self, _env, tmp_path, monkeypatch, caplog

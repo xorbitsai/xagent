@@ -49,6 +49,7 @@ from ..sandbox.base import (
     SandboxInspection,
     SandboxMountIntent,
     SandboxNotFoundError,
+    SandboxReconcileUnsupportedError,
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
@@ -2541,6 +2542,20 @@ class SandboxManager:
             "list_failed" if list_failed else "ok",
         )
 
+    async def _stop_legacy_existing(self, sandbox: SandboxInfo) -> None:
+        """Stop without triggering backend reconciliation when supported."""
+        try:
+            await self._service.stop_existing(
+                sandbox.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+            )
+        except SandboxReconcileUnsupportedError:
+            box = await self._service.get_or_create(
+                sandbox.name,
+                template=sandbox.template,
+                config=sandbox.config,
+            )
+            await box.stop()
+
     async def _legacy_cleanup(self) -> None:
         """Stop all running sandboxes.
 
@@ -2589,12 +2604,9 @@ class SandboxManager:
                     except ValueError:
                         # Not a normal managed sandbox name, stop
                         if sb.state == "running":
-                            box = await self._service.get_or_create(
-                                sb.name, template=sb.template, config=sb.config
-                            )
                             stop_started = time.monotonic()
                             try:
-                                await box.stop()
+                                await self._stop_legacy_existing(sb)
                             finally:
                                 stop_seconds += time.monotonic() - stop_started
                             stopped += 1
@@ -2673,12 +2685,9 @@ class SandboxManager:
 
                     # Stop running sandboxes with matching image
                     if sb.state == "running":
-                        box = await self._service.get_or_create(
-                            sb.name, template=sb.template, config=sb.config
-                        )
                         stop_started = time.monotonic()
                         try:
-                            await box.stop()
+                            await self._stop_legacy_existing(sb)
                         finally:
                             stop_seconds += time.monotonic() - stop_started
                         stopped += 1

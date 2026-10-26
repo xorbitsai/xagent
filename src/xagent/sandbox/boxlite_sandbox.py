@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import codecs
+import hashlib
 import ipaddress
 import logging
 import os
@@ -25,6 +27,7 @@ from .base import (
     Sandbox,
     SandboxConfig,
     SandboxInfo,
+    SandboxNotFoundError,
     SandboxService,
     SandboxSnapshot,
     SandboxTemplate,
@@ -35,14 +38,16 @@ logger = logging.getLogger(__name__)
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
 _EXECUTION_TIMEOUT_SECONDS = 60 * 60
 _EXECUTION_KILL_TIMEOUT_SECONDS = 5.0
-_BOXLITE_SECURITY_PROFILE = "boxlite-public-egress-v1"
 
 # BoxLite's allow_net is enforced against the resolved connection destination.
-# Build an allowlist that is the IPv4 Internet minus IANA special-use ranges,
-# plus IPv6 global unicast minus documentation/benchmark/special transition
-# prefixes. This blocks loopback, link-local, RFC1918/ULA, metadata-adjacent
-# and multicast destinations even when untrusted code uses literal addresses
-# or a hostname is rebound after validation.
+# Build an allowlist that is the IPv4 Internet minus IANA special-use ranges.
+# IPv6 entries are included for forward compatibility, but BoxLite 0.10.7's
+# native filter rejects non-IPv4 destinations before CIDR matching, so IPv6
+# egress currently remains fail-closed. This blocks loopback, link-local,
+# RFC1918/ULA, the standard link-local metadata endpoint, and multicast
+# destinations even when untrusted code uses literal addresses or a hostname
+# is rebound after validation. Host/public control-plane addresses require an
+# additional deployment firewall because a guest filter cannot identify them.
 _NON_PUBLIC_IPV4 = tuple(
     ipaddress.IPv4Network(network)
     for network in (
@@ -80,14 +85,14 @@ _NON_PUBLIC_IPV6 = tuple(
 _Network = TypeVar("_Network", ipaddress.IPv4Network, ipaddress.IPv6Network)
 
 
-async def _kill_execution_bounded(execution: Any, reason: str) -> None:
+async def _kill_execution_bounded(execution: Any) -> None:
     """Best-effort guest termination that cannot replace one hang with another."""
     try:
         await asyncio.wait_for(
             execution.kill(), timeout=_EXECUTION_KILL_TIMEOUT_SECONDS
         )
     except Exception:  # noqa: BLE001 - preserve the original failure/cancellation
-        logger.exception("Failed to kill %s BoxLite execution", reason)
+        logger.exception("Failed to kill BoxLite execution")
 
 
 def _subtract_networks(
@@ -112,6 +117,13 @@ PUBLIC_EGRESS_NETWORKS = tuple(
         + _subtract_networks([ipaddress.IPv6Network("2000::/3")], _NON_PUBLIC_IPV6)
     )
 )
+
+_BOXLITE_POLICY_DIGEST = hashlib.sha256(
+    "\n".join(
+        ("outbound=public-only", "inbound=disabled", *PUBLIC_EGRESS_NETWORKS)
+    ).encode("ascii")
+).hexdigest()[:12]
+_BOXLITE_SECURITY_PROFILE = f"boxlite-public-egress-v1-{_BOXLITE_POLICY_DIGEST}"
 
 
 class BoxliteStore(abc.ABC):
@@ -206,7 +218,10 @@ async def _collect_capped_stream(stream: Any, cap: int) -> tuple[str, bool]:
             retained.extend(encoded[:remaining])
         if len(encoded) > max(remaining, 0):
             truncated = True
-    return retained.decode("utf-8", errors="replace"), truncated
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    # If the byte cap splits a multibyte codepoint, final=False omits only the
+    # incomplete suffix while still replacing malformed bytes in the prefix.
+    return decoder.decode(bytes(retained), final=not truncated), truncated
 
 
 class BoxliteSandbox(Sandbox):
@@ -293,19 +308,25 @@ class BoxliteSandbox(Sandbox):
         stdout = stderr = ""
         stdout_truncated = stderr_truncated = False
         error_message = None
+        collectors = (
+            asyncio.create_task(
+                _collect_capped_stream(stdout_stream, max_output_bytes)
+            ),
+            asyncio.create_task(
+                _collect_capped_stream(stderr_stream, max_output_bytes)
+            ),
+        )
         try:
             (
                 (stdout, stdout_truncated),
                 (stderr, stderr_truncated),
-            ) = await asyncio.gather(
-                _collect_capped_stream(stdout_stream, max_output_bytes),
-                _collect_capped_stream(stderr_stream, max_output_bytes),
-            )
-        except asyncio.CancelledError:
-            await _kill_execution_bounded(execution, "cancelled")
-            raise
+            ) = await asyncio.gather(*collectors)
         except BaseException:
-            await _kill_execution_bounded(execution, "failed")
+            for collector in collectors:
+                if not collector.done():
+                    collector.cancel()
+            await asyncio.gather(*collectors, return_exceptions=True)
+            await _kill_execution_bounded(execution)
             raise
 
         try:
@@ -313,7 +334,7 @@ class BoxliteSandbox(Sandbox):
             exit_code = raw_result.exit_code
             error_message = raw_result.error_message
         except asyncio.CancelledError:
-            await _kill_execution_bounded(execution, "cancelled")
+            await _kill_execution_bounded(execution)
             raise
         except Exception:  # noqa: BLE001 - native wait failure becomes exec failure
             logger.exception("Failed to wait for BoxLite execution")
@@ -604,19 +625,17 @@ class BoxliteSandboxService(SandboxService):
         # Use lock to protect entire get_or_create process
         async with lock:
             # Check if box already exists
-            info: SandboxInfo | None = None
             raw_box = await self._runtime.get(name)
+            info = self._store.get_info(name) if raw_box else None
+            desired_template = template or (
+                info.template
+                if info is not None
+                else SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
+            )
+            desired_config = (
+                config or (info.config if info is not None else SandboxConfig())
+            ).model_copy(update={"security_profile": _BOXLITE_SECURITY_PROFILE})
             if raw_box:
-                # Box exists, get or restore info
-                info = self._store.get_info(name)
-                desired_template = template or (
-                    info.template
-                    if info is not None
-                    else SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE)
-                )
-                desired_config = (
-                    config or (info.config if info is not None else SandboxConfig())
-                ).model_copy(update={"security_profile": _BOXLITE_SECURITY_PROFILE})
                 # BoxLite has no immutable labels. Persisted desired state is
                 # therefore the only way to detect a network-policy upgrade.
                 # Always require the current profile, including for callers
@@ -638,24 +657,14 @@ class BoxliteSandboxService(SandboxService):
                     await self._runtime.remove(name, force=True)
                     self._store.delete_info(name)
                     raw_box = None
-                    info = SandboxInfo(
-                        name=name,
-                        state="running",
-                        template=desired_template,
-                        config=desired_config,
-                    )
             if not raw_box:
                 # Box doesn't exist, create new one
-                if info is None:
-                    tpl = template or SandboxTemplate(
-                        type="image", image=DEFAULT_SANDBOX_IMAGE
-                    )
-                    cfg = (config or SandboxConfig()).model_copy(
-                        update={"security_profile": _BOXLITE_SECURITY_PROFILE}
-                    )
-                    info = SandboxInfo(
-                        name=name, state="running", template=tpl, config=cfg
-                    )
+                info = SandboxInfo(
+                    name=name,
+                    state="running",
+                    template=desired_template,
+                    config=desired_config,
+                )
 
             assert info is not None
             # Create or reuse box
@@ -673,6 +682,21 @@ class BoxliteSandboxService(SandboxService):
             return BoxliteSandbox(
                 sandbox_name=name, box=box, info=info, store=self._store
             )
+
+    async def stop_existing(self, name: str, *, timeout: Optional[int] = None) -> None:
+        """Stop a native BoxLite handle without validating or recreating it."""
+        del timeout  # BoxLite 0.10.7 does not expose a graceful-stop timeout.
+        async with self._locks_lock:
+            if name not in self._locks:
+                self._locks[name] = asyncio.Lock()
+            lock = self._locks[name]
+
+        async with lock:
+            raw_box = await self._runtime.get(name)
+            if raw_box is None:
+                raise SandboxNotFoundError(f"Sandbox not found: {name}")
+            await raw_box.stop()
+            self._store.update_info_state(name, "stopped")
 
     async def list_sandboxes(self) -> list[SandboxInfo]:
         # Use boxlite as source of truth
@@ -715,10 +739,10 @@ class BoxliteSandboxService(SandboxService):
         """Boxlite has no label carrier, hardcodes reuse_existing=True (a
         fail-open get-or-create), cannot retrieve env/volumes/ports back
         from a running box, and has no control/name-lock infrastructure of
-        its own. The four spec-reconciliation lifecycle methods are left
-        unimplemented (inherited from SandboxService's default, which raises
-        SandboxReconcileUnsupportedError); this probe is how callers detect
-        that up front instead of hitting that exception.
+        its own. Inspect/create/start remain unsupported; stop_existing is
+        implemented only so startup cleanup can quiesce a native handle
+        without entering get_or_create migration. This probe therefore stays
+        false until the complete reconciliation contract is implemented.
         """
         return False
 

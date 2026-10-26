@@ -684,6 +684,29 @@ async def test_cleanup_handles_non_managed_sandbox(
     mock_box.stop.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_legacy_cleanup_uses_direct_stop_when_backend_supports_it(
+    manager: SandboxManager, service: FakeSandboxService
+):
+    """BoxLite cleanup must not enter get_or_create and trigger migration."""
+    sb = _make_sb_info("__warmup__", image="img:v1")
+    service.list_sandboxes.return_value = [sb]
+    service.stop_existing = AsyncMock()
+
+    with patch.dict(
+        "os.environ",
+        {"SANDBOX_IMAGE": "img:v1", "SANDBOX_CPUS": "1", "SANDBOX_MEMORY": "512"},
+        clear=True,
+    ):
+        await manager.cleanup()
+
+    service.stop_existing.assert_awaited_once_with(
+        sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+    )
+    service.get_or_create.assert_not_awaited()
+    service.delete.assert_not_awaited()
+
+
 class TestQuiesceReconcilingBackend:
     """``cleanup()`` on a backend that supports spec reconciliation routes to
     ``_quiesce`` instead of ``_legacy_cleanup``: stop every running managed

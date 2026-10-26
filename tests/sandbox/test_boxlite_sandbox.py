@@ -144,6 +144,85 @@ async def test_exec_caps_output_while_draining_boxlite_streams():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("chunks", "cap", "expected"),
+    [
+        ([b"abc"], 0, ""),
+        (["你".encode("utf-8")], 2, ""),
+        (["你".encode("utf-8"), b"a"], 3, "你"),
+    ],
+)
+async def test_exec_output_cap_handles_zero_and_multibyte_boundaries(
+    chunks, cap, expected
+):
+    execution = _FakeExecution(chunks, [])
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=_FakeNativeBox(execution))
+
+    result = await sandbox.exec("demo", max_output_bytes=cap)
+
+    assert result.stdout == expected
+    assert result.truncated is True
+
+
+@pytest.mark.asyncio
+async def test_exec_wait_failure_returns_failure_exit_code():
+    execution = _FakeExecution([b"partial"], [])
+
+    async def fail_wait():
+        raise RuntimeError("wait failed")
+
+    execution.wait = fail_wait
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=_FakeNativeBox(execution))
+
+    result = await sandbox.exec("demo", max_output_bytes=32)
+
+    assert result.exit_code == -1
+    assert result.stdout == "partial"
+
+
+@pytest.mark.asyncio
+async def test_exec_stream_failure_cancels_and_awaits_sibling_collector():
+    sibling_started = asyncio.Event()
+
+    class FailingStream:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await sibling_started.wait()
+            raise RuntimeError("stream failed")
+
+    class BlockingStream:
+        cancelled = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            sibling_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+
+    execution = _FakeExecution([], [])
+    sibling = BlockingStream()
+    execution.stdout_stream = FailingStream()
+    execution.stderr_stream = sibling
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = SimpleNamespace(_box=_FakeNativeBox(execution))
+
+    with pytest.raises(RuntimeError, match="stream failed"):
+        await sandbox.exec("demo", max_output_bytes=32)
+
+    assert sibling.cancelled is True
+    assert execution.killed is True
+
+
+@pytest.mark.asyncio
 async def test_exec_with_output_cap_kills_guest_when_cancelled():
     release = asyncio.Event()
 
@@ -282,7 +361,9 @@ class TestBoxliteSandboxService:
             # Check status
             info = await sandbox.info()
             assert info.template == template
-            assert info.config == config
+            assert info.config == config.model_copy(
+                update={"security_profile": service.runtime_security_profile()}
+            )
             assert info.state == "running"
 
             # Check using native interface, can only check partial fields
@@ -686,6 +767,7 @@ class TestBoxliteSandbox:
                 "pip", "install", "--user", "--break-system-packages", "pytest"
             )
             print(f"Output:\n{result.stdout}")
+            assert result.success, result.stderr
 
             # Run Python code
             python_code = """
@@ -699,7 +781,7 @@ class TestBoxliteSandbox:
             """
             result = await sandbox.run_code(python_code, code_type="python")
             print(f"Python output:\n{result.stdout}")
-            assert result.success
+            assert result.success, result.stderr
             assert "Hello from Python" in result.stdout
 
             await sandbox.stop()

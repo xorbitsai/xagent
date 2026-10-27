@@ -248,4 +248,4 @@ def test_revision_metadata() -> None:
     migration = _load_migration_module()
 
     assert migration.revision == "20261027_employment_hero_leave"
-    assert migration.down_revision == "20261026_auto_sequential_failover"
+    assert migration.down_revision == "20261027_task_dispatch_priority"

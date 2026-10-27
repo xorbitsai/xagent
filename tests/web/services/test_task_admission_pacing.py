@@ -4,7 +4,7 @@ import asyncio
 import multiprocessing
 import os
 
-from sqlalchemy import event, literal, text
+from sqlalchemy import bindparam, event, literal, text
 from sqlalchemy.engine import make_url
 
 from tests.web.services.test_task_execution_admission import (
@@ -28,7 +28,11 @@ async def test_start_burst_and_refill_have_no_window_rollover_double_burst(
     host, monkeypatch
 ):
     now = [100.0]
-    monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
+    monkeypatch.setattr(
+        pacing,
+        "database_time",
+        lambda: bindparam("fake_db_now", callable_=lambda: now[0]),
+    )
     admission.set_task_admission_hook(
         lambda db, command: admission.AdmissionPolicy(
             "paced",
@@ -86,7 +90,11 @@ async def test_idle_refill_is_bounded_and_backward_clock_does_not_create_allowan
     host, monkeypatch
 ):
     now = [100.0]
-    monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
+    monkeypatch.setattr(
+        pacing,
+        "database_time",
+        lambda: bindparam("fake_db_now", callable_=lambda: now[0]),
+    )
     admission.set_task_admission_hook(
         lambda db, command: admission.AdmissionPolicy(
             "idle",
@@ -113,7 +121,11 @@ async def test_live_guidance_does_not_consume_another_start(host, monkeypatch):
     from xagent.web.models.task_command import TaskExecutionCommand
 
     now = [100.0]
-    monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
+    monkeypatch.setattr(
+        pacing,
+        "database_time",
+        lambda: bindparam("fake_db_now", callable_=lambda: now[0]),
+    )
     admission.set_task_admission_hook(
         lambda db, command: admission.AdmissionPolicy(
             "guidance",
@@ -150,7 +162,11 @@ async def test_guidance_that_becomes_a_new_turn_waits_for_startup_allowance(
     from xagent.web.services.task_command_execution import execute_durable_task_command
 
     now = [100.0]
-    monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
+    monkeypatch.setattr(
+        pacing,
+        "database_time",
+        lambda: bindparam("fake_db_now", callable_=lambda: now[0]),
+    )
     monkeypatch.setattr(task_command_execution, "publish_task_event", AsyncMock())
     monkeypatch.setattr(
         task_command_execution, "get_session_local", lambda: host.sessions

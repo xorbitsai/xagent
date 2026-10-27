@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { requestPromptContext } from "./widget-parent-message"
+import { requestInitialMessage, requestPromptContext } from "./widget-parent-message"
 
 function stubParent() {
   const postMessage = vi.fn()
@@ -113,5 +113,104 @@ describe("requestPromptContext", () => {
 
     await expect(requestPromptContext()).resolves.toBeNull()
     expect(postMessage).not.toHaveBeenCalled()
+  })
+})
+
+describe("requestInitialMessage", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  function send(
+    value: unknown,
+    envelope: Record<string, unknown> = {},
+    source: MessageEventSource = window.parent as unknown as MessageEventSource,
+  ) {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "initial_message", value, ...envelope },
+      source,
+    }))
+  }
+
+  it("requests the message and delivers the trimmed reply", () => {
+    const postMessage = stubParent()
+    const onMessage = vi.fn()
+    const stop = requestInitialMessage(onMessage)
+
+    expect(postMessage).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "initial_message_request" },
+      "*",
+    )
+    send("  hi there ")
+
+    expect(onMessage).toHaveBeenCalledWith("hi there")
+    stop()
+  })
+
+  it("acknowledges the message it accepts and nothing else", () => {
+    const postMessage = stubParent()
+    const stop = requestInitialMessage(vi.fn())
+    const acks = () => postMessage.mock.calls.filter(([data]) => data.type === "initial_message_ack")
+
+    send("   ")
+    send("x".repeat(2001))
+    expect(acks()).toEqual([])
+
+    send("hi")
+    expect(acks()).toEqual([[{ xagent: true, v: 1, type: "initial_message_ack" }, "*"]])
+    stop()
+  })
+
+  it("accepts a message of exactly the length cap", () => {
+    stubParent()
+    const onMessage = vi.fn()
+    const stop = requestInitialMessage(onMessage)
+    const message = "x".repeat(2000)
+
+    send(message)
+
+    expect(onMessage).toHaveBeenCalledWith(message)
+    stop()
+  })
+
+  it("ignores other sources, wrong envelopes and unusable values", () => {
+    stubParent()
+    const onMessage = vi.fn()
+    const stop = requestInitialMessage(onMessage)
+
+    send("hi", {}, window as unknown as MessageEventSource)
+    send("hi", { xagent: false })
+    send("hi", { v: 2 })
+    send("hi", { type: "prompt_context" })
+    send("   ")
+    send(42)
+    send("x".repeat(2001))
+
+    expect(onMessage).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it("stops listening after cleanup", () => {
+    stubParent()
+    const onMessage = vi.fn()
+    requestInitialMessage(onMessage)()
+
+    send("hi")
+
+    expect(onMessage).not.toHaveBeenCalled()
+  })
+
+  it("does nothing on a direct visit", () => {
+    const post = vi.spyOn(window, "postMessage")
+    const onMessage = vi.fn()
+    const stop = requestInitialMessage(onMessage)
+
+    // Here window.parent === window, so the source check alone would accept this.
+    send("hi", {}, window as unknown as MessageEventSource)
+
+    expect(post).not.toHaveBeenCalled()
+    expect(onMessage).not.toHaveBeenCalled()
+    stop()
   })
 })

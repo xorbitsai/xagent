@@ -427,6 +427,16 @@ jobs:
           set -e
           python3 -m uv run python -m pytest ${{ matrix.paths }} -m "not slow and not postgresql" -n 4 --dist=loadscope -v --durations=30
 
+      - name: Run privileged writable sandbox tests
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
+        shell: bash
+        run: |
+          set -e
+          sudo -E "$PWD/.venv/bin/python" -m pytest \
+            tests/sandbox/test_docker_sandbox.py::TestDockerSandbox::test_upload_download_with_volume \
+            tests/core/test_workspace_nonroot_permissions.py::test_permission_migration_assigns_real_sandbox_gid \
+            -q
+
   pytest-fast-deepdoc:
     name: Pytest Fast Deepdoc (${{ matrix.name }})
     runs-on: ubuntu-latest

@@ -58,6 +58,9 @@ on:
       - 'tests/web/services/test_task_admission_guidance.py'
       - 'tests/migrations/test_task_admission_pacing_schema.py'
       - 'tests/web/services/test_queued_channel_pause_admission.py'
+      - 'tests/web/services/test_dispatch_fair_selection_postgresql.py'
+      - 'tests/web/services/fair_selection_support.py'
+      - 'src/xagent/web/services/task_dispatch_cap.py'
       - 'tests/web/services/test_queued_start_cancel_admission.py'
       - 'tests/web/services/test_shared_channel_execution.py'
       - 'src/xagent/web/services/shared_channel_execution.py'
@@ -281,6 +284,9 @@ jobs:
             tests/web/services/test_task_admission_guidance.py
             tests/migrations/test_task_admission_pacing_schema.py
             tests/web/services/test_queued_channel_pause_admission.py
+            tests/web/services/test_dispatch_fair_selection_postgresql.py
+            tests/web/services/fair_selection_support.py
+            src/xagent/web/services/task_dispatch_cap.py
             tests/web/services/test_queued_start_cancel_admission.py
             tests/web/services/test_shared_channel_execution.py
             src/xagent/web/services/shared_channel_execution.py
@@ -632,6 +638,19 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      - name: Test ordered Auto binding migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261026_auto_sequential_failover.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test task command claimable-kind index migration (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         shell: bash
@@ -676,6 +695,58 @@ jobs:
         shell: bash
         run: |
           pytest tests/alembic/test_20261022_task_command_claimable_fair_index.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task command unfinished-task index migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261026_task_command_unfinished_task_index.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task requested dispatch class migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261026_task_requested_dispatch_class.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task dispatch priority migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/alembic/test_20261027_task_dispatch_priority.py -m postgresql 2>&1 | tee pg.log
+          if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
+            echo "::error::Postgres-only cells were skipped; skipped is not passed"
+            exit 1
+          fi
+          grep -Eq '[1-9][0-9]* passed' pg.log
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test fair-share dispatch queries use the tenant index (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        shell: bash
+        run: |
+          pytest tests/web/services/test_dispatch_fair_selection_postgresql.py -m postgresql 2>&1 | tee pg.log
           if grep -Eq '(^|[^0-9])[0-9]+ skipped' pg.log; then
             echo "::error::Postgres-only cells were skipped; skipped is not passed"
             exit 1

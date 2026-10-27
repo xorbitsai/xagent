@@ -3289,6 +3289,135 @@ describe("useWebSocket normalized connections", () => {
     expect(socket.send).not.toHaveBeenCalled()
   })
 
+  describe("Session chat frames with file ids", () => {
+    const FILE_A = "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c"
+    const FILE_B = "7d2f0c1a-8b3e-4c55-a1f0-2e9d4b6c8a10"
+
+    const openSessionSocket = async () => {
+      const hook = renderHook(() => useWebSocket({ connection: sessionConnection() }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      socket.protocol = "xagent-session-v1"
+      act(() => socket.open())
+      return { ...hook, socket }
+    }
+
+    const frames = (socket: MockWebSocket) =>
+      socket.send.mock.calls.map((call) => JSON.parse(call[0] as string) as Record<string, unknown>)
+
+    it("sends file_ids and client_message_id without files or a task id", async () => {
+      const { result, socket } = await openSessionSocket()
+
+      const delivery = result.current.sendChatMessage(
+        "see attached", undefined, false, "msg-1", undefined,
+        { fileIds: [FILE_A, FILE_B], maxFileIds: 5 },
+      )
+
+      const frame = frames(socket)[0]
+      expect(frame).toMatchObject({
+        type: "chat",
+        message: "see attached",
+        client_message_id: "msg-1",
+        file_ids: [FILE_A, FILE_B],
+      })
+      expect(frame).not.toHaveProperty("files")
+      expect(frame).not.toHaveProperty("task_id")
+      expect(frame).not.toHaveProperty("request_id")
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-1" }))
+      await delivery
+    })
+
+    it.each([
+      ["no attachments argument", undefined],
+      ["an empty file id list", { fileIds: [] as string[], maxFileIds: 5 }],
+    ])("omits the file_ids key for %s", async (_label, attachments) => {
+      const { result, socket } = await openSessionSocket()
+
+      const delivery = result.current.sendChatMessage(
+        "plain", undefined, false, "msg-2", undefined, attachments,
+      )
+
+      expect(frames(socket)[0]).not.toHaveProperty("file_ids")
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-2" }))
+      await delivery
+    })
+
+    it("refuses to send file ids together with a request id", async () => {
+      const { result, socket } = await openSessionSocket()
+
+      await expect(result.current.sendChatMessage(
+        "answer", undefined, false, "msg-3", "request-1",
+        { fileIds: [FILE_A], maxFileIds: 5 },
+      )).rejects.toMatchObject({ disposition: "not_sent" })
+
+      expect(socket.send).not.toHaveBeenCalled()
+    })
+
+    it("refuses more file ids than the advertised limit", async () => {
+      const { result, socket } = await openSessionSocket()
+
+      await expect(result.current.sendChatMessage(
+        "too many", undefined, false, "msg-4", undefined,
+        { fileIds: [FILE_A, FILE_B], maxFileIds: 1 },
+      )).rejects.toMatchObject({ disposition: "not_sent" })
+
+      expect(socket.send).not.toHaveBeenCalled()
+    })
+
+    it("refuses file ids when the caller supplies no limit", async () => {
+      const { result, socket } = await openSessionSocket()
+
+      await expect(result.current.sendChatMessage(
+        "no limit", undefined, false, "msg-5", undefined, { fileIds: [FILE_A] },
+      )).rejects.toMatchObject({ disposition: "not_sent" })
+
+      expect(socket.send).not.toHaveBeenCalled()
+    })
+
+    it.each(["file-1", FILE_A.toUpperCase()])("refuses the malformed file id %s", async (fileId) => {
+      const { result, socket } = await openSessionSocket()
+
+      await expect(result.current.sendChatMessage(
+        "bad id", undefined, false, "msg-6", undefined, { fileIds: [fileId], maxFileIds: 5 },
+      )).rejects.toMatchObject({ disposition: "not_sent" })
+
+      expect(socket.send).not.toHaveBeenCalled()
+    })
+
+    it("refuses file ids on a connection that carries a task id", async () => {
+      const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 7 }))
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+      act(() => socket.open())
+
+      await expect(result.current.sendChatMessage(
+        "task bound", undefined, false, "msg-7", undefined, { fileIds: [FILE_A], maxFileIds: 5 },
+      )).rejects.toMatchObject({ disposition: "not_sent" })
+
+      expect(socket.send).not.toHaveBeenCalled()
+    })
+
+    it("sends identical file_ids when the same client message id is sent again", async () => {
+      const { result, socket } = await openSessionSocket()
+      const attachments = { fileIds: [FILE_A, FILE_B], maxFileIds: 5 }
+
+      const first = result.current.sendChatMessage("again", undefined, false, "msg-8", undefined, attachments)
+      act(() => socket.receive({
+        type: "message_rejected",
+        client_message_id: "msg-8",
+        error_code: "message_attachment_unavailable",
+      }))
+      await expect(first).rejects.toThrow()
+      const second = result.current.sendChatMessage("again", undefined, true, "msg-8", undefined, attachments)
+
+      const [firstFrame, secondFrame] = frames(socket)
+      expect(secondFrame.file_ids).toEqual(firstFrame.file_ids)
+      expect(secondFrame.file_ids).toEqual([FILE_A, FILE_B])
+      act(() => socket.receive({ type: "message_accepted", client_message_id: "msg-8" }))
+      await second
+    })
+  })
+
   it("rejects a coded unsuccessful 2xx batch upload before sending chat", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

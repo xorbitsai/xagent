@@ -3,7 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
-import { ChatInput } from "@/components/chat/ChatInput"
+import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { CompactionNotice } from "@/components/chat/CompactionNotice"
@@ -15,7 +15,7 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp, type TaskAutoResume } from "@/contexts/app-context-chat"
+import { useApp, type SessionAttachmentsConfig, type TaskAutoResume } from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
@@ -43,6 +43,24 @@ interface TaskConversationPanelProps {
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>
   deferFileUpload?: boolean
   onSend?: (message: string, config?: any, files?: File[]) => Promise<void> | void
+  // Upload-only mode (see ChatInput): the composer collects files although
+  // file reads stay disabled, and hands them to `onSend`.
+  attachments?: SessionAttachmentsConfig
+  attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>
+  onRetryAttachment?: (file: File) => void
+  // Attachment work is in progress (an upload, or a send with files until it
+  // has gone out and been accepted). It disables every file retry and counts
+  // as a message in flight, which locks the composer only while the task is
+  // pending or there is no task: while it is running, paused, waiting for an
+  // answer, completed or failed, the composer stays open.
+  attachmentsBusy?: boolean
+  // The collected files, when the caller holds them so that they outlive this
+  // panel. The panel then shows these and reports every change through
+  // `onAttachmentFilesChange`.
+  attachmentFiles?: File[]
+  // Called with the collected files every time they change: when the visitor
+  // adds or removes one, and once a send has completed.
+  onAttachmentFilesChange?: (files: File[]) => void
   onAgentExecutionClick?: (execution: AgentExecutionSummary) => void
 }
 
@@ -69,6 +87,7 @@ const INTERRUPTION_NOTICE_KEYS = {
   lease_expired: "taskInterruption.leaseExpired",
   persistence_failure: "taskInterruption.persistenceFailure",
   llm_unavailable: "taskInterruption.llmUnavailable",
+  model_output_invalid: "taskInterruption.modelOutputInvalid",
 } as const
 
 const interruptionNoticeKey = (reason: string) =>
@@ -85,6 +104,8 @@ const AUTO_RESUME_STOPPED_KEYS = {
   superseded: "taskInterruption.autoResumeStoppedSuperseded",
   failed: "taskInterruption.autoResumeStoppedFailed",
   disabled: "taskInterruption.autoResumeStoppedDisabled",
+  cancelled: "taskInterruption.autoResumeStoppedCancelled",
+  ineligible: "taskInterruption.autoResumeStoppedIneligible",
 } as const
 
 const autoResumeNotice = (
@@ -243,6 +264,12 @@ export function TaskConversationPanel({
   uploadFile,
   deferFileUpload = false,
   onSend,
+  attachments,
+  attachmentStatuses,
+  onRetryAttachment,
+  attachmentsBusy = false,
+  attachmentFiles,
+  onAttachmentFilesChange,
   onAgentExecutionClick,
 }: TaskConversationPanelProps) {
   const {
@@ -324,10 +351,31 @@ export function TaskConversationPanel({
     setDagPreviewOpen(true)
   }, [closeFilePreview])
 
+  // Upload-only mode keeps collecting files although `filesDisabled` closes
+  // every request that reads a file back.
+  const filesBlocked = filesDisabled && !attachments
+
+  const selectedFiles = attachmentFiles ?? files
+  // The newest selection. A send reads it once it has completed, because the
+  // visitor may have changed the files while it was in flight.
+  const latestFilesRef = useRef(selectedFiles)
+  latestFilesRef.current = selectedFiles
+
+  const updateFiles = (next: File[]) => {
+    latestFilesRef.current = next
+    setFiles(next)
+    onAttachmentFilesChange?.(next)
+  }
+
   const handleSend = async (message: string, config?: any, filesToSend?: File[]) => {
-    const outboundFiles = filesDisabled ? [] : (filesToSend || files)
+    const outboundFiles = filesBlocked ? [] : (filesToSend || selectedFiles)
     await (onSend ?? sendMessage)(message, config, outboundFiles)
-    setFiles([])
+    // In session mode only the files this send carried leave the selection:
+    // files added while it was in flight, and files kept hidden while uploads
+    // are not offered, stay. Other modes clear the selection after a send.
+    updateFiles(filesDisabled
+      ? latestFilesRef.current.filter((file) => !outboundFiles.includes(file))
+      : [])
   }
 
   const messageItems = useMemo<CombinedItem[]>(() => {
@@ -838,6 +886,11 @@ export function TaskConversationPanel({
     && state.currentTask.status === "paused"
     ? state.currentTask.autoResume
     : undefined
+  const isSupersededAutoResume = autoResume?.status === "stopped"
+    && autoResume.stopReason === "superseded"
+  const showStoppedResumeAction = autoResume?.status === "stopped"
+    && !isSupersededAutoResume
+    && taskControlsEnabled
   // The virtual message belongs to the latest turn, so it follows that turn's
   // stopped record the same way the process groups above do, including taking
   // no task-id failure reference. It only appears while the turn has no answer
@@ -881,10 +934,23 @@ export function TaskConversationPanel({
           </div>
         )}
         {(autoResume || interruptionReason) && (
-          <div role="status" data-testid="task-interruption-notice" className="mx-4 mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
-            {autoResume
-              ? autoResumeNotice(autoResume, t, locale)
-              : t(interruptionNoticeKey(interruptionReason as string))}
+          <div data-testid="task-interruption-notice" className="mx-4 mt-3 flex items-center gap-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">
+            <span role="status" className="flex-1">
+              {autoResume
+                ? autoResumeNotice(autoResume, t, locale)
+                : t(interruptionNoticeKey(interruptionReason as string))}
+            </span>
+            {showStoppedResumeAction && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={resumeTask}
+                className="shrink-0 border-amber-400 bg-transparent hover:bg-amber-100 dark:hover:bg-amber-900"
+              >
+                {t("agent.input.actions.resumeTask")}
+              </Button>
+            )}
           </div>
         )}
         <div className="flex-1 overflow-y-auto">
@@ -1039,14 +1105,15 @@ export function TaskConversationPanel({
                 || isConversationResetPending
                 || isMessageDeliveryPending
                 || isSessionInteractionLocked
+                || attachmentsBusy
               }
-              files={filesDisabled ? [] : files}
-              onFilesChange={filesDisabled ? undefined : setFiles}
+              files={filesBlocked ? [] : selectedFiles}
+              onFilesChange={filesBlocked ? undefined : updateFiles}
               showModeToggle={false}
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
               onPause={taskControlsEnabled ? pauseTask : undefined}
-              onResume={taskControlsEnabled ? resumeTask : undefined}
+              onResume={taskControlsEnabled && !isSupersededAutoResume ? resumeTask : undefined}
               onStop={canStopTask ? stopTask : undefined}
               stopState={stopState}
               taskConfig={state.currentTask ? {
@@ -1058,8 +1125,12 @@ export function TaskConversationPanel({
               } : undefined}
               readOnlyConfig={true}
               filesDisabled={filesDisabled}
+              attachments={attachments}
+              attachmentStatuses={attachmentStatuses}
+              onRetryAttachment={onRetryAttachment}
+              attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
-              hideFileUpload={hideFileUpload || filesDisabled}
+              hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}
               autoFocus={autoFocusInput}

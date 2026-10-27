@@ -14,9 +14,11 @@ from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.retry.wrapper import create_retry_wrapper
 from xagent.core.tools.adapters.vibe.vision_tool import VisionTool, get_vision_tool
 from xagent.core.tools.core.vision_tool import (
+    DetectObjectsResult,
     UnderstandMediaResult,
     _normalize_vision_response,
 )
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.services.model_service import get_default_vision_model
 
 
@@ -101,13 +103,14 @@ def mock_workspace():
     test_image.write_bytes(b"fake_image_data_for_test_image")
 
     workspace = Mock()
+    workspace.workspace_dir = temp_dir
 
     output_dir = temp_dir / "output"
     output_dir.mkdir(exist_ok=True)
     workspace.output_dir = output_dir
 
     # Mock the resolve_path_with_search method that VisionTool actually uses
-    def mock_resolve_path_with_search(filename):
+    def mock_resolve_path_with_search(filename, **_kwargs):
         if filename == "existing_image.jpg":
             return existing_image
         elif filename == "test_image.png":
@@ -116,6 +119,37 @@ def mock_workspace():
             raise FileNotFoundError(f"File not found: {filename}")
 
     workspace.resolve_path_with_search = Mock(side_effect=mock_resolve_path_with_search)
+
+    staging_dir = temp_dir / ".vision-staging"
+    staged_index = 0
+
+    def stage_path_for_external_upload(filename, *, max_bytes=None):
+        nonlocal staged_index
+        source = workspace.resolve_path_with_search(filename)
+        staging_dir.mkdir(exist_ok=True)
+        staged_index += 1
+        target = staging_dir / f"{staged_index}-{Path(source).name}"
+        target.write_bytes(Path(source).read_bytes())
+        return target
+
+    workspace.stage_path_for_external_upload = Mock(
+        side_effect=stage_path_for_external_upload
+    )
+
+    def stage_resolved_path_for_external_upload(source, _selector, **_kwargs):
+        nonlocal staged_index
+        staging_dir.mkdir(exist_ok=True)
+        staged_index += 1
+        target = staging_dir / f"{staged_index}-{Path(source).name}"
+        target.write_bytes(Path(source).read_bytes())
+        return target
+
+    workspace.stage_resolved_path_for_external_upload = Mock(
+        side_effect=stage_resolved_path_for_external_upload
+    )
+    workspace.discard_staged_external_upload = Mock(
+        side_effect=lambda path: Path(path).unlink(missing_ok=True)
+    )
 
     # Mock auto_register_files to return a proper context manager
     @contextmanager
@@ -374,7 +408,135 @@ class TestVisionToolUnderstandImages:
         assert result.images_processed == 1
 
         # Verify workspace methods were called
-        mock_workspace.resolve_path_with_search.assert_called_with("existing_image.jpg")
+        mock_workspace.resolve_path_with_search.assert_called_with(
+            "existing_image.jpg", detached_file_ids=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_understand_uploaded_symlink_stages_and_cleans_up(
+        self, mock_vision_model, tmp_path
+    ):
+        uploads = tmp_path / "uploads"
+        uploads.mkdir()
+        source = uploads / "chat-upload.jpg"
+        source.write_bytes(b"uploaded-image")
+        workspace = TaskWorkspace(
+            "task",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(uploads)],
+        )
+        (workspace.input_dir / source.name).symlink_to(source)
+
+        result = await VisionTool(mock_vision_model, workspace).understand_images(
+            f"input/{source.name}", "What is in this image?"
+        )
+
+        assert result.success is True
+        staging_root = workspace.external_upload_staging_root(host_private=True)
+        assert list(staging_root.iterdir()) == []
+
+    def test_uploaded_file_id_under_symlinked_root_stages(
+        self, mock_vision_model, tmp_path
+    ):
+        real_uploads = tmp_path / "real-uploads"
+        real_uploads.mkdir()
+        linked_uploads = tmp_path / "linked-uploads"
+        linked_uploads.symlink_to(real_uploads, target_is_directory=True)
+        source = linked_uploads / "uploaded.jpg"
+        source.write_bytes(b"uploaded-image")
+        workspace = TaskWorkspace(
+            "task",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(linked_uploads)],
+        )
+        workspace._file_id_to_path["uploaded-file-id"] = source
+
+        staged = VisionTool(mock_vision_model, workspace)._stage_media_path_sync(
+            "uploaded-file-id"
+        )
+
+        assert staged.read_bytes() == b"uploaded-image"
+        workspace.discard_staged_external_upload(staged)
+
+    def test_media_staging_rejects_swap_after_workspace_authorization(
+        self, mock_vision_model, tmp_path, monkeypatch
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        source = workspace.output_dir / "image.jpg"
+        source.write_bytes(b"authorized")
+        outside = tmp_path / "secret.jpg"
+        outside.write_bytes(b"secret")
+        real_resolve = workspace.resolve_path_with_search
+
+        def resolve_then_swap(selector: str, **kwargs):
+            resolved = real_resolve(selector, **kwargs)
+            source.unlink()
+            source.symlink_to(outside)
+            return resolved
+
+        monkeypatch.setattr(workspace, "resolve_path_with_search", resolve_then_swap)
+
+        with pytest.raises(FileNotFoundError):
+            VisionTool(mock_vision_model, workspace)._stage_media_path_sync(
+                "output/image.jpg"
+            )
+
+    @pytest.mark.asyncio
+    async def test_detect_error_restores_original_selector(
+        self, mock_vision_model, mock_workspace
+    ):
+        tool = VisionTool(mock_vision_model, mock_workspace)
+
+        async def reject_staged_image(images, *_args, **_kwargs):
+            staged = images if isinstance(images, str) else images[0]
+            return DetectObjectsResult(
+                success=False,
+                image_processed=staged,
+                error=f"Failed to decode {staged}",
+            )
+
+        tool.core.detect_objects = AsyncMock(side_effect=reject_staged_image)
+
+        result = await tool.detect_objects("existing_image.jpg", task="Find objects")
+
+        assert result.error == "Failed to decode existing_image.jpg"
+        assert result.image_processed == "existing_image.jpg"
+        assert ".vision-staging" not in result.error
+
+    @pytest.mark.asyncio
+    async def test_media_batch_keeps_valid_items_when_one_selector_fails(
+        self, vision_tool_with_workspace
+    ):
+        result = await vision_tool_with_workspace.understand_images(
+            ["existing_image.jpg", "missing.jpg"], "Describe the usable image"
+        )
+
+        assert result.success is True
+        assert result.images_processed == 1
+        assert any("missing.jpg" in warning for warning in result.warnings)
+
+    @pytest.mark.asyncio
+    async def test_understand_rejects_workspace_escape_paths(
+        self, mock_vision_model, tmp_path
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        outside = workspace.workspace_dir.parent / "outside.jpg"
+        outside.write_bytes(b"outside")
+        escape_link = workspace.output_dir / "escape.jpg"
+        escape_link.symlink_to(outside)
+
+        selectors = (
+            str(outside),
+            "output/../../outside.jpg",
+            "output/escape.jpg",
+        )
+        for selector in selectors:
+            result = await VisionTool(mock_vision_model, workspace).understand_images(
+                selector, "What is in this image?"
+            )
+            assert result.success is False
+
+        mock_vision_model.vision_chat.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_understand_single_image_path_without_workspace(
@@ -429,7 +591,7 @@ class TestVisionToolUnderstandImages:
         image_path = mock_workspace.resolve_path_with_search("existing_image.jpg")
         mock_workspace.resolve_path_with_search.reset_mock()
 
-        def resolve_file_ref(value: str) -> Path:
+        def resolve_file_ref(value: str, **_kwargs) -> Path:
             if value == file_ref:
                 return image_path
             raise FileNotFoundError(value)
@@ -442,7 +604,9 @@ class TestVisionToolUnderstandImages:
 
         assert result.success is True
         assert result.images_processed == 1
-        mock_workspace.resolve_path_with_search.assert_called_once_with(file_ref)
+        mock_workspace.resolve_path_with_search.assert_called_once_with(
+            file_ref, detached_file_ids=True
+        )
 
     @pytest.mark.asyncio
     async def test_understand_multiple_image_paths_with_workspace(
@@ -626,7 +790,7 @@ class TestVisionToolUnderstandImages:
         )
 
         assert result.success is False
-        assert "No valid images or video frames could be processed" in result.error
+        assert result.error == "Media is unavailable or outside the task workspace"
 
     @pytest.mark.asyncio
     async def test_understand_no_model_available(self):
@@ -693,6 +857,7 @@ class TestVisionToolUnderstandMedia:
             "</svg>"
         )
         svg_path.write_text(svg_source)
+        vision_tool_without_workspace.core.workspace_root = tmp_path
 
         with patch(
             "xagent.core.tools.core.vision_tool.rasterize_svg_bytes",
@@ -1176,6 +1341,7 @@ class TestVisionToolUnderstandMedia:
     ):
         video_path = tmp_path / "clip.mp4"
         video_path.write_bytes(b"fake-video")
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         completed_frames = [Mock(stdout=b""), Mock(stdout=b"jpeg-frame")]
 
         with (
@@ -1452,6 +1618,30 @@ class TestVisionToolDetectObjects:
         assert obj2["bbox"] == [0.7, 0.5, 0.95, 0.75]
 
     @pytest.mark.asyncio
+    async def test_detect_objects_reports_partial_resolution_failures(
+        self, mock_vision_model_with_detection, tmp_path
+    ):
+        workspace = TaskWorkspace("task", base_dir=str(tmp_path / "workspaces"))
+        source = workspace.output_dir / "valid.jpg"
+        source.write_bytes(b"image")
+        tool = VisionTool(mock_vision_model_with_detection, workspace)
+        tool.core.detect_objects = AsyncMock(
+            return_value=DetectObjectsResult(success=True)
+        )
+
+        result = await tool.detect_objects(
+            ["output/valid.jpg", "output/missing.jpg"],
+            task="Find objects",
+        )
+
+        assert result.success is True
+        assert result.warnings == [
+            "Failed to resolve media output/missing.jpg: "
+            "Media is unavailable or outside the task workspace"
+        ]
+        assert str(workspace.workspace_dir) not in result.warnings[0]
+
+    @pytest.mark.asyncio
     async def test_detect_objects_offloads_local_image_conversion(
         self, mock_vision_model_with_detection, tmp_path
     ):
@@ -1595,9 +1785,17 @@ class TestVisionToolDetectObjects:
         with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
             mock_draw.return_value = "/workspace/output/marked_test_image.jpg"
 
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
-                temp_image_path = temp_file.name
-                temp_file.write(b"fake_image_data")
+            temp_image = mock_workspace.workspace_dir / "marking-input.jpg"
+            temp_image.write_bytes(b"fake_image_data")
+            temp_image_path = str(temp_image)
+            original_resolver = mock_workspace.resolve_path_with_search.side_effect
+            mock_workspace.resolve_path_with_search.side_effect = (
+                lambda value, **kwargs: (
+                    temp_image
+                    if value == temp_image_path
+                    else original_resolver(value, **kwargs)
+                )
+            )
 
             try:
                 result = await vision_tool.detect_objects(
@@ -1610,6 +1808,7 @@ class TestVisionToolDetectObjects:
                     result.marked_image_path
                     == "/workspace/output/marked_test_image.jpg"
                 )
+                assert result.image_processed == temp_image_path
                 assert result.box_color == "red"  # default color
 
                 # Verify _draw_bounding_boxes was called
@@ -1711,6 +1910,7 @@ class TestVisionToolDetectObjects:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
             temp_image_path = temp_file.name
             temp_file.write(b"fake_image_data")
+        vision_tool.core.workspace_root = Path(temp_image_path).parent
 
         try:
             with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
@@ -1780,6 +1980,7 @@ class TestVisionToolDetectObjects:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
             temp_image_path = temp_file.name
             temp_file.write(b"fake_image_data")
+        vision_tool.core.workspace_root = Path(temp_image_path).parent
 
         try:
             with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
@@ -1843,6 +2044,7 @@ class TestVisionToolHelperMethods:
         svg_path = tmp_path / "official-logo.svg"
         svg_path.write_text('<svg xmlns="http://www.w3.org/2000/svg" />')
         png_bytes = b"rendered-png"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
 
         with patch(
             "xagent.core.tools.core.vision_tool.rasterize_svg_bytes",
@@ -1857,6 +2059,56 @@ class TestVisionToolHelperMethods:
         )
         rasterize.assert_called_once_with(svg_path.read_bytes())
 
+    def test_core_read_rejects_parent_symlink_swap(
+        self, vision_tool_without_workspace, tmp_path, monkeypatch
+    ):
+        workspace_root = tmp_path / "workspace"
+        media_dir = workspace_root / "media"
+        media_dir.mkdir(parents=True)
+        source = media_dir / "image.jpg"
+        source.write_bytes(b"authorized")
+        outside_dir = tmp_path / "outside"
+        outside_dir.mkdir()
+        (outside_dir / "image.jpg").write_bytes(b"secret")
+        moved_dir = workspace_root / "moved-media"
+        core = vision_tool_without_workspace.core
+        core.workspace_root = workspace_root
+        real_resolve = core._resolve_local_media_path
+
+        def resolve_then_swap(media_path: str) -> Path:
+            resolved = real_resolve(media_path)
+            media_dir.rename(moved_dir)
+            media_dir.symlink_to(outside_dir, target_is_directory=True)
+            return resolved
+
+        monkeypatch.setattr(core, "_resolve_local_media_path", resolve_then_swap)
+
+        with pytest.raises(RuntimeError, match="Failed to read local media"):
+            core._read_local_media_bytes(str(source))
+
+    @pytest.mark.asyncio
+    async def test_core_rejects_workspace_escape_selectors(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        outside = tmp_path / "outside.jpg"
+        outside.write_bytes(b"outside")
+        escape_link = workspace_root / "escape.jpg"
+        escape_link.symlink_to(outside)
+        core = vision_tool_without_workspace.core
+        core.workspace_root = workspace_root
+
+        for selector in (
+            str(outside),
+            str(workspace_root / ".." / "outside.jpg"),
+            str(escape_link),
+        ):
+            result = await core.understand_media(selector, "Describe it")
+            assert result.success is False
+
+        vision_tool_without_workspace.vision_model.vision_chat.assert_not_awaited()
+
     def test_decode_svg_bytes_rejects_script(self, vision_tool_without_workspace):
         svg = b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'
         with pytest.raises(ValueError, match="script"):
@@ -1869,6 +2121,7 @@ class TestVisionToolHelperMethods:
         from xagent.core.utils.svg import MAX_SVG_BYTES
 
         svg_path = tmp_path / "huge.svg"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         with open(svg_path, "w") as f:
             f.write("<svg>")
             f.write("a" * (MAX_SVG_BYTES + 1))
@@ -1887,6 +2140,7 @@ class TestVisionToolHelperMethods:
         self, vision_tool_without_workspace, tmp_path
     ):
         svg_path = tmp_path / "not-really.svg"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         svg_path.write_text("just some text pretending to be an svg file")
 
         content, warning = await vision_tool_without_workspace.core._svg_source_content(
@@ -1902,6 +2156,7 @@ class TestVisionToolHelperMethods:
         self, vision_tool_without_workspace, tmp_path
     ):
         svg_path = tmp_path / "official-logo.svg"
+        vision_tool_without_workspace.core.workspace_root = tmp_path
         svg_source = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"/>'
         svg_path.write_text(svg_source)
 
@@ -2345,7 +2600,7 @@ class TestDrawBoundingBoxes:
         )
 
         assert result.success is False
-        assert "Image file not found" in result.error
+        assert "Local media files require a task workspace" in result.error
 
     def test_draw_bounding_boxes_workspace_output(self, mock_workspace):
         """Test that bounding boxes are saved to workspace output directory"""

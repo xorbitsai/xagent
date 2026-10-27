@@ -1,6 +1,7 @@
 import React from "react";
 import { Sparkles } from "lucide-react";
-import { ChatInput } from "@/components/chat/ChatInput";
+import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput";
+import type { SessionAttachmentsConfig } from "@/contexts/app-context-chat";
 import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
@@ -77,6 +78,12 @@ type ChatStartScreenProps = {
   compactInput?: boolean;
   deferFileUpload?: boolean;
   filesDisabled?: boolean;
+  // Upload-only mode (see ChatInput): files can be collected although
+  // `filesDisabled` keeps every file read closed.
+  attachments?: SessionAttachmentsConfig;
+  attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>;
+  onRetryAttachment?: (file: File) => void;
+  attachmentsBusy?: boolean;
   voiceInputEnabled?: boolean;
   taskConfig?: React.ComponentProps<typeof ChatInput>["taskConfig"];
   autoFocus?: boolean;
@@ -108,13 +115,18 @@ export function ChatStartScreen({
   compactInput = false,
   deferFileUpload = false,
   filesDisabled = false,
+  attachments,
+  attachmentStatuses,
+  onRetryAttachment,
+  attachmentsBusy = false,
   voiceInputEnabled = true,
   taskConfig,
   autoFocus = false,
   inputMinHeightClass,
 }: ChatStartScreenProps) {
   const { t } = useI18n();
-  const enabledFiles = filesDisabled ? [] : files;
+  const filesBlocked = filesDisabled && !attachments;
+  const enabledFiles = filesBlocked ? [] : files;
 
   const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
     if (onPromptSelect) {
@@ -175,7 +187,7 @@ export function ChatStartScreen({
             isLoading={isSending}
             files={enabledFiles}
             onFilesChange={
-              filesDisabled ? undefined : (onFilesChange || (() => { }))
+              filesBlocked ? undefined : (onFilesChange || (() => { }))
             }
             showModeToggle={showModeToggle}
             inputValue={inputValue}
@@ -187,8 +199,12 @@ export function ChatStartScreen({
             compact={compactInput}
             deferFileUpload={deferFileUpload}
             filesDisabled={filesDisabled}
+            attachments={attachments}
+            attachmentStatuses={attachmentStatuses}
+            onRetryAttachment={onRetryAttachment}
+            attachmentsBusy={attachmentsBusy}
             voiceInputEnabled={voiceInputEnabled}
-            hideFileUpload={filesDisabled}
+            hideFileUpload={filesBlocked}
             taskConfig={taskConfig}
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}

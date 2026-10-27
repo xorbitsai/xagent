@@ -25,6 +25,7 @@ import pytest
 from docker.errors import APIError
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
+from xagent.config import get_sandbox_pids_limit
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     SPEC_CONTRACT_VERSION,
@@ -68,6 +69,21 @@ def docker_service():
 
 def _unique_name(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _effective_pids_limit(config: SandboxConfig) -> int | None:
+    """Mirror Docker create's resolution of an omitted backend default."""
+    if config.pids_limit is not None:
+        return config.pids_limit
+    return get_sandbox_pids_limit()
+
+
+def _effective_security_profile(config: SandboxConfig) -> str:
+    """Mirror Docker create's attested runtime-hardening profile."""
+    return (
+        config.security_profile
+        or docker_sandbox_module._DOCKER_RUNTIME_SECURITY_PROFILE
+    )
 
 
 # --- Fakes for mock-layer tests (no Docker required) ---
@@ -380,6 +396,7 @@ class TestCreatePublishVerification:
                     image_digest="sha256:deadbeef",
                     raw_nano_cpus=1_000_000_000,
                     raw_memory_bytes=512 * 1024 * 1024,
+                    raw_pids_limit=1024,
                     env={},
                     # Deliberately wrong: does not match the desired (empty)
                     # volume set, to force a MISMATCH on publish verification.
@@ -528,6 +545,7 @@ class TestCreatePersistsCanonicalDesiredState:
         assert raw_config.working_dir == "/home/", "test input must be non-canonical"
         assert row.config.working_dir == "/home"
         assert row.config.volumes == [tuple(v) for v in canonical_volumes]
+        assert row.config.pids_limit == get_sandbox_pids_limit()
 
         # Same objects the container itself was built from.
         assert row.template == captured["template"]
@@ -547,6 +565,8 @@ class TestCreatePersistsCanonicalDesiredState:
             volumes=row.config.volumes,
             network_isolated=bool(row.config.network_isolated),
             ports=row.config.ports,
+            pids_limit=row.config.pids_limit,
+            security_profile=row.config.security_profile,
         )
         assert (
             spec_from_row.fingerprint()
@@ -600,6 +620,7 @@ def _observed_facts(**overrides):
         image_digest="sha256:deadbeef",
         raw_nano_cpus=1_000_000_000,
         raw_memory_bytes=512 * 1024 * 1024,
+        raw_pids_limit=1024,
         env={},
         volumes=(),
         ports=(),
@@ -623,7 +644,7 @@ def _observed_inspection(**overrides):
 
 
 class TestFindPublishMismatchesEveryBranch:
-    """Cover all seven comparison branches, in both directions.
+    """Cover every comparison branch, in both directions.
 
     Publish verification is the mechanism whose *false positives* destroy a
     just-created container, so every branch needs a negative control (an
@@ -638,6 +659,7 @@ class TestFindPublishMismatchesEveryBranch:
             working_dir="/home",
             cpus=1,
             memory=512,
+            pids_limit=1024,
         )
 
     def test_agreeing_observation_reports_no_mismatch(self):
@@ -658,6 +680,7 @@ class TestFindPublishMismatchesEveryBranch:
             ("network_isolated", {"network_isolated": True}),
             ("cpus", {"raw_nano_cpus": 2_000_000_000}),
             ("memory", {"raw_memory_bytes": 1024 * 1024 * 1024}),
+            ("pids_limit", {"raw_pids_limit": 2048}),
         ],
     )
     def test_each_field_is_reported_when_it_disagrees(self, field, overrides):
@@ -687,6 +710,26 @@ class TestFindPublishMismatchesEveryBranch:
         )
         assert mismatches == ["cpus", "memory"]
 
+    @pytest.mark.parametrize("raw_value", [None, 0, -1])
+    def test_unlimited_backend_pids_values_are_normalized(self, raw_value):
+        desired = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image",
+            image=DEFAULT_SANDBOX_IMAGE,
+            working_dir="/home",
+            pids_limit=None,
+        )
+        inspection = _observed_inspection(
+            raw_nano_cpus=1_000_000_000,
+            raw_memory_bytes=512 * 1024 * 1024,
+            raw_pids_limit=raw_value,
+        )
+        assert (
+            docker_sandbox_module._find_publish_mismatches(
+                desired, DEFAULT_SANDBOX_IMAGE, inspection
+            )
+            == []
+        )
+
     def test_volume_and_port_comparison_ignores_ordering(self):
         desired = ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image",
@@ -694,6 +737,7 @@ class TestFindPublishMismatchesEveryBranch:
             working_dir="/home",
             volumes=[("/h1", "/g1", "rw"), ("/h2", "/g2", "ro")],
             ports=[(18080, 80), (18081, 81)],
+            pids_limit=1024,
         )
         inspection = _observed_inspection(
             volumes=(("/h2", "/g2", "ro"), ("/h1", "/g1", "rw")),
@@ -846,6 +890,8 @@ class TestDockerCreate:
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert inspection.fingerprint_label == desired.fingerprint()
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1043,6 +1089,8 @@ class TestDockerCreate:
                 working_dir=config.working_dir,
                 cpus=config.cpus,
                 memory=config.memory,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert desired.working_dir == "/home"
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1077,6 +1125,8 @@ class TestDockerCreate:
                 cpus=config.cpus,
                 memory=config.memory,
                 volumes=config.volumes,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1112,6 +1162,8 @@ class TestDockerCreate:
                 cpus=config.cpus,
                 memory=config.memory,
                 volumes=config.volumes,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1144,6 +1196,8 @@ class TestDockerCreate:
                 image=DEFAULT_SANDBOX_IMAGE,
                 cpus=config.cpus,
                 memory=config.memory,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:
@@ -1225,6 +1279,8 @@ class TestDockerCreateFromSnapshot:
                 volumes=config.volumes,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert inspection.fingerprint_label == desired.fingerprint()
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
@@ -1461,6 +1517,7 @@ def _attrs(**overrides) -> dict:
         "HostConfig": {
             "NanoCpus": 2_000_000_000,
             "Memory": 256 * 1024 * 1024,
+            "PidsLimit": 1024,
             "PortBindings": {"80/tcp": [{"HostPort": "18080"}]},
         },
         "State": {"Status": "running"},
@@ -1505,13 +1562,14 @@ class TestBuildInspectionFacts:
         assert inspection.facts.image_ref == "img:tag"
         assert inspection.facts.image_digest == "sha256:imagedigest"
 
-    def test_keeps_raw_backend_units_for_cpus_and_memory(self):
+    def test_keeps_raw_backend_units_for_cpus_memory_and_pids(self):
         """Raw units are what make a live ``docker update`` observable."""
         inspection = docker_sandbox_module._build_inspection(
             _FakeInspectableContainer(_attrs())
         )
         assert inspection.facts.raw_nano_cpus == 2_000_000_000
         assert inspection.facts.raw_memory_bytes == 256 * 1024 * 1024
+        assert inspection.facts.raw_pids_limit == 1024
 
     def test_parses_env_and_drops_entries_without_a_separator(self):
         inspection = docker_sandbox_module._build_inspection(
@@ -1801,6 +1859,8 @@ class TestCreateNetworkIsolatedSandbox:
                 cpus=config.cpus,
                 memory=config.memory,
                 network_isolated=True,
+                pids_limit=_effective_pids_limit(config),
+                security_profile=_effective_security_profile(config),
             )
             assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
         finally:

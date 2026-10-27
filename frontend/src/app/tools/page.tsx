@@ -102,6 +102,7 @@ export interface MCPServer {
   runtime_input_schema?: Record<string, any> | null
   runtime_bindings?: Record<string, any>[] | null
   allow_delegated_authorization?: boolean
+  signed_uploads_error?: string | null
 }
 
 interface ConfigurableToolField {
@@ -1061,6 +1062,14 @@ function ToolsPageContent() {
             {status?.needs_config && (
               <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
                 {t('tools.mcp.sharing.needsConfig')}
+              </span>
+            )}
+            {typeof server.signed_uploads_error === 'string' && (
+              <span
+                className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700"
+                title={t('tools.mcp.signedUploads.invalidBadgeDescription')}
+              >
+                {t('tools.mcp.signedUploads.invalidBadge')}
               </span>
             )}
             {needsReconnect(server) && <NeedsReconnectBadge />}

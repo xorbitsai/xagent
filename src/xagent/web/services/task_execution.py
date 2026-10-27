@@ -31,15 +31,19 @@ names must keep it importable from this module.
 
 import asyncio
 import enum
+import hashlib
 import json
 import logging
+import os
 import re
 import shutil
+import stat
+import tempfile
 import time
 import uuid
 import weakref
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -83,6 +87,7 @@ from ...core.execution_scope import (
     resolve_execution_scope,
 )
 from ...core.file_ref import build_file_ref
+from ...core.workspace import _is_sandbox_prepared
 from ..models.database import (
     get_db,
     get_session_local,
@@ -90,6 +95,7 @@ from ..models.database import (
 from ..models.task import Task, TaskStatus, task_status_predicate
 from ..models.uploaded_file import UploadedFile
 from .llm_utils import AutoModelUnavailableError
+from .release_hold import release_hold
 from .task_auto_recovery import (
     InterruptionDecision,
     InterruptionSettlementDeferred,
@@ -99,7 +105,11 @@ from .task_auto_recovery import (
     settlement_interruption_for_failure,
     settlement_interruption_for_result,
 )
-from .task_dispatch_cap import DispatchCapSnapshot, DispatchPolicy
+from .task_dispatch_cap import (
+    DispatchCapSnapshot,
+    DispatchPolicy,
+    TenantListingRequired,
+)
 from .task_events import DeliveryNotifier, publish_task_event
 from .task_execution_event_writer import (
     FactWitness,
@@ -107,6 +117,7 @@ from .task_execution_event_writer import (
     stage_result_fact_no_commit,
 )
 from .task_lease_service import (
+    current_task_lease,
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
     task_lease_attempt_predicate,
@@ -149,6 +160,11 @@ from .db_runtime import (
     propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
+from .db_write_retry import (
+    bound_rerun_lock_wait_no_commit,
+    retry_db_write_async,
+)
+from .execution_event_signals import report_commit_failure
 from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
@@ -163,6 +179,7 @@ from .file_turn import (
     build_prompt_context_block,
     normalize_filename,
     prompt_context_from_agent_config,
+    resolve_turn_file_infos,
 )
 from .mcp_runtime import (
     MCPActorExecutionIdentity,
@@ -196,6 +213,7 @@ from .uploaded_file_store import (
     SupersededObjectCleanupClaim,
     UploadedFileStore,
     UploadedFileVersionSnapshot,
+    _uploaded_file_version_match_predicates,
     cleanup_superseded_uploaded_file_objects,
     compensate_staged_uploaded_files,
     snapshot_uploaded_file_version,
@@ -215,6 +233,10 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+
+# A deferred delivery's notice is sent even while its resume is being
+# cancelled; a client that stops reading must not hold the canceller longer.
+_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS = 5.0
 
 
 _pause_accepted_task_ids: set[int] = set()
@@ -573,6 +595,9 @@ def _terminal_task_error_payload(
     SessionLocal = get_session_local()
     db = SessionLocal()
     canonical = False
+    # Set once the write has committed or was skipped; a failure after that
+    # (reading the payload to return) did not lose a fact.
+    write_settled = False
     try:
         from .task_execution_event_writer import uses_execution_events
 
@@ -612,6 +637,7 @@ def _terminal_task_error_payload(
         result = db.execute(statement.execution_options(synchronize_session=False))
         if int(getattr(result, "rowcount", 0) or 0) != 1:
             db.rollback()
+            write_settled = True
             current_payload = _task_error_payload(
                 db,
                 task_id,
@@ -659,6 +685,7 @@ def _terminal_task_error_payload(
                 db.refresh(task)
                 stage_result_fact_no_commit(db, task, {"error": message})
             db.commit()
+        write_settled = True
         return _task_error_payload(
             db,
             task_id,
@@ -670,6 +697,14 @@ def _terminal_task_error_payload(
         if canonical:
             from ...core.agent.checkpoint import ExecutionEventPersistenceError
 
+            if not write_settled:
+                report_commit_failure(
+                    "terminal_failure",
+                    exc,
+                    task_id=task_id,
+                    run_id=expected_run_id,
+                    retried=False,
+                )
             raise ExecutionEventPersistenceError(
                 "Terminal failure event commit failed"
             ) from exc
@@ -766,9 +801,16 @@ def _outbound_message_business_payload(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _persist_agent_outbound_event(
-    task_id: int, event: Dict[str, Any], *, authoritative: bool = False
+    task_id: int,
+    event: Dict[str, Any],
+    *,
+    authoritative: bool = False,
+    rerun: bool = False,
 ) -> None:
-    """Persist agent outbound events and durable waiting prompts."""
+    """Persist agent outbound events and durable waiting prompts.
+
+    ``rerun`` marks a retry of an authoritative write that failed transiently.
+    """
 
     from ..models.task import Task as DatabaseTask
     from ..models.task import TraceEvent as DatabaseTraceEvent
@@ -778,8 +820,8 @@ def _persist_agent_outbound_event(
     db_gen = get_db()
     db = next(db_gen)
     try:
-        from .task_lease_service import current_task_lease
-
+        if rerun:
+            bound_rerun_lock_wait_no_commit(db)
         lease = current_task_lease()
         if authoritative and event.get("type") == "final_answer_delta":
             # Chunks are ephemeral; complete answers and stream boundaries are
@@ -1003,6 +1045,48 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
         db.close()
 
 
+async def _persist_authoritative_outbound_event(
+    task_id: int, event: Dict[str, Any]
+) -> None:
+    """Persist an authoritative outbound event, rerunning transient failures.
+
+    A retryable failure may have committed. Each attempt writes a fresh copy
+    of ``event``, so its protocol id and payload are unchanged and a committed
+    attempt replays its fact and chat row instead of appending again. Some
+    branches rewrite the event they are given before COMMIT, so ``event`` is
+    left alone until an attempt succeeds and is then replaced by its copy.
+    """
+
+    attempts = 0
+
+    async def attempt() -> Dict[str, Any]:
+        nonlocal attempts
+        attempts += 1
+        candidate = deepcopy(event)
+        rerun = attempts > 1
+        await run_db_io_cancellation_safe(
+            lambda: _persist_agent_outbound_event(
+                task_id, candidate, authoritative=True, rerun=rerun
+            )
+        )
+        return candidate
+
+    try:
+        persisted = await retry_db_write_async(attempt, site="outbound")
+    except Exception as exc:
+        lease = current_task_lease()
+        report_commit_failure(
+            "outbound",
+            exc,
+            task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
+            retried=attempts > 1,
+        )
+        raise
+    event.clear()
+    event.update(persisted)
+
+
 def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
@@ -1027,11 +1111,7 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
                 payload_type, task_id, dict(payload)
             )
             if authoritative:
-                await run_db_io_cancellation_safe(
-                    lambda: _persist_agent_outbound_event(
-                        task_id, final_answer_event, authoritative=True
-                    )
-                )
+                await _persist_authoritative_outbound_event(task_id, final_answer_event)
             await publish_task_event(final_answer_event, task_id)
             return None
 
@@ -1055,11 +1135,12 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
             },
             event_id=payload.get("event_id"),
         )
-        await run_db_io_cancellation_safe(
-            lambda: _persist_agent_outbound_event(
-                task_id, event, authoritative=authoritative
+        if authoritative:
+            await _persist_authoritative_outbound_event(task_id, event)
+        else:
+            await run_db_io_cancellation_safe(
+                lambda: _persist_agent_outbound_event(task_id, event)
             )
-        )
         await publish_task_event(event, task_id)
         return cast(Dict[str, Any], event["data"]) if authoritative else None
 
@@ -2624,7 +2705,11 @@ async def execute_task_background(
             else:
                 agent_context.pop("task_source", None)
                 agent_context.pop("run_id", None)
-            if prompt_context_block is not None and not _has_display_message_override(
+            # The model text may carry server-added context (uploaded files, the
+            # prompt-context block). Whenever it differs from the transcript text,
+            # record the transcript text as the display message for the
+            # user_message trace event; a display message the caller set wins.
+            if task_for_agent != user_message and not _has_display_message_override(
                 agent_context
             ):
                 agent_context["display_message"] = user_message
@@ -2873,6 +2958,14 @@ async def execute_task_background(
         # Clean up background task record
         _clear_task_pause_accepted(task_id)
         background_task_manager.cleanup_task(task_id)
+        try:
+            agent_manager.note_runtime_settled(task_id)
+        except Exception:
+            logger.warning(
+                "Settling the cached runtime for task %s failed",
+                task_id,
+                exc_info=True,
+            )
 
 
 def _latest_result_user_turn_id(result: Dict[str, Any]) -> str | None:
@@ -3487,26 +3580,27 @@ async def execute_resume_background(
         if delivery_notifier is None:
             return
         try:
-            if delivery_outcome_unknown:
+            async with asyncio.timeout(_DEFERRED_DELIVERY_NOTICE_TIMEOUT_SECONDS):
+                if delivery_outcome_unknown:
+                    await delivery_notifier(
+                        turn_id=delivery_turn_id,
+                        accepted=False,
+                        message=client_error_message(
+                            ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
+                        ),
+                        error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
+                        retry_with_new_id=False,
+                        rejection_outcome="outcome_unknown",
+                    )
+                    return
                 await delivery_notifier(
                     turn_id=delivery_turn_id,
-                    accepted=False,
-                    message=client_error_message(
-                        ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN
-                    ),
-                    error_code=ClientErrorCode.MESSAGE_OUTCOME_UNKNOWN.value,
-                    retry_with_new_id=False,
-                    rejection_outcome="outcome_unknown",
+                    accepted=accepted,
+                    message=message,
+                    error_code=error_code.value if error_code is not None else None,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
                 )
-                return
-            await delivery_notifier(
-                turn_id=delivery_turn_id,
-                accepted=accepted,
-                message=message,
-                error_code=error_code.value if error_code is not None else None,
-                retry_with_new_id=retry_with_new_id,
-                rejection_outcome=rejection_outcome,
-            )
         except Exception:
             # Delivery state is durable; a disconnected client will retry the
             # same id and recover the result from that state.
@@ -3517,29 +3611,37 @@ async def execute_resume_background(
             )
 
     async def record_accepted_delivery() -> None:
-        """Record a durably accepted turn whose resume did not proceed."""
+        """Record a durably accepted turn whose resume did not proceed.
+
+        The marker and its notice finish before a cancellation that arrives
+        meanwhile propagates; see ``fail_deferred_delivery``.
+        """
         nonlocal delivery_accepted_unrecorded
         if not delivery_accepted_unrecorded:
             return
         delivery_accepted_unrecorded = False
-        if delivery_turn_id is not None:
-            try:
-                await run_db_io_cancellation_safe(
-                    lambda: mark_user_message_delivery_sync(
+
+        async def record() -> None:
+            if delivery_turn_id is not None:
+                try:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_DISPATCHED,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "delivery marker failed after an interrupted accepted "
+                        "deferred message for task %s turn %s",
                         task_id,
                         delivery_turn_id,
-                        DELIVERY_DISPATCHED,
+                        exc_info=True,
                     )
-                )
-            except Exception:
-                logger.warning(
-                    "delivery marker failed after an interrupted accepted "
-                    "deferred message for task %s turn %s",
-                    task_id,
-                    delivery_turn_id,
-                    exc_info=True,
-                )
-        await notify_deferred_delivery(True)
+            await notify_deferred_delivery(True)
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(record()))
 
     async def mark_deferred_delivery_failed() -> bool:
         """Persist a failed delivery without amplifying pool exhaustion."""
@@ -3570,6 +3672,33 @@ async def execute_resume_background(
                 exc_info=True,
             )
             return False
+
+    async def fail_deferred_delivery(
+        message: str | None = None,
+        *,
+        error_code: ClientErrorCode | None = None,
+        retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
+    ) -> None:
+        """Persist a failed or unknown delivery, then tell the client.
+
+        A canceller may cancel again while the write commits: cancel_task
+        re-cancels once its wait times out. Once the outcome is durable the
+        client must still hear it, so the write and its notice finish before
+        that cancellation propagates.
+        """
+
+        async def settle() -> None:
+            if await mark_deferred_delivery_failed():
+                await notify_deferred_delivery(
+                    False,
+                    message,
+                    error_code=error_code,
+                    retry_with_new_id=retry_with_new_id,
+                    rejection_outcome=rejection_outcome,
+                )
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(settle()))
 
     try:
         preacquired_resources = (
@@ -3850,6 +3979,13 @@ async def execute_resume_background(
                 )
             )
 
+        # Every resume route shares this point, including task commands and
+        # no-attachment channel turns. Materialize authorized pre-upgrade
+        # input symlinks before the non-root sandbox can observe them.
+        await run_db_io_cancellation_safe(
+            lambda: _prepare_workspace_inputs_for_agent(agent_service)
+        )
+
         # The task row can become RUNNING before the original AgentRunner has
         # created a context/checkpoint. Retry an early failed injection only
         # after that original execution has settled and persisted its state.
@@ -4023,7 +4159,11 @@ async def execute_resume_background(
                         task_id,
                         delivery_turn_id,
                     )
-            await notify_deferred_delivery(True)
+            # The turn is accepted and the cancel branch has nothing left to
+            # announce for it, so a cancel must not cut this notice short.
+            await drain_async_task_cancellation_safe(
+                asyncio.create_task(notify_deferred_delivery(True))
+            )
 
         # Resume is now durable: lease acquisition committed RUNNING. Do not
         # announce it earlier from the WebSocket request handler.
@@ -4259,8 +4399,7 @@ async def execute_resume_background(
         )
     except TaskLeaseLostError:
         if delivery_outcome_unknown:
-            if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(False)
+            await fail_deferred_delivery()
         await record_accepted_delivery()
         defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
         logger.warning(
@@ -4273,14 +4412,12 @@ async def execute_resume_background(
         logger.info(f"V2 resume background task {task_id} cancelled")
         await record_accepted_delivery()
         if delivery_turn_id is not None and not delivery_was_dispatched:
-            if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(
-                    False,
-                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                    retry_with_new_id=True,
-                    rejection_outcome="not_accepted",
-                )
+            await fail_deferred_delivery(
+                client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                retry_with_new_id=True,
+                rejection_outcome="not_accepted",
+            )
         raise
     except Exception as e:
         error_message = str(e)
@@ -4322,8 +4459,7 @@ async def execute_resume_background(
             )
             return
         elif delivery_outcome_unknown:
-            if await mark_deferred_delivery_failed():
-                await notify_deferred_delivery(False)
+            await fail_deferred_delivery()
         elif isinstance(e, _DeferredInjectionRejectedRetryableError):
             # Nothing was written for this message, so it is never failed or
             # resumed for. A fence left by an earlier uncertain input keeps the
@@ -4347,14 +4483,12 @@ async def execute_resume_background(
                 e.fenced,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
-                if await mark_deferred_delivery_failed():
-                    await notify_deferred_delivery(
-                        False,
-                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                        retry_with_new_id=True,
-                        rejection_outcome="not_accepted",
-                    )
+                await fail_deferred_delivery(
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
         elif (
             isinstance(e, (CheckpointUnavailableError, CheckpointAccessRefusedError))
             and lease is not None
@@ -4382,14 +4516,12 @@ async def execute_resume_background(
                 exc_info=True,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
-                if await mark_deferred_delivery_failed():
-                    await notify_deferred_delivery(
-                        False,
-                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
-                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
-                        retry_with_new_id=True,
-                        rejection_outcome="not_accepted",
-                    )
+                await fail_deferred_delivery(
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
         else:
             logger.error(
                 "V2 resume background task %s failed: %s",
@@ -4409,13 +4541,11 @@ async def execute_resume_background(
                 fallback=CLIENT_SAFE_TASK_FAILURE,
             )
             if delivery_turn_id is not None and not delivery_was_dispatched:
-                if await mark_deferred_delivery_failed():
-                    await notify_deferred_delivery(
-                        False,
-                        CLIENT_SAFE_VALIDATION_ERROR,
-                        retry_with_new_id=True,
-                        rejection_outcome="not_accepted",
-                    )
+                await fail_deferred_delivery(
+                    CLIENT_SAFE_VALIDATION_ERROR,
+                    retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
+                )
             current_snapshot = None
             if (
                 lease is None
@@ -4693,6 +4823,16 @@ async def execute_resume_background(
                     task_id,
                     expected_task=resume_owner_task,
                 )
+                try:
+                    from .agent_service_manager import get_agent_manager
+
+                    get_agent_manager().note_runtime_settled(task_id)
+                except Exception:
+                    logger.warning(
+                        "Settling the cached runtime for task %s failed",
+                        task_id,
+                        exc_info=True,
+                    )
 
         cleanup_task = asyncio.create_task(finalize_resume_resources())
         await drain_async_task_cancellation_safe(cleanup_task)
@@ -4795,8 +4935,8 @@ class BackgroundTaskManager:
         # the one place that drops entries: a task that has left the active set
         # is removed at the next snapshot. A task that releases its slot and
         # re-enters the active set outside the dispatcher before that snapshot
-        # keeps its old key; that only affects the per-tenant counts of the
-        # diagnostics line.
+        # keeps its old key; that affects the per-tenant counts of the
+        # diagnostics line, the fair-share ranking and the tenant cap.
         self._slot_keys: dict[int, str] = {}
         # Time this process spent at its dispatch cap, for the diagnostics
         # line's ``gate_held_s``. Observed at every cap snapshot and at each
@@ -4846,7 +4986,9 @@ class BackgroundTaskManager:
             return
         self._record_cap_state(
             DispatchCapSnapshot(
-                policy=policy, active_ids=self._active_task_ids()
+                policy=policy,
+                active_ids=self._active_task_ids(),
+                held=release_hold.closed,
             ).closed,
             now,
         )
@@ -4876,7 +5018,12 @@ class BackgroundTaskManager:
         active = self._active_task_ids()
         for task_id in [t for t in self._slot_keys if t not in active]:
             del self._slot_keys[task_id]
-        snapshot = DispatchCapSnapshot(policy=policy, active_ids=active)
+        snapshot = DispatchCapSnapshot(
+            policy=policy,
+            active_ids=active,
+            held=release_hold.closed,
+            occupancy=dict(self._tenant_occupancy(active)),
+        )
         self._cap_last_policy = policy
         self._record_cap_state(snapshot.closed, self._cap_clock())
         return snapshot
@@ -4888,20 +5035,38 @@ class BackgroundTaskManager:
         policy: DispatchPolicy,
         interactive: bool,
         fairness_key: str | None = None,
+        queued_tenants: Mapping[str, int] | None = None,
+        require_listing: bool = False,
     ) -> DispatchReservation | None:
         """Take a slot for ``task_id`` unless the policy keeps it from this command.
 
         ``interactive`` is the class of the command that wants the slot; a
         batch command is refused from the batch line on, an interactive one
-        only at the limit. Reads the active set and adds the token with no
-        await in between, so concurrent dispatch attempts cannot both take
-        the last slot. Records ``fairness_key`` for a task that was not yet
-        active; a task already in the active set keeps its recorded key.
+        only at the limit. Between the two lines, given ``queued_tenants`` (the
+        oldest queued command id of each queued tenant, as the selection that
+        picked the command listed them), the tenant that holds the most slots
+        here is refused a new slot (``DispatchCapSnapshot.capped_tenant``). When
+        ``require_listing`` is true and no listing came with the command,
+        ``TenantListingRequired`` is raised instead of taking a slot between
+        the two lines, so that the caller selects again with the listing.
+        Reads the active set and adds the token with no await in between, so
+        concurrent dispatch attempts cannot both take the last slot. Records
+        ``fairness_key`` for a task that was not yet active; a task already in
+        the active set keeps its recorded key. A refusal or a raise leaves no
+        trace.
         """
 
         snapshot = self.dispatch_cap_snapshot(policy)
         if not snapshot.admits(task_id, interactive=interactive):
             return None
+        if task_id not in snapshot.active_ids:
+            if queued_tenants is None:
+                if require_listing and snapshot.in_reserve_band:
+                    raise TenantListingRequired
+            else:
+                capped = snapshot.capped_tenant(queued_tenants)
+                if capped is not None and fairness_key == capped:
+                    return None
         if fairness_key is not None and task_id not in snapshot.active_ids:
             self._slot_keys[task_id] = fairness_key
         self._dispatch_reservations[task_id] += 1
@@ -5186,6 +5351,28 @@ class BackgroundTaskManager:
         else:
             self._window_finished_ok += 1
 
+    def release_counts(self) -> dict[str, int]:
+        """Everything this manager still owns, for a planned-restart idle check.
+
+        Read-only. Live handles count until their own done callback runs, so
+        an execution is counted until it has finished unwinding; resume
+        coordinators also count while they wait for the execution they will
+        replace, and reservations cover the window before registration. The
+        tables overlap (a registered coordinator is also a live handle), which
+        is harmless: only "all zero" is used as evidence.
+        """
+
+        return {
+            "live_executions": sum(
+                len(handles) for handles in self._live_executions.values()
+            ),
+            "resume_coordinators": sum(
+                1 for task in self.resume_tasks.values() if not task.done()
+            ),
+            "resume_reservations": len(self._resume_reservations),
+            "dispatch_reservations": sum(self._dispatch_reservations.values()),
+        }
+
     def inflight_counts(self) -> tuple[int, int]:
         """Return (executions in flight, resume coordinators not yet executing).
 
@@ -5384,67 +5571,490 @@ class BackgroundTaskManager:
 background_task_manager = BackgroundTaskManager()
 
 
+def _copy_durable_input_to_workspace(source: Path, target: Path, *, mode: int) -> None:
+    """Publish one regular durable input as a private task-local copy."""
+
+    source_flags = (
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
+    source_fd = os.open(source, source_flags)
+    temp_fd = -1
+    temp_path: Path | None = None
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ValueError("Durable task inputs must be regular files")
+        temp_fd, temp_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        os.fchmod(temp_fd, mode)
+        with (
+            os.fdopen(source_fd, "rb", closefd=True) as source_file,
+            os.fdopen(temp_fd, "wb", closefd=True) as target_file,
+        ):
+            source_fd = -1
+            temp_fd = -1
+            shutil.copyfileobj(source_file, target_file)
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _task_input_copy_mode(workspace: Any) -> int:
+    """Use sandbox-prepared permissions before the workspace widens group read."""
+
+    workspace_dir = getattr(workspace, "workspace_dir", None)
+    if workspace_dir is None:
+        return 0o644
+    try:
+        root_stat = Path(workspace_dir).resolve().stat()
+    except OSError:
+        return 0o644
+    if _is_sandbox_prepared(root_stat):
+        return 0o600
+    return 0o644
+
+
+def _workspace_owner_and_task(workspace: Any) -> tuple[int, int] | None:
+    """Return the validated durable owner/task identity for a workspace."""
+
+    owner_user_id = getattr(workspace, "owner_user_id", None)
+    task_id = getattr(workspace, "db_task_id", None)
+    if task_id is None:
+        task_id = getattr(workspace, "current_task_id", None)
+    if (
+        not isinstance(owner_user_id, int)
+        or isinstance(owner_user_id, bool)
+        or not isinstance(task_id, int)
+        or isinstance(task_id, bool)
+    ):
+        return None
+    return owner_user_id, task_id
+
+
+def _materialize_legacy_task_input_symlinks(
+    workspace: Any, input_dir: Path, *, copy_mode: int
+) -> None:
+    """Replace authorized pre-upgrade input symlinks with task-local copies."""
+
+    owner_and_task = _workspace_owner_and_task(workspace)
+    if owner_and_task is None:
+        return
+    owner_user_id, task_id = owner_and_task
+
+    legacy_links: dict[Path, Path] = {}
+    try:
+        entries = tuple(input_dir.iterdir())
+    except OSError:
+        logger.warning(
+            "Failed to inspect legacy task inputs in %s", input_dir, exc_info=True
+        )
+        return
+    for candidate in entries:
+        try:
+            if not candidate.is_symlink():
+                continue
+            raw_target = Path(os.readlink(candidate))
+        except OSError:
+            continue
+        if not raw_target.is_absolute():
+            raw_target = candidate.parent / raw_target
+        legacy_links[candidate] = Path(os.path.realpath(raw_target))
+    if not legacy_links:
+        return
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        linked_sources = set(legacy_links.values())
+        file_ids = [
+            str(row.file_id)
+            for row in db.query(UploadedFile.file_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id == owner_user_id,
+                UploadedFile.task_id == task_id,
+                UploadedFile.storage_status != "compensating",
+            )
+            .all()
+            if Path(os.path.realpath(str(row.storage_path))) in linked_sources
+        ]
+        file_infos: List[Dict[str, Any]] = []
+        if file_ids:
+            file_infos, _missing = resolve_turn_file_infos(
+                file_ids=file_ids,
+                owner_user_id=owner_user_id,
+                task_id=task_id,
+                db=db,
+            )
+
+    authorized_sources: dict[Path, dict[str, Any]] = {}
+    for file_info in file_infos:
+        raw_source_path = str(file_info.get("path") or "")
+        if not raw_source_path:
+            continue
+        source_path = Path(raw_source_path)
+        authorized_sources[Path(os.path.realpath(source_path))] = file_info
+
+    for candidate, linked_source in legacy_links.items():
+        matched_file_info = authorized_sources.get(linked_source)
+        if matched_file_info is None:
+            logger.warning(
+                "Leaving unmatched legacy task input symlink unchanged: %s -> %s",
+                candidate,
+                linked_source,
+            )
+            continue
+        source_path = Path(str(matched_file_info["path"]))
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            registration = workspace.describe_file_registration(str(candidate))
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=str(matched_file_info["file_id"]),
+            )
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=str(matched_file_info["file_id"]),
+            )
+        except (OSError, ValueError):
+            logger.warning(
+                "Failed to materialize legacy task input: storage=%s input_path=%s",
+                source_path,
+                candidate,
+                exc_info=True,
+            )
+            continue
+        logger.info(
+            "Materialized legacy task input: storage=%s input_path=%s",
+            source_path,
+            candidate,
+        )
+
+
+def _prepare_workspace_inputs_for_agent(
+    agent_service: Any,
+) -> tuple[Any, Path, int] | None:
+    """Prepare task-local inputs shared by starts, resumes, and channels."""
+    workspace = getattr(agent_service, "workspace", None)
+    if not workspace:
+        return None
+
+    raw_input_dir = getattr(workspace, "input_dir", None)
+    if not isinstance(raw_input_dir, (str, os.PathLike)):
+        return None
+    input_dir = Path(raw_input_dir)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    copy_mode = _task_input_copy_mode(workspace)
+    _materialize_legacy_task_input_symlinks(
+        workspace,
+        input_dir,
+        copy_mode=copy_mode,
+    )
+    return workspace, input_dir, copy_mode
+
+
+def _persist_durable_input_workspace_binding(
+    workspace: Any,
+    registration: Any,
+    *,
+    file_id: str,
+) -> bool:
+    """Persist a task-local input path so cold workspaces can reuse it."""
+
+    owner_and_task = _workspace_owner_and_task(workspace)
+    if owner_and_task is None:
+        return False
+    owner_user_id, task_id = owner_and_task
+    relative_path = str(getattr(registration, "relative_path", "") or "")
+    category = str(getattr(registration, "category", "") or "")
+    if category != "input" or not relative_path.startswith("input/"):
+        raise ValueError("Durable task input binding must stay under input/")
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        record = (
+            db.query(UploadedFile)
+            .filter(
+                UploadedFile.file_id == file_id,
+                UploadedFile.user_id == owner_user_id,
+                UploadedFile.task_id == task_id,
+                UploadedFile.detached_reason.is_(None),
+                UploadedFile.storage_status != "compensating",
+            )
+            .one_or_none()
+        )
+        if record is None:
+            raise ValueError("Durable task input metadata is unavailable")
+        existing_category = (
+            str(record.workspace_category)
+            if record.workspace_category is not None
+            else None
+        )
+        if existing_category not in (None, "input"):
+            return False
+        snapshot = snapshot_uploaded_file_version(record)
+        updated = (
+            db.query(UploadedFile)
+            .filter(*_uploaded_file_version_match_predicates(snapshot))
+            .update(
+                {
+                    UploadedFile.workspace_relative_path: relative_path,
+                    UploadedFile.workspace_category: category,
+                },
+                synchronize_session=False,
+            )
+        )
+        if updated != 1:
+            raise RuntimeError("Durable task input metadata changed concurrently")
+        db.commit()
+        return True
+
+
+def _try_persist_durable_input_workspace_binding(
+    workspace: Any,
+    registration: Any,
+    *,
+    file_id: str,
+) -> None:
+    """Best-effort cold-start optimization after the in-memory bind succeeds."""
+
+    try:
+        _persist_durable_input_workspace_binding(
+            workspace,
+            registration,
+            file_id=file_id,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to persist durable workspace input binding: file_id=%s path=%s",
+            file_id,
+            getattr(registration, "relative_path", None),
+            exc_info=True,
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _existing_input_path(
+    candidate: Path,
+    *,
+    input_dir: Path,
+    source_path: Path,
+    file_info: Dict[str, Any],
+) -> Path | None:
+    """Return a reusable input only when it still contains the durable bytes."""
+
+    try:
+        candidate_stat = candidate.lstat()
+        if (
+            candidate.parent.resolve() != input_dir.resolve()
+            or not stat.S_ISREG(candidate_stat.st_mode)
+            or candidate.is_symlink()
+        ):
+            return None
+        raw_expected_size = file_info.get("size")
+        expected_size = (
+            int(raw_expected_size)
+            if raw_expected_size is not None
+            else source_path.stat().st_size
+        )
+        if candidate_stat.st_size != expected_size:
+            return None
+        expected_checksum = str(file_info.get("checksum") or "").removeprefix("sha256:")
+        candidate_checksum = _sha256_file(candidate)
+        if len(expected_checksum) == 64:
+            return (
+                candidate if candidate_checksum == expected_checksum.lower() else None
+            )
+        return candidate if candidate_checksum == _sha256_file(source_path) else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 def _register_uploaded_files_for_agent(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
 ) -> None:
     """Bind already-durable inputs to the workspace without another upload."""
 
-    workspace = getattr(agent_service, "workspace", None)
-    if not workspace:
+    prepared = _prepare_workspace_inputs_for_agent(agent_service)
+    if prepared is None:
         return
-
-    input_dir = Path(workspace.input_dir)
-    input_dir.mkdir(parents=True, exist_ok=True)
+    workspace, input_dir, copy_mode = prepared
 
     for file_info in file_info_list:
         file_id = str(file_info.get("file_id") or "")
         source_path = Path(str(file_info.get("path") or ""))
-        if not file_id or not source_path.exists():
+        if not file_id:
             logger.warning(
                 "Skipping unavailable uploaded file for workspace: %s", file_info
             )
             continue
 
+        candidate: Path | None = None
+        reused_candidate = False
+        restored_candidate = False
+        resolve_file_id = getattr(workspace, "resolve_file_id", None)
+        if callable(resolve_file_id):
+            try:
+                previously_bound = resolve_file_id(file_id)
+                if isinstance(previously_bound, (str, os.PathLike)):
+                    candidate = _existing_input_path(
+                        Path(previously_bound),
+                        input_dir=input_dir,
+                        source_path=source_path,
+                        file_info=file_info,
+                    )
+                    if candidate is not None:
+                        reused_candidate = True
+            except (OSError, ValueError):
+                # A stale or backend-specific binding must not make an
+                # otherwise valid durable upload unavailable. Fall back to
+                # collision-safe materialization below.
+                candidate = None
+
         normalized_file_name = normalize_filename(
             Path(str(file_info.get("name") or source_path.name)).name
         )
-        candidate = input_dir / normalized_file_name
-        suffix_idx = 1
-        stem, ext = candidate.stem, candidate.suffix
-        while candidate.exists() or candidate.is_symlink():
-            try:
-                if candidate.resolve() == source_path.resolve():
-                    break
-            except OSError:
-                pass
-            candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
-            suffix_idx += 1
-
-        workspace_link_path: Path | None
-        if candidate.exists() or candidate.is_symlink():
-            workspace_link_path = candidate
-        else:
-            try:
-                candidate.symlink_to(source_path.resolve())
-                workspace_link_path = candidate
-            except OSError as link_err:
-                logger.warning(
-                    f"symlink failed ({link_err}); copying "
-                    f"{source_path.name} into workspace"
+        persisted_relative_path = str(
+            file_info.get("workspace_relative_path") or ""
+        ).strip()
+        persisted_category = str(file_info.get("workspace_category") or "").strip()
+        if (
+            candidate is None
+            and persisted_category == "input"
+            and persisted_relative_path
+        ):
+            relative_candidate = Path(persisted_relative_path)
+            if (
+                not relative_candidate.is_absolute()
+                and ".." not in relative_candidate.parts
+                and relative_candidate.parts[:1] == ("input",)
+            ):
+                restored_path = input_dir.parent / relative_candidate
+                candidate = _existing_input_path(
+                    restored_path,
+                    input_dir=input_dir,
+                    source_path=source_path,
+                    file_info=file_info,
                 )
-                shutil.copy2(source_path, candidate)
-                workspace_link_path = candidate
+                if candidate is not None:
+                    restored_candidate = True
 
-        registration = workspace.describe_file_registration(str(source_path.resolve()))
-        workspace.bind_already_durable_file(
+        if candidate is None:
+            candidate = input_dir / normalized_file_name
+            suffix_idx = 1
+            stem, ext = candidate.stem, candidate.suffix
+            while candidate.exists() or candidate.is_symlink():
+                try:
+                    if candidate.resolve() == source_path.resolve():
+                        break
+                except OSError:
+                    pass
+                candidate = input_dir / f"{stem}_{suffix_idx}{ext}"
+                suffix_idx += 1
+
+        copied_candidate = False
+        if reused_candidate:
+            # Re-attempt the best-effort persistence so a transient database
+            # failure on the first turn does not cause a cold-start duplicate.
+            registration = workspace.describe_file_registration(str(candidate))
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=file_id,
+            )
+            # ``resolve_file_id`` returned this task workspace's existing
+            # binding. It is already registered and permission-prepared; a
+            # second bind would only reopen a sandbox-writable pathname and
+            # create an avoidable check/use race.
+            file_info["workspace_path"] = str(candidate)
+            logger.info(
+                "Reused agent workspace file binding: file_id=%s input_path=%s",
+                file_id,
+                candidate,
+            )
+            continue
+        if restored_candidate:
+            registration = workspace.describe_file_registration(str(candidate))
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+            _try_persist_durable_input_workspace_binding(
+                workspace,
+                registration,
+                file_id=file_id,
+            )
+            file_info["workspace_path"] = str(candidate)
+            logger.info(
+                "Restored agent workspace file binding: file_id=%s input_path=%s",
+                file_id,
+                candidate,
+            )
+            continue
+        try:
+            _copy_durable_input_to_workspace(
+                source_path,
+                candidate,
+                mode=copy_mode,
+            )
+            copied_candidate = True
+        except (OSError, ValueError):
+            if not source_path.exists():
+                logger.warning(
+                    "Skipping unavailable uploaded file for workspace: %s",
+                    file_info,
+                )
+                continue
+            raise
+
+        registration = workspace.describe_file_registration(str(candidate))
+        try:
+            workspace.bind_already_durable_file(
+                registration,
+                file_id=file_id,
+            )
+        except BaseException:
+            if copied_candidate:
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Failed to remove unbound durable workspace input %s",
+                        candidate,
+                        exc_info=True,
+                    )
+            raise
+        _try_persist_durable_input_workspace_binding(
+            workspace,
             registration,
             file_id=file_id,
         )
-        file_info["path"] = str(registration.path)
-        file_info["workspace_path"] = str(workspace_link_path)
+        file_info["workspace_path"] = str(candidate)
+        file_info["workspace_relative_path"] = registration.relative_path
+        file_info["workspace_category"] = registration.category
         logger.info(
-            "File registered for agent workspace: storage=%s input_link=%s",
-            registration.path,
-            workspace_link_path,
+            "File registered for agent workspace: storage=%s input_path=%s",
+            source_path,
+            candidate,
         )

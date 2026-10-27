@@ -6,12 +6,16 @@ ensuring that each agent has its own isolated workspace context.
 """
 
 import contextvars
+import errno
 import logging
 import mimetypes
 import os
 import re
 import shutil
+import stat
+import tempfile
 import unicodedata
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +68,24 @@ _internal_file_registry: Dict[Tuple[str, str], Path] = {}
 _internal_path_registry: Dict[Tuple[str, str], str] = {}
 _internal_file_registry_lock = RLock()
 _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
+_SANDBOX_PERMISSION_MIGRATION_MARKER = ".xagent-permissions-v2"
+_SANDBOX_RUNTIME_GID = 1010
+# A failed legacy migration is retried after a process restart or through an
+# explicit migration call, but ordinary TaskWorkspace reconstruction must not
+# repeat a synchronous tree walk on every tool call.
+_sandbox_permission_migrations_attempted: set[str] = set()
+_sandbox_permission_migrations_lock = Lock()
+_SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS = (_INTERNAL_TEMP_DIR_NAME, "mcp-upload")
+
+
+class ExternalUploadStagingError(ValueError):
+    """A validated source could not be copied into upload staging."""
+
+
+class ExternalUploadSizeLimitError(ExternalUploadStagingError):
+    """An upload source exceeded the caller's staging byte limit."""
+
+
 # The name of the output subtree the engine owns for spilled tool results.
 # It is defined here, on the workspace side, and the spill module imports it
 # from here: tool modules import core.workspace, never the other way round.
@@ -73,6 +95,14 @@ SPILL_DIR_NAME = "tool-results"
 # family, per call on some paths -- announces the same collision once.
 _announced_reserved_names: set[str] = set()
 _announced_reserved_names_lock = Lock()
+
+
+def _is_sandbox_prepared(entry_stat: os.stat_result) -> bool:
+    """Return whether a directory carries the sandbox group contract."""
+
+    return entry_stat.st_gid == _SANDBOX_RUNTIME_GID and bool(
+        entry_stat.st_mode & stat.S_ISGID
+    )
 
 
 def scoped_user_root(
@@ -188,6 +218,7 @@ class TaskWorkspace:
         db_task_id: Optional[int] = None,
         scope_segments: Sequence[str] = (),
         durable_storage_segments: Sequence[str] | None = None,
+        migrate_sandbox_permissions: bool = True,
     ):
         self.id = id
         self.db_task_id = db_task_id
@@ -217,9 +248,12 @@ class TaskWorkspace:
         )  # Resolve base_dir to absolute path for consistent workspace reconstruction
         self.db_session = None  # Optional database session for file registration
         self._registration_lock = RLock()
+        self._host_external_upload_staging_root: Optional[Path] = None
+        self._host_external_upload_staging_cleanup: Any = None
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
+        self._migrate_sandbox_permissions = migrate_sandbox_permissions
         # Server-derived rollout policy for File Operation. ``None`` means the
         # exact upstream legacy path and therefore requires no policy query.
         # Public runtime construction sets version 1 only after loading a
@@ -237,6 +271,12 @@ class TaskWorkspace:
         self.output_dir = self.workspace_dir / "output"
         self.temp_dir = self.workspace_dir / "temp"
 
+        # Create the workspace tree before validating external roots.  The
+        # configured base directory is also the canonical per-user upload root
+        # in web runtimes, so an eagerly-created workspace must not discard it
+        # merely because no upload has created that root yet.
+        self._ensure_directories()
+
         # Allowed external directories (e.g., user upload directories with knowledge base files)
         self.allowed_external_dirs: List[Path] = []
         if allowed_external_dirs:
@@ -249,8 +289,6 @@ class TaskWorkspace:
                         f"Allowed external directory does not exist: {dir_path}"
                     )
 
-        # Create directory structure
-        self._ensure_directories()
         self._warn_if_reserved_output_name_is_taken()
 
     def __getstate__(self) -> dict[str, Any]:
@@ -258,13 +296,18 @@ class TaskWorkspace:
 
         state = dict(self.__dict__)
         state.pop("_registration_lock", None)
+        state.pop("_host_external_upload_staging_root", None)
+        state.pop("_host_external_upload_staging_cleanup", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         """Restore a fresh registration owner in the receiving process."""
 
         self.__dict__.update(state)
+        self.__dict__.setdefault("_migrate_sandbox_permissions", True)
         self._registration_lock = RLock()
+        self._host_external_upload_staging_root = None
+        self._host_external_upload_staging_cleanup = None
 
     @property
     def internal_temp_dir(self) -> Path:
@@ -346,8 +389,14 @@ class TaskWorkspace:
             self.resolve_path(file_path, default_dir), file_path
         )
 
-    def stage_file_for_external_upload(self, file_id: str) -> Path:
-        """Materialize a durable file into this task's upload-safe temp area.
+    def stage_file_for_external_upload(
+        self,
+        file_id: str,
+        *,
+        max_bytes: int | None = None,
+        host_private: bool = False,
+    ) -> Path:
+        """Materialize a durable file into this task's private staging area.
 
         Connectors intentionally accept only paths under the current task
         workspace.  A durable ``FileRef`` may resolve to the shared
@@ -360,37 +409,183 @@ class TaskWorkspace:
         source = self.resolve_file_id_detached(file_id)
         if source is None:
             raise FileNotFoundError(f"File not found: {file_id}")
-        raw_source = Path(source)
-        probe = raw_source
-        while probe != probe.parent:
-            if probe.is_symlink():
-                # A registered path can be replaced after lookup. Refuse
-                # symlink sources entirely so a later swap cannot redirect
-                # bytes to a different tenant's file before containment.
-                raise FileNotFoundError(f"File not found: {file_id}")
-            probe = probe.parent
-        try:
-            source = raw_source.resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            # Python 3.11/3.12 raise RuntimeError for symlink loops. Treat
-            # both that case and a disappearing source as an unavailable file.
-            raise FileNotFoundError(f"File not found: {file_id}") from exc
-        if not source.is_file() or not self._file_operation_path_in_authorized_storage(
-            source
-        ):
-            raise FileNotFoundError(f"File not found: {file_id}")
+        return self._stage_authorized_source(
+            Path(source),
+            file_id,
+            max_bytes=max_bytes,
+            host_private=host_private,
+        )
 
-        staging_root = self._external_upload_staging_root()
-        staging_dir = staging_root / uuid4().hex
-        staging_dir.mkdir(parents=True, exist_ok=False)
-        target = staging_dir / source.name
+    def issue_external_media_url_detached(self, file_id: str, purpose: str) -> str:
+        """Issue a purpose-bound URL for one exact task-owned registered image.
+
+        This host-only bridge is deliberately separate from local-path staging:
+        connectors such as Instagram ask their provider to fetch a URL rather
+        than accepting uploaded bytes. The URL is never persisted in workspace
+        state or returned to the model.
+        """
+
+        if self.owner_user_id is None or self.db_task_id is None:
+            raise FileNotFoundError("Registered image was not found")
+
+        from ..web.services.external_media import (
+            ExternalMediaNotFound,
+            ExternalMediaPurpose,
+            ExternalMediaUnavailable,
+            issue_external_media_url,
+        )
+        from .storage.manager import create_db_session
+
         try:
-            shutil.copy2(source, target)
+            external_purpose = ExternalMediaPurpose(purpose)
+        except ValueError:
+            raise ValueError("External media purpose is not supported") from None
+
+        db = create_db_session()
+        try:
+            try:
+                issued = issue_external_media_url(
+                    db,
+                    file_id=file_id,
+                    user_id=self.owner_user_id,
+                    task_id=self.db_task_id,
+                    purpose=external_purpose,
+                )
+            except ExternalMediaNotFound:
+                raise FileNotFoundError("Registered image was not found") from None
+            except ExternalMediaUnavailable as exc:
+                raise ValueError(str(exc)) from None
+            return issued.url
+        finally:
+            db.close()
+
+    @staticmethod
+    def _open_regular_file_nofollow(source: Path, selector: str) -> int:
+        """Open an absolute file without following any path component."""
+        absolute = source.absolute()
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(os.path.sep, directory_flags)
+        try:
+            for component in absolute.parts[1:-1]:
+                next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            file_fd = os.open(
+                absolute.name,
+                os.O_RDONLY
+                | getattr(os, "O_NONBLOCK", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=current_fd,
+            )
+        except OSError as exc:
+            raise FileNotFoundError(f"File not found: {selector}") from exc
+        finally:
+            os.close(current_fd)
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            os.close(file_fd)
+            raise FileNotFoundError(f"File not found: {selector}")
+        return file_fd
+
+    @classmethod
+    def _validate_regular_file_nofollow(cls, source: Path, selector: str) -> Path:
+        """Validate a lexical file capability without following any symlink."""
+        absolute = source.absolute()
+        file_fd = cls._open_regular_file_nofollow(absolute, selector)
+        os.close(file_fd)
+        return absolute
+
+    def _stage_authorized_source(
+        self,
+        source: Path,
+        selector: str,
+        *,
+        max_bytes: int | None = None,
+        host_private: bool = False,
+    ) -> Path:
+        """Copy an already-authorized source fd into private task staging."""
+        source_fd = self._open_regular_file_nofollow(source, selector)
+        staging_dir: Path | None = None
+        try:
+            staging_root = self.external_upload_staging_root(host_private=host_private)
+            staging_dir = staging_root / uuid4().hex
+            target = staging_dir / source.name
+            source_size = os.fstat(source_fd).st_size
+            if max_bytes is not None and source_size > max_bytes:
+                raise ExternalUploadSizeLimitError(
+                    f"File exceeds maximum staging size of {max_bytes} bytes: "
+                    f"{selector}"
+                )
+            staging_dir.mkdir(parents=True, exist_ok=False)
+            with os.fdopen(source_fd, "rb", closefd=True) as source_file:
+                source_fd = -1
+                with target.open("xb") as target_file:
+                    copied = 0
+                    while chunk := source_file.read(1024 * 1024):
+                        copied += len(chunk)
+                        if max_bytes is not None and copied > max_bytes:
+                            raise ExternalUploadSizeLimitError(
+                                "File grew beyond maximum staging size of "
+                                f"{max_bytes} bytes: {selector}"
+                            )
+                        target_file.write(chunk)
             os.chmod(target, 0o600)
         except BaseException:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
             raise
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
         return target
+
+    def stage_path_for_external_upload(
+        self,
+        file_path: str,
+        *,
+        max_bytes: int | None = None,
+        host_private: bool = False,
+    ) -> Path:
+        """Copy one workspace-authorized selector into private task staging."""
+        source = Path(self.resolve_path_with_search(file_path, detached_file_ids=True))
+        if source.is_symlink():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        try:
+            source = source.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise FileNotFoundError(f"File not found: {file_path}") from exc
+        if not source.is_absolute():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        return self._stage_authorized_source(
+            source,
+            file_path,
+            max_bytes=max_bytes,
+            host_private=host_private,
+        )
+
+    def stage_resolved_path_for_external_upload(
+        self,
+        source: Path,
+        selector: str,
+        *,
+        max_bytes: int | None = None,
+        host_private: bool = False,
+    ) -> Path:
+        """Stage the capability returned by ``resolve_path_with_search`` once."""
+        raw_source = Path(source)
+        if raw_source.is_symlink():
+            raise FileNotFoundError(f"File not found: {selector}")
+        try:
+            resolved = raw_source.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise FileNotFoundError(f"File not found: {selector}") from exc
+        if not resolved.is_absolute():
+            raise FileNotFoundError(f"File not found: {selector}")
+        return self._stage_authorized_source(
+            resolved,
+            selector,
+            max_bytes=max_bytes,
+            host_private=host_private,
+        )
 
     def discard_staged_external_upload(self, file_path: str | Path) -> None:
         """Remove a file previously returned by staging.
@@ -399,13 +594,26 @@ class TaskWorkspace:
         root, so a connector cannot cause arbitrary workspace deletion.
         """
 
-        staging_root = self._external_upload_staging_root()
         try:
             candidate = Path(file_path).resolve()
         except RuntimeError:
             # A symlink loop must not escape cleanup's confined-path check.
             candidate = Path(file_path)
-        if not candidate.is_relative_to(staging_root) or candidate == staging_root:
+        private_root = self._host_external_upload_staging_root
+        staging_root = None
+        if private_root is not None and candidate != private_root:
+            if candidate.is_relative_to(private_root):
+                staging_root = private_root
+        if staging_root is None:
+            try:
+                sandbox_root = self.external_upload_staging_root()
+            except ExternalUploadStagingError as exc:
+                raise ValueError(
+                    "staged upload path is outside the task staging area"
+                ) from exc
+            if candidate != sandbox_root and candidate.is_relative_to(sandbox_root):
+                staging_root = sandbox_root
+        if staging_root is None:
             raise ValueError("staged upload path is outside the task staging area")
         try:
             candidate.unlink(missing_ok=True)
@@ -418,20 +626,61 @@ class TaskWorkspace:
                     break
                 parent = parent.parent
 
+    def external_upload_staging_root(self, *, host_private: bool = False) -> Path:
+        """Return sandbox-visible connector staging or private media staging."""
+        if host_private and not in_sandbox_tool_runner():
+            with self._registration_lock:
+                existing = self._host_external_upload_staging_root
+                if existing is not None and existing.is_dir():
+                    return existing
+                cleanup = self._host_external_upload_staging_cleanup
+                if cleanup is not None:
+                    cleanup.detach()
+                staging_root = Path(
+                    tempfile.mkdtemp(prefix="xagent-external-upload-")
+                ).resolve()
+                os.chmod(staging_root, 0o700)
+                self._host_external_upload_staging_root = staging_root
+                self._host_external_upload_staging_cleanup = weakref.finalize(
+                    self, shutil.rmtree, staging_root, ignore_errors=True
+                )
+                return staging_root
+
+        parent_root = self.temp_dir.resolve(strict=True)
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(parent_root, flags)
+        current_fd = parent_fd
+        try:
+            for component in _SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS:
+                created = False
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                    created = True
+                except FileExistsError:
+                    pass
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+                try:
+                    if created:
+                        os.fchmod(next_fd, 0o700)
+                except BaseException:
+                    os.close(next_fd)
+                    raise
+                if current_fd != parent_fd:
+                    os.close(current_fd)
+                current_fd = next_fd
+        except OSError as exc:
+            raise ExternalUploadStagingError(
+                "task upload staging area is unavailable"
+            ) from exc
+        finally:
+            if current_fd != parent_fd:
+                os.close(current_fd)
+            os.close(parent_fd)
+        return parent_root.joinpath(*_SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS)
+
     def _external_upload_staging_root(self) -> Path:
-        """Return the staging root only when it remains under task temp/.
-
-        ``temp/`` is writable by code-exec tools, so both the internal marker
-        and the upload directory may be replaced with symlinks between task
-        runs. Resolve the complete path before creating or deleting anything,
-        and fail closed if either link escapes the task's temporary directory.
-        """
-
-        temp_root = self.temp_dir.resolve()
-        staging_root = (self.internal_temp_dir / "mcp-upload").resolve()
-        if staging_root == temp_root or not staging_root.is_relative_to(temp_root):
-            raise ValueError("task upload staging area is outside temp directory")
-        return staging_root
+        """Backward-compatible accessor for sandbox-visible connector staging."""
+        return self.external_upload_staging_root()
 
     def register_internal_file(
         self,
@@ -545,6 +794,11 @@ class TaskWorkspace:
         """
 
         resolved_path = file_path.resolve()
+        if (
+            file_path.parent.resolve() == self.workspace_dir.resolve()
+            and file_path.name == _SANDBOX_PERMISSION_MIGRATION_MARKER
+        ):
+            return True
         # The reserved root is the name under temp/, not whatever that name
         # points at: resolve the parent, never the reserved segment itself.
         # Following it would put the failure, and the answer, in the hands of
@@ -667,6 +921,12 @@ class TaskWorkspace:
         if require_persistence and any(not plan.should_persist for plan in plans):
             raise ValueError("Attachment registration requires a persisted task owner")
 
+        # Grant access only after the complete batch has passed path, ownership,
+        # and persistence validation. Permission repair is best effort because a
+        # caller may concurrently remove an otherwise valid path.
+        for registration, _file_id in registrations:
+            self._grant_sandbox_access_best_effort(registration)
+
         prepared: list[PreparedWorkspaceFileRegistration] = []
         try:
             for plan in plans:
@@ -770,6 +1030,107 @@ class TaskWorkspace:
             result_indexes.append(unique_index)
 
         return tuple(unique), tuple(result_indexes)
+
+    def _grant_registered_path_sandbox_access(
+        self, registration: WorkspaceFileRegistration
+    ) -> None:
+        """Keep host-created workspace deliverables editable by uid 1100."""
+        if not registration.is_workspace_file or in_sandbox_tool_runner():
+            return
+        workspace_root = self.workspace_dir.resolve()
+        root_stat = workspace_root.stat()
+        if not _is_sandbox_prepared(root_stat):
+            return
+        try:
+            relative = registration.path.absolute().relative_to(workspace_root)
+        except ValueError:
+            return
+
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        current_fd = os.open(workspace_root, directory_flags)
+        try:
+            for index, component in enumerate(relative.parts):
+                is_last = index == len(relative.parts) - 1
+                try:
+                    component_stat = os.stat(
+                        component, dir_fd=current_fd, follow_symlinks=False
+                    )
+                except OSError:
+                    return
+                is_directory = stat.S_ISDIR(component_stat.st_mode)
+                is_regular = stat.S_ISREG(component_stat.st_mode)
+                if not is_directory and not is_regular:
+                    return
+                if is_last and is_regular and component_stat.st_nlink > 1:
+                    return
+                flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+                if not is_last:
+                    flags |= os.O_DIRECTORY
+                try:
+                    next_fd = os.open(component, flags, dir_fd=current_fd)
+                except OSError:
+                    return
+                os.close(current_fd)
+                current_fd = next_fd
+                entry_stat = os.fstat(current_fd)
+                if (
+                    entry_stat.st_dev != component_stat.st_dev
+                    or entry_stat.st_ino != component_stat.st_ino
+                ):
+                    return
+                # Preserve the creating uid. In particular, sandbox-created
+                # files must stay owned by uid 1100 so chmod/utime/copy2 keep
+                # working on later sandbox calls.
+                os.fchown(current_fd, -1, _SANDBOX_RUNTIME_GID)
+                os.fchmod(
+                    current_fd,
+                    self._sandbox_compatible_mode(
+                        entry_stat.st_mode, directory=is_directory
+                    ),
+                )
+        finally:
+            if current_fd != -1:
+                os.close(current_fd)
+
+    def _grant_sandbox_access_best_effort(
+        self, registration: WorkspaceFileRegistration
+    ) -> None:
+        """Best-effort permission repair for an already validated path."""
+
+        try:
+            self._grant_registered_path_sandbox_access(registration)
+        except OSError:
+            logger.warning(
+                "Failed to grant sandbox access to workspace path %s",
+                registration.path,
+                exc_info=True,
+            )
+
+    def grant_sandbox_access(self, path: Union[str, Path]) -> None:
+        """Best-effort sandbox access for one host-created file or directory.
+
+        Some host-side tools create files without registering them as user
+        deliverables.  They still need the same descriptor-relative
+        directory and file permission repair as registered outputs when the
+        workspace is prepared for uid 1100/gid 1010.
+        """
+
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = self.workspace_dir / candidate
+        candidate = Path(os.path.abspath(candidate))
+        workspace_root = self.workspace_dir.resolve()
+        try:
+            relative = candidate.relative_to(workspace_root)
+        except ValueError:
+            return
+        registration = WorkspaceFileRegistration(
+            path=candidate,
+            relative_path=relative.as_posix(),
+            category=relative.parts[0] if relative.parts else "workspace",
+            is_workspace_file=True,
+        )
+        self._grant_sandbox_access_best_effort(registration)
 
     @staticmethod
     def _release_registration_session_if_clean(db: Any) -> None:
@@ -1173,6 +1534,7 @@ class TaskWorkspace:
         normalized_file_id = str(file_id).strip()
         if not normalized_file_id:
             raise ValueError("file_id is required for an already durable file")
+        self._grant_sandbox_access_best_effort(registration)
         with self._registration_lock:
             self._remember_file_registration(normalized_file_id, registration.path)
         return normalized_file_id
@@ -1512,7 +1874,31 @@ class TaskWorkspace:
         with self._registration_lock:
             cached_path = self._file_id_to_path.get(file_id)
         if cached_path is not None:
-            if cached_path.exists():
+            try:
+                resolved_cached_path = cached_path.resolve(strict=True)
+                try:
+                    cached_path = self._validate_regular_file_nofollow(
+                        cached_path, file_id
+                    )
+                except FileNotFoundError:
+                    # A configured external root may itself be an
+                    # operator-controlled symlink. Its canonical target was
+                    # frozen when the workspace was constructed; only that
+                    # trusted-prefix case may retry with the canonical path.
+                    if not any(
+                        resolved_cached_path == root
+                        or resolved_cached_path.is_relative_to(root)
+                        for root in self.allowed_external_dirs
+                    ):
+                        raise
+                    cached_path = self._validate_regular_file_nofollow(
+                        resolved_cached_path, file_id
+                    )
+            except (FileNotFoundError, OSError, RuntimeError):
+                resolved_cached_path = None
+            if resolved_cached_path is not None and (
+                self._file_operation_path_in_authorized_storage(resolved_cached_path)
+            ):
                 logger.debug(
                     f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
                 )
@@ -1568,17 +1954,17 @@ class TaskWorkspace:
                     .first()
                 )
                 if record and record.storage_path:
-                    resolved_path = Path(record.storage_path)
-                    if resolved_path.exists() and resolved_path.is_file():
-                        if not self._file_record_allowed_for_workspace(
-                            record, resolved_path
-                        ):
-                            logger.warning(
-                                "Rejected file_id outside workspace scope: %s",
-                                file_id,
-                            )
-                            return None
-                        return resolved_path
+                    raw_path = Path(record.storage_path)
+                    if not self._file_record_allowed_for_workspace(record, raw_path):
+                        logger.warning(
+                            "Rejected file_id outside workspace scope: %s",
+                            file_id,
+                        )
+                        return None
+                    try:
+                        return self._validate_regular_file_nofollow(raw_path, file_id)
+                    except FileNotFoundError:
+                        pass
                 if (
                     record
                     and getattr(record, "storage_key", None)
@@ -1592,7 +1978,17 @@ class TaskWorkspace:
                         return None
                     from ..web.services.managed_file_ref import ManagedFileRef
 
-                    return ManagedFileRef(record).materialize()
+                    raw_materialized = ManagedFileRef(record).materialize()
+                    materialized = raw_materialized.resolve(strict=True)
+                    if self._file_operation_path_in_authorized_storage(materialized):
+                        return self._validate_regular_file_nofollow(
+                            raw_materialized, file_id
+                        )
+                    logger.warning(
+                        "Rejected materialized file_id outside authorized storage: %s",
+                        file_id,
+                    )
+                    return None
                 return None
             finally:
                 if should_close:
@@ -1643,23 +2039,23 @@ class TaskWorkspace:
 
         storage_path = getattr(record, "storage_path", None)
         if storage_path:
-            local_path = Path(str(storage_path)).resolve()
-            if (
-                local_path.exists()
-                and local_path.is_file()
-                and self._file_operation_path_in_authorized_storage(local_path)
-            ):
-                return local_path
+            try:
+                local_path = self._validate_regular_file_nofollow(
+                    Path(str(storage_path)), str(getattr(record, "file_id", "file"))
+                )
+                if self._file_operation_path_in_authorized_storage(local_path):
+                    return local_path
+            except FileNotFoundError:
+                pass
         if storage_key and storage_status == "available":
             from ..web.services.managed_file_ref import ManagedFileRef
 
-            materialized = ManagedFileRef(record).materialize().resolve()
-            if (
-                materialized.exists()
-                and materialized.is_file()
-                and self._file_operation_path_in_authorized_storage(materialized)
-            ):
-                return materialized
+            raw_materialized = ManagedFileRef(record).materialize()
+            materialized = raw_materialized.resolve(strict=True)
+            if self._file_operation_path_in_authorized_storage(materialized):
+                return self._validate_regular_file_nofollow(
+                    raw_materialized, str(getattr(record, "file_id", "file"))
+                )
         return None
 
     def resolve_file_operation_path(self, file_path: str) -> Path:
@@ -1764,12 +2160,411 @@ class TaskWorkspace:
         finally:
             db.close()
 
+    def _prepare_sandbox_workspace_parent(self) -> bool:
+        """Repair descendants of the first prepared sandbox-group ancestor.
+
+        The mounted prefix can be a strict ancestor of an actor/task layout.
+        Those intermediate directories may predate the non-root sandbox
+        contract, so detecting only the immediate parent would silently skip
+        their repair. Walk the already-resolved parent by descriptor and, once
+        a gid/setgid anchor is found, prepare every remaining component.
+        """
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        traversal_flags = getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY
+        traversal_flags |= getattr(os, "O_NOFOLLOW", 0)
+        parent = self.workspace_dir.parent.resolve()
+        uploads_root = get_uploads_dir().expanduser().resolve()
+        try:
+            relative_parts = parent.relative_to(uploads_root).parts
+        except ValueError:
+            return False
+        try:
+            current_fd = os.open(uploads_root, traversal_flags)
+            prepared_ancestor_found = _is_sandbox_prepared(os.fstat(current_fd))
+        except OSError:
+            return False
+        try:
+            for component in relative_parts:
+                next_fd = -1
+                try:
+                    next_fd = os.open(component, traversal_flags, dir_fd=current_fd)
+                    component_stat = os.fstat(next_fd)
+                    if prepared_ancestor_found:
+                        mutation_fd = os.open(
+                            component, directory_flags, dir_fd=current_fd
+                        )
+                        try:
+                            os.fchown(mutation_fd, -1, _SANDBOX_RUNTIME_GID)
+                            os.fchmod(
+                                mutation_fd,
+                                stat.S_IMODE(component_stat.st_mode) | 0o2050,
+                            )
+                        finally:
+                            os.close(mutation_fd)
+                    elif _is_sandbox_prepared(component_stat):
+                        prepared_ancestor_found = True
+                except OSError:
+                    if next_fd >= 0:
+                        os.close(next_fd)
+                    return False
+                os.close(current_fd)
+                current_fd = next_fd
+            return prepared_ancestor_found
+        finally:
+            os.close(current_fd)
+
     def _ensure_directories(self) -> None:
-        """Ensure all workspace directories exist"""
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        """Ensure task directories inherit writable sandbox-group access."""
+        self.workspace_dir.parent.mkdir(parents=True, exist_ok=True)
+        parent = self.workspace_dir.parent.resolve()
+        uploads_root = get_uploads_dir().expanduser().resolve()
+        parent_is_managed = parent == uploads_root or parent.is_relative_to(
+            uploads_root
+        )
+        parent_is_prepared = parent_is_managed and _is_sandbox_prepared(parent.stat())
+        repaired_parent_chain = False
+        if not parent_is_prepared:
+            repaired_parent_chain = self._prepare_sandbox_workspace_parent()
+            parent_is_prepared = repaired_parent_chain
+        if not parent_is_prepared:
+            self._ensure_legacy_directories()
+            return
+
+        try:
+            self._ensure_prepared_sandbox_directories(repaired_parent_chain)
+        except OSError:
+            logger.warning(
+                "Failed to repair prepared sandbox workspace %s; using legacy layout",
+                self.workspace_dir,
+                exc_info=True,
+            )
+            self._ensure_legacy_directories()
+
+    def _ensure_legacy_directories(self) -> None:
+        self.workspace_dir.mkdir(exist_ok=True)
         self.input_dir.mkdir(exist_ok=True)
         self.output_dir.mkdir(exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
+
+    @staticmethod
+    def _open_prepared_directory(
+        parent_fd: int,
+        name: str,
+        flags: int,
+        *,
+        create_mode: int,
+        final_mode: int,
+    ) -> int:
+        try:
+            os.mkdir(name, mode=create_mode, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(name, flags, dir_fd=parent_fd)
+        try:
+            os.fchown(directory_fd, -1, _SANDBOX_RUNTIME_GID)
+            os.fchmod(directory_fd, final_mode)
+        except BaseException:
+            os.close(directory_fd)
+            raise
+        return directory_fd
+
+    def _ensure_prepared_sandbox_directories(self, repaired_parent_chain: bool) -> None:
+        """Create and repair one workspace beneath a trusted prepared parent."""
+
+        flags = os.O_RDONLY | os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+
+        parent = self.workspace_dir.parent.resolve()
+        parent_open_flags = flags | getattr(os, "O_PATH", 0)
+        parent_fd = os.open(parent, parent_open_flags)
+        try:
+            workspace_fd = self._open_prepared_directory(
+                parent_fd,
+                self.workspace_dir.name,
+                flags,
+                create_mode=0o750,
+                final_mode=0o2750,
+            )
+        finally:
+            os.close(parent_fd)
+
+        try:
+            for directory in (self.input_dir, self.output_dir, self.temp_dir):
+                fd = self._open_prepared_directory(
+                    workspace_fd,
+                    directory.name,
+                    flags,
+                    create_mode=0o770,
+                    final_mode=0o2770,
+                )
+                os.close(fd)
+            temp_fd = os.open(self.temp_dir.name, flags, dir_fd=workspace_fd)
+            try:
+                self._ensure_internal_temp_directory(temp_fd, flags)
+            finally:
+                os.close(temp_fd)
+            if self._migrate_sandbox_permissions:
+                migration_key = str(self.workspace_dir)
+                with _sandbox_permission_migrations_lock:
+                    should_migrate = (
+                        repaired_parent_chain
+                        or migration_key not in _sandbox_permission_migrations_attempted
+                    )
+                    if should_migrate:
+                        _sandbox_permission_migrations_attempted.add(migration_key)
+                if should_migrate:
+                    try:
+                        self._migrate_existing_sandbox_permissions(
+                            workspace_fd, flags, force=repaired_parent_chain
+                        )
+                    except BaseException:
+                        with _sandbox_permission_migrations_lock:
+                            _sandbox_permission_migrations_attempted.discard(
+                                migration_key
+                            )
+                        raise
+        finally:
+            os.close(workspace_fd)
+
+    def _ensure_internal_temp_directory(
+        self, temp_fd: int, directory_flags: int
+    ) -> None:
+        """Create the reserved temp directory without trusting sandbox state.
+
+        Legacy ``temp/`` layouts may have allowed the sandbox to replace the
+        reserved name. Remove non-directory entries descriptor-relatively and
+        retry, but do not let a process that continuously races the name make
+        workspace construction or cleanup impossible.
+        """
+        recoverable_open_errors = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP}
+        internal_flags = directory_flags | getattr(os, "O_NONBLOCK", 0)
+        for _attempt in range(3):
+            try:
+                os.mkdir(_INTERNAL_TEMP_DIR_NAME, mode=0o750, dir_fd=temp_fd)
+            except FileExistsError:
+                pass
+            try:
+                internal_fd = os.open(
+                    _INTERNAL_TEMP_DIR_NAME,
+                    internal_flags,
+                    dir_fd=temp_fd,
+                )
+            except OSError as exc:
+                if exc.errno not in recoverable_open_errors:
+                    raise
+                if exc.errno == errno.ENOENT:
+                    # The name vanished between mkdir/open. There is nothing
+                    # safe to remove; retry the descriptor-relative lookup.
+                    continue
+                try:
+                    os.unlink(_INTERNAL_TEMP_DIR_NAME, dir_fd=temp_fd)
+                except FileNotFoundError:
+                    pass
+                except IsADirectoryError:
+                    # The entry changed after the failed open; retry it as a
+                    # directory rather than removing recursively.
+                    pass
+                continue
+            try:
+                os.fchown(internal_fd, -1, _SANDBOX_RUNTIME_GID)
+                os.fchmod(internal_fd, 0o2750)
+            finally:
+                os.close(internal_fd)
+            return
+        logger.warning(
+            "Sandbox kept replacing reserved temp entry %s; continuing without "
+            "repair so workspace cleanup remains available",
+            self.internal_temp_dir,
+        )
+
+    @staticmethod
+    def _sandbox_compatible_mode(mode: int, *, directory: bool) -> int:
+        owner_permissions = (stat.S_IMODE(mode) >> 6) & 0o7
+        # Do not copy setuid/setgid bits from legacy files into a sandbox bind
+        # mount. Directories need only setgid so new entries inherit the sandbox gid.
+        special = stat.S_ISGID if directory else 0
+        return special | (owner_permissions << 6) | (owner_permissions << 3)
+
+    def _migrate_existing_sandbox_permissions(
+        self, workspace_fd: int, directory_flags: int, *, force: bool = False
+    ) -> None:
+        """One-time, descriptor-safe migration for pre-nonroot task contents."""
+        marker_flags = (
+            os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            marker_fd = os.open(
+                _SANDBOX_PERMISSION_MIGRATION_MARKER,
+                marker_flags,
+                dir_fd=workspace_fd,
+            )
+        except OSError:
+            marker_fd = -1
+        if marker_fd >= 0:
+            try:
+                marker_stat = os.fstat(marker_fd)
+                if (
+                    not force
+                    and stat.S_ISREG(marker_stat.st_mode)
+                    and marker_stat.st_uid == os.geteuid()
+                ):
+                    return
+            finally:
+                os.close(marker_fd)
+
+        migration_succeeded = True
+        for directory_name in ("input", "output", "temp"):
+            directory_fd = os.open(directory_name, directory_flags, dir_fd=workspace_fd)
+            try:
+                migration_succeeded = (
+                    self._migrate_sandbox_tree(
+                        directory_fd,
+                        skip_names=(
+                            frozenset({_INTERNAL_TEMP_DIR_NAME})
+                            if directory_name == "temp"
+                            else None
+                        ),
+                    )
+                    and migration_succeeded
+                )
+            finally:
+                os.close(directory_fd)
+
+        if not migration_succeeded:
+            logger.warning(
+                "Sandbox permission migration remains incomplete for workspace %s",
+                self.workspace_dir,
+            )
+            return
+
+        try:
+            os.unlink(_SANDBOX_PERMISSION_MIGRATION_MARKER, dir_fd=workspace_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Never recursively remove an unexpected entry at this reserved
+            # name. A directory or protected inode can safely leave migration
+            # incomplete without breaking workspace reconstruction.
+            logger.warning(
+                "Cannot replace sandbox permission migration marker for %s",
+                self.workspace_dir,
+                exc_info=True,
+            )
+            return
+        try:
+            marker_fd = os.open(
+                _SANDBOX_PERMISSION_MIGRATION_MARKER,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=workspace_fd,
+            )
+        except FileExistsError:
+            # Another process completed the same idempotent migration first.
+            return
+        os.close(marker_fd)
+
+    def _migrate_sandbox_tree(
+        self, directory_fd: int, *, skip_names: Optional[frozenset[str]] = None
+    ) -> bool:
+        """Repair a tree iteratively without retaining one fd per directory."""
+        succeeded = True
+        pending: list[tuple[str, ...]] = [()]
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        while pending:
+            relative_parts = pending.pop()
+            try:
+                current_fd = os.dup(directory_fd)
+            except OSError:
+                logger.warning(
+                    "Failed to duplicate the legacy sandbox workspace root",
+                    exc_info=True,
+                )
+                return False
+            try:
+                try:
+                    for component in relative_parts:
+                        next_fd = os.open(component, directory_flags, dir_fd=current_fd)
+                        os.close(current_fd)
+                        current_fd = next_fd
+                except FileNotFoundError:
+                    # A concurrently removed directory no longer needs repair.
+                    continue
+                except OSError:
+                    succeeded = False
+                    continue
+                try:
+                    names = os.listdir(current_fd)
+                except OSError:
+                    logger.warning(
+                        "Failed to list a legacy sandbox workspace directory",
+                        exc_info=True,
+                    )
+                    succeeded = False
+                    continue
+                for name in names:
+                    if not relative_parts and skip_names and name in skip_names:
+                        continue
+                    try:
+                        entry_stat = os.stat(
+                            name,
+                            dir_fd=current_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        # A vanished entry no longer needs repair.
+                        continue
+                    except OSError:
+                        succeeded = False
+                        continue
+                    is_directory = stat.S_ISDIR(entry_stat.st_mode)
+                    is_regular = stat.S_ISREG(entry_stat.st_mode)
+                    if not is_directory and not is_regular:
+                        continue
+                    if is_regular and entry_stat.st_nlink > 1:
+                        continue
+                    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+                    if is_directory:
+                        flags |= os.O_DIRECTORY
+                    try:
+                        entry_fd = os.open(name, flags, dir_fd=current_fd)
+                    except FileNotFoundError:
+                        # A vanished entry no longer needs repair.
+                        continue
+                    except OSError:
+                        succeeded = False
+                        continue
+                    try:
+                        opened_stat = os.fstat(entry_fd)
+                        if (
+                            opened_stat.st_dev != entry_stat.st_dev
+                            or opened_stat.st_ino != entry_stat.st_ino
+                        ):
+                            succeeded = False
+                            continue
+                        try:
+                            os.fchown(entry_fd, -1, _SANDBOX_RUNTIME_GID)
+                            os.fchmod(
+                                entry_fd,
+                                self._sandbox_compatible_mode(
+                                    opened_stat.st_mode, directory=is_directory
+                                ),
+                            )
+                        except OSError:
+                            logger.warning(
+                                "Failed to migrate sandbox workspace entry %s",
+                                name,
+                                exc_info=True,
+                            )
+                            succeeded = False
+                            continue
+                        if is_directory:
+                            pending.append((*relative_parts, name))
+                    finally:
+                        os.close(entry_fd)
+            finally:
+                os.close(current_fd)
+        return succeeded
 
     def _warn_if_reserved_output_name_is_taken(self) -> None:
         """Log once per process and workspace that the reserved output name is taken."""
@@ -1992,6 +2787,7 @@ class TaskWorkspace:
         file_path: str,
         *,
         resolve_file_ids: bool = True,
+        detached_file_ids: bool = False,
     ) -> Path:
         """
         Resolve a file path within the workspace with intelligent directory search.
@@ -2000,6 +2796,8 @@ class TaskWorkspace:
 
         Args:
             file_path: Relative or absolute file path
+            resolve_file_ids: Whether a single path component may be a file id.
+            detached_file_ids: Resolve file ids with a worker-owned DB session.
 
         Returns:
             Resolved absolute path within workspace or allowed external directories
@@ -2019,7 +2817,12 @@ class TaskWorkspace:
             and len(path.parts) == 1
             and "/" not in file_id_candidate
         ):
-            resolved_by_id = self.resolve_file_id(file_id_candidate)
+            resolver = (
+                self.resolve_file_id_detached
+                if detached_file_ids
+                else self.resolve_file_id
+            )
+            resolved_by_id = resolver(file_id_candidate)
             if resolved_by_id is not None:
                 return resolved_by_id
 
@@ -2230,6 +3033,8 @@ class TaskWorkspace:
         a failure would tell deletion the directory leaked when it did not.
         """
         self._forget_internal_files()
+        with _sandbox_permission_migrations_lock:
+            _sandbox_permission_migrations_attempted.discard(str(self.workspace_dir))
         if self.workspace_dir.exists():
             logger.info(f"Removing workspace directory: {self.workspace_dir}")
             try:

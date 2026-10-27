@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import type { WidgetParentMessageType } from "@/lib/widget-parent-message"
+import { MAX_INITIAL_MESSAGE_LENGTH, type WidgetParentMessageType } from "@/lib/widget-parent-message"
 
 import { evaluateWidgetScript, widgetScript } from "@/test-utils/widget-script"
 
@@ -106,7 +106,7 @@ describe("widget chrome", () => {
     // corresponding control (a same-origin, same-source, correctly-enveloped
     // message the host would now just ignore) with no compiler error to
     // catch it.
-    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse", "prompt_context_request"]
+    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse", "prompt_context_request", "initial_message_request", "initial_message_ack"]
     for (const messageType of messageTypes) {
       expect(widgetScript).toContain(`data.type === '${messageType}'`)
     }
@@ -259,6 +259,125 @@ describe("widget chrome", () => {
     fromIframe("widget_minimize")
 
     expect(panelEl()).toHaveClass("open")
+  })
+
+  describe("data-initial-message", () => {
+    const initialMessage = (value: string) => (
+      { xagent: true, v: 1, type: "initial_message", value }
+    )
+
+    function runWithInitialMessage(value = "  hello agent  ") {
+      runWidget({ "data-widget-key": "widget-secret", "data-initial-message": value })
+      return vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+    }
+
+    it("holds the message until the panel is first opened", () => {
+      const postToIframe = runWithInitialMessage()
+
+      fromIframe("initial_message_request")
+      expect(postToIframe).not.toHaveBeenCalled()
+
+      fabEl()?.click()
+      expect(postToIframe).toHaveBeenCalledTimes(1)
+      expect(postToIframe).toHaveBeenCalledWith(initialMessage("hello agent"), HOST)
+    })
+
+    it("replies at once when the panel was opened before the request", () => {
+      const postToIframe = runWithInitialMessage()
+      fabEl()?.click()
+
+      fromIframe("initial_message_request")
+
+      expect(postToIframe).toHaveBeenCalledWith(initialMessage("hello agent"), HOST)
+    })
+
+    it("answers a repeated request until the iframe acknowledges, then never again", () => {
+      const postToIframe = runWithInitialMessage()
+      fromIframe("initial_message_request")
+      // The iframe's listener went away (not ready) before the first open.
+      fabEl()?.click()
+      expect(postToIframe).toHaveBeenCalledTimes(1)
+
+      // Closing and reopening does not repost without a new request.
+      fabEl()?.click()
+      fabEl()?.click()
+      expect(postToIframe).toHaveBeenCalledTimes(1)
+
+      fromIframe("initial_message_request")
+      expect(postToIframe).toHaveBeenCalledTimes(2)
+
+      fromIframe("initial_message_ack")
+      fromIframe("initial_message_request")
+      fabEl()?.click()
+      fabEl()?.click()
+      expect(postToIframe).toHaveBeenCalledTimes(2)
+    })
+
+    it("accepts a message of exactly the length cap", () => {
+      const message = "x".repeat(2000)
+      const postToIframe = runWithInitialMessage(message)
+      fabEl()?.click()
+
+      fromIframe("initial_message_request")
+
+      expect(postToIframe).toHaveBeenCalledWith(initialMessage(message), HOST)
+    })
+
+    it("keeps the length cap in step with the iframe side", () => {
+      expect(widgetScript).toContain(`var MAX_INITIAL_MESSAGE_LENGTH = ${MAX_INITIAL_MESSAGE_LENGTH};`)
+    })
+
+    it("reads the attribute at delivery, not at load", () => {
+      const postToIframe = runWithInitialMessage("early")
+      fromIframe("initial_message_request")
+
+      document.currentScript!.setAttribute("data-initial-message", "late")
+      fabEl()?.click()
+
+      expect(postToIframe).toHaveBeenCalledWith(initialMessage("late"), HOST)
+    })
+
+    it("sends nothing without the attribute or with a blank one", () => {
+      runWidget()
+      const postWithout = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+      fabEl()?.click()
+      fromIframe("initial_message_request")
+      expect(postWithout).not.toHaveBeenCalled()
+
+      document.currentScript!.setAttribute("data-initial-message", "   ")
+      fromIframe("initial_message_request")
+      expect(postWithout).not.toHaveBeenCalled()
+    })
+
+    it("warns once and sends nothing for an over-long message", () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+      const postToIframe = runWithInitialMessage("x".repeat(2001))
+      fabEl()?.click()
+
+      fromIframe("initial_message_request")
+      fromIframe("initial_message_request")
+
+      expect(postToIframe).not.toHaveBeenCalled()
+      expect(warn).toHaveBeenCalledTimes(1)
+    })
+
+    it("ignores a request from a different source or origin", () => {
+      const postToIframe = runWithInitialMessage()
+      fabEl()?.click()
+
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "initial_message_request" },
+        origin: HOST,
+        source: window,
+      }))
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "initial_message_request" },
+        origin: "https://evil.example",
+        source: iframeEl()?.contentWindow as Window,
+      }))
+
+      expect(postToIframe).not.toHaveBeenCalled()
+    })
   })
 
   it("replies to a prompt_context_request with the parsed attribute values", () => {

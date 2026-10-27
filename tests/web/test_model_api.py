@@ -692,10 +692,20 @@ class TestModelAPI:
         assert data["auto_model"]["model_name"] == "auto"
         assert data["auto_model"]["can_delete"] is False
         assert "vision" not in data["auto_model"]["abilities"]
-        assert {candidate["routing_model_id"] for candidate in data["candidates"]} == {
+        assert [candidate["routing_model_id"] for candidate in data["candidates"]] == [
             "openai/gpt-5.5",
             "deepseek/deepseek-v4-flash",
-        }
+        ]
+
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert config.mode == "routing"
+            assert [candidate.position for candidate in config.candidates] == [0, 1]
+        finally:
+            db.close()
 
         get_response = client.get("/api/models/auto-config", headers=regular_headers)
         assert get_response.status_code == 200
@@ -724,17 +734,36 @@ class TestModelAPI:
                     "fallback_model_id": second.json()["id"],
                     "candidates": [
                         {
-                            "target_model_id": first.json()["id"],
-                            "routing_model_id": "openai/gpt-5.5",
-                        },
-                        {
                             "target_model_id": second.json()["id"],
                             "routing_model_id": "deepseek/deepseek-v4-flash",
+                        },
+                        {
+                            "target_model_id": first.json()["id"],
+                            "routing_model_id": "openai/gpt-5.5",
                         },
                     ],
                 },
             )
         assert update_response.status_code == 200
+        expected_updated_profiles = [
+            "deepseek/deepseek-v4-flash",
+            "openai/gpt-5.5",
+        ]
+        assert [
+            candidate["routing_model_id"]
+            for candidate in update_response.json()["candidates"]
+        ] == expected_updated_profiles
+        db = next(get_db())
+        try:
+            config = (
+                db.query(AutoModelConfig).filter_by(user_id=regular_user["id"]).one()
+            )
+            assert [
+                (candidate.routing_model_id, candidate.position)
+                for candidate in config.candidates
+            ] == list(zip(expected_updated_profiles, [0, 1], strict=True))
+        finally:
+            db.close()
         defaults_after_update = client.get(
             "/api/models/user-default", headers=regular_headers
         )
@@ -782,8 +811,8 @@ class TestModelAPI:
             assert isinstance(llm, RouterLLM)
             assert llm.model_name == "auto"
             assert llm._candidate_models == (
-                "openai/gpt-5.5",
                 "deepseek/deepseek-v4-flash",
+                "openai/gpt-5.5",
             )
             assert llm._fallback_model == "deepseek/deepseek-v4-flash"
             downstream = llm._downstream_resolver("openai/gpt-5.5")
@@ -902,6 +931,7 @@ class TestModelAPI:
                     config_id=config.id,
                     routing_model_id="openai/gpt-5.5",
                     target_model_id=target.id,
+                    position=0,
                 )
             )
             db.commit()
@@ -1958,6 +1988,7 @@ class TestModelAPI:
                 config_id=config.id,
                 routing_model_id="openai/gpt-5.5",
                 target_model_id=target.id,
+                position=0,
             )
             db.add(candidate)
             db.commit()

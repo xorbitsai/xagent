@@ -31,17 +31,21 @@ import functools
 import inspect
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, cast
 
 from sqlalchemy import and_, delete, exists, func, or_, select, update
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.selectable import ScalarSelect
 
-from ...config import get_shared_task_execution_enabled
+from ...config import (
+    get_dispatch_accept_requested_class_enabled,
+    get_shared_task_execution_enabled,
+)
 from ..models.task import Task, TaskStatus
 from ..models.task_admission import TaskAdmissionBucket, TaskAdmissionTicket
 from ..models.task_command import TaskExecutionCommand
+from . import task_admission_pacing
 from .task_admission_observation import record_queue_full
 from .task_admission_pacing import (
     StartupPacing,
@@ -61,6 +65,10 @@ if TYPE_CHECKING:
     from .task_command_transport import ClaimedTaskCommand, SettledTaskCommand
 
 logger = logging.getLogger(__name__)
+
+# The inclusive range of a command priority; higher goes first.
+PRIORITY_MIN = -10
+PRIORITY_MAX = 10
 
 _EXECUTION_KINDS = frozenset({"start", "resume", "resume_input", "message"})
 _TERMINAL = ("completed", "failed")
@@ -88,17 +96,31 @@ class AdmissionQueueFull(RuntimeError):
     """The host must translate this retryable refusal at its ingress boundary."""
 
 
+class ExecutionHeld(AdmissionQueueFull):
+    """New execution is paused on this process for a planned restart.
+
+    Raised by ``release_hold.admit`` before any side effect. A subclass of the
+    queue-full refusal on purpose: every ingress that already projects that
+    retryable "not accepted" outcome onto its own protocol handles this one
+    the same way, without a new wire code. The argument names the entry kind.
+    """
+
+
 @dataclass(frozen=True, kw_only=True)
 class CommandClassification:
     """What a deployment decided for one new execution command at acceptance.
 
     ``fairness_key`` is the tenant the command is accounted to; None means the
-    acceptance step gives it the task owner's default key.
+    acceptance step gives it the task owner's default key. ``priority`` is an
+    integer from -10 to 10, higher first, that orders the command among the
+    commands of its tenant key and class; None means the command inherits the
+    priority its task was created with, or 0 when the task has none.
     """
 
     admission: AdmissionPolicy | None = None
     dispatch_class: DispatchClass = DISPATCH_CLASS_BATCH
     fairness_key: str | None = None
+    priority: int | None = None
 
     def __post_init__(self) -> None:
         if self.dispatch_class not in DISPATCH_CLASSES:
@@ -106,6 +128,11 @@ class CommandClassification:
         key = self.fairness_key
         if key is not None and not (isinstance(key, str) and 1 <= len(key) <= 64):
             raise ValueError(f"Invalid fairness key: {self.fairness_key!r}")
+        priority = self.priority
+        if priority is not None and not (
+            type(priority) is int and PRIORITY_MIN <= priority <= PRIORITY_MAX
+        ):
+            raise ValueError(f"Invalid priority: {self.priority!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -117,6 +144,12 @@ class TaskClassificationView:
     ``previous_dispatch_class`` is the class of the task's latest earlier
     execution-opening command, or None when there is none. It is read for
     every background command and is None for any other command.
+    ``requested_dispatch_class`` is the value the caller declared when it created
+    the task, exactly as stored: it may not be a valid class, and it is present
+    whether or not the deployment accepts declarations. ``upstream_dispatch_class``
+    decides whether to adopt it and only adopts a valid class.
+    ``dispatch_priority`` is the priority the caller declared at creation, as
+    stored: None means none.
     """
 
     task_id: int
@@ -125,6 +158,8 @@ class TaskClassificationView:
     owner_user_id: int
     background: bool
     previous_dispatch_class: DispatchClass | None
+    requested_dispatch_class: str | None
+    dispatch_priority: int | None
 
 
 CommandClassifier = Callable[
@@ -152,14 +187,52 @@ def upstream_source_class(source: str | None) -> DispatchClass | None:
     return None
 
 
+def _accepted_declaration(view: TaskClassificationView) -> DispatchClass | None:
+    """The caller's declared class if this deployment adopts it, else None.
+
+    A declaration is adopted only when it is a valid class, the acceptance
+    setting is on, and fair-share dispatch is on. The checks run in that order
+    and stop at the first that fails, so a task without a declaration reads
+    neither setting. A stored value that is not a valid class is treated as no
+    declaration and logged.
+    """
+    declared = view.requested_dispatch_class
+    if declared is None:
+        return None
+    if declared not in DISPATCH_CLASSES:
+        logger.warning(
+            "Task %s has an unknown requested dispatch class %r; ignoring it",
+            view.task_id,
+            declared,
+        )
+        return None
+    if not get_dispatch_accept_requested_class_enabled():
+        return None
+    # Imported here: the transport module imports this one.
+    from .task_command_transport import _fair_share_enabled
+
+    if not _fair_share_enabled():
+        return None
+    return cast(DispatchClass, declared)
+
+
 def upstream_dispatch_class(view: TaskClassificationView, kind: str) -> DispatchClass:
     """The upstream default class of one execution-opening command.
 
-    A background command follows its task source; a source the rule does not
-    recognize keeps the interactive class of the task's previous command, and
-    is batch otherwise. Any other command is interactive when it answers a
-    waiting task and otherwise follows its task source, batch if unrecognized.
+    An answer to a waiting task (a ``resume_input`` command that is not
+    background) is always interactive and never looks at the task's
+    declaration. Any other command takes the caller's
+    declared class when the task has a valid one and both the acceptance setting and
+    fair-share dispatch are on. Without an accepted declaration, a background
+    command follows its task source; a source the rule does not recognize keeps
+    the interactive class of the task's previous command, and is batch
+    otherwise. Any other command follows its task source, batch if unrecognized.
     """
+    if kind == "resume_input" and not view.background:
+        return DISPATCH_CLASS_INTERACTIVE
+    accepted = _accepted_declaration(view)
+    if accepted is not None:
+        return accepted
     if view.background:
         by_source = upstream_source_class(view.source)
         if by_source is not None:
@@ -167,8 +240,6 @@ def upstream_dispatch_class(view: TaskClassificationView, kind: str) -> Dispatch
         if view.previous_dispatch_class == DISPATCH_CLASS_INTERACTIVE:
             return DISPATCH_CLASS_INTERACTIVE
         return DISPATCH_CLASS_BATCH
-    if kind == "resume_input":
-        return DISPATCH_CLASS_INTERACTIVE
     return upstream_source_class(view.source) or DISPATCH_CLASS_BATCH
 
 
@@ -247,6 +318,11 @@ def set_command_classifier(
     ``dispatch_class`` field defaults to batch, so a classifier that only sets
     ``admission`` makes every command batch. To keep the upstream class it can
     return ``dispatch_class=upstream_dispatch_class(view, command.kind)``.
+    It may also return a ``priority`` from -10 to 10 for the command; None keeps
+    the priority the task was created with.
+    The view carries the caller's declaration as stored; a classifier that
+    decides for itself whether to adopt it can clear it before calling the
+    upstream rule with ``dataclasses.replace(view, requested_dispatch_class=None)``.
     ``admission_enabled`` (a ``bool``) declares whether it may return an
     admission policy.
     """
@@ -430,8 +506,41 @@ def _held_ticket(ticket: type[TaskAdmissionTicket]) -> ColumnElement[bool]:
     )
 
 
+_cached_admission_eligible: tuple[object, ColumnElement[bool]] | None = None
+
+
 def admission_eligible() -> ColumnElement[bool]:
-    """Advisory queue scan; the transaction below rechecks after locking."""
+    """Advisory queue scan; the transaction below rechecks after locking.
+
+    The expression is built once per process and shared by every caller. It is
+    immutable and holds no per-call state, so every time dependency inside it
+    must go through ``task_admission_pacing.database_time``; the cache is keyed
+    on that function object, read from the module on each call.
+
+    The cached expression is rebuilt only when
+    ``task_admission_pacing.database_time`` is replaced. Replacing the helper
+    functions in this module that build the predicate (``startup_eligible``,
+    ``_live_count``, ``_older_waiter``, ``_held_ticket``, ``_behind_own_task``,
+    ``_joins_running_execution``) does not rebuild it; call
+    ``reset_admission_eligible_cache()`` first. Replacing the clock must happen
+    on a single thread.
+    """
+    global _cached_admission_eligible
+    clock = task_admission_pacing.database_time
+    cached = _cached_admission_eligible
+    if cached is None or cached[0] is not clock:
+        cached = (clock, _build_admission_eligible())
+        _cached_admission_eligible = cached
+    return cached[1]
+
+
+def reset_admission_eligible_cache() -> None:
+    """Drop the cached expression so the next call rebuilds it."""
+    global _cached_admission_eligible
+    _cached_admission_eligible = None
+
+
+def _build_admission_eligible() -> ColumnElement[bool]:
     blocked = exists(
         select(1)
         .select_from(TaskAdmissionTicket)

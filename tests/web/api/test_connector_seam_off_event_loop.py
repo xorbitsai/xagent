@@ -70,6 +70,7 @@ _SEAM_REACHING_FUNCTIONS = {
     # the offender list.
     "xagent.web.api.mcp._teardown_mcp_app_server_locally",
     "xagent.web.api.mcp.delete_mcp_server",
+    "xagent.web.api.mcp.get_mcp_server",
     "xagent.web.api.mcp.get_mcp_servers",
     "xagent.web.api.mcp.list_mcp_apps",
     "xagent.web.api.mcp.update_mcp_server",

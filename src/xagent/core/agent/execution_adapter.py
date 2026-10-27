@@ -176,6 +176,9 @@ class AgentExecutionAdapter:
             "outbound_message_handler", self.config.outbound_message_handler
         )
         resume_metadata = dict(kwargs.get("metadata") or {})
+        # The current service policy is trusted and must dominate both a
+        # checkpoint and caller-supplied resume metadata.
+        resume_metadata.update(self.config.execution_metadata)
         preferred_modalities = normalize_input_modalities(
             self.config.preferred_input_modalities
         )
@@ -195,6 +198,7 @@ class AgentExecutionAdapter:
             # AgentService may have rebuilt the tool objects after a connection
             # or policy change. A paused runner still holds the previous list.
             handle.runner.agent.tools = self.config.tools
+            handle.runner.agent.memory_store = self.config.memory_store
             handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()

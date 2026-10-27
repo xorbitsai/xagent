@@ -1,4 +1,7 @@
 import logging
+import os
+import stat
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -14,7 +17,7 @@ from .meta_graph import graph_error_response as _graph_error
 from .meta_graph import graph_request as _graph_request
 from .meta_graph import is_public_image_url as _is_public_image_url
 from .meta_graph import success_response as _success
-from .utils import setup_proxy_env
+from .utils import allowed_dirs_from_env, setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("facebook-mcp")
@@ -23,6 +26,71 @@ setup_proxy_env()
 
 mcp = FastMCP("facebook-mcp")
 requests = meta_graph.requests  # exposed for test monkeypatching
+_UPLOAD_ALLOWED_DIRS_ENV_VAR = "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS"
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_IMAGE_MEDIA_TYPES = {
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+}
+
+
+def _allowed_image_dirs() -> list[Path]:
+    try:
+        return allowed_dirs_from_env(_UPLOAD_ALLOWED_DIRS_ENV_VAR)
+    except ValueError as exc:
+        logger.warning("Invalid Facebook upload directory configuration: %s", exc)
+        raise ValueError("Upload directory configuration is invalid") from None
+
+
+def _read_allowed_image(image_path: str) -> tuple[str, bytes, str]:
+    if not image_path.strip():
+        raise ValueError("file_path must be a non-empty path")
+
+    candidate = Path(image_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        local_path = candidate.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        logger.warning("Could not resolve Facebook image path %r: %s", image_path, exc)
+        raise ValueError("Could not resolve file_path") from None
+
+    if not any(local_path.is_relative_to(root) for root in _allowed_image_dirs()):
+        logger.warning("Rejected Facebook image path outside allowed directories")
+        raise PermissionError("Image file is outside the allowed directories")
+
+    media_type = _IMAGE_MEDIA_TYPES.get(local_path.suffix.lower())
+    if media_type is None:
+        raise ValueError("file_path must reference a supported image file")
+
+    try:
+        with local_path.open("rb") as image_file:
+            file_stat = os.fstat(image_file.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("The given path is not a regular file")
+            if file_stat.st_size == 0:
+                raise ValueError("Image file must not be empty")
+            if file_stat.st_size > _MAX_IMAGE_BYTES:
+                raise ValueError(
+                    "Image file exceeds the local upload limit of "
+                    f"{_MAX_IMAGE_BYTES} bytes"
+                )
+            content = image_file.read(file_stat.st_size)
+    except FileNotFoundError:
+        raise FileNotFoundError("Image file was not found") from None
+    except IsADirectoryError:
+        raise ValueError("The given path is not a regular file") from None
+    except OSError as exc:
+        logger.warning("Could not read Facebook image file: %s", exc)
+        raise ValueError("Could not read the image file") from None
+    if len(content) != file_stat.st_size:
+        raise ValueError("Image file changed while it was being read")
+    return local_path.name, content, media_type
 
 
 def _graph_path(value: Any, name: str, suffix: str) -> str:
@@ -231,28 +299,52 @@ def facebook_publish_text_post(page_id: str, message: str) -> str:
 @mcp.tool()
 def facebook_publish_image_post(
     page_id: str,
-    image_url: str,
+    image_url: str | None = None,
     caption: str | None = None,
     published: bool = True,
+    file_path: str | None = None,
 ) -> str:
-    """Publish an image post to a Facebook Page using a public image URL."""
+    """Publish an image post from a public URL or a workspace image file.
+
+    Provide exactly one of image_url and file_path. file_path must be an
+    absolute path inside the current task workspace.
+    """
     try:
-        if not _is_public_image_url(image_url):
+        url_value = (
+            image_url if isinstance(image_url, str) and image_url.strip() else None
+        )
+        file_value = (
+            file_path if isinstance(file_path, str) and file_path.strip() else None
+        )
+        has_url = url_value is not None
+        has_file = file_value is not None
+        if has_url == has_file:
+            raise ValueError("Provide exactly one of image_url or file_path")
+        if url_value is not None and not _is_public_image_url(url_value):
             raise ValueError("image_url must be a public http or https URL")
+        local_image = _read_allowed_image(file_value) if file_value else None
+
         page_token = _page_access_token(page_id)
-        data = {
-            "url": image_url,
+        data: dict[str, Any] = {
             "published": "true" if published else "false",
         }
         if caption:
             data["caption"] = caption
+        path = _graph_path(page_id, "page_id", "photos")
 
-        result = _graph_request(
-            "POST",
-            _graph_path(page_id, "page_id", "photos"),
-            token=page_token,
-            data=data,
-        )
+        if url_value is not None:
+            data["url"] = url_value
+            result = _graph_request("POST", path, token=page_token, data=data)
+        else:
+            assert local_image is not None
+            filename, content, media_type = local_image
+            result = _graph_request(
+                "POST",
+                path,
+                token=page_token,
+                data=data,
+                files={"source": (filename, content, media_type)},
+            )
         return _success(photo_id=result.get("id"), post_id=result.get("post_id"))
     except GraphAPIError as e:
         logger.error("Error publishing Facebook Page image post for %s: %s", page_id, e)

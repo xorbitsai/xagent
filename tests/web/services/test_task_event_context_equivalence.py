@@ -589,6 +589,79 @@ def test_control_tool_batch_across_the_floor(canonical):
     assert tool_batches(messages(sweep(factory, task_id))) == [["work"]]
 
 
+def sweep_live(factory, task_id):
+    """``sweep`` against the full-history projection only.
+
+    The frozen oracle predates settlement facts that carry attempt identity.
+    """
+    with factory() as db:
+        top = db.get(Task, task_id).conversation_event_sequence
+    try:
+        with forbid_legacy_content(factory.kw["bind"]):
+            for horizon in range(top + 1):
+                set_horizon(factory, task_id, horizon)
+                compare_live(factory, task_id)
+    finally:
+        set_horizon(factory, task_id, top)
+    return _read(factory, task_event_context_service.load_task_event_context, task_id)
+
+
+def settlement(db, task_id, batch, attempt, kind="tool_execution_start", **kwargs):
+    """A resumed interaction's settlement fact for ``attempt``, in a later run."""
+    data = {
+        "tool_name": "search",
+        "tool_call_id": attempt,
+        "tool_params": {"q": attempt},
+        "settlement_delivery": True,
+    }
+    if kind != "tool_execution_start":
+        data["result"] = kwargs.pop("result")
+    return fact(
+        db,
+        task_id,
+        kind,
+        f"{attempt}:settlement:{kind}",
+        {"data": data},
+        tool_attempt_id=attempt,
+        assistant_message_id=batch,
+        run_id="resumed-run",
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("floor", [None, "after_wait", "inside_settlement"])
+def test_settlement_replaces_the_waiting_result_across_the_floor(canonical, floor):
+    factory, task_id = canonical
+    with factory() as db:
+        call(db, task_id, "batch", "gate", run_id="first-run")
+        done(
+            db,
+            task_id,
+            "batch",
+            "gate",
+            run_id="first-run",
+            result={"success": False, "status": "waiting_for_user"},
+        )
+        if floor == "after_wait":
+            summarize(db, task_id, "s", last_root(db, task_id))
+        settlement(db, task_id, "batch", "gate")
+        if floor == "inside_settlement":
+            summarize(db, task_id, "s", last_root(db, task_id))
+        settlement(
+            db,
+            task_id,
+            "batch",
+            "gate",
+            "tool_execution_end",
+            result={"success": True, "value": "settled"},
+        )
+        db.commit()
+    result = messages(sweep_live(factory, task_id))
+    assert tool_batches(result) == [["gate"]]
+    [observation] = [m for m in result if m["role"] == "tool"]
+    assert observation["raw_result"] == {"success": True, "value": "settled"}
+
+
 def test_message_cutoffs_match_turn_cutoffs(canonical):
     factory, task_id = canonical
     with factory() as db:

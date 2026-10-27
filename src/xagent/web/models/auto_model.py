@@ -29,6 +29,9 @@ class AutoModelConfig(Base):  # type: ignore
         Integer, ForeignKey("models.id", ondelete="CASCADE"), nullable=False
     )
     strategy = Column(String(20), nullable=False, default="balanced")
+    mode = Column(
+        String(32), nullable=False, default="routing", server_default="routing"
+    )
     fallback_model_id = Column(
         Integer, ForeignKey("models.id", ondelete="RESTRICT"), nullable=True
     )
@@ -43,7 +46,7 @@ class AutoModelConfig(Base):  # type: ignore
         "AutoModelCandidate",
         back_populates="config",
         cascade="all, delete-orphan",
-        order_by="AutoModelCandidate.id",
+        order_by="AutoModelCandidate.position, AutoModelCandidate.id",
     )
 
 
@@ -54,13 +57,13 @@ class AutoModelCandidate(Base):  # type: ignore
     __table_args__ = (
         UniqueConstraint(
             "config_id",
-            "routing_model_id",
-            name="uq_auto_candidate_routing_model",
+            "target_model_id",
+            name="uq_auto_candidate_target_model",
         ),
         UniqueConstraint(
             "config_id",
-            "target_model_id",
-            name="uq_auto_candidate_target_model",
+            "position",
+            name="uq_auto_candidate_position",
         ),
     )
 
@@ -72,6 +75,7 @@ class AutoModelCandidate(Base):  # type: ignore
         index=True,
     )
     routing_model_id = Column(String(200), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
     target_model_id = Column(
         Integer, ForeignKey("models.id", ondelete="RESTRICT"), nullable=False
     )

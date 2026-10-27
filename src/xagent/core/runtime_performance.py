@@ -44,6 +44,8 @@ METER_NAME = "xagent.runtime"
 _SHUTDOWN_TIMEOUT_MILLISECONDS = 5_000
 _MAX_ATTRIBUTE_VALUES_PER_METRIC = 64
 _OVERFLOW_ATTRIBUTE_VALUE = "other"
+# Any other key is dropped silently at export, so every key a call site
+# passes must be listed here; a test scans the source for unlisted keys.
 _ALLOWED_ATTRIBUTE_KEYS = frozenset(
     {
         "error.type",
@@ -51,6 +53,9 @@ _ALLOWED_ATTRIBUTE_KEYS = frozenset(
         "handler",
         "operation",
         "outcome",
+        "site",
+        "state",
+        "storage",
     }
 )
 

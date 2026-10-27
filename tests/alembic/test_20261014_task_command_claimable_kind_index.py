@@ -316,7 +316,15 @@ def test_postgresql_reply_first_lookup_uses_the_partial_index(
 
     assert found is not None
     assert found[2] is transport.TaskCommandKind.RESUME_INPUT
-    statement, parameters = captured[0]
+    # The reply lookup filters by kind and takes the oldest id; the presence
+    # precheck issued before it has no ORDER BY.
+    reply_lookups = [
+        (statement, parameters)
+        for statement, parameters in captured
+        if "kind =" in statement and "ORDER BY" in statement
+    ]
+    assert len(reply_lookups) == 1, [statement for statement, _ in captured]
+    statement, parameters = reply_lookups[0]
     with engine.connect() as connection:
         plan = "\n".join(
             row[0]

@@ -8,15 +8,22 @@ import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls
 import {
   AppProvider,
   type AppProviderTransportConfig,
+  type SessionAttachmentsConfig,
   useApp,
 } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
+import { useWidgetInitialMessage } from "@/hooks/use-widget-initial-message"
 import type { WebSocketConnection } from "@/hooks/use-websocket"
 import { readSendErrorCode } from "@/components/chat/clarification-delivery"
 import {
   clientErrorTranslationKey,
   type ClientErrorCode,
 } from "@/lib/client-errors"
+import {
+  toAttachments,
+  useSessionAttachments,
+  type SessionUploadControls,
+} from "./use-session-attachments"
 import {
   buildWidgetSessionWebSocketUrl,
   useWidgetSession,
@@ -46,6 +53,10 @@ const getSessionTerminalPresentation = (code: string | null): SessionTerminalPre
   code ? SESSION_TERMINAL_PRESENTATION[code] ?? "unavailable" : "unavailable"
 )
 
+const isNotificationHandled = (error: unknown): boolean =>
+  typeof error === "object" && error !== null
+  && (error as { notificationHandled?: unknown }).notificationHandled === true
+
 interface SessionConversationContentProps {
   status: WidgetSessionStatus
   agent: WidgetSessionAgent | null
@@ -58,6 +69,9 @@ interface SessionConversationContentProps {
   // the panel itself is still actually expanded.
   isExpanded: boolean
   onExpandedChange: (expanded: boolean) => void
+  // Present only while the session server advertises file uploads.
+  attachments?: SessionAttachmentsConfig
+  uploads: SessionUploadControls
 }
 
 function SessionConversationContent({
@@ -67,6 +81,8 @@ function SessionConversationContent({
   isAbsoluteExpiryWarningVisible,
   isExpanded,
   onExpandedChange,
+  attachments,
+  uploads,
 }: SessionConversationContentProps) {
   const {
     state,
@@ -81,13 +97,33 @@ function SessionConversationContent({
     sessionConversationState,
   } = useApp()
   const { t } = useI18n()
+  const conversationEstablished = state.taskId !== null
+  const {
+    startFiles,
+    onStartFilesChange,
+    sendStartMessage,
+    panelFiles,
+    onPanelFilesChange,
+    sendWithAttachments,
+    statuses: attachmentStatuses,
+    isBusy: isAttachmentBusy,
+    retryAttachment,
+  } = useSessionAttachments({
+    attachments,
+    uploads,
+    status,
+    conversationEstablished,
+    sendMessage,
+    sessionConversationState,
+    isSessionInteractionLocked,
+    isConversationResetPending,
+  })
   const [resetError, setResetError] = useState(false)
   // The failure is stored as a code, not as text, so the line is translated
   // at render time and follows a locale switch. It is only a note on the
   // start page; the toast raised by the composer is the failure signal.
   const [startMessageFailure, setStartMessageFailure] =
     useState<{ code: ClientErrorCode | null } | null>(null)
-  const conversationEstablished = state.taskId !== null
 
   // The failure line belongs to the current start-page visit only: whenever
   // the conversation becomes established or returns to the start page, the
@@ -110,12 +146,16 @@ function SessionConversationContent({
   ) => {
     setStartMessageFailure(null)
     try {
-      await sendMessage(message, config, files)
+      await sendStartMessage(message, files, config)
     } catch (error) {
-      setStartMessageFailure({ code: readSendErrorCode(error) })
+      // An error that is already announced, or that the visitor caused, leaves
+      // no failure line behind.
+      if (!isNotificationHandled(error)) {
+        setStartMessageFailure({ code: readSendErrorCode(error) })
+      }
       throw error
     }
-  }, [sendMessage])
+  }, [sendStartMessage])
 
   const handleStartNewConversation = useCallback(async () => {
     setResetError(false)
@@ -125,6 +165,13 @@ function SessionConversationContent({
       setResetError(true)
     }
   }, [startNewConversation])
+
+  useWidgetInitialMessage({
+    ready: status === "active" && agent !== null && isConnected,
+    // A first send queued during the initial connect has no task yet.
+    hasConversation: state.taskId !== null || isMessageDeliveryPending,
+    onMessage: (message) => handleStartMessage(message, []),
+  })
 
   if (status === "waiting" || (status === "refreshing" && !agent)) {
     return (
@@ -162,7 +209,10 @@ function SessionConversationContent({
 
   const reloadRequired = isSessionInteractionLocked
   const resetDisabled =
-    reloadRequired || isConversationResetPending || isMessageDeliveryPending
+    reloadRequired
+    || isConversationResetPending
+    || isMessageDeliveryPending
+    || isAttachmentBusy
 
   return (
     <div className="flex h-screen flex-col bg-background">
@@ -239,10 +289,17 @@ function SessionConversationContent({
             showTokenUsage={false}
             showDagPreview={false}
             showTaskFiles={false}
-            hideFileUpload={true}
+            hideFileUpload={!attachments}
             hideConfig={true}
             compactInput={true}
             deferFileUpload={true}
+            onSend={attachments ? sendWithAttachments : undefined}
+            attachments={attachments}
+            attachmentStatuses={attachments ? attachmentStatuses : undefined}
+            onRetryAttachment={attachments ? retryAttachment : undefined}
+            attachmentsBusy={isAttachmentBusy}
+            attachmentFiles={attachments ? panelFiles : []}
+            onAttachmentFilesChange={attachments ? onPanelFilesChange : undefined}
           />
         ) : (
           <div className="h-full overflow-y-auto">
@@ -257,9 +314,14 @@ function SessionConversationContent({
                   || isConversationResetPending
                   || isMessageDeliveryPending
                   || reloadRequired
+                  || isAttachmentBusy
                 }
-                files={[]}
-                onFilesChange={() => undefined}
+                files={attachments ? startFiles : []}
+                onFilesChange={attachments ? onStartFilesChange : () => undefined}
+                attachments={attachments}
+                attachmentStatuses={attachments ? attachmentStatuses : undefined}
+                onRetryAttachment={attachments ? retryAttachment : undefined}
+                attachmentsBusy={isAttachmentBusy}
                 readOnlyConfig={true}
                 hideConfig={true}
                 compactInput={true}
@@ -280,6 +342,24 @@ function SessionConversationContent({
 export function SessionAgentChatPage() {
   const bridge = useWidgetSession()
   const [isExpanded, setIsExpanded] = useState(false)
+
+  // The advertised capabilities follow every session_update. While the bridge
+  // refreshes the token it has no session, and the composer keeps the last
+  // advertisement so the visitor's files do not disappear for the refresh.
+  const advertisedUploads = bridge.session?.capabilities?.fileUploads
+  const [heldUploads, setHeldUploads] = useState(advertisedUploads)
+  if (bridge.session && heldUploads !== advertisedUploads) {
+    setHeldUploads(advertisedUploads)
+  }
+  const fileUploads = bridge.session
+    ? advertisedUploads
+    : bridge.status === "refreshing" ? heldUploads : undefined
+  const attachments = useMemo(() => toAttachments(fileUploads), [fileUploads])
+  const uploads = useMemo<SessionUploadControls>(() => ({
+    ensureFreshSession: bridge.ensureFreshSession,
+    refreshSession: bridge.refreshSession,
+    waitForOpenConnection: bridge.waitForOpenConnection,
+  }), [bridge.ensureFreshSession, bridge.refreshSession, bridge.waitForOpenConnection])
 
   const connection = useMemo<WebSocketConnection | null>(() => {
     if (bridge.status !== "active" || !bridge.session) return null
@@ -315,12 +395,16 @@ export function SessionAgentChatPage() {
       allowTasklessChat: true,
       supportsConversationReset: true,
       history: "none",
+      // Uploading is the separate `attachments` option: "disabled" here keeps
+      // previews, downloads and file mentions closed.
       files: "disabled",
+      ...(attachments ? { attachments } : {}),
       agentCards: "disabled",
       voice: "disabled",
       taskControls: "disabled",
     },
   }), [
+    attachments,
     bridge.handleConnectionClose,
     bridge.handleConnectionFailure,
     bridge.handleConnectionOpen,
@@ -338,6 +422,8 @@ export function SessionAgentChatPage() {
         }
         isExpanded={isExpanded}
         onExpandedChange={setIsExpanded}
+        attachments={attachments}
+        uploads={uploads}
       />
     </AppProvider>
   )

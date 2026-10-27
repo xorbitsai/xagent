@@ -858,6 +858,9 @@
   fab.setAttribute('aria-label', 'Open chat');
 
   var isOpen = false;
+  var hasOpened = false;
+  var initialMessageRequested = false;
+  var initialMessageDelivered = false;
 
   // Non-null exactly while THIS instance owns a reference on the shared lock
   // below, and which element that reference is against -- a second widget
@@ -933,10 +936,12 @@
 
   function openPanel() {
     isOpen = true;
+    hasOpened = true;
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
     fab.setAttribute('aria-label', 'Close chat');
     applyScrollLock();
+    deliverInitialMessage();
   }
 
   function closePanel() {
@@ -1033,6 +1038,35 @@
     return parsed;
   }
 
+  // Must stay in step with MAX_INITIAL_MESSAGE_LENGTH in widget-parent-message.ts.
+  var MAX_INITIAL_MESSAGE_LENGTH = 2000;
+  var initialMessageWarned = false;
+  function readInitialMessage() {
+    var raw = (scriptTag.getAttribute('data-initial-message') || '').trim();
+    if (!raw) return null;
+    if (raw.length > MAX_INITIAL_MESSAGE_LENGTH) {
+      if (!initialMessageWarned) {
+        initialMessageWarned = true;
+        console.warn('Xagent Widget: data-initial-message exceeds ' + MAX_INITIAL_MESSAGE_LENGTH + ' characters; ignoring it.');
+      }
+      return null;
+    }
+    return raw;
+  }
+
+  // The iframe loads with the page while the panel is still hidden, so the
+  // message waits for the first open: sending on load would start an agent
+  // run for every page view, including visitors who never open the chat.
+  // The value is host-authored: never fill it from URL parameters or other
+  // visitor-controlled input, since in Session mode it runs as a signed turn.
+  function deliverInitialMessage() {
+    if (torndown || initialMessageDelivered || !initialMessageRequested || !hasOpened || !iframe.contentWindow) return;
+    initialMessageRequested = false;
+    var value = readInitialMessage();
+    if (value === null) return;
+    iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'initial_message', value: value }, host);
+  }
+
   // The header's close control lives inside the iframe's React app and has
   // no direct handle to panel/fab, so it signals intent back here over
   // postMessage instead. Named (not inline) so panelRemovalObserver can
@@ -1073,6 +1107,13 @@
         { xagent: true, v: 1, type: 'prompt_context', values: readPromptContext() },
         host
       );
+    } else if (data.type === 'initial_message_request') {
+      initialMessageRequested = true;
+      deliverInitialMessage();
+    } else if (data.type === 'initial_message_ack') {
+      // Only the iframe's own acknowledgement ends delivery: a post made while
+      // its listener was down (not ready, reloading) is simply answered again.
+      initialMessageDelivered = true;
     }
   }
   window.addEventListener('message', onChromeMessage);

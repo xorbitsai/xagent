@@ -10,6 +10,7 @@ from mcp.types import Tool as MCPTool
 
 from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.base import ToolCategory
+from xagent.core.tools.adapters.vibe.config import _PUBLIC_MCP_UNAVAILABLE_REASONS
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
@@ -177,6 +178,14 @@ def test_unavailable_tool_supports_public_load_phase_messages(reason, message):
     assert result["reason"] == reason
     assert result["error"] == message
     assert result["content"] == [{"text": message}]
+
+
+def test_every_load_failure_phase_is_a_public_unavailable_reason():
+    # A phase missing from the public reasons would reach users as the generic
+    # "mcp_server_unavailable" reason instead of its own.
+    assert {phase.value for phase in MCPFailurePhase} <= (
+        _PUBLIC_MCP_UNAVAILABLE_REASONS
+    )
 
 
 def test_unavailable_tool_sync_returns_clean_error():

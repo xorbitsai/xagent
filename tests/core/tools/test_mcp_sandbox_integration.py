@@ -31,6 +31,24 @@ class TestShouldSandboxMcpConnection:
             ({"transport": "stdio", "command": "npx", "args": []}, True),
             ({"transport": "stdio", "command": "uvx", "args": []}, True),
             ({"transport": "stdio", "command": "/usr/bin/npx", "args": []}, True),
+            (
+                {
+                    "transport": "stdio",
+                    "command": "python",
+                    "args": [],
+                    "sandbox_required": True,
+                },
+                True,
+            ),
+            (
+                {
+                    "transport": "stdio",
+                    "command": "",
+                    "args": [],
+                    "sandbox_required": True,
+                },
+                True,
+            ),
             ({"transport": "stdio", "command": "python", "args": []}, False),
             ({"transport": "sse", "url": "http://localhost"}, False),
             ({"transport": "streamable_http", "url": "http://localhost"}, False),
@@ -172,6 +190,29 @@ class TestLoadMcpToolsAsAgentTools:
         assert result.failures == ()
         mock_direct.assert_awaited_once()
         mock_sandboxed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_required_sandbox_without_instance_fails_closed(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "python",
+            "args": ["server.py"],
+            "sandbox_required": True,
+        }
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.mcp_adapter._load_direct_mcp_tools",
+            new=AsyncMock(),
+        ) as mock_direct:
+            result = await load_mcp_tools_as_agent_tools(
+                {"custom": connection}, sandbox=None
+            )
+
+        assert result.tools == ()
+        assert result.loaded_servers == ()
+        assert len(result.failures) == 1
+        assert result.failures[0].phase is MCPFailurePhase.SESSION_START
+        mock_direct.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_sandbox_list_failure_is_preserved_without_secret(self, caplog):

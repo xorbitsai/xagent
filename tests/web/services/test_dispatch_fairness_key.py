@@ -432,7 +432,9 @@ async def test_dispatch_passes_the_candidate_key_to_the_slot_reservation(
     monkeypatch.setattr(
         transport,
         "_find_command_candidate",
-        lambda *_args: transport.CommandCandidate(11, 5, KINDS.START, True, "team:3"),
+        lambda *_args, **_kwargs: transport.CommandCandidate(
+            11, 5, KINDS.START, True, "team:3"
+        ),
     )
     seen: list[dict] = []
 

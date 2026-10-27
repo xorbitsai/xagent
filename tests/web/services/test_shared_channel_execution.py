@@ -191,6 +191,12 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
         execute_task=AsyncMock(return_value=execution_result),
     )
     monkeypatch.setattr(agent_service_manager, "get_agent_manager", lambda: manager)
+    registered_file_infos = []
+    monkeypatch.setattr(
+        task_execution,
+        "_register_uploaded_files_for_agent",
+        lambda _service, file_infos: registered_file_infos.append(file_infos),
+    )
     bridge = Mock()
     sending = asyncio.Event()
     release = asyncio.Event()
@@ -260,6 +266,7 @@ async def test_worker_handoff_and_channel_result_commit_atomically(
     )
     assert forwarded_context["task_source"] == "internal"
     assert forwarded_context["run_id"] == selected.run_id
+    assert registered_file_infos == [[]]
     with get_session_local()() as db:
         task = db.get(Task, command.task_id)
         row = db.get(TaskExecutionCommand, command.id)

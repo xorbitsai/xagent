@@ -25,9 +25,13 @@ def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments for sandboxed tool execution."""
     parser = argparse.ArgumentParser(description="Run a sandboxed Xagent tool")
     parser.add_argument("--execution-spec-b64", required=True)
-    parser.add_argument("--args-b64", required=True)
+    args_group = parser.add_mutually_exclusive_group(required=True)
+    args_group.add_argument("--args-b64")
+    args_group.add_argument("--args-file")
     parser.add_argument("--result-file", required=True)
-    parser.add_argument("--init-params-b64")
+    init_group = parser.add_mutually_exclusive_group()
+    init_group.add_argument("--init-params-b64")
+    init_group.add_argument("--init-params-file")
     return parser.parse_args()
 
 
@@ -38,14 +42,23 @@ def _load_tool_class(import_path: str) -> type[Any]:
     return cast(type[Any], getattr(module, class_name))
 
 
-def _load_args(args_b64: str) -> dict[str, Any]:
-    """Decode JSON tool arguments from base64."""
-    args_json = base64.b64decode(args_b64).decode("utf-8")
+def _load_args(args_b64: str | None, args_file: str | None) -> dict[str, Any]:
+    """Load JSON tool arguments from a private file or legacy base64."""
+    if args_file:
+        args_json = Path(args_file).read_text("utf-8")
+    elif args_b64:
+        args_json = base64.b64decode(args_b64).decode("utf-8")
+    else:  # argparse enforces one source; keep the loader fail closed by itself.
+        raise ValueError("tool arguments are missing")
     return cast(dict[str, Any], json.loads(args_json))
 
 
-def _load_init_params(init_params_b64: str | None) -> dict[str, Any]:
-    """Decode optional cloudpickled init params from base64."""
+def _load_init_params(
+    init_params_b64: str | None, init_params_file: str | None
+) -> dict[str, Any]:
+    """Decode optional cloudpickled init params from a private file or argv."""
+    if init_params_file:
+        init_params_b64 = Path(init_params_file).read_text("ascii")
     if not init_params_b64:
         return {}
     return cast(dict[str, Any], cloudpickle.loads(base64.b64decode(init_params_b64)))
@@ -120,8 +133,8 @@ def main() -> None:
     try:
         parsed = _parse_args()
         execution_spec = _load_execution_spec(parsed)
-        init_params = _load_init_params(parsed.init_params_b64)
-        tool_args = _load_args(parsed.args_b64)
+        init_params = _load_init_params(parsed.init_params_b64, parsed.init_params_file)
+        tool_args = _load_args(parsed.args_b64, parsed.args_file)
     except Exception as e:
         print(f"Sandbox config error: {e}", file=sys.stderr)
         raise

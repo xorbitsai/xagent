@@ -10,6 +10,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/app/widget/chat/[[]token[]]/page-client.tsx",
         "src/components/chat/ChatInput.tsx",
         "src/components/chat/ChatMessage.tsx",
+        "src/components/chat/ChatStartScreen.tsx",
         "src/components/chat/clarification-form.tsx",
         "src/components/chat/connector-runtime-dialog.tsx",
         "src/components/chat/connector-runtime-dialog-state.ts",
@@ -25,6 +26,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/ui/markdown-renderer.tsx",
         "src/components/widget/public-agent-chat-page.tsx",
         "src/components/widget/session-agent-chat-page.tsx",
+        "src/components/widget/use-session-attachments.ts",
         "src/components/widget/use-widget-session.ts",
         "src/components/widget/widget-chrome-controls.tsx",
         "src/contexts/app-context-chat.tsx",
@@ -33,6 +35,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/contexts/file-access-context.tsx",
         "src/hooks/use-file-mention.ts",
         "src/hooks/use-websocket.ts",
+        "src/hooks/use-widget-initial-message.ts",
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/connector-runtime-api.ts",
@@ -78,6 +81,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/widget/session-agent-chat-page.tsx": {
           statements: 90, branches: 85, functions: 75, lines: 90,
         },
+        "src/components/widget/use-session-attachments.ts": {
+          statements: 90, branches: 85, functions: 75, lines: 90,
+        },
         "src/components/widget/use-widget-session.ts": {
           statements: 95, branches: 80, functions: 90, lines: 95,
         },
@@ -119,6 +125,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/contexts/app-context-chat.tsx": {
           statements: 40, branches: 60, functions: 60, lines: 40,
         },
+        "src/hooks/use-widget-initial-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
+        },
         "src/hooks/use-websocket.ts": { statements: 80, branches: 75, functions: 65, lines: 80 },
         "src/lib/api-wrapper.ts": { statements: 75, branches: 65, functions: 60, lines: 75 },
         "src/contexts/auth-context.tsx": { statements: 70, branches: 65, functions: 90, lines: 70 },
@@ -128,6 +137,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/pages/oidc-callback.tsx": { statements: 75, branches: 45, functions: 95, lines: 75 },
         "src/components/chat/ChatInput.tsx": { statements: 60, branches: 60, functions: 40, lines: 60 },
         "src/components/chat/ChatMessage.tsx": { statements: 50, branches: 50, functions: 40, lines: 50 },
+        "src/components/chat/ChatStartScreen.tsx": { statements: 100, branches: 95, functions: 90, lines: 100 },
         "src/components/chat/clarification-form.tsx": {
           statements: 76, branches: 68, functions: 62, lines: 76,
         },
@@ -182,6 +192,7 @@ export default defineConfig({
       "src/components/chat/FileChip.test.tsx",
       "src/components/chat/chat-input-public-file-access.test.tsx",
       "src/components/chat/ChatMessage.test.tsx",
+      "src/components/chat/ChatStartScreen.test.tsx",
       "src/components/chat/TraceEventRenderer.test.tsx",
       "src/components/chat/trace-event-processing.test.ts",
       "src/components/chat/clarification-form.test.tsx",
@@ -206,6 +217,7 @@ export default defineConfig({
       "src/components/widget/public-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.test.tsx",
       "src/components/widget/session-agent-chat-page.integration.test.tsx",
+      "src/components/widget/use-session-attachments.test.tsx",
       "src/components/widget/use-widget-session.test.tsx",
       "src/contexts/app-context-chat.test.tsx",
       "src/contexts/auth-context.test.tsx",
@@ -213,6 +225,7 @@ export default defineConfig({
       "src/contexts/file-access-context.test.tsx",
       "src/hooks/use-file-mention.test.tsx",
       "src/hooks/use-websocket.test.ts",
+      "src/hooks/use-widget-initial-message.test.tsx",
       "src/lib/api-wrapper.test.ts",
       "src/lib/auth-cache.test.ts",
       "src/ci/dependency-security.test.ts",

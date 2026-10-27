@@ -1,10 +1,10 @@
 """Tests for mcp_runner.py helper functions and main()."""
 
-import base64
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 from unittest.mock import AsyncMock, patch
 
@@ -66,8 +66,10 @@ class TestLoadConnection:
 
     def test_roundtrip(self):
         connection = {"transport": "stdio", "command": "npx", "args": ["demo"]}
-        connection_b64 = base64.b64encode(json.dumps(connection).encode()).decode()
-        assert _load_connection(connection_b64) == connection
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as config:
+            json.dump(connection, config)
+            config.flush()
+            assert _load_connection(config.name) == connection
 
 
 class TestMain:
@@ -75,14 +77,13 @@ class TestMain:
 
     def test_happy_path(self, tmp_path):
         result_file = str(tmp_path / "result.json")
-        connection_b64 = base64.b64encode(
-            json.dumps(
-                {"transport": "stdio", "command": "npx", "args": ["demo"]}
-            ).encode()
-        ).decode()
+        connection_file = tmp_path / "connection.json"
+        connection_file.write_text(
+            json.dumps({"transport": "stdio", "command": "npx", "args": ["demo"]})
+        )
         argv = [
-            "--connection-b64",
-            connection_b64,
+            "--connection-file",
+            str(connection_file),
             "--result-file",
             result_file,
         ]

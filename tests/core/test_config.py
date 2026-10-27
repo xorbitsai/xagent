@@ -37,6 +37,7 @@ from xagent.config import (
     DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
     DEEPDOC_XINFERENCE_URL,
     DEEPDOC_XINFERENCE_USERNAME,
+    EXTERNAL_MEDIA_URL_TTL_SECONDS,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -1211,6 +1212,23 @@ class TestFileStorageConfig:
         with pytest.raises(ValueError, match="XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"):
             get_file_stream_ticket_ttl_seconds()
 
+    def test_external_media_url_ttl_defaults_to_600(self, monkeypatch):
+        monkeypatch.delenv(EXTERNAL_MEDIA_URL_TTL_SECONDS, raising=False)
+
+        assert config.get_external_media_url_ttl_seconds() == 600
+
+    def test_external_media_url_ttl_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(EXTERNAL_MEDIA_URL_TTL_SECONDS, "900")
+
+        assert config.get_external_media_url_ttl_seconds() == 900
+
+    @pytest.mark.parametrize("value", ["0", "59", "3601", "abc"])
+    def test_external_media_url_ttl_rejects_invalid(self, monkeypatch, value):
+        monkeypatch.setenv(EXTERNAL_MEDIA_URL_TTL_SECONDS, value)
+
+        with pytest.raises(ValueError, match="XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS"):
+            config.get_external_media_url_ttl_seconds()
+
     def test_file_delivery_accel_redirect_enabled_defaults_false(self, monkeypatch):
         monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, raising=False)
 
@@ -1889,6 +1907,29 @@ class TestGetSandboxMemory:
         monkeypatch.setenv(SANDBOX_MEMORY, "invalid")
         result = get_sandbox_memory()
         assert result is None
+
+
+class TestGetSandboxPidsLimit:
+    def test_default_and_override(self, monkeypatch):
+        from xagent.config import SANDBOX_PIDS_LIMIT, get_sandbox_pids_limit
+
+        monkeypatch.delenv(SANDBOX_PIDS_LIMIT, raising=False)
+        assert get_sandbox_pids_limit() == 1024
+        monkeypatch.setenv(SANDBOX_PIDS_LIMIT, "2048")
+        assert get_sandbox_pids_limit() == 2048
+
+    @pytest.mark.parametrize("value", ["invalid", "-1", "63"])
+    def test_invalid_or_too_small_value_uses_default(self, monkeypatch, value):
+        from xagent.config import SANDBOX_PIDS_LIMIT, get_sandbox_pids_limit
+
+        monkeypatch.setenv(SANDBOX_PIDS_LIMIT, value)
+        assert get_sandbox_pids_limit() == 1024
+
+    def test_zero_disables_limit(self, monkeypatch):
+        from xagent.config import SANDBOX_PIDS_LIMIT, get_sandbox_pids_limit
+
+        monkeypatch.setenv(SANDBOX_PIDS_LIMIT, "0")
+        assert get_sandbox_pids_limit() is None
 
 
 class TestGetSandboxEnv:
@@ -3352,6 +3393,50 @@ def test_trace_database_invalid_admission_limit_falls_back(monkeypatch, value):
     assert config.get_trace_db_max_inflight() == 4
 
 
+def test_db_write_retry_defaults(monkeypatch):
+    monkeypatch.delenv(config.DB_WRITE_RETRY_ATTEMPTS, raising=False)
+    monkeypatch.delenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, raising=False)
+    monkeypatch.delenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, raising=False)
+    assert config.get_db_write_retry_attempts() == 3
+    assert config.get_db_write_retry_base_delay_ms() == 50
+    assert config.get_db_write_retry_max_delay_ms() == 1000
+
+
+def test_db_write_retry_overrides(monkeypatch):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_ATTEMPTS, "5")
+    monkeypatch.setenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, "10")
+    monkeypatch.setenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, "250")
+    assert config.get_db_write_retry_attempts() == 5
+    assert config.get_db_write_retry_base_delay_ms() == 10
+    assert config.get_db_write_retry_max_delay_ms() == 250
+
+
+def test_db_write_retry_zero_delays_are_allowed(monkeypatch):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, "0")
+    monkeypatch.setenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, "0")
+    assert config.get_db_write_retry_base_delay_ms() == 0
+    assert config.get_db_write_retry_max_delay_ms() == 0
+
+
+def test_db_write_retry_one_attempt_disables_retries(monkeypatch):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_ATTEMPTS, "1")
+    assert config.get_db_write_retry_attempts() == 1
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc"])
+def test_db_write_retry_invalid_attempts_fall_back(monkeypatch, value):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_ATTEMPTS, value)
+    assert config.get_db_write_retry_attempts() == 3
+
+
+@pytest.mark.parametrize("value", ["-1", "abc"])
+def test_db_write_retry_invalid_delays_fall_back(monkeypatch, value):
+    monkeypatch.setenv(config.DB_WRITE_RETRY_BASE_DELAY_MS, value)
+    monkeypatch.setenv(config.DB_WRITE_RETRY_MAX_DELAY_MS, value)
+    assert config.get_db_write_retry_base_delay_ms() == 50
+    assert config.get_db_write_retry_max_delay_ms() == 1000
+
+
 @pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
 def test_toby_personal_stdio_explicit_opt_in(monkeypatch, value):
     monkeypatch.setenv(config.TOBY_PERSONAL_STDIO_ENABLED, value)
@@ -4095,6 +4180,67 @@ def test_dispatcher_interactive_reserve_env_parsing(
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="xagent.config"):
         assert config.get_dispatcher_interactive_reserve_per_process() == expected
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.config" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == int(warns)
+    assert all(env_var in record.getMessage() for record in warnings)
+
+
+@pytest.mark.parametrize(
+    ("const", "env_var", "getter"),
+    [
+        (
+            "DISPATCHER_FAIR_SHARE",
+            "XAGENT_DISPATCHER_FAIR_SHARE",
+            "get_dispatcher_fair_share_enabled",
+        ),
+        (
+            "DISPATCH_ACCEPT_REQUESTED_CLASS",
+            "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS",
+            "get_dispatch_accept_requested_class_enabled",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("raw", "expected", "warns"),
+    [
+        (None, False, False),
+        ("true", True, False),
+        ("TRUE", True, False),
+        ("True", True, False),
+        ("1", True, False),
+        ("yes", True, False),
+        ("YES", True, False),
+        ("on", True, False),
+        ("On", True, False),
+        ("false", False, False),
+        ("FALSE", False, False),
+        ("0", False, False),
+        ("no", False, False),
+        ("off", False, False),
+        # A blank value states nothing, as when a compose file interpolates an
+        # unset variable: unlike the numeric settings above, it does not warn.
+        ("", False, False),
+        ("   ", False, False),
+        ("garbage", False, True),
+    ],
+)
+def test_dispatch_switch_env_parsing(
+    monkeypatch, caplog, const, env_var, getter, raw, expected, warns
+):
+    assert getattr(config, const) == env_var
+    if raw is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, raw)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="xagent.config"):
+        assert getattr(config, getter)() is expected
 
     warnings = [
         record

@@ -58,7 +58,7 @@ Every app process (`combined` or `web` role) and every worker logs one INFO line
 per minute, including minutes with no work:
 
 ```
-runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0
+runtime diagnostics role=worker pid=4242 window_s=60.0 inflight=1 resume_inflight=0 started_1m=2 finished_1m=1 ok=1 failed=0 cancelled=0 gate_held_s=0.0 slot_tenants=1 slot_top=1 loop_lag_max_ms=12.3 loop_lag_samples=0 degradations=- fair_misses=0
 ```
 
 Read the lines per `pid`. A pid that keeps logging `inflight=0` is alive and
@@ -83,7 +83,104 @@ those tasks the largest tenant holds. Executions started outside the dispatcher
 are not counted. Both values are read when the line is logged, like `inflight`,
 not summed over the minute. They are 0 in a process that does not dispatch task
 commands, and without shared execution, where dispatch takes no slot
-reservation. The line is not logged when `XAGENT_LOG_LEVEL` is above `INFO`.
+reservation. `degradations` lists the names of the process's active degraded
+signals, sorted and comma-separated, or `-` when there are none. `/health`
+reports them only for a web process; a worker has no HTTP endpoint, so this
+line is where a worker's degradations appear. `fair_misses` is how many times
+in the minute a query for the commands of one tenant key and dispatch class found
+nothing this process could claim; that pair is then skipped for two seconds. It
+is 0 when `XAGENT_DISPATCHER_FAIR_SHARE` is off and in a process that does not
+dispatch task commands. The line is not logged when `XAGENT_LOG_LEVEL` is above
+`INFO`.
+
+Runtime metrics (OpenTelemetry, OTLP/HTTP) are separate from this line and off
+unless configured (`XAGENT_RUNTIME_TELEMETRY_ENABLED` or an OTLP metrics
+endpoint; see `example.env`). Configure them on worker processes as well as web
+processes: in a split deployment, execution-side metrics such as trace writes
+and event write retries are recorded by the workers, where tasks run.
+
+`XAGENT_DISPATCHER_FAIR_SHARE` is off by default, and with it off the dispatcher
+selects commands exactly as before. With it on, a process that has room for a new
+execution takes the oldest claimable command of the tenant that holds the fewest
+of its slots, instead of the oldest claimable command of all; tenants that hold
+as many slots are ordered by their oldest queued command that opens an execution.
+Only executions the process started through its dispatcher count for a tenant,
+as for `slot_tenants`: a resume started another way, such as one for a task that
+waited for an A2A or a user reply, holds a slot of the cap but counts for no
+tenant, so its tenant ranks as if it held fewer slots. Between the batch line
+and the limit (`XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS` above 0), when
+at least two tenants have queued commands, the tenant holding the most slots in
+the process may not take a new one, so a reserve slot can stay empty until the
+process is back under the batch line. Controls and commands of tasks the process
+already runs still pass, but within one task a cancel or pause queued behind a
+held-back start waits with it. A command dispatched by its id is not held back.
+The switch accepts `1`,
+`true`, `yes` or `on` and `0`, `false`, `no` or `off`, in any case; unset or
+blank is off. Any other value counts as off and logs a warning in two places:
+where the dispatcher or the classification of a command whose task declared a
+dispatch class reads it (both use one parse per value), and where the
+`dispatch policy` line parses it, which happens again whenever the dispatch
+policy or classifier changes. The value
+in use is logged as `fair_share=` on the process's `dispatch policy` line, at its
+first dispatch snapshot and whenever the value, the policy or the classifier
+changes, so that line tells whether the switch is on; `fair_misses` is 0 both
+when it is off and when it is on with nothing missed.
+
+`POST /v1/chat/tasks` takes an optional `dispatch_class`, `interactive` or
+`batch`, which is stored with the task exactly as sent. `XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS`
+is off by default, and with it off the stored value never changes the class of
+any command. A command takes the task's declared class only when that setting and
+`XAGENT_DISPATCHER_FAIR_SHARE` are both on. This applies to the start, to appended
+messages, to manual resumes and to automatic resumes; an automatic resume takes
+the declared class before the task source. Answers to a waiting task do not look
+at the declaration and are always interactive, and pause and cancel are not
+classified. The decision is made when each command is enqueued and is then fixed
+on the command, so changing the setting affects only commands enqueued afterwards:
+a task whose declaration starts being accepted gets it on its later commands, and
+one whose declaration stops being accepted goes back to the source rule on its
+next command. The create response reports the class the start command was given
+in `dispatch_class`; it is null when the server runs the task in its own process
+instead of through the dispatch queue, and it does not describe later commands.
+
+Starts, messages and manual resumes are classified in the process that accepts
+the request, and automatic resumes in the process that executes the task, so set
+`XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS` and `XAGENT_DISPATCHER_FAIR_SHARE` to the
+same values in every process that accepts commands and every process that executes
+them. If they differ, the commands of one task can get different classes. The
+setting is read each time a command whose task has a valid declaration is
+classified. A stored value that is not a valid class is treated as no declaration
+and logged as a warning for each such command; a task with no declaration reads
+neither setting. A deployment classifier installed with `set_command_classifier`
+receives the stored declaration in the task view and decides for itself whether to
+adopt it.
+
+`POST /v1/chat/tasks` also takes an optional `priority`, an integer from -10 to 10
+(0 when omitted or null; higher goes first). It is stored with the task and copied
+onto the start, appended messages, manual and automatic resumes and answers; pause
+and cancel carry 0. A deployment classifier may return its own priority for a
+command. With `XAGENT_DISPATCHER_FAIR_SHARE` off the value is stored and changes
+nothing. With it on, it takes effect only while the process sees at least two tenant
+keys with queued commands, and it only orders commands of the same tenant key and
+dispatch class: of the sixteen highest-priority queued commands of that pair, the
+highest priority, then the oldest, that can be claimed is taken. When both classes
+of a tenant key have a candidate, the batch candidate is compared by its id and the
+interactive side by the smallest id among the claimable interactive commands of its
+window, so with equal priorities the order is the same as comparing ids. An older
+command that needs no new slot, such as a control command or one of a task already
+running in the process, still goes first, and a class the dispatcher has set aside
+for a while is not asked, so only the other class counts. Answers to waiting tasks
+are still taken first, oldest first. The fallback round, the step that takes an
+older command needing no new slot, a scan with no free slot (a process at its limit
+or on hold), and the path for a single queued tenant key ignore priority. Low-
+priority commands of a tenant key can be starved by a steady stream of higher-
+priority ones from the same key. If the sixteen highest-priority queued commands of
+a tenant key and class all wait for tasks leased by other processes, the tenant
+keeps being missed, even when a lower- priority command of it could run, until a
+fallback round happens to take it: that round takes the oldest claimable command of
+the whole table, which is not necessarily one of this tenant. With an admission hook
+installed, the same happens to a tenant whose command at the head of an admission
+queue has lower priority than the sixteen behind it, so do not enable admission
+together with priorities until admission waiters are ordered by priority.
 
 ## Configuration and upgrade
 

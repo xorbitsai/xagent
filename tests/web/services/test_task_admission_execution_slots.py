@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import literal
+from sqlalchemy import bindparam, literal
 
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.web.services.test_task_execution_admission import (
@@ -189,7 +189,11 @@ async def test_guidance_that_becomes_a_new_turn_acquires_its_own_lane(
     )
 
     now = [100.0]
-    monkeypatch.setattr(pacing, "database_time", lambda: literal(now[0]))
+    monkeypatch.setattr(
+        pacing,
+        "database_time",
+        lambda: bindparam("fake_db_now", callable_=lambda: now[0]),
+    )
     monkeypatch.setattr(observation, "database_time", lambda: literal(now[0]))
     monkeypatch.setattr(task_command_execution, "publish_task_event", AsyncMock())
     monkeypatch.setattr(

@@ -292,6 +292,12 @@ class ToolCallRecord:
     # Time the model response issued this invocation. Legacy rows keep ``None``
     # because their real invocation time cannot be reconstructed safely.
     issued_at: float | None = None
+    # Execution-event identity of the attempt and its batch, assigned when the
+    # tracer records execution events. A resumed settlement reuses them so its
+    # facts belong to the original attempt; rows written before the fields
+    # existed keep ``None``.
+    tool_attempt_id: str | None = None
+    assistant_message_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -309,6 +315,8 @@ class ToolCallRecord:
             "settlement_trace_pending": self.settlement_trace_pending,
             "step_id": self.step_id,
             "issued_at": self.issued_at,
+            "tool_attempt_id": self.tool_attempt_id,
+            "assistant_message_id": self.assistant_message_id,
         }
 
     @classmethod
@@ -339,6 +347,14 @@ class ToolCallRecord:
             step_id=str(data["step_id"]) if data.get("step_id") else None,
             issued_at=(
                 float(data["issued_at"]) if data.get("issued_at") is not None else None
+            ),
+            tool_attempt_id=(
+                str(data["tool_attempt_id"]) if data.get("tool_attempt_id") else None
+            ),
+            assistant_message_id=(
+                str(data["assistant_message_id"])
+                if data.get("assistant_message_id")
+                else None
             ),
         )
 
@@ -3478,6 +3494,12 @@ class ReActPattern(AgentPattern):
         }
         if record.invocation_id:
             base["invocation_id"] = record.invocation_id
+        # Settlement facts close the original attempt: the event writer keys
+        # them by this identity and the model context takes the settlement end
+        # as the attempt's outcome.
+        if record.tool_attempt_id and record.assistant_message_id:
+            base["tool_attempt_id"] = record.tool_attempt_id
+            base["assistant_message_id"] = record.assistant_message_id
         turn_id = record.settlement_turn_id or getattr(runtime, "active_turn_id", None)
         if turn_id:
             base["turn_id"] = str(turn_id)
@@ -3563,7 +3585,13 @@ class ReActPattern(AgentPattern):
         step_id: str | None,
         data: dict[str, Any],
     ) -> bool:
-        """Require persistence and report whether the trace event landed."""
+        """Require persistence and report whether the trace event landed.
+
+        A failed execution-event commit stops the run like every other strict
+        fact: readers would otherwise keep the attempt's waiting outcome. The
+        ledger still owes the trace, so the resumed run replays it. Any other
+        tracer failure leaves the trace owed and the run going.
+        """
 
         execution_id = getattr(runtime, "execution_id", None)
         try:
@@ -3576,8 +3604,10 @@ class ReActPattern(AgentPattern):
             )
             if inspect.isawaitable(emitted):
                 await emitted
+        except ExecutionEventPersistenceError:
+            raise
         except Exception:
-            logger.debug("settlement trace event failed", exc_info=True)
+            logger.warning("settlement trace event failed", exc_info=True)
             return False
         return True
 
@@ -3678,6 +3708,10 @@ class ReActPattern(AgentPattern):
             tool_call["turn_id"] = record.turn_id
         if record.step_id:
             tool_call["step_id"] = record.step_id
+        if record.tool_attempt_id:
+            tool_call["tool_attempt_id"] = record.tool_attempt_id
+        if record.assistant_message_id:
+            tool_call["assistant_message_id"] = record.assistant_message_id
         settlement_turn_id = getattr(runtime, "active_turn_id", None)
 
         if settlement.status == "succeeded":
@@ -6560,6 +6594,16 @@ class ReActPattern(AgentPattern):
             settlement_trace_pending=settlement_trace_pending,
             step_id=(str(tool_call["step_id"]) if tool_call.get("step_id") else None),
             issued_at=issued_at,
+            tool_attempt_id=(
+                str(tool_call["tool_attempt_id"])
+                if tool_call.get("tool_attempt_id")
+                else None
+            ),
+            assistant_message_id=(
+                str(tool_call["assistant_message_id"])
+                if tool_call.get("assistant_message_id")
+                else None
+            ),
         )
         self._store_tool_record(record, index_tool_call_id=index_tool_call_id)
 

@@ -33,6 +33,10 @@ from ..skills.utils import create_skill_manager
 from ..templates.utils import create_template_manager
 from .dynamic_memory_store import admit_memory_storage_at_startup
 from .models.database import configure_db, get_engine
+from .runtime_telemetry import (
+    start_process_runtime_telemetry,
+    stop_process_runtime_telemetry,
+)
 from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 from .services.chrome_mcp_runtime import shutdown_chrome_execution_session_pool
 from .services.execution_scope_snapshot import register_execution_scope_snapshot_loader
@@ -102,6 +106,7 @@ async def run_worker(
     sandbox = None
     idle_sweep = None
     diagnostics = None
+    telemetry = None
     stop = stop if stop is not None else asyncio.Event()
     try:
         if initialize_host is not None:
@@ -109,6 +114,7 @@ async def run_worker(
         register_local_browser_runtime()
         register_execution_scope_snapshot_loader()
         initialize_langfuse()
+        telemetry = start_process_runtime_telemetry()
         await create_skill_manager().initialize()
         await create_template_manager().initialize()
         # Admit persistent memory before this worker starts accepting tasks.
@@ -177,7 +183,11 @@ async def run_worker(
                 await sandbox.cleanup()
             flush_langfuse()
         finally:
-            await stop_process_diagnostics(diagnostics)
+            try:
+                await stop_process_diagnostics(diagnostics)
+            finally:
+                # Last, so metrics recorded while execution drained are flushed.
+                await stop_process_runtime_telemetry(telemetry)
 
 
 async def _main() -> None:

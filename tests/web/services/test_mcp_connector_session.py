@@ -25,6 +25,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPServerLoadFailure,
 )
 from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
+from xagent.core.tools.adapters.vibe.signed_upload import signed_upload_settings_error
 from xagent.core.utils.encryption import encrypt_env_dict, encrypt_value
 from xagent.web import mcp_apps
 from xagent.web.api.mcp import _ensure_catalog_app_server, get_mcp_server_tools
@@ -44,10 +45,24 @@ from xagent.web.services.mcp_runtime import (
     mcp_env_hooks_snapshot,
     set_mcp_shared_env_hook,
 )
-from xagent.web.tools.config import WebToolConfig
+from xagent.web.tools.config import WebToolConfig, set_oauth_token_resolver_hook
 
 LOADER = "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools"
 SANDBOX_MANAGER = "xagent.web.sandbox_manager.get_sandbox_manager"
+BUILD_RUNTIME_CONNECTION = (
+    "xagent.web.services.mcp_runtime.build_mcp_runtime_connection"
+)
+
+SIGNED_UPLOADS = [
+    {
+        "tool_name": "attach_document",
+        "file_argument": "document_file_id",
+        "issuing_tool_name": "request_upload",
+        "allowed_upload_hosts": ["uploads.example.test"],
+        "upload_path_prefix": "/staged/",
+        "content_types": {".pdf": "application/pdf"},
+    }
+]
 
 
 @pytest.fixture()
@@ -101,12 +116,14 @@ class _Loader:
         )
 
 
-def _link(db, user: User, server: MCPServer, **fields: Any) -> None:
+def _link(
+    db, user: User, server: MCPServer, *, is_owner: bool = True, **fields: Any
+) -> None:
     db.add(
         UserMCPServer(
             user_id=user.id,
             mcpserver_id=server.id,
-            is_owner=True,
+            is_owner=is_owner,
             is_active=True,
             **fields,
         )
@@ -155,6 +172,7 @@ def _connect_stripe(db, user: User, *, env_source: str | None = "own") -> MCPSer
         db,
         user,
         server,
+        is_owner=False,
         env=encrypt_env_dict({"STRIPE_API_KEY": "user-key"}),
         env_source=env_source,
     )
@@ -236,6 +254,7 @@ async def _session_connection(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     loader = _Loader()
     monkeypatch.setattr(LOADER, loader)
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: _SandboxManager())
     result = await list_connector_tools(
         db, user=user, server_id=server.id, name_prefix="mcp_"
     )
@@ -351,6 +370,56 @@ async def test_plain_stdio_server_matches_the_task(db_users, monkeypatch):
 
     assert connection["args"] == ["-m", "custom_server", "--flag"]
     assert connection["env"]["CUSTOM_SETTING"] == "on"
+
+
+@pytest.mark.asyncio
+async def test_ownerless_custom_stdio_is_still_sandbox_required(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _connect_plain_stdio(db, user)
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_owner = False
+    db.commit()
+
+    connection, _refs = await _task_connection(db, user, server, monkeypatch)
+
+    assert connection["sandbox_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_custom_stdio_cannot_spoof_catalog_app_id(db_users, monkeypatch):
+    db, user, _ = db_users
+    server = _connect_plain_stdio(db, user)
+    app = mcp_apps.get_app_by_id(db, "google-maps")
+    assert app is not None
+    launch = app["launch_config"]
+    association = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    association.is_owner = False
+    server.name = "google-maps"
+    server.command = launch["command"]
+    server.args = launch["args"]
+    server.auth = {"app_id": "google-maps"}
+    server.cwd = "/tmp"
+    server.env = {"PYTHONPATH": "/attacker"}
+    db.commit()
+
+    connection, _refs = await _task_connection(db, user, server, monkeypatch)
+
+    assert connection["command"] == launch["command"]
+    assert connection["sandbox_required"] is True
 
 
 @pytest.mark.asyncio
@@ -486,6 +555,7 @@ async def test_load_results_are_classified(db_users, monkeypatch, load_result, o
     db, user, _ = db_users
     server = _connect_plain_stdio(db, user)
     monkeypatch.setattr(LOADER, _Loader(load_result))
+    monkeypatch.setattr(SANDBOX_MANAGER, lambda: _SandboxManager())
 
     result = await list_connector_tools(
         db, user=user, server_id=server.id, name_prefix="mcp_"
@@ -530,7 +600,7 @@ class _SandboxManager:
 
 def _connect_google_maps(db, user: User) -> MCPServer:
     server, _ = _ensure_catalog_app_server(db, "google-maps")
-    _link(db, user, server)
+    _link(db, user, server, is_owner=False)
     return server
 
 
@@ -548,6 +618,7 @@ async def test_npx_connector_runs_in_the_users_sandbox(db_users, monkeypatch):
     )
 
     assert result.outcome is ConnectorToolsOutcome.OK
+    assert "sandbox_required" not in loader.calls[0][0]["google-maps"]
     assert loader.calls[0][1]["sandbox"] is manager.lease
     assert manager.released == [("tools", str(user.id))]
 
@@ -596,7 +667,7 @@ async def test_npx_connector_fails_closed_without_a_sandbox_lease(
 
 
 @pytest.mark.asyncio
-async def test_npx_connector_runs_on_the_host_without_a_sandbox_manager(
+async def test_catalog_npx_connector_keeps_host_fallback_without_a_sandbox_manager(
     db_users, monkeypatch
 ):
     db, user, _ = db_users
@@ -719,3 +790,179 @@ async def test_tools_route_reports_a_connector_that_cannot_be_started(
         "reason": "sandbox_unavailable",
         "failures": [],
     }
+
+
+def _connect_plain_remote(db, user: User, *, transport: str, url: str) -> MCPServer:
+    server = MCPServer.from_config(
+        {
+            "name": f"uploads-{transport}",
+            "managed": "external",
+            "transport": transport,
+            "url": url,
+        }
+    )
+    db.add(server)
+    db.commit()
+    _link(db, user, server)
+    return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transport", "url"),
+    [
+        ("streamable_http", "https://mcp.example.test/mcp"),
+        ("sse", "https://mcp.example.test/sse"),
+    ],
+)
+async def test_signed_uploads_reach_connection(db_users, monkeypatch, transport, url):
+    db, user, _ = db_users
+    server = _connect_plain_remote(db, user, transport=transport, url=url)
+    server.signed_uploads = SIGNED_UPLOADS
+    db.commit()
+
+    connection = await _assert_task_parity(db, user, server, monkeypatch)
+
+    assert connection["signed_uploads"] == SIGNED_UPLOADS
+
+
+ISSUER_ENTRY = {
+    "issuing_tool_name": "request_upload",
+    "allowed_upload_hosts": ["uploads.example.test"],
+    "upload_path_prefix": "/staged/",
+    "content_types": {".pdf": "application/pdf"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stored",
+    [
+        pytest.param([ISSUER_ENTRY], id="issuer-only"),
+        pytest.param(
+            [ISSUER_ENTRY, {**SIGNED_UPLOADS[0], "issuing_tool_name": "issue_other"}],
+            id="issuer-and-replacement",
+        ),
+    ],
+)
+async def test_issuer_entries_reach_connection(db_users, monkeypatch, stored):
+    db, user, _ = db_users
+    server = _connect_plain_remote(
+        db, user, transport="streamable_http", url="https://mcp.example.test/mcp"
+    )
+    server.signed_uploads = stored
+    db.commit()
+
+    connection = await _assert_task_parity(db, user, server, monkeypatch)
+
+    assert connection["transport"] == "streamable_http"
+    assert connection["signed_uploads"] == stored
+    assert "unavailable" not in connection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["websocket", "stdio"])
+async def test_signed_uploads_stay_off_other_transports(
+    db_users, monkeypatch, transport
+):
+    db, user, _ = db_users
+    if transport == "websocket":
+        server = _connect_plain_remote(
+            db, user, transport="websocket", url="wss://mcp.example.test/ws"
+        )
+    else:
+        server = _connect_plain_stdio(db, user)
+    server.signed_uploads = SIGNED_UPLOADS
+    db.commit()
+
+    connection = await _assert_task_parity(db, user, server, monkeypatch)
+
+    assert "signed_uploads" not in connection
+
+
+MARKER = "planted_marker_tool"
+
+
+def _invalid_entry(**changes: Any) -> dict[str, Any]:
+    entry = {**SIGNED_UPLOADS[0], "tool_name": MARKER}
+    entry.update(changes)
+    return entry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "url"),
+    [
+        pytest.param({"tool_name": MARKER}, None, id="not-a-list"),
+        pytest.param({}, None, id="empty-object"),
+        pytest.param(
+            [
+                {
+                    key: value
+                    for key, value in _invalid_entry().items()
+                    if key != "content_types"
+                }
+            ],
+            None,
+            id="missing-key",
+        ),
+        pytest.param(
+            [_invalid_entry(allowed_upload_hosts=["10.0.0.1"])],
+            None,
+            id="ip-upload-host",
+        ),
+        pytest.param([_invalid_entry()], "https:///mcp", id="url-without-host"),
+    ],
+)
+async def test_invalid_settings_fail_closed_in_web_runtime(
+    db_users, monkeypatch, caplog, stored, url
+):
+    caplog.set_level("DEBUG")
+    db, user, _ = db_users
+    server = _connect_remote_oauth(db, user)
+    server.signed_uploads = stored
+    if url is not None:
+        server.url = url
+    db.commit()
+
+    runtime_calls: list[tuple[Any, ...]] = []
+
+    async def _forbidden_runtime_connection(*args: Any, **kwargs: Any):
+        runtime_calls.append(args)
+        raise AssertionError("the connection must not be built for invalid settings")
+
+    monkeypatch.setattr(BUILD_RUNTIME_CONNECTION, _forbidden_runtime_connection)
+
+    # Records and supplies no token, so a resolution that ran before the check
+    # would leave the outcome unchanged and show up only in this list.
+    resolver_calls: list[Any] = []
+
+    def _recording_resolver(request: Any) -> None:
+        resolver_calls.append(request)
+        return None
+
+    set_oauth_token_resolver_hook(_recording_resolver)
+    try:
+        configs = await WebToolConfig(
+            db=db, request=None, user=user, user_id=user.id
+        ).get_mcp_server_configs()
+    finally:
+        set_oauth_token_resolver_hook(None)
+
+    (config,) = [item for item in configs if item["name"] == server.name]
+    assert config["transport"] == "unavailable"
+    assert config["config"]["unavailable"] is True
+    assert config["config"]["reason"] == "invalid_configuration"
+    assert config["config"]["message"] == "MCP server upload settings are invalid."
+    assert runtime_calls == []
+    assert resolver_calls == []
+    assert MARKER not in caplog.text
+    error = signed_upload_settings_error(
+        stored, transport=server.transport, url=server.url
+    )
+    assert isinstance(error, str) and error
+    assert error not in caplog.text
+    assert any(
+        record.levelname == "WARNING" and server.name in record.getMessage()
+        for record in caplog.records
+    )

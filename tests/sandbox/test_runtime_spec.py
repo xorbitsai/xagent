@@ -10,6 +10,8 @@ path.
 from __future__ import annotations
 
 import dataclasses
+import os
+import stat
 
 import pytest
 
@@ -28,6 +30,7 @@ from xagent.sandbox.base import (
     SandboxTemplate,
     SpecVerdict,
     canonical_sandbox_path,
+    grant_sandbox_runtime_access,
     spec_matches_inspection,
 )
 
@@ -39,6 +42,8 @@ def _make_spec(**overrides) -> ResolvedSandboxRuntimeSpec:
         working_dir="/home",
         cpus=1,
         memory=512,
+        pids_limit=1024,
+        security_profile="nonroot-public-egress-v1",
         env={"FOO": "bar", "BAZ": "qux"},
         volumes=[("/host/a", "/guest/a", "ro")],
         network_isolated=False,
@@ -55,6 +60,7 @@ def _make_facts(**overrides) -> ObservedRuntimeFacts:
         image_digest="sha256:deadbeef",
         raw_nano_cpus=1_000_000_000,
         raw_memory_bytes=512 * 1024 * 1024,
+        raw_pids_limit=1024,
         env={"FOO": "bar"},
         volumes=(("/host/a", "/guest/a", "ro"),),
         ports=((8080, 80),),
@@ -79,6 +85,116 @@ def _make_inspection(**overrides) -> SandboxInspection:
     return SandboxInspection(**kwargs)
 
 
+def test_workspace_access_grants_only_the_mount_root(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    workspace.chmod(0o777)
+    nested = workspace / "nested"
+    nested.mkdir(mode=0o700)
+    source = nested / "source.txt"
+    source.write_text("data")
+    source.chmod(0o600)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside")
+    outside.chmod(0o600)
+    (workspace / "outside-link").symlink_to(outside)
+
+    requested_modes: list[int] = []
+    real_fchmod = os.fchmod
+
+    def record_fchmod(fd: int, mode: int) -> None:
+        requested_modes.append(mode)
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args, **kwargs: None)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
+    grant_sandbox_runtime_access(workspace, trusted_root=tmp_path)
+
+    workspace_mode = stat.S_IMODE(workspace.stat().st_mode)
+    nested_mode = stat.S_IMODE(nested.stat().st_mode)
+    source_mode = stat.S_IMODE(source.stat().st_mode)
+    assert workspace_mode & 0o777 == 0o750
+    assert requested_modes == [0o2750]
+    assert nested_mode == 0o700
+    assert source_mode == 0o600
+    assert workspace_mode & 0o007 == 0
+    assert nested_mode & 0o007 == 0
+    assert source_mode & 0o006 == 0
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o600
+
+
+def test_workspace_access_fails_closed_when_gid_cannot_be_assigned(
+    tmp_path, monkeypatch
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+
+    def refuse_chown(*args, **kwargs):
+        raise PermissionError("not permitted")
+
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", refuse_chown)
+    with pytest.raises(SandboxContractError, match="run as root"):
+        grant_sandbox_runtime_access(workspace, trusted_root=tmp_path)
+    assert stat.S_IMODE(workspace.stat().st_mode) == 0o700
+
+
+def test_workspace_access_accepts_trusted_symlinked_ancestor(tmp_path, monkeypatch):
+    real_root = tmp_path / "real-root"
+    workspace = real_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    requested_modes: list[int] = []
+    real_fchmod = os.fchmod
+
+    def record_fchmod(fd: int, mode: int) -> None:
+        requested_modes.append(mode)
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchmod", record_fchmod)
+
+    grant_sandbox_runtime_access(linked_root / "workspace", trusted_root=linked_root)
+
+    assert stat.S_IMODE(workspace.stat().st_mode) & 0o777 == 0o750
+    assert requested_modes == [0o2750]
+
+
+@pytest.mark.skipif(not hasattr(os, "O_PATH"), reason="O_PATH is Linux-specific")
+def test_workspace_access_traverses_execute_only_ancestor(tmp_path, monkeypatch):
+    execute_only = tmp_path / "execute-only"
+    trusted_root = execute_only / "uploads"
+    workspace = trusted_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    execute_only.chmod(0o111)
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
+
+    try:
+        grant_sandbox_runtime_access(workspace, trusted_root=trusted_root)
+    finally:
+        execute_only.chmod(0o755)
+
+    assert stat.S_IMODE(workspace.stat().st_mode) & 0o777 == 0o750
+
+
+def test_workspace_access_rejects_symlink_in_managed_suffix(tmp_path, monkeypatch):
+    trusted_root = tmp_path / "uploads"
+    trusted_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    (trusted_root / "workspace").symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr("xagent.sandbox.base.os.fchown", lambda *args: None)
+
+    with pytest.raises(SandboxContractError, match="safely open"):
+        grant_sandbox_runtime_access(
+            trusted_root / "workspace", trusted_root=trusted_root
+        )
+
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o700
+
+
 # --- ResolvedSandboxRuntimeSpec: field sensitivity ---
 
 
@@ -95,6 +211,8 @@ class TestSpecFieldSensitivity:
             {"working_dir": "/other"},
             {"cpus": 2},
             {"memory": 1024},
+            {"pids_limit": 2048},
+            {"security_profile": "different-profile"},
             {"env": {"FOO": "different", "BAZ": "qux"}},
             {"volumes": [("/host/a", "/guest/a", "rw")]},
             {"network_isolated": True},
@@ -144,6 +262,8 @@ class TestSpecFieldSensitivity:
             "working_dir",
             "cpus",
             "memory",
+            "pids_limit",
+            "security_profile",
             "env",
             "volumes",
             "network_isolated",
@@ -389,11 +509,11 @@ class TestFromPartsSentinelDefaults:
         )
         assert spec.memory == 512
 
-    def test_working_dir_none_defaults_to_home(self):
+    def test_working_dir_none_defaults_to_sandbox_home(self):
         spec = ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image", image="python:3.12-slim", working_dir=None
         )
-        assert spec.working_dir == "/home"
+        assert spec.working_dir == "/home/sandbox"
 
     def test_working_dir_trailing_slash_is_normalized(self):
         spec = ResolvedSandboxRuntimeSpec.from_parts(
@@ -411,7 +531,7 @@ class TestContractVersionNotInFingerprint:
         assert "contract_version" not in field_names
 
     def test_module_constant_exists(self):
-        assert SPEC_CONTRACT_VERSION == 1
+        assert SPEC_CONTRACT_VERSION == 2
 
 
 # --- ResolvedSandboxRuntimeSpec: to_backend_config round trip ---
@@ -429,6 +549,8 @@ class TestToBackendConfig:
         assert config.working_dir == "/home"
         assert config.cpus == 1
         assert config.memory == 512
+        assert config.pids_limit == 1024
+        assert config.security_profile == "nonroot-public-egress-v1"
         assert config.env == {"FOO": "bar", "BAZ": "qux"}
         assert config.volumes == [("/host/a", "/guest/a", "ro")]
         assert config.network_isolated is False
@@ -584,6 +706,24 @@ class TestSpecMatchesInspection:
             ),
         )
         assert spec_matches_inspection(desired, inspection) is SpecVerdict.MISMATCH
+
+    @pytest.mark.parametrize("raw_pids_limit", [2048, -1, 0, None])
+    def test_pids_limit_drift_is_mismatch(self, raw_pids_limit):
+        desired = _make_spec(pids_limit=1024)
+        inspection = _make_inspection(
+            fingerprint_label=desired.fingerprint(),
+            facts=_make_facts(raw_pids_limit=raw_pids_limit),
+        )
+        assert spec_matches_inspection(desired, inspection) is SpecVerdict.MISMATCH
+
+    @pytest.mark.parametrize("raw_pids_limit", [-1, 0, None])
+    def test_unlimited_pids_values_match_unlimited_desired(self, raw_pids_limit):
+        desired = _make_spec(pids_limit=None)
+        inspection = _make_inspection(
+            fingerprint_label=desired.fingerprint(),
+            facts=_make_facts(raw_pids_limit=raw_pids_limit),
+        )
+        assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
 
     def test_label_mismatch_is_mismatch_regardless_of_raw_units(self):
         desired = _make_spec(cpus=1, memory=512)

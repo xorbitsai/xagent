@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 from unittest.mock import Mock
 
+import pytest
 import requests
 
 from xagent.web.tools.mcp import facebook
@@ -350,6 +352,220 @@ def test_publish_image_post_uses_public_url_payload(monkeypatch):
         "photo_id": "photo-1",
         "post_id": "page-1_post-1",
     }
+
+
+def test_publish_image_post_uploads_allowed_workspace_file(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(tmp_path))
+    image_path = tmp_path / "launch.png"
+    image_path.write_bytes(b"not-empty-image-fixture")
+
+    def request(method, url, **kwargs):
+        if url.endswith("/me/accounts"):
+            return MockResponse(
+                {"data": [{"id": "page-1", "access_token": "page-token"}]}
+            )
+        assert method == "POST"
+        assert url == "https://graph.facebook.com/v25.0/page-1/photos"
+        assert kwargs["headers"] == {
+            "Authorization": "Bearer page-token",
+            "Accept": "application/json",
+        }
+        assert kwargs["data"] == {
+            "published": "false",
+            "caption": "Launch visual",
+        }
+        filename, content, media_type = kwargs["files"]["source"]
+        assert filename == "launch.png"
+        assert content == b"not-empty-image-fixture"
+        assert media_type == "image/png"
+        return MockResponse({"id": "photo-1", "post_id": "page-1_post-1"})
+
+    monkeypatch.setattr(facebook.requests, "request", Mock(side_effect=request))
+
+    result = _payload(
+        facebook.facebook_publish_image_post(
+            "page-1",
+            caption="Launch visual",
+            published=False,
+            file_path=str(image_path),
+        )
+    )
+
+    assert result == {
+        "status": "success",
+        "photo_id": "photo-1",
+        "post_id": "page-1_post-1",
+    }
+
+
+def test_publish_image_post_requires_exactly_one_source(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    mock_request = Mock()
+    monkeypatch.setattr(facebook.requests, "request", mock_request)
+
+    missing = _payload(facebook.facebook_publish_image_post("page-1"))
+    duplicate = _payload(
+        facebook.facebook_publish_image_post(
+            "page-1",
+            "https://example.com/image.png",
+            file_path=str(tmp_path / "image.png"),
+        )
+    )
+
+    expected = {
+        "status": "error",
+        "message": "Provide exactly one of image_url or file_path",
+    }
+    assert missing == expected
+    assert duplicate == expected
+    mock_request.assert_not_called()
+
+
+def test_publish_image_post_rejects_outside_paths_before_existence_check(
+    monkeypatch, tmp_path: Path
+):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.png"
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(allowed))
+
+    missing = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(outside))
+    )
+    outside.write_bytes(b"image")
+    existing = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(outside))
+    )
+
+    assert (
+        missing
+        == existing
+        == {
+            "status": "error",
+            "message": "Image file is outside the allowed directories",
+        }
+    )
+
+
+def test_publish_image_post_rejects_traversal_and_symlink_escape(
+    monkeypatch, tmp_path: Path
+):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"image")
+    link = allowed / "link.png"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("symlinks are not supported on this platform")
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(allowed))
+
+    traversal = _payload(
+        facebook.facebook_publish_image_post(
+            "page-1", file_path=str(allowed / ".." / "outside.png")
+        )
+    )
+    symlink = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(link))
+    )
+
+    expected = {
+        "status": "error",
+        "message": "Image file is outside the allowed directories",
+    }
+    assert traversal == expected
+    assert symlink == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "content", "message"),
+    [
+        ("image.svg", b"<svg/>", "file_path must reference a supported image file"),
+        ("empty.png", b"", "Image file must not be empty"),
+    ],
+)
+def test_publish_image_post_rejects_invalid_workspace_image(
+    monkeypatch, tmp_path: Path, name: str, content: bytes, message: str
+):
+    image_path = tmp_path / name
+    image_path.write_bytes(content)
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(tmp_path))
+
+    result = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(image_path))
+    )
+
+    assert result == {"status": "error", "message": message}
+
+
+def test_publish_image_post_rejects_directory_and_missing_file(
+    monkeypatch, tmp_path: Path
+):
+    directory = tmp_path / "directory.png"
+    directory.mkdir()
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(tmp_path))
+
+    directory_result = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(directory))
+    )
+    missing_result = _payload(
+        facebook.facebook_publish_image_post(
+            "page-1", file_path=str(tmp_path / "missing.png")
+        )
+    )
+
+    assert directory_result == {
+        "status": "error",
+        "message": "The given path is not a regular file",
+    }
+    assert missing_result == {
+        "status": "error",
+        "message": "Image file was not found",
+    }
+
+
+def test_publish_image_post_rejects_oversized_file(monkeypatch, tmp_path: Path):
+    image_path = tmp_path / "large.png"
+    with image_path.open("wb") as image_file:
+        image_file.truncate(facebook._MAX_IMAGE_BYTES + 1)
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(tmp_path))
+
+    result = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(image_path))
+    )
+
+    assert result == {
+        "status": "error",
+        "message": (
+            "Image file exceeds the local upload limit of "
+            f"{facebook._MAX_IMAGE_BYTES} bytes"
+        ),
+    }
+
+
+def test_publish_image_post_rejects_file_outside_allowed_dirs(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    allowed_dir = tmp_path / "allowed"
+    allowed_dir.mkdir()
+    image_path = tmp_path / "outside.png"
+    image_path.write_bytes(b"image")
+    monkeypatch.setenv("XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS", str(allowed_dir))
+
+    mock_request = Mock()
+    monkeypatch.setattr(facebook.requests, "request", mock_request)
+    result = _payload(
+        facebook.facebook_publish_image_post("page-1", file_path=str(image_path))
+    )
+
+    assert result == {
+        "status": "error",
+        "message": "Image file is outside the allowed directories",
+    }
+    mock_request.assert_not_called()
 
 
 def test_graph_api_errors_are_structured_and_redact_tokens(monkeypatch):

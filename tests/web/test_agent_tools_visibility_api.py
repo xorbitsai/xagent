@@ -1,6 +1,7 @@
 import os
 import tempfile
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -30,6 +31,12 @@ app_for_tests.include_router(tools_router)
 app_for_tests.dependency_overrides[get_db] = override_get_db
 app_for_tests.dependency_overrides[get_auth_db] = auth_db_override(override_get_db)
 client = TestClient(app_for_tests)
+
+
+@pytest.fixture(autouse=True)
+def _disable_global_sandbox_manager(monkeypatch):
+    """Keep these API visibility tests independent of process-global state."""
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
 
 
 def _setup_test_db() -> str:

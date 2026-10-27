@@ -282,11 +282,14 @@ async def test_effective_policy_is_logged_when_it_changes(
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert lines == [
         "dispatch policy limit=10 interactive_reserve=0 "
-        "classifier=upstream_command_classifier admission_enabled=False",
+        "classifier=upstream_command_classifier admission_enabled=False "
+        "fair_share=False",
         "dispatch policy limit=10 interactive_reserve=2 "
-        "classifier=upstream_command_classifier admission_enabled=False",
+        "classifier=upstream_command_classifier admission_enabled=False "
+        "fair_share=False",
         "dispatch policy limit=10 interactive_reserve=3 "
-        "classifier=upstream_command_classifier admission_enabled=False",
+        "classifier=upstream_command_classifier admission_enabled=False "
+        "fair_share=False",
     ]
 
 

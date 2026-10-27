@@ -5,25 +5,140 @@ DockerSandbox tests
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
 import re
 import socket
+import tarfile
 import tempfile
+import threading
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
-from xagent.sandbox.base import SandboxConfig, SandboxTemplate
+from xagent.sandbox.base import (
+    SANDBOX_RUNTIME_GID,
+    SANDBOX_RUNTIME_UID,
+    ResolvedSandboxRuntimeSpec,
+    SandboxConfig,
+    SandboxRuntimeConflictError,
+    SandboxTemplate,
+    SpecVerdict,
+    spec_matches_inspection,
+)
 from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
+    _parse_container_config,
     _SandboxControl,
+    _write_tar_from_content,
+    _write_tar_from_local_path,
     is_docker_available,
 )
+
+
+def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
+    archive = io.BytesIO()
+
+    _write_tar_from_content("secret", "id_key", archive)
+
+    with tarfile.open(fileobj=archive, mode="r") as tar:
+        info = tar.getmember("id_key")
+        assert info.uid == 1100
+        assert info.gid == 1010
+        assert info.mode == 0o600
+
+
+@pytest.mark.parametrize("source_mode", [0o400, 0o644, 0o755])
+def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
+    tmp_path, source_mode
+) -> None:
+    source = tmp_path / "id_key"
+    source.write_text("secret", encoding="utf-8")
+    source.chmod(source_mode)
+    archive = io.BytesIO()
+
+    _write_tar_from_local_path(str(source), "id_key", archive)
+
+    with tarfile.open(fileobj=archive, mode="r") as tar:
+        info = tar.getmember("id_key")
+        assert info.uid == 1100
+        assert info.gid == 1010
+        assert info.mode == source_mode
+        assert info.mtime == int(source.stat().st_mtime)
+        extracted = tar.extractfile(info)
+        assert extracted is not None
+        assert extracted.read() == b"secret"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
+def test_write_tar_local_path_rejects_fifo_swap_without_blocking(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "upload.txt"
+    source.write_text("safe", encoding="utf-8")
+    real_open = os.open
+    swapped = False
+    opened_flags: list[int] = []
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == source and not swapped:
+            swapped = True
+            source.unlink()
+            os.mkfifo(source)
+            opened_flags.append(flags)
+        return real_open(path, flags, *args, **kwargs)
+
+    with tempfile.TemporaryFile() as archive:
+        monkeypatch.setattr(docker_sandbox_module.os, "open", swap_before_open)
+        outcome: list[BaseException | None] = []
+
+        def pack() -> None:
+            try:
+                _write_tar_from_local_path(str(source), "upload.txt", archive)
+            except BaseException as exc:
+                outcome.append(exc)
+            else:
+                outcome.append(None)
+
+        worker = threading.Thread(target=pack, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        if worker.is_alive():
+            writer_fd = real_open(source, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer_fd)
+            worker.join(timeout=2)
+
+        assert not worker.is_alive(), "opening a swapped FIFO must never block"
+        assert opened_flags and opened_flags[0] & os.O_NONBLOCK
+        assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
+
+
+def test_write_tar_local_path_rejects_symlink_consistently(tmp_path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("secret", encoding="utf-8")
+    source = tmp_path / "source.txt"
+    source.symlink_to(target)
+
+    with tempfile.TemporaryFile() as archive:
+        with pytest.raises(ValueError, match="regular local file"):
+            _write_tar_from_local_path(str(source), "source.txt", archive)
+
+
+@pytest.mark.parametrize("raw_pids_limit", [0, 1, 63, -1, None])
+def test_inspect_treats_unrealizable_pids_limit_as_unset(raw_pids_limit) -> None:
+    container = _labeled_container({})
+    container.attrs["HostConfig"]["PidsLimit"] = raw_pids_limit
+
+    info = _parse_container_config(container)
+
+    assert info.config.pids_limit is None
 
 
 @pytest.fixture(scope="module")
@@ -62,6 +177,9 @@ class _FakeDockerClient:
 
     def ping(self):
         return True
+
+    def info(self):
+        return {"SecurityOptions": []}
 
 
 class _FailingStartContainer:
@@ -112,6 +230,99 @@ class TestDockerSandboxServiceFailures:
 
         assert len(created_container.remove_calls) == 1
         assert created_container.remove_calls[0] is True
+
+    @pytest.mark.parametrize("security_options", [[], None])
+    def test_host_workspace_readiness_probe_succeeds_and_cleans_up(
+        self, tmp_path, monkeypatch, security_options
+    ):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": security_options}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+        monkeypatch.setattr(docker_sandbox_module.os, "fchown", lambda *_args: None)
+
+        service.validate_host_workspace_access()
+
+        assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    def test_host_workspace_readiness_probe_fails_closed(self, tmp_path, monkeypatch):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        def reject_chown(*_args):
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(docker_sandbox_module.os, "fchown", reject_chown)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
+            service.validate_host_workspace_access()
+        assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
+
+    def test_host_workspace_readiness_wraps_upload_root_creation_failure(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        uploads_root = tmp_path / "missing" / "uploads"
+        monkeypatch.setattr(
+            docker_sandbox_module, "get_uploads_dir", lambda: uploads_root
+        )
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        def reject_mkdir(*_args, **_kwargs):
+            raise PermissionError("read-only parent")
+
+        monkeypatch.setattr(Path, "mkdir", reject_mkdir)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="assign gid 1010"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_root_backend(
+        self, tmp_path, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 1000)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="run as root"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_rejects_rootless_daemon(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": ["name=rootless"]}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="rootful Docker"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_rejects_userns_remap(self, tmp_path, monkeypatch):
+        client = _FakeDockerClient()
+        client.info = lambda: {"SecurityOptions": ["name=userns"]}
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(
+            SandboxRuntimeConflictError, match="user-namespace remapping"
+        ):
+            service.validate_host_workspace_access()
 
 
 class TestDockerSandboxRunCodeValidation:
@@ -186,8 +397,8 @@ def _labeled_container(
             "Created": "2026-01-01T00:00:00Z",
         },
         reload=lambda: None,
-        stop=lambda timeout=None: (on_stop() if on_stop is not None else None),
-        remove=lambda force=False: (on_remove() if on_remove is not None else None),
+        stop=lambda timeout=None: on_stop() if on_stop is not None else None,
+        remove=lambda force=False: on_remove() if on_remove is not None else None,
     )
 
 
@@ -478,6 +689,8 @@ class TestNamespaceIsolation:
 
     @pytest.mark.asyncio
     async def test_create_container_writes_v2_owner_labels(self, monkeypatch):
+        monkeypatch.delenv("SANDBOX_PIDS_LIMIT", raising=False)
+
         async def _noop_ensure_image(_client, _image):
             return None
 
@@ -507,6 +720,68 @@ class TestNamespaceIsolation:
             # ~30s SIGKILL timeout. Only the create kwarg is asserted; the
             # stop-time drop was verified manually, not gated by a CI timer.
             assert captured["init"] is True
+            assert captured["user"] == "1100:1010"
+            assert captured["environment"]["HOME"] == "/home/sandbox"
+            assert captured["cap_drop"] == ["ALL"]
+            assert captured["pids_limit"] == 1024
+
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(
+                pids_limit=2048,
+                env={"HOME": "/tmp/custom-home"},
+                volumes=[("/host/workspace", "/root/.xagent/user_1", "rw")],
+            ),
+        )
+        assert captured["pids_limit"] == 2048
+        assert captured["environment"]["HOME"] == "/tmp/custom-home"
+        assert captured["tmpfs"]["/root"].endswith("mode=0711,uid=1100,gid=1010")
+
+        monkeypatch.setenv("SANDBOX_PIDS_LIMIT", "0")
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(),
+        )
+        assert "pids_limit" not in captured
+
+    @pytest.mark.asyncio
+    async def test_create_defaults_runtime_security_profile(self, monkeypatch):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        captured: dict[str, object] = {}
+
+        class _StopAfterDesiredSpec(Exception):
+            pass
+
+        def capture_spec(**kwargs):
+            captured.update(kwargs)
+            raise _StopAfterDesiredSpec
+
+        monkeypatch.setattr(
+            docker_sandbox_module.ResolvedSandboxRuntimeSpec,
+            "from_parts",
+            staticmethod(capture_spec),
+        )
+
+        with pytest.raises(_StopAfterDesiredSpec):
+            await service.create(
+                "user::1",
+                SandboxTemplate(type="image", image="img"),
+                SandboxConfig(),
+            )
+
+        assert captured["security_profile"] == service.runtime_security_profile()
 
 
 class TestManagerPathsRespectNamespace:
@@ -699,18 +974,33 @@ class TestDockerSandboxService:
                     "MY_VAR": "hello",
                 },
                 volumes=[
-                    (temp_dir, "/mnt/data", "rw"),  # Read-write mount
+                    (temp_dir, "/mnt/data", "ro"),
                 ],
                 network_isolated=False,
                 ports=[
                     (host_port, 80),  # Host dynamic port -> Container 80
                 ],
+                pids_limit=256,
+                security_profile="nonroot-public-egress-v1",
             )
-            sandbox = await service.get_or_create(
-                name,
-                template=template,
-                config=config,
+            sandbox = await service.create(name, template, config)
+
+            inspection = await service.inspect(name)
+            assert inspection is not None
+            desired = ResolvedSandboxRuntimeSpec.from_parts(
+                template_type="image",
+                image=DEFAULT_SANDBOX_IMAGE,
+                working_dir=config.working_dir,
+                cpus=config.cpus,
+                memory=config.memory,
+                env=config.env,
+                volumes=config.volumes,
+                network_isolated=bool(config.network_isolated),
+                ports=config.ports,
+                pids_limit=config.pids_limit,
+                security_profile=config.security_profile,
             )
+            assert spec_matches_inspection(desired, inspection) is SpecVerdict.MATCH
 
             # Check status
             info = await sandbox.info()
@@ -733,14 +1023,6 @@ class TestDockerSandboxService:
             result = await sandbox.exec("test", "-d", "/mnt/data")
             assert result.exit_code == 0
             print("✓ Volume mount configuration effective")
-
-            # Write file in mounted volume, verify visible on host
-            await sandbox.exec("sh", "-c", "echo 'test' > /mnt/data/test.txt")
-            host_file = os.path.join(temp_dir, "test.txt")
-            assert os.path.exists(host_file)
-            with open(host_file, "r") as f:
-                assert f.read().strip() == "test"
-            print("✓ Volume mount read-write normal")
 
             # Verify port mapping is effective
             # Start HTTP server inside sandbox (port 80 in container)
@@ -1241,12 +1523,13 @@ class TestDockerSandbox:
 
             # Execute simple command
             msg = "hello word"
-            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > test.txt')
+            result = await sandbox.exec("sh", "-c", f'echo "{msg}" > /tmp/test.txt')
+            assert result.exit_code == 0
 
-            result = await sandbox.exec("sh", "-c", "ls | grep test.txt")
+            result = await sandbox.exec("sh", "-c", "ls /tmp | grep test.txt")
             print(f"Command output: {result.stdout.strip()}")
 
-            result = await sandbox.exec("cat", "test.txt")
+            result = await sandbox.exec("cat", "/tmp/test.txt")
             print(f"result: {result.stdout.strip()}")
             assert result.stdout.strip() == msg
 
@@ -1281,7 +1564,7 @@ class TestDockerSandbox:
             )
 
             result = await sandbox.exec(
-                "pip", "install", "--break-system-packages", "pytest"
+                "pip", "install", "--user", "--break-system-packages", "pytest"
             )
             print(f"Output:\n{result.stdout}")
 
@@ -1496,8 +1779,45 @@ class TestDockerSandbox:
                 pass
 
     @pytest.mark.asyncio(loop_scope="module")
+    async def test_runtime_user_can_write_to_prepared_bind_mount(
+        self, docker_service, tmp_path_factory
+    ):
+        """The fixed non-root identity can write to an operator-prepared RW
+        mount even when the test runner itself has no CAP_CHOWN."""
+        name = f"test_nonroot_bind_write_{uuid.uuid4().hex[:8]}"
+        service = docker_service
+        host_dir = tmp_path_factory.mktemp("sandbox-bind-write")
+        host_dir.chmod(0o733)
+        try:
+            sandbox = await service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(
+                    cpus=1,
+                    memory=256,
+                    volumes=[(str(host_dir), "/mnt/data", "rw")],
+                ),
+            )
+
+            identity = await sandbox.exec("id", "-u")
+            assert identity.exit_code == 0, identity.stderr
+            assert identity.stdout.strip() == str(SANDBOX_RUNTIME_UID)
+            runtime_write = await sandbox.exec(
+                "sh", "-c", "printf runtime-write > /mnt/data/from-runtime.txt"
+            )
+            assert runtime_write.exit_code == 0, runtime_write.stderr
+            assert (host_dir / "from-runtime.txt").read_text() == "runtime-write"
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
     async def test_upload_download_with_volume(self, docker_service):
         """Test upload/download compatibility with volume mounts"""
+        if os.geteuid() != 0:
+            pytest.skip("writable fixed-uid bind-mount test requires host CAP_CHOWN")
         name = "test_upload_download_with_volume"
         service = docker_service
 
@@ -1511,6 +1831,12 @@ class TestDockerSandbox:
 
             # Create temporary directory as volume
             temp_dir = tempfile.mkdtemp()
+            os.chown(temp_dir, -1, SANDBOX_RUNTIME_GID)
+            os.chmod(temp_dir, 0o2750)
+            runtime_output = os.path.join(temp_dir, "output")
+            os.mkdir(runtime_output, mode=0o770)
+            os.chown(runtime_output, -1, SANDBOX_RUNTIME_GID)
+            os.chmod(runtime_output, 0o2770)
             volume_file_path = os.path.join(temp_dir, "volume_file.txt")
             volume_content = "This file is in the mounted volume"
             with open(volume_file_path, "w") as f:
@@ -1582,6 +1908,19 @@ class TestDockerSandbox:
                     host_written_content = f.read()
                 assert host_written_content == write_content
                 print("✓ Sandbox write to volume directory, visible on host")
+
+                # Prove the container's runtime uid 1100 (not the Docker
+                # archive API) can create a file in a managed workspace dir.
+                runtime_write = await sandbox.exec(
+                    "sh",
+                    "-c",
+                    "printf runtime-write > /mnt/data/output/from-runtime.txt",
+                )
+                assert runtime_write.exit_code == 0, runtime_write.stderr
+                with open(
+                    os.path.join(runtime_output, "from-runtime.txt"), "r"
+                ) as runtime_file:
+                    assert runtime_file.read() == "runtime-write"
 
                 await sandbox.stop()
 

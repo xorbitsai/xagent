@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -53,6 +53,10 @@ from .context.execution import (
     TOOL_EVIDENCE_REMOVED_METADATA_KEY,
     context_checkpoint_gate,
     derive_compact_threshold,
+)
+from .context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+    reconcile_execution_memory_retrieval_cache,
 )
 from .interruption import (
     INTERRUPTION_REASON_KEY,
@@ -117,6 +121,7 @@ RESERVED_ENGINE_METADATA_KEYS = frozenset(
         TOOL_EVIDENCE_REMOVED_METADATA_KEY,
         ACCEPTED_TURN_IDS_METADATA_KEY,
         _TRACED_TURN_IDS_METADATA_KEY,
+        MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
     }
 )
 
@@ -483,7 +488,8 @@ class AgentRunner:
                     workspace_base = base_dir or self.workspace_base_dir
                     if context.workspace_path:
                         workspace_base = str(Path(context.workspace_path).parent)
-                    workspace = self.workspace_manager.get_or_create_workspace(
+                    workspace = await asyncio.to_thread(
+                        self.workspace_manager.get_or_create_workspace,
                         base_dir=workspace_base,
                         task_id=context.workspace_id or workspace_id or execution_id,
                         allowed_external_dirs=allowed_external_dirs,
@@ -592,6 +598,11 @@ class AgentRunner:
                 await self._setup_tools(tools, task_id=execution_id)
                 for pattern in patterns:
                     load_pattern_checkpoint(pattern, checkpoint)
+                    self._reconcile_memory_retrieval_cache(
+                        context,
+                        pattern,
+                        metadata,
+                    )
                     teardown_status = "failed"
                     try:
                         result = await pattern.run(
@@ -1596,7 +1607,8 @@ class AgentRunner:
         workspace = None
         context_kwargs: dict[str, Any] = {}
         if self.workspace_enabled:
-            workspace = self.workspace_manager.get_or_create_workspace(
+            workspace = await asyncio.to_thread(
+                self.workspace_manager.get_or_create_workspace,
                 base_dir=base_dir or self.workspace_base_dir,
                 task_id=workspace_id or execution_id,
                 allowed_external_dirs=allowed_external_dirs,
@@ -1708,6 +1720,46 @@ class AgentRunner:
         request_context = metadata.get("request_context")
         if isinstance(request_context, dict):
             self._apply_request_context(context, request_context)
+
+    def _reconcile_memory_retrieval_cache(
+        self,
+        context: ExecutionContext,
+        pattern: Any,
+        metadata: dict[str, Any] | None,
+    ) -> None:
+        """Apply the current host policy before any resumed child can prompt."""
+
+        if (
+            metadata is None
+            or MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY not in metadata
+        ):
+            # Core SDK callers that never opted into host policy keep their
+            # legacy behavior.  Present ``None`` is distinct: it is an
+            # explicit host denial and must clear checkpointed retrieval.
+            return
+        raw_fingerprint = metadata.get(MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY)
+        trusted_fingerprint = (
+            raw_fingerprint
+            if isinstance(raw_fingerprint, str) and raw_fingerprint
+            else None
+        )
+
+        active_step_contexts: Mapping[str, dict[str, Any]] = {}
+        direct_contexts = getattr(pattern, "active_step_contexts", None)
+        if isinstance(direct_contexts, Mapping):
+            active_step_contexts = direct_contexts
+        else:
+            dag_state = getattr(pattern, "dag_state", None)
+            if isinstance(dag_state, Mapping):
+                nested_contexts = dag_state.get("active_step_contexts")
+                if isinstance(nested_contexts, Mapping):
+                    active_step_contexts = nested_contexts
+
+        reconcile_execution_memory_retrieval_cache(
+            context,
+            active_step_contexts,
+            trusted_scope_fingerprint=trusted_fingerprint,
+        )
 
     def _resolve_compact_threshold(self) -> tuple[int, str]:
         """Derive the context-compaction threshold from the model's context window.

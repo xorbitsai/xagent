@@ -46,6 +46,7 @@ from unittest.mock import patch
 import pytest
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
+import xagent.web.sandbox_manager as sandbox_manager_module
 import xagent.web.services.workspace_binding as workspace_binding
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.workspace import scoped_user_root
@@ -114,6 +115,27 @@ def _uploads(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(workspace_binding, "get_uploads_dir", lambda: tmp_path)
     monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
+    monkeypatch.setattr(sandbox_manager_module, "get_uploads_dir", lambda: tmp_path)
+    if os.geteuid() != 0:
+        # These classes exercise reconciliation against a real daemon, not the
+        # root-only gid grant itself (covered by unit tests). Keep them active
+        # on non-root CI runners by replacing that seam with test-only,
+        # world-writable directories that uid 1100 can use in the container.
+        tmp_path.chmod(0o777)
+
+        def prepare_test_mount(root: Path, *, trusted_root: Path, **_kwargs) -> None:
+            root.mkdir(parents=True, exist_ok=True)
+            current = root
+            trusted = Path(trusted_root)
+            while current != trusted:
+                current.chmod(0o777)
+                current = current.parent
+
+        monkeypatch.setattr(
+            sandbox_manager_module,
+            "grant_sandbox_runtime_access",
+            prepare_test_mount,
+        )
     return tmp_path
 
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import logging
 import posixpath
@@ -26,6 +25,7 @@ from .sandboxed_tool_wrapper import (
     SANDBOX_SRC_ROOT,
     SandboxDependencyManager,
     _SandboxLeaseProviderLike,
+    _write_sandbox_file_cancellation_safe,
     create_sandboxed_tool,
     resolve_primary_sandbox,
 )
@@ -74,6 +74,8 @@ def should_sandbox_mcp_connection(connection: Connection) -> bool:
     """Return whether the MCP connection should run inside sandbox."""
     if connection.get("transport") != "stdio":
         return False
+    if requires_sandbox_mcp_connection(connection):
+        return True
 
     command = connection.get("command")
     if not isinstance(command, str) or not command.strip():
@@ -82,11 +84,16 @@ def should_sandbox_mcp_connection(connection: Connection) -> bool:
     return posixpath.basename(command) in _MCP_SANDBOX_COMMANDS
 
 
+def requires_sandbox_mcp_connection(connection: Connection) -> bool:
+    """Return whether host execution is forbidden for this connection."""
+    return connection.get("transport") == "stdio" and bool(
+        connection.get("sandbox_required")
+    )
+
+
 def _serialize_connection(connection: Connection) -> str:
-    """Serialize a connection dict for sandbox transport."""
-    return base64.b64encode(
-        json.dumps(connection, ensure_ascii=False).encode("utf-8")
-    ).decode("ascii")
+    """Serialize a connection dict for a private sandbox-side file."""
+    return json.dumps(connection, ensure_ascii=False)
 
 
 async def list_tools_in_sandbox(
@@ -97,7 +104,7 @@ async def list_tools_in_sandbox(
 ) -> list[MCPTool]:
     """List MCP tools by creating the MCP session inside sandbox."""
     result_file = f"/tmp/xagent_mcp_tools_{uuid.uuid4().hex}.json"
-    connection_b64 = _serialize_connection(connection)
+    connection_file = f"/tmp/xagent_mcp_connection_{uuid.uuid4().hex}.json"
 
     # `sandbox` may be a SandboxLeaseProvider (no exec/read_file/name of its
     # own) rather than a real Sandbox -- unwrap to the primary sandbox, since
@@ -109,13 +116,22 @@ async def list_tools_in_sandbox(
     )
 
     try:
+        # Cleanup still runs if the backend creates the file and then reports
+        # an upload failure, so a partially written credential payload cannot
+        # survive this listing attempt.
+        await _write_sandbox_file_cancellation_safe(
+            target_sandbox,
+            _serialize_connection(connection),
+            connection_file,
+            overwrite=False,
+        )
         try:
             result = await asyncio.wait_for(
                 target_sandbox.exec(
                     "python",
                     _MCP_RUNNER_PATH,
-                    "--connection-b64",
-                    connection_b64,
+                    "--connection-file",
+                    connection_file,
                     "--result-file",
                     result_file,
                     env={"PYTHONPATH": SANDBOX_SRC_ROOT},
@@ -176,7 +192,7 @@ async def list_tools_in_sandbox(
         return tools
     finally:
         try:
-            await target_sandbox.exec("rm", "-f", result_file)
+            await target_sandbox.exec("rm", "-f", connection_file, result_file)
         except Exception:
             pass
 

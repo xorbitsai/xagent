@@ -788,8 +788,24 @@ def _cache(agent, *, task_id=7, owner_id=3):
     return agents
 
 
-async def _turn(agents, *, task_id=7, owner_id=3):
+async def _turn(agents, monkeypatch, *, task_id=7, owner_id=3):
     """One cache-hit turn through the public entry point."""
+    from xagent.web.services.task_setup_snapshot import MemoryPolicyTaskFields
+
+    async def load_policy_fields(*_args, **_kwargs):
+        return MemoryPolicyTaskFields(
+            id=task_id,
+            user_id=owner_id,
+            agent_id=None,
+            source="slack",
+            agent_config={},
+        )
+
+    monkeypatch.setattr(
+        agent_service_manager,
+        "_load_memory_policy_task_fields_for_agent",
+        load_policy_fields,
+    )
     return await agents.get_agent_for_task(
         task_id,
         task_owner_user_id=owner_id,
@@ -829,7 +845,7 @@ async def test_a_cache_hit_after_drift_runs_with_memory_disabled(monkeypatch, tm
     # An administrator repoints the authority between turns.
     state["snapshot"] = _snapshot(model_name="text-embedding-3-large")
 
-    returned = await _turn(agents)
+    returned = await _turn(agents, monkeypatch)
 
     assert returned is agent
     assert agent.memory_enabled is False
@@ -853,7 +869,7 @@ async def test_a_reconciled_service_cannot_reach_the_old_store(monkeypatch, tmp_
     agents = _cache(agent)
 
     state["snapshot"] = _snapshot(model_name="text-embedding-3-large")
-    await _turn(agents)
+    await _turn(agents, monkeypatch)
 
     assert agent.memory is not published
     assert isinstance(unwrap_memory_store(agent.memory), InMemoryMemoryStore)
@@ -886,7 +902,7 @@ async def test_a_ready_cache_hit_costs_one_authority_read_and_changes_nothing(
     agents = _cache(agent)
 
     before = state["reads"]
-    returned = await _turn(agents)
+    returned = await _turn(agents, monkeypatch)
     reads_for_the_turn = state["reads"] - before
 
     assert reads_for_the_turn == 1
@@ -903,16 +919,12 @@ async def test_a_ready_cache_hit_costs_one_authority_read_and_changes_nothing(
 
 
 @pytest.mark.asyncio
-async def test_a_service_already_without_memory_reads_nothing_and_stays_off(
+async def test_a_service_already_without_memory_rechecks_and_can_turn_back_on(
     monkeypatch, tmp_path
 ):
-    """One-directional: this path disables, it never re-enables.
-
-    A preview or an agent-backed task runs with memory off by configuration,
-    not by lifecycle, and the cache-hit path does not carry the inputs that
-    decided that -- so a healthy lifecycle must not turn memory back on.
-    """
-    state, _manager_ = _ready_runtime(monkeypatch, tmp_path)
+    """The authoritative cache-hit projection makes policy bidirectional."""
+    state, memory_manager = _ready_runtime(monkeypatch, tmp_path)
+    published = memory_manager.get_memory_store()
     agent = _cached_agent(
         InMemoryMemoryStore(),
         memory_enabled=False,
@@ -922,12 +934,13 @@ async def test_a_service_already_without_memory_reads_nothing_and_stays_off(
     agents = _cache(agent)
 
     before = state["reads"]
-    await _turn(agents)
+    await _turn(agents, monkeypatch)
 
-    assert state["reads"] == before
-    assert agent.memory_enabled is False
-    assert agent.memory_available is False
-    assert agent.memory_availability_reason == "blocked_repair"
+    assert state["reads"] == before + 1
+    assert agent.memory is published
+    assert agent.memory_enabled is True
+    assert agent.memory_available is True
+    assert agent.memory_availability_reason is None
 
 
 # --------------------------------------------------------------------------

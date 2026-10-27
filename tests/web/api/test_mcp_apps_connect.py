@@ -895,6 +895,7 @@ def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
         ("concurrent_tools", ["some_tool"]),
         ("runtime_input_schema", {"type": "object"}),
         ("runtime_bindings", {"some_binding": "value"}),
+        ("signed_uploads", [{"tool_name": "attach_document"}]),
         ("concurrency_safe", True),
     ],
 )

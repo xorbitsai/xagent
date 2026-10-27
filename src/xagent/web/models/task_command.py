@@ -7,18 +7,45 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
     text,
 )
+from sqlalchemy.orm import deferred
 from sqlalchemy.sql import func
 
 from .database import Base
 
+# A command is in exactly one of two status sets, and together they hold every
+# status a command is written with.
+#
+# Claimable: statuses a dispatcher can still claim. The three claimable partial
+# indexes below, the dispatcher's presence precheck and the shared-mode claim
+# condition take their status set from here. The legacy claim arms name their
+# statuses; a test keeps them within this set, so a precheck cannot miss a
+# command a claim would take.
+#
+# Terminal: statuses of a settled command. A retry may move a failed command
+# back to pending, which puts it back in the unfinished-task partial index
+# below. That index takes its status set from here, as the unfinished-command
+# checks in the transport and admission code (``status NOT IN`` the terminal
+# set) do; a test keeps their terminal tuples equal to it.
+CLAIMABLE_COMMAND_STATUSES = ("pending", "processing")
+TERMINAL_COMMAND_STATUSES = ("completed", "failed")
+
 # Rows a dispatcher can still claim. Settled commands leave the partial index,
 # so it stays small however large the command history grows.
-_CLAIMABLE_STATUS_CLAUSE = text("status IN ('pending', 'processing')")
+_CLAIMABLE_STATUS_CLAUSE = text(
+    "status IN ({})".format(", ".join(f"'{s}'" for s in CLAIMABLE_COMMAND_STATUSES))
+)
+
+# Rows that are not settled. The partial index keeps only these, so it stays
+# small however large the command history grows.
+_UNFINISHED_STATUS_CLAUSE = text(
+    "status NOT IN ({})".format(", ".join(f"'{s}'" for s in TERMINAL_COMMAND_STATUSES))
+)
 
 
 class TaskExecutionCommand(Base):  # type: ignore
@@ -51,6 +78,29 @@ class TaskExecutionCommand(Base):  # type: ignore
             "ix_task_commands_claimable_fair",
             "fairness_key",
             "dispatch_class",
+            "id",
+            sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
+            postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
+        ),
+        # Serves three reads: the oldest unfinished id of one task (the dispatcher's
+        # lookup of what a running task has queued), the check, in every
+        # claimable query, that a task has no unfinished command before the
+        # candidate, and the admission code's check that no earlier command of the
+        # same task is still waiting (``_behind_own_task``).
+        Index(
+            "ix_task_commands_unfinished_task",
+            "task_id",
+            "id",
+            sqlite_where=_UNFINISHED_STATUS_CLAUSE,
+            postgresql_where=_UNFINISHED_STATUS_CLAUSE,
+        ),
+        # Ordered for the claimable command of one tenant key and dispatch class
+        # with the highest priority and, within it, the lowest id.
+        Index(
+            "ix_task_commands_claimable_fair_priority",
+            "fairness_key",
+            "dispatch_class",
+            text("priority DESC"),
             "id",
             sqlite_where=_CLAIMABLE_STATUS_CLAUSE,
             postgresql_where=_CLAIMABLE_STATUS_CLAUSE,
@@ -113,6 +163,14 @@ class TaskExecutionCommand(Base):  # type: ignore
     # transaction and never updated after it commits. Rows that predate the
     # column read the empty string and count as an ordinary tenant.
     fairness_key = Column(String(64), nullable=False, server_default="", default="")
+    # The priority this command was accepted with, -10 to 10, higher first. Set
+    # by stage_task_command in the acceptance transaction, never updated after
+    # it commits; old rows and control commands read 0. It orders commands of one
+    # tenant key and class, only while fair-share dispatch is on. Deferred, so a
+    # query for commands does not select it.
+    priority = deferred(
+        Column(SmallInteger, nullable=False, server_default="0", default=0)
+    )
     attempt_count = Column(Integer, nullable=False, default=0, server_default="0")
     failure_count = Column(Integer, nullable=False, default=0, server_default="0")
     defer_count = Column(Integer, nullable=False, default=0, server_default="0")

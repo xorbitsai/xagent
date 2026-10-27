@@ -20,7 +20,7 @@ import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -47,8 +47,9 @@ from xagent.web.models.task import (
     TaskStatus,
     TraceEvent,
 )
+from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
-from xagent.web.services import task_start
+from xagent.web.services import task_event_bridge, task_start
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -4222,3 +4223,248 @@ def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
         assert task_after.error_message is None
     finally:
         db.close()
+
+
+# ===== POST /v1/chat/tasks: dispatch_class =====
+
+ACCEPT_REQUESTED_CLASS = "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
+FAIR_SHARE = "XAGENT_DISPATCHER_FAIR_SHARE"
+
+
+@pytest.fixture
+def shared_mode(monkeypatch):
+    monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
+    monkeypatch.setattr(task_event_bridge, "_bridge", Mock())
+
+
+def _create_with_dispatch_class(agent_id, full_key, **extra):
+    return client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "go"},
+            **extra,
+        },
+    )
+
+
+def _stored_declaration(task_id):
+    db = _direct_db_session()
+    try:
+        return (
+            db.query(Task.requested_dispatch_class).filter(Task.id == task_id).scalar()
+        )
+    finally:
+        db.close()
+
+
+def _command_classes(task_id):
+    db = _direct_db_session()
+    try:
+        rows = (
+            db.query(TaskExecutionCommand.kind, TaskExecutionCommand.dispatch_class)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id)
+            .all()
+        )
+        return [(str(kind), klass) for kind, klass in rows]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("value", ["Interactive", "", "urgent", 1, True])
+def test_an_invalid_dispatch_class_is_rejected(value):
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(agent_id, full_key, dispatch_class=value)
+    assert response.status_code == 422, response.text
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "sent,accept,fair,expected",
+    [
+        ("interactive", False, False, "batch"),
+        ("interactive", True, False, "batch"),
+        ("interactive", False, True, "batch"),
+        ("interactive", True, True, "interactive"),
+        ("batch", False, False, "batch"),
+        ("batch", True, True, "batch"),
+        ("null", True, True, "batch"),
+        ("omitted", True, True, "batch"),
+        ("omitted", False, False, "batch"),
+    ],
+)
+def test_the_response_reports_the_class_the_start_command_got(
+    shared_mode, monkeypatch, sent, accept, fair, expected
+):
+    monkeypatch.setenv(ACCEPT_REQUESTED_CLASS, str(accept))
+    monkeypatch.setenv(FAIR_SHARE, str(fair))
+    agent_id, full_key = _create_agent_with_key()
+    extra = (
+        {}
+        if sent == "omitted"
+        else {"dispatch_class": None if sent == "null" else sent}
+    )
+    response = _create_with_dispatch_class(agent_id, full_key, **extra)
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["dispatch_class"] == expected
+    assert _command_classes(body["task_id"]) == [("start", expected)]
+    # The task stores what was sent, accepted or not; null and omitted store nothing.
+    stored = sent if sent in ("interactive", "batch") else None
+    assert _stored_declaration(body["task_id"]) == stored
+
+
+def test_without_a_dispatch_queue_the_response_class_is_null_and_the_declaration_kept():
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(
+        agent_id, full_key, dispatch_class="interactive"
+    )
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert "dispatch_class" in body
+    assert body["dispatch_class"] is None
+    assert _stored_declaration(body["task_id"]) == "interactive"
+    assert _command_classes(body["task_id"]) == []
+
+
+def test_an_append_ignores_the_field_and_follows_the_tasks_declaration(
+    shared_mode, monkeypatch
+):
+    monkeypatch.setenv(ACCEPT_REQUESTED_CLASS, "true")
+    monkeypatch.setenv(FAIR_SHARE, "true")
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(
+        agent_id, full_key, dispatch_class="interactive"
+    ).json()
+    task_id = created["task_id"]
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "run_id": created["run_id"],
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "more"},
+            "dispatch_class": "batch",
+        },
+    )
+    assert appended.status_code == 202, appended.text
+    assert "dispatch_class" not in appended.json()
+    assert _command_classes(task_id) == [
+        ("start", "interactive"),
+        ("start", "interactive"),
+    ]
+    assert _stored_declaration(task_id) == "interactive"
+
+
+# ===== POST /v1/chat/tasks: priority =====
+
+
+def _stored_priorities(task_id):
+    """(task column, [command column of each command]) read by explicit query."""
+    db = _direct_db_session()
+    try:
+        task = db.query(Task.dispatch_priority).filter(Task.id == task_id).scalar()
+        commands = (
+            db.query(TaskExecutionCommand.priority)
+            .filter(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id)
+            .all()
+        )
+        return task, [priority for (priority,) in commands]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("value", [True, False, 1.0, "1", 11, -11, "high", [1]])
+def test_an_invalid_priority_is_rejected_with_the_error_envelope(value):
+    agent_id, full_key = _create_agent_with_key()
+    response = _create_with_dispatch_class(agent_id, full_key, priority=value)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"]
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).count() == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "extra,stored_on_task,on_command",
+    [
+        ({}, None, 0),
+        ({"priority": None}, None, 0),
+        ({"priority": 0}, 0, 0),
+        ({"priority": -10}, -10, -10),
+        ({"priority": 10}, 10, 10),
+        ({"priority": 3}, 3, 3),
+    ],
+    ids=["omitted", "null", "zero", "minimum", "maximum", "three"],
+)
+def test_a_priority_is_stored_on_the_task_and_its_start_command(
+    shared_mode, extra, stored_on_task, on_command
+):
+    agent_id, full_key = _create_agent_with_key()
+
+    response = _create_with_dispatch_class(agent_id, full_key, **extra)
+
+    assert response.status_code == 202, response.text
+    assert _stored_priorities(response.json()["task_id"]) == (
+        stored_on_task,
+        [on_command],
+    )
+    assert "priority" not in response.json()
+
+
+def test_an_append_ignores_the_field_and_inherits_the_tasks_priority(shared_mode):
+    agent_id, full_key = _create_agent_with_key()
+    created = _create_with_dispatch_class(agent_id, full_key, priority=4).json()
+    task_id = created["task_id"]
+    db = _direct_db_session()
+    try:
+        db.query(TaskExecutionCommand).filter(
+            TaskExecutionCommand.task_id == task_id
+        ).update({"status": "completed"})
+        db.query(Task).filter(Task.id == task_id).update(
+            {
+                "status": TaskStatus.COMPLETED,
+                "control_state": "completed",
+                "run_id": created["run_id"],
+            }
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    appended = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "more"},
+            "priority": -7,
+        },
+    )
+
+    assert appended.status_code == 202, appended.text
+    assert _stored_priorities(task_id) == (4, [4, 4])

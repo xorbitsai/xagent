@@ -549,6 +549,7 @@ _CANONICAL_EMPTY_SERVER_FIELDS = (
     "timeout",
     "runtime_input_schema",
     "runtime_bindings",
+    "signed_uploads",
     "docker_url",
     "docker_image",
     "docker_environment",

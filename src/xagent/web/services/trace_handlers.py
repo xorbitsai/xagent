@@ -46,6 +46,10 @@ from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
 from ...web.services.db_runtime import drain_async_task_cancellation_safe
+from ...web.services.db_write_retry import (
+    bound_rerun_lock_wait_no_commit,
+    is_retryable_database_error,
+)
 from ...web.services.interaction_rollout import (
     COUNTER_CHECKPOINT_READ_PARTITION_WIDENED,
     increment_counter,
@@ -105,6 +109,36 @@ CHECKPOINT_ROW_SCAN_LIMIT = 100
 # scan that reaches the cap without a resolution is treated as unavailable
 # rather than continuing indefinitely.
 CHECKPOINT_SCAN_MAX_PAGES = 50
+
+
+class ToolAttemptAlreadyStartedError(RuntimeError):
+    """A tool attempt already has a start fact from an earlier, unreconciled run."""
+
+    def __init__(self, tool_attempt_id: str) -> None:
+        super().__init__("Tool attempt already started; result reconciliation required")
+        self.tool_attempt_id = tool_attempt_id
+
+
+@dataclass
+class CommitState:
+    """What one ``commit_event`` call has staged across its retry attempts.
+
+    A retryable failure may still have committed, so the next attempt must
+    accept the ``tool_execution_start`` row this call inserted as its own
+    instead of treating it as an earlier, possibly executed start. Owned by
+    a single call: tool batches share the adapter and commit concurrently.
+    """
+
+    start_event_id: str | None = None
+    # 1 for the first attempt; set by commit_event before each attempt.
+    attempt: int = 0
+
+
+def _retryable_commit_failure(
+    error: BaseException, commit_state: CommitState | None
+) -> bool:
+    """Whether ``commit_event`` may run this V2 fact write again."""
+    return commit_state is not None and is_retryable_database_error(error)
 
 
 @dataclass(frozen=True)
@@ -238,38 +272,63 @@ class DatabaseTraceHandler(BaseTraceHandler):
         """Handle system-level events for database storage."""
         await self._save_to_database(event)
 
-    async def _save_to_database(self, event: CoreTraceEvent) -> None:
+    async def _save_to_database(
+        self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
+    ) -> None:
         """Save trace event to database."""
+        storage = "v2" if self.authoritative else "v1"
         try:
             # A cancelled caller must wait for the instrumented worker to
             # release its transaction before task settlement can begin.
             worker = asyncio.create_task(
                 get_trace_database_runtime().run(
-                    lambda: self._sync_save_to_database(event),
-                    lambda db: self._save_trace_event(db, event),
-                    prepare=lambda: self._prepare_async_trace_transaction(event),
+                    lambda: self._sync_save_to_database(
+                        event, commit_state=commit_state
+                    ),
+                    lambda db: self._save_trace_event(
+                        db, event, commit_state=commit_state
+                    ),
+                    prepare=lambda: self._prepare_async_trace_transaction(
+                        event, commit_state=commit_state
+                    ),
                 )
             )
             await drain_async_task_cancellation_safe(worker)
             increment_performance_counter(
                 "xagent.trace.database.writes",
-                attributes={"outcome": "succeeded"},
+                attributes={"outcome": "succeeded", "storage": storage},
             )
         except Exception as e:
+            if _retryable_commit_failure(e, commit_state):
+                # commit_event may run this write again; its retry counter
+                # and final error report the outcome of the whole write.
+                increment_performance_counter(
+                    "xagent.trace.database.writes",
+                    attributes={"outcome": "retryable_failed", "storage": storage},
+                )
+                logger.warning(
+                    "Trace event commit attempt failed for task %s: %s",
+                    self.task_id,
+                    e,
+                )
+                raise
             increment_performance_counter(
                 "xagent.trace.database.writes",
-                attributes={"outcome": "failed"},
+                attributes={"outcome": "failed", "storage": storage},
             )
             # Don't catch required field validation errors - let them propagate
             if isinstance(e, ValueError) and ("missing required" in str(e)):
                 logger.error(f"Re-raising required field validation error: {e}")
                 raise
             if getattr(event, "require_persisted", False):
-                logger.error(
-                    "Required trace event persistence failed for task %s: %s",
-                    self.task_id,
-                    e,
-                )
+                if not self.authoritative:
+                    # An authoritative write is reported once, with its
+                    # retry outcome, by ExecutionEventTraceAdapter.commit_event.
+                    logger.error(
+                        "Required trace event persistence failed for task %s: %s",
+                        self.task_id,
+                        e,
+                    )
                 raise
 
             logger.warning(
@@ -1005,24 +1064,28 @@ class DatabaseTraceHandler(BaseTraceHandler):
             return _AnchorFallback(undecodable=True)
         return dict(snapshot)
 
-    def _sync_save_to_database(self, event: CoreTraceEvent) -> None:
+    def _sync_save_to_database(
+        self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
+    ) -> None:
         """Synchronous database save operation (runs in thread pool)."""
         # Create database session
         db = next(get_db())
         try:
             # Save unified trace event to database
-            self._save_trace_event(db, event)
+            self._save_trace_event(db, event, commit_state=commit_state)
         finally:
             db.close()
 
     def _prepare_async_trace_transaction(
-        self, event: CoreTraceEvent
+        self, event: CoreTraceEvent, *, commit_state: CommitState | None = None
     ) -> Callable[[Session], None]:
         from .task_event_trace_handler import get_event_type_mapping
         from .trace_event_staging import prepare_trace_payload
 
         if self.authoritative:
-            return lambda db: self._save_trace_event(db, event)
+            return lambda db: self._save_trace_event(
+                db, event, commit_state=commit_state
+            )
 
         event_type = get_event_type_mapping(event)
         with observe_duration("xagent.trace.database.serialization.duration"):
@@ -1043,6 +1106,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
         event: CoreTraceEvent,
         *,
         prepared: PreparedTracePayload | None = None,
+        commit_state: CommitState | None = None,
     ) -> None:
         """Save trace event in unified format to database."""
         from .task_event_trace_handler import get_event_type_mapping
@@ -1070,6 +1134,8 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 )
                 from .task_execution_event_writer import append_fact_no_commit
 
+                if commit_state is not None and commit_state.attempt > 1:
+                    bound_rerun_lock_wait_no_commit(db)
                 lock_task_execution_events_no_commit(db, self.task_id)
                 lease = current_task_lease()
                 if lease is not None:
@@ -1092,6 +1158,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
                         )
                 is_state = data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
                 attempt = data.get("tool_attempt_id")
+                fresh_start = False
+                # A resumed interaction settles the original attempt in a later
+                # run. Its pair gets its own identity under that attempt.
+                settlement = data.get("settlement_delivery") is True
+                fact_type = (
+                    f"settlement:{event_type_str}" if settlement else event_type_str
+                )
                 if attempt:
                     from uuid import NAMESPACE_URL, uuid5
 
@@ -1100,29 +1173,54 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     event.id = str(
                         uuid5(
                             NAMESPACE_URL,
-                            f"task:{self.task_id}:{self.build_id or 'root'}:{attempt}:{event_type_str}",
+                            f"task:{self.task_id}:{self.build_id or 'root'}:{attempt}:{fact_type}",
                         )
                     )
-                    if (
-                        event_type_str == "tool_execution_start"
-                        and db.query(TaskExecutionEvent.id)
-                        .filter(
-                            TaskExecutionEvent.task_id == self.task_id,
-                            TaskExecutionEvent.scope_id == (self.build_id or "root"),
-                            TaskExecutionEvent.tool_attempt_id == attempt,
+                    if settlement:
+                        # Settlement replays its pair until both commit. A row
+                        # from an earlier run whose commit ack was lost is the
+                        # same settlement, not a conflict.
+                        if (
+                            db.query(TaskExecutionEvent.id)
+                            .filter(
+                                TaskExecutionEvent.task_id == self.task_id,
+                                TaskExecutionEvent.scope_id
+                                == (self.build_id or "root"),
+                                TaskExecutionEvent.idempotency_key
+                                == f"tool:{attempt}:{fact_type}",
+                            )
+                            .first()
+                            is not None
+                        ):
+                            db.commit()
+                            return
+                    elif event_type_str == "tool_execution_start":
+                        rows = {
+                            event_id
+                            for (event_id,) in db.query(
+                                TaskExecutionEvent.event_id
+                            ).filter(
+                                TaskExecutionEvent.task_id == self.task_id,
+                                TaskExecutionEvent.scope_id
+                                == (self.build_id or "root"),
+                                TaskExecutionEvent.tool_attempt_id == attempt,
+                            )
+                        }
+                        own_start = (
+                            commit_state.start_event_id
+                            if commit_state is not None
+                            else None
                         )
-                        .first()
-                        is not None
-                    ):
-                        # Until event-based recovery reconciles the attempt, do
-                        # not re-execute a possibly completed external effect.
-                        raise RuntimeError(
-                            "Tool attempt already started; result reconciliation required"
-                        )
+                        # The only row this call may find is the start its own
+                        # earlier attempt inserted before losing the commit ack.
+                        if rows - {own_start}:
+                            # Until event-based recovery reconciles the attempt,
+                            # do not re-execute a possibly completed external
+                            # effect.
+                            raise ToolAttemptAlreadyStartedError(str(attempt))
+                        fresh_start = not rows
                 key = (
-                    f"tool:{attempt}:{event_type_str}"
-                    if attempt
-                    else f"runtime:{event.id}"
+                    f"tool:{attempt}:{fact_type}" if attempt else f"runtime:{event.id}"
                 )
                 payload: dict[str, Any] = {
                     "data": data,
@@ -1156,6 +1254,10 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     payload=payload,
                     occurred_at=timestamp,
                 )
+                if fresh_start and commit_state is not None:
+                    # Recorded before commit: once COMMIT is sent, a retryable
+                    # error no longer says whether this row exists.
+                    commit_state.start_event_id = str(fact.event_id)
                 data = cast(dict[str, Any], fact.payload["data"])
                 if event.event_type.category == TraceCategory.LLM:
                     # Keep complete facts, but preserve the legacy projection cap.
@@ -1327,10 +1429,14 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     f"Skip trace event for missing task {self.task_id}: {event.id}"
                 )
                 return
-            logger.error(f"Failed to save trace event to database: {e}")
+            if not self.authoritative:
+                logger.error(f"Failed to save trace event to database: {e}")
             raise
         except Exception as e:
-            logger.error(f"Failed to save trace event to database: {e}")
+            # A V2 write is reported once, with its retry outcome, by
+            # ExecutionEventTraceAdapter.commit_event.
+            if not self.authoritative:
+                logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise
 

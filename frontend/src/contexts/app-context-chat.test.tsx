@@ -3251,6 +3251,7 @@ describe("AppProvider websocket message routing", () => {
     expect(autoResume()).toEqual({
       status: "scheduled",
       nextAttemptAt: "2026-05-27T05:00:15+00:00",
+      attempt: 1,
       runId: "run-1",
       stateVersion: 4,
     })
@@ -3261,7 +3262,7 @@ describe("AppProvider websocket message routing", () => {
 
     update(4, { status: "resuming" })
     expect(autoResume()).toMatchObject({ status: "resuming" })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
     act(() => {
       onMessage?.({
@@ -3290,11 +3291,25 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
     expect(screen.getByTestId("task-state-version").textContent).toBe("7")
-    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoRecovery()).toMatchObject({ reason: "lease_expired", runId: "run-1", stateVersion: 7 })
     expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 7 })
 
     update(7, { status: "stopped", stop_reason: "limit_reached" })
     expect(autoResume()).toMatchObject({ status: "stopped", stopReason: "limit_reached" })
+    // A terminal phase wins over late non-terminal phases from the same
+    // attempt, including a legacy notice with no comparable attempt number.
+    update(7, { status: "scheduled" })
+    update(7, { status: "resuming" })
+    update(7, { status: "scheduled", attempt: undefined })
+    expect(autoResume()).toMatchObject({ status: "stopped", stopReason: "limit_reached" })
+
+    // A held legacy notice with no attempt number must not block a newer,
+    // orderable phase at that fence.
+    update(8, { status: "scheduled", attempt: undefined })
+    expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 8 })
+    expect(autoResume()).not.toHaveProperty("attempt")
+    update(8, { status: "resuming", attempt: 1 })
+    expect(autoResume()).toMatchObject({ status: "resuming", attempt: 1, stateVersion: 8 })
 
     // A new pause at a later fence starts without a notice.
     act(() => {
@@ -3340,7 +3355,7 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-auto-resume").textContent).toBe("null")
   })
 
-  it("keeps a task_paused event's interruption reason until the task leaves paused", async () => {
+  it("keeps a task_paused event's interruption reason only at its fence", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -3366,7 +3381,7 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
     // History replay re-announces the pause without a reason: keep it.
     act(() => {
@@ -3380,7 +3395,7 @@ describe("AppProvider websocket message routing", () => {
         control_state: "paused",
       })
     })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
     act(() => {
       onMessage?.({
@@ -3413,10 +3428,10 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "user_pause" })
+    expect(autoRecovery()).toMatchObject({ reason: "user_pause", runId: "run-1", stateVersion: 6 })
   })
 
-  it("loads a paused task's interruption from task_info and clears it when a new run starts", async () => {
+  it("loads a paused task's interruption from task_info and clears it when the fence changes", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -3436,13 +3451,15 @@ describe("AppProvider websocket message routing", () => {
         auto_recovery: {
           reason: "lease_expired",
           interrupted_at: "2026-05-27T04:59:00+00:00",
+          run_id: "run-1",
+          state_version: 4,
         },
       }))
     })
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoRecovery()).toMatchObject({ reason: "lease_expired", runId: "run-1", stateVersion: 4 })
 
     // A live task_info frame does not carry the view: keep the known one.
     act(() => {
@@ -3453,7 +3470,19 @@ describe("AppProvider websocket message routing", () => {
         control_state: "paused",
       }))
     })
-    expect(autoRecovery()).toEqual({ reason: "lease_expired" })
+    expect(autoRecovery()).toMatchObject({ reason: "lease_expired", runId: "run-1", stateVersion: 4 })
+
+    // A later paused fence with no recovery row must not inherit the old
+    // fence's reason.
+    act(() => {
+      onMessage?.(taskInfoMessage(1, {
+        status: "paused",
+        run_id: "run-1",
+        state_version: 6,
+        control_state: "paused",
+      }))
+    })
+    expect(autoRecovery()).toBeNull()
 
     // A new run's task_info (``task_started`` itself carries no status
     // update) moves the task off paused.
@@ -3461,7 +3490,7 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(taskInfoMessage(1, {
         status: "running",
         run_id: "run-2",
-        state_version: 5,
+        state_version: 7,
         control_state: "running",
       }))
     })
@@ -3469,6 +3498,255 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
     expect(autoRecovery()).toBeNull()
+  })
+
+  it("restores automatic resume from task_info without letting a stale snapshot replace a live notice", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    const autoResume = () => JSON.parse(screen.getByTestId("task-auto-resume").textContent || "null")
+    const pausedInfo = (autoRecovery: unknown) => taskInfoMessage(1, {
+      status: "paused",
+      run_id: "run-1",
+      state_version: 4,
+      control_state: "paused",
+      auto_recovery: autoRecovery,
+    })
+
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: {
+          status: "scheduled",
+          stop_reason: null,
+          reason: "llm_unavailable",
+          attempt: 1,
+          next_attempt_at: "2026-05-27T05:00:15+00:00",
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(autoResume()).toEqual({
+        status: "scheduled",
+        nextAttemptAt: "2026-05-27T05:00:15+00:00",
+        attempt: 1,
+        runId: "run-1",
+        stateVersion: 4,
+      })
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:16Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: {
+          auto_resume: {
+            status: "resuming",
+            stop_reason: null,
+            reason: "llm_unavailable",
+            attempt: 1,
+            next_attempt_at: null,
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toMatchObject({ status: "resuming", attempt: 1 })
+
+    // A slower task read still describing the scheduled phase must not move
+    // the same attempt backwards from resuming to scheduled.
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: {
+          status: "scheduled",
+          attempt: 1,
+          next_attempt_at: "2026-05-27T05:00:15+00:00",
+        },
+      }))
+    })
+    expect(autoResume()).toMatchObject({ status: "resuming", attempt: 1 })
+
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:17Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: {
+          auto_resume: {
+            status: "scheduled",
+            reason: "llm_unavailable",
+            attempt: 2,
+            next_attempt_at: "2026-05-27T05:00:30+00:00",
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+      // A late phase from the prior attempt is older than attempt 2's
+      // scheduled state under the backend's ordering contract.
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:18Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: {
+          auto_resume: {
+            status: "resuming",
+            reason: "llm_unavailable",
+            attempt: 1,
+          },
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 2 })
+
+    // A recovery view for another fence and a transient null read are both
+    // non-authoritative for the live notice already held.
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "lease_expired",
+        run_id: "run-0",
+        state_version: 3,
+        auto_resume: { status: "stopped", stop_reason: "expired", attempt: 1 },
+      }))
+      onMessage?.(pausedInfo(null))
+    })
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 2 })
+
+    // Unlike an unavailable whole recovery view, an explicit same-fence
+    // null ends the held notice.
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: null,
+      }))
+    })
+    expect(autoResume()).toBeNull()
+
+    // The null view is terminal for this fence, so a delayed notice cannot
+    // resurrect it. Moving to a newer fence releases the marker.
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:19Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 4,
+        data: { auto_resume: { status: "resuming", attempt: 3 } },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toBeNull()
+    act(() => {
+      onMessage?.(pausedInfo({
+        reason: "llm_unavailable",
+        run_id: "run-1",
+        state_version: 4,
+        auto_resume: { status: "scheduled", attempt: 4 },
+      }))
+    })
+    expect(autoResume()).toBeNull()
+    act(() => {
+      onMessage?.({
+        type: "task_recovery_update",
+        timestamp: "2026-05-27T05:00:20Z",
+        task_id: 1,
+        run_id: "run-1",
+        state_version: 5,
+        data: { auto_resume: { status: "scheduled", attempt: 1 } },
+      } as unknown as TestWebSocketMessage)
+    })
+    expect(autoResume()).toMatchObject({ status: "scheduled", stateVersion: 5 })
+  })
+
+  it("merges a same-task session adoption without regressing its recovery notice", () => {
+    const baseTask = {
+      id: "1",
+      title: "Test task",
+      status: "paused" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      runId: "run-1",
+      stateVersion: 4,
+    }
+    const task = {
+      ...baseTask,
+      waitingRequestId: "stale-request",
+      autoResume: {
+        status: "resuming" as const,
+        attempt: 1,
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    let state = projectAppState(createInitialState(), {
+      type: "SET_CURRENT_TASK",
+      payload: task,
+    })
+    state = projectAppState(state, {
+      type: "ADOPT_SESSION_TASK",
+      payload: {
+        taskId: 1,
+        task: {
+          ...baseTask,
+          title: "Fresh task record",
+          updatedAt: "2026-05-27T05:00:02Z",
+        },
+      },
+    })
+    expect(state.currentTask?.autoResume).toMatchObject({ status: "resuming", attempt: 1 })
+    expect(state.currentTask?.waitingRequestId).toBeUndefined()
+    expect(state.currentTask?.title).toBe("Fresh task record")
+  })
+
+  it("does not carry non-recovery fields into a same-task session adoption", () => {
+    const currentTask = {
+      id: "1",
+      title: "Old task record",
+      status: "completed" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      waitingRequestId: "stale-request",
+      dagTerminatedAt: "2026-05-27T05:00:01Z",
+    }
+    const state = projectAppState({
+      ...createInitialState(),
+      taskId: 1,
+      currentTask,
+    }, {
+      type: "ADOPT_SESSION_TASK",
+      payload: {
+        taskId: 1,
+        task: {
+          id: "1",
+          title: "Fresh task record",
+          status: "completed",
+          description: "Test task",
+          createdAt: "2026-05-27T05:00:00Z",
+          updatedAt: "2026-05-27T05:00:05Z",
+        },
+      },
+    })
+
+    expect(state.currentTask?.waitingRequestId).toBeUndefined()
+    expect(state.currentTask?.dagTerminatedAt).toBe("2026-05-27T05:00:05Z")
+    expect(state.currentTask?.dagTerminatedAtProvisional).toBe(true)
   })
 
   it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {
@@ -3487,14 +3765,20 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(taskInfoMessage(1, {
         status: "paused",
         ...pausedState,
-        auto_recovery: { reason: "llm_unavailable", interrupted_at: "2026-05-27T04:59:00+00:00" },
+        auto_recovery: {
+          reason: "llm_unavailable",
+          interrupted_at: "2026-05-27T04:59:00+00:00",
+          run_id: "run-1",
+          state_version: 4,
+        },
       }))
     })
     await waitFor(() => {
-      expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+      expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
     })
 
-    // Replayed activity infers running, which drops the reason...
+    // Replayed activity infers running, but must not erase the fenced reason
+    // before the reasserted pause arrives.
     act(() => {
       onMessage?.({
         type: "trace_event",
@@ -3509,9 +3793,9 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("running")
     })
-    expect(autoRecovery()).toBeNull()
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
 
-    // ...and the pause history reasserts last restores it.
+    // The pause history reassertion leaves the held reason intact.
     act(() => {
       onMessage?.({
         type: "task_paused",
@@ -3525,10 +3809,101 @@ describe("AppProvider websocket message routing", () => {
     await waitFor(() => {
       expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
-    expect(autoRecovery()).toEqual({ reason: "llm_unavailable" })
+    expect(autoRecovery()).toMatchObject({ reason: "llm_unavailable", runId: "run-1", stateVersion: 4 })
   })
 
-  it("lets a task_info that reports no interruption clear a stale one", async () => {
+  it("keeps a restored auto-resume notice through replayed activity and the reasserted pause", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    const autoResume = () => JSON.parse(screen.getByTestId("task-auto-resume").textContent || "null")
+    const pausedState = { run_id: "run-1", state_version: 4, control_state: "paused" }
+
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+      onMessage?.(taskInfoMessage(1, {
+        status: "paused",
+        ...pausedState,
+        auto_recovery: {
+          reason: "llm_unavailable",
+          run_id: "run-1",
+          state_version: 4,
+          auto_resume: {
+            status: "scheduled",
+            stop_reason: null,
+            reason: "llm_unavailable",
+            attempt: 1,
+            next_attempt_at: "2026-05-27T05:00:15+00:00",
+          },
+        },
+      }))
+    })
+    await waitFor(() => {
+      expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 1,
+        data: {
+          event_id: "replayed-dag-start",
+          event_type: "dag_execute_start",
+          data: { iteration: 1 },
+        },
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "history-done",
+          event_type: "historical_data_complete",
+          data: {},
+        },
+      })
+      onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        status: "paused",
+        ...pausedState,
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("paused")
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+
+    // Once replay is complete, the same trace kind is live and may infer
+    // running. The notice stays fenced so a later pause at this fence can
+    // show it again.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:04Z",
+        task_id: 1,
+        data: {
+          event_id: "live-dag-start",
+          event_type: "dag_execute_start",
+          data: { iteration: 2 },
+        },
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(autoResume()).toMatchObject({ status: "scheduled", attempt: 1 })
+  })
+
+  it("keeps the known interruption when task_info temporarily reports auto_recovery as null", async () => {
     render(
       <AppProvider token="token">
         <SeedRunningTask />
@@ -3546,7 +3921,11 @@ describe("AppProvider websocket message routing", () => {
     })
 
     act(() => {
-      onMessage?.(pausedInfo({ reason: "persistence_failure" }))
+      onMessage?.(pausedInfo({
+        reason: "persistence_failure",
+        run_id: "run-1",
+        state_version: 4,
+      }))
     })
     await waitFor(() => {
       expect(screen.getByTestId("task-auto-recovery").textContent).toContain("persistence_failure")
@@ -3555,7 +3934,7 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(pausedInfo(null))
     })
     await waitFor(() => {
-      expect(screen.getByTestId("task-auto-recovery").textContent).toBe("null")
+      expect(screen.getByTestId("task-auto-recovery").textContent).toContain("persistence_failure")
     })
   })
 
@@ -5578,6 +5957,188 @@ describe("AppProvider websocket message routing", () => {
       "answer-q1",
       "inputreq_0011223344556677889900aabbccddee",
     )
+  })
+
+  describe("Session upload-only attachments", () => {
+    function RenderedMessagesProbe() {
+      const { state } = useApp()
+      return (
+        <div data-testid="rendered-messages">
+          {state.messages.map((message) => <div key={message.id}>{message.content}</div>)}
+        </div>
+      )
+    }
+
+    const attachments = { accept: ".pdf,.png", maxFiles: 3, maxFileBytes: 1024 }
+    const uploaded = [
+      {
+        kind: "uploaded" as const,
+        fileId: "0b1e5c9e-3f1a-4a63-9b0e-6c1d2f3a4b5c",
+        name: "report.pdf",
+        size: 11,
+        type: "application/pdf",
+      },
+      {
+        kind: "uploaded" as const,
+        fileId: "7d2f0c1a-8b3e-4c55-a1f0-2e9d4b6c8a10",
+        name: "chart.png",
+        size: 22,
+        type: "image/png",
+      },
+    ]
+    const withAttachments = () => {
+      const transport = makeSessionTransport()
+      return {
+        ...transport,
+        session: { ...transport.session, attachments },
+      }
+    }
+
+    it("keeps files disabled and previews closed with the attachments option", () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+
+      expect(screen.getByTestId("files-disabled").textContent).toBe("true")
+      expect(() => getSessionControls().getFilePreviewUrl("manual-file")).toThrow(
+        "Files are disabled for this conversation.",
+      )
+      expect(() => getSessionControls().getFileDownloadUrl("manual-file")).toThrow()
+    })
+
+    it("sends the uploaded file ids and the per-message limit and shows the file names in the bubble", async () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+          <RenderedMessagesProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await act(async () => {
+        await getSessionControls().sendMessage(
+          "see attached",
+          { clientMessageId: "with-files" },
+          [],
+          { uploadedFiles: uploaded },
+        )
+      })
+
+      expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+        "see attached",
+        [],
+        undefined,
+        "with-files",
+        undefined,
+        { fileIds: uploaded.map((file) => file.fileId), maxFileIds: 3 },
+      )
+      const bubbles = screen.getByTestId("rendered-messages").textContent ?? ""
+      expect(bubbles).toContain("report.pdf")
+      expect(bubbles).toContain("chart.png")
+    })
+
+    it("sends a plain Session turn without a sixth argument when nothing was uploaded", async () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await act(async () => {
+        await getSessionControls().sendMessage("plain", { clientMessageId: "plain-1" }, [], { uploadedFiles: [] })
+      })
+
+      expect(sendChatMessageMock.mock.calls.at(-1)).toHaveLength(5)
+    })
+
+    it("still rejects File objects while files are disabled", async () => {
+      render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      const file = new File(["x"], "x.pdf", { type: "application/pdf" })
+
+      await expect(getSessionControls().sendMessage("with file", {}, [file])).rejects.toThrow(
+        "Files are disabled for this conversation.",
+      )
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("refuses uploaded files from a send made before the transport withdrew attachments", async () => {
+      const { rerender } = render(
+        <AppProvider token="token" transport={withAttachments()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+      const sendFromEarlierRender = getSessionControls().sendMessage
+
+      rerender(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+
+      await expect(sendFromEarlierRender(
+        "late", { clientMessageId: "late-1" }, [], { uploadedFiles: uploaded },
+      )).rejects.toThrow("Attachments are not available")
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ["lowers the per-message limit", { ...attachments, maxFiles: 1 }, 1],
+      ["withdraws attachments", undefined, undefined],
+    ])("checks a resent frame against the attachments current at the resend when the new session %s", async (_name, next, limitAtResend) => {
+      sendChatMessageMock.mockRejectedValueOnce(
+        new MessageDeliveryError("lost", "outcome_unknown", { connectionLost: true }),
+      )
+      const tree = (identity: string, current?: typeof attachments) => {
+        const transport = makeSessionTransport(makeSessionConnection(identity))
+        return (
+          <AppProvider
+            token="token"
+            transport={{ ...transport, session: { ...transport.session, ...(current ? { attachments: current } : {}) } }}
+          >
+            <SessionControlsProbe />
+          </AppProvider>
+        )
+      }
+      const { rerender } = render(tree("session-one", attachments))
+      act(() => webSocketOptions.current?.onConnect?.())
+      const outcome = getSessionControls().sendMessage(
+        "see attached", { clientMessageId: "resent" }, [], { uploadedFiles: uploaded },
+      ).then(() => "ok", (error: Error) => error)
+      await act(async () => {})
+
+      rerender(tree("session-two", next))
+      act(() => webSocketOptions.current?.onConnect?.())
+      await act(async () => { await outcome })
+
+      const fileIds = uploaded.map((file) => file.fileId)
+      expect(sendChatMessageMock.mock.calls.map((call) => call[5])).toEqual([
+        { fileIds, maxFileIds: 3 },
+        { fileIds, maxFileIds: limitAtResend },
+      ])
+    })
+
+    it("rejects uploaded files when the transport does not offer attachments", async () => {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onConnect?.())
+
+      await expect(getSessionControls().sendMessage(
+        "sneaky", { clientMessageId: "no-cap" }, [], { uploadedFiles: uploaded },
+      )).rejects.toThrow("Attachments are not available")
+      expect(sendChatMessageMock).not.toHaveBeenCalled()
+    })
   })
 
   it("forwards taskless Session files so unsupported delivery rejects instead of sending text alone", async () => {

@@ -1,3 +1,5 @@
+import os
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -157,3 +159,90 @@ def test_overlay_keeps_nginx_storage_read_only_and_the_others_writable():
     assert _storage_mount("nginx")["read_only"] is True
     for service in ("backend", "worker", "scheduler"):
         assert not _storage_mount(service).get("read_only")
+
+
+def _nginx_group_setup_command() -> str:
+    nginx = _overlay_services()["nginx"]
+    command = nginx["command"]
+
+    assert command[:2] == ["/bin/sh", "-c"]
+    return command[2].replace("$$", "$")
+
+
+def _run_nginx_group_setup(
+    tmp_path: Path, *, group_contents: str, nginx_contents: str
+) -> tuple[subprocess.CompletedProcess[str], str, str, Path]:
+    group_file = tmp_path / "group"
+    nginx_conf = tmp_path / "nginx.conf"
+    marker = tmp_path / "nginx-exec"
+    bin_dir = tmp_path / "bin"
+    fake_nginx = bin_dir / "nginx"
+
+    group_file.write_text(group_contents, encoding="utf-8")
+    nginx_conf.write_text(nginx_contents, encoding="utf-8")
+    bin_dir.mkdir()
+    fake_nginx.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" > "$XAGENT_NGINX_EXEC_MARKER"\n',
+        encoding="utf-8",
+    )
+    fake_nginx.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+            "XAGENT_NGINX_GROUP_FILE": str(group_file),
+            "XAGENT_NGINX_CONF": str(nginx_conf),
+            "XAGENT_NGINX_EXEC_MARKER": str(marker),
+        }
+    )
+    result = subprocess.run(
+        ["/bin/sh", "-c", _nginx_group_setup_command()],
+        check=False,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    return (
+        result,
+        group_file.read_text(encoding="utf-8"),
+        nginx_conf.read_text(encoding="utf-8"),
+        marker,
+    )
+
+
+def test_nginx_workers_use_existing_sandbox_group_as_primary_group(tmp_path):
+    result, group_contents, nginx_contents, marker = _run_nginx_group_setup(
+        tmp_path,
+        group_contents="nginx:x:101:101:\nsandbox:x:1010:\n",
+        nginx_contents="user nginx;\nevents {}\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert group_contents.count(":x:1010:") == 1
+    assert nginx_contents.startswith("user nginx sandbox;\n")
+    assert marker.read_text(encoding="utf-8") == "-g daemon off;\n"
+
+
+def test_nginx_workers_create_missing_sandbox_group(tmp_path):
+    result, group_contents, nginx_contents, _marker = _run_nginx_group_setup(
+        tmp_path,
+        group_contents="nginx:x:101:101:\n",
+        nginx_contents="user nginx;\nevents {}\n",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "xagent_sandbox:x:1010:\n" in group_contents
+    assert nginx_contents.startswith("user nginx xagent_sandbox;\n")
+
+
+def test_nginx_group_setup_fails_when_user_directive_is_missing(tmp_path):
+    result, _group_contents, _nginx_contents, marker = _run_nginx_group_setup(
+        tmp_path,
+        group_contents="nginx:x:101:101:\nsandbox:x:1010:\n",
+        nginx_contents="events {}\n",
+    )
+
+    assert result.returncode != 0
+    assert "failed to find nginx user directive" in result.stderr
+    assert not marker.exists()

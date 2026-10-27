@@ -118,6 +118,59 @@ def configure(env, user, bindings, *, default=False):
     )
 
 
+def test_candidate_relationship_reads_persisted_position_order(env):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    config = configure(
+        env,
+        env.consumer,
+        [("text-a", first), ("text-b", second)],
+    )
+    assert config.mode == "routing"
+    assert [candidate.position for candidate in config.candidates] == [0, 1]
+
+    config.candidates[0].position = -1
+    env.db.flush()
+    config.candidates[1].position = 0
+    env.db.flush()
+    config.candidates[0].position = 1
+    env.db.commit()
+    env.db.expire_all()
+
+    loaded = env.db.get(AutoModelConfig, config.id)
+    assert loaded is not None
+    assert [candidate.routing_model_id for candidate in loaded.candidates] == [
+        "text-b",
+        "text-a",
+    ]
+
+
+def test_create_all_schema_allows_same_profile_for_distinct_targets(env):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    config = configure(env, env.consumer, [("text-a", first)])
+    env.db.add(
+        AutoModelCandidate(
+            config_id=config.id,
+            routing_model_id="text-a",
+            target_model_id=second.id,
+            position=1,
+        )
+    )
+    env.db.commit()
+    env.db.expire_all()
+
+    loaded = env.db.get(AutoModelConfig, config.id)
+    assert loaded is not None
+    assert [
+        (candidate.routing_model_id, candidate.target_model_id, candidate.position)
+        for candidate in loaded.candidates
+    ] == [
+        ("text-a", first.id, 0),
+        ("text-a", second.id, 1),
+    ]
+
+
 def broken_default(env, slot="general"):
     t = target(env, env.consumer)
     cfg = configure(env, env.consumer, [("text-a", t)])

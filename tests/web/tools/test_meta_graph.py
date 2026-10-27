@@ -131,10 +131,43 @@ def test_graph_request_rejects_data_and_json_body_together(monkeypatch):
     request = Mock()
     monkeypatch.setattr(meta_graph.requests, "request", request)
 
-    with pytest.raises(ValueError, match="either data or json_body"):
+    with pytest.raises(ValueError, match="either json_body or form/multipart data"):
         meta_graph.graph_request("POST", "/x", data={"a": 1}, json_body={"b": 2})
 
     request.assert_not_called()
+
+
+def test_graph_request_rejects_files_and_json_body_together(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    request = Mock()
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+
+    with pytest.raises(ValueError, match="either json_body or form/multipart data"):
+        meta_graph.graph_request(
+            "POST", "/x", json_body={"a": 1}, files={"source": object()}
+        )
+
+    request.assert_not_called()
+
+
+def test_graph_request_sends_multipart_without_content_type(monkeypatch):
+    monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
+    seen = {}
+
+    def request(**kwargs):
+        seen.update(kwargs)
+        return MockResponse({"id": "photo-1"}, text="{}")
+
+    monkeypatch.setattr(meta_graph.requests, "request", request)
+    source = ("image.png", object(), "image/png")
+
+    meta_graph.graph_request(
+        "POST", "/page-1/photos", data={"caption": "hello"}, files={"source": source}
+    )
+
+    assert seen["data"] == {"caption": "hello"}
+    assert seen["files"] == {"source": source}
+    assert "Content-Type" not in seen["headers"]
 
 
 def test_graph_headers_omits_content_type_by_default():

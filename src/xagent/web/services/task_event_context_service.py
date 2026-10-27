@@ -654,6 +654,8 @@ def _project(
                     f"Tool event has no attempt/batch identity (task_id={event.task_id}, event_id={event.event_id})"
                 )
             if event.kind == "tool_execution_start":
+                if data.get("settlement_delivery") is True:
+                    continue
                 starts[str(event.tool_attempt_id)] = event
                 batches.setdefault(str(event.assistant_message_id), []).append(event)
             else:
@@ -696,10 +698,13 @@ def _project(
             data = _data(start)
             end = outcomes.get(str(start.tool_attempt_id))
             if end is not None:
+                # A resumed interaction's settlement replaces the waiting
+                # outcome; the run that resumed the call commits it.
+                settles = _data(end).get("settlement_delivery") is True
                 if (
                     end.sequence <= start.sequence
                     or end.assistant_message_id != start.assistant_message_id
-                    or end.run_id != start.run_id
+                    or (end.run_id != start.run_id and not settles)
                 ):
                     raise ValueError(
                         f"Tool outcome does not match its start (task_id={task_id}, event_id={end.event_id}, start_event_id={start.event_id})"

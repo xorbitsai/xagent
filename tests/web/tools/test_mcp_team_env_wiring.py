@@ -38,6 +38,7 @@ from sqlalchemy.pool import StaticPool
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.core.tools.adapters.vibe.mcp_tools import create_mcp_tools
+from xagent.web import mcp_apps
 from xagent.web.models import Base, MCPServer, User, UserMCPServer
 from xagent.web.services import agent_team_scope, connector_team_scope, mcp_runtime
 from xagent.web.tools.config import WebToolConfig
@@ -208,6 +209,48 @@ async def _config_for(db_session, seed, server, *, connector_team_id) -> dict:
     configs = await cfg._load_mcp_server_configs()
     (config,) = [c for c in configs if c["id"] == int(server.id)]
     return config
+
+
+@pytest.mark.asyncio
+async def test_catalog_stdio_with_untrusted_user_env_requires_sandbox(
+    db_session, seed, monkeypatch
+):
+    server = _create_stdio_mcp(
+        db_session,
+        "catalog-python",
+        env={"API_TOKEN": "platform"},
+    )
+    _link_own_env(
+        db_session,
+        user=seed.c,
+        server=server,
+        env={"PYTHONPATH": "/tmp/attacker"},
+        env_source="own",
+    )
+
+    def catalog_app(_db, candidate):
+        if int(candidate.id) != int(server.id):
+            return None
+        return {
+            "id": "catalog-python",
+            "transport": "stdio",
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "probe"],
+                "required_env": ["API_TOKEN"],
+            },
+        }
+
+    monkeypatch.setattr(mcp_apps, "get_app_for_mcp_server", catalog_app)
+
+    config = await _config_for(
+        db_session,
+        seed,
+        server,
+        connector_team_id=None,
+    )
+
+    assert config["config"]["sandbox_required"] is True
 
 
 # ---------------------------------------------------------------------------

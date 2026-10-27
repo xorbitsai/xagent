@@ -62,12 +62,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Chrome executable". --build-arg INSTALL_CHROME=false skips it (and the
 # npx cache below) for deployments that never enable the connector.
 #
-# Security posture matches Dockerfile.backend's, not a new risk: this
-# container always execs as root (docker_sandbox.py) and the connector's
-# launch_config passes --no-sandbox/--disable-setuid-sandbox, so Chrome
-# runs as UID 0 with its own sandbox disabled. Accepted only because the
-# connector stays is_visible_in_connector: false pending the same
-# security review Dockerfile.backend's comment tracks.
+# The connector's launch_config currently passes
+# --no-sandbox/--disable-setuid-sandbox even though both Docker and Boxlite
+# execute it as the uid 1100 sandbox user. Keep the connector hidden pending
+# the security review tracked by the corresponding backend-image comment.
 ARG INSTALL_CHROME=true
 # Resolves "stable" to exactly /opt/google/chrome/chrome on Linux -- see
 # Dockerfile.backend's block for the per-architecture rationale (no
@@ -111,14 +109,14 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
 # Warm the npx cache for the version pinned in builtin_mcp_registry.py's
 # launch_config, mirroring Dockerfile.backend's identical step, to skip
 # the npm registry on launch. The execution-scoped Chrome controller passes
-# this cache path explicitly. Boxlite executes as the non-root `sandbox` user,
-# so ownership is transferred below before its offline smoke check.
+# this cache path explicitly. Both sandbox backends execute as the non-root
+# `sandbox` user, so ownership is transferred before the offline smoke check.
 #
 # `--help` exercises resolution without starting Chrome, so this needs
 # no display/GPU setup at build time. umask 0022, not 0000: only
 # cross-user *read* access is needed during this root-owned build step. The
-# completed tree is handed to the dedicated sandbox uid below so Boxlite can
-# also update npm metadata on a cache miss without making it world-writable.
+# completed tree is handed to the dedicated sandbox uid below so either
+# backend can update npm metadata on a cache miss without world-writable files.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         umask 0022 && npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
     fi
@@ -151,7 +149,7 @@ RUN groupadd --gid 1010 sandbox \
 USER sandbox
 WORKDIR /home/sandbox
 
-# Prove the warmed package is usable by Boxlite's actual uid without network
+# Prove the warmed package is usable by the sandbox runtime uid without network
 # access. This also catches root-owned cache metadata before the image ships.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 NPM_CONFIG_OFFLINE=true \

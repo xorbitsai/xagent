@@ -53,15 +53,9 @@ from ..core.execution_scope import (
     ExecutionScopeResolverContractError,
 )
 from ..core.file_storage import StorageKeyScopeError
-from ..core.runtime_performance import (
-    initialize_runtime_performance_telemetry,
-    register_observable_gauge,
-    shutdown_runtime_performance_telemetry,
-    start_event_loop_lag_monitor,
-    stop_event_loop_lag_monitor,
-)
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
+from .api.admin_execution_events import router as admin_execution_events_router
 from .api.admin_interaction_rollout import router as admin_interaction_rollout_router
 from .api.admin_mcp import admin_mcp_router
 from .api.admin_memory_embedding_authority import (
@@ -110,6 +104,10 @@ from .content_security import is_active_content_type
 from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
+from .runtime_telemetry import (
+    start_process_runtime_telemetry,
+    stop_process_runtime_telemetry,
+)
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
 from .services.connector_team_scope import (
     ConnectorHookSessionBoundaryError,
@@ -431,10 +429,25 @@ async def _run_trigger_dispatcher(
         finally:
             db.close()
 
+    from .services.release_hold import release_hold
+
     loop = asyncio.get_running_loop()
     next_gmail_watch_scan_at = 0.0
     next_preview_run_reap_at = 0.0
+    tick_paused = False
     while True:
+        # Trigger production pauses at the tick boundary while a planned
+        # restart holds new execution: a tick already past this point runs to
+        # its end (and is counted until then), a later one neither scans due
+        # schedules nor starts PENDING runs. Those stay PENDING for this
+        # process after an abort, or for its successor.
+        tick = None if release_hold.closed else release_hold.track("trigger_tick")
+        if (tick is None) != tick_paused:
+            tick_paused = tick is None
+            logger.info(
+                "Trigger dispatcher %s new runs",
+                "paused before starting" if tick_paused else "resumed starting",
+            )
         try:
             now = loop.time()
             if now >= next_gmail_watch_scan_at:
@@ -459,11 +472,12 @@ async def _run_trigger_dispatcher(
                         now + get_gmail_watch_renewal_interval_seconds()
                     )
 
-            processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
-            if processed:
-                logger.info(
-                    "Trigger dispatcher processed %s due schedule(s)", processed
-                )
+            if tick is not None:
+                processed = await asyncio.to_thread(_scan_due_scheduled_triggers_tick)
+                if processed:
+                    logger.info(
+                        "Trigger dispatcher processed %s due schedule(s)", processed
+                    )
 
             # Gated on its own, much coarser timer (matching the Gmail
             # watch-renewal gating above): the staleness threshold this
@@ -490,18 +504,24 @@ async def _run_trigger_dispatcher(
                         now + get_background_job_sweep_interval_seconds()
                     )
 
-            SessionLocal = get_session_local()
-            db = SessionLocal()
-            try:
-                started = await dispatch_pending_trigger_runs(db, limit=batch_size)
-                if started:
-                    logger.info("Trigger dispatcher started %s trigger run(s)", started)
-            finally:
-                db.close()
+            if tick is not None:
+                SessionLocal = get_session_local()
+                db = SessionLocal()
+                try:
+                    started = await dispatch_pending_trigger_runs(db, limit=batch_size)
+                    if started:
+                        logger.info(
+                            "Trigger dispatcher started %s trigger run(s)", started
+                        )
+                finally:
+                    db.close()
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             logger.warning("Trigger dispatcher tick failed: %s", exc, exc_info=True)
+        finally:
+            if tick is not None:
+                tick.release()
 
         await asyncio.sleep(poll_interval_seconds)
 
@@ -1654,6 +1674,7 @@ app.include_router(deployment_config_router)
 app.include_router(tools_router)
 app.include_router(admin_users_router)
 app.include_router(admin_interaction_rollout_router)
+app.include_router(admin_execution_events_router)
 app.include_router(execution_budget_router)
 app.include_router(admin_memory_embedding_authority_router)
 app.include_router(admin_mcp_router)
@@ -1712,45 +1733,17 @@ def start_runtime_performance_monitor(app_instance: FastAPI) -> None:
     existing = getattr(app_instance.state, "runtime_performance_task", None)
     if existing is not None and not existing.done():
         return
-    try:
-        if not initialize_runtime_performance_telemetry():
-            app_instance.state.runtime_performance_task = None
-            return
+    from .api.websocket import manager
 
-        from .api.websocket import manager
-        from .services.task_execution import background_task_manager
-
-        register_observable_gauge(
-            "xagent.agent_tasks.running",
-            lambda: len(background_task_manager.running_tasks),
-            unit="{task}",
-            description="Current locally running agent tasks",
-        )
-        register_observable_gauge(
-            "xagent.agent_tasks.resuming",
-            lambda: len(background_task_manager.resume_tasks),
-            unit="{task}",
-            description="Current local resume coordinators",
-        )
-        register_observable_gauge(
-            "xagent.websocket.connections",
-            manager.connection_count,
-            unit="{connection}",
-            description="Current task WebSocket connections",
-        )
-        app_instance.state.runtime_performance_task = start_event_loop_lag_monitor()
-    except Exception:
-        # Telemetry is observational and must not block application startup.
-        app_instance.state.runtime_performance_task = None
-        shutdown_runtime_performance_telemetry()
-        logger.warning("Could not start runtime performance monitor", exc_info=True)
+    app_instance.state.runtime_performance_task = start_process_runtime_telemetry(
+        websocket_connections=manager.connection_count
+    )
 
 
 async def stop_runtime_performance_monitor(app_instance: FastAPI) -> None:
     task = getattr(app_instance.state, "runtime_performance_task", None)
     app_instance.state.runtime_performance_task = None
-    await stop_event_loop_lag_monitor(task)
-    await asyncio.to_thread(shutdown_runtime_performance_telemetry)
+    await stop_process_runtime_telemetry(task)
 
 
 def start_app_process_diagnostics(app_instance: FastAPI) -> None:

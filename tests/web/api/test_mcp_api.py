@@ -1514,6 +1514,8 @@ class TestMCPApiModels:
             "user_env": None,
             "runtime_input_schema": None,
             "runtime_bindings": None,
+            "signed_uploads": None,
+            "signed_uploads_error": None,
             "allow_delegated_authorization": False,
             "can_edit_global": True,
             "transport_display": "STDIO",
@@ -1555,6 +1557,8 @@ class TestMCPApiModels:
             ("user_env",),
             ("runtime_input_schema",),
             ("runtime_bindings",),
+            ("signed_uploads",),
+            ("signed_uploads_error",),
             ("allow_delegated_authorization",),
             ("can_edit_global",),
         }

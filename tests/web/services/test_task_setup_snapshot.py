@@ -43,6 +43,7 @@ from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
     _TaskFields,
     detach_runtime_user_fields,
+    load_memory_policy_task_fields_sync,
     load_task_setup_snapshot_sync,
 )
 from xagent.web.services.trace_message_storage import (
@@ -136,6 +137,33 @@ def test_owner_mismatch_raises_distinct_from_missing(db_session) -> None:
         load_task_setup_snapshot_sync(task_id=int(task.id), task_owner_user_id=None)
         is not None
     )
+
+
+def test_memory_policy_projection_reads_only_authoritative_task_fields(
+    db_session,
+) -> None:
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        agent_id=None,
+        source="slack",
+        agent_config={"is_preview": True},
+    )
+
+    fields = load_memory_policy_task_fields_sync(int(task.id), int(user.id))
+
+    assert fields is not None
+    assert fields.id == int(task.id)
+    assert fields.user_id == int(user.id)
+    assert fields.agent_id is None
+    assert fields.source == "slack"
+    assert fields.agent_config == {"is_preview": True}
+    assert load_memory_policy_task_fields_sync(99999, int(user.id)) is None
+    from xagent.web.services.task_setup_snapshot import TaskOwnerMismatchError
+
+    with pytest.raises(TaskOwnerMismatchError):
+        load_memory_policy_task_fields_sync(int(task.id), int(user.id) + 1)
 
 
 def test_actor_authorization_is_applied_inside_snapshot_session(db_session) -> None:

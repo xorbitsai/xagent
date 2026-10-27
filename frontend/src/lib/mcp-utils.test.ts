@@ -92,6 +92,8 @@ const mcpDetailPayload = {
   ],
   allow_delegated_authorization: true,
   can_edit_global: false,
+  signed_uploads: null,
+  signed_uploads_error: null,
   transport_display: "Streamable HTTP",
   created_at: "2026-07-01T00:00:00",
   updated_at: "2026-07-02T00:00:00",
@@ -298,6 +300,8 @@ describe("MCP edit contract", () => {
       runtime_input_schema: mcpDetailPayload.runtime_input_schema,
       runtime_bindings: mcpDetailPayload.runtime_bindings,
       allow_delegated_authorization: true,
+      signed_uploads: null,
+      signed_uploads_error: null,
     })
   })
 
@@ -307,6 +311,7 @@ describe("MCP edit contract", () => {
     ["runtime_input_schema", { runtime_input_schema: undefined }],
     ["runtime_bindings", { runtime_bindings: undefined }],
     ["allow_delegated_authorization", { allow_delegated_authorization: undefined }],
+    ["a non-string signed_uploads_error", { signed_uploads_error: 1 }],
   ])("rejects a detail response missing %s", (_field, replacement) => {
     expect(() => parseMcpServerDetail({ ...mcpDetailPayload, ...replacement })).toThrow(
       "Invalid MCP server detail response",
@@ -389,5 +394,233 @@ describe("MCP edit contract", () => {
       runtime_bindings: null,
       allow_delegated_authorization: false,
     })
+  })
+})
+
+const SIGNED_UPLOADS = [
+  {
+    tool_name: "attach_document",
+    file_argument: "document_file_id",
+    issuing_tool_name: "request_upload",
+    allowed_upload_hosts: ["uploads.example.test"],
+    upload_path_prefix: "/staged/",
+    content_types: { ".pdf": "application/pdf" },
+  },
+]
+const SETTINGS_ERROR = "signed_uploads[0] must have exactly the documented keys"
+// Stored entries that cannot be used: the detail echoes them as they are.
+const BAD_SIGNED_UPLOADS = [{ tool_name: "attach_document", file_argument: "document_file_id" }]
+// A stored value that is not a list: the detail reads it as null.
+const NOT_A_LIST = { tool_name: "attach_document" }
+const NOT_A_LIST_ERROR = "signed_uploads must be a list"
+
+function withoutKey(object: Record<string, unknown>, key: string): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(object).filter(([name]) => name !== key))
+}
+
+function ownerDetail(overrides: Record<string, unknown> = {}) {
+  return parseMcpServerDetail({ ...mcpDetailPayload, can_edit_global: true, ...overrides })
+}
+
+describe("MCP signed upload settings", () => {
+  it("parses signed upload settings and the settings error into edit state", () => {
+    const detail = ownerDetail({ signed_uploads: SIGNED_UPLOADS, signed_uploads_error: null })
+    expect(detail.signed_uploads).toEqual(SIGNED_UPLOADS)
+    expect(detail.signed_uploads_error).toBeNull()
+
+    const { formData } = mcpServerDetailToEditState(detail)
+    expect(formData.signed_uploads).toEqual(SIGNED_UPLOADS)
+    expect(formData.signed_uploads_error).toBeNull()
+
+    ;(formData.signed_uploads as Record<string, unknown>[])[0].tool_name = "changed"
+    expect(detail.signed_uploads).toEqual(SIGNED_UPLOADS)
+
+    const bad = ownerDetail({
+      signed_uploads: BAD_SIGNED_UPLOADS,
+      signed_uploads_error: SETTINGS_ERROR,
+    })
+    const badForm = mcpServerDetailToEditState(bad).formData
+    expect(badForm.signed_uploads).toEqual(BAD_SIGNED_UPLOADS)
+    expect(badForm.signed_uploads_error).toBe(SETTINGS_ERROR)
+  })
+
+  it("rejects a detail response without a signed upload key", () => {
+    expect(() =>
+      parseMcpServerDetail(withoutKey(mcpDetailPayload, "signed_uploads")),
+    ).toThrow("Invalid MCP server detail response: signed_uploads is missing")
+    expect(() =>
+      parseMcpServerDetail(withoutKey(mcpDetailPayload, "signed_uploads_error")),
+    ).toThrow("Invalid MCP server detail response: signed_uploads_error is missing")
+  })
+
+  it.each([
+    ["an object", {}],
+    ["a string", "x"],
+    ["a number", 1],
+    ["a boolean", true],
+    ["a stored object", NOT_A_LIST],
+  ])("treats a signed_uploads value that is not a list as no settings", (_name, stored) => {
+    const detail = ownerDetail({ signed_uploads: stored, signed_uploads_error: NOT_A_LIST_ERROR })
+    expect(detail.signed_uploads).toBeNull()
+    expect(detail.signed_uploads_error).toBe(NOT_A_LIST_ERROR)
+  })
+
+  it("emits no signed_uploads for an unchanged edit", () => {
+    const detail = ownerDetail({ signed_uploads: SIGNED_UPLOADS })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(buildMcpServerPayload(formData, detail)).toEqual({})
+  })
+
+  it("sends edited signed upload settings", () => {
+    const detail = ownerDetail({ signed_uploads: SIGNED_UPLOADS })
+    const { formData } = mcpServerDetailToEditState(detail)
+    const edited = [{ ...SIGNED_UPLOADS[0], upload_path_prefix: "/incoming/" }]
+
+    expect(buildMcpServerPayload({ ...formData, signed_uploads: edited }, detail)).toEqual({
+      signed_uploads: edited,
+    })
+  })
+
+  it("sends an empty list when clearing invalid stored settings", () => {
+    const detail = ownerDetail({
+      signed_uploads: BAD_SIGNED_UPLOADS,
+      signed_uploads_error: SETTINGS_ERROR,
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(buildMcpServerPayload({ ...formData, signed_uploads: [] }, detail)).toEqual({
+      signed_uploads: [],
+    })
+  })
+
+  it("sends an empty list when clearing settings that are not a list", () => {
+    const detail = ownerDetail({ signed_uploads: NOT_A_LIST, signed_uploads_error: NOT_A_LIST_ERROR })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(buildMcpServerPayload({ ...formData, signed_uploads: [] }, detail)).toEqual({
+      signed_uploads: [],
+    })
+  })
+
+  it.each([
+    ["entries that cannot be used", BAD_SIGNED_UPLOADS, SETTINGS_ERROR],
+    ["a value that is not a list", NOT_A_LIST, NOT_A_LIST_ERROR],
+  ])("leaves invalid stored settings alone when the form does not touch them", (_name, stored, error) => {
+    const detail = ownerDetail({ signed_uploads: stored, signed_uploads_error: error })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(buildMcpServerPayload({ ...formData, description: "Updated" }, detail)).toEqual({
+      description: "Updated",
+    })
+  })
+
+  it.each(
+    ["stdio", "websocket"].flatMap((target) => [
+      [target, { signed_uploads: SIGNED_UPLOADS, signed_uploads_error: null }],
+      [target, { signed_uploads: BAD_SIGNED_UPLOADS, signed_uploads_error: SETTINGS_ERROR }],
+      [target, { signed_uploads: NOT_A_LIST, signed_uploads_error: NOT_A_LIST_ERROR }],
+      [target, { signed_uploads: null, signed_uploads_error: null }],
+    ]),
+  )("sends an empty list when an edit leaves sse or streamable_http", (target, stored) => {
+    const detail = ownerDetail(stored as Record<string, unknown>)
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(buildMcpServerPayload({ ...formData, transport: target as string }, detail)).toEqual({
+      transport: target,
+      signed_uploads: [],
+    })
+  })
+
+  it("keeps signed upload settings when switching between sse and streamable_http", () => {
+    const detail = ownerDetail({ transport: "sse", signed_uploads: SIGNED_UPLOADS })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(
+      buildMcpServerPayload({ ...formData, transport: "streamable_http" }, detail),
+    ).toEqual({ transport: "streamable_http" })
+  })
+
+  it("sends nothing for transports that never carry settings", () => {
+    const detail = ownerDetail({ transport: "stdio" })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(buildMcpServerPayload({ ...formData, transport: "websocket" }, detail)).toEqual({
+      transport: "websocket",
+    })
+  })
+
+  it("never sends signed_uploads for a viewer who cannot edit the shared config", () => {
+    const detail = parseMcpServerDetail({ ...mcpDetailPayload, signed_uploads: SIGNED_UPLOADS })
+    const { formData } = mcpServerDetailToEditState(detail)
+    const edited = [{ ...SIGNED_UPLOADS[0], upload_path_prefix: "/other/" }]
+
+    expect(
+      "signed_uploads" in buildMcpServerPayload({ ...formData, signed_uploads: edited }, detail),
+    ).toBe(false)
+    expect(
+      "signed_uploads" in buildMcpServerPayload(
+        { ...formData, signed_uploads: edited, transport: "stdio" },
+        detail,
+      ),
+    ).toBe(false)
+  })
+
+  it.each([
+    ["sse", SIGNED_UPLOADS, true],
+    ["streamable_http", SIGNED_UPLOADS, true],
+    ["stdio", SIGNED_UPLOADS, false],
+    ["websocket", SIGNED_UPLOADS, false],
+    ["sse", [], false],
+    ["sse", null, false],
+  ])(
+    "sends signed_uploads on create only for sse and streamable_http with entries",
+    (transport, signedUploads, expected) => {
+      const payload = buildMcpServerPayload({
+        name: "new_mcp",
+        transport,
+        description: "",
+        config: { url: "https://mcp.example.com/mcp" },
+        user_env: {},
+        runtime_input_schema: null,
+        runtime_bindings: null,
+        allow_delegated_authorization: false,
+        signed_uploads: signedUploads,
+      })
+
+      expect("signed_uploads" in payload).toBe(expected)
+      if (expected) expect(payload.signed_uploads).toEqual(SIGNED_UPLOADS)
+    },
+  )
+
+  it("never sends signed_uploads_error", () => {
+    const created = buildMcpServerPayload({
+      name: "new_mcp",
+      transport: "sse",
+      config: { url: "https://mcp.example.com/mcp" },
+      signed_uploads: SIGNED_UPLOADS,
+      signed_uploads_error: SETTINGS_ERROR,
+    })
+    expect("signed_uploads_error" in created).toBe(false)
+
+    const detail = ownerDetail({
+      signed_uploads: BAD_SIGNED_UPLOADS,
+      signed_uploads_error: SETTINGS_ERROR,
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+    const edited = buildMcpServerPayload({ ...formData, signed_uploads: [] }, detail)
+    expect("signed_uploads_error" in edited).toBe(false)
+  })
+
+  it.each([
+    ["a list with a non-object", [1]],
+    ["an object", {}],
+  ])("rejects signed_uploads form data that is not a list of objects", (_name, value) => {
+    const detail = ownerDetail({ signed_uploads: SIGNED_UPLOADS })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(() => buildMcpServerPayload({ ...formData, signed_uploads: value }, detail)).toThrow(
+      "Invalid MCP server form data: signed_uploads",
+    )
   })
 })

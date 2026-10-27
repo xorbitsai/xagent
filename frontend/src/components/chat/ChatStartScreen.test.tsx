@@ -10,6 +10,10 @@ const chatInputProps = vi.hoisted(() => ({
     files?: File[]
     filesDisabled?: boolean
     hideFileUpload?: boolean
+    onFilesChange?: (files: File[]) => void
+    attachments?: { accept: string; maxFiles: number; maxFileBytes: number }
+    attachmentStatuses?: ReadonlyMap<File, string>
+    onRetryAttachment?: (file: File) => void
     selectedAgents?: Array<{ id: number | string; name: string }>
     onSend: (message: string, config?: unknown) => void
   },
@@ -279,5 +283,162 @@ describe("ChatStartScreen file capability", () => {
     expect(chatInputProps.current?.files).toEqual([file])
     chatInputProps.current?.onSend("hello", { mode: "balanced" })
     expect(onSend).toHaveBeenCalledWith("hello", [file], { mode: "balanced" })
+  })
+})
+
+describe("ChatStartScreen upload-only attachments", () => {
+  const attachments = { accept: ".pdf", maxFiles: 2, maxFileBytes: 100 }
+  const file = new File(["x"], "report.pdf", { type: "application/pdf" })
+
+  it("hides files and the upload control while files are disabled without attachments", () => {
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        onSend={vi.fn()}
+        files={[file]}
+        onFilesChange={vi.fn()}
+        filesDisabled
+      />
+    )
+
+    expect(chatInputProps.current?.files).toEqual([])
+    expect(chatInputProps.current?.onFilesChange).toBeUndefined()
+    expect(chatInputProps.current?.hideFileUpload).toBe(true)
+    expect(chatInputProps.current?.filesDisabled).toBe(true)
+  })
+
+  it("keeps the collected files and the upload control in upload-only mode while files stay disabled", () => {
+    const onFilesChange = vi.fn()
+    const onRetryAttachment = vi.fn()
+    const statuses = new Map<File, "uploading">([[file, "uploading"]])
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        onSend={vi.fn()}
+        files={[file]}
+        onFilesChange={onFilesChange}
+        filesDisabled
+        attachments={attachments}
+        attachmentStatuses={statuses}
+        onRetryAttachment={onRetryAttachment}
+      />
+    )
+
+    const props = chatInputProps.current
+    expect(props?.files).toEqual([file])
+    expect(props?.onFilesChange).toBe(onFilesChange)
+    expect(props?.hideFileUpload).toBe(false)
+    expect(props?.filesDisabled).toBe(true)
+    expect(props?.attachments).toBe(attachments)
+    expect(props?.attachmentStatuses).toBe(statuses)
+    expect(props?.onRetryAttachment).toBe(onRetryAttachment)
+  })
+
+  it("sends the collected files with the message in upload-only mode", () => {
+    const onSend = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        onSend={onSend}
+        files={[file]}
+        onFilesChange={vi.fn()}
+        filesDisabled
+        attachments={attachments}
+      />
+    )
+
+    chatInputProps.current?.onSend("hello", { model: "m" } as never)
+
+    expect(onSend).toHaveBeenCalledWith("hello", [file], { model: "m" })
+  })
+})
+
+describe("ChatStartScreen starting prompts", () => {
+  const Icon = ({ className }: { className?: string }) => <svg data-testid="prompt-icon" className={className} />
+
+  it("renders a plain-text prompt card that fills the composer when no handler is given", () => {
+    const onInputChange = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        description="Answers schedules"
+        icon="/logo.png"
+        prompts={["Show my schedule"]}
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText("Answers schedules")).toBeTruthy()
+    expect(document.querySelector('img[src="/logo.png"]')).not.toBeNull()
+    expect(screen.getByText("chatPage.sections.startingPrompts")).toBeTruthy()
+    fireEvent.click(screen.getByText("Show my schedule"))
+
+    expect(onInputChange).toHaveBeenCalledWith("Show my schedule")
+  })
+
+  it("lets onPromptSelect take over and passes the highlight terms of a card prompt", () => {
+    const onPromptSelect = vi.fn()
+    const onInputChange = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        icon={<span data-testid="node-icon" />}
+        prompts={[
+          "Plain prompt",
+          { title: "Card prompt", prompt: "Full card prompt", promptHighlights: ["card"], icon: Icon },
+        ]}
+        onPromptSelect={onPromptSelect}
+        onInputChange={onInputChange}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.getByTestId("node-icon")).toBeTruthy()
+    expect(screen.getByTestId("prompt-icon")).toBeTruthy()
+    fireEvent.click(screen.getByText("Plain prompt"))
+    fireEvent.click(screen.getByText("Card prompt"))
+
+    expect(onPromptSelect).toHaveBeenNthCalledWith(1, "Plain prompt", undefined)
+    expect(onPromptSelect).toHaveBeenNthCalledWith(2, "Full card prompt", ["card"])
+    expect(onInputChange).not.toHaveBeenCalled()
+  })
+
+  it("renders prompts as pills next to a team picker and does nothing without any handler", () => {
+    const onPromptSelect = vi.fn()
+    const { rerender } = render(
+      <ChatStartScreen
+        title="My team"
+        agents={[{ id: 1, name: "Maya" }]}
+        prompts={["Pill prompt", { title: "Titled pill", prompt: "Titled prompt", promptHighlights: ["x"], icon: Icon }]}
+        onPromptSelect={onPromptSelect}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.queryByText("chatPage.sections.startingPrompts")).toBeNull()
+    fireEvent.click(screen.getByRole("button", { name: "Pill prompt" }))
+    fireEvent.click(screen.getByRole("button", { name: "Titled pill" }))
+    expect(onPromptSelect).toHaveBeenNthCalledWith(1, "Pill prompt", undefined)
+    expect(onPromptSelect).toHaveBeenNthCalledWith(2, "Titled prompt", ["x"])
+
+    rerender(
+      <ChatStartScreen
+        title="My team"
+        agents={[{ id: 1, name: "Maya" }]}
+        prompts={["Pill prompt"]}
+        onSend={vi.fn()}
+      />
+    )
+    expect(() => fireEvent.click(screen.getByRole("button", { name: "Pill prompt" }))).not.toThrow()
+  })
+
+  it("passes the draft and the collected files to onSend", () => {
+    const onSend = vi.fn()
+    render(<ChatStartScreen title="Support Agent" onSend={onSend} />)
+
+    chatInputProps.current?.onSend("hello", { model: "m" } as never)
+
+    expect(onSend).toHaveBeenCalledWith("hello", [], { model: "m" })
   })
 })

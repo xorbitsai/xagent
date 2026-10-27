@@ -72,6 +72,14 @@ from ..services.db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from ..services.external_media import (
+    ExternalMediaPurpose,
+    ExternalMediaTicketRejected,
+    ExternalMediaUnavailable,
+    instagram_image_requires_normalization,
+    instagram_jpeg_bytes,
+    redeem_external_media_ticket,
+)
 from ..services.kb_file_service import (
     KB_RETAINED_DIR,
     aggregate_uploaded_file_statuses,
@@ -1695,6 +1703,95 @@ FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
 # media element auto-fetches on render too, so preview_file below reuses
 # that same constant/rationale as ``cache_headers`` whenever a ticket
 # authenticated the request, rather than a second identical constant.
+
+
+@file_router.api_route(
+    "/external-media/{file_id}",
+    methods=["GET", "HEAD"],
+    response_model=None,
+    include_in_schema=False,
+)
+def external_media_file(
+    file_id: str,
+    ticket: str = Query(...),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Serve one registered image to the external service named by its ticket."""
+
+    try:
+        redeemed = redeem_external_media_ticket(
+            db,
+            file_id=file_id,
+            ticket=ticket,
+        )
+    except ExternalMediaTicketRejected:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired external media ticket",
+        ) from None
+
+    record = redeemed.record
+    file_ref = ManagedFileRef(record)
+    try:
+        path = file_ref.materialize(
+            allow_existing_local=_is_under_uploads(
+                file_ref.local_path,
+                int(record.user_id),
+            )
+        )
+    except DurableObjectIntegrityError as exc:
+        raise _file_integrity_failed() from exc
+    except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        raise HTTPException(status_code=404, detail="File not found") from exc
+    except DurableStorageOperationError as exc:
+        _raise_durable_storage_unavailable(
+            exc,
+            "external media delivery",
+            file_id=record.file_id,
+        )
+
+    response_headers = {
+        "Cache-Control": "no-store, max-age=0",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+    }
+    try:
+        normalize_for_instagram = (
+            redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            and instagram_image_requires_normalization(path)
+        )
+    except ExternalMediaUnavailable as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    if normalize_for_instagram:
+        try:
+            content = instagram_jpeg_bytes(path)
+        except ExternalMediaUnavailable as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        return Response(
+            content=content,
+            media_type="image/jpeg",
+            headers={
+                **response_headers,
+                "Content-Disposition": _content_disposition_header(
+                    "inline", f"{Path(str(record.filename)).stem}.jpg"
+                ),
+            },
+        )
+
+    return FileResponse(
+        path,
+        media_type=(
+            "image/jpeg"
+            if redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            else redeemed.media_type
+        ),
+        headers={
+            **response_headers,
+            "Content-Disposition": _content_disposition_header(
+                "inline", str(record.filename)
+            ),
+        },
+    )
 
 
 def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:

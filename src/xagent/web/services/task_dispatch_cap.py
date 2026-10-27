@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ...config import (
+    DISPATCHER_FAIR_SHARE,
     DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS,
     DISPATCHER_MAX_INFLIGHT_PER_PROCESS,
+    get_dispatcher_fair_share_enabled,
     get_dispatcher_interactive_reserve_per_process,
     get_dispatcher_max_inflight_per_process,
 )
@@ -74,10 +77,22 @@ class DispatchCapSnapshot:
     interactive command may take a slot while fewer than ``limit`` tasks are
     active, a batch command only while fewer than ``limit - interactive_reserve``
     are.
+
+    ``occupancy`` is how many slots each tenant key holds in this process, filled
+    by ``BackgroundTaskManager.dispatch_cap_snapshot``; a snapshot built anywhere
+    else, such as the one that only observes the cap state, leaves it empty.
     """
 
     policy: DispatchPolicy
     active_ids: frozenset[int]
+    # A planned restart holds new execution (``release_hold``): the cap then
+    # reads as closed whatever the count, so exactly the existing closed-cap
+    # rules apply -- controls of any task and commands of tasks that already
+    # hold a slot pass, everything that would open a new execution waits.
+    held: bool = False
+    occupancy: Mapping[str, int] = field(
+        default_factory=dict, hash=False, compare=False
+    )
 
     @property
     def limit(self) -> int:
@@ -85,11 +100,13 @@ class DispatchCapSnapshot:
 
     @property
     def closed(self) -> bool:
-        return len(self.active_ids) >= self.limit
+        return self.held or len(self.active_ids) >= self.limit
 
     @property
     def batch_closed(self) -> bool:
-        return len(self.active_ids) >= self.limit - self.policy.interactive_reserve
+        return self.held or (
+            len(self.active_ids) >= self.limit - self.policy.interactive_reserve
+        )
 
     def admits(self, task_id: int, *, interactive: bool) -> bool:
         """Whether a command of ``task_id`` may open an execution.
@@ -101,13 +118,59 @@ class DispatchCapSnapshot:
             return True
         return not (self.closed if interactive else self.batch_closed)
 
+    @property
+    def in_reserve_band(self) -> bool:
+        """Whether the process sits between its batch line and its limit.
+
+        Only there can the tenant cap hold a tenant back: below the batch line
+        every command may take a slot, at the limit none may, and with no
+        interactive reserve the band is empty.
+        """
+        return self.batch_closed and not self.closed
+
+    def capped_tenant(self, queued: Mapping[str, int] | None) -> str | None:
+        """The tenant that may not take a new slot now, or None when nobody is held back.
+
+        ``queued`` maps each queued tenant key to the id of its oldest queued
+        command. Between the batch line and the limit, when at least two
+        tenants are queued, the tenant holding the most slots in this process
+        is held back. Every tenant that holds slots is compared, queued or not;
+        when the top holders have nothing queued nobody is held back, and on a
+        tie only the tied tenant with the earliest queued command is.
+
+        None when ``queued`` is None or lists fewer than two tenants, when the
+        process is not between the lines (``in_reserve_band``) and when no
+        queued tenant is a top holder. The empty string is a valid tenant key
+        and a valid result, so callers compare the result with ``is None``.
+        """
+        if queued is None or len(queued) < 2 or not self.in_reserve_band:
+            return None
+        top = max(self.occupancy.values(), default=0)
+        if top <= 0:
+            return None
+        holders = [
+            key for key, held in self.occupancy.items() if held == top and key in queued
+        ]
+        if not holders:
+            return None
+        return min(holders, key=lambda key: queued[key])
+
+
+class TenantListingRequired(Exception):
+    """A slot was asked for without the queued tenants, inside the reserve band.
+
+    Raised by ``BackgroundTaskManager.reserve_dispatch_slot`` only when the
+    caller passed ``require_listing=True``; it leaves no state behind. The
+    dispatch attempt that gets it selects again, with the tenants listed.
+    """
+
 
 # The last raw environment values and the policy parsed from them; the clamp
 # warning is logged once per parse. Event-loop thread only.
 _policy_memo: tuple[tuple[str | None, str | None], DispatchPolicy] | None = None
-# The policy, classifier name and admission declaration the process last
-# reported, so the report repeats only when one of them changes.
-_logged_policy: tuple[DispatchPolicy, str, bool] | None = None
+# The policy, classifier name, admission declaration and raw fair-share value the
+# process last reported, so the report repeats only when one of them changes.
+_logged_policy: tuple[DispatchPolicy, str, bool, str | None] | None = None
 
 
 def current_dispatch_policy() -> DispatchPolicy:
@@ -147,9 +210,9 @@ def current_dispatch_policy() -> DispatchPolicy:
 def build_dispatch_cap_snapshot() -> DispatchCapSnapshot:
     """Snapshot the process's active task ids. Event-loop thread only.
 
-    Reports the effective policy, with the installed classifier, the first time
-    a process builds a snapshot and whenever the policy, the classifier or its
-    admission declaration changes.
+    Reports the effective policy, with the installed classifier and the fair-share
+    switch, the first time a process builds a snapshot and whenever the policy,
+    the classifier, its admission declaration or the switch's raw value changes.
     """
 
     from .task_execution import background_task_manager
@@ -165,17 +228,20 @@ def _report_policy(policy: DispatchPolicy) -> None:
     from .task_execution_admission import describe_installed_classifier
 
     classifier, admission = describe_installed_classifier()
-    reported = (policy, classifier, admission)
+    # The raw switch value, not its parse: parsing an invalid value warns, and
+    # this runs for every snapshot.
+    reported = (policy, classifier, admission, os.getenv(DISPATCHER_FAIR_SHARE))
     if reported == _logged_policy:
         return
     _logged_policy = reported
     logger.info(
         "dispatch policy limit=%s interactive_reserve=%s classifier=%s "
-        "admission_enabled=%s",
+        "admission_enabled=%s fair_share=%s",
         policy.limit,
         policy.interactive_reserve,
         classifier,
         admission,
+        get_dispatcher_fair_share_enabled(),
     )
     if admission and policy.interactive_reserve > 0:
         logger.warning(

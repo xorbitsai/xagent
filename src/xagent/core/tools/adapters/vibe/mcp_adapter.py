@@ -5,15 +5,19 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 import math
 import os
 import re
-from collections.abc import Coroutine, Iterable, Iterator
+import threading
+from collections import OrderedDict
+from collections.abc import AsyncIterator, Coroutine, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -46,7 +50,12 @@ from ....file_ref import (
     parse_file_id_ref,
     sanitize_file_ref_for_context,
 )
-from ....utils.security import redact_sensitive_text
+from ....utils.egress_proxy import get_trusted_proxy_url
+from ....utils.public_http_transport import (
+    PublicHttpTransport,
+    UnsafePublicHttpTarget,
+)
+from ....utils.security import PrivateNetworkHostError, redact_sensitive_text
 from ...core.mcp.sessions import (
     Connection,
     SSEConnection,
@@ -82,12 +91,81 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     SandboxedMCPLoadResult,
     list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
+    requires_sandbox_mcp_connection,
     should_sandbox_mcp_connection,
 )
-from .signed_upload import is_signed_upload_issuing_tool
+from .signed_upload import (
+    SignedUploadBinding,
+    SignedUploadIssuer,
+    SignedUploadResponseError,
+    SignedUploadTicket,
+    SignedUploadURLRejected,
+    check_signed_upload_url,
+    connection_signed_uploads,
+    parse_signed_upload_response,
+)
 from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
+
+_HUBSPOT_TOOL_GUIDANCE = {
+    "search_crm_objects": (
+        " For a request to find a specific contact by name or email and read a "
+        "property value, use this record-search tool. For an email lookup, use "
+        "an exact email property filter rather than relying on free-text search, "
+        "and request the desired contact properties. If the property's internal "
+        "name is unknown, resolve it with search_properties first, then return "
+        "to this tool; property metadata does not contain contact values. An "
+        "empty result alone does not prove an access problem: check "
+        "get_user_details or discover_hubspot_schema before diagnosing one. If "
+        "read access is confirmed but the exact search is empty, say that no "
+        "matching contact is visible to the connected user; do not invent a "
+        "missing scope or claim that the contact does not exist."
+    ),
+    "search_properties": (
+        " This tool returns property definitions, not CRM record values. Never "
+        "use property names, metadata, or counts to answer a specific contact's "
+        "property value or to conclude that contact records are inaccessible. "
+        "After resolving the internal property name, call search_crm_objects."
+    ),
+    "get_properties": (
+        " This tool returns property definitions, not CRM record values. Never "
+        "use property names, metadata, or counts to answer a specific contact's "
+        "property value or to conclude that contact records are inaccessible. "
+        "After resolving the internal property name, call search_crm_objects."
+    ),
+    "get_user_details": (
+        " Use this tool to verify contact read access when a contact record tool "
+        "is unavailable or rejects a lookup. Report only the access status this "
+        "tool actually returns. If it reports no contact read access, tell the "
+        "user to reconnect or reauthorize HubSpot with Contacts read permission, "
+        "or ask a HubSpot admin to expand the user's record visibility. Do not "
+        "label an empty search result as a scope or permission error without "
+        "this evidence. When contact read access is present, an empty exact "
+        "search means only that no matching record is visible to this user."
+    ),
+    "discover_hubspot_schema": (
+        " When diagnosing a failed contact lookup, inspect the contacts object "
+        "type and report its returned read-access status exactly. Distinguish a "
+        "confirmed permission or record-visibility restriction from a successful "
+        "search that simply found no matching contact."
+    ),
+}
+
+
+def _provider_tool_description_guidance(
+    source_server: str | None, tool_name: str
+) -> str:
+    """Return narrow host guidance for provider-owned remote MCP tools.
+
+    Remote servers own their tool schemas and descriptions. The host only adds
+    guidance where production usage exposed an ambiguity between otherwise
+    valid tools; keeping this keyed by both provider and raw tool name prevents
+    one provider's workflow from leaking into similarly named custom servers.
+    """
+    if str(source_server or "").casefold() != "hubspot":
+        return ""
+    return _HUBSPOT_TOOL_GUIDANCE.get(tool_name.casefold(), "")
 
 
 class MCPFailurePhase(str, Enum):
@@ -97,6 +175,10 @@ class MCPFailurePhase(str, Enum):
     transport raised an ``httpx.HTTPStatusError`` with status 401 or 403:
     the server, or whatever answers in front of it, refused the request
     outright.
+
+    ``INVALID_CONFIGURATION`` is recorded when the connection carries
+    signed-upload settings that are not valid; it is found before any session
+    is opened.
     """
 
     SESSION_START = "session_start"
@@ -107,6 +189,7 @@ class MCPFailurePhase(str, Enum):
     SANDBOX_TOOL_WRAP = "sandbox_tool_wrap"
     NO_TOOLS_RETURNED = "no_tools_returned"
     AUTH_REJECTED = "auth_rejected"
+    INVALID_CONFIGURATION = "invalid_configuration"
 
 
 _DEFAULT_UNAVAILABLE_MCP_MESSAGE = "MCP server credentials are unavailable."
@@ -121,6 +204,7 @@ _MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
     MCPFailurePhase.SANDBOX_TOOL_WRAP: ("Some MCP server tools could not be prepared."),
     MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
     MCPFailurePhase.AUTH_REJECTED: "MCP server refused the connection.",
+    MCPFailurePhase.INVALID_CONFIGURATION: "MCP server upload settings are invalid.",
 }
 # HTTP statuses that end a load's retries. A 401 means the credentials were
 # not accepted, and every attempt of a load sends the same credentials, so a
@@ -285,6 +369,144 @@ class EmptyArgsModel(BaseModel):
     pass
 
 
+# Return model shared by every MCP tool adapter. Kept without a docstring
+# so that its JSON schema carries no description.
+class MCPToolResult(BaseModel):
+    content: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Tool execution result content"
+    )
+    structured_content: Any = Field(
+        default=None,
+        description=(
+            "Structured JSON result of the tool call, if the server returned one."
+        ),
+    )
+    runtime_bound_arguments: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Redacted runtime-bound arguments supplied with this call",
+    )
+    is_error: bool = Field(
+        default=False,
+        description="Whether the tool execution resulted in an error",
+    )
+
+
+# A log entry a build wants emitted: (level, %-style template, arguments). The
+# build hands entries back instead of logging, so each adapter emits its own
+# records, in its own logging context, whether it built the classes or reused
+# them.
+_BuildDiagnostic = tuple[int, str, tuple[Any, ...]]
+
+
+class _GeneratedArgumentClasses(NamedTuple):
+    """The argument model and validator generated for one tool."""
+
+    args_type: Type[BaseModel]
+    args_validator: Any | None
+    diagnostics: tuple[_BuildDiagnostic, ...]
+
+
+class _ArgsModelBuild(NamedTuple):
+    """Outcome of building an argument model.
+
+    ``cacheable`` is False when the build fell back after an unexpected
+    exception: that outcome depends on the interpreter state at the time (for
+    example how deep the call stack already was), not only on the schema.
+    """
+
+    model: Type[BaseModel]
+    diagnostics: list[_BuildDiagnostic]
+    cacheable: bool
+
+
+_MCP_CLASS_CACHE_MAX_ENTRIES = 1024
+# Oversized schemas are built per adapter, not cached.
+_MCP_CLASS_CACHE_MAX_SCHEMA_CHARS = 256 * 1024
+_McpClassCacheKey = tuple[type, str, str, frozenset[str]]
+# Insertion-ordered: the oldest entry is evicted first. Entries are only ever
+# read through ``_generated_argument_classes``.
+_MCP_CLASS_CACHE: OrderedDict[_McpClassCacheKey, _GeneratedArgumentClasses] = (
+    OrderedDict()
+)
+_MCP_CLASS_CACHE_LOCK = threading.Lock()
+
+
+def _generated_argument_classes(
+    adapter: "MCPToolAdapter",
+) -> _GeneratedArgumentClasses:
+    """Return the argument model and validator for ``adapter``'s tool.
+
+    The classes depend only on the adapter class, the tool name, the input
+    schema and which of its properties the runtime binds, so adapters with the
+    same four share one set. The schema is keyed in the order it arrived,
+    because the nested-schema budget is spent in property order and a
+    reordered schema can therefore emit a different model. Generation runs on
+    a private copy of the schema so a cached class never refers to an object
+    the caller still owns.
+
+    Only outcomes that the key fully determines are cached: a build that fell
+    back after an unexpected exception is rebuilt on the next adapter. A
+    schema that cannot be serialized, or is too large to keep, is built for
+    this adapter alone.
+    """
+    tool_name = adapter.mcp_tool.name
+    schema = adapter.mcp_tool.inputSchema
+    try:
+        schema_json = json.dumps(schema, separators=(",", ":"), allow_nan=True)
+    except (TypeError, ValueError, RecursionError) as exc:
+        logger.debug(
+            "MCP tool %s input schema is not cached: %s", tool_name, type(exc).__name__
+        )
+        return _build_argument_classes(adapter, schema)[0]
+    if len(schema_json) > _MCP_CLASS_CACHE_MAX_SCHEMA_CHARS:
+        logger.debug("MCP tool %s input schema is too large to cache", tool_name)
+        return _build_argument_classes(adapter, schema)[0]
+
+    key = (
+        type(adapter),
+        tool_name,
+        hashlib.sha256(schema_json.encode("ascii")).hexdigest(),
+        frozenset(
+            adapter._runtime_bound_tool_argument_names(
+                adapter._input_schema_properties()
+            )
+        ),
+    )
+    with _MCP_CLASS_CACHE_LOCK:
+        cached = _MCP_CLASS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    built, cacheable = _build_argument_classes(adapter, json.loads(schema_json))
+    if not cacheable:
+        return built
+    with _MCP_CLASS_CACHE_LOCK:
+        existing = _MCP_CLASS_CACHE.setdefault(key, built)
+        while len(_MCP_CLASS_CACHE) > _MCP_CLASS_CACHE_MAX_ENTRIES:
+            _MCP_CLASS_CACHE.popitem(last=False)
+    return existing
+
+
+def _build_argument_classes(
+    adapter: "MCPToolAdapter", schema: Any
+) -> tuple[_GeneratedArgumentClasses, bool]:
+    """Generate the argument model and validator from ``schema``.
+
+    Returns the classes and whether the outcome is fully determined by the
+    inputs (see ``_ArgsModelBuild``).
+    """
+    args_build = adapter._build_args_model(schema)
+    validator, validator_diagnostics = adapter._build_args_validator(args_build.model)
+    return (
+        _GeneratedArgumentClasses(
+            args_build.model,
+            validator,
+            tuple(args_build.diagnostics) + tuple(validator_diagnostics),
+        ),
+        args_build.cacheable,
+    )
+
+
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
@@ -311,6 +533,7 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("google-drive", "google_drive_update_file_content"): ("file_path",),
     ("slack", "slack_upload_file"): ("file_path",),
     ("jira", "jira_add_attachment"): ("file_path",),
+    ("facebook-pages", "facebook_publish_image_post"): ("file_path",),
 }
 
 # Tools above whose own ``file_id`` argument names something other than a
@@ -319,6 +542,35 @@ _DURABLE_UPLOAD_FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
 _DURABLE_UPLOAD_OWN_FILE_ID_TOOLS: frozenset[tuple[str, str]] = frozenset(
     {("google-drive", "google_drive_update_file_content")}
 )
+
+
+@dataclass(frozen=True)
+class _ExternalMediaBinding:
+    file_argument: str
+    url_argument: str
+    purpose: str
+
+
+# These built-in tools do not upload bytes themselves. The host converts one
+# exact registered FileRef into a purpose-bound, TTL-bound URL and substitutes
+# that URL only as an argument to the MCP call.
+_EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
+    ("instagram", "instagram_publish_image"): _ExternalMediaBinding(
+        file_argument="file_path",
+        url_argument="image_url",
+        purpose="instagram-publish",
+    ),
+}
+_EXTERNAL_MEDIA_FILE_NOT_FOUND = "file_id not found or not accessible."
+_EXTERNAL_MEDIA_FILE_REF_REQUIRED = (
+    "file_path must be a registered file_id, file:<id>, or workspace path."
+)
+_EXTERNAL_MEDIA_EXCLUSIVE_SOURCE = "Provide exactly one of image_url or file_path."
+
+
+class _ExternalMediaPreparationError(ValueError):
+    """A public-safe external-media preparation failure."""
+
 
 # Built-in connector tools that create a real binary under the current task
 # workspace. Their result is annotated with a durable FileRef at the host
@@ -395,6 +647,16 @@ def _workspace_download_field(server_name: str, tool_name: str) -> str | None:
     )
 
 
+def _external_media_binding(
+    server_name: str, tool_name: str
+) -> _ExternalMediaBinding | None:
+    from .....builtin_identity import canonicalize_builtin_identity
+
+    return _EXTERNAL_MEDIA_BINDINGS.get(
+        (canonicalize_builtin_identity(server_name) or "", tool_name)
+    )
+
+
 def _file_ref_value(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -455,6 +717,141 @@ def _replace_exact_string_values(value: Any, replacements: Mapping[str, str]) ->
     return value
 
 
+# A signed upload is sent in chunks of this size, each read off the event loop.
+_SIGNED_UPLOAD_CHUNK_BYTES = 64 * 1024
+# A signed URL this close to its expiry is treated as already expired.
+_SIGNED_UPLOAD_EXPIRY_MARGIN = timedelta(seconds=5)
+_SIGNED_UPLOAD_ERROR_TEXT_MAX_CHARS = 200
+_SIGNED_UPLOAD_FILE_UNAVAILABLE_MESSAGE = "The attached file is no longer available."
+_SIGNED_UPLOAD_UNTRUSTED_CONNECTOR_MESSAGE = "Upload refused: untrusted connector."
+_SIGNED_UPLOAD_UNSUPPORTED_TYPE_MESSAGE = (
+    "This file type cannot be sent to the connector."
+)
+_SIGNED_UPLOAD_UNTRUSTED_URL_MESSAGE = "Upload refused: untrusted upload URL."
+_SIGNED_UPLOAD_FAILED_MESSAGE = "File upload failed."
+_SIGNED_UPLOAD_ISSUER_ARGUMENT_MESSAGE = (
+    "Pass one workspace file as `file`, written as file:<id>."
+)
+_SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE = (
+    "The workspace file is no longer available."
+)
+# What the model is told about a tool the host runs in place of an issuing tool.
+# The connector's own description of that tool is not used: it tells the caller
+# to fetch an upload URL and send the bytes itself.
+_SIGNED_UPLOAD_ISSUER_DESCRIPTION = (
+    "Upload a workspace file (attached or generated) to this connector. "
+    "Pass the file as `file`, written as file:<id>. The host works out the "
+    "file's name, type, size and SHA-256 digest, asks the connector for an "
+    "upload and sends the bytes itself; it never returns an upload URL. The "
+    "result holds the connector's `file_id`, and `expires_at` when the "
+    "connector reports one. Put that `file_id` in the argument of the "
+    "connector tool that takes the file, also when that tool is called "
+    "through another tool's arguments. A `file_id` may work only once and "
+    "only until it expires; call this tool again for a new one."
+)
+_SIGNED_UPLOAD_ISSUER_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "file": {
+            "type": "string",
+            "description": "A workspace file (attached or generated), written as file:<id>.",
+        }
+    },
+    "required": ["file"],
+}
+
+
+def _utcnow() -> datetime:
+    """Current time as an aware UTC datetime; tests replace this function."""
+    return datetime.now(timezone.utc)
+
+
+def _signed_upload_transport() -> httpx.AsyncBaseTransport:
+    """Transport for the signed upload request.
+
+    The target URL comes from the connector's reply, so the request goes
+    through the public-network egress policy that remote MCP sessions use.
+    Tests replace this function; the client built around it is not replaceable.
+    """
+    return PublicHttpTransport(proxy_url=get_trusted_proxy_url())
+
+
+class _SignedUploadRefused(Exception):
+    """Ends a signed upload; ``result`` goes to the model.
+
+    Raised with one of the signed-upload messages, or with ``result=`` when the
+    outcome is already a complete tool result, such as an authorization failure
+    of the issuing call.  A tool that replaces an argument ends its call with
+    ``result`` before the connector's tool runs; a tool the host runs in place
+    of an issuing tool returns ``result`` as its own result.
+    """
+
+    def __init__(
+        self, message: str = "", *, result: dict[str, Any] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.result: dict[str, Any] = (
+            result
+            if result is not None
+            else {"content": [{"text": message}], "is_error": True}
+        )
+
+
+def _check_signed_upload_connection(
+    connection: Any,
+    binding: SignedUploadBinding | SignedUploadIssuer,
+    tool_name: str,
+) -> None:
+    """Refuse a signed upload over a connection to another host than the settings'."""
+    url = connection.get("url") if isinstance(connection, Mapping) else None
+    try:
+        host = urlsplit(url).hostname if isinstance(url, str) else None
+    except ValueError:
+        host = None
+    if host != binding.connection_host:
+        logger.warning(
+            "MCP tool %s refused a signed upload for an untrusted connector",
+            tool_name,
+        )
+        raise _SignedUploadRefused(_SIGNED_UPLOAD_UNTRUSTED_CONNECTOR_MESSAGE)
+
+
+def _file_size_and_sha256(path: Path) -> tuple[int, str]:
+    digest = hashlib.sha256()
+    size = 0
+    with open(path, "rb") as handle:
+        while chunk := handle.read(_SIGNED_UPLOAD_CHUNK_BYTES):
+            size += len(chunk)
+            digest.update(chunk)
+    return size, digest.hexdigest()
+
+
+def _connector_refusal_text(result: Mapping[str, Any]) -> str:
+    """The connector's own error text, redacted and length capped.
+
+    The joined text is cut to ``_MCP_TOOL_ERROR_RAW_MAX_CHARS`` before either
+    redaction pass runs, because it has no length limit of its own and both
+    passes cost time in proportion to their input. The cut appends
+    ``_TEXT_TRUNCATION_MARK`` so ``redact_urls_in_text`` replaces a URL cut in
+    half as a whole; the mark is removed again before the final cap.
+    """
+    content = result.get("content")
+    parts: list[str] = []
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, Mapping) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    raw = " ".join(parts)
+    if len(raw) > _MCP_TOOL_ERROR_RAW_MAX_CHARS:
+        raw = raw[:_MCP_TOOL_ERROR_RAW_MAX_CHARS] + _TEXT_TRUNCATION_MARK
+    redacted = redact_sensitive_text(redact_urls_in_text(raw)).replace(
+        _TEXT_TRUNCATION_MARK, ""
+    )
+    return redacted[:_SIGNED_UPLOAD_ERROR_TEXT_MAX_CHARS]
+
+
 # Hard ceiling on how many exception nodes either walk over a failed call
 # visits, so a wide or cyclic __cause__/__context__ graph cannot spin.
 # Three consumers read it: _bounded_exception_nodes (the 401 resolver's
@@ -469,14 +866,15 @@ _EXCEPTION_WALK_NODE_LIMIT = 64
 # capped on its own. No traceback is attached to any of them. The message
 # returned to the caller ("Error executing MCP tool.") never carries it.
 _MCP_TOOL_ERROR_LOG_MAX_CHARS = 500
-# Caps str(exc) before either redaction pass in _truncated_error_message runs.
-# str(exc) comes from a remote MCP server (or an SDK relaying its response)
-# and has no length limit of its own, while both redaction passes cost time
-# proportional to their input, so an unbounded message is a CPU-cost lever a
-# hostile or compromised server can pull regardless of how cheap either pass
-# is made per character. This bound only needs to keep the redaction passes
-# themselves cheap -- _MCP_TOOL_ERROR_LOG_MAX_CHARS is still what bounds the
-# final logged size.
+# Caps str(exc) before either redaction pass in _truncated_error_message runs,
+# and an issuing tool's error text before the same passes in
+# _connector_refusal_text. Both come from a remote MCP server (or an SDK
+# relaying its response) and have no length limit of their own, while both
+# redaction passes cost time proportional to their input, so an unbounded text
+# is a CPU-cost lever a hostile or compromised server can pull regardless of
+# how cheap either pass is made per character. This bound only needs to keep
+# the redaction passes themselves cheap -- _MCP_TOOL_ERROR_LOG_MAX_CHARS and
+# _SIGNED_UPLOAD_ERROR_TEXT_MAX_CHARS are still what bound the final sizes.
 _MCP_TOOL_ERROR_RAW_MAX_CHARS = 4096
 # Caps how many related exceptions of a failed call get their own log line:
 # the leaves of a (possibly nested) BaseExceptionGroup and the exceptions on
@@ -1338,16 +1736,17 @@ _URL_TOKEN_RE = re.compile(r"(?:https?|wss?)://[^\s<>]+", re.IGNORECASE)
 _URL_TRAILING_PUNCTUATION = ",.;:"
 _URL_TRAILING_BRACKETS = {")": "(", "]": "[", "}": "{"}
 # Appended by a caller that truncates the text it hands to
-# ``redact_urls_in_text`` (``_truncated_error_message`` is the only producer).
+# ``redact_urls_in_text`` (``_truncated_error_message`` and
+# ``_connector_refusal_text`` are the producers).
 # A URL token carrying it was cut at an unknown offset, so its remaining
 # authority may be the front half of a ``user:pass`` whose ``@`` was cut away.
 # U+FFFE is a Unicode noncharacter, permanently reserved and never assigned a
 # meaning in interchange text, so in practice its presence comes from that
 # append; nothing stops a remote message from carrying one on its own; if
 # that happens, the only effect is that the token carrying it is redacted
-# too. ``_truncated_error_message``, the only caller that appends it, also
-# strips it unconditionally before anything is logged -- a guarantee scoped
-# to that call site, not to every consumer of ``redact_urls_in_text``.
+# too. Both callers that append it also strip it unconditionally before the
+# text is logged or returned -- a guarantee scoped to those two call sites,
+# not to every consumer of ``redact_urls_in_text``.
 _TEXT_TRUNCATION_MARK = "\ufffe"
 
 
@@ -1881,10 +2280,12 @@ class MCPToolAdapter(AbstractBaseTool):
         workspace: Any | None = None,
         durable_upload_fields: tuple[str, ...] = (),
         durable_upload_own_file_id: bool = False,
+        external_media_binding: _ExternalMediaBinding | None = None,
         workspace_download_field: str | None = None,
         concurrency_safe: bool = False,
         concurrent_tools: Optional[List[str]] = None,
         raw_annotations: Optional[Mapping[str, Any]] = None,
+        signed_upload: SignedUploadBinding | None = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -1905,6 +2306,8 @@ class MCPToolAdapter(AbstractBaseTool):
             durable_upload_own_file_id: Whether the tool's own ``file_id``
                 argument is not a workspace file, so the FileRef wording names
                 ``durable_upload_fields`` instead of "file_id".
+            external_media_binding: Host-owned contract that converts a
+                registered image FileRef into a purpose-bound provider URL.
             workspace_download_field: Host-owned result field for a built-in
                 connector download that should be registered as a durable
                 FileRef.
@@ -1920,6 +2323,13 @@ class MCPToolAdapter(AbstractBaseTool):
                 real ``true``. Omitted means no wire evidence reached this
                 adapter, which classifies as ``UNDECLARED`` -- never as a
                 read-only promise.
+            signed_upload: Binding from this connection's signed-upload
+                settings, for a connector that takes a file through a signed
+                upload. When set and a workspace is present, the host uploads
+                a workspace file the model passes for
+                ``signed_upload.file_argument`` before this tool runs. A
+                binding whose ``file_argument`` the model cannot fill is
+                ignored with a warning (see ``_usable_signed_upload``).
         """
         self.mcp_tool = mcp_tool
         self._raw_annotations = raw_annotations
@@ -1931,6 +2341,7 @@ class MCPToolAdapter(AbstractBaseTool):
         self._workspace = workspace
         self._durable_upload_fields = durable_upload_fields
         self._durable_upload_own_file_id = durable_upload_own_file_id
+        self._external_media_binding = external_media_binding
         self._workspace_download_field = workspace_download_field
         self._is_excel_tool = (
             self.source_server == "excel" and self.mcp_tool.name.startswith("excel_")
@@ -1950,6 +2361,7 @@ class MCPToolAdapter(AbstractBaseTool):
         runtime_config = connection if isinstance(connection, Mapping) else {}
         self._runtime_bindings = runtime_bindings_from_config(runtime_config)
         self._connector_runtime = connector_runtime_from_config(runtime_config)
+        self._signed_upload = self._usable_signed_upload(signed_upload)
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -1957,9 +2369,14 @@ class MCPToolAdapter(AbstractBaseTool):
         # make unrelated tools of any server one repeated-action stream.
         self.decision_group = self.name
 
-        # Build models from MCP tool schema
-        self._args_type = self._build_args_model()
-        self._args_validator = self._build_args_validator()
+        # Models are generated from the MCP tool schema and shared with every
+        # adapter of the same tool; each adapter still emits its own build
+        # diagnostics.
+        generated = _generated_argument_classes(self)
+        self._args_type = generated.args_type
+        self._args_validator = generated.args_validator
+        for level, template, log_args in generated.diagnostics:
+            logger.log(level, template, *log_args)
         self._return_type = self._build_return_model()
         self._result_integrity = MCPResultIntegrityGuard(
             source_server=self.source_server,
@@ -2010,10 +2427,26 @@ class MCPToolAdapter(AbstractBaseTool):
         description = (
             self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
         )
+        description += _provider_tool_description_guidance(
+            self.source_server, self.mcp_tool.name
+        )
         if self._workspace is not None and self._durable_upload_fields:
             description += _durable_upload_note(
                 self._durable_upload_fields,
                 own_file_id=self._durable_upload_own_file_id,
+            )
+        if self._workspace is not None and self._external_media_binding is not None:
+            description += (
+                " A registered workspace image (file:<id> or workspace path) may "
+                f"be supplied for `{self._external_media_binding.file_argument}`; "
+                "the host gives "
+                "the provider short-lived, TTL-bound access."
+            )
+        if self._workspace is not None and self._signed_upload is not None:
+            description += (
+                " A registered workspace file (file:<id>) may be supplied for "
+                f"`{self._signed_upload.file_argument}`; the host uploads it to "
+                "the connector before this tool runs."
             )
         if self._workspace is not None and self._workspace_download_field is not None:
             description += (
@@ -2122,8 +2555,13 @@ class MCPToolAdapter(AbstractBaseTool):
         """MCP tools are always async."""
         return True
 
-    def _build_args_model(self) -> Type[BaseModel]:
-        """Build Pydantic model from MCP tool input schema.
+    def _build_args_model(self, schema: Any) -> _ArgsModelBuild:
+        """Build Pydantic model from an MCP tool input schema.
+
+        ``schema`` is the tool's ``inputSchema`` or an equivalent copy. The
+        build reads nothing else of the tool but its name and which input
+        properties the runtime binds, and it hands back the log entries it
+        would emit instead of logging them.
 
         Field-level metadata the connector author wrote (description, enum,
         pattern, format and the length/range bounds) is carried through to the
@@ -2145,20 +2583,23 @@ class MCPToolAdapter(AbstractBaseTool):
         from the arguments sent to the server instead of carrying a value no
         provider client can serialize.
         """
+        diagnostics: list[_BuildDiagnostic] = []
         try:
-            if not self.mcp_tool.inputSchema:
+            if not schema:
                 # No input parameters
-                return EmptyArgsModel
+                return _ArgsModelBuild(EmptyArgsModel, diagnostics, True)
 
             # Convert JSON schema to Pydantic model
-            schema = self.mcp_tool.inputSchema
-
             if not isinstance(schema, dict):
-                logger.warning(
-                    f"Invalid input schema for MCP tool {self.mcp_tool.name}"
+                diagnostics.append(
+                    (
+                        logging.WARNING,
+                        "Invalid input schema for MCP tool %s",
+                        (self.mcp_tool.name,),
+                    )
                 )
 
-                return EmptyArgsModel
+                return _ArgsModelBuild(EmptyArgsModel, diagnostics, True)
 
             # Extract properties and required fields
             properties = schema.get("properties", {})
@@ -2170,7 +2611,7 @@ class MCPToolAdapter(AbstractBaseTool):
             )
 
             if not isinstance(properties, Mapping) or not properties:
-                return EmptyArgsModel
+                return _ArgsModelBuild(EmptyArgsModel, diagnostics, True)
 
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
@@ -2243,35 +2684,49 @@ class MCPToolAdapter(AbstractBaseTool):
                 # One line per tool, whatever the connector declared. A
                 # malformed schema can drop keys on many fields at once, and
                 # a line per key would turn one bad connector into a flood.
-                logger.debug(
-                    "MCP tool %s dropped %d field schema metadata keys "
-                    "and %d unreadable field schemas",
-                    self.mcp_tool.name,
-                    tool_metadata.rejected_keys,
-                    tool_metadata.unreadable_fields,
+                diagnostics.append(
+                    (
+                        logging.DEBUG,
+                        "MCP tool %s dropped %d field schema metadata keys "
+                        "and %d unreadable field schemas",
+                        (
+                            self.mcp_tool.name,
+                            tool_metadata.rejected_keys,
+                            tool_metadata.unreadable_fields,
+                        ),
+                    )
                 )
 
             # Create the model
             model_name = f"{self.mcp_tool.name.title().replace('_', '')}Args"
-            return create_model(model_name, **fields)
-
-        except Exception as e:
-            logger.error(
-                f"Failed to build args model for MCP tool {self.mcp_tool.name}: {e}"
+            return _ArgsModelBuild(
+                create_model(model_name, **fields), diagnostics, True
             )
 
-            return EmptyArgsModel
+        except Exception as e:
+            diagnostics.append(
+                (
+                    logging.ERROR,
+                    "Failed to build args model for MCP tool %s: %s",
+                    (self.mcp_tool.name, str(e)),
+                )
+            )
 
-    def _build_args_validator(self) -> Any | None:
+            return _ArgsModelBuild(EmptyArgsModel, diagnostics, False)
+
+    def _build_args_validator(
+        self, args_type: Type[BaseModel]
+    ) -> tuple[Any | None, list[_BuildDiagnostic]]:
         """Compile the adapter-visible argument schema for local checks.
 
         A malformed remote schema must not make the whole connector unload.
         ``_build_args_model`` already drops unsupported fragments; if the
         remaining Pydantic schema is still invalid, preserve the historical
-        Pydantic-only validation path and log only the exception class.
+        Pydantic-only validation path and report only the exception class. The
+        validator holds no per-call state, so adapters may share one.
         """
         try:
-            schema = self._args_type.model_json_schema()
+            schema = args_type.model_json_schema()
             # Regexes supplied by an MCP server are model-facing hints, not a
             # safe event-loop validator. In particular, Python's backtracking
             # engine can be blocked by a pathological pattern, and ECMA-only
@@ -2279,15 +2734,16 @@ class MCPToolAdapter(AbstractBaseTool):
             # the provider schema but omit it from local pre-call checks.
             schema = _remove_schema_keyword(schema, "pattern")
             Draft202012Validator.check_schema(schema)
-            return Draft202012Validator(schema)
+            return Draft202012Validator(schema), []
         except (jsonschema_exceptions.SchemaError, TypeError, ValueError) as exc:
-            logger.warning(
-                "MCP tool %s argument schema could not be compiled for nested "
-                "validation: %s",
-                self.mcp_tool.name,
-                type(exc).__name__,
-            )
-            return None
+            return None, [
+                (
+                    logging.WARNING,
+                    "MCP tool %s argument schema could not be compiled for nested "
+                    "validation: %s",
+                    (self.mcp_tool.name, type(exc).__name__),
+                )
+            ]
 
     def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
         if self._args_validator is None:
@@ -2426,28 +2882,7 @@ class MCPToolAdapter(AbstractBaseTool):
         }
 
     def _build_return_model(self) -> Type[BaseModel]:
-        """Build return model for MCP tool output."""
-
-        # MCP tools return CallToolResult which contains content
-        class MCPToolResult(BaseModel):
-            content: List[Dict[str, Any]] = Field(
-                default_factory=list, description="Tool execution result content"
-            )
-            structured_content: Any = Field(
-                default=None,
-                description=(
-                    "Structured JSON result of the tool call, if the server returned one."
-                ),
-            )
-            runtime_bound_arguments: Dict[str, Any] = Field(
-                default_factory=dict,
-                description="Redacted runtime-bound arguments supplied with this call",
-            )
-            is_error: bool = Field(
-                default=False,
-                description="Whether the tool execution resulted in an error",
-            )
-
+        """Return the model for MCP tool output."""
         return MCPToolResult
 
     def _json_schema_to_python_type(self, schema: Dict[str, Any]) -> Type:
@@ -2803,6 +3238,61 @@ class MCPToolAdapter(AbstractBaseTool):
             await self._discard_external_upload_args(staged)
             raise
 
+    async def _substitute_external_media_args(
+        self, tool_args: Mapping[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        binding = self._external_media_binding
+        workspace = self._workspace
+        prepared = dict(tool_args)
+        if binding is None or workspace is None:
+            return prepared, {}
+
+        raw_file = prepared.get(binding.file_argument)
+        if raw_file is None or (isinstance(raw_file, str) and not raw_file.strip()):
+            return prepared, {}
+        raw_url = prepared.get(binding.url_argument)
+        if raw_url is not None and (
+            not isinstance(raw_url, str) or bool(raw_url.strip())
+        ):
+            raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_EXCLUSIVE_SOURCE)
+
+        file_id = _file_ref_value(raw_file)
+        if file_id is None and isinstance(raw_file, str):
+            try:
+                resolved_path = await self._run_upload_staging_operation(
+                    workspace.resolve_path,
+                    raw_file,
+                )
+                file_id = await self._run_upload_staging_operation(
+                    workspace.get_file_id_from_path,
+                    str(resolved_path),
+                )
+            except (FileNotFoundError, OSError, ValueError):
+                file_id = None
+        if file_id is None:
+            raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_FILE_REF_REQUIRED)
+        try:
+            external_url = await self._run_upload_staging_operation(
+                workspace.issue_external_media_url_detached,
+                file_id,
+                binding.purpose,
+            )
+        except FileNotFoundError:
+            raise _ExternalMediaPreparationError(
+                _EXTERNAL_MEDIA_FILE_NOT_FOUND
+            ) from None
+        except ValueError as exc:
+            raise _ExternalMediaPreparationError(str(exc)) from None
+
+        prepared.pop(binding.file_argument, None)
+        prepared[binding.url_argument] = external_url
+        replacement = f"file:{file_id}"
+        escaped_url = external_url.replace("/", r"\/")
+        replacements = {external_url: replacement}
+        if escaped_url != external_url:
+            replacements[escaped_url] = replacement
+        return prepared, replacements
+
     async def _discard_external_upload_args(self, staged: list[Any]) -> None:
         workspace = self._workspace
         if workspace is None:
@@ -2998,6 +3488,14 @@ class MCPToolAdapter(AbstractBaseTool):
                     own_file_id=self._durable_upload_own_file_id,
                 )
                 return {"content": [{"text": message}], "is_error": True}
+            try:
+                (
+                    tool_args,
+                    external_media_replacements,
+                ) = await self._substitute_external_media_args(tool_args)
+            except _ExternalMediaPreparationError as exc:
+                await self._discard_external_upload_args(staged_uploads)
+                return {"content": [{"text": str(exc)}], "is_error": True}
 
             # Pydantic inserts declared defaults before this point. Validate
             # only values supplied by the model. Runtime-bound fields are
@@ -3042,6 +3540,22 @@ class MCPToolAdapter(AbstractBaseTool):
                     ) = await self._invocation_connection()
                     if invocation_connection is None:
                         return _delegated_authorization_failed_result()
+                    replacements: dict[str, str] = {}
+                    if self._signed_upload is not None:
+                        try:
+                            (
+                                tool_args,
+                                replacements,
+                                invocation_connection,
+                            ) = await self._substitute_signed_upload(
+                                self._signed_upload,
+                                invocation_connection,
+                                tool_args,
+                                tool_meta,
+                                was_refreshed=was_refreshed,
+                            )
+                        except _SignedUploadRefused as refused:
+                            return refused.result
                     try:
                         result = await self._execute_mcp_call(
                             invocation_connection, tool_args, tool_meta
@@ -3082,29 +3596,49 @@ class MCPToolAdapter(AbstractBaseTool):
                         )
                     if bound_args:
                         result["runtime_bound_arguments"] = bound_args
-                    return _replace_staged_upload_paths(result, staged_upload_sources)
+                    return _replace_exact_string_values(
+                        _replace_staged_upload_paths(
+                            result,
+                            {
+                                **staged_upload_sources,
+                                **external_media_replacements,
+                            },
+                        ),
+                        replacements,
+                    )
             finally:
                 await self._discard_external_upload_args(staged_uploads)
 
-        # The tool-loading handlers (_load_direct_mcp_tools,
-        # load_mcp_tools_as_agent_tools) log only class names (and, in
-        # _load_direct_mcp_tools, an integer HTTP status) above DEBUG
-        # and keep the raw traceback (exc_info) for DEBUG, because a traceback
-        # is unredacted and unbounded. These two handlers log at ERROR, but
-        # only _truncated_error_message() output -- passed through
-        # redact_urls_in_text and redact_sensitive_text and capped per line --
-        # and never a traceback, so do not add exc_info here. Shapes neither
-        # helper recognises: #2272 and some of those listed in #2356.
         except BaseExceptionGroup as e:
+            return self._execution_failure_result(e)
+
+        except Exception as e:
+            return self._execution_failure_result(e)
+
+    def _execution_failure_result(self, exc: BaseException) -> dict[str, Any]:
+        """Log a failed tool call and return the fixed error result.
+
+        Both ``run_json_async`` implementations that execute a call end in this
+        handler.  The tool-loading handlers (_load_direct_mcp_tools,
+        load_mcp_tools_as_agent_tools) log only class names (and, in
+        _load_direct_mcp_tools, an integer HTTP status) above DEBUG
+        and keep the raw traceback (exc_info) for DEBUG, because a traceback
+        is unredacted and unbounded.  This handler logs at ERROR, but
+        only _truncated_error_message() output -- passed through
+        redact_urls_in_text and redact_sensitive_text and capped per line --
+        and never a traceback, so do not add exc_info here.  Shapes neither
+        helper recognises: #2272 and some of those listed in #2356.
+        """
+        if isinstance(exc, BaseExceptionGroup):
             logger.error(
                 "MCP tool %s execution failed with exception group %s: %s",
                 self.mcp_tool.name,
-                type(e).__name__,
-                _truncated_error_message(e),
+                type(exc).__name__,
+                _truncated_error_message(exc),
             )
             leaf_count = 0
-            for node in _level_order_exception_nodes(e):
-                if node is e or isinstance(node, BaseExceptionGroup):
+            for node in _level_order_exception_nodes(exc):
+                if node is exc or isinstance(node, BaseExceptionGroup):
                     continue
                 if leaf_count >= _MCP_TOOL_ERROR_LOG_MAX_SUB_EXCEPTIONS:
                     break
@@ -3115,22 +3649,17 @@ class MCPToolAdapter(AbstractBaseTool):
                     type(node).__name__,
                     _truncated_error_message(node),
                 )
-            return {
-                "content": [{"text": "Error executing MCP tool."}],
-                "is_error": True,
-            }
-
-        except Exception as e:
+        else:
             logger.error(
                 "MCP tool %s execution failed with %s: %s",
                 self.mcp_tool.name,
-                type(e).__name__,
-                _truncated_error_message(e),
+                type(exc).__name__,
+                _truncated_error_message(exc),
             )
-            return {
-                "content": [{"text": "Error executing MCP tool."}],
-                "is_error": True,
-            }
+        return {
+            "content": [{"text": "Error executing MCP tool."}],
+            "is_error": True,
+        }
 
     async def _invocation_connection(self) -> tuple[Connection | None, bool]:
         """Resolve a one-call trusted connection without stale fallback."""
@@ -3333,7 +3862,7 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_meta: Mapping[str, Any],
         *,
         was_refreshed: bool,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], Connection]:
         """Run a host-issued call under the authorization policy of a model call.
 
         A failure is handled exactly as it is for the call the model asked
@@ -3341,14 +3870,23 @@ class MCPToolAdapter(AbstractBaseTool):
         refresh or retry, and the same exception otherwise.  Refresh callbacks
         are read from ``self.connection``, never from ``connection``.
 
+        Returns ``(result, last_connection)``.  ``last_connection`` is the
+        connection of the last call this method made: the refreshed connection
+        once a 401 led to a retry on it, otherwise ``connection``.  A caller
+        that calls the connector again uses it, so a refreshed credential is
+        not dropped after one call.
+
         This mirrors the outer call section of ``run_json_async``,
         ``_retry_after_authorization_failure`` and ``_retry_resolver_401``.
         Whoever changes one of those three must change this method too; the
         equivalence test between the two paths fails when they drift apart.
         """
         try:
-            return await self._execute_named_mcp_call(
-                connection, tool_name, tool_args, tool_meta
+            return (
+                await self._execute_named_mcp_call(
+                    connection, tool_name, tool_args, tool_meta
+                ),
+                connection,
             )
         except (BaseExceptionGroup, Exception) as exc:
             if was_refreshed:
@@ -3365,7 +3903,7 @@ class MCPToolAdapter(AbstractBaseTool):
                     _OAUTH_TOKEN_RESOLVER_REFRESH_KEY
                 )
                 if challenge is None or not callable(resolver_refresh):
-                    return _delegated_authorization_failed_result()
+                    return _delegated_authorization_failed_result(), connection
 
                 logger.info(
                     "Retrying MCP tool %s after resolver authorization failure",
@@ -3381,21 +3919,28 @@ class MCPToolAdapter(AbstractBaseTool):
                         tool_name,
                         type(refresh_exc).__name__,
                     )
-                    return _delegated_authorization_failed_result()
+                    return _delegated_authorization_failed_result(), connection
 
                 from ....agent.result import ClassifiedToolFailure
 
                 if isinstance(refreshed, ClassifiedToolFailure):
-                    return _delegated_authorization_failed_result(
-                        failure_code=refreshed.failure_code
+                    return (
+                        _delegated_authorization_failed_result(
+                            failure_code=refreshed.failure_code
+                        ),
+                        connection,
                     )
 
                 if not _is_executable_remote_connection(refreshed):
-                    return _delegated_authorization_failed_result()
+                    return _delegated_authorization_failed_result(), connection
 
+                resolver_connection = cast(Connection, refreshed)
                 try:
-                    return await self._execute_named_mcp_call(
-                        cast(Connection, refreshed), tool_name, tool_args, tool_meta
+                    return (
+                        await self._execute_named_mcp_call(
+                            resolver_connection, tool_name, tool_args, tool_meta
+                        ),
+                        resolver_connection,
                     )
                 except (BaseExceptionGroup, Exception) as retry_exc:
                     excluded_response_ids = (
@@ -3412,13 +3957,16 @@ class MCPToolAdapter(AbstractBaseTool):
                         )
                         is not None
                     ):
-                        return _delegated_authorization_failed_result()
+                        return (
+                            _delegated_authorization_failed_result(),
+                            resolver_connection,
+                        )
                     logger.error(
                         "MCP tool %s resolver authorization retry failed with %s",
                         tool_name,
                         type(retry_exc).__name__,
                     )
-                    return _delegated_retry_failed_result()
+                    return _delegated_retry_failed_result(), resolver_connection
 
             if not _exception_indicates_http_401(exc):
                 raise
@@ -3442,22 +3990,269 @@ class MCPToolAdapter(AbstractBaseTool):
                     tool_name,
                     type(refresh_exc).__name__,
                 )
-                return _delegated_authorization_failed_result()
+                return _delegated_authorization_failed_result(), connection
             if not isinstance(refreshed, dict):
-                return _delegated_authorization_failed_result()
+                return _delegated_authorization_failed_result(), connection
+            refreshed_connection = cast(Connection, refreshed)
             try:
-                return await self._execute_named_mcp_call(
-                    cast(Connection, refreshed), tool_name, tool_args, tool_meta
+                return (
+                    await self._execute_named_mcp_call(
+                        refreshed_connection, tool_name, tool_args, tool_meta
+                    ),
+                    refreshed_connection,
                 )
             except (BaseExceptionGroup, Exception) as retry_exc:
                 if _exception_indicates_http_401(retry_exc):
-                    return _delegated_authorization_failed_result()
+                    return (
+                        _delegated_authorization_failed_result(),
+                        refreshed_connection,
+                    )
                 logger.error(
                     "MCP tool %s delegated authorization retry failed with %s",
                     tool_name,
                     type(retry_exc).__name__,
                 )
-                return _delegated_retry_failed_result()
+                return _delegated_retry_failed_result(), refreshed_connection
+
+    async def _signed_upload_chunks(self, handle: Any) -> AsyncIterator[bytes]:
+        """Yield an open staged file in chunks, each read off the event loop."""
+        while chunk := await self._run_upload_staging_operation(
+            handle.read, _SIGNED_UPLOAD_CHUNK_BYTES
+        ):
+            yield chunk
+
+    async def _substitute_signed_upload(
+        self,
+        binding: SignedUploadBinding,
+        invocation_connection: Connection,
+        tool_args: dict[str, Any],
+        tool_meta: Mapping[str, Any],
+        *,
+        was_refreshed: bool,
+    ) -> tuple[dict[str, Any], dict[str, str], Connection]:
+        """Upload the workspace file the model passed, ahead of the tool call.
+
+        Returns ``(tool_args, replacements, connection)``; the tool call uses
+        ``connection``.  After an upload it is the connection the issuing call
+        last used, which is a refreshed one when the issuing call refreshed
+        after a 401; otherwise it is ``invocation_connection``.  After an
+        upload the argument holds the connector's own file id and
+        ``replacements`` maps that id back to ``file:<id>`` for the result the
+        model sees.  When the argument holds no workspace file, the arguments
+        come back unchanged with no replacements.
+
+        ``file:<id>`` always names a workspace file.  A bare UUID names one
+        only when the workspace can stage it for this task; otherwise it is
+        taken as the connector's own file id and reaches the tool unchanged.
+        When the task has a workspace, the per-call connection's host is
+        checked before the workspace is asked, so over a connection to another
+        host a bare UUID is refused too.
+
+        When a step refuses the upload, ``_SignedUploadRefused`` carries the
+        result to return and the tool is not called.  Any other ``OSError`` while
+        staging or hashing the file, and cancellation, propagate as they are.
+        The staged copy is removed on every outcome.
+
+        The signed URL and everything the connector sent with it are credentials:
+        none of it is logged or returned to the model.
+        """
+        tool_name = self.mcp_tool.name
+        file_argument = binding.file_argument
+        value = tool_args.get(file_argument)
+        file_id = _file_ref_value(value)
+        if file_id is None:
+            return tool_args, {}, invocation_connection
+        explicit_reference = parse_file_id_ref(value) is not None
+        workspace = self._workspace
+        if workspace is None:
+            if not explicit_reference:
+                return tool_args, {}, invocation_connection
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_FILE_UNAVAILABLE_MESSAGE)
+
+        _check_signed_upload_connection(invocation_connection, binding, tool_name)
+
+        try:
+            staged = await self._stage_external_upload_file(file_id)
+        except FileNotFoundError:
+            if not explicit_reference:
+                return tool_args, {}, invocation_connection
+            raise _SignedUploadRefused(
+                _SIGNED_UPLOAD_FILE_UNAVAILABLE_MESSAGE
+            ) from None
+
+        try:
+            ticket, issuing_connection = await self._issue_and_upload_staged_file(
+                binding,
+                staged,
+                invocation_connection,
+                tool_meta,
+                was_refreshed=was_refreshed,
+            )
+            substituted = dict(tool_args)
+            substituted[file_argument] = ticket.file_id
+            return (
+                substituted,
+                {ticket.file_id: f"file:{file_id}"},
+                issuing_connection,
+            )
+        finally:
+            await self._discard_external_upload_args([staged])
+
+    async def _issue_and_upload_staged_file(
+        self,
+        target: SignedUploadBinding | SignedUploadIssuer,
+        staged: Path,
+        invocation_connection: Connection,
+        tool_meta: Mapping[str, Any],
+        *,
+        was_refreshed: bool,
+    ) -> tuple[SignedUploadTicket, Connection]:
+        """Issue a signed upload for a staged file and PUT its bytes.
+
+        ``staged`` is a copy the caller staged and removes, and
+        ``invocation_connection`` already passed the connection-host check.
+        Returns the validated ticket and the connection the issuing call last
+        used.  Every refusal raises ``_SignedUploadRefused`` with the result for
+        the model.  An ``OSError`` while hashing the staged copy, and
+        cancellation, propagate; an ``OSError`` while sending it ends the upload
+        as "File upload failed.".  The signed URL and the headers never leave
+        this method.
+        """
+        tool_name = self.mcp_tool.name
+        mime_type = target.content_types.get(staged.suffix.lower())
+        if mime_type is None:
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_UNSUPPORTED_TYPE_MESSAGE)
+        size_bytes, digest = await self._run_upload_staging_operation(
+            _file_size_and_sha256, staged
+        )
+
+        try:
+            (
+                issued,
+                issuing_connection,
+            ) = await self._call_issuing_tool_with_authorization_retry(
+                invocation_connection,
+                target.issuing_tool_name,
+                {
+                    "filename": staged.name,
+                    "mime_type": mime_type,
+                    "size_bytes": size_bytes,
+                    "sha256": digest,
+                },
+                tool_meta,
+                was_refreshed=was_refreshed,
+            )
+        except (BaseExceptionGroup, Exception) as exc:
+            if _exception_indicates_http_401(exc):
+                raise _SignedUploadRefused(
+                    result=_delegated_authorization_failed_result()
+                ) from None
+            logger.error(
+                "MCP tool %s signed upload issuing call failed with %s",
+                tool_name,
+                type(exc).__name__,
+            )
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_FAILED_MESSAGE) from None
+        # Results that the normalizer produced always carry
+        # ``structured_content``; the helper's own authorization results
+        # never do and are final as they are.
+        if "structured_content" not in issued:
+            raise _SignedUploadRefused(result=issued)
+        # A refresh after a 401 replaces the connection, and the reply came
+        # over the replacement, so it is checked like the first one.
+        _check_signed_upload_connection(issuing_connection, target, tool_name)
+        if issued.get("is_error"):
+            raise _SignedUploadRefused(
+                "The connector refused the file: " + _connector_refusal_text(issued)
+            )
+
+        try:
+            ticket = parse_signed_upload_response(issued, size_bytes=size_bytes)
+        except SignedUploadResponseError as exc:
+            logger.warning(
+                "MCP tool %s signed upload response %s",
+                tool_name,
+                "carried a forbidden header"
+                if exc.reason == "forbidden_header"
+                else "malformed",
+            )
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_FAILED_MESSAGE) from None
+
+        try:
+            upload_url = check_signed_upload_url(ticket.upload_url, target)
+        except SignedUploadURLRejected as exc:
+            if exc.host is None:
+                logger.warning(
+                    "MCP tool %s rejected a malformed signed upload URL",
+                    tool_name,
+                )
+            else:
+                logger.warning(
+                    "MCP tool %s rejected a signed upload URL for host %s",
+                    tool_name,
+                    exc.host,
+                )
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_UNTRUSTED_URL_MESSAGE) from None
+
+        # Adding the margin to the current time, rather than subtracting it
+        # from the connector's value, keeps an expiry near datetime.min
+        # from overflowing.
+        if _utcnow() + _SIGNED_UPLOAD_EXPIRY_MARGIN >= ticket.expires_at:
+            logger.warning(
+                "MCP tool %s signed upload URL expired before upload", tool_name
+            )
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_FAILED_MESSAGE)
+
+        put_headers = httpx.Headers(dict(ticket.headers))
+        if "content-length" not in put_headers:
+            put_headers["Content-Length"] = str(size_bytes)
+
+        try:
+            handle = await self._run_upload_staging_operation(open, staged, "rb")
+            try:
+                async with httpx.AsyncClient(
+                    transport=_signed_upload_transport(),
+                    trust_env=False,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(60.0),
+                ) as client:
+                    # Only the status code is used; the response body is
+                    # never read.
+                    async with client.stream(
+                        "PUT",
+                        upload_url,
+                        headers=put_headers,
+                        content=self._signed_upload_chunks(handle),
+                    ) as response:
+                        upload_succeeded = response.is_success
+                        status_code = response.status_code
+            finally:
+                await self._run_upload_staging_operation(handle.close)
+        except (
+            httpx.HTTPError,
+            OSError,
+            UnsafePublicHttpTarget,
+            PrivateNetworkHostError,
+        ) as exc:
+            logger.error(
+                "MCP tool %s signed upload to host %s failed with %s",
+                tool_name,
+                upload_url.host,
+                type(exc).__name__,
+            )
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_FAILED_MESSAGE) from None
+        # Any 2xx is success. Redirects are not followed, so a 3xx fails
+        # like any other status outside 2xx.
+        if not upload_succeeded:
+            logger.error(
+                "MCP tool %s signed upload to host %s returned status %s",
+                tool_name,
+                upload_url.host,
+                status_code,
+            )
+            raise _SignedUploadRefused(_SIGNED_UPLOAD_FAILED_MESSAGE)
+
+        return ticket, issuing_connection
 
     def _get_current_user_id(self) -> Optional[str]:
         """Get current user ID from environment or context."""
@@ -3482,6 +4277,30 @@ class MCPToolAdapter(AbstractBaseTool):
             if isinstance(target_key, str) and target_key in properties:
                 bound.add(target_key)
         return bound
+
+    def _usable_signed_upload(
+        self, binding: SignedUploadBinding | None
+    ) -> SignedUploadBinding | None:
+        """``binding``, or ``None`` when the model cannot fill its file argument.
+
+        The argument model has a field only for each inputSchema property that
+        no runtime binding fills, so a value for any other name never reaches
+        the tool call. Such a binding could never upload anything, so the tool
+        neither advertises nor attempts a signed upload.
+        """
+        if binding is None:
+            return None
+        properties = self._input_schema_properties()
+        if binding.file_argument not in properties or (
+            binding.file_argument in self._runtime_bound_tool_argument_names(properties)
+        ):
+            logger.warning(
+                "MCP tool %s ignores its signed-upload settings: the model "
+                "cannot fill the file argument",
+                self.mcp_tool.name,
+            )
+            return None
+        return binding
 
     def _runtime_tool_arguments(
         self, *, redact_sensitive: bool = False, log_skipped: bool = True
@@ -3570,6 +4389,158 @@ class MCPToolAdapter(AbstractBaseTool):
     def return_value_as_string(self, value: Any) -> str:
         """Convert return value to string representation."""
         return _mcp_return_value_as_string(value)
+
+
+class SignedUploadIssuerAdapter(MCPToolAdapter):
+    """The tool the host runs in place of a connector's issuing tool.
+
+    The model passes one workspace file as ``file``.  The host stages it, asks the
+    connector for a signed upload with ``_issue_and_upload_staged_file``, sends
+    the bytes and returns only the connector's file id (and when it stops
+    working, if the connector says).  The model then puts that file id into the
+    connector tool that takes the file.  The signed URL and the headers never
+    reach the model.
+
+    The tool has the issuing tool's name, so it takes the issuing tool's place
+    in the connector's tool list.  It has its own description and arguments, a
+    fixed set that does not depend on the connector's annotations, runtime
+    bindings or schema.
+
+    ``run_json_async`` does not call ``MCPToolAdapter.run_json_async``.  It
+    ends in the same ``_execution_failure_result`` handler, but it repeats that
+    method's pre-call checks (the user allowlist and ``_invocation_connection``)
+    itself.  Whoever adds a pre-call check there must add it here too.
+    """
+
+    def __init__(
+        self,
+        issuer: SignedUploadIssuer,
+        connection: Connection,
+        *,
+        name_prefix: Optional[str] = None,
+        visibility: Optional[ToolVisibility] = None,
+        allow_users: Optional[List[str]] = None,
+        source_server: Optional[str] = None,
+        workspace: Any | None = None,
+        concurrency_safe: bool = False,
+        concurrent_tools: Optional[List[str]] = None,
+    ):
+        self._issuer = issuer
+        super().__init__(
+            mcp_tool=MCPTool(
+                name=issuer.issuing_tool_name,
+                description=_SIGNED_UPLOAD_ISSUER_DESCRIPTION,
+                inputSchema=_SIGNED_UPLOAD_ISSUER_INPUT_SCHEMA,
+            ),
+            connection=connection,
+            name_prefix=name_prefix,
+            visibility=visibility,
+            allow_users=allow_users,
+            source_server=source_server,
+            workspace=workspace,
+            concurrency_safe=concurrency_safe,
+            concurrent_tools=concurrent_tools,
+            # The connector's annotations describe its own tool.  Without any,
+            # the same-turn duplicate-write guard leaves this tool alone: a
+            # second call for the same file asks for a new file id on purpose.
+            raw_annotations=None,
+        )
+
+    @property
+    def description(self) -> str:
+        """The fixed description, with no runtime-binding note appended."""
+        return _SIGNED_UPLOAD_ISSUER_DESCRIPTION
+
+    def _runtime_bound_tool_argument_names(
+        self, properties: Mapping[str, Any]
+    ) -> set[str]:
+        """No argument of this tool is filled by a runtime binding.
+
+        Runtime bindings fill arguments of the connector's own tools; ``file``
+        belongs to the host.
+        """
+        return set()
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        """Upload the workspace file the model passed and return the file id."""
+        try:
+            current_user_id = self._get_current_user_id()
+            if not self._is_user_allowed(current_user_id):
+                return _mcp_access_denied_result(current_user_id, self.mcp_tool.name)
+
+            file_id = (
+                _file_ref_value(args.get("file")) if isinstance(args, Mapping) else None
+            )
+            if file_id is None:
+                return {
+                    "content": [{"text": _SIGNED_UPLOAD_ISSUER_ARGUMENT_MESSAGE}],
+                    "is_error": True,
+                }
+            if self._workspace is None:
+                return {
+                    "content": [
+                        {"text": _SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE}
+                    ],
+                    "is_error": True,
+                }
+
+            # Lazy import to avoid core -> web layer dependency at module level.
+            from .....web.user_context import UserContext
+
+            user_context = UserContext(current_user_id)
+            tool_meta = self._runtime_mcp_meta()
+            with user_context.set_context():
+                (
+                    invocation_connection,
+                    was_refreshed,
+                ) = await self._invocation_connection()
+                if invocation_connection is None:
+                    return _delegated_authorization_failed_result()
+                try:
+                    _check_signed_upload_connection(
+                        invocation_connection, self._issuer, self.mcp_tool.name
+                    )
+                    try:
+                        staged = await self._stage_external_upload_file(file_id)
+                    except FileNotFoundError:
+                        raise _SignedUploadRefused(
+                            _SIGNED_UPLOAD_ISSUER_FILE_UNAVAILABLE_MESSAGE
+                        ) from None
+                    try:
+                        (
+                            ticket,
+                            _issuing_connection,
+                        ) = await self._issue_and_upload_staged_file(
+                            self._issuer,
+                            staged,
+                            invocation_connection,
+                            tool_meta,
+                            was_refreshed=was_refreshed,
+                        )
+                    finally:
+                        await self._discard_external_upload_args([staged])
+                except _SignedUploadRefused as refused:
+                    return refused.result
+
+            reply: dict[str, str] = {"file_id": ticket.file_id}
+            if ticket.file_id_expires_at is not None:
+                # Written out again rather than passed on, so the model only
+                # ever sees digits and fixed punctuation from the connector.
+                reply["expires_at"] = (
+                    ticket.file_id_expires_at.replace(tzinfo=None).isoformat(
+                        timespec="seconds"
+                    )
+                    + "Z"
+                )
+            return {
+                "content": [{"type": "text", "text": json.dumps(reply)}],
+                "structured_content": reply,
+                "is_error": False,
+            }
+        except BaseExceptionGroup as e:
+            return self._execution_failure_result(e)
+        except Exception as e:
+            return self._execution_failure_result(e)
 
 
 class ChromeExecutionMCPToolAdapter(MCPToolAdapter):
@@ -3790,6 +4761,20 @@ def model_visible_mcp_tools(tools: Iterable[Any]) -> list[Any]:
     ]
 
 
+def _mcp_tool_identity(server_name: str, name_prefix: str) -> tuple[str, str]:
+    """The adapter name prefix and the normalized source server of a tool.
+
+    The prefix puts the server name in the tool name.  The source server is
+    carried as structured metadata, normalized through the same SSOT the
+    selector parse and the config filter use, so that server-scoped selection
+    matches by equality and never re-parses the tool name.
+    """
+    from .selection_spec import normalize_mcp_server_name
+
+    tool_prefix = f"{name_prefix}{server_name}_" if name_prefix else f"{server_name}_"
+    return tool_prefix, normalize_mcp_server_name(server_name)
+
+
 def _build_mcp_tool_adapter(
     server_name: str,
     connection: Connection,
@@ -3801,15 +4786,10 @@ def _build_mcp_tool_adapter(
     workspace: Any | None = None,
     concurrency_safe: bool = False,
     concurrent_tools: Optional[List[str]] = None,
+    signed_upload: SignedUploadBinding | None = None,
 ) -> MCPToolAdapter:
     """Create MCP tool adapter."""
-    # Create tool name with server prefix
-    tool_prefix = f"{name_prefix}{server_name}_" if name_prefix else f"{server_name}_"
-
-    # Carry the originating server identity as structured metadata, normalized
-    # once here through the same SSOT the selector parse / config filter use,
-    # so server-scoped selection matches by equality (no tool-name re-parse).
-    from .selection_spec import normalize_mcp_server_name
+    tool_prefix, source_server = _mcp_tool_identity(server_name, name_prefix)
 
     return MCPToolAdapter(
         mcp_tool=mcp_tool,
@@ -3817,12 +4797,13 @@ def _build_mcp_tool_adapter(
         name_prefix=tool_prefix,
         visibility=visibility,
         allow_users=allow_users,
-        source_server=normalize_mcp_server_name(server_name),
+        source_server=source_server,
         workspace=workspace,
         durable_upload_fields=_durable_upload_fields(server_name, mcp_tool.name),
         durable_upload_own_file_id=_durable_upload_has_own_file_id(
             server_name, mcp_tool.name
         ),
+        external_media_binding=_external_media_binding(server_name, mcp_tool.name),
         workspace_download_field=_workspace_download_field(server_name, mcp_tool.name),
         concurrency_safe=concurrency_safe,
         concurrent_tools=concurrent_tools,
@@ -3830,6 +4811,39 @@ def _build_mcp_tool_adapter(
         # sandboxed loader attach it, so one builder serves both paths and
         # neither can quietly lose the evidence the other keeps.
         raw_annotations=raw_annotations_for(mcp_tool),
+        signed_upload=signed_upload,
+    )
+
+
+def _build_signed_upload_issuer_adapter(
+    server_name: str,
+    connection: Connection,
+    issuer: SignedUploadIssuer,
+    *,
+    name_prefix: str = "mcp_",
+    visibility: Optional[ToolVisibility] = None,
+    allow_users: Optional[List[str]] = None,
+    workspace: Any | None = None,
+    concurrency_safe: bool = False,
+    concurrent_tools: Optional[List[str]] = None,
+) -> SignedUploadIssuerAdapter:
+    """Create the tool that stands in for ``issuer``'s issuing tool.
+
+    The tool's name and its source server come out the same as for an ordinary
+    adapter of the same connector, so it is listed, scoped and allowed like any
+    other tool of that connector.
+    """
+    tool_prefix, source_server = _mcp_tool_identity(server_name, name_prefix)
+    return SignedUploadIssuerAdapter(
+        issuer,
+        connection,
+        name_prefix=tool_prefix,
+        visibility=visibility,
+        allow_users=allow_users,
+        source_server=source_server,
+        workspace=workspace,
+        concurrency_safe=concurrency_safe,
+        concurrent_tools=concurrent_tools,
     )
 
 
@@ -4144,7 +5158,44 @@ async def _load_direct_mcp_tools(
     ``create_session``; tool adapters always receive ``connection`` itself.
     Once the recorder is sealed (the caller abandoned this load), no further
     attempt starts, whatever the transport.
+
+    The connection's signed-upload settings are read once, before any session
+    is opened.  Settings that are not valid end the load with an
+    ``INVALID_CONFIGURATION`` failure and the server is never contacted.  An
+    issuing tool that a setting takes over is replaced by a host tool of the same
+    name; one that only serves a replaced argument is left out of the list.
     """
+    try:
+        signed_uploads = connection_signed_uploads(connection)
+    except ValueError as exc:
+        logger.warning(
+            "Not loading tools from MCP server %s: its signed-upload settings "
+            "are invalid",
+            server_name,
+        )
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=server_name,
+                    phase=MCPFailurePhase.INVALID_CONFIGURATION,
+                    error_type=type(exc).__name__,
+                    attempts=0,
+                ),
+            ),
+        )
+    issuers_by_tool = {
+        entry.issuing_tool_name: entry
+        for entry in signed_uploads
+        if isinstance(entry, SignedUploadIssuer)
+    }
+    bindings = [
+        entry for entry in signed_uploads if isinstance(entry, SignedUploadBinding)
+    ]
+    issuing_tool_names = {binding.issuing_tool_name for binding in bindings}
+    bindings_by_tool = {binding.tool_name: binding for binding in bindings}
+
     agent_tools: list[AbstractBaseTool] = []
     mcp_tools: list[MCPTool] = []
     transport = connection.get("transport", "")
@@ -4260,22 +5311,41 @@ async def _load_direct_mcp_tools(
 
     adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
-        if is_signed_upload_issuing_tool(connection, mcp_tool.name):
-            # The host calls this tool itself while preparing a registered
-            # signed upload; the model never receives the URL it returns.
+        issuer = issuers_by_tool.get(mcp_tool.name)
+        if issuer is None and mcp_tool.name in issuing_tool_names:
+            # The host calls this tool itself while preparing a signed upload
+            # that replaces a file argument of another tool of this connector;
+            # the model never receives the URL it returns.
             continue
         try:
-            adapter = _build_mcp_tool_adapter(
-                server_name,
-                connection,
-                mcp_tool,
-                name_prefix=name_prefix,
-                visibility=visibility,
-                allow_users=allow_users,
-                workspace=workspace,
-                concurrency_safe=concurrency_safe,
-                concurrent_tools=concurrent_tools,
-            )
+            if issuer is not None:
+                # The host runs this issuing tool for the model: the model gets
+                # a tool of the same name that uploads a workspace file and
+                # returns only the connector's file id, never the URL.
+                adapter: MCPToolAdapter = _build_signed_upload_issuer_adapter(
+                    server_name,
+                    connection,
+                    issuer,
+                    name_prefix=name_prefix,
+                    visibility=visibility,
+                    allow_users=allow_users,
+                    workspace=workspace,
+                    concurrency_safe=concurrency_safe,
+                    concurrent_tools=concurrent_tools,
+                )
+            else:
+                adapter = _build_mcp_tool_adapter(
+                    server_name,
+                    connection,
+                    mcp_tool,
+                    name_prefix=name_prefix,
+                    visibility=visibility,
+                    allow_users=allow_users,
+                    workspace=workspace,
+                    concurrency_safe=concurrency_safe,
+                    concurrent_tools=concurrent_tools,
+                    signed_upload=bindings_by_tool.get(mcp_tool.name),
+                )
 
             agent_tools.append(adapter)
             logger.debug(f"Created adapter for tool: {adapter.name}")
@@ -4289,6 +5359,16 @@ async def _load_direct_mcp_tools(
                 type(e).__name__,
             )
             continue
+
+    listed_tool_names = {mcp_tool.name for mcp_tool in mcp_tools}
+    for issuing_tool_name in issuers_by_tool:
+        if issuing_tool_name not in listed_tool_names:
+            logger.warning(
+                "MCP server %s does not list the issuing tool %s named in its "
+                "signed-upload settings; no upload tool is offered",
+                server_name,
+                issuing_tool_name,
+            )
 
     failures: tuple[MCPServerLoadFailure, ...] = ()
     if adapter_error_type is not None:
@@ -4406,8 +5486,9 @@ async def load_mcp_tools_as_agent_tools(
         name_prefix: Prefix for tool names (default: "mcp_")
         visibility: Tool visibility setting
         allow_users: List of allowed user IDs
-        sandbox: Optional sandbox instance. When provided, stdio connections
-            using npx/uvx will be routed through the sandbox for isolation.
+        sandbox: Optional sandbox instance. When provided, eligible stdio
+            connections are routed through it. Connections explicitly marked
+            sandbox_required fail closed when it is unavailable.
         workspace: Current task workspace for durable FileRef upload staging.
 
     Returns:
@@ -4425,7 +5506,14 @@ async def load_mcp_tools_as_agent_tools(
     for server_name, connection in connection_map.items():
         try:
             logger.info(f"Loading tools from MCP server: {server_name}")
-            if sandbox is not None and should_sandbox_mcp_connection(connection):
+            sandbox_required = should_sandbox_mcp_connection(connection)
+            if requires_sandbox_mcp_connection(connection) and sandbox is None:
+                raise RuntimeError(
+                    "This stdio MCP connection requires a sandbox, but no sandbox "
+                    "is available"
+                )
+            if sandbox_required and sandbox is not None:
+                assert sandbox is not None
                 concurrency_safe, concurrent_tools = _connection_concurrency_config(
                     connection
                 )
@@ -4437,6 +5525,7 @@ async def load_mcp_tools_as_agent_tools(
                     _concurrency_safe: bool = concurrency_safe,
                     _concurrent_tools: list[str] = concurrent_tools,
                 ) -> MCPToolAdapter:
+                    # The sandbox runs only stdio connections, whose signed-upload settings are never read.
                     return _build_mcp_tool_adapter(
                         _server_name,
                         _connection,

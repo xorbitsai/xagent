@@ -94,6 +94,8 @@ DISPATCHER_MAX_INFLIGHT_PER_PROCESS = "XAGENT_DISPATCHER_MAX_INFLIGHT_PER_PROCES
 DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS = (
     "XAGENT_DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS"
 )
+DISPATCHER_FAIR_SHARE = "XAGENT_DISPATCHER_FAIR_SHARE"
+DISPATCH_ACCEPT_REQUESTED_CLASS = "XAGENT_DISPATCH_ACCEPT_REQUESTED_CLASS"
 UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
     "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
 )
@@ -143,6 +145,7 @@ FILE_DELIVERY_SIGNED_URL_TTL_SECONDS = "XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECO
 FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
 FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
 FILE_STREAM_TICKET_TTL_SECONDS = "XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"
+EXTERNAL_MEDIA_URL_TTL_SECONDS = "XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
@@ -188,6 +191,7 @@ LLM_STREAM_NO_PAYLOAD_ABORT_MODELS = "XAGENT_LLM_STREAM_NO_PAYLOAD_ABORT_MODELS"
 LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS = "XAGENT_LLM_STREAM_NO_PAYLOAD_TIMEOUT_SECONDS"
 SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
+SANDBOX_PIDS_LIMIT = "SANDBOX_PIDS_LIMIT"
 SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 # Set only inside the sandbox tool runner, which has no database credentials.
@@ -219,6 +223,9 @@ CHECKPOINT_HISTORY_LIMIT = "XAGENT_CHECKPOINT_HISTORY_LIMIT"
 CHECKPOINT_GATE_STALL_WARNING_SECONDS = "XAGENT_CHECKPOINT_GATE_STALL_WARNING_SECONDS"
 ASYNC_TRACE_DB_ENABLED = "XAGENT_ASYNC_TRACE_DB_ENABLED"
 TRACE_DB_MAX_INFLIGHT = "XAGENT_TRACE_DB_MAX_INFLIGHT"
+DB_WRITE_RETRY_ATTEMPTS = "XAGENT_DB_WRITE_RETRY_ATTEMPTS"
+DB_WRITE_RETRY_BASE_DELAY_MS = "XAGENT_DB_WRITE_RETRY_BASE_DELAY_MS"
+DB_WRITE_RETRY_MAX_DELAY_MS = "XAGENT_DB_WRITE_RETRY_MAX_DELAY_MS"
 COMPACT_THRESHOLD_RATIO = "XAGENT_COMPACT_THRESHOLD_RATIO"
 COMPACT_THRESHOLD_DEFAULT = "XAGENT_COMPACT_THRESHOLD_DEFAULT"
 REDIS_URL = "XAGENT_REDIS_URL"
@@ -691,6 +698,21 @@ def get_dispatcher_interactive_reserve_per_process() -> int:
     return _get_positive_int_env(
         DISPATCHER_INTERACTIVE_RESERVE_PER_PROCESS, 0, minimum=0
     )
+
+
+def get_dispatcher_fair_share_enabled() -> bool:
+    """Whether dispatch ranks tenants by the slots they hold here (default off)."""
+
+    return _get_strict_bool_env(DISPATCHER_FAIR_SHARE, False)
+
+
+def get_dispatch_accept_requested_class_enabled() -> bool:
+    """Whether a caller's declared dispatch class may decide a command's class.
+
+    Default off: a declaration is stored but never changes a command's class.
+    """
+
+    return _get_strict_bool_env(DISPATCH_ACCEPT_REQUESTED_CLASS, False)
 
 
 def get_uploaded_file_recovery_interval_seconds() -> int:
@@ -2936,6 +2958,35 @@ def get_file_stream_ticket_ttl_seconds() -> int:
     return ttl
 
 
+def get_external_media_url_ttl_seconds() -> int:
+    """Get the lifetime of an external-service media URL.
+
+    These URLs let a named external provider fetch one registered image. They
+    are deliberately short-lived because the credential appears in the URL.
+
+    Priority:
+        1. XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS environment variable
+        2. Default of 600 (10 minutes)
+    """
+    env_value = os.getenv(EXTERNAL_MEDIA_URL_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 600
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {EXTERNAL_MEDIA_URL_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl < 60 or ttl > 3600:
+        raise ValueError(
+            f"Invalid {EXTERNAL_MEDIA_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be between 60 and 3600 seconds."
+        )
+    return ttl
+
+
 def get_file_delivery_accel_redirect_enabled() -> bool:
     """Return whether private file endpoints may use nginx X-Accel-Redirect."""
     env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED)
@@ -3440,6 +3491,53 @@ def get_trace_db_max_inflight() -> int:
     return _get_positive_int_env(TRACE_DB_MAX_INFLIGHT, 4)
 
 
+def get_db_write_retry_attempts() -> int:
+    """Get the total attempts for a V2 execution-event write, first try included.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_ATTEMPTS environment variable
+        2. Default of 3
+
+    A value of 1 disables retries. SQLite errors are capped at two attempts
+    regardless of this value, because SQLite reports BUSY only after waiting
+    out its busy timeout.
+
+    Returns:
+        Maximum number of attempts, at least 1
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_ATTEMPTS, 3)
+
+
+def get_db_write_retry_base_delay_ms() -> int:
+    """Get the base backoff, in milliseconds, between execution-event write retries.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_BASE_DELAY_MS environment variable
+        2. Default of 50
+
+    The ceiling doubles with each retry up to the maximum delay, and the
+    actual wait is jittered uniformly below that ceiling. Zero retries
+    immediately.
+
+    Returns:
+        Base delay in milliseconds, at least 0
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_BASE_DELAY_MS, 50, minimum=0)
+
+
+def get_db_write_retry_max_delay_ms() -> int:
+    """Get the backoff ceiling, in milliseconds, for execution-event write retries.
+
+    Priority:
+        1. XAGENT_DB_WRITE_RETRY_MAX_DELAY_MS environment variable
+        2. Default of 1000
+
+    Returns:
+        Maximum delay in milliseconds, at least 0
+    """
+    return _get_positive_int_env(DB_WRITE_RETRY_MAX_DELAY_MS, 1000, minimum=0)
+
+
 def get_db_max_overflow() -> int:
     """Get the SQLAlchemy connection pool max overflow for the shared web engine.
 
@@ -3741,6 +3839,34 @@ def get_sandbox_memory() -> int | None:
         except ValueError:
             logger.warning(f"Invalid {SANDBOX_MEMORY} value: {env_str}")
     return None
+
+
+def get_sandbox_pids_limit() -> int | None:
+    """Get the process/thread limit for sandbox containers.
+
+    Priority:
+        1. SANDBOX_PIDS_LIMIT environment variable
+        2. 1024 by default
+
+    Linux counts threads against the pids cgroup. The default therefore
+    leaves enough room for Chrome and numeric libraries while still bounding
+    fork bombs. Set the value to 0 to omit the Docker pids limit on hosts
+    without a pids cgroup controller. Other values below 64 and invalid values
+    fall back to 1024.
+    """
+    value = os.getenv(SANDBOX_PIDS_LIMIT)
+    if value is None or not value.strip():
+        return 1024
+    try:
+        parsed = int(value)
+    except ValueError:
+        parsed = -1
+    if parsed == 0:
+        return None
+    if parsed >= 64:
+        return parsed
+    logger.warning("Invalid %s=%r; falling back to 1024", SANDBOX_PIDS_LIMIT, value)
+    return 1024
 
 
 def get_sandbox_env() -> dict[str, str]:

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 from typing import Any, List, Optional, Protocol
 
+from ..core.memory.access_scope import MemoryAccessScope
 from ..core.memory.base import MemoryStore
 from ..core.memory.core import MemoryNote, MemoryResponse
 from .memory_lifecycle import MemoryLifecycleStatus, MemoryUnavailableError
@@ -74,6 +75,36 @@ class RevocableMemoryStore(MemoryStore):
     def revoked(self) -> bool:
         """Whether this reference has been superseded."""
         return self._source.publication_generation() != self._generation
+
+    def with_memory_access_scope(
+        self, access_scope: MemoryAccessScope
+    ) -> "RevocableMemoryStore":
+        """Copy this publication guard around a fixed-scope delegate.
+
+        The source and generation remain identical, so a task-specific wrapper
+        cannot outlive the admitted publication from which it was derived.
+        Unsupported delegate compositions fail closed.
+        """
+        binder = getattr(self._base_store, "with_memory_access_scope", None)
+        if not callable(binder):
+            raise TypeError("memory publication does not support fixed access scopes")
+        bound = binder(access_scope)
+        if bound is self._base_store:
+            raise TypeError("memory publication did not create a rebound access scope")
+        if not isinstance(bound, MemoryStore):
+            raise TypeError(
+                "memory publication returned an invalid rebound access scope"
+            )
+        return RevocableMemoryStore(
+            base_store=bound,
+            source=self._source,
+            generation=self._generation,
+        )
+
+    def unwrapped_store(self) -> Any:
+        """Return the storage adapter behind all supported wrappers."""
+        unwrapped = getattr(self._base_store, "unwrapped_store", None)
+        return unwrapped() if callable(unwrapped) else self._base_store
 
     # -- MemoryStore surface ---------------------------------------------
 
@@ -125,13 +156,8 @@ def unwrap_memory_store(store: Any) -> Any:
     Reports what the storage adapter actually is, without asserting that a
     revoked reference is usable -- unwrapping is description, not access.
     """
-    # Imported here: user_isolated_memory has no reason to know about this
-    # module, and a module-level import would make that dependency circular.
-    from .user_isolated_memory import UserIsolatedMemoryStore
-
-    while isinstance(store, (RevocableMemoryStore, UserIsolatedMemoryStore)):
-        store = store._base_store
-    return store
+    unwrapped = getattr(store, "unwrapped_store", None)
+    return unwrapped() if callable(unwrapped) else store
 
 
 __all__ = [

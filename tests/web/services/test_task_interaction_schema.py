@@ -1069,6 +1069,8 @@ def test_none_as_null_is_limited_to_explicit_column_contracts() -> None:
     Interaction payloads distinguish absent answers and reject absent requests.
     Upload cleanup manifests use SQL NULL when no manifest has been persisted,
     so unclaimed uploads do not block migration downgrade.
+    MCP server signed-upload settings store SQL NULL when a connector has none,
+    matching the rows that predate the column.
 
     Imports xagent.web.models first (same reason as
     test_table_is_registered_in_metadata above) so every model's table is
@@ -1089,6 +1091,7 @@ def test_none_as_null_is_limited_to_explicit_column_contracts() -> None:
         ("task_interaction_requests", "request_payload"),
         ("task_interaction_requests", "response_payload"),
         ("uploaded_files", "cleanup_manifest"),
+        ("mcp_servers", "signed_uploads"),
     }
 
 

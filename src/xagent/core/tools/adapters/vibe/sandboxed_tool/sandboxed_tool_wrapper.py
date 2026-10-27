@@ -58,6 +58,50 @@ SANDBOX_BASE_DEPENDENCIES = [
 ]
 
 
+async def _write_sandbox_file_cancellation_safe(
+    sandbox: Sandbox,
+    content: str,
+    remote_path: str,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """Finish an in-flight upload before propagating caller cancellation.
+
+    Docker file writes use ``asyncio.to_thread`` internally. Cancelling the
+    await does not stop that worker, so cleanup could otherwise delete the
+    destination before the worker recreates it. Shield and drain the owned
+    upload task first; its own failure still propagates normally when the
+    caller was not cancelled.
+    """
+    upload = asyncio.create_task(
+        sandbox.write_file(content, remote_path, overwrite=overwrite)
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(upload)
+        except asyncio.CancelledError as error:
+            current = asyncio.current_task()
+            caller_is_cancelling = current is not None and current.cancelling() > 0
+            if not caller_is_cancelling:
+                raise
+            if cancellation is None:
+                cancellation = error
+            if not upload.done():
+                continue
+            try:
+                upload.result()
+            except BaseException as upload_error:
+                raise cancellation from upload_error
+        except BaseException as upload_error:
+            if cancellation is not None:
+                raise cancellation from upload_error
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return
+
+
 class _StaticSandboxLease:
     """Async context manager that exposes one fixed sandbox."""
 
@@ -216,6 +260,7 @@ class SandboxDependencyManager:
                         sandbox.exec(
                             "pip",
                             "install",
+                            "--user",
                             "--break-system-packages",
                             "-r",
                             "/tmp/requirements.txt",
@@ -463,11 +508,21 @@ class SandboxedToolWrapper(AbstractBaseTool):
         )
 
     def _build_execution_command(
-        self, args: Mapping[str, Any], result_file: str
+        self,
+        args: Mapping[str, Any],
+        result_file: str,
+        *,
+        args_file: str | None = None,
+        init_params_file: str | None = None,
     ) -> list[str]:
-        """Build the sandbox command used to execute a tool runner."""
-        args_json = json.dumps(dict(args), ensure_ascii=False)
-        args_b64 = base64.b64encode(args_json.encode("utf-8")).decode("ascii")
+        """Build the sandbox command used to execute a tool runner.
+
+        Runtime callers pass private sandbox-side files for tool arguments and
+        constructor parameters.  The base64 form remains only as a compatibility
+        seam for direct runner tests; base64 is encoding, not secret redaction,
+        so production must never put connection environments or user arguments
+        in the process argv.
+        """
         execution_spec_json = json.dumps(self._execution_spec, ensure_ascii=False)
         execution_spec_b64 = base64.b64encode(
             execution_spec_json.encode("utf-8")
@@ -478,13 +533,20 @@ class SandboxedToolWrapper(AbstractBaseTool):
             _TOOL_RUNNER_PATH,
             "--execution-spec-b64",
             execution_spec_b64,
-            "--args-b64",
-            args_b64,
             "--result-file",
             result_file,
         ]
+        if args_file is not None:
+            command.extend(["--args-file", args_file])
+        else:
+            args_json = json.dumps(dict(args), ensure_ascii=False)
+            args_b64 = base64.b64encode(args_json.encode("utf-8")).decode("ascii")
+            command.extend(["--args-b64", args_b64])
         if self._init_params_b64 is not None:
-            command.extend(["--init-params-b64", self._init_params_b64])
+            if init_params_file is not None:
+                command.extend(["--init-params-file", init_params_file])
+            else:
+                command.extend(["--init-params-b64", self._init_params_b64])
         return command
 
     async def get_sandbox_for_test(self) -> Sandbox:
@@ -649,51 +711,85 @@ class SandboxedToolWrapper(AbstractBaseTool):
     async def _run_json_in_sandbox(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously in sandbox"""
 
-        # Generate unique result file name
-        result_file = f"/tmp/xagent_result_{uuid.uuid4().hex}.json"
+        # Keep every per-call payload in a private sandbox-side file. In
+        # particular, MCP adapter init params contain the connection env, and
+        # command-line base64 would expose those secrets through /proc and
+        # process listings to other code running as the same sandbox user.
+        call_id = uuid.uuid4().hex
+        result_file = f"/tmp/xagent_result_{call_id}.json"
+        args_file = f"/tmp/xagent_args_{call_id}.json"
+        init_params_file = f"/tmp/xagent_init_{call_id}.b64"
 
         try:
             async with self._lease_sandbox() as sandbox:
                 # Ensure dependencies are installed
                 await self._ensure_dependencies(sandbox)
+                try:
+                    await _write_sandbox_file_cancellation_safe(
+                        sandbox,
+                        json.dumps(dict(args), ensure_ascii=False),
+                        args_file,
+                        overwrite=False,
+                    )
+                    if self._init_params_b64 is not None:
+                        await _write_sandbox_file_cancellation_safe(
+                            sandbox,
+                            self._init_params_b64,
+                            init_params_file,
+                            overwrite=False,
+                        )
 
-                # Execute script in sandbox
-                logger.debug(f"Executing tool {self._target.name} in sandbox")
-                command = self._build_execution_command(args, result_file)
-                timeout_seconds = self._exec_timeout() if self._exec_timeout else None
-                if timeout_seconds is not None:
-                    # Bound inside the sandbox: `timeout` kills the runner's
-                    # whole process group, which cancelling this await would not.
-                    # SIGKILL rather than TERM-then-KILL: once the runner dies
-                    # `timeout` exits, so a delayed KILL would never reach a
-                    # child that ignores SIGTERM.
-                    command = ["timeout", "-s", "KILL", str(timeout_seconds), *command]
-                started = time.monotonic()
-                result = await sandbox.exec(
-                    command[0], *command[1:], env=self._build_execution_env()
-                )
-
-                if (
-                    timeout_seconds is not None
-                    and result.exit_code in _SIGKILL_EXIT_CODES
-                    and time.monotonic() - started >= timeout_seconds
-                ):
-                    raise RuntimeError(
-                        f"Tool execution timed out after {timeout_seconds} seconds "
-                        "and its sandbox process was terminated. Split the work "
-                        "into smaller steps or avoid unbounded operations such as "
-                        "recursive scans of '/'."
+                    # Execute script in sandbox
+                    logger.debug(f"Executing tool {self._target.name} in sandbox")
+                    command = self._build_execution_command(
+                        args,
+                        result_file,
+                        args_file=args_file,
+                        init_params_file=init_params_file,
+                    )
+                    timeout_seconds = (
+                        self._exec_timeout() if self._exec_timeout else None
+                    )
+                    if timeout_seconds is not None:
+                        # Bound inside the sandbox: `timeout` kills the runner's
+                        # whole process group, which cancelling this await would not.
+                        # SIGKILL rather than TERM-then-KILL: once the runner dies
+                        # `timeout` exits, so a delayed KILL would never reach a
+                        # child that ignores SIGTERM.
+                        command = [
+                            "timeout",
+                            "-s",
+                            "KILL",
+                            str(timeout_seconds),
+                            *command,
+                        ]
+                    started = time.monotonic()
+                    result = await sandbox.exec(
+                        command[0], *command[1:], env=self._build_execution_env()
                     )
 
-                # Check execution result
-                if result.exit_code != 0:
-                    error_msg = result.stderr or result.error_message or "Unknown error"
-                    logger.error(f"Tool execution failed: {error_msg}")
-                    raise RuntimeError(f"Tool execution failed: {error_msg}")
+                    if (
+                        timeout_seconds is not None
+                        and result.exit_code in _SIGKILL_EXIT_CODES
+                        and time.monotonic() - started >= timeout_seconds
+                    ):
+                        raise RuntimeError(
+                            f"Tool execution timed out after {timeout_seconds} seconds "
+                            "and its sandbox process was terminated. Split the work "
+                            "into smaller steps or avoid unbounded operations such as "
+                            "recursive scans of '/'."
+                        )
 
-                # Read output from result file
-                output = ""
-                try:
+                    # Check execution result
+                    if result.exit_code != 0:
+                        error_msg = (
+                            result.stderr or result.error_message or "Unknown error"
+                        )
+                        logger.error(f"Tool execution failed: {error_msg}")
+                        raise RuntimeError(f"Tool execution failed: {error_msg}")
+
+                    # Read output from result file
+                    output = ""
                     read_result = await sandbox.exec("cat", result_file)
                     if read_result.exit_code != 0:
                         logger.error(
@@ -716,9 +812,18 @@ class SandboxedToolWrapper(AbstractBaseTool):
                     )
                     raise RuntimeError(f"Failed to parse tool output: {e}")
                 finally:
-                    # Clean up result file
+                    # Always clean up private inputs, including when writing the
+                    # second payload, launching the process, or waiting for it
+                    # fails or is cancelled. Do this before releasing the worker
+                    # lease so another call cannot observe stale credentials.
                     try:
-                        await sandbox.exec("rm", "-f", result_file)
+                        await sandbox.exec(
+                            "rm",
+                            "-f",
+                            result_file,
+                            args_file,
+                            init_params_file,
+                        )
                     except Exception:
                         pass
 

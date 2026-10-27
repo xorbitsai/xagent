@@ -327,6 +327,18 @@ async def test_worker_runs_process_diagnostics_until_stop(
 
     monkeypatch.setattr(worker, "start_process_diagnostics", start_diagnostics)
     monkeypatch.setattr(worker, "stop_process_diagnostics", stop_diagnostics)
+    telemetry = SimpleNamespace(name="telemetry")
+
+    def start_telemetry():
+        order.append("telemetry_start")
+        return telemetry
+
+    async def stop_telemetry(task):
+        seen["telemetry_stopped"] = task
+        order.append("telemetry_stop")
+
+    monkeypatch.setattr(worker, "start_process_runtime_telemetry", start_telemetry)
+    monkeypatch.setattr(worker, "stop_process_runtime_telemetry", stop_telemetry)
 
     async def supervise(executor, stop_event):
         assert "diagnostics_start" in order
@@ -340,10 +352,13 @@ async def test_worker_runs_process_diagnostics_until_stop(
     if shutdown_step_fails:
         with pytest.raises(ConnectionError):
             await worker.run_worker(stop=stop)
-        assert order[-1] == "diagnostics_stop"
     else:
         await worker.run_worker(stop=stop)
         assert order.index("drain") < order.index("diagnostics_stop")
-        assert order[-1] == "diagnostics_stop"
+    # Metric export is flushed last, after the final diagnostics line, even
+    # when a shutdown step fails.
+    assert order[-2:] == ["diagnostics_stop", "telemetry_stop"]
+    assert order.index("telemetry_start") < order.index("dispatch")
     assert order.index("dispatch") < order.index("diagnostics_start")
     assert seen["stopped"] is diagnostics
+    assert seen["telemetry_stopped"] is telemetry

@@ -7,13 +7,14 @@ import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
-import type { SessionStopState } from "@/contexts/app-context-chat";
+import type { SessionAttachmentsConfig, SessionStopState } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { apiRequest, classifyUploadError, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { clientErrorTranslationKey, readClientErrorCode } from "@/lib/client-errors";
 import { normalizeUploadFileIds } from "@/lib/upload-file-ids";
+import { capabilityRefusal } from "@/lib/widget-session-upload";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
@@ -35,6 +36,11 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+
+export type ComposerAttachmentStatus = "uploading" | "uploaded" | "failed";
+
+const DEFAULT_FILE_ACCEPT =
+  ".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp";
 
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
@@ -78,6 +84,23 @@ interface ChatInputProps {
   }>;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
   deferFileUpload?: boolean;
+  /**
+   * Upload-only mode for a composer whose `filesDisabled` is set: the visitor
+   * may pick, drop and paste files, which are collected in `files` for the
+   * caller to upload and send. Everything that reads a file back (mentions,
+   * chip previews) stays governed by `filesDisabled`, and this composer never
+   * uploads a file itself in this mode.
+   */
+  attachments?: SessionAttachmentsConfig;
+  /** Upload state of each collected file, kept by the caller in this mode. */
+  attachmentStatuses?: ReadonlyMap<File, ComposerAttachmentStatus>;
+  onRetryAttachment?: (file: File) => void;
+  /**
+   * True while the caller is uploading files or sending a message with files.
+   * Retrying a failed file is refused until it is false again, so a retry never
+   * starts beside work that is already in flight.
+   */
+  attachmentsBusy?: boolean;
 }
 
 type ExecutionMode = "auto" | "flash" | "balanced" | "think";
@@ -137,6 +160,10 @@ export function ChatInput({
   selectedAgents = [],
   uploadFile,
   deferFileUpload = false,
+  attachments,
+  attachmentStatuses,
+  onRetryAttachment,
+  attachmentsBusy = false,
 }: ChatInputProps) {
   const router = useRouter();
   const [internalMessage, setInternalMessage] = useState("");
@@ -267,9 +294,14 @@ export function ChatInput({
     t,
     filesDisabled,
   );
+  // Whether the composer may collect files at all. `filesDisabled` alone also
+  // closes every file read, which upload-only mode must not reopen, so only the
+  // collecting sites below use this instead of `filesDisabled`.
+  const filesBlocked = filesDisabled && !attachments;
+  const attachmentsPaused = !!attachments && !!currentInteractionRequestId;
   const enabledFiles = useMemo(
-    () => filesDisabled ? [] : files,
-    [files, filesDisabled],
+    () => filesBlocked ? [] : files,
+    [files, filesBlocked],
   );
 
   // Track files for async operations
@@ -489,13 +521,50 @@ export function ChatInput({
     }
   };
 
+  // Applies the advertised limits to files the visitor is adding, before any of
+  // them is collected. Each kind of refusal is reported once per selection.
+  const admitAttachments = (
+    newFiles: File[],
+    limits: SessionAttachmentsConfig,
+  ): File[] => {
+    const admitted: File[] = [];
+    const refused = new Set<"type" | "size" | "count">();
+    for (const file of newFiles) {
+      const refusal = capabilityRefusal(file, limits);
+      if (refusal) {
+        refused.add(refusal);
+      } else if (filesRef.current.length + admitted.length >= limits.maxFiles) {
+        refused.add("count");
+      } else {
+        admitted.push(file);
+      }
+    }
+    if (refused.has("type")) toast.error(t("widgetSession.attachments.typeNotSupported"));
+    if (refused.has("size")) toast.error(t("clientErrors.uploadTooLarge"));
+    if (refused.has("count")) {
+      toast.error(t("widgetSession.attachments.tooManyFiles", { count: limits.maxFiles }));
+    }
+    return admitted;
+  };
+
   const appendFiles = (newFiles: File[]) => {
     if (
-      filesDisabled
+      filesBlocked
       || newFiles.length === 0
       || !onFilesChange
       || isInputBusy
     ) return;
+    if (attachments) {
+      // Upload-only mode: the caller owns uploading, so nothing here uploads,
+      // whatever `deferFileUpload` says.
+      if (attachmentsPaused) {
+        toast.error(t("widgetSession.attachments.noFilesOnAnswer"));
+        return;
+      }
+      const admitted = admitAttachments(newFiles, attachments);
+      if (admitted.length > 0) onFilesChange([...filesRef.current, ...admitted]);
+      return;
+    }
     onFilesChange([...filesRef.current, ...newFiles]);
     if (!deferFileUpload) {
       uploadFiles(newFiles);
@@ -708,7 +777,8 @@ export function ChatInput({
   const offersStopControl = compact && !!onStop;
   const isStopInFlight = offersStopControl && stopState === "stopping";
   const canSubmit = () => {
-    const isUploadingFiles = uploadingFiles.size > 0;
+    const isUploadingFiles = uploadingFiles.size > 0
+      || enabledFiles.some((file) => attachmentStatuses?.get(file) === "uploading");
     // A stop request the server has not answered yet still owns this turn, so
     // a composer that offers the stop control accepts nothing new until it
     // resolves: the send control stays in its slot, dimmed and inert, instead
@@ -779,7 +849,7 @@ export function ChatInput({
       !isFileDragEvent(e)
       || isInputBusy
       || hideFileUpload
-      || filesDisabled
+      || filesBlocked
     ) return;
     e.preventDefault();
     e.stopPropagation();
@@ -792,7 +862,7 @@ export function ChatInput({
       !isFileDragEvent(e)
       || isInputBusy
       || hideFileUpload
-      || filesDisabled
+      || filesBlocked
     ) return;
     e.preventDefault();
     e.stopPropagation();
@@ -817,7 +887,7 @@ export function ChatInput({
       !isFileDragEvent(e)
       || isInputBusy
       || hideFileUpload
-      || filesDisabled
+      || filesBlocked
     ) return;
     e.preventDefault();
     e.stopPropagation();
@@ -980,7 +1050,7 @@ export function ChatInput({
     const items = Array.from(e.clipboardData.items || []);
     const fileItems = items.filter(item => item.kind === 'file');
 
-    if (fileItems.length > 0 && !hideFileUpload && !filesDisabled) {
+    if (fileItems.length > 0 && !hideFileUpload && !filesBlocked) {
       e.preventDefault();
       const pastedFiles: File[] = [];
 
@@ -1021,7 +1091,7 @@ export function ChatInput({
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (filesDisabled) return;
+    if (filesBlocked) return;
 
     const selectedFiles = Array.from(e.target.files || []);
     appendFiles(selectedFiles);
@@ -1137,13 +1207,17 @@ export function ChatInput({
           {enabledFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
               {enabledFiles.map((file, index) => {
-                const isUploading = uploadingFiles.has(`${file.name}-${file.lastModified}`);
+                const attachmentStatus = attachmentStatuses?.get(file);
+                const isUploading = attachmentStatus === "uploading"
+                  || uploadingFiles.has(`${file.name}-${file.lastModified}`);
+                const isFailed = attachmentStatus === "failed";
                 return (
                   <div
                     key={index}
                     className={cn(
                       "inline-flex h-8 items-center gap-2 rounded-md border border-slate-200 bg-slate-100 px-3 text-sm text-slate-700 animate-fade-in-scale transition-colors",
-                      isUploading && "opacity-70"
+                      isUploading && "opacity-70",
+                      isFailed && "border-red-300 bg-red-50 text-red-700"
                     )}
                   >
                     <div className="flex h-4 w-4 items-center justify-center text-slate-600">
@@ -1154,6 +1228,21 @@ export function ChatInput({
                       )}
                     </div>
                     <span className="max-w-[180px] truncate font-medium">{file.name}</span>
+                    {attachmentStatus === "uploading" && (
+                      <span className="text-xs text-slate-500">
+                        {t("widgetSession.attachments.uploading")}
+                      </span>
+                    )}
+                    {isFailed && (
+                      <button
+                        type="button"
+                        onClick={() => onRetryAttachment?.(file)}
+                        disabled={attachmentsBusy}
+                        className="text-xs font-medium underline underline-offset-2 disabled:pointer-events-none disabled:opacity-50"
+                      >
+                        {t("widgetSession.attachments.uploadFailedRetry")}
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => removeFile(index)}
@@ -1202,7 +1291,7 @@ export function ChatInput({
           {/* Bottom toolbar or inline button */}
           {compact ? (
             <div className="absolute right-2 bottom-2 flex items-center gap-2">
-              {!hideFileUpload && !filesDisabled && (
+              {!hideFileUpload && !filesBlocked && (
                 <>
                   <input
                     ref={fileInputRef}
@@ -1210,7 +1299,7 @@ export function ChatInput({
                     multiple
                     onChange={handleFileSelect}
                     className="hidden"
-                    accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                    accept={attachments?.accept ?? DEFAULT_FILE_ACCEPT}
                   />
                   <Button
                     type="button"
@@ -1218,7 +1307,7 @@ export function ChatInput({
                     size="sm"
                     className="h-8 w-8 p-0 text-muted-foreground hover:text-foreground hover:bg-secondary/80 rounded-full"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={isInputBusy}
+                    disabled={isInputBusy || attachmentsPaused}
                     title={t("chatPage.input.actions.upload")}
                   >
                     <Paperclip className="h-4 w-4" />
@@ -1372,18 +1461,18 @@ export function ChatInput({
                   </Popover>
                 )}
                 {/* Add files or bind this new task to a local host window. */}
-                {(!hideFileUpload && !filesDisabled)
+                {(!hideFileUpload && !filesBlocked)
                   || showLocalBrowser
                   || showTaskRuntimeExtension ? (
                   <>
-                    {!hideFileUpload && !filesDisabled && (
+                    {!hideFileUpload && !filesBlocked && (
                       <input
                         ref={fileInputRef}
                         type="file"
                         multiple
                         onChange={handleFileSelect}
                         className="hidden"
-                        accept=".pdf,.doc,.docx,.txt,.md,.csv,.json,.xlsx,.xls,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp"
+                        accept={attachments?.accept ?? DEFAULT_FILE_ACCEPT}
                       />
                     )}
                     <LocalBrowserMenu
@@ -1393,7 +1482,7 @@ export function ChatInput({
                       extensionSelection={taskRuntimeSelection}
                       onExtensionSelectionChange={setTaskRuntimeSelection}
                       onAddFiles={
-                        !hideFileUpload && !filesDisabled
+                        !hideFileUpload && !filesBlocked && !attachmentsPaused
                           ? () => fileInputRef.current?.click()
                           : undefined
                       }

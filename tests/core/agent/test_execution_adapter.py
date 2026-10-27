@@ -11,10 +11,14 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig, ReActPattern
+from xagent.core.agent.context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+)
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.core.agent.service import AgentService
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
 
@@ -53,6 +57,9 @@ class TracerCheckpointStore:
     async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
         payload = self.by_execution_id.get(execution_id)
         return dict(payload) if payload is not None else None
+
+    async def trace_event(self, event_type: Any, **kwargs: Any) -> str:
+        return f"{event_type}-{kwargs.get('execution_id', 'execution')}"
 
 
 class RecordingTracer:
@@ -169,6 +176,37 @@ def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -
     assert metadata["builtin_agent_name"] == "internal_worker"
     assert normalized["metadata"]["agent_type"] == "builtin"
     assert normalized["metadata"]["builtin_agent_name"] == "internal_worker"
+
+
+@pytest.mark.asyncio
+async def test_fresh_execution_uses_server_memory_fingerprint_over_request_context() -> (
+    None
+):
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="memory-policy",
+            pattern="react",
+            llm=FakeLLM(["done"]),
+            tools=[],
+            execution_metadata={
+                MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "trusted"
+            },
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(
+        task="answer",
+        task_id="memory-policy",
+        context={MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "spoofed"},
+    )
+
+    assert (
+        result["agent_result"]["context"].metadata[
+            MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+        ]
+        == "trusted"
+    )
 
 
 @pytest.mark.parametrize("pattern_name", ["dag_plan_execute", "auto"])
@@ -1859,6 +1897,8 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
 ) -> None:
     old_tool = FakeTool()
     new_tool = FakeTool()
+    old_memory = InMemoryMemoryStore()
+    new_memory = InMemoryMemoryStore()
     llm = FakeLLM(
         [
             {
@@ -1880,6 +1920,10 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
             pattern="react",
             llm=llm,
             tools=[old_tool],
+            memory_store=old_memory,
+            execution_metadata={
+                MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "scope-a"
+            },
             tracer=TracerCheckpointStore(),
             skill_manager=NoSkillManager(),
         )
@@ -1889,6 +1933,7 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     handle = adapter.registry.get("refresh-tools-exec")
     assert handle is not None
     assert handle.runner.agent.tools == [old_tool]
+    assert handle.runner.agent.memory_store is old_memory
 
     await adapter.post_user_message(
         "refresh-tools-exec", "Connection settings updated.", request_interrupt=False
@@ -1896,13 +1941,20 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     # AgentService rebuilds its tools before resuming an existing runner.
     # The refreshed objects (including removals) must reach that runner too.
     adapter.config.tools = [] if remove_tool else [new_tool]
+    adapter.config.memory_store = new_memory
+    adapter.config.execution_metadata[
+        MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY
+    ] = "scope-b"
     # Even if the model repeats the old tool name, a removed tool must not run.
     llm.responses.append(
         {"tool_calls": [{"id": "call-noop", "name": "noop", "args": {}}]}
     )
     llm.responses.append("done")
 
-    resumed = await adapter.resume("refresh-tools-exec")
+    resumed = await adapter.resume(
+        "refresh-tools-exec",
+        metadata={MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY: "spoofed"},
+    )
 
     assert resumed is not None
     assert resumed["status"] == "completed"
@@ -1911,6 +1963,12 @@ async def test_execution_adapter_resume_refreshes_cached_runner_tools(
     assert old_tool.teardown_calls == ["refresh-tools-exec"]
     assert new_tool.calls == ([] if remove_tool else [{}])
     assert handle.runner.agent.tools == adapter.config.tools
+    assert handle.runner.agent.memory_store is new_memory
+    resumed_context = resumed["agent_result"]["context"]
+    assert (
+        resumed_context.metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY]
+        == "scope-b"
+    )
     resumed_names = {schema["function"]["name"] for schema in llm.calls[1]["tools"]}
     assert ("noop" in resumed_names) is not remove_tool
 

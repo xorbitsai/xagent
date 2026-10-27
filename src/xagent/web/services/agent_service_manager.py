@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import time
 from collections import deque
 from dataclasses import dataclass
 from itertools import count
@@ -17,6 +18,9 @@ from ...config import (
     get_external_upload_dirs,
     get_shared_task_execution_enabled,
 )
+from ...core.agent.context.memory_retrieval import (
+    MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY,
+)
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
@@ -26,6 +30,10 @@ from ...core.execution_scope import (
     get_execution_scope,
     resolve_execution_scope,
     scope_fingerprint,
+)
+from ...core.memory.access_scope import (
+    MemoryAccessScope,
+    bind_memory_access_scope,
 )
 from ...core.memory.base import MemoryStore
 from ...core.memory.in_memory import InMemoryMemoryStore
@@ -108,7 +116,11 @@ from .memory_availability import (
     public_memory_availability_reason,
 )
 from .memory_policy import (
+    MEMORY_POLICY_BINDING_FAILURE_REASON,
+    MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON,
+    MEMORY_POLICY_TASK_MISSING_REASON,
     MemoryPolicyRequest,
+    memory_retrieval_scope_fingerprint,
     resolve_trusted_memory_policy,
 )
 from .task_execution_context_service import (
@@ -137,11 +149,13 @@ from .task_runtime import (
     registered_task_extensions,
 )
 from .task_setup_snapshot import (
+    MemoryPolicyTaskFields,
     RuntimeUserFields,
     TaskModelOverride,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
     detach_runtime_user_fields,
+    load_memory_policy_task_fields_sync,
     load_task_setup_snapshot_sync,
 )
 from .task_workspace_cleanup import (
@@ -165,6 +179,7 @@ logger = logging.getLogger(__name__)
 
 # Depth of the per-task recently evicted scope fingerprints used to detect cycles.
 _EVICTED_FINGERPRINT_MEMORY = 4
+_MEMORY_METADATA_INPUT_UNSET = object()
 
 
 def _is_published_agent(agent: Agent) -> bool:
@@ -231,13 +246,21 @@ class AgentServiceMemoryPolicy:
     memory_enabled: bool
     memory_available: bool = True
     memory_availability_reason: str | None = None
+    memory_access_scope: MemoryAccessScope | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
         """The reason as a caller may see it."""
         return public_memory_availability_reason(self.memory_availability_reason)
 
-    def execution_metadata(self) -> dict[str, Any]:
+    def execution_metadata(
+        self,
+        *,
+        ambient_owner_user_id: int | None | object = _MEMORY_METADATA_INPUT_UNSET,
+        ambient_execution_scope: ExecutionScope | None | object = (
+            _MEMORY_METADATA_INPUT_UNSET
+        ),
+    ) -> dict[str, Any]:
         """Caller-safe availability for checkpoints and task trace metadata.
 
         Empty while memory is available, so an ordinary task's trace is
@@ -246,12 +269,35 @@ class AgentServiceMemoryPolicy:
         be folded before persistence. The raw reason remains available on this
         policy object for operator logging only.
         """
-        if self.memory_available:
-            return {}
-        return {
-            MEMORY_AVAILABLE_METADATA_KEY: False,
-            MEMORY_AVAILABILITY_REASON_METADATA_KEY: self.public_availability_reason,
-        }
+        metadata: dict[str, Any] = {}
+        if (
+            ambient_owner_user_id is not _MEMORY_METADATA_INPUT_UNSET
+            and ambient_execution_scope is not _MEMORY_METADATA_INPUT_UNSET
+        ):
+            metadata[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY] = (
+                memory_retrieval_scope_fingerprint(
+                    enabled=self.memory_enabled and self.memory_available,
+                    access_scope=self.memory_access_scope,
+                    ambient_owner_user_id=cast(
+                        int | None,
+                        ambient_owner_user_id,
+                    ),
+                    ambient_execution_scope=cast(
+                        ExecutionScope | None,
+                        ambient_execution_scope,
+                    ),
+                )
+            )
+        if not self.memory_available:
+            metadata.update(
+                {
+                    MEMORY_AVAILABLE_METADATA_KEY: False,
+                    MEMORY_AVAILABILITY_REASON_METADATA_KEY: (
+                        self.public_availability_reason
+                    ),
+                }
+            )
+        return metadata
 
 
 def _optional_task_int(task: Any, field: str) -> int | None:
@@ -292,7 +338,7 @@ def resolve_agent_service_memory_policy(
         if override is not None and not override.available:
             logger.warning(
                 "Trusted memory policy made persistent memory unavailable (%s)",
-                override.reason,
+                public_memory_availability_reason(override.reason),
             )
         return AgentServiceMemoryPolicy(
             memory=InMemoryMemoryStore(),
@@ -302,7 +348,7 @@ def resolve_agent_service_memory_policy(
         )
 
     try:
-        memory = get_memory_store()
+        memory: MemoryStore = get_memory_store()
     except MemoryUnavailableError as error:
         # Persistent memory is fenced off -- blocked on repair, awaiting a
         # restart, or transiently unavailable. The task still starts; it simply
@@ -319,11 +365,25 @@ def resolve_agent_service_memory_policy(
             memory_availability_reason=error.status.state.value,
         )
 
+    access_scope = override.memory_access_scope if override is not None else None
+    if access_scope is not None:
+        try:
+            memory = bind_memory_access_scope(memory, access_scope)
+        except Exception:
+            logger.warning("Trusted memory access-scope binding failed")
+            return AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=MEMORY_POLICY_BINDING_FAILURE_REASON,
+            )
+
     return AgentServiceMemoryPolicy(
         memory=memory,
         memory_enabled=enabled,
         memory_available=True if override is None else override.available,
         memory_availability_reason=None if override is None else override.reason,
+        memory_access_scope=access_scope,
     )
 
 
@@ -749,14 +809,20 @@ async def create_default_tools(
 
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
+    workspace_config_getter = getattr(tool_config, "get_workspace_config", None)
+    workspace_config = (
+        workspace_config_getter() if callable(workspace_config_getter) else None
+    )
+    try:
+        workspace = await ToolFactory.create_workspace_async(tool_config, strict=True)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}") from exc
+    if workspace_config and workspace is None:
+        raise RuntimeError(f"Failed to prepare workspace for task {task_id}")
+
     runtime_contribution = EMPTY_TASK_RUNTIME_CONTRIBUTION
     if task_runtime_context is not None and registered_task_extensions():
         try:
-            workspace = await asyncio.to_thread(
-                ToolFactory.create_workspace,
-                tool_config.get_workspace_config(),
-            )
-            tool_config.set_task_runtime_workspace(workspace)
             runtime_contribution = await build_task_runtime(
                 task_runtime_context.with_workspace(workspace)
             )
@@ -1222,6 +1288,22 @@ async def _load_task_setup_snapshot_for_agent(
     )
 
 
+async def _load_memory_policy_task_fields_for_agent(
+    task_id: int,
+    task_owner_user_id: int | None,
+    caller_db: Session | None,
+) -> MemoryPolicyTaskFields | None:
+    """Load the authoritative warm-cache policy projection off the loop."""
+
+    return await _run_agent_runtime_db_io(
+        caller_db,
+        lambda: load_memory_policy_task_fields_sync(
+            task_id,
+            task_owner_user_id,
+        ),
+    )
+
+
 # Bound invalidation waits for an unlocked but FIFO-queued build lock.
 _INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
 
@@ -1230,6 +1312,23 @@ _INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
 # only after its original manager was replaced. Reusing a token then would
 # recreate the same ABA hazard as removing and rebuilding one task entry.
 _agent_run_generation_counter = count(1)
+
+# A cached runtime that no execution is using is dropped once this long has
+# passed since it was last acquired, its execution last ended, or its turn last
+# settled. The window keeps a quick follow-up turn on the warm instance.
+_IDLE_RUNTIME_MAX_AGE_SECONDS = 120.0
+# The soft cap never drops a runtime active within this many seconds, which
+# covers the gap between ``get_agent_for_task`` returning and the execution
+# registering itself.
+_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS = 30.0
+# A paused or waiting-for-user execution still owns its slot for a later
+# resume, so its runtime is kept much longer.
+_IDLE_RESUMABLE_MAX_AGE_SECONDS = 1800.0
+# Most idle-but-not-yet-expired runtimes one process keeps once they are older
+# than ``_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS``; the least recently active go
+# first once the count is exceeded.
+_IDLE_RUNTIME_SOFT_CAP = 128
+_IDLE_SWEEP_INTERVAL_SECONDS = 60.0
 
 
 class AgentServiceManager:
@@ -1259,6 +1358,16 @@ class AgentServiceManager:
         # a process-local sequence rather than this removable per-task map, so
         # eviction and manager replacement cannot make an old token current.
         self._agent_run_generations: Dict[int, int] = {}
+        # ``_monotonic()`` of each task's latest acquisition, execution end,
+        # settled turn, or sweep that saw it running. The idle sweep measures
+        # a runtime's idle time from it; a missing entry counts as idle
+        # forever.
+        self._agent_last_active_at: Dict[int, float] = {}
+        # Clock used for idle accounting; replaceable so tests need not sleep.
+        self._monotonic: Callable[[], float] = time.monotonic
+        # Periodic idle sweep, started lazily from the first acquisition so it
+        # always runs on the event loop that owns this manager's runtimes.
+        self._idle_sweep_task: Optional["asyncio.Task[None]"] = None
         # Keep only the owner needed to retry a failed workspace cleanup.
         self._agent_cleanup_owner_ids: Dict[int, int] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
@@ -2145,6 +2254,7 @@ class AgentServiceManager:
             ExecutionScope, None, ExecutionScopeNotProvided
         ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
+        self._ensure_idle_sweep_task()
         lock = self._agent_build_locks.get(task_id)
         if lock is None:
             lock = asyncio.Lock()
@@ -2165,6 +2275,7 @@ class AgentServiceManager:
             if task_setup_snapshot is not None and task_setup_snapshot.task.run_id:
                 self._agent_run_ids[task_id] = task_setup_snapshot.task.run_id
             self._agent_run_generations[task_id] = next(_agent_run_generation_counter)
+            self._agent_last_active_at[task_id] = self._monotonic()
             return agent
 
     async def _get_agent_for_task_unlocked(
@@ -3021,7 +3132,7 @@ class AgentServiceManager:
                         scope=scope,
                     )
 
-                    # Create AgentService first (this creates the workspace)
+                    # Reuse the workspace prepared off the event-loop thread.
                     self._agents[task_id] = AgentService(
                         budget_policy_provider=budget_policy_provider(
                             user_id=int(runtime_user.id),
@@ -3050,9 +3161,28 @@ class AgentServiceManager:
                         memory_enabled=memory_policy.memory_enabled,
                         memory_available=memory_policy.memory_available,
                         memory_availability_reason=memory_policy.public_availability_reason,
-                        execution_metadata=memory_policy.execution_metadata(),
+                        execution_metadata=memory_policy.execution_metadata(
+                            ambient_owner_user_id=runtime_user_id,
+                            ambient_execution_scope=scope,
+                        ),
                         system_prompt=system_prompt,  # Pass agent builder instructions
+                        workspace=(
+                            tool_config.get_task_runtime_workspace()
+                            if tool_config is not None
+                            else None
+                        ),
                     )
+                    try:
+                        self._sweep_idle_runtimes(
+                            reason="insert", just_inserted=task_id
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Idle runtime sweep after building the runtime for "
+                            "task %s failed",
+                            task_id,
+                            exc_info=True,
+                        )
 
                     selected_file_ids = _selected_file_ids_from_agent_config(
                         task.agent_config if task is not None else None
@@ -3111,14 +3241,43 @@ class AgentServiceManager:
                 raise
 
         if not rebuilt_this_call:
+            policy_task: Any | None
+            policy_lookup_failure_reason: str | None = None
+            if task_setup_snapshot is not None:
+                policy_task = task_setup_snapshot.task
+                persisted_agent_config = task_setup_snapshot.agent_config
+            else:
+                try:
+                    policy_task = await _load_memory_policy_task_fields_for_agent(
+                        task_id,
+                        runtime_user_id,
+                        db,
+                    )
+                    if policy_task is None:
+                        policy_lookup_failure_reason = MEMORY_POLICY_TASK_MISSING_REASON
+                        persisted_agent_config = None
+                    else:
+                        persisted_agent_config = policy_task.agent_config
+                except TaskOwnerMismatchError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Failed to refresh memory eligibility for cached task %s; "
+                        "this turn runs with memory disabled",
+                        task_id,
+                    )
+                    policy_task = None
+                    persisted_agent_config = None
+                    policy_lookup_failure_reason = (
+                        MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON
+                    )
             await self._reconcile_cached_agent_memory_policy(
                 task_id,
-                task=(
-                    task_setup_snapshot.task
-                    if task_setup_snapshot is not None
-                    else None
-                ),
+                task=policy_task,
                 agent_config=persisted_agent_config,
+                ambient_owner_user_id=runtime_user_id,
+                ambient_execution_scope=scope,
+                lookup_failure_reason=policy_lookup_failure_reason,
             )
 
         self._agent_owner_ids[task_id] = runtime_user_id
@@ -3162,6 +3321,9 @@ class AgentServiceManager:
         *,
         task: Optional[Any],
         agent_config: Optional[Mapping[str, Any]],
+        ambient_owner_user_id: int | None,
+        ambient_execution_scope: ExecutionScope | None,
+        lookup_failure_reason: str | None = None,
     ) -> None:
         """Re-resolve memory policy for a cached AgentService before its turn.
 
@@ -3186,15 +3348,12 @@ class AgentServiceManager:
         path: ``RevocableMemoryStore._live()`` stays lock-free and never
         touches the database.
 
-        Reconciliation is one-directional and atomic with respect to the turn.
-        One-directional, because this path does not carry every input that
-        decided enablement when the service was built -- a preview or an
-        agent-backed task runs with memory off by configuration, not by
-        lifecycle -- so a policy that now reports memory as available never
-        turns memory back on. Atomic, because the policy is resolved first and
-        then applied without awaiting in between, under the per-task build
-        lock: the turn either runs with memory or runs disabled with a
-        recorded reason, never half-reconciled.
+        The minimal task projection passed here contains every field that
+        decides eligibility, so reconciliation is deliberately bidirectional:
+        preview and Agent Builder transitions can disable and later re-enable
+        memory without rebuilding the rest of the runtime.  Resolution awaits
+        first; applying the complete policy does not await and runs under the
+        per-task build lock.
 
         An operation already past its ``_live()`` check completes. That is
         inherent to any revocation boundary -- the check cannot un-issue a
@@ -3203,29 +3362,46 @@ class AgentServiceManager:
         nothing here tries to abort work in flight.
         """
         agent = self._agents.get(task_id)
-        if agent is None or not getattr(agent, "memory_enabled", False):
-            # Already running without memory. Nothing to reconcile, and this
-            # path never re-enables, so there is no reason to read anything.
+        if agent is None:
             return
 
-        policy = await resolve_agent_service_memory_policy_async(
-            task=task,
-            agent_config=agent_config,
+        if lookup_failure_reason is not None:
+            policy = AgentServiceMemoryPolicy(
+                memory=InMemoryMemoryStore(),
+                memory_enabled=False,
+                memory_available=False,
+                memory_availability_reason=lookup_failure_reason,
+            )
+        else:
+            policy = await resolve_agent_service_memory_policy_async(
+                task=task,
+                agent_config=agent_config,
+            )
+        execution_metadata = policy.execution_metadata(
+            ambient_owner_user_id=ambient_owner_user_id,
+            ambient_execution_scope=ambient_execution_scope,
         )
-        if policy.memory_available:
-            return
-
-        agent.revoke_memory(
-            inert_store=policy.memory,
-            availability_reason=policy.public_availability_reason,
-            execution_metadata=policy.execution_metadata(),
-        )
-        logger.warning(
-            "Reconciled cached AgentService for task %s onto an inert memory "
-            "store (%s); this turn runs with memory disabled",
-            task_id,
-            policy.memory_availability_reason,
-        )
+        if not policy.memory_available:
+            agent.revoke_memory(
+                inert_store=policy.memory,
+                availability_reason=policy.public_availability_reason,
+                execution_metadata=execution_metadata,
+            )
+        else:
+            agent.apply_memory_policy(
+                memory=policy.memory,
+                enabled=policy.memory_enabled,
+                available=True,
+                availability_reason=policy.public_availability_reason,
+                execution_metadata=execution_metadata,
+            )
+        if not policy.memory_available:
+            logger.warning(
+                "Reconciled cached AgentService for task %s onto an inert "
+                "memory store (%s); this turn runs with memory disabled",
+                task_id,
+                policy.memory_availability_reason,
+            )
 
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]
@@ -3437,6 +3613,192 @@ class AgentServiceManager:
                 deferred_task_ids,
             )
 
+    def _runtime_bookkeeping_maps(self) -> tuple[dict[int, Any], ...]:
+        """Per-task maps stored alongside a cached runtime, besides the idle clock."""
+        return (
+            self._agents,
+            self._agent_owner_ids,
+            self._agent_sandbox_keys,
+            self._agent_sandbox_providers,
+            self._agent_scope_fingerprints,
+            self._agent_model_overrides,
+            self._agent_run_ids,
+            self._agent_run_generations,
+            self._agent_evicted_scope_fingerprints,
+        )
+
+    def _forget_runtime(self, task_id: int) -> None:
+        """Drop every per-task cache entry for a runtime this process is done with.
+
+        Clears the cached ``AgentService`` and all bookkeeping stored with it,
+        but neither the workspace nor ``_agent_cleanup_owner_ids`` (a failed
+        workspace cleanup still needs its owner) nor ``_mcp_actor_policies``
+        and ``_agent_build_locks`` (their own owners decide when those go).
+        """
+        for bookkeeping in self._runtime_bookkeeping_maps():
+            bookkeeping.pop(task_id, None)
+        self._agent_last_active_at.pop(task_id, None)
+
+    def _prune_build_lock(self, task_id: int) -> None:
+        """Drop a task's build lock once nothing can still depend on it.
+
+        Removed only when the task has no cached runtime, the lock is neither
+        held nor awaited (replacing a lock someone is queued on would let a
+        second builder bypass single-flight), and the task has not been
+        acquired within the minimum idle age.
+        """
+        if task_id in self._agents:
+            return
+        lock = self._agent_build_locks.get(task_id)
+        if lock is None or lock.locked() or getattr(lock, "_waiters", None):
+            return
+        active_at = self._agent_last_active_at.get(task_id)
+        if (
+            active_at is not None
+            and self._monotonic() - active_at < _IDLE_RUNTIME_MAX_AGE_SECONDS
+        ):
+            return
+        self._agent_build_locks.pop(task_id, None)
+
+    def _sweep_idle_runtimes(
+        self, *, reason: str, just_inserted: Optional[int] = None
+    ) -> None:
+        """Drop cached runtimes that nothing in this process is using.
+
+        Synchronous and never awaits, so the decision and the removal are one
+        atomic step on the event loop. A cached runtime is kept when its task
+        is the one just inserted, an MCP actor task (those are released only
+        by ``remove_agent``), holds its build lock, has an execution running,
+        or reports a status that cannot be read. Otherwise it is dropped once
+        it has been idle -- measured from its latest acquisition, execution
+        end or settled turn -- for ``_IDLE_RUNTIME_MAX_AGE_SECONDS``, or
+        ``_IDLE_RESUMABLE_MAX_AGE_SECONDS`` when a paused or waiting execution
+        may still resume on it. A running runtime's idle clock is refreshed by
+        every sweep that observes it.
+
+        After that, if more than ``_IDLE_RUNTIME_SOFT_CAP`` runtimes remain
+        that are droppable, not yet old enough to expire and idle for at least
+        ``_IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS``, the least recently active
+        among them are dropped as well. Runtimes protected above, resumable, or
+        more recently active than that floor never count towards the cap and
+        are never dropped by it.
+
+        Leftover per-task bookkeeping of tasks without a cached runtime (for
+        example after sandbox eviction) is cleared under the same lock and
+        idle-age conditions, and unused build locks are pruned last.
+        """
+        now = self._monotonic()
+
+        def idle_seconds(task_id: int) -> float:
+            active_at = self._agent_last_active_at.get(task_id)
+            return float("inf") if active_at is None else now - active_at
+
+        def build_lock_held(task_id: int) -> bool:
+            lock = self._agent_build_locks.get(task_id)
+            return lock is not None and lock.locked()
+
+        young_droppable: List[tuple[float, int]] = []
+        for task_id, agent in list(self._agents.items()):
+            if task_id == just_inserted or task_id in self._mcp_actor_policies:
+                continue
+            if build_lock_held(task_id):
+                continue
+            try:
+                status = agent.get_execution_status(str(task_id))
+            except Exception:
+                logger.debug(
+                    "Keeping cached AgentService for task %s: execution status "
+                    "is unavailable",
+                    task_id,
+                    exc_info=True,
+                )
+                continue
+            if status and status.get("is_running"):
+                self._agent_last_active_at[task_id] = now
+                continue
+            resumable = bool(status and status.get("is_resumable"))
+            max_age = (
+                _IDLE_RESUMABLE_MAX_AGE_SECONDS
+                if resumable
+                else _IDLE_RUNTIME_MAX_AGE_SECONDS
+            )
+            idle = idle_seconds(task_id)
+            if idle >= max_age:
+                self._forget_runtime(task_id)
+                logger.info(
+                    "Evicted idle cached AgentService for task %s (idle %.0fs, %s)",
+                    task_id,
+                    idle,
+                    reason,
+                )
+            elif not resumable and idle >= _IDLE_RUNTIME_SOFT_CAP_MIN_AGE_SECONDS:
+                young_droppable.append((self._agent_last_active_at[task_id], task_id))
+
+        overflow = len(young_droppable) - _IDLE_RUNTIME_SOFT_CAP
+        if overflow > 0:
+            young_droppable.sort()
+            for _, task_id in young_droppable[:overflow]:
+                idle = idle_seconds(task_id)
+                self._forget_runtime(task_id)
+                logger.info(
+                    "Evicted idle cached AgentService for task %s (idle %.0fs, %s)",
+                    task_id,
+                    idle,
+                    f"{reason}, soft cap",
+                )
+
+        leftover_task_ids = set().union(
+            *self._runtime_bookkeeping_maps(), self._agent_last_active_at
+        ) - set(self._agents)
+        for task_id in leftover_task_ids:
+            if (
+                task_id in self._mcp_actor_policies
+                or build_lock_held(task_id)
+                or idle_seconds(task_id) < _IDLE_RUNTIME_MAX_AGE_SECONDS
+            ):
+                continue
+            self._forget_runtime(task_id)
+
+        for task_id in [
+            t for t in list(self._agent_build_locks) if t not in self._agents
+        ]:
+            self._prune_build_lock(task_id)
+
+    def note_runtime_settled(self, task_id: int) -> None:
+        """Run one idle sweep because a turn for ``task_id`` just finished.
+
+        Settling refreshes the task's idle clock, so a follow-up within the
+        idle window reuses the warm runtime; the runtime is then dropped by
+        the same idle rules as any other. A task without a cached runtime gets
+        no entry. Must be called on the event-loop thread; calling it from a
+        worker thread raises ``RuntimeError`` instead of mutating the caches
+        concurrently.
+        """
+        asyncio.get_running_loop()
+        logger.debug("Cached runtime for task %s settled", task_id)
+        if task_id in self._agents:
+            self._agent_last_active_at[task_id] = self._monotonic()
+        self._sweep_idle_runtimes(reason="settled")
+
+    def _ensure_idle_sweep_task(self) -> None:
+        """Start this manager's periodic idle sweep on the running event loop."""
+        loop = asyncio.get_running_loop()
+        task = self._idle_sweep_task
+        if task is not None and not task.done() and task.get_loop() is loop:
+            return
+        self._idle_sweep_task = loop.create_task(self._idle_sweep_loop())
+
+    async def _idle_sweep_loop(self) -> None:
+        """Sweep periodically until the manager is replaced."""
+        while True:
+            await asyncio.sleep(_IDLE_SWEEP_INTERVAL_SECONDS)
+            if _global_agent_manager is not self:
+                return
+            try:
+                self._sweep_idle_runtimes(reason="periodic")
+            except Exception:
+                logger.warning("Periodic idle runtime sweep failed", exc_info=True)
+
     def current_run_generation(self, task_id: int) -> Optional[int]:
         """Which acquisition of this task's runtime is current, if any.
 
@@ -3533,6 +3895,7 @@ class AgentServiceManager:
             self._agent_owner_ids.pop(task_id, None)
             self._agent_run_ids.pop(task_id, None)
             self._agent_run_generations.pop(task_id, None)
+            self._agent_last_active_at.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
@@ -3943,6 +4306,17 @@ class AgentServiceManager:
             async def finalize_execution_resources() -> None:
                 nonlocal lease_ownership_lost
 
+                # The execution has ended; restart the idle window so the
+                # runtime survives until the entrypoint settles it.
+                try:
+                    finished_task_key = (
+                        int(tracker_task_id) if tracker_task_id else None
+                    )
+                except (TypeError, ValueError):
+                    finished_task_key = None
+                if finished_task_key is not None and finished_task_key in self._agents:
+                    self._agent_last_active_at[finished_task_key] = self._monotonic()
+
                 tracker_pool_timeout: Exception | None = None
                 heartbeat_pool_timeout: BaseException | None = None
                 heartbeat_lost = False
@@ -4216,7 +4590,23 @@ class AgentServiceManager:
                     memory_enabled=memory_policy.memory_enabled,
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
-                    execution_metadata=memory_policy.execution_metadata(),
+                    execution_metadata=memory_policy.execution_metadata(
+                        ambient_owner_user_id=user_id,
+                        ambient_execution_scope=scope,
+                    ),
+                    workspace=(
+                        tool_config.get_task_runtime_workspace()
+                        if tool_config is not None
+                        else None
+                    ),
+                )
+            try:
+                self._sweep_idle_runtimes(reason="insert", just_inserted=task_id)
+            except Exception:
+                logger.warning(
+                    "Idle runtime sweep after building the runtime for task %s failed",
+                    task_id,
+                    exc_info=True,
                 )
 
             agent_service = self._agents[task_id]

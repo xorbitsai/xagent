@@ -355,6 +355,8 @@ async def create_chat_task(
                 item.model_dump() for item in request.connector_runtime_context or ()
             ),
             timezone=request.timezone,
+            requested_dispatch_class=request.dispatch_class,
+            requested_priority=request.priority,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -377,6 +379,7 @@ async def create_chat_task(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        dispatch_class=started.dispatch_class,
     )
 
 

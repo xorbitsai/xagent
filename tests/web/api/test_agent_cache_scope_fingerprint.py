@@ -366,6 +366,12 @@ class _CachedAgentWithToolConfig:
     def invalidate_tools(self) -> None:
         self.invalidate_calls += 1
 
+    def revoke_memory(self, **kwargs: Any) -> None:
+        pass
+
+    def apply_memory_policy(self, **kwargs: Any) -> None:
+        pass
+
     def cleanup_workspace(self) -> None:
         pass
 

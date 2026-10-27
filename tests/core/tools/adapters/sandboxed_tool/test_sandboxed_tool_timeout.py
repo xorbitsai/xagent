@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import cloudpickle
 import pytest
 
 from tests.core.tools.adapters.sandboxed_tool.conftest import FakeBaseTool
@@ -48,6 +50,13 @@ class RecordingSandbox:
         self.tool_exit_code = tool_exit_code
         self.tool_delay = tool_delay
         self.commands: list[list[str]] = []
+        self.files: dict[str, str] = {}
+
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
+        assert overwrite or remote_path not in self.files
+        self.files[remote_path] = content
 
     async def exec(self, command: str, *args: str, env=None, **_: object):
         self.commands.append([command, *args])
@@ -71,6 +80,16 @@ class ShortBoundedTool(FakeBaseTool):
     @property
     def name(self) -> str:
         return "short_bounded_tool"
+
+
+@sandbox_config()
+class SecretInitTool(FakeBaseTool):
+    def __init__(self, secret: str) -> None:
+        self.secret = secret
+
+    @property
+    def name(self) -> str:
+        return "secret_init_tool"
 
 
 async def _run(wrapper: SandboxedToolWrapper, code: str = "print('ok')"):
@@ -99,6 +118,89 @@ async def test_tools_without_exec_timeout_stay_unbounded():
     await _run(wrapper, code="")
 
     assert sandbox.commands[0][0] == "python"
+
+
+@pytest.mark.asyncio
+async def test_runtime_payloads_are_private_files_not_process_arguments():
+    sandbox = RecordingSandbox()
+    wrapper = SandboxedToolWrapper(SecretInitTool("connection-secret"), sandbox)
+
+    await _run(wrapper, code="argument-secret")
+
+    tool_command = sandbox.commands[0]
+    command_text = " ".join(tool_command)
+    assert "--args-file" in tool_command
+    assert "--init-params-file" in tool_command
+    assert "--args-b64" not in tool_command
+    assert "--init-params-b64" not in tool_command
+    assert "connection-secret" not in command_text
+    assert "argument-secret" not in command_text
+    assert any("argument-secret" in content for content in sandbox.files.values())
+    assert any(
+        "connection-secret" in repr(cloudpickle.loads(base64.b64decode(content)))
+        for path, content in sandbox.files.items()
+        if path.endswith(".b64")
+    )
+
+
+@pytest.mark.asyncio
+async def test_private_payloads_are_removed_when_tool_execution_fails():
+    sandbox = RecordingSandbox(tool_exit_code=1)
+    wrapper = SandboxedToolWrapper(SecretInitTool("connection-secret"), sandbox)
+
+    with pytest.raises(RuntimeError, match="Tool execution failed"):
+        await _run(wrapper, code="argument-secret")
+
+    cleanup_command = sandbox.commands[-1]
+    assert cleanup_command[:2] == ["rm", "-f"]
+    assert any(path.endswith(".json") for path in cleanup_command[2:])
+    assert any(path.endswith(".b64") for path in cleanup_command[2:])
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drains_init_upload_before_payload_cleanup():
+    class DelayedInitUploadSandbox(RecordingSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.upload_started = asyncio.Event()
+            self.release_upload = asyncio.Event()
+            self.upload_count = 0
+            self.events: list[str] = []
+
+        async def write_file(
+            self, content: str, remote_path: str, overwrite: bool = False
+        ) -> None:
+            self.upload_count += 1
+            if self.upload_count == 2:
+                self.upload_started.set()
+                await self.release_upload.wait()
+                self.events.append("upload_finished")
+            await super().write_file(content, remote_path, overwrite)
+
+        async def exec(self, command: str, *args: str, **kwargs: object):
+            if command == "rm":
+                self.events.append("cleanup")
+                for path in args[1:]:
+                    self.files.pop(path, None)
+            return await super().exec(command, *args, **kwargs)
+
+    sandbox = DelayedInitUploadSandbox()
+    wrapper = SandboxedToolWrapper(SecretInitTool("connection-secret"), sandbox)
+    invocation = asyncio.create_task(_run(wrapper, code="argument-secret"))
+
+    await sandbox.upload_started.wait()
+    invocation.cancel()
+    await asyncio.sleep(0)
+
+    assert not invocation.done()
+    assert sandbox.events == []
+
+    sandbox.release_upload.set()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    assert sandbox.events == ["upload_finished", "cleanup"]
+    assert sandbox.files == {}
 
 
 # `timeout -s KILL` also kills itself with the process group, so the exec
@@ -130,6 +232,14 @@ class LocalProcessSandbox:
     """Runs sandbox commands as local processes against this checkout."""
 
     name = "local"
+
+    async def write_file(
+        self, content: str, remote_path: str, overwrite: bool = False
+    ) -> None:
+        path = Path(remote_path)
+        if not overwrite and path.exists():
+            raise FileExistsError(remote_path)
+        path.write_text(content, encoding="utf-8")
 
     async def exec(self, command: str, *args: str, env=None, **_: object):
         if command == "timeout":

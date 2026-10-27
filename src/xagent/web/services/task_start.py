@@ -13,8 +13,9 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -53,6 +54,7 @@ from .task_command_transport import (
     command_identity_matches_task,
     notify_task_command_dispatcher,
 )
+from .task_dispatch_cap import DispatchClass
 from .task_execution_controller import task_execution_controller
 from .task_orchestrator import (
     TaskTurnError,
@@ -123,6 +125,9 @@ class TaskStartResult:
     run_id: str
     state_version: int
     control_state: str
+    # Set only by task creation: the class its start command was given. None for
+    # an append, and for a creation that runs in this process.
+    dispatch_class: DispatchClass | None = None
 
 
 def _resolve_turn_files(
@@ -230,6 +235,7 @@ class _PreparedCreateTaskStart:
     created_at: datetime
     payload: TaskTurnPayload
     claimed_turn: _PreparedTurn
+    dispatch_class: DispatchClass | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +258,8 @@ def _prepare_created_task_isolated(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     timezone: str | None = None,
+    requested_dispatch_class: str | None = None,
+    requested_priority: int | None = None,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
@@ -279,6 +287,8 @@ def _prepare_created_task_isolated(
             input=message,
             source="sdk",
             is_visible=False,
+            requested_dispatch_class=requested_dispatch_class,
+            dispatch_priority=requested_priority,
         )
         runtime_plan = prepare_create_connector_runtime(
             db=db,
@@ -326,6 +336,18 @@ def _prepare_created_task_isolated(
         created_at = db.query(Task.created_at).filter(Task.id == task_id).scalar()
         if created_at is None:
             raise RuntimeError("created task has no creation timestamp")
+        # Read in the transaction that stages the command, so the reported
+        # class is the one that commits.
+        start_dispatch_class: DispatchClass | None = None
+        if isinstance(claimed_turn, _EnqueuedTurn):
+            start_dispatch_class = cast(
+                DispatchClass,
+                db.execute(
+                    select(TaskExecutionCommand.dispatch_class).where(
+                        TaskExecutionCommand.id == claimed_turn.command_db_id
+                    )
+                ).scalar_one(),
+            )
         commit_claimed_turn_or_reconcile(
             db,
             task_id=task_id,
@@ -340,6 +362,7 @@ def _prepare_created_task_isolated(
             created_at=created_at,
             payload=payload,
             claimed_turn=claimed_turn,
+            dispatch_class=start_dispatch_class,
         )
     except Exception:
         db.rollback()
@@ -595,6 +618,8 @@ async def create_sdk_task(
     file_ids: tuple[str, ...],
     connector_runtime_context: tuple[dict[str, Any], ...],
     timezone: str | None,
+    requested_dispatch_class: str | None = None,
+    requested_priority: int | None = None,
 ) -> TaskStartResult:
     async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
         prepared = await run_db_io_cancellation_safe(
@@ -606,6 +631,8 @@ async def create_sdk_task(
                 file_ids=file_ids,
                 connector_runtime_context=connector_runtime_context,
                 timezone=timezone,
+                requested_dispatch_class=requested_dispatch_class,
+                requested_priority=requested_priority,
             )
         )
         try:
@@ -639,6 +666,7 @@ async def create_sdk_task(
         run_id=started.run_id,
         state_version=started.state_version,
         control_state=started.control_state,
+        dispatch_class=prepared.dispatch_class,
     )
 
 

@@ -160,12 +160,13 @@ class AutoModelService:
             self.db.flush()
 
         config.fallback_model_id = request.fallback_model_id  # type: ignore[assignment]
-        for candidate in request.candidates:
+        for position, candidate in enumerate(request.candidates):
             self.db.add(
                 AutoModelCandidate(
                     config_id=config.id,
                     routing_model_id=candidate.routing_model_id,
                     target_model_id=candidate.target_model_id,
+                    position=position,
                 )
             )
 

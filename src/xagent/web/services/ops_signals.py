@@ -1,10 +1,13 @@
 """In-process registry of degraded-mode operational signals.
 
-Xagent has no metrics stack, so security-relevant degradations (e.g. Gmail
-OIDC verification running without service-account email checks) would
-otherwise only exist as log lines. This registry gives them a
-machine-readable surface — the ``/health`` endpoint reports active
-degradations — that uptime monitors and dashboards can alert on.
+Degradations are states, not events: security-relevant misconfiguration
+(e.g. Gmail OIDC verification running without service-account email checks)
+or a dependency that stays unavailable. Runtime metrics, exported over OTLP
+only when enabled (``xagent.core.runtime_performance``), count events; this
+registry gives the ongoing states a surface that needs no metrics backend.
+The ``/health`` endpoint of a web process reports active degradations, and
+every process, workers included, lists them on its per-minute runtime
+diagnostics line (``process_diagnostics``).
 
 ``/health`` is unauthenticated, so it exposes only the signal *names*;
 the detail strings describe security-relevant misconfiguration and are

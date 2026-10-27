@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from xagent.web.tools.config import WebToolConfig
 
 _READ_ALLOWLIST_ENV_VARS = (
+    "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS",
     "XAGENT_SLACK_FILE_ALLOWED_DIRS",
     "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS",
     "XAGENT_GMAIL_FILE_ALLOWED_DIRS",
@@ -66,6 +67,7 @@ def test_transport_config_omits_allowlist_vars_without_a_task_id() -> None:
     )
 
     assert "XAGENT_SLACK_FILE_ALLOWED_DIRS" not in transport_config["env"]
+    assert "XAGENT_FACEBOOK_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_GMAIL_FILE_ALLOWED_DIRS" not in transport_config["env"]
     assert "XAGENT_ONEDRIVE_FILE_ALLOWED_DIRS" not in transport_config["env"]

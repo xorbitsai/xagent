@@ -106,6 +106,17 @@ describe("translations", () => {
     )
   })
 
+  it("keeps signed upload translations non-empty", () => {
+    assertTranslationLeavesNonEmpty(
+      translations.en.tools.mcp.signedUploads,
+      "translations.en.tools.mcp.signedUploads",
+    )
+    assertTranslationLeavesNonEmpty(
+      translations.zh.tools.mcp.signedUploads,
+      "translations.zh.tools.mcp.signedUploads",
+    )
+  })
+
   it("resolves a typed translation key", () => {
     expect(resolveTranslation("en", "tools.mcp.runtime.title")).toBe(
       "Runtime Inputs",

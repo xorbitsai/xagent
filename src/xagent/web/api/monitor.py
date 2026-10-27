@@ -188,7 +188,9 @@ def safe_get_json_field(column: Any, field_path: str, db_session: Session) -> An
 
 
 @monitor_router.get("/tools")
-async def get_tools() -> Dict[str, Any]:
+async def get_tools(
+    _current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
     """Get list of available tools"""
     try:
         from ...core.agent.service import AgentService

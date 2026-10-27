@@ -1,3 +1,5 @@
+from .access_scope import MemoryAccessScope as MemoryAccessScope
+from .access_scope import bind_memory_access_scope as bind_memory_access_scope
 from .base import MemoryStore as MemoryStore
 from .core import MemoryNote as MemoryNote
 from .core import MemoryResponse as MemoryResponse

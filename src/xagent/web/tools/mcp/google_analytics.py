@@ -397,13 +397,23 @@ def google_analytics_run_report(
       [{"dimension": {"dimensionName": "date"}, "desc": true}].
     limit: max rows to return (default 100, max 150 — keeps a wide report's
       serialized response under the MCP output size limit).
-    offset: row offset for paging — if row_count in the response exceeds
-      limit, call again with offset=limit, then offset=2*limit, and so on.
-    truncated: true when the response has fewer rows than row_count or rows
-      were removed to fit the MCP output size limit.
-    totals: the complete report-level metric totals returned by GA4. For any
-      total, use this field rather than summing rows; never compare totals
-      across calls that use different date_ranges or filters.
+    offset: row offset for paging. Follow next_offset only when it is present.
+
+    The response always requests GA4's TOTAL metric aggregation. Use totals
+    for headline totals; never replace them by summing rows. A metric can be
+    non-additive across dimensions, so if the row sum differs from totals,
+    report the difference and consult metadata for GA4-reported causes. With
+    multiple date_ranges, totals contains one row per range, identified by
+    the dateRange dimension value (the supplied name or date_range_N); do not
+    interpret totals[0] as a grand total across ranges. The response echoes
+    the normalized property ID and the other request inputs as supplied so
+    values from concurrent calls cannot be attributed to the wrong query.
+
+    Pagination fields distinguish an incomplete GA4 page from local output
+    trimming. When output_truncated is true and next_offset is present,
+    continue there because the retained rows are a prefix of the API page. If
+    next_offset is absent, no row fit; retry the same offset with a narrower
+    query.
     """
     try:
         normalized_property_id = _normalize_property_id(property_id)
@@ -420,8 +430,9 @@ def google_analytics_run_report(
         body: dict[str, Any] = {
             "metrics": [{"name": m} for m in metrics],
             "dateRanges": [_date_range_body(dr) for dr in date_ranges],
-            # Always request report-level totals so callers do not have to
-            # derive them from a possibly truncated dimension breakdown.
+            # Keep the authoritative total in the same GA4 request as any
+            # dimensional breakdown. This avoids a second request drifting
+            # to a different property, range, or filter.
             "metricAggregations": ["TOTAL"],
             # Always sent explicitly: GA4's default would otherwise return up
             # to 10k rows in one response.
@@ -447,10 +458,28 @@ def google_analytics_run_report(
         )
         dimension_headers = result.get("dimensionHeaders") or []
         metric_headers = result.get("metricHeaders") or []
-        rows = result.get("rows") or []
-        row_count = result.get("rowCount") or 0
         totals = result.get("totals") or []
-        server_truncated = row_count > len(rows)
+        metadata = result.get("metadata") or {}
+        rows = list(result.get("rows") or [])
+        row_count = int(result.get("rowCount") or 0)
+        api_returned_count = len(rows)
+        has_more = offset + api_returned_count < row_count
+
+        query: dict[str, Any] = {
+            "property_id": normalized_property_id,
+            "metrics": list(metrics),
+            "date_ranges": date_ranges,
+            "limit": limit,
+            "offset": offset,
+        }
+        if dimensions:
+            query["dimensions"] = list(dimensions)
+        if dimension_filter:
+            query["dimension_filter"] = dimension_filter
+        if metric_filter:
+            query["metric_filter"] = metric_filter
+        if order_bys:
+            query["order_bys"] = order_bys
 
         # Surface two gotchas in the result itself, so the LLM catches them
         # even if it never reads the docstring.
@@ -505,6 +534,27 @@ def google_analytics_run_report(
             # Prepended (not appended) so it isn't the first thing an
             # output-length truncation cuts off a large report's response.
             extra_kwargs["note"] = " ".join(notes)
+        # Multiple ranges add GA4's implicit dateRange dimension even when
+        # the caller did not request any dimensions explicitly.
+        if dimensions or len(date_ranges) > 1:
+            if totals:
+                extra_kwargs["aggregation_note"] = (
+                    "Use totals for headline totals; do not replace totals by "
+                    "summing rows. If the row sum differs, report the delta "
+                    "and use metadata for GA4-reported thresholding, sampling, "
+                    "or (other) row effects; do not invent another cause."
+                )
+            else:
+                extra_kwargs["aggregation_note"] = (
+                    "GA4 returned no totals even though TOTAL was requested. "
+                    "Do not invent a total by summing rows."
+                )
+            if len(date_ranges) > 1 and totals:
+                extra_kwargs["aggregation_note"] += (
+                    " Multiple date_ranges produce one totals row per range; "
+                    "match each total by its dateRange dimension value and do "
+                    "not treat totals[0] as a grand total across ranges."
+                )
 
         # RUN_REPORT_MAX_LIMIT bounds row count, not bytes: several long
         # dimension values (e.g. full URLs) at once can still cross the
@@ -512,32 +562,78 @@ def google_analytics_run_report(
         # until the serialized response fits, mirroring the truncated-flag
         # pattern in google_analytics_list_properties.
         max_output_length = get_tool_max_output_length()
-        original_row_count = len(rows)
-        response = _success(
-            **extra_kwargs,
-            dimension_headers=dimension_headers,
-            metric_headers=metric_headers,
-            rows=rows,
-            row_count=row_count,
-            totals=totals,
-            truncated=server_truncated,
-        )
-        while len(response) > max_output_length and len(rows) > 1:
-            rows = rows[: len(rows) // 2]
-            response = _success(
+
+        def _build_response(*, output_truncated: bool) -> str:
+            next_offset = None
+            pagination_hint = None
+            if output_truncated:
+                if rows:
+                    next_offset = offset + len(rows)
+                    pagination_hint = (
+                        "Response rows were trimmed for output size. The rows "
+                        "returned are the API page prefix; continue with "
+                        f"offset={next_offset}."
+                    )
+                else:
+                    pagination_hint = (
+                        "Response rows were trimmed for output size. Retry the "
+                        f"same offset={offset} with fewer metrics/dimensions or "
+                        "narrower filters; do not advance the offset."
+                    )
+            elif has_more:
+                next_offset = offset + api_returned_count
+                pagination_hint = (
+                    f"More GA4 rows are available; call again with "
+                    f"offset={next_offset}."
+                )
+
+            return _success(
                 **extra_kwargs,
+                query=query,
                 dimension_headers=dimension_headers,
                 metric_headers=metric_headers,
+                totals=totals,
+                metadata=metadata,
                 rows=rows,
                 row_count=row_count,
-                totals=totals,
-                truncated=True,
+                returned_count=len(rows),
+                api_returned_count=api_returned_count,
+                has_more=has_more,
+                next_offset=next_offset,
+                output_truncated=output_truncated,
+                truncated=has_more or output_truncated,
+                **(
+                    {"pagination_hint": pagination_hint}
+                    if pagination_hint is not None
+                    else {}
+                ),
             )
-        if len(rows) < original_row_count:
+
+        response = _build_response(output_truncated=False)
+        while len(response) > max_output_length and rows:
+            rows = rows[: len(rows) // 2]
+            response = _build_response(output_truncated=True)
+        if len(rows) < api_returned_count:
             logger.warning(
                 f"Google Analytics run_report response trimmed from "
-                f"{original_row_count} to {len(rows)} rows to stay under "
+                f"{api_returned_count} to {len(rows)} rows to stay under "
                 f"the {max_output_length}-char output limit"
+            )
+        if len(response) > max_output_length:
+            # Rows are the only optional part we can safely discard. The
+            # echoed query identifies which property/range/filter produced
+            # the totals, so truncating either query or totals would make the
+            # result ambiguous or incorrect. Return a small, valid JSON error
+            # instead of letting the platform cut an oversized success
+            # response at an arbitrary character boundary.
+            logger.warning(
+                "Google Analytics run_report metadata and totals exceed the "
+                f"{max_output_length}-char output limit after all rows were removed"
+            )
+            return _error(
+                "Google Analytics report metadata and totals cannot fit the "
+                "configured output limit even with all rows removed. Narrow "
+                "the filters or request fewer metrics and dimensions."
             )
         return response
     except Exception as e:

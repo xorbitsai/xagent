@@ -74,6 +74,17 @@ class _TaskFields:
 
 
 @dataclass(frozen=True)
+class MemoryPolicyTaskFields:
+    """Small authoritative task projection used on warm-runtime cache hits."""
+
+    id: int
+    user_id: int
+    agent_id: int | None
+    source: str | None
+    agent_config: Any
+
+
+@dataclass(frozen=True)
 class RuntimeUserFields:
     """Primitive runtime identity required while an agent is constructed."""
 
@@ -577,6 +588,47 @@ def load_task_setup_snapshot_sync(
             execution_recovery=execution_recovery,
             reconstruction=reconstruction,
             workforce_runtime=deepcopy(core.workforce),
+        )
+    finally:
+        session.close()
+
+
+def load_memory_policy_task_fields_sync(
+    task_id: int,
+    task_owner_user_id: int | None,
+) -> MemoryPolicyTaskFields | None:
+    """Read only fields that can change memory eligibility for a cache hit."""
+
+    session_factory = get_session_local()
+    session: Session = session_factory()
+    try:
+        row = (
+            session.query(
+                Task.id,
+                Task.user_id,
+                Task.agent_id,
+                Task.source,
+                Task.agent_config,
+            )
+            .filter(Task.id == task_id)
+            .first()
+        )
+        if row is None:
+            return None
+        owner_user_id = int(row[1])
+        if task_owner_user_id is not None and owner_user_id != task_owner_user_id:
+            raise TaskOwnerMismatchError(
+                task_id,
+                task_owner_user_id,
+                owner_user_id,
+            )
+        raw_config = row[4]
+        return MemoryPolicyTaskFields(
+            id=int(row[0]),
+            user_id=owner_user_id,
+            agent_id=int(row[2]) if row[2] is not None else None,
+            source=str(row[3]) if row[3] is not None else None,
+            agent_config=deepcopy(raw_config),
         )
     finally:
         session.close()

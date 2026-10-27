@@ -10,11 +10,13 @@ from ...agent.trace import (
     trace_memory_retrieve_start,
 )
 from ...user_context import current_user_id
+from .memory_retrieval import (
+    MEMORY_CONTEXT_METADATA_KEY,
+    RETRIEVED_MEMORIES_METADATA_KEY,
+)
 
 logger = logging.getLogger(__name__)
 
-MEMORY_CONTEXT_METADATA_KEY = "retrieved_memory_context"
-RETRIEVED_MEMORIES_METADATA_KEY = "retrieved_memories"
 SELECTED_SKILL_METADATA_KEY = "selected_skill"
 SKILL_CONTEXT_METADATA_KEY = "selected_skill_context"
 # True only when generate_image is registered and edit_image is not; a deployment

@@ -54,6 +54,7 @@ if TYPE_CHECKING:
         auth = Column(JSON, nullable=True)  # Dict[str, Any]
         runtime_input_schema = Column(JSON, nullable=True)
         runtime_bindings = Column(JSON, nullable=True)
+        signed_uploads = Column(JSON(none_as_null=True), nullable=True)
         allow_delegated_authorization = Column(
             Boolean, nullable=False, default=False, server_default="0"
         )

@@ -4,7 +4,7 @@ import logging
 import os
 import urllib.parse
 import uuid
-from datetime import date
+from datetime import date, datetime
 from functools import cache
 from importlib import resources
 from pathlib import Path
@@ -16,6 +16,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.errors import HttpError  # type: ignore
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from .utils import (
     InsufficientScopeError,
@@ -952,6 +953,133 @@ def get_calendar_service() -> Any:
     return build("calendar", "v3", credentials=credentials)
 
 
+def _search_boundary_kind(field: Any) -> tuple[str, str | None] | None:
+    """Classify one event boundary by the shape of its own value.
+
+    Returns ("all_day", date_string) for a valid bare date, ("timed", None)
+    for a non-empty `dateTime`, and None when the side is missing, is not a
+    dict, or carries neither a valid date nor a `dateTime`. The shape alone
+    decides only the kind; it does not validate a timed value. An all-day date
+    has no instant to resolve without inventing one, so callers compare two
+    all-day instances as dates and treat a date against a timed boundary as a
+    kind change instead of collapsing the date into a time zone's midnight;
+    timed sides are resolved separately with `_event_boundary_key`, and an
+    unresolvable result is treated as unknown, never as a usable instant.
+    """
+    if not isinstance(field, dict):
+        return None
+    date_time = field.get("dateTime")
+    if isinstance(date_time, str) and date_time:
+        return ("timed", None)
+    date_value = field.get("date")
+    if isinstance(date_value, str) and is_bare_date(date_value):
+        return ("all_day", date_value)
+    return None
+
+
+def _event_boundary_key(field: Any, tz_name: str) -> datetime | None:
+    """Resolve a timed event boundary (start or originalStartTime) to the
+    instant it denotes.
+
+    Reuses `_event_boundary` so the existing resolution rules stay in one
+    place: a `dateTime` that carries its own offset keeps it (even when the
+    same object's `timeZone` names a different, organizer-owned zone), an
+    offsetless `dateTime` is read in its sibling `timeZone`, and only when that
+    sibling is absent does it fall back to `tz_name`, the zone the search
+    response reports for the calendar. All-day dates never reach this helper;
+    `_search_boundary_kind` keeps them as dates.
+    `datetime_key_for_comparison` then treats equivalent spellings ("Z" vs
+    "+00:00", differing offsets, fractional seconds) as the same instant.
+    Returns None, rather than a guessed instant, when the value cannot be
+    resolved - malformed data, an unknown zone, or a wall time skipped by a
+    daylight-saving transition - so callers never report a rescheduling from a
+    value they could not read.
+    """
+    try:
+        boundary = _event_boundary(field, tz_name)
+    except (TypeError, ValueError):
+        return None
+    if boundary is None:
+        return None
+    key = _datetime_key_for_comparison(boundary)
+    return key if isinstance(key, datetime) else None
+
+
+def _search_event_local_time(field: Any, tz_name: str) -> str | None:
+    """Render one event boundary as the wall-clock time a person in the
+    calendar's `tz_name` would read: an ISO 8601 string with that zone's offset
+    for a timed boundary, or the untouched YYYY-MM-DD date for an all-day one
+    (which has no clock time to convert). None when the boundary cannot be
+    resolved instead of an invented time.
+    """
+    kind = _search_boundary_kind(field)
+    if kind is None:
+        return None
+    if kind[0] == "all_day":
+        return kind[1]
+    point = _event_boundary_key(field, tz_name)
+    if point is None:
+        return None
+    try:
+        zone = resolve_zoneinfo(tz_name)
+    except ValueError:
+        return None
+    return point.astimezone(zone).isoformat()
+
+
+def _search_event_was_rescheduled(event: dict[str, Any], tz_name: str) -> bool:
+    """Whether a recurring instance's current start differs from the start it
+    was originally scheduled for.
+
+    Google adds `originalStartTime` only to a recurring series' instances, so
+    an event without a usable one has nothing to compare and is not treated as
+    moved. Each side is classified by its own shape first: two all-day dates
+    compare as calendar dates (never as widened midnights, which can collapse
+    around a zone's skipped day), and two timed boundaries compare as the
+    instants they denote via `_event_boundary_key` (never as raw strings). A
+    date against a timed boundary is a kind change and counts as rescheduled
+    only when the timed side resolves to a real instant; an unresolvable timed
+    value keeps this False instead of turning "can't tell" into a positive
+    answer. A side that cannot be classified at all also keeps this False.
+    """
+    original_start = event.get("originalStartTime")
+    current_start = event.get("start")
+    original_kind = _search_boundary_kind(original_start)
+    current_kind = _search_boundary_kind(current_start)
+    if original_kind is None or current_kind is None:
+        return False
+    if original_kind[0] != current_kind[0]:
+        timed_field = original_start if original_kind[0] == "timed" else current_start
+        return _event_boundary_key(timed_field, tz_name) is not None
+    if original_kind[0] == "all_day":
+        return original_kind[1] != current_kind[1]
+    original_key = _event_boundary_key(original_start, tz_name)
+    current_key = _event_boundary_key(current_start, tz_name)
+    if original_key is None or current_key is None:
+        return False
+    return original_key != current_key
+
+
+def _normalize_search_event(event: Any, tz_name: str) -> Any:
+    """Return one events.list item with four small fields added and every
+    original field/value kept exactly as Google sent it.
+
+    `local_start`/`local_end` are wall-clock renderings in `tz_name` (the zone
+    the search response reports for the calendar), `local_timezone` is that
+    zone, and `rescheduled` is whether this recurring instance actually moved.
+    The copy is shallow and per event, so no full event is duplicated and the
+    provider response is not mutated in place.
+    """
+    if not isinstance(event, dict):
+        return event
+    normalized = dict(event)
+    normalized["local_start"] = _search_event_local_time(event.get("start"), tz_name)
+    normalized["local_end"] = _search_event_local_time(event.get("end"), tz_name)
+    normalized["local_timezone"] = tz_name
+    normalized["rescheduled"] = _search_event_was_rescheduled(event, tz_name)
+    return normalized
+
+
 @mcp.tool()
 def google_calendar_search_events(
     query: str | None = None,
@@ -962,9 +1090,25 @@ def google_calendar_search_events(
     """
     Search and list Google Calendar events with optional query and label filters.
     Optionally filter by time_min and time_max (RFC3339 formatted, e.g., '2024-01-01T00:00:00Z').
+    Every returned event keeps Google's original fields and adds local_start,
+    local_end, local_timezone and rescheduled. local_start/local_end are the
+    event's start and end as wall-clock times in local_timezone, the time zone
+    the calendar reports for the search: timed events use an ISO 8601 string
+    with its offset, all-day events keep their YYYY-MM-DD date. If a local time
+    cannot be resolved, its local field is null; fall back to the event's own
+    start or end instead of inventing a time. Report event times to the user in
+    local_timezone.
+    rescheduled is true only when a recurring instance's original start differs
+    from its current start; describe an occurrence as moved or rescheduled only
+    when rescheduled is true.
+    An event is cancelled only when its status is "cancelled"; rescheduled being
+    true does not mean the occurrence was cancelled.
     """
     try:
         service = get_calendar_service()
+        # events.list already defaults to the calendar's own time zone and reports
+        # it on the response, so no calendars().get() metadata read (and its
+        # permission) is needed before listing events.
         kwargs = {
             "calendarId": "primary",
             "maxResults": max_results,
@@ -980,7 +1124,11 @@ def google_calendar_search_events(
             kwargs["q"] = query
 
         events_result = service.events().list(**kwargs).execute()
-        events = events_result.get("items", [])
+        calendar_timezone = events_result.get("timeZone") or "UTC"
+        events = [
+            _normalize_search_event(event, calendar_timezone)
+            for event in events_result.get("items", [])
+        ]
 
         return json.dumps({"status": "success", "events": events})
 
@@ -1199,6 +1347,37 @@ def _error_message(exc: Exception, requested_conference: bool) -> str:
             " add_google_meet=False)"
         )
     return message
+
+
+def _rsvp_error_message(exc: Exception) -> str:
+    """Return an actionable RSVP failure without exposing request URLs.
+
+    ``HttpError.__str__`` includes the full provider request URI. Keep the
+    useful status and Google-provided message, but parse them from the response
+    instead so query parameters and other request details never reach the
+    agent. Unexpected exceptions are intentionally described by type only.
+    """
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        provider_message = ""
+        try:
+            payload = json.loads(exc.content.decode("utf-8"))
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                provider_message = " ".join(error["message"].split())[:500]
+        except (AttributeError, UnicodeDecodeError, ValueError):
+            pass
+        status_text = f" (HTTP {status})" if status is not None else ""
+        detail = f": {provider_message}" if provider_message else ""
+        return (
+            f"Google Calendar could not apply the RSVP{status_text}{detail}. "
+            "Check the event in Google Calendar before retrying."
+        )
+    return (
+        "Google Calendar could not apply the RSVP because an unexpected "
+        f"{type(exc).__name__} occurred. Check the event and connector before "
+        "retrying."
+    )
 
 
 def _event_response(event: dict[str, Any]) -> str:
@@ -2872,10 +3051,10 @@ def google_calendar_respond_to_event(
     new comment is given, an existing comment on that entry is cleared, so an
     old note cannot stay attached to a different reply; a non-empty comment is
     written as the new note. No other attendee entry is ever sent or modified.
-    If the caller's own attendee entry already has the requested
-    responseStatus and no new comment is given, the tool writes nothing and
-    returns the current event with "changed": false in the result, so a retry
-    cannot send the organizer a duplicate reply.
+    If the caller's own attendee entry already has the requested responseStatus
+    and the comment is omitted or unchanged, the tool writes nothing and returns
+    the current event with "changed": false in the result, so a retry cannot send
+    the organizer a duplicate reply.
     notify_organizer=True (the default) lets Google send its notification for
     this reply; pass False to send none.
     A reply only applies to an invitation someone else organized. When the user
@@ -2925,7 +3104,7 @@ def google_calendar_respond_to_event(
             )
         except HttpError as exc:
             if exc.resp.status in (404, 410):
-                raise ValueError(
+                raise ToolError(
                     f"Event {event_id!r} was not found on the user's primary "
                     "calendar. Nothing was written; use "
                     "google_calendar_search_events to find its id."
@@ -2975,10 +3154,9 @@ def google_calendar_respond_to_event(
             )
 
         existing_comment = own_entry.get("comment") or ""
-        new_comment = (
-            comment_text if comment_text and comment_text != existing_comment else ""
-        )
-        if own_entry.get("responseStatus") == normalized_response and not new_comment:
+        response_unchanged = own_entry.get("responseStatus") == normalized_response
+        comment_unchanged = not comment_text or comment_text == existing_comment
+        if response_unchanged and comment_unchanged:
             # Patching the same reply again would send the organizer another
             # notification for a reply they already have. Reuse the normal
             # success envelope and mark the result as not written.
@@ -2986,7 +3164,7 @@ def google_calendar_respond_to_event(
             response_payload["changed"] = False
             response_payload["message"] = (
                 "No reply was sent: the caller's attendee entry already has "
-                "this response and no new comment was given. Nothing was "
+                "this response and no comment change was requested. Nothing was "
                 "written."
             )
             return json.dumps(response_payload)
@@ -2999,8 +3177,8 @@ def google_calendar_respond_to_event(
         # drop or revert someone else's reply.
         own = copy.deepcopy(own_entry)
         own["responseStatus"] = normalized_response
-        if new_comment:
-            own["comment"] = new_comment
+        if comment_text:
+            own["comment"] = comment_text
         elif existing_comment:
             # The response changed and no replacement note was given, so clear
             # the old note explicitly: under attendeesOmitted an omitted
@@ -3022,9 +3200,14 @@ def google_calendar_respond_to_event(
         )
         return _event_response(updated_event)
 
-    except Exception as e:
-        logger.error(f"Error responding to event: {e}")
+    except ToolError:
+        raise
+    except ValueError as e:
+        logger.error("Invalid calendar RSVP request: %s", e)
         return json.dumps({"status": "error", "message": str(e)})
+    except Exception as e:
+        logger.error("Error responding to event: %s", type(e).__name__)
+        raise ToolError(_rsvp_error_message(e)) from e
 
 
 if __name__ == "__main__":

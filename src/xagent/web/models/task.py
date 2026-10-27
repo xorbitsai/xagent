@@ -13,6 +13,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -23,7 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import deferred, relationship
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -560,6 +561,17 @@ class Task(Base):  # type: ignore
         nullable=True,
         index=True,
     )
+
+    # The dispatch class the caller declared at creation, stored as sent whether
+    # or not a deployment accepts it; acceptance is decided as each command is
+    # enqueued.
+    requested_dispatch_class = Column(String(16), nullable=True)
+
+    # The priority the caller declared at creation, as sent; NULL means none.
+    # Commands inherit it. Its only writer is the SDK task-creation endpoint,
+    # which checks the range first, so copying it to a command does not.
+    # Deferred, so a query for tasks does not select it.
+    dispatch_priority = deferred(Column(SmallInteger, nullable=True))
 
     # Visibility flag for discovery surfaces such as sidebar/history/search.
     # Hidden tasks still use normal owner/admin access by exact task_id.

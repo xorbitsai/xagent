@@ -69,6 +69,48 @@ def test_configured_auto_returns_router_with_explicit_bindings(monkeypatch):
     assert llm._fallback_model == "deepseek/deepseek-v4-flash"
 
 
+def test_configured_auto_passes_the_explicit_sequential_mode_contract():
+    bindings = ["candidate:11", "candidate:12"]
+    profiles = dict.fromkeys(bindings, "deepseek/deepseek-v4-flash")
+    modalities = {
+        bindings[0]: ["text"],
+        bindings[1]: ["text", "image"],
+    }
+    config = ChatModelConfig(
+        id="configured-auto",
+        model_provider="router",
+        model_name="auto",
+        router_mode="sequential_failover",
+        router_candidate_models=bindings,
+        router_candidate_profiles=profiles,
+        router_candidate_input_modalities=modalities,
+    )
+
+    llm = create_base_llm(config, downstream_resolver=lambda _binding: "target")
+
+    assert isinstance(llm, RouterLLM)
+    assert llm.uses_sequential_failover
+    assert llm._candidate_models == tuple(bindings)
+    assert llm._candidate_profiles == profiles
+    assert llm._candidate_input_modalities == {
+        binding: tuple(values) for binding, values in modalities.items()
+    }
+
+
+def test_configured_auto_defaults_to_routing_mode():
+    config = ChatModelConfig(
+        id="configured-auto",
+        model_provider="router",
+        model_name="auto",
+        router_candidate_models=["deepseek/deepseek-v4-flash"],
+    )
+
+    llm = create_base_llm(config, downstream_resolver=lambda _profile: "target")
+
+    assert isinstance(llm, RouterLLM)
+    assert not llm.uses_sequential_failover
+
+
 def test_openrouter_non_auto_is_not_router_llm():
     # A normal OpenRouter slug is dispatched directly, not via xrouter.
     config = ChatModelConfig(

@@ -2,11 +2,13 @@
 
 import asyncio
 import ipaddress
+import os
 import re
 import socket
 import ssl
+import threading
 from dataclasses import dataclass
-from typing import Callable, Mapping
+from typing import Callable, Iterable, Mapping, NoReturn
 from urllib.parse import (
     SplitResult,
     parse_qsl,
@@ -259,6 +261,104 @@ def build_ca_bundle_ssl_context() -> ssl.SSLContext:
     """
 
     return httpx.create_ssl_context(trust_env=True)
+
+
+_SHARED_CA_GUARDED_MESSAGE = "shared CA context is guarded against mutation"
+_SHARED_CA_ALPN = ["http/1.1"]
+
+_shared_ca_lock = threading.Lock()
+_shared_ca_slot: tuple[tuple[object, ...], ssl.SSLContext] | None = None
+
+
+def _reject_shared_ca_mutation(*args: object, **kwargs: object) -> NoReturn:
+    raise RuntimeError(_SHARED_CA_GUARDED_MESSAGE)
+
+
+def _set_shared_ca_alpn_protocols(protocols: Iterable[str]) -> None:
+    # httpcore re-applies its ALPN list on every connection. The same value is
+    # a no-op here so the ALPN setting of the published context is never
+    # written again.
+    if list(protocols) != _SHARED_CA_ALPN:
+        raise RuntimeError(_SHARED_CA_GUARDED_MESSAGE)
+
+
+def _shared_ca_key() -> tuple[object, ...]:
+    """Mirror which CA source ``httpx.create_ssl_context(trust_env=True)`` uses."""
+    cafile = os.environ.get("SSL_CERT_FILE")
+    if cafile:
+        try:
+            stat = os.stat(cafile)
+            file_identity: tuple[int, ...] | None = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        except OSError:
+            # Building the context reports the unreadable file.
+            file_identity = None
+        return ("file", cafile, file_identity)
+    capath = os.environ.get("SSL_CERT_DIR")
+    if capath:
+        try:
+            stat = os.stat(capath)
+            dir_identity: tuple[int, ...] | None = (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_mtime_ns,
+                stat.st_ctime_ns,
+            )
+        except OSError:
+            dir_identity = None
+        return ("dir", capath, dir_identity)
+    return ("certifi",)
+
+
+def shared_ca_bundle_ssl_context() -> ssl.SSLContext:
+    """Return one process-wide CA-only context for HTTP/1.1 client transports.
+
+    The context equals ``build_ca_bundle_ssl_context()``. It is rebuilt when
+    the CA source changes: the key is the ``SSL_CERT_FILE`` path with that
+    file's device, inode, size, mtime and ctime, or, when no file is set, the
+    ``SSL_CERT_DIR`` path with that directory's device, inode, mtime and
+    ctime. Any rewrite of the file or entry change in the directory therefore
+    rebuilds the context. Only the latest context is kept; transports that
+    already hold an older one keep using it. A failed build is not cached and
+    raises as it does in ``build_ca_bundle_ssl_context()``.
+
+    After publication the context is guarded against mutation:
+    ``set_alpn_protocols`` with ``["http/1.1"]`` is a no-op, and any other
+    ALPN list, ``load_cert_chain``, ``load_verify_locations``,
+    ``load_default_certs``, ``set_default_verify_paths`` and ``set_ciphers``
+    raise ``RuntimeError``. Attribute assignment (``verify_mode``,
+    ``check_hostname``, ``options``) cannot be intercepted, so callers must
+    not assign them. Use it only with ``http2=False`` transports and never
+    where a client certificate is loaded; use ``build_ca_bundle_ssl_context()``
+    there.
+
+    The mutating methods are overridden on the instance, never through a
+    subclass or ``__class__``. The type must stay exactly ``ssl.SSLContext``:
+    for any other context class anyio's TLS stream creates the TLS object
+    (``wrap_bio``) in its shared worker-thread pool, so a saturated pool
+    delays every new handshake past its connect timeout.
+    """
+    global _shared_ca_slot
+    with _shared_ca_lock:
+        key = _shared_ca_key()
+        slot = _shared_ca_slot
+        if slot is not None and slot[0] == key:
+            return slot[1]
+        context = build_ca_bundle_ssl_context()
+        context.set_alpn_protocols(_SHARED_CA_ALPN)
+        context.set_alpn_protocols = _set_shared_ca_alpn_protocols  # type: ignore[method-assign,assignment]
+        context.load_cert_chain = _reject_shared_ca_mutation  # type: ignore[method-assign]
+        context.load_verify_locations = _reject_shared_ca_mutation  # type: ignore[method-assign]
+        context.load_default_certs = _reject_shared_ca_mutation  # type: ignore[method-assign]
+        context.set_default_verify_paths = _reject_shared_ca_mutation  # type: ignore[method-assign]
+        context.set_ciphers = _reject_shared_ca_mutation  # type: ignore[method-assign]
+        _shared_ca_slot = (key, context)
+        return context
 
 
 def validate_public_http_url_shape(

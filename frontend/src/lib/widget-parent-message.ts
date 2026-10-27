@@ -14,6 +14,22 @@ export type WidgetParentMessageType =
   | "widget_expand"
   | "widget_collapse"
   | "prompt_context_request"
+  | "initial_message_request"
+  | "initial_message_ack"
+
+// Must stay in step with MAX_INITIAL_MESSAGE_LENGTH in public/widget.js.
+export const MAX_INITIAL_MESSAGE_LENGTH = 2000
+
+// The host's reply to this iframe, or null for anything else: another source,
+// a malformed envelope, or a different type.
+function hostMessageOfType(event: MessageEvent, type: string): Record<string, unknown> | null {
+  if (event.source !== window.parent) return null
+  const data = event.data as Record<string, unknown> | null
+  return data && typeof data === "object"
+    && data.xagent === true && data.v === 1 && data.type === type
+    ? data
+    : null
+}
 
 export function postToParentWidget(type: WidgetParentMessageType): void {
   // A direct (non-embedded) visit to this page has window.parent === window;
@@ -34,15 +50,9 @@ export function requestPromptContext(
       resolve(values)
     }
     const handleMessage = (event: MessageEvent) => {
-      if (event.source !== window.parent) return
-      const data: unknown = event.data
-      if (
-        !data || typeof data !== "object"
-        || (data as Record<string, unknown>).xagent !== true
-        || (data as Record<string, unknown>).v !== 1
-        || (data as Record<string, unknown>).type !== "prompt_context"
-      ) return
-      const values = (data as Record<string, unknown>).values
+      const data = hostMessageOfType(event, "prompt_context")
+      if (!data) return
+      const values = data.values
       const proto = values && typeof values === "object" ? Object.getPrototypeOf(values) : undefined
       if (proto !== Object.prototype && proto !== null) {
         finish(null)
@@ -74,16 +84,31 @@ export function listenForWidgetHostMessage(
     // this a same-document script's own window.postMessage(..., "*") would
     // satisfy `event.source === window.parent` trivially -- mirrors the
     // same direct-visit guard postToParentWidget already applies above.
-    if (window.parent === window || event.source !== window.parent) return
-    const data: unknown = event.data
-    if (
-      !data || typeof data !== "object"
-      || (data as Record<string, unknown>).xagent !== true
-      || (data as Record<string, unknown>).v !== 1
-      || (data as Record<string, unknown>).type !== type
-    ) return
+    if (window.parent === window || !hostMessageOfType(event, type)) return
     onMessage()
   }
   window.addEventListener("message", handleMessage)
+  return () => window.removeEventListener("message", handleMessage)
+}
+
+// Posts initial_message_request, then listens. Unlike prompt_context the parent
+// may answer long after the request: it holds the message until the visitor
+// first opens the panel. No timeout, so the caller owns the lifetime through
+// the returned cleanup. A valid message is acknowledged, and that ack is what
+// stops the parent from answering again.
+export function requestInitialMessage(
+  onMessage: (message: string) => void,
+): () => void {
+  if (window.parent === window) return () => undefined
+  const handleMessage = (event: MessageEvent) => {
+    const data = hostMessageOfType(event, "initial_message")
+    if (!data || typeof data.value !== "string") return
+    const message = data.value.trim()
+    if (!message || message.length > MAX_INITIAL_MESSAGE_LENGTH) return
+    postToParentWidget("initial_message_ack")
+    onMessage(message)
+  }
+  window.addEventListener("message", handleMessage)
+  postToParentWidget("initial_message_request")
   return () => window.removeEventListener("message", handleMessage)
 }

@@ -1468,16 +1468,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # backend and sandbox images, which each guarantee that path
             # exists) — a hardcoded path here would break every other
             # platform.
-            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': the
-            # Docker sandbox backend runs Chrome as root while Boxlite uses
-            # the image's uid 1100. This matches the root/no-sandbox exposure
-            # the existing
-            # browser_use tool (core/tools/core/browser_use.py) already
-            # carries in the backend image -- not identical flags
-            # (browser_use passes only --no-sandbox, plus
-            # --disable-web-security and file-access flags this connector
-            # does not set), just a comparable, already-accepted
-            # trade-off, not a new class of risk.
+            # --chrome-arg='--no-sandbox'/'--disable-setuid-sandbox': both
+            # sandbox backends run Chrome as the image's uid 1100. These flags
+            # remain an explicit reduction in browser isolation, so the
+            # connector stays hidden pending its security review.
             # --chrome-arg='--disable-dev-shm-usage': Docker's default
             # /dev/shm size (64MB) is a well-documented Chrome-in-container
             # crash mode: --no-sandbox is set above regardless, so this

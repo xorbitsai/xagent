@@ -281,8 +281,9 @@ export function ConnectMcpDialog({
   // The `??` default reproduces the pre-field gate and exists only for a
   // rolling deploy of the multi-container layout, where a new frontend
   // container can briefly talk to an older backend. It is a UI hint, never a
-  // permission: the edit route itself answers 404 without a personal
-  // association row (GET/PUT /api/mcp/servers/{id}, /api/custom-apis/{id}).
+  // permission: the routes behind it enforce access themselves -- PUT
+  // /api/mcp/servers/{id} answers 404 without a personal association row,
+  // while its GET and /api/custom-apis/{id} also accept a team access verdict.
   // Producer-side coverage is not in question -- all three emitting branches
   // are pinned to emit a bool by
   // test_every_listed_entry_carries_all_three_decisions (tests/web, which CI

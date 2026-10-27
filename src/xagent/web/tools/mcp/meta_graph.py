@@ -109,6 +109,7 @@ def graph_request(
     data: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
     files: dict[str, Any] | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> Any:
     """Issue a Graph API request and return the decoded JSON body.
 
@@ -146,7 +147,7 @@ def graph_request(
         url=f"{GRAPH_BASE_URL}{path}",
         headers=graph_headers(request_token, content_type=content_type),
         params=params,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
         **body_kwargs,
     )
 

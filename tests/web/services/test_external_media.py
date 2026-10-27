@@ -36,6 +36,9 @@ def _record(
     *,
     filename: str | None = None,
     mime_type: str = "image/png",
+    storage_path: str = "/unused/launch.png",
+    storage_status: str = "available",
+    storage_key: str | None = "users/7/launch.png",
 ) -> UploadedFile:
     filename = filename or ("launch.jpg" if mime_type == "image/jpeg" else "launch.png")
     return UploadedFile(
@@ -44,26 +47,21 @@ def _record(
         task_id=11,
         filename=filename,
         mime_type=mime_type,
-        storage_status="available",
-        storage_path="/unused/launch.png",
-        storage_key="users/7/launch.png",
+        storage_status=storage_status,
+        storage_path=storage_path,
+        storage_key=storage_key,
         checksum="a" * 64,
         file_size=1,
     )
 
 
-def test_issue_instagram_uses_ticket_even_when_durable_url_is_available(monkeypatch):
+def test_issue_instagram_uses_public_ticket_url(monkeypatch):
     file_id = str(uuid4())
     record = _record(file_id, mime_type="image/jpeg")
     monkeypatch.delenv("XAGENT_EXTERNAL_MEDIA_URL_TTL_SECONDS", raising=False)
-    monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
-    signed_access_url = Mock(
-        return_value="https://objects.example.test/launch.jpg?signature=secret"
-    )
-    monkeypatch.setattr(
-        external_media.ManagedFileRef, "signed_access_url", signed_access_url
-    )
+    validate = Mock()
+    monkeypatch.setattr(external_media, "_validate_instagram_record", validate)
 
     issued = external_media.issue_external_media_url(
         _DB(record),
@@ -76,20 +74,14 @@ def test_issue_instagram_uses_ticket_even_when_durable_url_is_available(monkeypa
     assert issued.direct_object_url is False
     assert issued.expires_in == 600
     assert issued.url.startswith("https://api.example.test/")
-    signed_access_url.assert_not_called()
+    validate.assert_called_once()
 
 
-def test_issue_falls_back_to_public_ticket_url(monkeypatch):
+def test_issue_returns_public_ticket_url(monkeypatch):
     file_id = str(uuid4())
     record = _record(file_id)
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test/")
-    monkeypatch.setattr(
-        external_media.ManagedFileRef,
-        "signed_access_url",
-        lambda self, **kwargs: (
-            "https://objects.example.test/launch.png?signature=secret"
-        ),
-    )
+    monkeypatch.setattr(external_media, "_validate_instagram_record", Mock())
 
     issued = external_media.issue_external_media_url(
         _DB(record),
@@ -114,11 +106,6 @@ def test_issue_falls_back_to_public_ticket_url(monkeypatch):
 def test_issue_requires_public_base_for_local_storage(monkeypatch):
     file_id = str(uuid4())
     monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
-    monkeypatch.setattr(
-        external_media.ManagedFileRef,
-        "signed_access_url",
-        lambda self, **kwargs: None,
-    )
 
     with pytest.raises(
         external_media.ExternalMediaUnavailable,
@@ -146,10 +133,13 @@ def test_issue_rejects_cross_task_record():
         )
 
 
-def test_issue_rejects_non_image_record():
+def test_issue_rejects_unsupported_image_format():
     file_id = str(uuid4())
 
-    with pytest.raises(external_media.ExternalMediaNotFound):
+    with pytest.raises(
+        external_media.ExternalMediaUnavailable,
+        match="PNG or JPEG",
+    ):
         external_media.issue_external_media_url(
             _DB(_record(file_id, filename="payload.svg", mime_type="image/svg+xml")),
             file_id=file_id,
@@ -163,11 +153,7 @@ def test_ticket_is_bound_to_exact_file(monkeypatch):
     file_id = str(uuid4())
     other_file_id = str(uuid4())
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
-    monkeypatch.setattr(
-        external_media.ManagedFileRef,
-        "signed_access_url",
-        lambda self, **kwargs: None,
-    )
+    monkeypatch.setattr(external_media, "_validate_instagram_record", Mock())
     issued = external_media.issue_external_media_url(
         _DB(_record(file_id)),
         file_id=file_id,
@@ -269,6 +255,20 @@ def test_instagram_jpeg_conversion_flattens_alpha_and_pads_aspect_ratio(tmp_path
         assert image.mode == "RGB"
         assert image.width >= 320
         assert image.width / image.height >= external_media.INSTAGRAM_MIN_ASPECT_RATIO
+        assert image.getpixel((0, 0)) == pytest.approx((255, 255, 255), abs=3)
+
+
+def test_instagram_conversion_upscales_tiny_tall_image_to_minimum_width(tmp_path):
+    source = tmp_path / "tiny-tall.png"
+    Image.new("RGB", (3, 4), "blue").save(source)
+
+    converted = external_media.instagram_jpeg_bytes(source)
+    output = tmp_path / "tiny-tall.jpg"
+    output.write_bytes(converted)
+
+    with Image.open(output) as image:
+        assert image.width >= external_media.INSTAGRAM_MIN_WIDTH
+        assert image.width / image.height >= external_media.INSTAGRAM_MIN_ASPECT_RATIO
 
 
 def test_instagram_conversion_resizes_before_padding_extreme_tall_image(tmp_path):
@@ -341,6 +341,7 @@ def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_pa
     source.write_bytes(b"placeholder")
 
     class OversizedImage:
+        format = "PNG"
         width = 5001
         height = 5001
 
@@ -359,6 +360,81 @@ def test_instagram_source_pixel_limit_is_checked_before_load(monkeypatch, tmp_pa
 
     with pytest.raises(external_media.ExternalMediaUnavailable, match="pixel limit"):
         external_media.instagram_image_requires_normalization(source)
+
+
+@pytest.mark.parametrize(
+    "error", [SyntaxError("bad JPEG"), external_media.struct.error()]
+)
+def test_instagram_decoder_errors_are_mapped(monkeypatch, tmp_path, error):
+    source = tmp_path / "image.jpg"
+    source.write_bytes(b"placeholder")
+    monkeypatch.setattr(external_media.Image, "open", Mock(side_effect=error))
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="decoded"):
+        external_media.instagram_image_requires_normalization(source)
+
+
+def test_issue_preflights_image_header(monkeypatch, tmp_path):
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / "launch.png"
+    source.parent.mkdir(parents=True)
+    Image.new("RGB", (640, 640), "blue").save(source)
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+
+    issued = external_media.issue_external_media_url(
+        _DB(
+            _record(
+                file_id,
+                storage_path=str(source),
+                storage_status="legacy",
+                storage_key=None,
+            )
+        ),
+        file_id=file_id,
+        user_id=7,
+        task_id=11,
+        purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+    )
+
+    assert issued.url.startswith("https://api.example.test/")
+
+
+def test_issue_rejects_corrupt_image_before_ticket(monkeypatch, tmp_path):
+    uploads_dir = tmp_path / "uploads"
+    source = uploads_dir / "user_7" / "web_task_11" / "broken.png"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"not-an-image")
+    file_id = str(uuid4())
+    monkeypatch.setattr(external_media, "get_uploads_dir", lambda: uploads_dir)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.test")
+
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="decoded"):
+        external_media.issue_external_media_url(
+            _DB(
+                _record(
+                    file_id,
+                    storage_path=str(source),
+                    storage_status="legacy",
+                    storage_key=None,
+                )
+            ),
+            file_id=file_id,
+            user_id=7,
+            task_id=11,
+            purpose=external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
+        )
+
+
+def test_large_jpeg_header_uses_higher_source_pixel_limit():
+    image = Mock(format="JPEG", width=8000, height=6000)
+
+    external_media._validate_instagram_source(image)
+
+    image.format = "PNG"
+    with pytest.raises(external_media.ExternalMediaUnavailable, match="pixel limit"):
+        external_media._validate_instagram_source(image)
 
 
 def test_instagram_processing_memory_error_is_mapped(monkeypatch, tmp_path):

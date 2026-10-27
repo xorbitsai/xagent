@@ -14,6 +14,7 @@ from .meta_graph import error_response as _error
 from .meta_graph import graph_error_response as _graph_error
 from .meta_graph import graph_request as _graph_request
 from .meta_graph import is_public_image_url as _is_public_image_url
+from .meta_graph import redact_secrets as _redact_secrets
 from .meta_graph import success_response as _success
 from .utils import setup_proxy_env
 
@@ -39,6 +40,7 @@ MEDIA_FIELDS = (
 MEDIA_CONTAINER_STATUS_FIELDS = "status_code,status"
 MEDIA_CONTAINER_MAX_POLLS = 30
 MEDIA_CONTAINER_POLL_INTERVAL_SECONDS = 1.0
+MEDIA_CONTAINER_TIMEOUT_SECONDS = 60.0
 _MEDIA_CONTAINER_READY_STATUSES = frozenset({"FINISHED", "PUBLISHED"})
 _MEDIA_CONTAINER_FAILED_STATUSES = frozenset({"ERROR", "EXPIRED"})
 
@@ -97,21 +99,31 @@ def _list_pages_with_instagram_accounts() -> list[dict[str, Any]]:
 
 
 def _wait_for_media_container(container_id: str) -> None:
+    deadline = time.monotonic() + MEDIA_CONTAINER_TIMEOUT_SECONDS
     for attempt in range(MEDIA_CONTAINER_MAX_POLLS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         status = _graph_request(
             "GET",
             _graph_path(container_id),
             params={"fields": MEDIA_CONTAINER_STATUS_FIELDS},
+            timeout=min(meta_graph.DEFAULT_TIMEOUT_SECONDS, remaining),
         )
         status_code = str(status.get("status_code") or "").upper()
+        status_text = str(status.get("status") or "").strip()
         if status_code in _MEDIA_CONTAINER_READY_STATUSES:
             return
         if status_code in _MEDIA_CONTAINER_FAILED_STATUSES:
-            raise ValueError(
-                f"Instagram media processing failed for container {container_id}"
-            )
+            message = f"Instagram media processing failed for container {container_id}"
+            if status_text:
+                message = f"{message}: {status_text}"
+            raise ValueError(message)
         if attempt + 1 < MEDIA_CONTAINER_MAX_POLLS:
-            time.sleep(MEDIA_CONTAINER_POLL_INTERVAL_SECONDS)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(MEDIA_CONTAINER_POLL_INTERVAL_SECONDS, remaining))
     raise TimeoutError(
         f"Instagram media processing timed out for container {container_id}"
     )
@@ -208,10 +220,11 @@ def instagram_publish_image(
     """Create and publish an Instagram image from a URL or workspace FileRef.
 
     Provide exactly one of image_url and file_path. The Xagent host resolves a
-    registered file_id (or file:<id>) supplied as file_path into a short-lived
-    provider URL before this connector runs.
+    registered file_id, file:<id>, or workspace path supplied as file_path into
+    a short-lived provider URL before this connector runs.
     """
-    resolved_image_url: str | None = None
+    url_value: str | None = None
+    container_id: str | None = None
     try:
         url_value = (
             image_url if isinstance(image_url, str) and image_url.strip() else None
@@ -223,13 +236,12 @@ def instagram_publish_image(
             raise ValueError("Provide exactly one of image_url or file_path")
         if file_value is not None:
             raise ValueError(
-                "file_path must be a registered file_id or file:<id> resolved by "
-                "the Xagent host"
+                "file_path must be a registered file_id, file:<id>, or workspace "
+                "path resolved by the Xagent host"
             )
         if url_value is None or not _is_public_image_url(url_value):
             raise ValueError("image_url must be a public http or https URL")
-        resolved_image_url = url_value
-        data = {"image_url": resolved_image_url}
+        data = {"image_url": url_value}
         if caption:
             data["caption"] = caption
 
@@ -238,24 +250,34 @@ def instagram_publish_image(
             _graph_path(instagram_account_id, "media"),
             data=data,
         )
-        container_id = container.get("id")
-        if not container_id:
+        raw_container_id = container.get("id")
+        if not raw_container_id:
             raise ValueError("Instagram media container response did not include id")
+        container_id = str(raw_container_id)
 
-        _wait_for_media_container(str(container_id))
+        _wait_for_media_container(container_id)
         published = _graph_request(
             "POST",
             _graph_path(instagram_account_id, "media_publish"),
-            data={"creation_id": str(container_id)},
+            data={"creation_id": container_id},
         )
         return _success(container_id=container_id, media_id=published.get("id"))
     except GraphAPIError as e:
-        if resolved_image_url:
-            e.sensitive_values.add(resolved_image_url)
-            e.sensitive_values.add(resolved_image_url.replace("/", r"\/"))
+        if url_value:
+            e.sensitive_values.add(url_value)
+            e.sensitive_values.add(url_value.replace("/", r"\/"))
+        if container_id:
+            if isinstance(e.details, dict):
+                e.details = {**e.details, "container_id": container_id}
+            else:
+                e.details = {
+                    "container_id": container_id,
+                    "graph_error": e.details,
+                }
         logger.error(
-            "Instagram Graph API rejected image publishing for %s",
+            "Instagram Graph API rejected image publishing for %s: %s",
             instagram_account_id,
+            _redact_secrets(str(e), e.sensitive_values),
         )
         return _graph_error(e)
     except Exception as e:

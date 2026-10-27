@@ -1,6 +1,7 @@
 import json
 from unittest.mock import Mock
 
+import pytest
 import requests
 
 from xagent.web.tools.mcp import instagram
@@ -268,7 +269,12 @@ def test_publish_image_stops_when_container_processing_fails(monkeypatch):
         requests_seen.append(url)
         if url.endswith("/ig-1/media"):
             return MockResponse({"id": "container-1"})
-        return MockResponse({"status_code": "ERROR"})
+        return MockResponse(
+            {
+                "status_code": "ERROR",
+                "status": "Media width is unsupported",
+            }
+        )
 
     monkeypatch.setattr(instagram.requests, "request", Mock(side_effect=request))
 
@@ -278,7 +284,10 @@ def test_publish_image_stops_when_container_processing_fails(monkeypatch):
 
     assert result == {
         "status": "error",
-        "message": "Instagram media processing failed for container container-1",
+        "message": (
+            "Instagram media processing failed for container container-1: "
+            "Media width is unsupported"
+        ),
     }
     assert not any(url.endswith("/media_publish") for url in requests_seen)
 
@@ -309,6 +318,26 @@ def test_publish_image_timeout_includes_reusable_container_id(monkeypatch):
     sleep.assert_called_once_with(instagram.MEDIA_CONTAINER_POLL_INTERVAL_SECONDS)
 
 
+def test_media_container_polling_honors_wall_clock_deadline(monkeypatch):
+    graph_request = Mock(return_value={"status_code": "IN_PROGRESS"})
+    sleep = Mock()
+    monotonic = Mock(side_effect=[0.0, 0.0, 60.0])
+    monkeypatch.setattr(instagram, "_graph_request", graph_request)
+    monkeypatch.setattr(instagram.time, "sleep", sleep)
+    monkeypatch.setattr(instagram.time, "monotonic", monotonic)
+
+    with pytest.raises(TimeoutError, match="container-deadline"):
+        instagram._wait_for_media_container("container-deadline")
+
+    graph_request.assert_called_once_with(
+        "GET",
+        "/container-deadline",
+        params={"fields": "status_code,status"},
+        timeout=instagram.meta_graph.DEFAULT_TIMEOUT_SECONDS,
+    )
+    sleep.assert_not_called()
+
+
 def test_publish_image_redacts_graph_error_while_polling(monkeypatch, caplog):
     monkeypatch.setenv("META_ACCESS_TOKEN", "user-token")
     signed_url = "https://api.example.test/media?ticket=temporary-secret"
@@ -336,6 +365,8 @@ def test_publish_image_redacts_graph_error_while_polling(monkeypatch, caplog):
     assert escaped_url not in serialized
     assert signed_url not in caplog.text
     assert escaped_url not in caplog.text
+    assert result["details"]["container_id"] == "container-1"
+    assert "[redacted]" in caplog.text
     assert not any(url.endswith("/media_publish") for url in requests_seen)
 
 

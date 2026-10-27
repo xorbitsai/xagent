@@ -297,3 +297,58 @@ def test_workspace_issues_scoped_instagram_media_url(
         "purpose": external_media.ExternalMediaPurpose.INSTAGRAM_PUBLISH,
     }
     assert db.closed is True
+
+
+@pytest.mark.parametrize(
+    ("service_error", "expected_error", "message"),
+    [
+        ("not_found", FileNotFoundError, "Registered image was not found"),
+        ("unavailable", ValueError, "Image could not be decoded"),
+    ],
+)
+def test_workspace_maps_external_media_errors(
+    monkeypatch,
+    tmp_path: Path,
+    service_error: str,
+    expected_error: type[Exception],
+    message: str,
+) -> None:
+    from xagent.core.storage import manager
+    from xagent.web.services import external_media
+
+    workspace = TaskWorkspace("web_task_11", str(tmp_path), db_task_id=11)
+    workspace.owner_user_id = 7
+
+    class FakeDB:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    db = FakeDB()
+
+    def issue(*args, **kwargs):
+        if service_error == "not_found":
+            raise external_media.ExternalMediaNotFound("hidden")
+        raise external_media.ExternalMediaUnavailable(message)
+
+    monkeypatch.setattr(manager, "create_db_session", lambda: db)
+    monkeypatch.setattr(external_media, "issue_external_media_url", issue)
+
+    with pytest.raises(expected_error, match=message):
+        workspace.issue_external_media_url_detached(
+            "31218a9f-1497-4216-9f75-1fc8d51368c4",
+            "instagram-publish",
+        )
+
+    assert db.closed is True
+
+
+def test_workspace_external_media_requires_database_scope(tmp_path: Path) -> None:
+    workspace = TaskWorkspace("local_task", str(tmp_path))
+
+    with pytest.raises(FileNotFoundError, match="Registered image was not found"):
+        workspace.issue_external_media_url_detached(
+            "31218a9f-1497-4216-9f75-1fc8d51368c4",
+            "instagram-publish",
+        )

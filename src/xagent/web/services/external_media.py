@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -12,24 +13,27 @@ from typing import Any
 from urllib.parse import quote, urlencode, urlsplit
 from uuid import UUID
 
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_media_url_ttl_seconds,
-    get_file_delivery_redirect_enabled,
     get_public_api_base_url,
+    get_uploads_dir,
 )
 from ...core.file_ref import parse_file_id_ref
+from ...core.workspace import scoped_user_root
 from .. import jwt_codec as jwt
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..jwt_codec import JWTError
 from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import (
     DurableObjectIntegrityError,
+    DurableObjectMissingError,
     DurableStorageOperationError,
     ManagedFileRef,
 )
+from .uploaded_file_cleanup_publication import FilePublicationUnavailable
 
 EXTERNAL_MEDIA_TICKET_TYPE = "external_media_ticket"
 EXTERNAL_MEDIA_ROUTE_PREFIX = "/api/files/external-media"
@@ -82,14 +86,16 @@ INSTAGRAM_MAX_ASPECT_RATIO = 1.91
 INSTAGRAM_MIN_WIDTH = 320
 INSTAGRAM_MAX_WIDTH = 1440
 INSTAGRAM_MAX_SOURCE_PIXELS = 25_000_000
+INSTAGRAM_MAX_JPEG_SOURCE_PIXELS = 100_000_000
 _INSTAGRAM_IMAGE_FORMATS = ["PNG", "JPEG"]
-_EXIF_ORIENTATION_TAG = 274
 _INSTAGRAM_PROCESSING_ERRORS = (
     OSError,
     UnidentifiedImageError,
     Image.DecompressionBombError,
     ValueError,
     MemoryError,
+    SyntaxError,
+    struct.error,
 )
 
 
@@ -106,7 +112,7 @@ def _image_media_type(record: Any) -> str:
     filename = str(getattr(record, "filename", "") or "").strip().lower()
     media_type = _IMAGE_MEDIA_TYPES.get(Path(filename).suffix)
     if media_type is None:
-        raise ExternalMediaNotFound("Registered image was not found")
+        raise ExternalMediaUnavailable("Instagram accepts PNG or JPEG images")
     return media_type
 
 
@@ -177,39 +183,14 @@ def issue_external_media_url(
         user_id=int(user_id),
         task_id=int(task_id),
     )
-    media_type = _image_media_type(record)
     ttl = get_external_media_url_ttl_seconds()
-    signed_url = None
-    if (
-        purpose is not ExternalMediaPurpose.INSTAGRAM_PUBLISH
-        and get_file_delivery_redirect_enabled()
-    ):
-        try:
-            signed_url = ManagedFileRef(record).signed_access_url(
-                expires=ttl,
-                content_type=media_type,
-            )
-        except DurableObjectIntegrityError as exc:
-            raise ExternalMediaUnavailable(
-                "Registered image failed integrity verification"
-            ) from exc
-        except DurableStorageOperationError as exc:
-            raise ExternalMediaUnavailable(
-                "Registered image could not be prepared for external delivery"
-            ) from exc
-    if signed_url and urlsplit(signed_url).scheme == "https":
-        return ExternalMediaURL(
-            url=signed_url,
-            expires_in=ttl,
-            direct_object_url=True,
-        )
-
     public_base_url = get_public_api_base_url()
     if not public_base_url or urlsplit(public_base_url).scheme != "https":
         raise ExternalMediaUnavailable(
             "A public HTTPS XAGENT_PUBLIC_API_BASE_URL is required for external "
             "media delivery"
         )
+    _validate_instagram_record(record)
     ticket = _encode_ticket(
         file_id=normalized_file_id,
         user_id=int(user_id),
@@ -282,10 +263,58 @@ def redeem_external_media_ticket(
 def _validate_instagram_source(image: Image.Image) -> None:
     if image.width <= 0 or image.height <= 0:
         raise ExternalMediaUnavailable("Registered image has invalid dimensions")
-    if image.width * image.height > INSTAGRAM_MAX_SOURCE_PIXELS:
+    pixel_limit = (
+        INSTAGRAM_MAX_JPEG_SOURCE_PIXELS
+        if image.format == "JPEG"
+        else INSTAGRAM_MAX_SOURCE_PIXELS
+    )
+    if image.width * image.height > pixel_limit:
         raise ExternalMediaUnavailable(
             "Registered image exceeds the Instagram source pixel limit"
         )
+
+
+def _local_record_path_is_trusted(record: UploadedFile, path: Path) -> bool:
+    uploads_root = get_uploads_dir().resolve()
+    user_root = scoped_user_root(get_uploads_dir(), int(record.user_id)).resolve()
+    resolved = path.resolve()
+    return resolved.is_relative_to(uploads_root) and resolved.is_relative_to(user_root)
+
+
+def _validate_instagram_header(path: Path) -> None:
+    try:
+        with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
+            _validate_instagram_source(image)
+    except ExternalMediaUnavailable:
+        raise
+    except _INSTAGRAM_PROCESSING_ERRORS as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be decoded for Instagram"
+        ) from exc
+
+
+def _validate_instagram_record(record: UploadedFile) -> None:
+    file_ref = ManagedFileRef(record)
+    try:
+        path = file_ref.materialize(
+            allow_existing_local=_local_record_path_is_trusted(
+                record,
+                file_ref.local_path,
+            )
+        )
+    except DurableObjectIntegrityError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image failed integrity verification"
+        ) from exc
+    except (DurableObjectMissingError, FilePublicationUnavailable) as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image bytes are unavailable"
+        ) from exc
+    except DurableStorageOperationError as exc:
+        raise ExternalMediaUnavailable(
+            "Registered image could not be prepared for external delivery"
+        ) from exc
+    _validate_instagram_header(path)
 
 
 def instagram_image_requires_normalization(path: Path) -> bool:
@@ -295,17 +324,21 @@ def instagram_image_requires_normalization(path: Path) -> bool:
         file_size = path.stat().st_size
         with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as image:
             _validate_instagram_source(image)
-            image.load()
-            orientation = image.getexif().get(_EXIF_ORIENTATION_TAG, 1)
+            if image.format != "JPEG":
+                return True
+            orientation = image.getexif().get(ExifTags.Base.Orientation, 1)
             ratio = image.width / image.height
-            return (
-                image.format != "JPEG"
-                or image.mode != "RGB"
-                or orientation not in {None, 1}
+            requires_normalization = (
+                image.mode != "RGB"
+                or orientation != 1
                 or file_size > INSTAGRAM_MAX_JPEG_BYTES
                 or not INSTAGRAM_MIN_WIDTH <= image.width <= INSTAGRAM_MAX_WIDTH
                 or not INSTAGRAM_MIN_ASPECT_RATIO <= ratio <= INSTAGRAM_MAX_ASPECT_RATIO
             )
+            if requires_normalization:
+                return True
+            image.load()
+            return False
     except ExternalMediaUnavailable:
         raise
     except _INSTAGRAM_PROCESSING_ERRORS as exc:
@@ -342,6 +375,9 @@ def _resize_for_instagram_canvas(image: Image.Image) -> Image.Image:
     canvas_width, _ = _instagram_canvas_size(image)
     if canvas_width < INSTAGRAM_MIN_WIDTH:
         scale = INSTAGRAM_MIN_WIDTH / canvas_width
+        if image.width / image.height < INSTAGRAM_MIN_ASPECT_RATIO:
+            minimum_height = ceil(INSTAGRAM_MIN_WIDTH / INSTAGRAM_MIN_ASPECT_RATIO)
+            scale = max(scale, minimum_height / image.height)
         image = image.resize(
             (
                 max(1, ceil(image.width * scale)),
@@ -358,6 +394,8 @@ def instagram_jpeg_bytes(path: Path) -> bytes:
     try:
         with Image.open(path, formats=_INSTAGRAM_IMAGE_FORMATS) as opened:
             _validate_instagram_source(opened)
+            if opened.format == "JPEG":
+                opened.draft("RGB", (INSTAGRAM_MAX_WIDTH, 1800))
             image = ImageOps.exif_transpose(opened)
             image.load()
 

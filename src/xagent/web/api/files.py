@@ -1780,7 +1780,11 @@ def external_media_file(
 
     return FileResponse(
         path,
-        media_type=redeemed.media_type,
+        media_type=(
+            "image/jpeg"
+            if redeemed.purpose is ExternalMediaPurpose.INSTAGRAM_PUBLISH
+            else redeemed.media_type
+        ),
         headers={
             **response_headers,
             "Content-Disposition": _content_disposition_header(

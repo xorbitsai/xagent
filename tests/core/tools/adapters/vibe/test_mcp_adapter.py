@@ -691,6 +691,12 @@ async def test_instagram_external_media_maps_workspace_errors(error, expected):
 @pytest.mark.asyncio
 async def test_instagram_external_media_requires_file_ref():
     class FakeWorkspace:
+        def resolve_path(self, file_path):
+            raise FileNotFoundError(file_path)
+
+        def get_file_id_from_path(self, path):
+            raise AssertionError("an unresolved path must not be registered")
+
         def issue_external_media_url_detached(self, file_id, purpose):
             raise AssertionError("must not issue a URL for an unregistered path")
 
@@ -718,9 +724,52 @@ async def test_instagram_external_media_requires_file_ref():
     )
 
     assert result == {
-        "content": [{"text": "file_path must be a registered file_id or file:<id>."}],
+        "content": [
+            {
+                "text": (
+                    "file_path must be a registered file_id, file:<id>, or "
+                    "workspace path."
+                )
+            }
+        ],
         "is_error": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_instagram_registered_workspace_path_is_substituted():
+    file_id = "31218a9f-1497-4216-9f75-1fc8d51368c4"
+    resolved = Path("/task/output/image.png")
+    temporary_url = "https://api.example.test/media?ticket=temporary-secret"
+
+    class FakeWorkspace:
+        def resolve_path(self, file_path):
+            assert file_path == "output/image.png"
+            return resolved
+
+        def get_file_id_from_path(self, path):
+            assert path == str(resolved)
+            return file_id
+
+        def issue_external_media_url_detached(self, requested_file_id, purpose):
+            assert requested_file_id == file_id
+            assert purpose == "instagram-publish"
+            return temporary_url
+
+    adapter = _instagram_adapter_for_workspace(FakeWorkspace())
+
+    prepared, replacements = await adapter._substitute_external_media_args(
+        {
+            "instagram_account_id": "ig-1",
+            "file_path": "output/image.png",
+        }
+    )
+
+    assert prepared == {
+        "instagram_account_id": "ig-1",
+        "image_url": temporary_url,
+    }
+    assert replacements[temporary_url] == f"file:{file_id}"
 
 
 @pytest.mark.asyncio

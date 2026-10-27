@@ -501,7 +501,7 @@ _EXTERNAL_MEDIA_BINDINGS: dict[tuple[str, str], _ExternalMediaBinding] = {
 }
 _EXTERNAL_MEDIA_FILE_NOT_FOUND = "file_id not found or not accessible."
 _EXTERNAL_MEDIA_FILE_REF_REQUIRED = (
-    "file_path must be a registered file_id or file:<id>."
+    "file_path must be a registered file_id, file:<id>, or workspace path."
 )
 _EXTERNAL_MEDIA_EXCLUSIVE_SOURCE = "Provide exactly one of image_url or file_path."
 
@@ -2338,8 +2338,9 @@ class MCPToolAdapter(AbstractBaseTool):
             )
         if self._workspace is not None and self._external_media_binding is not None:
             description += (
-                " A registered workspace image (file:<id>) may be supplied for "
-                f"`{self._external_media_binding.file_argument}`; the host gives "
+                " A registered workspace image (file:<id> or workspace path) may "
+                f"be supplied for `{self._external_media_binding.file_argument}`; "
+                "the host gives "
                 "the provider short-lived, TTL-bound access."
             )
         if self._workspace is not None and self._signed_upload is not None:
@@ -3157,6 +3158,18 @@ class MCPToolAdapter(AbstractBaseTool):
             raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_EXCLUSIVE_SOURCE)
 
         file_id = _file_ref_value(raw_file)
+        if file_id is None and isinstance(raw_file, str):
+            try:
+                resolved_path = await self._run_upload_staging_operation(
+                    workspace.resolve_path,
+                    raw_file,
+                )
+                file_id = await self._run_upload_staging_operation(
+                    workspace.get_file_id_from_path,
+                    str(resolved_path),
+                )
+            except (FileNotFoundError, OSError, ValueError):
+                file_id = None
         if file_id is None:
             raise _ExternalMediaPreparationError(_EXTERNAL_MEDIA_FILE_REF_REQUIRED)
         try:

@@ -123,9 +123,8 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
-def test_seed_rows_match_registry(tmp_path):
-    """The migration snapshot and the runtime registry must define the same
-    employment-hero rows (the migration is a frozen copy; this catches drift)."""
+def test_seed_rows_match_registry_except_fields_updated_by_later_migration(tmp_path):
+    """The seed remains frozen while later migrations evolve catalog fields."""
     from xagent.web.builtin_mcp_registry import (
         get_builtin_oauth_provider_rows,
         get_builtin_public_mcp_app_rows,
@@ -138,7 +137,16 @@ def test_seed_rows_match_registry(tmp_path):
         for row in get_builtin_public_mcp_app_rows()
         if row["app_id"] == "employment-hero"
     )
-    assert migration._employment_hero_app_row() == registry_app
+    seeded_app = migration._employment_hero_app_row()
+    assert {
+        key: value
+        for key, value in seeded_app.items()
+        if key not in {"description", "oauth_scopes"}
+    } == {
+        key: value
+        for key, value in registry_app.items()
+        if key not in {"description", "oauth_scopes"}
+    }
 
     registry_provider = next(
         row

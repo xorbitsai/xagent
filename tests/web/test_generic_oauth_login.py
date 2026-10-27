@@ -802,8 +802,9 @@ def test_employment_hero_login_requests_exact_canonical_scope(db_session):
     qs = parse_qs(urlparse(_location(resp)).query)
 
     assert qs["scope"] == [
-        "employees:list employees:show organisations:list teams:list "
-        "timesheet_entries:list"
+        "employees:list employees:show leave_balances:list "
+        "leave_categories:list leave_requests:approve leave_requests:create "
+        "leave_requests:list organisations:list teams:list timesheet_entries:list"
     ]
 
 

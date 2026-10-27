@@ -60,6 +60,11 @@ def db_session(tmp_path):
                 "employees:show",
                 "teams:list",
                 "timesheet_entries:list",
+                "leave_categories:list",
+                "leave_balances:list",
+                "leave_requests:list",
+                "leave_requests:create",
+                "leave_requests:approve",
             ],
             is_visible_in_connector=True,
             launch_config={

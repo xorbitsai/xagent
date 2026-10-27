@@ -1733,7 +1733,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "employment-hero",
             "name": "Employment Hero",
-            "description": "Connect to Employment Hero to look up organisations, employees, teams, and timesheet entries.",
+            "description": "Connect to Employment Hero to look up organisations, employees, teams, timesheets, leave categories, balances and requests, and to create or approve leave requests with confirmation.",
             "icon": "https://www.google.com/s2/favicons?domain=employmenthero.com&sz=128",
             "transport": "oauth",
             "provider_name": "employment-hero",
@@ -1752,6 +1752,11 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "employees:show",
                 "teams:list",
                 "timesheet_entries:list",
+                "leave_categories:list",
+                "leave_balances:list",
+                "leave_requests:list",
+                "leave_requests:create",
+                "leave_requests:approve",
             ],
             "is_visible_in_connector": True,
             "launch_config": {

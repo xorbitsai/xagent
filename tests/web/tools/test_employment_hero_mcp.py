@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import Mock
 
@@ -270,6 +271,25 @@ def test_list_employees_rejects_invalid_member_type(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_list_employees_forwards_query_without_loading_the_whole_directory(
+    monkeypatch,
+):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    json.loads(
+        employment_hero.employment_hero_list_employees(
+            "org-1", item_per_page=20, query="  Summer Smith  "
+        )
+    )
+
+    assert mock_request.call_args.kwargs["params"] == {
+        "page_index": 1,
+        "item_per_page": 20,
+        "query": "Summer Smith",
+    }
+
+
 def test_get_employee_url_encodes_path_segments(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"data": {"id": "emp-1"}}))
     monkeypatch.setattr(employment_hero.requests, "request", mock_request)
@@ -380,3 +400,321 @@ def test_tool_functions_return_error_envelope_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "forbidden" in result["message"]
+
+
+def test_request_adds_actionable_scope_hint_to_403(monkeypatch):
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=403, json_data={"message": "forbidden"}
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        employment_hero._request(
+            "GET",
+            "/organisations/org-1/leave_categories",
+            required_scope=employment_hero.LEAVE_CATEGORIES_LIST_SCOPE,
+        )
+
+    message = str(excinfo.value)
+    assert employment_hero.LEAVE_CATEGORIES_LIST_SCOPE in message
+    assert "disconnect and reconnect" in message
+
+
+def test_list_leave_categories_requests_expected_path(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "items": [
+                        {
+                            "id": "category-1",
+                            "name": "Annual Leave",
+                            "unit_type": "days",
+                        }
+                    ],
+                    "total_items": 1,
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(employment_hero.employment_hero_list_leave_categories("org/1"))
+
+    assert result["status"] == "success"
+    assert result["leave_categories"]["items"][0]["name"] == "Annual Leave"
+    assert (
+        mock_request.call_args.kwargs["url"]
+        == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations/org%2F1/leave_categories"
+    )
+
+
+def test_get_leave_balances_requests_employee_path(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "items": [
+                        {
+                            "leave_category_name": "Annual Leave",
+                            "available_balance": 10,
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_get_leave_balances("org-1", "emp/1")
+    )
+
+    assert result["status"] == "success"
+    assert (
+        mock_request.call_args.kwargs["url"]
+        == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations/org-1/employees/emp%2F1/leave_balances"
+    )
+
+
+def test_list_leave_requests_supports_manager_filters(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_list_leave_requests(
+            "org-1",
+            statuses=[" Pending ", "Approved"],
+            start_date="2026-11-01",
+            end_date="2026-11-30",
+            leave_category_id="category/1",
+            page_index=2,
+            item_per_page=50,
+        )
+    )
+
+    assert result["status"] == "success"
+    call = mock_request.call_args
+    assert (
+        call.kwargs["url"]
+        == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations/org-1/leave_requests"
+    )
+    assert call.kwargs["params"] == {
+        "page_index": 2,
+        "item_per_page": 50,
+        "statuses": ["Pending", "Approved"],
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-30",
+        "leave_category_id": "category/1",
+    }
+
+
+def test_list_leave_requests_supports_employee_view(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    json.loads(
+        employment_hero.employment_hero_list_leave_requests(
+            "org-1", employee_id="emp/1"
+        )
+    )
+
+    assert (
+        mock_request.call_args.kwargs["url"]
+        == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations/org-1/employees/emp%2F1/leave_requests"
+    )
+
+
+@pytest.mark.parametrize(
+    "start_date,end_date,message",
+    [
+        ("2026-02-30", "2026-03-01", "valid YYYY-MM-DD"),
+        ("2026-11-02", "2026-11-01", "on or after"),
+    ],
+)
+def test_list_leave_requests_rejects_invalid_date_ranges(
+    monkeypatch, start_date, end_date, message
+):
+    mock_request = Mock()
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_list_leave_requests(
+            "org-1", start_date=start_date, end_date=end_date
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_list_leave_requests_accepts_one_sided_date_filter(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_list_leave_requests(
+            "org-1", start_date="2026-11-01"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"]["start_date"] == "2026-11-01"
+    assert "end_date" not in mock_request.call_args.kwargs["params"]
+
+
+def test_create_leave_request_sends_validated_json_body(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "id": "leave-1",
+                    "employee_id": "emp-1",
+                    "status": "Pending",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_create_leave_request(
+            "org-1",
+            "emp-1",
+            "category-1",
+            "2026-12-24",
+            "2026-12-25",
+            comment="Holiday",
+            hours_per_day=[{"date": "2026-12-24", "hours": 7.6}],
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["leave_request"]["id"] == "leave-1"
+    call = mock_request.call_args
+    assert call.kwargs["method"] == "POST"
+    assert call.kwargs["json"] == {
+        "leave_category_id": "category-1",
+        "start_date": "2026-12-24",
+        "end_date": "2026-12-25",
+        "comment": "Holiday",
+        "hours_per_day": [{"date": "2026-12-24", "hours": 7.6}],
+    }
+
+
+@pytest.mark.parametrize(
+    "hours_per_day,message",
+    [
+        ([{"date": "2026-12-23", "hours": 7.6}], "must fall within"),
+        (
+            [
+                {"date": "2026-12-24", "hours": 7.6},
+                {"date": "2026-12-24", "hours": 4},
+            ],
+            "duplicate date",
+        ),
+        ([{"date": "2026-12-24", "hours": -1}], "non-negative number"),
+        ([{"date": "2026-12-24", "hours": float("nan")}], "non-negative number"),
+        ([{"date": "2026-12-24"}], "exactly 'date' and 'hours'"),
+    ],
+)
+def test_create_leave_request_rejects_invalid_hours_per_day(
+    monkeypatch, hours_per_day, message
+):
+    mock_request = Mock()
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_create_leave_request(
+            "org-1",
+            "emp-1",
+            "category-1",
+            "2026-12-24",
+            "2026-12-25",
+            hours_per_day=hours_per_day,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert message in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_create_leave_request_does_not_report_empty_response_as_success(monkeypatch):
+    monkeypatch.setattr(
+        employment_hero.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204, text="")),
+    )
+
+    result = json.loads(
+        employment_hero.employment_hero_create_leave_request(
+            "org-1", "emp-1", "category-1", "2026-12-24", "2026-12-25"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "unexpected response" in result["message"]
+
+
+def test_approve_leave_request_requests_expected_path(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"id": "leave-1", "status": "Approved"}}
+        )
+    )
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_approve_leave_request(
+            "org-1", "emp/1", "leave/1"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["leave_request"]["status"] == "Approved"
+    call = mock_request.call_args
+    assert call.kwargs["method"] == "POST"
+    assert "json" not in call.kwargs
+    assert (
+        call.kwargs["url"]
+        == f"{employment_hero.EMPLOYMENT_HERO_BASE_URL}/organisations/org-1/employees/emp%2F1/leave_requests/leave%2F1/approve"
+    )
+
+
+def test_leave_tools_are_discoverable_with_expected_annotations_and_search_schema():
+    tools = {tool.name: tool for tool in asyncio.run(employment_hero.mcp.list_tools())}
+
+    expected_leave_tools = {
+        "employment_hero_list_leave_categories",
+        "employment_hero_get_leave_balances",
+        "employment_hero_list_leave_requests",
+        "employment_hero_create_leave_request",
+        "employment_hero_approve_leave_request",
+    }
+    assert expected_leave_tools <= set(tools)
+    assert "query" in tools["employment_hero_list_employees"].inputSchema["properties"]
+
+    for name in (
+        "employment_hero_list_leave_categories",
+        "employment_hero_get_leave_balances",
+        "employment_hero_list_leave_requests",
+    ):
+        assert tools[name].annotations is not None
+        assert tools[name].annotations.readOnlyHint is True
+
+    create = tools["employment_hero_create_leave_request"].annotations
+    assert create is not None
+    assert create.destructiveHint is False
+    assert create.idempotentHint is False
+
+    approve = tools["employment_hero_approve_leave_request"].annotations
+    assert approve is not None
+    assert approve.destructiveHint is True
+    assert approve.idempotentHint is True

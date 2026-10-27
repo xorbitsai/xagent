@@ -108,6 +108,65 @@ from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 _DESCRIPTION_BOUND_ARGS_MAX_CHARS = 4096
 
+_HUBSPOT_TOOL_GUIDANCE = {
+    "search_crm_objects": (
+        " For a request to find a specific contact by name or email and read a "
+        "property value, use this record-search tool. For an email lookup, use "
+        "an exact email property filter rather than relying on free-text search, "
+        "and request the desired contact properties. If the property's internal "
+        "name is unknown, resolve it with search_properties first, then return "
+        "to this tool; property metadata does not contain contact values. An "
+        "empty result alone does not prove an access problem: check "
+        "get_user_details or discover_hubspot_schema before diagnosing one. If "
+        "read access is confirmed but the exact search is empty, say that no "
+        "matching contact is visible to the connected user; do not invent a "
+        "missing scope or claim that the contact does not exist."
+    ),
+    "search_properties": (
+        " This tool returns property definitions, not CRM record values. Never "
+        "use property names, metadata, or counts to answer a specific contact's "
+        "property value or to conclude that contact records are inaccessible. "
+        "After resolving the internal property name, call search_crm_objects."
+    ),
+    "get_properties": (
+        " This tool returns property definitions, not CRM record values. Never "
+        "use property names, metadata, or counts to answer a specific contact's "
+        "property value or to conclude that contact records are inaccessible. "
+        "After resolving the internal property name, call search_crm_objects."
+    ),
+    "get_user_details": (
+        " Use this tool to verify contact read access when a contact record tool "
+        "is unavailable or rejects a lookup. Report only the access status this "
+        "tool actually returns. If it reports no contact read access, tell the "
+        "user to reconnect or reauthorize HubSpot with Contacts read permission, "
+        "or ask a HubSpot admin to expand the user's record visibility. Do not "
+        "label an empty search result as a scope or permission error without "
+        "this evidence. When contact read access is present, an empty exact "
+        "search means only that no matching record is visible to this user."
+    ),
+    "discover_hubspot_schema": (
+        " When diagnosing a failed contact lookup, inspect the contacts object "
+        "type and report its returned read-access status exactly. Distinguish a "
+        "confirmed permission or record-visibility restriction from a successful "
+        "search that simply found no matching contact."
+    ),
+}
+
+
+def _provider_tool_description_guidance(
+    source_server: str | None, tool_name: str
+) -> str:
+    """Return narrow host guidance for provider-owned remote MCP tools.
+
+    Remote servers own their tool schemas and descriptions. The host only adds
+    guidance where production usage exposed an ambiguity between otherwise
+    valid tools; keeping this keyed by both provider and raw tool name prevents
+    one provider's workflow from leaking into similarly named custom servers.
+    """
+    if str(source_server or "").casefold() != "hubspot":
+        return ""
+    return _HUBSPOT_TOOL_GUIDANCE.get(tool_name.casefold(), "")
+
 
 class MCPFailurePhase(str, Enum):
     """Public-safe phase where an MCP server failed to load.
@@ -2324,6 +2383,9 @@ class MCPToolAdapter(AbstractBaseTool):
         """Describe both the MCP operation and its effective task bindings."""
         description = (
             self.mcp_tool.description or f"Execute MCP tool: {self.mcp_tool.name}"
+        )
+        description += _provider_tool_description_guidance(
+            self.source_server, self.mcp_tool.name
         )
         if self._workspace is not None and self._durable_upload_fields:
             description += _durable_upload_note(

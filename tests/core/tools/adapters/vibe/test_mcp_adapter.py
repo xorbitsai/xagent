@@ -377,6 +377,70 @@ def test_mcp_tool_adapter_source_server_defaults_none():
     assert adapter.metadata.source_server is None
 
 
+@pytest.mark.parametrize("tool_name", ["search_properties", "get_properties"])
+def test_hubspot_property_tools_direct_named_contact_lookups_to_record_search(
+    tool_name,
+):
+    adapter = _build_mcp_tool_adapter(
+        "HubSpot",
+        {"transport": "streamable_http", "url": "https://mcp.hubspot.com"},
+        _mcp_tool(tool_name),
+    )
+
+    assert "property definitions, not CRM record values" in adapter.description
+    assert "call search_crm_objects" in adapter.description
+    assert adapter.metadata.description == adapter.description
+
+
+def test_hubspot_record_search_guides_exact_email_and_requested_property_lookup():
+    adapter = _build_mcp_tool_adapter(
+        "HubSpot",
+        {"transport": "streamable_http", "url": "https://mcp.hubspot.com"},
+        _mcp_tool("search_crm_objects"),
+    )
+
+    assert "exact email property filter" in adapter.description
+    assert "request the desired contact properties" in adapter.description
+    assert "empty result alone does not prove an access problem" in adapter.description
+    assert "no matching contact is visible to the connected user" in (
+        adapter.description
+    )
+
+
+@pytest.mark.parametrize("tool_name", ["get_user_details", "discover_hubspot_schema"])
+def test_hubspot_access_tools_require_evidence_before_reporting_permissions(
+    tool_name,
+):
+    adapter = _build_mcp_tool_adapter(
+        "HubSpot",
+        {"transport": "streamable_http", "url": "https://mcp.hubspot.com"},
+        _mcp_tool(tool_name),
+    )
+
+    assert "contact" in adapter.description.casefold()
+    assert "access" in adapter.description.casefold()
+    assert "empty" in adapter.description.casefold() or "no matching" in (
+        adapter.description.casefold()
+    )
+
+
+@pytest.mark.parametrize(
+    ("server_name", "tool_name"),
+    [("Custom CRM", "search_crm_objects"), ("HubSpot", "unrelated_tool")],
+)
+def test_hubspot_named_contact_guidance_is_scoped_to_known_hosted_tools(
+    server_name,
+    tool_name,
+):
+    adapter = _build_mcp_tool_adapter(
+        server_name,
+        {"transport": "streamable_http", "url": "https://mcp.example.test"},
+        _mcp_tool(tool_name),
+    )
+
+    assert adapter.description == f"{tool_name} tool"
+
+
 @pytest.mark.parametrize(
     ("tool_name", "expected"),
     [

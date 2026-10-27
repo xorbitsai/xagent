@@ -1,7 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { BrainCircuit, Check, Settings2, Sparkles } from "lucide-react";
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  BrainCircuit,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Settings2,
+  Sparkles,
+} from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -47,6 +54,7 @@ interface AutoCandidate {
 
 interface AutoConfig {
   configured: boolean;
+  mode: "routing" | "sequential_failover";
   fallback_model_id?: number;
   auto_model?: Model;
   candidates: AutoCandidate[];
@@ -116,6 +124,9 @@ export function AutoModelConfigCard({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [fallbackId, setFallbackId] = useState<string>("");
+  const [mode, setMode] = useState<"routing" | "sequential_failover">(
+    "routing",
+  );
   const [setAsDefault, setSetAsDefault] = useState(false);
 
   const availableModels = useMemo(
@@ -147,6 +158,7 @@ export function AutoModelConfigCard({
     nextProfiles: RouterProfile[],
   ) => {
     setConfig(nextConfig);
+    setMode(nextConfig.mode || "routing");
     setSelectedIds(
       nextConfig.candidates.map((candidate) =>
         String(candidate.target_model_id),
@@ -244,6 +256,7 @@ export function AutoModelConfigCard({
   };
 
   const duplicateProfiles = useMemo(() => {
+    if (mode === "sequential_failover") return new Set<string>();
     const counts = Object.values(bindings).reduce<Record<string, number>>(
       (acc, value) => {
         if (value) acc[value] = (acc[value] || 0) + 1;
@@ -256,13 +269,23 @@ export function AutoModelConfigCard({
         .filter(([, count]) => count > 1)
         .map(([id]) => id),
     );
-  }, [bindings]);
+  }, [bindings, mode]);
+
+  const moveCandidate = (index: number, offset: -1 | 1) => {
+    setSelectedIds((current) => {
+      const target = index + offset;
+      if (target < 0 || target >= current.length) return current;
+      const next = [...current];
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  };
 
   const canSave =
     selectedModels.length > 0 &&
     selectedModels.every((model) => Boolean(bindings[String(model.id)])) &&
     duplicateProfiles.size === 0 &&
-    Boolean(fallbackId);
+    (mode === "sequential_failover" || Boolean(fallbackId));
 
   const save = async () => {
     if (!canSave) return;
@@ -274,7 +297,9 @@ export function AutoModelConfigCard({
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            fallback_model_id: Number(fallbackId),
+            mode,
+            fallback_model_id:
+              mode === "routing" ? Number(fallbackId) : null,
             set_as_default: setAsDefault,
             candidates: selectedModels.map((model) => ({
               target_model_id: model.id,
@@ -379,6 +404,35 @@ export function AutoModelConfigCard({
 
           <div className="space-y-6 py-2">
             <div className="space-y-2">
+              <Label>{t("models.auto.mode")}</Label>
+              <Select
+                value={mode}
+                onValueChange={(value) =>
+                  setMode(value as "routing" | "sequential_failover")
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="routing">
+                    {t("models.auto.modeRouting")}
+                  </SelectItem>
+                  <SelectItem value="sequential_failover">
+                    {t("models.auto.modeSequential")}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {t(
+                  mode === "routing"
+                    ? "models.auto.modeRoutingHelp"
+                    : "models.auto.modeSequentialHelp",
+                )}
+              </p>
+            </div>
+
+            <div className="space-y-2">
               <Label>{t("models.auto.candidateModels")}</Label>
               <MultiSelect
                 values={selectedIds}
@@ -401,19 +455,48 @@ export function AutoModelConfigCard({
             {selectedModels.length > 0 && (
               <div className="space-y-3">
                 <Label>{t("models.auto.profileBindings")}</Label>
-                {selectedModels.map((model) => {
+                {selectedModels.map((model, index) => {
                   const binding = bindings[String(model.id)] || "";
                   return (
                     <div
                       key={model.id}
                       className="grid gap-2 rounded-lg border p-3 md:grid-cols-[1fr_1.4fr] md:items-center"
                     >
-                      <div>
-                        <div className="text-sm font-medium">
-                          {model.model_name}
-                        </div>
-                        <div className="text-xs text-muted-foreground">
-                          {model.model_provider}
+                      <div className="flex items-center gap-2">
+                        {mode === "sequential_failover" && (
+                          <div className="flex shrink-0 gap-1">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-7"
+                              disabled={index === 0}
+                              aria-label={t("models.auto.moveUp")}
+                              onClick={() => moveCandidate(index, -1)}
+                            >
+                              <ChevronUp className="h-3.5 w-3.5" />
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-7"
+                              disabled={index === selectedModels.length - 1}
+                              aria-label={t("models.auto.moveDown")}
+                              onClick={() => moveCandidate(index, 1)}
+                            >
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        )}
+                        <div>
+                          <div className="text-sm font-medium">
+                            {mode === "sequential_failover" && `${index + 1}. `}
+                            {model.model_name}
+                          </div>
+                          <div className="text-xs text-muted-foreground">
+                            {model.model_provider}
+                          </div>
                         </div>
                       </div>
                       <Select
@@ -454,28 +537,30 @@ export function AutoModelConfigCard({
               </div>
             )}
 
-            <div className="space-y-2">
-              <Label>{t("models.auto.fallback")}</Label>
-              <Select
-                value={fallbackId}
-                onValueChange={setFallbackId}
-                disabled={!selectedModels.length}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder={t("models.auto.selectFallback")} />
-                </SelectTrigger>
-                <SelectContent>
-                  {selectedModels.map((model) => (
-                    <SelectItem key={model.id} value={String(model.id)}>
-                      {model.model_name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-xs text-muted-foreground">
-                {t("models.auto.fallbackHelp")}
-              </p>
-            </div>
+            {mode === "routing" && (
+              <div className="space-y-2">
+                <Label>{t("models.auto.fallback")}</Label>
+                <Select
+                  value={fallbackId}
+                  onValueChange={setFallbackId}
+                  disabled={!selectedModels.length}
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder={t("models.auto.selectFallback")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {selectedModels.map((model) => (
+                      <SelectItem key={model.id} value={String(model.id)}>
+                        {model.model_name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {t("models.auto.fallbackHelp")}
+                </p>
+              </div>
+            )}
 
             <div className="flex items-center justify-between gap-4 rounded-lg border p-4">
               <div>

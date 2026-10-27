@@ -424,6 +424,7 @@ class AutoModelConfigUpdate(BaseModel):
         deprecated=True,
         description="Deprecated compatibility field; Auto always uses xrouter auto.",
     )
+    mode: Literal["routing", "sequential_failover"] = "routing"
     fallback_model_id: Optional[int] = None
     set_as_default: Optional[bool] = None
     candidates: List[AutoModelCandidateUpdate]
@@ -439,13 +440,18 @@ class AutoModelConfigUpdate(BaseModel):
             raise ValueError("routing_model_id must not be empty")
         if len(target_ids) != len(set(target_ids)):
             raise ValueError("Each saved model can only appear once")
-        if len(routing_ids) != len(set(routing_ids)):
+        if self.mode == "routing" and len(routing_ids) != len(set(routing_ids)):
             raise ValueError("Each routing profile can only appear once")
         if (
             self.fallback_model_id is not None
             and self.fallback_model_id not in target_ids
         ):
             raise ValueError("The fallback model must be one of the candidates")
+        if self.mode == "sequential_failover" and self.fallback_model_id is not None:
+            raise ValueError(
+                "Sequential failover uses candidate order and does not accept "
+                "fallback_model_id"
+            )
         return self
 
 
@@ -458,6 +464,7 @@ class AutoModelCandidateResponse(BaseModel):
 class AutoModelConfigResponse(BaseModel):
     configured: bool
     strategy: Literal["balanced"] = "balanced"
+    mode: Literal["routing", "sequential_failover"] = "routing"
     fallback_model_id: Optional[int] = None
     auto_model: Optional[ModelWithAccessInfo] = None
     candidates: List[AutoModelCandidateResponse] = Field(default_factory=list)

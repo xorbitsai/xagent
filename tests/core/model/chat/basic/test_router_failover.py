@@ -23,6 +23,8 @@ from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 PRIMARY = "deepseek/deepseek-v4-flash"
 FALLBACK = "openai/gpt-5.5"
+THIRD = "z-ai/glm-5.3"
+FOURTH = "deepseek/deepseek-chat"
 MESSAGES = [{"role": "user", "content": "summarize the report"}]
 
 _REQUEST = httpx.Request("POST", "https://provider.example/v1/chat/completions")
@@ -91,9 +93,9 @@ class _FakeLLM(BaseLLM):
     ) -> AsyncIterator[StreamChunk]:
         del messages, kwargs
         self.calls += 1
-        if self.error is not None and not self.error_after_chunks:
-            raise self.error
         try:
+            if self.error is not None and not self.error_after_chunks:
+                raise self.error
             for chunk in self.chunks:
                 yield chunk
             if self.error is not None:
@@ -116,6 +118,7 @@ def _router(
     selected: str = PRIMARY,
     fallback: str | None = FALLBACK,
     configured: bool = True,
+    mode: str = "routing",
 ) -> RouterLLM:
     resolutions: list[tuple[str, bool]] = []
     selections: list[str] = []
@@ -126,8 +129,9 @@ def _router(
 
     router = RouterLLM(
         downstream_resolver=resolve,
+        mode=mode,
         candidate_models=list(models) if configured else None,
-        fallback_model=fallback,
+        fallback_model=None if mode == "sequential_failover" else fallback,
         use_environment_fallback=False,
     )
 
@@ -140,6 +144,148 @@ def _router(
     router.resolutions = resolutions  # type: ignore[attr-defined]
     router.selections = selections  # type: ignore[attr-defined]
     return router
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_count", [0, 1, 2, 3])
+async def test_sequential_failover_uses_the_first_success_in_order(
+    monkeypatch, failed_count
+):
+    profiles = [PRIMARY, FALLBACK, THIRD, FOURTH]
+    models = {
+        profile: _FakeLLM(
+            f"saved-{index}",
+            error=(
+                openai.APIConnectionError(request=_REQUEST)
+                if index < failed_count
+                else None
+            ),
+        )
+        for index, profile in enumerate(profiles)
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await prepared.chat(MESSAGES) == f"saved-{failed_count}"
+    assert [models[profile].calls for profile in profiles] == [
+        *(1 for _ in range(failed_count + 1)),
+        *(0 for _ in range(3 - failed_count)),
+    ]
+    assert router.selections == []
+
+
+@pytest.mark.asyncio
+async def test_sequential_bindings_keep_duplicate_profiles_as_distinct_targets(
+    monkeypatch,
+):
+    candidates = ("candidate:11", "candidate:12")
+    models = {
+        candidates[0]: _FakeLLM(
+            "tuas-deepseek", error=openai.APIConnectionError(request=_REQUEST)
+        ),
+        candidates[1]: _FakeLLM("official-deepseek"),
+    }
+    router = RouterLLM(
+        downstream_resolver=lambda candidate, **_kwargs: models[candidate],
+        mode="sequential_failover",
+        candidate_models=candidates,
+        candidate_profiles={candidate: PRIMARY for candidate in candidates},
+        candidate_input_modalities={
+            candidates[0]: ("text",),
+            candidates[1]: ("text", "image"),
+        },
+        use_environment_fallback=False,
+    )
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model: None)
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await prepared.chat(MESSAGES) == "official-deepseek"
+    assert [model.calls for model in models.values()] == [1, 1]
+
+
+@pytest.mark.asyncio
+async def test_sequential_failover_all_failures_report_the_attempted_chain(monkeypatch):
+    profiles = [PRIMARY, FALLBACK, THIRD, FOURTH]
+    models = {
+        profile: _FakeLLM(
+            f"saved-{index}", error=openai.APIConnectionError(request=_REQUEST)
+        )
+        for index, profile in enumerate(profiles)
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+
+    with pytest.raises(openai.APIConnectionError) as raised:
+        await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES)
+
+    assert [model.calls for model in models.values()] == [1, 1, 1, 1]
+    assert raised.value.__notes__ == [
+        "Auto sequential failover exhausted: " + " -> ".join(profiles)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sequential_failover_stops_on_a_non_failover_error(monkeypatch):
+    error = _status_error(openai.BadRequestError, 400)
+    models = {
+        PRIMARY: _FakeLLM("saved-primary", error=error),
+        FALLBACK: _FakeLLM("saved-fallback"),
+        THIRD: _FakeLLM("saved-third"),
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+
+    with pytest.raises(openai.BadRequestError) as raised:
+        await (await router.prepare_for_call(MESSAGES)).chat(MESSAGES)
+
+    assert raised.value is error
+    assert [model.calls for model in models.values()] == [1, 0, 0]
+
+
+@pytest.mark.asyncio
+async def test_sequential_stream_reaches_the_fourth_candidate_before_output(
+    monkeypatch,
+):
+    profiles = [PRIMARY, FALLBACK, THIRD, FOURTH]
+    models = {
+        profile: _FakeLLM(
+            f"saved-{index}",
+            error=(openai.APIConnectionError(request=_REQUEST) if index < 3 else None),
+        )
+        for index, profile in enumerate(profiles)
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+
+    prepared = await router.prepare_for_call(MESSAGES)
+
+    assert await _collect(prepared.stream_chat(MESSAGES)) == ["saved-3"]
+    assert {
+        profile: model.stream_closed for profile, model in models.items()
+    } == dict.fromkeys(profiles, True)
+
+
+@pytest.mark.asyncio
+async def test_sequential_failover_skips_incompatible_and_smaller_candidates(
+    monkeypatch,
+):
+    error = openai.APIConnectionError(request=_REQUEST)
+    models = {
+        PRIMARY: _FakeLLM("saved-primary", error=error, context_window=128_000),
+        FALLBACK: _FakeLLM("saved-text-only", context_window=128_000),
+        THIRD: _FakeLLM("saved-small", context_window=32_000),
+        FOURTH: _FakeLLM("saved-compatible", context_window=256_000),
+    }
+    router = _router(monkeypatch, models, mode="sequential_failover")
+    monkeypatch.setattr(
+        router,
+        "_profile_input_modalities",
+        lambda model: ("text",) if model == FALLBACK else ("text", "image"),
+    )
+
+    prepared = await router.prepare_for_call(IMAGE_MESSAGES)
+
+    assert await prepared.vision_chat(IMAGE_MESSAGES) == "saved-compatible"
+    assert [model.calls for model in models.values()] == [1, 0, 0, 1]
 
 
 @pytest.mark.asyncio

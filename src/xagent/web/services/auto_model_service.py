@@ -125,12 +125,13 @@ class AutoModelService:
                 + ", ".join(str(model_id) for model_id in missing_target_ids)
             )
 
-        for candidate in request.candidates:
-            validate_candidate_modalities(
-                catalog,
-                candidate.routing_model_id,
-                targets[candidate.target_model_id].abilities or [],
-            )
+        if request.mode == "routing":
+            for candidate in request.candidates:
+                validate_candidate_modalities(
+                    catalog,
+                    candidate.routing_model_id,
+                    targets[candidate.target_model_id].abilities or [],
+                )
 
         config = (
             self.db.query(AutoModelConfig)
@@ -144,6 +145,7 @@ class AutoModelService:
                 user_id=user_id,
                 router_model_id=router_model.id,
                 strategy="balanced",
+                mode=request.mode,
             )
             self.db.add(config)
             self.db.flush()
@@ -154,18 +156,20 @@ class AutoModelService:
             # longer user-selectable until xrouter exposes distinct single-model
             # routing policies that work with an explicit candidate set.
             config.strategy = "balanced"  # type: ignore[assignment]
+            config.mode = request.mode  # type: ignore[assignment]
             self.db.query(AutoModelCandidate).filter(
                 AutoModelCandidate.config_id == config.id
             ).delete(synchronize_session=False)
             self.db.flush()
 
         config.fallback_model_id = request.fallback_model_id  # type: ignore[assignment]
-        for candidate in request.candidates:
+        for position, candidate in enumerate(request.candidates):
             self.db.add(
                 AutoModelCandidate(
                     config_id=config.id,
                     routing_model_id=candidate.routing_model_id,
                     target_model_id=candidate.target_model_id,
+                    position=position,
                 )
             )
 
@@ -209,6 +213,7 @@ class AutoModelService:
             return {
                 "configured": False,
                 "strategy": "balanced",
+                "mode": "routing",
                 "fallback_model_id": None,
                 "auto_model": None,
                 "candidates": [],
@@ -254,6 +259,7 @@ class AutoModelService:
         return {
             "configured": True,
             "strategy": "balanced",
+            "mode": config.mode,
             "fallback_model_id": config.fallback_model_id,
             "auto_model": auto_model,
             "candidates": candidates,

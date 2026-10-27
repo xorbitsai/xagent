@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -47,7 +47,12 @@ class ChatModelConfig(ModelConfig):
     # from the user's Auto configuration and are intentionally not stored on a
     # concrete provider model row.
     router_config_name: Optional[str] = None
+    router_mode: str = "routing"
     router_candidate_models: Optional[List[str]] = None
+    # Sequential Auto candidates use saved-binding keys so the same routing
+    # profile may appear more than once while still resolving distinct targets.
+    router_candidate_profiles: Optional[Dict[str, str]] = None
+    router_candidate_input_modalities: Optional[Dict[str, List[str]]] = None
     router_fallback_model: Optional[str] = None
     # Runtime-only: set by configured Auto on a candidate whose call can move
     # to the fallback, so the failures that would move it stop retrying after

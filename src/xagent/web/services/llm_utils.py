@@ -802,8 +802,11 @@ class UserAwareModelStorage:
         if config is None or not config.candidates:
             raise AutoModelUnavailableError("Auto model has no configured candidates")
 
-        targets_by_profile: dict[str, ChatModelConfig] = {}
-        fallback_profile: str | None = None
+        mode = str(config.mode or "routing")
+        targets_by_candidate: dict[str, ChatModelConfig] = {}
+        profiles_by_candidate: dict[str, str] = {}
+        modalities_by_candidate: dict[str, list[str]] = {}
+        fallback_candidate: str | None = None
         for candidate in config.candidates:
             target = candidate.target_model
             if (
@@ -827,45 +830,71 @@ class UserAwareModelStorage:
                     candidate.routing_model_id,
                 )
                 continue
-            targets_by_profile[candidate.routing_model_id] = target_cfg
+            candidate_id = (
+                f"candidate:{candidate.id}"
+                if mode == "sequential_failover"
+                else candidate.routing_model_id
+            )
+            targets_by_candidate[candidate_id] = target_cfg
+            profiles_by_candidate[candidate_id] = candidate.routing_model_id
+            modalities_by_candidate[candidate_id] = [
+                "text",
+                *(
+                    modality
+                    for modality, ability in (
+                        ("image", "vision"),
+                        ("audio", "audio"),
+                        ("video", "video"),
+                    )
+                    if ability in (target_cfg.abilities or [])
+                ),
+            ]
             if candidate.target_model_id == config.fallback_model_id:
-                fallback_profile = candidate.routing_model_id
+                fallback_candidate = candidate_id
 
-        if not targets_by_profile:
+        if not targets_by_candidate:
             raise AutoModelUnavailableError(
                 "Auto model has no active configured candidates"
             )
 
         try:
             catalog = load_router_profile_catalog()
-            for profile_id, target_cfg in targets_by_profile.items():
-                validate_candidate_modalities(
-                    catalog, profile_id, target_cfg.abilities or []
-                )
+            if mode == "routing":
+                for candidate_id, target_cfg in targets_by_candidate.items():
+                    validate_candidate_modalities(
+                        catalog,
+                        profiles_by_candidate[candidate_id],
+                        target_cfg.abilities or [],
+                    )
         except (AutoModelConfigurationError, AutoModelDependencyError) as exc:
             raise AutoModelUnavailableError(str(exc)) from exc
 
-        profile_ids = list(targets_by_profile)
+        candidate_ids = list(targets_by_candidate)
         configured = router_cfg.model_copy(
             update={
                 "router_config_name": AUTO_ROUTER_CONFIG_NAME,
-                "router_candidate_models": profile_ids,
-                "router_fallback_model": fallback_profile,
+                "router_mode": mode,
+                "router_candidate_models": candidate_ids,
+                "router_candidate_profiles": (
+                    profiles_by_candidate if mode == "sequential_failover" else None
+                ),
+                "router_candidate_input_modalities": (
+                    modalities_by_candidate if mode == "sequential_failover" else None
+                ),
+                "router_fallback_model": fallback_candidate,
             }
         )
 
-        def _resolve(profile_id: str, *, limit_attempts: bool = False) -> BaseLLM:
-            target_cfg = targets_by_profile.get(profile_id)
+        def _resolve(candidate_id: str, *, limit_attempts: bool = False) -> BaseLLM:
+            target_cfg = targets_by_candidate.get(candidate_id)
             if target_cfg is None:
-                raise RuntimeError(
-                    f"xrouter selected unbound Auto profile {profile_id!r}"
-                )
+                raise RuntimeError(f"Auto selected unbound candidate {candidate_id!r}")
             # The router asks for this only when the call can still move to
             # the fallback, so a candidate failing in a way the fallback takes
             # over gives up quickly instead of spending the whole retry
             # deadline first. Other failures keep the saved budget, and the
             # fallback keeps its own because nothing comes after it.
-            if limit_attempts and profile_id != fallback_profile:
+            if limit_attempts and candidate_id != fallback_candidate:
                 target_cfg = target_cfg.model_copy(
                     update={
                         "auto_failover_max_attempts": get_auto_primary_max_attempts()
@@ -874,7 +903,7 @@ class UserAwareModelStorage:
             llm = self.core_storage.create_llm_instance(target_cfg)
             if llm is None:
                 raise RuntimeError(
-                    f"failed to build Auto downstream LLM for {profile_id!r}"
+                    f"failed to build Auto downstream LLM for {candidate_id!r}"
                 )
             return llm
 

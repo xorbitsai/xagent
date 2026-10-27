@@ -136,7 +136,10 @@ def create_base_llm(
             timeout=model.timeout,
             abilities=model.abilities,
             downstream_resolver=downstream_resolver,
+            mode=model.router_mode,
             candidate_models=model.router_candidate_models,
+            candidate_profiles=model.router_candidate_profiles,
+            candidate_input_modalities=model.router_candidate_input_modalities,
             fallback_model=model.router_fallback_model,
             use_environment_fallback=provider != ROUTER_PROVIDER,
         )

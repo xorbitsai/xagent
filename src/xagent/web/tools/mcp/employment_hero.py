@@ -34,6 +34,10 @@ MAX_PAGE_SIZE = 100
 # than forwarded verbatim, so a typo'd/guessed value (e.g. "staff") gets a
 # clear error instead of an unpredictable API-side response.
 MEMBER_TYPES = ("employee", "contractor")
+# Documented request-filter values for both the organisation manager view and
+# the employee leave-request endpoint. Response payloads use title case, but
+# the request contract uses these lowercase values.
+LEAVE_REQUEST_STATUSES = ("pending", "approved", "declined")
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True)
 CREATE = ToolAnnotations(destructiveHint=False, idempotentHint=False)
@@ -546,7 +550,7 @@ def employment_hero_list_leave_requests(
     manager/approver view, or provide it for one employee's requests.
     organisation_id: id from employment_hero_list_organisations.
     employee_id: optional id from employment_hero_list_employees(query=...).
-    statuses: optional Employment Hero status values to filter by.
+    statuses: optional request status filters: pending, approved, or declined.
     start_date, end_date: optional inclusive YYYY-MM-DD range boundaries.
     leave_category_id: optional id from employment_hero_list_leave_categories.
     page_index: 1-based page number.
@@ -558,10 +562,19 @@ def employment_hero_list_leave_requests(
         params = _pagination_params(page_index, item_per_page)
         if statuses:
             normalized_statuses = [
-                status.strip() for status in statuses if status.strip()
+                status.strip().lower() for status in statuses if status.strip()
             ]
             if not normalized_statuses:
                 raise ValueError("statuses must contain at least one non-empty value")
+            invalid_statuses = sorted(
+                set(normalized_statuses).difference(LEAVE_REQUEST_STATUSES)
+            )
+            if invalid_statuses:
+                raise ValueError(
+                    "Invalid statuses "
+                    f"{', '.join(invalid_statuses)}; expected only "
+                    f"{', '.join(LEAVE_REQUEST_STATUSES)}"
+                )
             params["statuses"] = normalized_statuses
         if normalized_start:
             params["start_date"] = normalized_start

@@ -489,7 +489,7 @@ def test_list_leave_requests_supports_manager_filters(monkeypatch):
     result = json.loads(
         employment_hero.employment_hero_list_leave_requests(
             "org-1",
-            statuses=[" Pending ", "Approved"],
+            statuses=[" pending ", "approved"],
             start_date="2026-11-01",
             end_date="2026-11-30",
             leave_category_id="category/1",
@@ -507,11 +507,39 @@ def test_list_leave_requests_supports_manager_filters(monkeypatch):
     assert call.kwargs["params"] == {
         "page_index": 2,
         "item_per_page": 50,
-        "statuses": ["Pending", "Approved"],
+        "statuses": ["pending", "approved"],
         "start_date": "2026-11-01",
         "end_date": "2026-11-30",
         "leave_category_id": "category/1",
     }
+
+
+def test_list_leave_requests_normalizes_and_validates_statuses(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"data": {"items": []}}))
+    monkeypatch.setattr(employment_hero.requests, "request", mock_request)
+
+    result = json.loads(
+        employment_hero.employment_hero_list_leave_requests(
+            "org-1", statuses=[" Pending ", "DECLINED"]
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"]["statuses"] == [
+        "pending",
+        "declined",
+    ]
+
+    mock_request.reset_mock()
+    result = json.loads(
+        employment_hero.employment_hero_list_leave_requests(
+            "org-1", statuses=["cancelled"]
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "pending, approved, declined" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_leave_requests_supports_employee_view(monkeypatch):

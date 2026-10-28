@@ -1190,7 +1190,11 @@ async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
         oauth_token_required=True,
     )
     with isolated_session_factory() as verification_db:
-        assert verification_db.get(UserOAuth, account_id) is not None
+        preserved = verification_db.get(UserOAuth, account_id)
+        assert preserved is not None
+        assert preserved.access_token == "old-token"
+        assert preserved.refresh_token == "refresh-token-issued-under-old-client"
+        assert preserved.expires_at is not None
 
 
 @pytest.mark.asyncio
@@ -1263,37 +1267,7 @@ async def test_user_oauth_refresh_google_revoked_token_keeps_reconnect_tombstone
         assert tombstone.expires_at is None
 
 
-@pytest.mark.parametrize(
-    ("status_code", "payload"),
-    [
-        (400, {"error": "invalid_grant"}),
-        (
-            400,
-            {
-                "error": "invalid_grant",
-                "error_description": "Token was issued to another client.",
-            },
-        ),
-        (
-            400,
-            {
-                "error": "invalid_grant",
-                "error_description": "Token has been expired or revoked.",
-                "error_subtype": "invalid_rapt",
-            },
-        ),
-        (
-            500,
-            {
-                "error": "invalid_grant",
-                "error_description": "Token has been expired or revoked.",
-            },
-        ),
-    ],
-)
-def test_google_refresh_only_classifies_explicit_revocation(status_code, payload):
-    response = httpx.Response(status_code, json=payload)
-
+def test_google_refresh_classifies_explicit_revocation():
     with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
         web_tools_config._log_and_classify_failed_refresh(
             response=httpx.Response(
@@ -1306,9 +1280,69 @@ def test_google_refresh_only_classifies_explicit_revocation(status_code, payload
             provider_name="google",
         )
 
+
+@pytest.mark.parametrize(
+    ("provider_name", "status_code", "payload"),
+    [
+        ("google", 400, {"error": "invalid_grant"}),
+        (
+            "google",
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token was issued to another client.",
+            },
+        ),
+        (
+            "google",
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+                "error_subtype": "invalid_rapt",
+            },
+        ),
+        (
+            "google",
+            500,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+        (
+            "google",
+            401,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+        (
+            "google",
+            200,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+        (
+            "zoom",
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+    ],
+)
+def test_google_refresh_rejects_ambiguous_status_or_provider(
+    provider_name, status_code, payload
+):
+    response = httpx.Response(status_code, json=payload)
     web_tools_config._log_and_classify_failed_refresh(
         response=response,
-        provider_name="google",
+        provider_name=provider_name,
     )
 
 
@@ -1480,7 +1514,12 @@ def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
     a falsy-but-truthy value (e.g. "") that would defeat the `error_code or
     "unknown"` logging fallback or accidentally satisfy an `in` check
     against _PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES."""
-    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+    payload = web_tools_config._oauth_refresh_error_payload(response)
+    if payload is not None:
+        assert (
+            web_tools_config._oauth_refresh_error_code_from_payload(payload, "google")
+            is None
+        )
 
 
 def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
@@ -1496,8 +1535,7 @@ def test_oauth_refresh_error_code_swallows_non_value_error_parse_failures():
             raise RecursionError("maximum recursion depth exceeded")
 
     assert (
-        web_tools_config._oauth_refresh_error_code(ExplodingJsonResponse(), "google")
-        is None
+        web_tools_config._oauth_refresh_error_payload(ExplodingJsonResponse()) is None
     )
 
 
@@ -1510,10 +1548,15 @@ def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
     response = httpx.Response(
         400, json={"error": {"type": "OAuthException", "code": 190}}
     )
-    assert web_tools_config._oauth_refresh_error_code(response, "meta") == (
+    payload = web_tools_config._oauth_refresh_error_payload(response)
+    assert payload is not None
+    assert web_tools_config._oauth_refresh_error_code_from_payload(payload, "meta") == (
         "invalid_grant"
     )
-    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+    assert (
+        web_tools_config._oauth_refresh_error_code_from_payload(payload, "google")
+        is None
+    )
 
 
 @pytest.mark.asyncio

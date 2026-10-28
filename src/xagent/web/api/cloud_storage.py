@@ -600,14 +600,12 @@ def _google_refresh_failure_reason(
     if exc.retryable or status is None or status >= 500:
         return "refresh_unavailable"
     if error_code == _GOOGLE_INVALID_GRANT:
-        # The connector runtime does not treat invalid_grant as a dead
-        # refresh token (``_PROVIDER_DEAD_REFRESH_TOKEN_ERROR_CODES`` in
-        # ``tools/config.py``): it also covers a token issued to another
-        # client, for example after an admin rotates the OAuth client, and
-        # the runtime clears credentials it believes dead. Nothing is ever
-        # cleared on this path; the reason only selects the message a caller
-        # shows (reconnect), and the stored credential stays for the
-        # runtime's own refresh to judge.
+        # The connector runtime only tombstones a Google invalid_grant when
+        # the structured response also carries Google's explicit
+        # expired-or-revoked description. This google-auth path does not
+        # clear credentials: the reason only selects the message shown by
+        # the caller, while the stored credential remains for the connector
+        # runtime's stricter response classifier to judge.
         return "reauth_required"
     return "refresh_unavailable"
 

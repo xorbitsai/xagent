@@ -2,10 +2,48 @@ import pytest
 
 from xagent.core.utils.security import host_matches_suffix
 from xagent.web.oauth_provider_quirks import (
+    is_google_revoked_refresh_error,
     matches_provider_family,
     meta_invalid_token_error_code,
     requires_json_accept_header,
 )
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Token has been expired or revoked.",
+        "Token has been expired or revoked",
+        "  TOKEN HAS BEEN EXPIRED OR REVOKED.  ",
+    ],
+)
+def test_google_revoked_refresh_error_accepts_description_format_variants(
+    description,
+):
+    assert is_google_revoked_refresh_error(
+        error_code="invalid_grant",
+        error_description=description,
+    )
+
+
+@pytest.mark.parametrize(
+    ("description", "subtype"),
+    [
+        (None, None),
+        (123, None),
+        ("Token was issued to another client.", None),
+        ("Token has been expired or revoked.", "invalid_rapt"),
+        ("Token has been expired or revoked.", object()),
+    ],
+)
+def test_google_revoked_refresh_error_rejects_ambiguous_or_malformed_details(
+    description, subtype
+):
+    assert not is_google_revoked_refresh_error(
+        error_code="invalid_grant",
+        error_description=description,
+        error_subtype=subtype,
+    )
 
 
 def test_requires_json_accept_header_true_for_github():

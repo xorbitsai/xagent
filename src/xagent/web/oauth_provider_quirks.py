@@ -31,6 +31,8 @@ _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER = frozenset({"github"})
 # than incorrectly deleting a connection that's still alive.
 _META_INVALID_TOKEN_ERROR_CODES = frozenset({190, 102})
 
+_GOOGLE_REVOKED_REFRESH_DESCRIPTION = "token has been expired or revoked"
+
 
 def requires_json_accept_header(provider: str) -> bool:
     return provider.lower() in _PROVIDERS_REQUIRING_JSON_ACCEPT_HEADER
@@ -54,6 +56,38 @@ def meta_invalid_token_error_code(error: object) -> str | None:
     ):
         return "invalid_grant"
     return None
+
+
+def _normalized_oauth_error_text(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().casefold().rstrip(".").strip()
+    return normalized or None
+
+
+def is_google_revoked_refresh_error(
+    *,
+    error_code: object,
+    error_description: object,
+    error_subtype: object = None,
+) -> bool:
+    """Return whether Google's response explicitly says a refresh token died.
+
+    ``invalid_grant`` alone is ambiguous: it also covers a token issued to a
+    different OAuth client. Require Google's revoked/expired description and
+    reject every non-empty or malformed subtype so organization
+    reauthentication failures such as ``invalid_rapt`` stay transient.
+    """
+
+    subtype_is_absent = error_subtype is None or (
+        isinstance(error_subtype, str) and not error_subtype.strip()
+    )
+    return bool(
+        _normalized_oauth_error_text(error_code) == "invalid_grant"
+        and _normalized_oauth_error_text(error_description)
+        == _GOOGLE_REVOKED_REFRESH_DESCRIPTION
+        and subtype_is_absent
+    )
 
 
 def matches_provider_family(provider: str, base_name: str) -> bool:

@@ -314,7 +314,7 @@ async def test_acquire_without_recorded_key_returns_none(
 
 
 @pytest.mark.asyncio
-async def test_capacity_error_rejects_task_by_default(sandbox_mgr, monkeypatch) -> None:
+async def test_capacity_error_rejects_task(sandbox_mgr, monkeypatch) -> None:
     """Capacity exhaustion must reject the task, not silently run locally."""
     monkeypatch.delenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False)
     manager = AgentServiceManager()
@@ -333,44 +333,42 @@ async def test_capacity_error_rejects_task_by_default(sandbox_mgr, monkeypatch) 
 
 
 @pytest.mark.asyncio
-async def test_capacity_error_falls_back_locally_when_enabled(
+async def test_capacity_error_ignores_removed_fallback_flag(
     sandbox_mgr, monkeypatch
 ) -> None:
-    """The explicit opt-in restores local fallback under capacity pressure."""
+    """The removed legacy flag cannot re-enable host-local execution."""
     monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
     manager = AgentServiceManager()
     sandbox_mgr.get_or_create_lease_provider = AsyncMock(
         side_effect=SandboxCapacityError(cap=2, in_use=2)
     )
 
-    sandbox = await manager._get_or_create_task_sandbox(
-        task_id=1,
-        workspace_owner_id=7,
-        mount_intent=None,
-    )
+    with pytest.raises(SandboxCapacityError):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            mount_intent=None,
+        )
 
-    assert sandbox is None
     assert 1 not in manager._agent_sandbox_keys
 
 
 @pytest.mark.asyncio
-async def test_sandbox_unavailability_keeps_local_fallback(
-    sandbox_mgr, monkeypatch
-) -> None:
-    """Non-capacity sandbox failures keep today's local-execution fallback."""
+async def test_sandbox_unavailability_fails_closed(sandbox_mgr, monkeypatch) -> None:
+    """Runtime failures must never execute the task on the host."""
     monkeypatch.delenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False)
     manager = AgentServiceManager()
     sandbox_mgr.get_or_create_lease_provider = AsyncMock(
         side_effect=RuntimeError("docker daemon unreachable")
     )
 
-    sandbox = await manager._get_or_create_task_sandbox(
-        task_id=1,
-        workspace_owner_id=7,
-        mount_intent=None,
-    )
+    with pytest.raises(RuntimeError, match="docker daemon unreachable"):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            mount_intent=None,
+        )
 
-    assert sandbox is None
     assert 1 not in manager._agent_sandbox_keys
 
 
@@ -380,8 +378,7 @@ _SCOPE = ExecutionScope(
 )
 
 # A scope that sets no ``sandbox_key_suffix`` resolves to the same
-# ``user:{owner}`` lifecycle key as unscoped execution, so it has no container
-# of its own to protect and must keep the unscoped fallback behavior.
+# ``user:{owner}`` lifecycle key as unscoped execution. Both forms fail closed.
 _SUFFIXLESS_SCOPE = ExecutionScope(
     workspace_segments=("clients", "3", "end_users", "7"),
 )
@@ -449,17 +446,10 @@ async def test_suffix_scoped_execution_fails_closed(
         ),
     ],
 )
-async def test_suffixless_scope_keeps_unscoped_fallback(
+async def test_suffixless_scope_fails_closed(
     sandbox_mgr, monkeypatch, fallback_flag, side_effect
 ) -> None:
-    """A scope without a suffix behaves exactly like unscoped execution.
-
-    It shares the ``user:{owner}`` container, so there is no scope-owned
-    isolation to protect: capacity fallback (when the flag is on) and the
-    non-capacity local fallback both remain available. Gating fail-closed on
-    ``sandbox_key_suffix`` — not scope-presence — is what keeps this path from
-    becoming an availability regression.
-    """
+    """A scope without a suffix still cannot downgrade to host execution."""
     if fallback_flag is None:
         monkeypatch.delenv(
             "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", raising=False
@@ -471,14 +461,14 @@ async def test_suffixless_scope_keeps_unscoped_fallback(
     manager = AgentServiceManager()
     sandbox_mgr.get_or_create_lease_provider = AsyncMock(side_effect=side_effect)
 
-    sandbox = await manager._get_or_create_task_sandbox(
-        task_id=1,
-        workspace_owner_id=7,
-        mount_intent=None,
-        scope=_SUFFIXLESS_SCOPE,
-    )
+    with pytest.raises(type(side_effect)):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            mount_intent=None,
+            scope=_SUFFIXLESS_SCOPE,
+        )
 
-    assert sandbox is None
     assert 1 not in manager._agent_sandbox_keys
 
 
@@ -510,13 +500,10 @@ async def test_contract_error_always_fails_closed(
     """A sandbox lifecycle contract violation never falls back to local
     execution, for unscoped, suffixless-scope, or suffix-scoped tasks alike.
 
-    The local-execution fallback exists for sandbox-service
-    *unavailability* (a non-contract ``Exception``); a
-    ``SandboxContractError`` means the manager explicitly refused to honor
-    the desired mount/runtime spec, and silently running the task on the
-    host would defeat that refusal rather than surface it. Enabling the
-    capacity opt-in flag must not change this -- it is unrelated to
-    contract violations.
+    A ``SandboxContractError`` means the manager explicitly refused to honor
+    the desired mount/runtime spec. Silently running the task on the host
+    would defeat that refusal rather than surface it. The removed legacy
+    capacity fallback flag must not change this.
     """
     monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
     manager = AgentServiceManager()
@@ -541,22 +528,21 @@ async def test_capacity_semantics_unchanged_by_contract_classification(
     sandbox_mgr, monkeypatch
 ) -> None:
     """SandboxCapacityError is not a SandboxContractError: adding the
-    contract-error branch must not change unscoped capacity's own opt-in
-    local-fallback semantics (already covered above, re-asserted here as a
-    classification-boundary pin)."""
+    contract-error branch must not allow the removed legacy flag to bypass
+    fail-closed capacity handling."""
     monkeypatch.setenv("XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY", "true")
     manager = AgentServiceManager()
     sandbox_mgr.get_or_create_lease_provider = AsyncMock(
         side_effect=SandboxCapacityError(cap=2, in_use=2)
     )
 
-    sandbox = await manager._get_or_create_task_sandbox(
-        task_id=1,
-        workspace_owner_id=7,
-        mount_intent=None,
-    )
+    with pytest.raises(SandboxCapacityError):
+        await manager._get_or_create_task_sandbox(
+            task_id=1,
+            workspace_owner_id=7,
+            mount_intent=None,
+        )
 
-    assert sandbox is None
     assert 1 not in manager._agent_sandbox_keys
     assert 1 not in manager._agent_sandbox_providers
 

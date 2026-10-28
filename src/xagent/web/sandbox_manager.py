@@ -78,9 +78,8 @@ _SANDBOX_STOP_TIMEOUT_SECONDS = 30
 class SandboxCapacityError(RuntimeError):
     """The sandbox container cap is reached and no idle sandbox is evictable.
 
-    Distinct from sandbox-service unavailability: by default the web layer
-    rejects the task with this error instead of falling back to local
-    execution (see XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY).
+    The web layer rejects the task with this error; it never falls back to
+    host-local execution.
     """
 
     def __init__(self, *, cap: int, in_use: int) -> None:
@@ -3026,19 +3025,20 @@ def _create_sandbox_service() -> Optional[SandboxService]:
     elif implementation == "docker":
         return _create_docker_service()
     else:
-        logger.warning(
-            f"Unknown sandbox implementation: {implementation}, falling back to docker"
+        raise ValueError(
+            "Unknown SANDBOX_IMPLEMENTATION "
+            f"{implementation!r}; expected 'docker' or 'boxlite'"
         )
-        return _create_docker_service()
 
 
 def _create_boxlite_service() -> Optional[SandboxService]:
     """Create Boxlite sandbox service."""
     try:
         from ..sandbox import BoxliteSandboxService
-    except ImportError:
-        logger.error("boxlite is not installed.")
-        return None
+    except ImportError as exc:
+        raise RuntimeError(
+            "SANDBOX_IMPLEMENTATION=boxlite requires the BoxLite dependency"
+        ) from exc
 
     from .sandbox_store import DBBoxliteStore
 
@@ -3046,7 +3046,6 @@ def _create_boxlite_service() -> Optional[SandboxService]:
     store = DBBoxliteStore(namespace=worker_id)
     home_dir = get_boxlite_home_dir()
 
-    service = None
     try:
         service = BoxliteSandboxService(
             store=store, home_dir=None if home_dir is None else str(home_dir)
@@ -3055,7 +3054,7 @@ def _create_boxlite_service() -> Optional[SandboxService]:
             f"Created Boxlite sandbox service (home_dir={home_dir or 'default'})"
         )
     except Exception as e:
-        logger.error(f"Failed to create Boxlite sandbox service: {e}")
+        raise RuntimeError("Failed to initialize the BoxLite sandbox runtime") from e
 
     return service
 
@@ -3078,9 +3077,10 @@ def _create_docker_service() -> Optional[SandboxService]:
         )
     try:
         from ..sandbox import DockerSandboxService
-    except ImportError:
-        logger.error("docker sandbox dependencies are not installed.")
-        return None
+    except ImportError as exc:
+        raise RuntimeError(
+            "SANDBOX_IMPLEMENTATION=docker requires the Docker dependencies"
+        ) from exc
 
     from .sandbox_store import DBDockerStore
 
@@ -3089,8 +3089,7 @@ def _create_docker_service() -> Optional[SandboxService]:
     try:
         service = DockerSandboxService(store=store, namespace=namespace)
     except Exception as exc:
-        logger.error("Failed to create Docker sandbox service: %s", exc)
-        return None
+        raise RuntimeError("Failed to initialize the Docker sandbox runtime") from exc
 
     logger.info("Created Docker sandbox service (namespace=%s)", namespace)
     try:

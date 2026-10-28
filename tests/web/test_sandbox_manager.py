@@ -67,8 +67,8 @@ class TestCreateSandboxService:
         assert result is not None
         mock_create.assert_called_once()
 
-    def test_unknown_implementation_falls_back_to_docker(self):
-        """Test unknown implementation falls back to docker."""
+    def test_unknown_implementation_fails_closed(self):
+        """A typo must not silently select a different sandbox runtime."""
         with (
             patch.dict(
                 "os.environ",
@@ -77,9 +77,9 @@ class TestCreateSandboxService:
             ),
             patch("xagent.web.sandbox_manager._create_docker_service") as mock_create,
         ):
-            mock_create.return_value = FakeSandboxService()
-            _create_sandbox_service()
-        mock_create.assert_called_once()
+            with pytest.raises(ValueError, match="SANDBOX_IMPLEMENTATION"):
+                _create_sandbox_service()
+        mock_create.assert_not_called()
 
     def test_docker_selected(self):
         """Test docker implementation selection."""
@@ -194,8 +194,8 @@ class TestCreateBoxliteService:
 
         assert mock_cls.call_args[1]["home_dir"] == "/tmp/sandbox"
 
-    def test_creation_failure_returns_none(self):
-        """Test that BoxliteSandboxService construction failure returns None."""
+    def test_creation_failure_is_fatal(self):
+        """An enabled BoxLite runtime must not degrade to local execution."""
         with (
             patch(
                 "xagent.sandbox.BoxliteSandboxService",
@@ -203,9 +203,8 @@ class TestCreateBoxliteService:
             ),
             patch("xagent.sandbox.MemBoxliteStore", return_value=MagicMock()),
         ):
-            result = _create_boxlite_service()
-
-        assert result is None
+            with pytest.raises(RuntimeError, match="initialize the BoxLite"):
+                _create_boxlite_service()
 
 
 class TestCreateDockerService:
@@ -231,8 +230,8 @@ class TestCreateDockerService:
         assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
         assert mock_service_cls.call_args[1]["namespace"] == "test"
 
-    def test_creation_failure_returns_none(self):
-        """Test that DockerSandboxService construction failure returns None."""
+    def test_creation_failure_is_fatal(self):
+        """An enabled Docker runtime must not degrade to local execution."""
         with (
             patch("xagent.web.sandbox_store.DBDockerStore", return_value=MagicMock()),
             patch(
@@ -240,9 +239,8 @@ class TestCreateDockerService:
                 side_effect=RuntimeError("docker not available"),
             ),
         ):
-            result = _create_docker_service()
-
-        assert result is None
+            with pytest.raises(RuntimeError, match="initialize the Docker"):
+                _create_docker_service()
 
     def test_missing_namespace_is_fatal(self, monkeypatch):
         """Missing namespace must fail loudly, never degrade to unscoped mode."""

@@ -203,9 +203,6 @@ SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
 SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
 SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
 SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
-SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY = (
-    "XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY"
-)
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
@@ -3256,25 +3253,6 @@ def get_sandbox_max_containers() -> int | None:
     """
     # Sentinel default 0 (< minimum) maps every unset/invalid case to None.
     return _get_positive_int_env(SANDBOX_MAX_CONTAINERS, 0, minimum=1) or None
-
-
-def get_sandbox_allow_local_fallback_on_capacity() -> bool:
-    """Whether tasks may fall back to local (host) execution at capacity.
-
-    Priority:
-        1. XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY environment variable
-        2. Default ``False`` — capacity exhaustion rejects the task
-
-    By default a task that cannot get a sandbox because the container cap
-    is reached is rejected with a clear error. Deployments that prefer
-    availability over strict sandboxing can enable this to run such tasks
-    on the host instead (with a warning log). Sandbox-service
-    unavailability keeps its local fallback regardless of this setting.
-
-    Returns:
-        True when local fallback on capacity exhaustion is allowed.
-    """
-    return _get_bool_env(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, False)
 
 
 def get_lancedb_path() -> Path:

@@ -1194,6 +1194,125 @@ async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
 
 
 @pytest.mark.asyncio
+async def test_user_oauth_refresh_google_revoked_token_keeps_reconnect_tombstone(
+    db_session, monkeypatch
+):
+    """Google's explicit revoked-token response is strong enough to stop
+    retrying, while preserving the account identity used by reconnect flows.
+    """
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+        )
+    )
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-token"
+    )
+    oauth_account.refresh_token = "revoked-refresh-token"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    account_id = oauth_account.id
+    db.commit()
+
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class RevokedTokenAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Token has been expired or revoked.",
+                },
+            )
+
+    monkeypatch.setattr(
+        web_tools_config, "create_public_async_client", RevokedTokenAsyncClient
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Google Drive"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        tombstone = verification_db.get(UserOAuth, account_id)
+        assert tombstone is not None
+        assert tombstone.access_token == ""
+        assert tombstone.refresh_token is None
+        assert tombstone.expires_at is None
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [
+        (400, {"error": "invalid_grant"}),
+        (
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token was issued to another client.",
+            },
+        ),
+        (
+            400,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+                "error_subtype": "invalid_rapt",
+            },
+        ),
+        (
+            500,
+            {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+    ],
+)
+def test_google_refresh_only_classifies_explicit_revocation(status_code, payload):
+    response = httpx.Response(status_code, json=payload)
+
+    with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+        web_tools_config._log_and_classify_failed_refresh(
+            response=httpx.Response(
+                400,
+                json={
+                    "error": "invalid_grant",
+                    "error_description": "Token has been expired or revoked.",
+                },
+            ),
+            provider_name="google",
+        )
+
+    web_tools_config._log_and_classify_failed_refresh(
+        response=response,
+        provider_name="google",
+    )
+
+
+@pytest.mark.asyncio
 async def test_user_oauth_refresh_does_not_commit_unrelated_caller_changes(
     db_session,
     monkeypatch,

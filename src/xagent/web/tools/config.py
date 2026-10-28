@@ -4150,6 +4150,7 @@ class WebToolConfig(BaseToolConfig):
                     mark_gmail_oauth_reconnect_required(
                         oauth_db,
                         oauth_account=oauth_account,
+                        expected_refresh_token=attempted_refresh_token,
                     )
                 else:
                     oauth_account.access_token = ""

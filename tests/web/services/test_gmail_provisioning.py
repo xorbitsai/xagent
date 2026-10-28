@@ -1918,6 +1918,48 @@ def test_token_cleared_gmail_account_quiesces_watch_and_trigger(
     assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
     assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
 
+    assert (
+        sweep_gmail_provisioning(
+            db_session,
+            service_factory=lambda *_args: pytest.fail(
+                "reconnect tombstone must not be retried"
+            ),
+        )
+        == 0
+    )
+
+
+def test_mark_gmail_reconnect_preserves_newer_refresh_token(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    account.refresh_token = "new-refresh-token"
+    account.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="hist-newer-token",
+        topic_name="projects/demo-project/topics/xagent-gmail-newer",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    updated = mark_gmail_oauth_reconnect_required(
+        db_session,
+        oauth_account=account,
+        expected_refresh_token="superseded-refresh-token",
+    )
+
+    assert updated is None
+    db_session.refresh(account)
+    db_session.refresh(state)
+    assert account.access_token == "access-token"
+    assert account.refresh_token == "new-refresh-token"
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+
 
 def test_mark_gmail_oauth_reconnect_required_serializes_with_the_transition_lock(
     db_session: Session,

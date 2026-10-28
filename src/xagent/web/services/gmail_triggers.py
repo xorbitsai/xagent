@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, cast
@@ -14,9 +15,8 @@ from google.auth.transport.requests import (
     Request,
 )
 from google.oauth2.credentials import Credentials
-from sqlalchemy import String, case
+from sqlalchemy import String, case, func, or_
 from sqlalchemy import cast as sql_cast
-from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -28,6 +28,7 @@ from ..models.gmail_watch import GmailWatchState
 from ..models.oauth_provider import OAuthProvider
 from ..models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..models.user_oauth import UserOAuth
+from ..oauth_provider_quirks import is_google_revoked_refresh_error
 from .time_utils import coerce_utc as _coerce_utc
 from .user_oauth import (
     get_scoped_user_oauth_account,
@@ -53,6 +54,37 @@ class GmailWatchConfigurationError(GmailTriggerError):
 
 class GmailWatchDisabledError(GmailWatchConfigurationError):
     """Raised when watch (re-)registration is blocked by XAGENT_GMAIL_WATCH_ENABLED."""
+
+
+class GmailOAuthReconnectRequiredError(GmailWatchConfigurationError):
+    """A structured Google response confirmed that this grant is dead.
+
+    The attempted token is retained only for a compare-before-clear check. It
+    is deliberately not included in ``args`` or the exception message, so
+    logs and tracebacks cannot disclose it.
+    """
+
+    def __init__(self, *, attempted_refresh_token: str | None = None) -> None:
+        super().__init__("Gmail OAuth credentials are unavailable; reconnect required")
+        self.attempted_refresh_token = attempted_refresh_token
+
+
+def _is_google_revoked_refresh_exception(exc: RefreshError) -> bool:
+    """Classify google-auth's structured, non-retryable refresh response."""
+
+    if exc.retryable:
+        return False
+    details = next(
+        (value for value in reversed(exc.args) if isinstance(value, Mapping)),
+        None,
+    )
+    if details is None:
+        return False
+    return is_google_revoked_refresh_error(
+        error_code=details.get("error"),
+        error_description=details.get("error_description"),
+        error_subtype=details.get("error_subtype"),
+    )
 
 
 class _GmailApiRequest:
@@ -229,10 +261,15 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
         expiry=_credentials_expiry(cast("datetime | None", oauth_account.expires_at)),
     )
     if creds.expired and creds.refresh_token:
+        attempted_refresh_token = str(creds.refresh_token)
         try:
             creds.refresh(Request())
         except RefreshError as exc:
             db.rollback()
+            if _is_google_revoked_refresh_exception(exc):
+                raise GmailOAuthReconnectRequiredError(
+                    attempted_refresh_token=attempted_refresh_token
+                ) from exc
             raise GmailWatchConfigurationError(
                 "Gmail credential refresh failed"
             ) from exc
@@ -322,6 +359,7 @@ def _renew_watch_for_account(
     silently-expiring-watch bug (#1231).
     """
     from .gmail_provisioning import (
+        GMAIL_RECONNECT_REQUIRED_ERROR,
         GMAIL_WATCH_DISABLED_ERROR,
         ensure_gmail_mailbox_provisioned,
     )
@@ -335,6 +373,8 @@ def _renew_watch_for_account(
         service_factory=service_factory,
     )
     if str(state.status or "") != "active":
+        if str(state.last_error or "") == GMAIL_RECONNECT_REQUIRED_ERROR:
+            raise GmailOAuthReconnectRequiredError()
         raise GmailTriggerError(
             str(state.last_error or "Gmail per-mailbox provisioning failed")
         )
@@ -407,6 +447,14 @@ def scan_due_gmail_watch_renewals(
                 service_factory=service_factory,
             )
             renewed += 1
+        except GmailOAuthReconnectRequiredError:
+            logger.warning(
+                "Gmail watch for user %s, oauth_account %s requires reconnect",
+                user_id,
+                oauth_account.id,
+            )
+            db.rollback()
+            continue
         except Exception as exc:
             logger.error(
                 "Failed to renew Gmail watch for user %s, oauth_account %s: %s",
@@ -663,6 +711,32 @@ async def collect_gmail_pubsub_events(
     state_id = int(state.id)
     try:
         service = await asyncio.to_thread(service_factory, db, oauth_account)
+    except GmailOAuthReconnectRequiredError as exc:
+        db.rollback()
+        from .gmail_provisioning import mark_gmail_oauth_reconnect_required
+
+        updated = await asyncio.to_thread(
+            mark_gmail_oauth_reconnect_required,
+            db,
+            oauth_account=oauth_account,
+            expected_refresh_token=exc.attempted_refresh_token,
+        )
+        if updated is not None:
+            logger.warning(
+                "Gmail OAuth grant for watch %s requires reconnect; "
+                "acknowledging callback without reading Gmail history",
+                state_id,
+            )
+            return GmailPubsubEventCollection(events=[], skipped=1)
+        replacement_error = GmailWatchConfigurationError(
+            "Gmail credential refresh was superseded by newer credentials"
+        )
+        _record_watch_state_error(
+            db,
+            state_id=state_id,
+            error_message=str(replacement_error),
+        )
+        raise replacement_error from exc
     except GmailTriggerError as exc:
         db.rollback()
         _record_watch_state_error(
@@ -697,6 +771,8 @@ async def collect_gmail_pubsub_events(
                 oauth_account,
                 service_factory=service_factory,
             )
+        except GmailOAuthReconnectRequiredError:
+            return GmailPubsubEventCollection(events=[], skipped=1)
         except Exception as watch_exc:
             logger.error(
                 "Failed to re-register Gmail watch for %s: %s",

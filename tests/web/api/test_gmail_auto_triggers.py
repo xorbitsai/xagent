@@ -35,6 +35,7 @@ from xagent.web.services.gmail_provisioning import (
     reconcile_gmail_trigger_provisioning,
 )
 from xagent.web.services.gmail_triggers import (
+    GmailOAuthReconnectRequiredError,
     GmailPubsubNotification,
     GmailTriggerError,
     GmailWatchConfigurationError,
@@ -46,11 +47,9 @@ from xagent.web.services.gmail_triggers import (
 )
 from xagent.web.services.trigger_providers import (
     GmailProvider,
-)
-from xagent.web.services.trigger_providers import gmail as gmail_trigger_provider
-from xagent.web.services.trigger_providers import (
     register_trigger_provider,
 )
+from xagent.web.services.trigger_providers import gmail as gmail_trigger_provider
 
 from .conftest import _direct_db_session, client
 
@@ -2114,6 +2113,71 @@ def test_build_gmail_service_raises_configuration_error_when_refresh_fails(
         db.close()
 
 
+def test_build_gmail_service_classifies_structured_revoked_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "env-client-id")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "env-client-secret")
+
+    class FakeCredentials:
+        def __init__(self, **kwargs: object) -> None:
+            self.expired = True
+            self.refresh_token = kwargs.get("refresh_token")
+
+        def refresh(self, _request: object) -> None:
+            raise RefreshError(
+                "invalid_grant: Token has been expired or revoked.",
+                {
+                    "error": "invalid_grant",
+                    "error_description": "Token has been expired or revoked.",
+                },
+            )
+
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_triggers.Credentials",
+        FakeCredentials,
+    )
+    db = _direct_db_session()
+    try:
+        provider = (
+            db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one()
+        )
+        provider.client_id = ""
+        provider.client_secret = ""
+        user = _create_user(db, "gmail-structured-revoked-user")
+        oauth = _create_gmail_oauth(db, user)
+        oauth.expires_at = datetime(2026, 6, 29, 12, tzinfo=timezone.utc)
+        db.add_all([provider, oauth])
+        db.commit()
+        db.refresh(oauth)
+
+        with pytest.raises(GmailOAuthReconnectRequiredError) as exc_info:
+            build_gmail_service(db, oauth)
+
+        assert exc_info.value.attempted_refresh_token == "refresh-token"
+        assert "refresh-token" not in repr(exc_info.value)
+        db.refresh(oauth)
+        assert oauth.access_token == "access-token"
+        assert oauth.refresh_token == "refresh-token"
+    finally:
+        db.close()
+
+
+def test_retryable_google_refresh_error_does_not_require_reconnect() -> None:
+    exc = RefreshError(
+        "invalid_grant: Token has been expired or revoked.",
+        {
+            "error": "invalid_grant",
+            "error_description": "Token has been expired or revoked.",
+        },
+        retryable=True,
+    )
+
+    assert gmail_triggers._is_google_revoked_refresh_exception(exc) is False
+
+
 def test_gmail_watch_state_model_can_persist() -> None:
     db = _direct_db_session()
     try:
@@ -3428,6 +3492,60 @@ def test_collect_gmail_pubsub_events_records_service_configuration_error() -> No
         db.close()
 
 
+def test_collect_gmail_pubsub_events_quiesces_structured_revoked_grant() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-revoked-callback-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(
+            db,
+            user,
+            config={
+                "watch_label": "INBOX",
+                "oauth_account_id": int(oauth.id),
+            },
+        )
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-revoked-callback"
+        )
+        state.status = TriggerProvisioningStatus.ACTIVE.value
+        state.watch_expiration = datetime.now(timezone.utc) + timedelta(days=1)
+        db.commit()
+
+        def revoked_service_factory(_db, _oauth):
+            raise GmailOAuthReconnectRequiredError(
+                attempted_refresh_token="refresh-token"
+            )
+
+        collection = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-structured-revoked",
+                ),
+                state=state,
+                service_factory=revoked_service_factory,
+            )
+        )
+
+        assert collection.events == []
+        assert collection.skipped == 1
+        db.refresh(oauth)
+        db.refresh(state)
+        db.refresh(trigger)
+        assert oauth.access_token == ""
+        assert oauth.refresh_token is None
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+        assert state.watch_expiration is None
+        assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+        assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    finally:
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_skips_deleted_message_without_failing_batch() -> (
     None
 ):
@@ -3957,6 +4075,68 @@ def test_scan_due_gmail_watch_renewals_records_failure_and_continues(
         db.refresh(second_state)
         assert "revoked credentials" in str(first_state.last_error)
         assert second_state.history_id == "999"
+    finally:
+        db.close()
+
+
+def test_scan_due_gmail_watch_renewals_quiesces_structured_revoked_grant(
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env, caplog
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-renewal-revoked-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(
+            db,
+            user,
+            config={
+                "watch_label": "INBOX",
+                "oauth_account_id": int(oauth.id),
+            },
+        )
+        state = _create_gmail_watch_state(db, user, oauth)
+        state.status = TriggerProvisioningStatus.ACTIVE.value
+        state.watch_expiration = datetime(2026, 6, 29, 12, tzinfo=timezone.utc)
+        db.commit()
+
+        def revoked_service_factory(_db, _oauth):
+            raise GmailOAuthReconnectRequiredError(
+                attempted_refresh_token="refresh-token"
+            )
+
+        with caplog.at_level("WARNING"):
+            renewed = scan_due_gmail_watch_renewals(
+                db,
+                now=datetime(2026, 6, 29, tzinfo=timezone.utc),
+                service_factory=revoked_service_factory,
+            )
+
+        assert renewed == 0
+        db.refresh(oauth)
+        db.refresh(state)
+        db.refresh(trigger)
+        assert oauth.access_token == ""
+        assert oauth.refresh_token is None
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+        assert state.watch_expiration is None
+        assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
+        assert "requires reconnect" in caplog.text
+        assert "Traceback" not in caplog.text
+
+        caplog.clear()
+        assert (
+            scan_due_gmail_watch_renewals(
+                db,
+                now=datetime(2026, 6, 29, tzinfo=timezone.utc),
+                service_factory=lambda *_args: pytest.fail(
+                    "reconnect tombstone must not be retried"
+                ),
+            )
+            == 0
+        )
+        assert caplog.text == ""
     finally:
         db.close()
 

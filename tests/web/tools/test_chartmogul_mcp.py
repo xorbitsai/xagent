@@ -177,9 +177,9 @@ def test_list_customers_returns_entries(monkeypatch):
     assert result["status"] == "success"
     assert result["entries"][0]["name"] == "Acme"
     assert result["entries"][0]["mrr"] == "9357.00"
-    assert result["entries"][0]["mrr_cents"] == 935700
+    assert result["entries"][0]["mrr_in_cents"] == 935700
     assert result["entries"][0]["arr"] == "112284.00"
-    assert result["entries"][0]["arr_cents"] == 11228400
+    assert result["entries"][0]["arr_in_cents"] == 11228400
     assert result["entries"][0]["currency"] == "PHP"
     assert result["has_more"] is False
     assert mock_request.call_args.kwargs["url"] == (
@@ -198,6 +198,37 @@ def test_list_customers_rejects_unexpected_shape(monkeypatch):
     result = json.loads(chartmogul.chartmogul_list_customers())
 
     assert result["status"] == "error"
+
+
+def test_list_customers_rejects_non_dict_entry(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"entries": ["not-a-customer"]})),
+    )
+
+    result = json.loads(chartmogul.chartmogul_list_customers())
+
+    assert result["status"] == "error"
+    assert "unexpected response" in result["message"]
+
+
+def test_list_customers_accepts_integral_float_money(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"entries": [{"uuid": "cus_1", "mrr": 3000.0}]}
+            )
+        ),
+    )
+
+    result = json.loads(chartmogul.chartmogul_list_customers())
+
+    assert result["status"] == "success"
+    assert result["entries"][0]["mrr"] == "30.00"
+    assert result["entries"][0]["mrr_in_cents"] == 3000.0
 
 
 def test_list_customers_treats_null_entries_as_empty_page(monkeypatch):
@@ -232,15 +263,21 @@ def test_list_customers_clamps_per_page(monkeypatch):
 
 @pytest.mark.parametrize(
     ("cents", "expected"),
-    [(0, "0.00"), (1, "0.01"), (-1, "-0.01"), (935700, "9357.00")],
+    [
+        (0, "0.00"),
+        (1, "0.01"),
+        (-1, "-0.01"),
+        (935700, "9357.00"),
+        (3000.0, "30.00"),
+    ],
 )
 def test_major_units_is_exact(cents, expected):
     assert chartmogul._major_units(cents, "amount") == expected
 
 
-@pytest.mark.parametrize("value", [True, 1.0, "100", {}])
-def test_major_units_rejects_non_integer_source_values(value):
-    with pytest.raises(TypeError, match="non-integer value"):
+@pytest.mark.parametrize("value", [True, 1.5, float("nan"), float("inf"), "100", {}])
+def test_major_units_rejects_non_integral_source_values(value):
+    with pytest.raises(TypeError, match="non-integral cents value"):
         chartmogul._major_units(value, "amount")
 
 
@@ -338,15 +375,32 @@ def test_single_customer_results_use_major_currency_units(monkeypatch, invoke):
     customer = json.loads(invoke())["customer"]
 
     assert customer["mrr"] == "9357.00"
-    assert customer["mrr_cents"] == 935700
+    assert customer["mrr_in_cents"] == 935700
     assert customer["arr"] == "112284.00"
-    assert customer["arr_cents"] == 11228400
+    assert customer["arr_in_cents"] == 11228400
     assert customer["currency"] == "PHP"
 
 
 def test_customer_money_normalization_preserves_null_and_missing_fields():
     assert chartmogul._customer_with_major_units({"mrr": None}) == {"mrr": None}
     assert chartmogul._customer_with_major_units({"uuid": "cus_1"}) == {"uuid": "cus_1"}
+
+
+def test_get_customer_returns_error_envelope_for_invalid_money(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"uuid": "cus_1", "mrr": "3000", "currency": "USD"}
+            )
+        ),
+    )
+
+    result = json.loads(chartmogul.chartmogul_get_customer("cus_1"))
+
+    assert result["status"] == "error"
+    assert "non-integral cents value for mrr" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +581,26 @@ def test_single_opportunity_results_include_major_currency_amount(monkeypatch, i
     assert opportunity["amount"] == "1000.00"
     assert opportunity["amount_in_cents"] == 100000
     assert opportunity["currency"] == "USD"
+
+
+@pytest.mark.parametrize(
+    "opportunity",
+    [
+        {"uuid": "opp_1"},
+        {"uuid": "opp_1", "amount_in_cents": None},
+    ],
+)
+def test_get_opportunity_omits_amount_without_source_cents(monkeypatch, opportunity):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=opportunity)),
+    )
+
+    result = json.loads(chartmogul.chartmogul_get_opportunity("opp_1"))
+
+    assert result["status"] == "success"
+    assert "amount" not in result["opportunity"]
 
 
 def test_list_opportunities_rejects_unexpected_shape(monkeypatch):

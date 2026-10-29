@@ -162,10 +162,10 @@ describe("agent trigger API client", () => {
 
     const request = getOwnerTriggerRunHistory({ kind: "agent", id: 42 }, 7, 12)
 
-    await expect(request).rejects.toMatchObject<Partial<AgentTriggerRunHistoryError>>({
+    await expect(request).rejects.toMatchObject({
       name: "AgentTriggerRunHistoryError",
       status: 410,
-    })
+    } satisfies Partial<AgentTriggerRunHistoryError>)
   })
 })
 

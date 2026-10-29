@@ -581,7 +581,9 @@ describe("AgentTriggersDialog", () => {
 
     fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
-    fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
 
     expect(await screen.findByText("Prepare the daily report")).toBeInTheDocument()
     expect(screen.getByText("The daily report is ready")).toBeInTheDocument()
@@ -593,13 +595,18 @@ describe("AgentTriggersDialog", () => {
     expect(routerPushMock).toHaveBeenCalledWith("/task/99")
   })
 
-  it("shows a routine history authorization error inline", async () => {
+  it("shows a workforce routine history authorization error inline", async () => {
+    const workforceTrigger = {
+      ...baseTrigger9,
+      agent_id: null,
+      workforce_id: 5,
+    }
     apiRequestMock.mockImplementation((url: string) => {
       if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
-      if (url === "http://api.local/api/agents/42/triggers") {
-        return Promise.resolve(jsonResponse([baseTrigger9]))
+      if (url === "http://api.local/api/workforces/5/triggers") {
+        return Promise.resolve(jsonResponse([workforceTrigger]))
       }
-      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+      if (url === "http://api.local/api/workforces/5/triggers/9/runs") {
         return Promise.resolve(
           jsonResponse([
             {
@@ -621,10 +628,60 @@ describe("AgentTriggersDialog", () => {
           ]),
         )
       }
-      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+      if (url === "http://api.local/api/workforces/5/triggers/9/runs/12/history") {
         return Promise.resolve(
           jsonResponse({ detail: "Trigger run is not available" }, { status: 403 }),
         )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        owner={{ kind: "workforce", id: 5 }}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
+
+    expect(await screen.findByText("triggers.runs.historyForbidden")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "common.retry" })).not.toBeInTheDocument()
+    expect(screen.queryByText("Connection lost. Reload the page to reconnect.")).not.toBeInTheDocument()
+  })
+
+  it.each([
+    { status: 404, message: "triggers.runs.historyUnavailable", retryable: false },
+    { status: 410, message: "triggers.runs.historyExpired", retryable: false },
+    { status: 500, message: "triggers.runs.historyLoadFailed", retryable: true },
+  ])("maps a $status routine history error", async ({ status, message, retryable }) => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              status: "completed",
+              idempotency_key: "run-12",
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(jsonResponse({ detail: "backend detail" }, { status }))
       }
       return Promise.resolve(jsonResponse([]))
     })
@@ -640,11 +697,17 @@ describe("AgentTriggersDialog", () => {
 
     fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
-    fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
 
-    expect(await screen.findByText("triggers.runs.historyForbidden")).toBeInTheDocument()
-    expect(screen.queryByRole("button", { name: "common.retry" })).not.toBeInTheDocument()
-    expect(screen.queryByText("Connection lost. Reload the page to reconnect.")).not.toBeInTheDocument()
+    expect(await screen.findByText(message)).toBeInTheDocument()
+    const retry = screen.queryByRole("button", { name: "common.retry" })
+    if (retryable) {
+      expect(retry).toBeInTheDocument()
+    } else {
+      expect(retry).not.toBeInTheDocument()
+    }
   })
 
   it("does not show the interactive task link to a teammate who does not own the run", async () => {
@@ -681,7 +744,9 @@ describe("AgentTriggersDialog", () => {
 
     fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
-    expect(await screen.findByRole("button", { name: "triggers.runs.viewResult" })).toBeInTheDocument()
+    expect(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    ).toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "triggers.runs.openTask" })).not.toBeInTheDocument()
   })
 

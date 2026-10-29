@@ -367,6 +367,15 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
     headers = _admin_headers()
     workforce_id = _create_workforce(headers, publish=True)
     trigger = _create_workforce_webhook_trigger(headers, workforce_id)
+    other_trigger = _create_workforce_webhook_trigger(
+        headers, workforce_id, name="Other workforce webhook"
+    )
+    other_workforce_id = _create_workforce(
+        headers, name="Other trigger workforce", publish=True
+    )
+    other_workforce_trigger = _create_workforce_webhook_trigger(
+        headers, other_workforce_id, name="Cross-workforce webhook"
+    )
 
     fired = client.post(
         f"/api/workforces/{workforce_id}/triggers/{trigger['id']}/test",
@@ -433,6 +442,31 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
         headers=outsider_headers,
     )
     assert outsider_history.status_code == 403, outsider_history.text
+
+    cross_trigger_history = client.get(
+        f"/api/workforces/{workforce_id}/triggers/{other_trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert cross_trigger_history.status_code == 404, cross_trigger_history.text
+
+    cross_workforce_run_history = client.get(
+        f"/api/workforces/{other_workforce_id}/triggers/{other_workforce_trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert cross_workforce_run_history.status_code == 404, (
+        cross_workforce_run_history.text
+    )
+
+    mismatched_workforce_history = client.get(
+        f"/api/workforces/{other_workforce_id}/triggers/{trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert mismatched_workforce_history.status_code == 404, (
+        mismatched_workforce_history.text
+    )
 
 
 def test_workforce_webhook_callback_fires_and_deduplicates(

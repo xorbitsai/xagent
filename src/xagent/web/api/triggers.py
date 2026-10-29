@@ -408,7 +408,7 @@ async def get_trigger_run(
         run_id=run_id,
         include_payload=include_payload,
         request=request,
-        user_id=int(current_user.id),
+        user=current_user,
     )
 
 
@@ -419,7 +419,7 @@ def _trigger_run_detail(
     run_id: int,
     include_payload: bool,
     request: Request,
-    user_id: int,
+    user: User,
 ) -> TriggerRunResponse:
     run = _run_or_404(db, trigger=trigger, run_id=run_id)
 
@@ -434,35 +434,24 @@ def _trigger_run_detail(
             # payload are plain validation errors and stay unaudited.
             snapshot = run.payload_snapshot
             if isinstance(snapshot, dict) and "encrypted_payload" in snapshot:
-                record_trigger_audit_best_effort(
+                _audit_payload_read(
                     db,
-                    outcome=TriggerAuditOutcome.PAYLOAD_READ,
-                    provider=str(trigger.provider) if trigger.provider else None,
-                    callback_id=(
-                        str(trigger.callback_id) if trigger.callback_id else None
-                    ),
-                    trigger_id=int(trigger.id),
-                    detail={
-                        "trigger_run_id": int(run.id),
-                        "user_id": user_id,
-                        "success": False,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    },
-                    remote_ip=request.client.host if request.client else None,
+                    trigger=trigger,
+                    run=run,
+                    request=request,
+                    user=user,
+                    success=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                    best_effort=True,
                 )
             raise _handle_service_error(exc)
-        record_trigger_audit(
+        _audit_payload_read(
             db,
-            outcome=TriggerAuditOutcome.PAYLOAD_READ,
-            provider=str(trigger.provider) if trigger.provider else None,
-            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
-            trigger_id=int(trigger.id),
-            detail={
-                "trigger_run_id": int(run.id),
-                "user_id": user_id,
-                "success": True,
-            },
-            remote_ip=request.client.host if request.client else None,
+            trigger=trigger,
+            run=run,
+            request=request,
+            user=user,
+            success=True,
         )
     return _serialize_run(run, payload=payload)
 
@@ -483,38 +472,95 @@ def _run_or_404(
     return run
 
 
+def _audit_payload_read(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run: TriggerRun,
+    request: Request,
+    user: User,
+    success: bool,
+    surface: str | None = None,
+    error: str | None = None,
+    best_effort: bool = False,
+) -> None:
+    detail: dict[str, Any] = {
+        "trigger_run_id": int(run.id),
+        "user_id": int(user.id),
+        "success": success,
+    }
+    if surface is not None:
+        detail["surface"] = surface
+    if error is not None:
+        detail["error"] = error
+    if best_effort:
+        record_trigger_audit_best_effort(
+            db,
+            outcome=TriggerAuditOutcome.PAYLOAD_READ,
+            provider=str(trigger.provider) if trigger.provider else None,
+            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+            trigger_id=int(trigger.id),
+            detail=detail,
+            remote_ip=request.client.host if request.client else None,
+        )
+    else:
+        record_trigger_audit(
+            db,
+            outcome=TriggerAuditOutcome.PAYLOAD_READ,
+            provider=str(trigger.provider) if trigger.provider else None,
+            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+            trigger_id=int(trigger.id),
+            detail=detail,
+            remote_ip=request.client.host if request.client else None,
+        )
+
+
 def _display_history_messages(
     db: Session,
     *,
     task: Task,
 ) -> list[TriggerRunHistoryMessage]:
-    """Read the full client display transcript, independent of model compaction."""
+    """Read only the routine-initiated display turn.
+
+    Trigger tasks remain available to their owner for private follow-up turns.
+    Team-visible history therefore starts at the first user row and stops before
+    the next one, while still reading the display projection so model-context
+    compaction cannot remove the original routine input.
+    """
+    rows: list[tuple[Any, Any]]
     if int(task.conversation_storage_version) == 2:
         from ..services.task_event_display import load_event_display_snapshot
 
-        rows: list[Any] = list(load_event_display_snapshot(db, int(task.id)).messages)
+        rows = [
+            (row.get("role"), row.get("content"))
+            for row in load_event_display_snapshot(db, int(task.id)).messages
+        ]
     else:
-        rows = list(
+        stored_rows = list(
             db.query(TaskChatMessage)
             .filter(TaskChatMessage.task_id == int(task.id))
             .order_by(TaskChatMessage.id.asc())
             .all()
         )
+        rows = []
+        for stored_row in stored_rows:
+            stored_role = str(stored_row.role)
+            stored_content = str(stored_row.content or "")
+            if stored_role == "assistant":
+                stored_content = client_safe_assistant_history_content(
+                    content=stored_content,
+                    message_type=str(stored_row.message_type or ""),
+                )
+            rows.append((stored_role, stored_content))
 
     messages: list[TriggerRunHistoryMessage] = []
-    for row in rows:
-        if isinstance(row, TaskChatMessage):
-            role = str(row.role)
-            content = str(row.content or "")
-            if role == "assistant":
-                content = client_safe_assistant_history_content(
-                    content=content,
-                    message_type=str(row.message_type or ""),
-                )
-        elif isinstance(row, dict):
-            role = row.get("role")
-            content = row.get("content")
-        else:
+    routine_input_seen = False
+    for role, content in rows:
+        if role == "user":
+            if routine_input_seen:
+                break
+            routine_input_seen = True
+        elif not routine_input_seen:
             continue
         if role not in {"user", "assistant"} or not isinstance(content, str):
             continue
@@ -537,7 +583,7 @@ def _trigger_run_history(
     trigger: AgentTrigger,
     run_id: int,
     request: Request,
-    user_id: int,
+    user: User,
 ) -> TriggerRunHistoryResponse:
     """Return a run's read-only, client-safe transcript.
 
@@ -572,19 +618,14 @@ def _trigger_run_history(
     # The first user turn is the rendered trigger prompt and may embed the
     # original event payload. Treat this read like include_payload=True so it
     # leaves the same durable forensic trail.
-    record_trigger_audit(
+    _audit_payload_read(
         db,
-        outcome=TriggerAuditOutcome.PAYLOAD_READ,
-        provider=str(trigger.provider) if trigger.provider else None,
-        callback_id=str(trigger.callback_id) if trigger.callback_id else None,
-        trigger_id=int(trigger.id),
-        detail={
-            "trigger_run_id": int(run.id),
-            "user_id": user_id,
-            "success": True,
-            "surface": "run_history",
-        },
-        remote_ip=request.client.host if request.client else None,
+        trigger=trigger,
+        run=run,
+        request=request,
+        user=user,
+        success=True,
+        surface="run_history",
     )
     return TriggerRunHistoryResponse(
         run_id=int(run.id),
@@ -616,7 +657,7 @@ def get_trigger_run_history(
         trigger=trigger,
         run_id=run_id,
         request=request,
-        user_id=int(current_user.id),
+        user=current_user,
     )
 
 
@@ -848,7 +889,7 @@ def get_workforce_trigger_run_route(
         run_id=run_id,
         include_payload=include_payload,
         request=request,
-        user_id=int(current_user.id),
+        user=current_user,
     )
 
 
@@ -876,7 +917,7 @@ def get_workforce_trigger_run_history_route(
         trigger=trigger,
         run_id=run_id,
         request=request,
-        user_id=int(current_user.id),
+        user=current_user,
     )
 
 

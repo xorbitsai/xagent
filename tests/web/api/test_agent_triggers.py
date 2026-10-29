@@ -23,6 +23,7 @@ from xagent.web.models.task import (
     TaskStatus,
     TraceEvent,
 )
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerAudit,
@@ -3717,6 +3718,20 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                         content="internal orchestration note",
                         message_type="system_message",
                     ),
+                    TaskChatMessage(
+                        task_id=int(task.id),
+                        user_id=admin_user_id,
+                        role="user",
+                        content="Use my private connector for a follow-up",
+                        message_type="user_message",
+                    ),
+                    TaskChatMessage(
+                        task_id=int(task.id),
+                        user_id=admin_user_id,
+                        role="assistant",
+                        content="Private connector result",
+                        message_type="assistant_response",
+                    ),
                     # Model-context reads replace everything through this
                     # watermark with a system summary. Display-history reads
                     # must still return the original user-visible rows.
@@ -3757,6 +3772,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
         assert "do-not-leak" not in teammate_read.text
         assert "internal orchestration note" not in teammate_read.text
         assert "Earlier routine conversation" not in teammate_read.text
+        assert "private connector" not in teammate_read.text.lower()
 
         db = _direct_db_session()
         try:
@@ -3782,6 +3798,13 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
             headers=admin_headers,
         )
         assert cross_trigger_read.status_code == 404, cross_trigger_read.text
+
+        other_agent_id = _create_agent(admin_headers, "Other routine owner")
+        cross_agent_read = client.get(
+            f"/api/agents/{other_agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+            headers=admin_headers,
+        )
+        assert cross_agent_read.status_code == 404, cross_agent_read.text
 
         owner_read = client.get(history_url, headers=admin_headers)
         assert owner_read.status_code == 200, owner_read.text
@@ -3817,6 +3840,7 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
             is_visible=False,
             input="V2 prompt",
             conversation_storage_version=2,
+            conversation_event_sequence=5,
         )
         db.add(task)
         db.flush()
@@ -3827,28 +3851,86 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
             idempotency_key="history:v2",
         )
         db.add(run)
+        occurred_at = datetime.now(timezone.utc)
+        db.add_all(
+            [
+                TaskExecutionEvent(
+                    event_id=f"00000000-0000-0000-0000-{sequence:012d}",
+                    task_id=int(task.id),
+                    sequence=sequence,
+                    scope_id="root",
+                    run_id=run_key,
+                    turn_id=turn_id,
+                    idempotency_key=f"v2-history:{sequence}",
+                    kind=kind,
+                    payload_version=1,
+                    payload={
+                        "data": {
+                            "content": content,
+                            "message_type": message_type,
+                            "attachments": (
+                                [{"file_id": "private-v2-file"}]
+                                if kind == "input_accepted"
+                                else []
+                            ),
+                        }
+                    },
+                    occurred_at=occurred_at + timedelta(seconds=sequence),
+                )
+                for sequence, run_key, turn_id, kind, content, message_type in [
+                    (
+                        1,
+                        "routine-run",
+                        "routine-turn",
+                        "input_accepted",
+                        "V2 prompt",
+                        "user_message",
+                    ),
+                    (
+                        2,
+                        "routine-run",
+                        "routine-turn",
+                        "assistant_message",
+                        "V2 result",
+                        "assistant_response",
+                    ),
+                    (
+                        3,
+                        "routine-run",
+                        "routine-turn",
+                        "assistant_message",
+                        "",
+                        "assistant_response",
+                    ),
+                    (
+                        4,
+                        "private-run",
+                        "private-turn",
+                        "input_accepted",
+                        "Private V2 follow-up",
+                        "user_message",
+                    ),
+                    (
+                        5,
+                        "private-run",
+                        "private-turn",
+                        "assistant_message",
+                        "Private V2 result",
+                        "assistant_response",
+                    ),
+                ]
+            ]
+        )
         db.commit()
         run_id = int(run.id)
         task_id = int(task.id)
     finally:
         db.close()
 
-    snapshot = MagicMock(
-        messages=(
-            {"role": "user", "content": "V2 prompt"},
-            {"role": "assistant", "content": "V2 result"},
-            {"role": "assistant", "content": ""},
-            {"role": "system", "content": "internal"},
-        )
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
     )
-    with patch(
-        "xagent.web.services.task_event_display.load_event_display_snapshot",
-        return_value=snapshot,
-    ) as load_snapshot:
-        history = client.get(
-            f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
-            headers=headers,
-        )
 
     assert history.status_code == 200, history.text
     assert history.json() == {
@@ -3859,7 +3941,8 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
             {"role": "assistant", "content": "V2 result"},
         ],
     }
-    load_snapshot.assert_called_once()
+    assert "private-v2-file" not in history.text
+    assert "Private V2" not in history.text
 
 
 def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:

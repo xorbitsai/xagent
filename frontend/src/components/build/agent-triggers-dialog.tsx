@@ -120,6 +120,12 @@ interface RunHistoryErrorState {
   retryable: boolean
 }
 
+const RUN_HISTORY_ERROR_KEYS = {
+  403: "triggers.runs.historyForbidden",
+  404: "triggers.runs.historyUnavailable",
+  410: "triggers.runs.historyExpired",
+} as const
+
 const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
 // The plain "YYYY-MM-DD" shape buildConfig sends for daily/weekly/monthly's
 // start_at — zone-agnostic on purpose (see buildConfig / scheduleFieldsFromConfig).
@@ -762,17 +768,13 @@ export function AgentTriggersDialog({
       if (runHistoryRequestRef.current !== requestId) return
       console.error(err)
       const status = err instanceof AgentTriggerRunHistoryError ? err.status : null
-      const message =
-        status === 410
-          ? t("triggers.runs.historyExpired")
-          : status === 404
-            ? t("triggers.runs.historyUnavailable")
-            : status === 403
-              ? t("triggers.runs.historyForbidden")
-              : t("triggers.runs.historyLoadFailed")
+      const errorKey =
+        status === null
+          ? undefined
+          : RUN_HISTORY_ERROR_KEYS[status as keyof typeof RUN_HISTORY_ERROR_KEYS]
       setRunHistoryError({
-        message,
-        retryable: status === null || ![403, 404, 410].includes(status),
+        message: t(errorKey ?? "triggers.runs.historyLoadFailed"),
+        retryable: errorKey === undefined,
       })
     } finally {
       if (runHistoryRequestRef.current === requestId) {
@@ -2280,11 +2282,11 @@ export function AgentTriggersDialog({
                             variant="link"
                             className="h-auto gap-0.5 p-0 text-xs"
                             aria-expanded={expandedRunId === run.id}
-                            aria-label={t(
+                            aria-label={`${t(
                               expandedRunId === run.id
                                 ? "triggers.runs.hideResult"
                                 : "triggers.runs.viewResult",
-                            )}
+                            )} #${run.task_id}`}
                             onClick={() => toggleRunHistory(run)}
                           >
                             #{run.task_id}

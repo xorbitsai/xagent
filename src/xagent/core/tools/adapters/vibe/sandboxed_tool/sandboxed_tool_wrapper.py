@@ -42,9 +42,11 @@ logger = logging.getLogger(__name__)
 
 # Base path where project source code is mounted inside the sandbox
 SANDBOX_SRC_ROOT = "/app/src"
-_TOOL_RUNNER_PATH = (
+SANDBOX_TOOL_RUNNER_PATH = (
     f"{SANDBOX_SRC_ROOT}/xagent/core/tools/adapters/vibe/sandboxed_tool/tool_runner.py"
 )
+# Kept as the execution seam used by existing local-runner tests.
+_TOOL_RUNNER_PATH = SANDBOX_TOOL_RUNNER_PATH
 
 # `timeout -s KILL` SIGKILLs its whole process group at the deadline, itself
 # included, so the exec reports a SIGKILL death: 128+9 from docker, -9 from

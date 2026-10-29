@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from ....core.tools.core.web_content import get_trusted_proxy_url
 from ....core.utils import public_requests as requests
@@ -35,6 +36,29 @@ MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 # outright, mirroring the same bounded-retry policy already used by the
 # Jira/Slack/Intercom sibling modules.
 MAX_RETRY_AFTER_SECONDS = 30
+
+# A 4xx query response is a property of the submitted HogQL (or of PostHog's
+# own query compiler), not a transport failure that becomes safer or more
+# useful when the agent immediately submits near-identical SQL. Keep the
+# provider fields on the exception so the query tool can give the model a
+# precise, provider-authored reason and an equally precise retry instruction.
+_RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+
+class _PostHogAPIError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        code: str | None,
+        detail: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.detail = detail
+        self.retryable = status_code in _RETRYABLE_HTTP_STATUSES
 
 
 def _success(**payload: Any) -> str:
@@ -188,6 +212,56 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     return detail if isinstance(detail, str) and detail else None
 
 
+def _extract_error_code(response: requests.Response) -> str | None:
+    """Return PostHog's stable machine-readable error code when present."""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    if not isinstance(code, str) or not code or len(code) > 100:
+        return None
+    if not all(character.isalnum() or character in "_.-" for character in code):
+        return None
+    return code
+
+
+def _query_error_message(exc: BaseException) -> str:
+    """Render a failed HogQL call with an explicit retry contract."""
+
+    if not isinstance(exc, _PostHogAPIError):
+        return (
+            f"PostHog HogQL query failed: {exc}. Do not retry the same query "
+            "unchanged; report this error or make one correction that directly "
+            "addresses it."
+        )
+
+    code = f", code {exc.code}" if exc.code else ""
+    detail = exc.detail or str(exc)
+    prefix = (
+        f"PostHog rejected the HogQL query (HTTP {exc.status_code}{code}): {detail}"
+    )
+    if exc.retryable:
+        return (
+            f"{prefix}. PostHog classified this as a temporary provider failure. "
+            "Do not retry it immediately; report the failure and try again later."
+        )
+    if exc.code == "decimal_overflow" or "decimal overflow" in detail.casefold():
+        return (
+            f"{prefix}. This is a non-retryable PostHog query-engine failure. "
+            "Do not try equivalent aggregate or timestamp-filter variants in this "
+            "task; report PostHog's error to the user."
+        )
+    return (
+        f"{prefix}. This request is not retryable as-is. Do not retry the same or "
+        "an equivalent query; report the error unless the query can be materially "
+        "corrected from this message."
+    )
+
+
 def _make_request(**kwargs: Any) -> requests.Response:
     """Issue the actual HTTP call with `trust_env=False`, so `requests`
     never falls back to an ambient/OS-native proxy source
@@ -299,6 +373,7 @@ def _request(
     except requests.HTTPError as exc:
         message = str(exc)
         detail = _extract_error_detail(response)
+        code = _extract_error_code(response)
         if detail is None:
             detail = response.text.strip()
             if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
@@ -309,7 +384,13 @@ def _request(
             # headers (e.g. a misconfigured gateway's error page), redact
             # the Bearer token before it reaches logs or the LLM's context.
             message = f"{message} - {redact_sensitive_text(detail)}"
-        raise RuntimeError(message) from exc
+        safe_detail = redact_sensitive_text(detail) if detail else None
+        raise _PostHogAPIError(
+            message,
+            status_code=response.status_code,
+            code=code,
+            detail=safe_detail,
+        ) from exc
 
     if response.status_code == 204 or not response.content:
         return {}
@@ -458,6 +539,9 @@ def posthog_query(
     offset param to page past it -- a caller that needs more than 100
     rows, or a specific slice of a larger result, should add its own
     LIMIT/OFFSET to hogql_query instead.
+    A rejected query is a failed tool call, not an empty result. In particular,
+    do not retry a PostHog decimal-overflow response with equivalent aggregate
+    or timestamp-filter variants; report the provider error instead.
     """
     try:
         body: dict[str, Any] = {"query": {"kind": "HogQLQuery", "query": hogql_query}}
@@ -483,7 +567,11 @@ def posthog_query(
         )
     except Exception as e:
         logger.error(f"Error running PostHog HogQL query in project {project_id}: {e}")
-        return _error(str(e))
+        # FastMCP converts ToolError into CallToolResult(isError=True). Returning
+        # the connector's ordinary {"status":"error"} JSON here would make the
+        # host classify this as a successful tool call, encouraging the model to
+        # keep submitting near-identical aggregate queries after a permanent 400.
+        raise ToolError(_query_error_message(e)) from e
 
 
 @mcp.tool()

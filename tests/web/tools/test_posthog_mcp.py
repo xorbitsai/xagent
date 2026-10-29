@@ -559,10 +559,12 @@ def test_request_does_not_retry_a_second_429(monkeypatch):
     monkeypatch.setattr(posthog, "_make_request", mock_request)
     monkeypatch.setattr(posthog.time, "sleep", Mock())
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(posthog._PostHogAPIError) as excinfo:
         posthog._request("GET", "/api/users/@me/")
 
     assert mock_request.call_count == 2
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retryable is True
 
 
 def test_request_redacts_connection_error_message(monkeypatch):
@@ -598,8 +600,15 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
         ),
     )
 
-    with pytest.raises(RuntimeError, match="Invalid Personal API key"):
+    with pytest.raises(
+        posthog._PostHogAPIError, match="Invalid Personal API key"
+    ) as excinfo:
         posthog._request("GET", "/api/users/@me/")
+
+    assert excinfo.value.status_code == 401
+    assert excinfo.value.code == "invalid_personal_api_key"
+    assert excinfo.value.detail == "Invalid Personal API key."
+    assert excinfo.value.retryable is False
 
 
 def test_request_redacts_bearer_token_in_error_detail(monkeypatch):
@@ -837,6 +846,41 @@ def test_query_sends_hogql_query_body(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "hogql_query",
+    [
+        "select count() from events where timestamp > now() - interval 7 day",
+        (
+            "select count(distinct distinct_id) from events "
+            "where timestamp > now() - interval 7 day"
+        ),
+        (
+            "select event, count() from events "
+            "where timestamp > now() - interval 7 day group by event"
+        ),
+        (
+            "select toDate(timestamp), count() from events "
+            "where timestamp > now() - interval 7 day group by toDate(timestamp)"
+        ),
+    ],
+)
+def test_query_passes_aggregate_shapes_through_unchanged(monkeypatch, hogql_query):
+    """The connector must not add a cast or otherwise rewrite valid HogQL."""
+
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"columns": ["count"], "results": [[8]]})
+    )
+    monkeypatch.setattr(posthog, "_make_request", mock_request)
+
+    result = json.loads(posthog.posthog_query(hogql_query))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["json"]["query"] == {
+        "kind": "HogQLQuery",
+        "query": hogql_query,
+    }
+
+
 def test_query_omits_name_when_not_provided(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
     monkeypatch.setattr(posthog, "_make_request", mock_request)
@@ -881,10 +925,59 @@ def test_query_reports_clear_error_for_malformed_results_shape(monkeypatch):
         Mock(return_value=MockResponse(json_data={"results": {"not": "a-list"}})),
     )
 
-    result = json.loads(posthog.posthog_query("select 1"))
+    from mcp.server.fastmcp.exceptions import ToolError
 
-    assert result["status"] == "error"
-    assert "results" in result["message"]
+    with pytest.raises(ToolError, match="results"):
+        posthog.posthog_query("select 1")
+
+
+@pytest.mark.asyncio
+async def test_query_decimal_overflow_is_a_failed_non_retryable_mcp_call(monkeypatch):
+    """A PostHog 400 must not look like a successful result to the agent."""
+
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from xagent.core.agent.result import tool_result_succeeded
+    from xagent.core.tools.adapters.vibe.mcp_adapter import (
+        _normalized_mcp_call_result,
+    )
+
+    monkeypatch.setattr(
+        posthog,
+        "_make_request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data={
+                    "type": "query_error",
+                    "code": "query_error",
+                    "detail": "Decimal overflow while executing query.",
+                },
+            )
+        ),
+    )
+
+    async with create_connected_server_and_client_session(
+        posthog.mcp._mcp_server
+    ) as session:
+        result = await session.call_tool(
+            "posthog_query",
+            {
+                "hogql_query": (
+                    "select event, count() from events "
+                    "where timestamp > now() - interval 7 day group by event"
+                )
+            },
+        )
+
+    assert result.isError is True
+    message = result.content[0].text
+    assert "HTTP 400" in message
+    assert "query_error" in message
+    assert "Decimal overflow while executing query" in message
+    assert "non-retryable" in message
+    assert "Do not try equivalent aggregate" in message
+    assert tool_result_succeeded(_normalized_mcp_call_result(result)) is False
 
 
 def test_list_persons_includes_search_param(monkeypatch):

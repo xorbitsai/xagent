@@ -57,28 +57,38 @@ _METRIC_INTERVALS_BY_NAME = {
 }
 _METRIC_INTERVALS_BY_NAME["asp"] = frozenset({"month", "quarter", "year"})
 _METRIC_INTERVALS_BY_NAME["ltv"] = frozenset({"month"})
-_ALL_METRIC_MONEY_ENTRY_FIELDS = ("mrr", "arr", "ltv", "asp", "arpa")
-_ALL_METRIC_MONEY_SUMMARY_FIELDS = (
-    "current-mrr",
-    "previous-mrr",
-    "current-arr",
-    "previous-arr",
-    "current-ltv",
-    "previous-ltv",
-    "current-asp",
-    "previous-asp",
-    "current-arpa",
-    "previous-arpa",
-)
-_MRR_MONEY_ENTRY_FIELDS = (
-    "mrr",
-    "mrr-new-business",
-    "mrr-expansion",
-    "mrr-contraction",
-    "mrr-churn",
-    "mrr-reactivation",
-)
-_SINGLE_VALUE_MONEY_METRICS = frozenset({"arr", "arpa", "asp", "ltv"})
+_METRIC_MONEY_FIELDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "all": (
+        ("mrr", "arr", "ltv", "asp", "arpa"),
+        (
+            "current-mrr",
+            "previous-mrr",
+            "current-arr",
+            "previous-arr",
+            "current-ltv",
+            "previous-ltv",
+            "current-asp",
+            "previous-asp",
+            "current-arpa",
+            "previous-arpa",
+        ),
+    ),
+    "mrr": (
+        (
+            "mrr",
+            "mrr-new-business",
+            "mrr-expansion",
+            "mrr-contraction",
+            "mrr-churn",
+            "mrr-reactivation",
+        ),
+        ("current", "previous"),
+    ),
+    "arr": (("arr",), ("current", "previous")),
+    "arpa": (("arpa",), ("current", "previous")),
+    "asp": (("asp",), ("current", "previous")),
+    "ltv": (("ltv",), ("current", "previous")),
+}
 
 
 def _success(**payload: Any) -> str:
@@ -99,16 +109,39 @@ def _major_units(cents: Any, field: str) -> str:
     return f"{Decimal(cents) / Decimal(100):.2f}"
 
 
+def _with_major_units(
+    record: dict[str, Any],
+    money_fields: tuple[str, ...],
+    *,
+    allow_fractional: bool = False,
+) -> dict[str, Any]:
+    """Normalize known money fields while retaining their source cents."""
+    normalized = dict(record)
+    for field in money_fields:
+        if field not in record or record[field] is None:
+            continue
+        cents = record[field]
+        normalized[f"{field.replace('-', '_')}_cents"] = cents
+        if not allow_fractional:
+            normalized[field] = _major_units(cents, field)
+            continue
+        if isinstance(cents, bool) or not isinstance(cents, (int, float)):
+            raise TypeError(
+                f"ChartMogul returned a non-numeric value for {field}: "
+                f"{type(cents).__name__}"
+            )
+        decimal_cents = Decimal(str(cents))
+        if not decimal_cents.is_finite():
+            raise TypeError(
+                f"ChartMogul returned a non-finite value for {field}: {cents}"
+            )
+        normalized[field] = f"{decimal_cents / Decimal(100):.2f}"
+    return normalized
+
+
 def _customer_with_major_units(customer: dict[str, Any]) -> dict[str, Any]:
     """Make ChartMogul customer MRR/ARR safe for user-facing consumption."""
-    normalized = dict(customer)
-    for field in ("mrr", "arr"):
-        if field not in customer or customer[field] is None:
-            continue
-        cents = customer[field]
-        normalized[f"{field}_cents"] = cents
-        normalized[field] = _major_units(cents, field)
-    return normalized
+    return _with_major_units(customer, ("mrr", "arr"))
 
 
 def _opportunity_with_major_units(opportunity: dict[str, Any]) -> dict[str, Any]:
@@ -136,36 +169,6 @@ def _entries_with_major_units(
     return {**result, "entries": entries}
 
 
-def _metric_record_with_major_units(
-    record: dict[str, Any],
-    money_fields: tuple[str, ...],
-    *,
-    allow_fractional: bool = False,
-) -> dict[str, Any]:
-    """Normalize known metric money fields and retain their source cents."""
-    normalized = dict(record)
-    for field in money_fields:
-        if field not in record or record[field] is None:
-            continue
-        cents = record[field]
-        normalized[f"{field.replace('-', '_')}_cents"] = cents
-        if allow_fractional:
-            if isinstance(cents, bool) or not isinstance(cents, (int, float)):
-                raise TypeError(
-                    f"ChartMogul returned a non-numeric value for {field}: "
-                    f"{type(cents).__name__}"
-                )
-            decimal_cents = Decimal(str(cents))
-            if not decimal_cents.is_finite():
-                raise TypeError(
-                    f"ChartMogul returned a non-finite value for {field}: {cents}"
-                )
-            normalized[field] = f"{decimal_cents / Decimal(100):.2f}"
-        else:
-            normalized[field] = _major_units(cents, field)
-    return normalized
-
-
 def _metrics_with_major_units(
     result: Any, metric: str, endpoint: str
 ) -> dict[str, Any]:
@@ -179,36 +182,18 @@ def _metrics_with_major_units(
     if any(not isinstance(entry, dict) for entry in entries):
         raise TypeError(f"ChartMogul returned an unexpected response for {endpoint}")
 
-    entry_money_fields: tuple[str, ...]
-    summary_money_fields: tuple[str, ...]
-    if metric == "all":
-        entry_money_fields = _ALL_METRIC_MONEY_ENTRY_FIELDS
-        summary_money_fields = _ALL_METRIC_MONEY_SUMMARY_FIELDS
-    elif metric == "mrr":
-        entry_money_fields = _MRR_MONEY_ENTRY_FIELDS
-        summary_money_fields = ("current", "previous")
-    elif metric in _SINGLE_VALUE_MONEY_METRICS:
-        entry_money_fields = (metric,)
-        summary_money_fields = ("current", "previous")
-    else:
-        entry_money_fields = ()
-        summary_money_fields = ()
-    allow_fractional = metric == "ltv"
+    entry_money_fields, summary_money_fields = _METRIC_MONEY_FIELDS.get(
+        metric, ((), ())
+    )
 
     return {
         **result,
         "entries": [
-            _metric_record_with_major_units(
-                entry,
-                entry_money_fields,
-                allow_fractional=allow_fractional,
-            )
+            _with_major_units(entry, entry_money_fields, allow_fractional=True)
             for entry in entries
         ],
-        "summary": _metric_record_with_major_units(
-            summary,
-            summary_money_fields,
-            allow_fractional=allow_fractional,
+        "summary": _with_major_units(
+            summary, summary_money_fields, allow_fractional=True
         ),
     }
 
@@ -838,10 +823,10 @@ def chartmogul_get_metrics(
     ChartMogul's metrics API applies the product's own subscription,
     expansion, contraction, reactivation, and churn calculations.
 
-    Monetary values are exact two-decimal strings in the ChartMogul account's
-    selected currency. Their source cent values are retained under explicit
-    ``*_cents`` fields, matching the customer metric convention. Counts,
-    rates, and percentage-change fields are not currency and remain unchanged.
+    Monetary values are two-decimal strings in the ChartMogul account's
+    selected currency. Fractional metric cents are rounded to the nearest
+    cent; exact source values are retained under explicit ``*_cents`` fields.
+    Counts, rates, and percentage-change fields remain unchanged.
 
     metric: one of "all", "mrr", "arr", "arpa", "asp", "customer-count",
       "customer-churn-rate", "mrr-churn-rate", or "ltv". Use "all" to
@@ -852,7 +837,8 @@ def chartmogul_get_metrics(
     interval: one of "day", "week", "month", "quarter", or "year" for most
       metrics. ASP supports only "month", "quarter", and "year". Standalone
       LTV is monthly-only, so it accepts only "month" and does not send an
-      interval parameter to ChartMogul.
+      interval parameter to ChartMogul. For long ranges, prefer a coarser
+      interval over "day" to avoid output truncation.
     geo: optional comma-separated ISO 3166-1 alpha-2 country codes.
     plans: optional comma-separated plan UUIDs, external IDs, or names.
     """
@@ -886,7 +872,10 @@ def chartmogul_get_metrics(
         )
         result = _metrics_with_major_units(result, metric, endpoint)
         return success_with_capped_dict(
-            "metrics", result, extra_fields={"metric": metric}
+            "metrics",
+            result,
+            extra_fields={"metric": metric},
+            keep_list_tail=True,
         )
     except Exception as e:
         logger.exception(f"Error fetching ChartMogul {metric} metrics")

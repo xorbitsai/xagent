@@ -131,6 +131,20 @@ def _entries_with_major_units(
     return {**result, "entries": entries}
 
 
+def _metric_record_with_major_units(
+    record: dict[str, Any], money_fields: tuple[str, ...]
+) -> dict[str, Any]:
+    """Normalize known metric money fields and retain their source cents."""
+    normalized = dict(record)
+    for field in money_fields:
+        if field not in record or record[field] is None:
+            continue
+        cents = record[field]
+        normalized[f"{field.replace('-', '_')}_cents"] = cents
+        normalized[field] = _major_units(cents, field)
+    return normalized
+
+
 def _metrics_with_major_units(
     result: Any, metric: str, endpoint: str
 ) -> dict[str, Any]:
@@ -162,9 +176,10 @@ def _metrics_with_major_units(
     return {
         **result,
         "entries": [
-            _record_with_major_units(entry, entry_money_fields) for entry in entries
+            _metric_record_with_major_units(entry, entry_money_fields)
+            for entry in entries
         ],
-        "summary": _record_with_major_units(summary, summary_money_fields),
+        "summary": _metric_record_with_major_units(summary, summary_money_fields),
     }
 
 
@@ -795,8 +810,8 @@ def chartmogul_get_metrics(
 
     Monetary values are exact two-decimal strings in the ChartMogul account's
     selected currency. Their source cent values are retained under explicit
-    ``*_in_cents`` fields. Counts, rates, and percentage-change fields
-    are not currency and remain unchanged.
+    ``*_cents`` fields, matching the customer metric convention. Counts,
+    rates, and percentage-change fields are not currency and remain unchanged.
 
     metric: one of "all", "mrr", "arr", "arpa", "asp", "customer-count",
       "customer-churn-rate", "mrr-churn-rate", or "ltv". Use "all" to

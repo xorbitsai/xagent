@@ -666,13 +666,13 @@ def test_get_metrics_mrr_normalizes_money_and_passes_filters(monkeypatch):
     assert result["metric"] == "mrr"
     entry = result["metrics"]["entries"][0]
     assert entry["mrr"] == "21833.00"
-    assert entry["mrr_in_cents"] == 2183300
+    assert entry["mrr_cents"] == 2183300
     assert entry["mrr-contraction"] == "-25.00"
-    assert entry["mrr_contraction_in_cents"] == -2500
+    assert entry["mrr_contraction_cents"] == -2500
     assert entry["percentage-change"] == 1.2
     summary = result["metrics"]["summary"]
     assert summary["current"] == "21833.00"
-    assert summary["current_in_cents"] == 2183300
+    assert summary["current_cents"] == 2183300
     assert summary["percentage-change"] == 3.97
 
     request = mock_request.call_args.kwargs
@@ -725,14 +725,14 @@ def test_get_metrics_all_normalizes_only_monetary_fields(monkeypatch):
 
     entry = result["metrics"]["entries"][0]
     assert entry["mrr"] == "21833.00"
-    assert entry["mrr_in_cents"] == 2183300
+    assert entry["mrr_cents"] == 2183300
     assert entry["arpa"] == "5458.25"
-    assert entry["arpa_in_cents"] == 545825
+    assert entry["arpa_cents"] == 545825
     assert entry["customers"] == 4
     assert entry["customer-churn-rate"] == 2.5
     summary = result["metrics"]["summary"]
     assert summary["current-mrr"] == "21833.00"
-    assert summary["current_mrr_in_cents"] == 2183300
+    assert summary["current_mrr_cents"] == 2183300
     assert summary["current-customers"] == 4
     assert summary["current-customer-churn-rate"] == 2.5
 
@@ -761,15 +761,15 @@ def test_get_metrics_count_values_are_not_treated_as_money(monkeypatch):
     assert "plans" not in mock_request.call_args.kwargs["params"]
 
 
-def test_get_metrics_accepts_integral_float_money(monkeypatch):
+def test_get_metrics_rejects_non_integer_money(monkeypatch):
     monkeypatch.setattr(
         chartmogul.requests,
         "request",
         Mock(
             return_value=MockResponse(
                 json_data={
-                    "entries": [{"date": "2026-09-30", "ltv": 145000.0}],
-                    "summary": {"current": 145000.0, "previous": 140000.0},
+                    "entries": [{"date": "2026-09-30", "ltv": 145000.5}],
+                    "summary": {"current": 145000, "previous": 140000},
                 }
             )
         ),
@@ -779,10 +779,8 @@ def test_get_metrics_accepts_integral_float_money(monkeypatch):
         chartmogul.chartmogul_get_metrics("ltv", "2026-09-01", "2026-09-30")
     )
 
-    assert result["status"] == "success"
-    assert result["metrics"]["entries"][0]["ltv"] == "1450.00"
-    assert result["metrics"]["entries"][0]["ltv_in_cents"] == 145000.0
-    assert result["metrics"]["summary"]["current"] == "1450.00"
+    assert result["status"] == "error"
+    assert "non-integer value for ltv" in result["message"]
 
 
 @pytest.mark.parametrize(

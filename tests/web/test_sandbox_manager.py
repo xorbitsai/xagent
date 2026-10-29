@@ -9,6 +9,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.web.sandbox_fakes import FakeSandboxService
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+    SANDBOX_TOOL_RUNNER_PATH,
+)
+from xagent.core.tools.adapters.vibe.sandboxed_tool.tool_runner import (
+    TOOL_RUNNER_PROBE_MARKER,
+)
 from xagent.sandbox.base import (
     ExecResult,
     Sandbox,
@@ -18,12 +24,6 @@ from xagent.sandbox.base import (
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
-)
-from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    SANDBOX_TOOL_RUNNER_PATH,
-)
-from xagent.core.tools.adapters.vibe.sandboxed_tool.tool_runner import (
-    TOOL_RUNNER_PROBE_MARKER,
 )
 from xagent.web.sandbox_manager import (
     SandboxManager,

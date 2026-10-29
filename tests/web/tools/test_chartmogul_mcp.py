@@ -217,6 +217,36 @@ def test_list_customers_treats_null_entries_as_empty_page(monkeypatch):
     assert result["entries"] == []
 
 
+def test_list_customers_rejects_non_object_entry(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"entries": [42]})),
+    )
+
+    result = json.loads(chartmogul.chartmogul_list_customers())
+
+    assert result["status"] == "error"
+    assert "unexpected response for /customers" in result["message"]
+
+
+def test_list_customers_wraps_non_integer_money_as_error(monkeypatch):
+    monkeypatch.setattr(
+        chartmogul.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"entries": [{"uuid": "cus_1", "mrr": "935700"}]}
+            )
+        ),
+    )
+
+    result = json.loads(chartmogul.chartmogul_list_customers())
+
+    assert result["status"] == "error"
+    assert "non-integer value for mrr: str" in result["message"]
+
+
 def test_list_customers_clamps_per_page(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"entries": [], "has_more": False})
@@ -527,6 +557,22 @@ def test_single_opportunity_results_include_major_currency_amount(monkeypatch, i
     assert opportunity["amount"] == "1000.00"
     assert opportunity["amount_in_cents"] == 100000
     assert opportunity["currency"] == "USD"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        (
+            {"uuid": "opp_1", "amount_in_cents": None},
+            {"uuid": "opp_1", "amount_in_cents": None},
+        ),
+        ({"uuid": "opp_1"}, {"uuid": "opp_1"}),
+    ],
+)
+def test_opportunity_money_normalization_preserves_null_and_missing_fields(
+    source, expected
+):
+    assert chartmogul._opportunity_with_major_units(source) == expected
 
 
 def test_list_opportunities_rejects_unexpected_shape(monkeypatch):

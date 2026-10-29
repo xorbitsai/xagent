@@ -79,15 +79,9 @@ def _opportunity_with_major_units(opportunity: dict[str, Any]) -> dict[str, Any]
 def _entries_with_major_units(
     result: dict[str, Any],
     endpoint: str,
+    normalizer: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
     """Normalize monetary fields on one validated customers/opportunities page."""
-    normalizer: Callable[[dict[str, Any]], dict[str, Any]]
-    if endpoint == "/customers":
-        normalizer = _customer_with_major_units
-    elif endpoint == "/opportunities":
-        normalizer = _opportunity_with_major_units
-    else:
-        raise ValueError(f"Unsupported monetary endpoint: {endpoint}")
     entries: list[dict[str, Any]] = []
     for entry in result["entries"]:
         if not isinstance(entry, dict):
@@ -319,7 +313,9 @@ def chartmogul_list_customers(
             },
         )
         result = _validated_list_result(result, "/customers")
-        result = _entries_with_major_units(result, "/customers")
+        result = _entries_with_major_units(
+            result, "/customers", _customer_with_major_units
+        )
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul customers: {e}", exc_info=True)
@@ -592,7 +588,9 @@ def chartmogul_list_opportunities(
             },
         )
         result = _validated_list_result(result, "/opportunities")
-        result = _entries_with_major_units(result, "/opportunities")
+        result = _entries_with_major_units(
+            result, "/opportunities", _opportunity_with_major_units
+        )
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul opportunities: {e}", exc_info=True)

@@ -17,6 +17,7 @@ import pytest
 
 from xagent.web.api import triggers as trigger_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
@@ -48,6 +49,9 @@ def test_workforce_trigger_run_read_routes_are_sync() -> None:
         trigger_api.list_workforce_trigger_runs_route
     )
     assert not asyncio.iscoroutinefunction(trigger_api.get_workforce_trigger_run_route)
+    assert not asyncio.iscoroutinefunction(
+        trigger_api.get_workforce_trigger_run_history_route
+    )
 
 
 def test_missing_workforce_raises_trigger_service_error() -> None:
@@ -395,8 +399,32 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
         assert config.get("trigger_id") == trigger["id"]
         assert config.get("trigger_run_id") == int(run.id)
         assert config.get("trigger_test") is True
+        db.add(
+            TaskChatMessage(
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                role="assistant",
+                content="Workforce routine finished",
+                message_type="assistant_response",
+            )
+        )
+        db.commit()
+        run_id = int(run.id)
+        task_id = int(task.id)
     finally:
         db.close()
+
+    history = client.get(
+        f"/api/workforces/{workforce_id}/triggers/{trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json()["task_id"] == task_id
+    assert history.json()["messages"][-1] == {
+        "role": "assistant",
+        "content": "Workforce routine finished",
+    }
 
 
 def test_workforce_webhook_callback_fires_and_deduplicates(

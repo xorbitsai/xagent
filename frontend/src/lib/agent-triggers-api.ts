@@ -57,6 +57,17 @@ export interface AgentTriggerRun {
   updated_at: string | null
 }
 
+export interface AgentTriggerRunHistoryMessage {
+  role: "user" | "assistant"
+  content: string
+}
+
+export interface AgentTriggerRunHistory {
+  run_id: number
+  task_id: number
+  messages: AgentTriggerRunHistoryMessage[]
+}
+
 export interface AgentTriggerPayload {
   type?: AgentTriggerType
   name?: string | null
@@ -322,6 +333,20 @@ export async function listOwnerTriggerRuns(
   const response = await apiRequest(`${ownerTriggerUrl(owner, triggerId)}/runs`)
   if (!response.ok) {
     throw await parseApiError(response, "Failed to load trigger runs")
+  }
+  return response.json()
+}
+
+export async function getOwnerTriggerRunHistory(
+  owner: TriggerOwnerRef,
+  triggerId: number | string,
+  runId: number | string,
+): Promise<AgentTriggerRunHistory> {
+  const response = await apiRequest(
+    `${ownerTriggerUrl(owner, triggerId)}/runs/${runId}/history`,
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load trigger run history")
   }
   return response.json()
 }

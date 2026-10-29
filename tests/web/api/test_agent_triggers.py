@@ -3601,6 +3601,117 @@ def test_trigger_runtime_visibility_uses_trigger_task_owner() -> None:
         set_agent_team_scope_hook(None)
 
 
+def test_team_member_can_read_shared_trigger_run_history_without_task_ownership() -> (
+    None
+):
+    """Routine visibility, not Task ownership, governs the read-only history."""
+    admin_headers = _admin_headers()
+    teammate_headers = _register_second_user("routine-history-teammate")
+    outsider_headers = _register_second_user("routine-history-outsider")
+    db = _direct_db_session()
+    try:
+        admin_user_id = int(db.query(User).filter(User.username == "admin").one().id)
+        teammate_user_id = int(
+            db.query(User).filter(User.username == "routine-history-teammate").one().id
+        )
+    finally:
+        db.close()
+
+    set_agent_team_scope_hook(
+        lambda _db, user_id: (
+            AgentTeamScope(team_id=100, is_team_admin=False)
+            if user_id in {admin_user_id, teammate_user_id}
+            else None
+        )
+    )
+    try:
+        agent_id = _create_agent(admin_headers, "Shared routine history")
+        promoted = client.post(
+            f"/api/agents/{agent_id}/promote-team",
+            headers=admin_headers,
+            json={"visibility": "team"},
+        )
+        assert promoted.status_code == 200, promoted.text
+
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=admin_headers,
+            json={"type": "webhook", "name": "Shared history hook"},
+        )
+        assert created.status_code == 200, created.text
+        trigger_id = int(created.json()["id"])
+        fired = client.post(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+            headers=admin_headers,
+            json={"payload": {"subject": "daily report"}},
+        )
+        assert fired.status_code == 200, fired.text
+        run = fired.json()["trigger_run"]
+        run_id = int(run["id"])
+        task_id = int(run["task_id"])
+
+        db = _direct_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            assert int(task.user_id) == admin_user_id
+            db.add_all(
+                [
+                    TaskChatMessage(
+                        task_id=task_id,
+                        user_id=admin_user_id,
+                        role="user",
+                        content="Prepare the daily report",
+                        message_type="user_message",
+                        attachments=[{"file_id": "private-file", "name": "input.csv"}],
+                    ),
+                    TaskChatMessage(
+                        task_id=task_id,
+                        user_id=admin_user_id,
+                        role="assistant",
+                        content="The daily report is ready",
+                        message_type="assistant_response",
+                    ),
+                    TaskChatMessage(
+                        task_id=task_id,
+                        user_id=admin_user_id,
+                        role="system",
+                        content="internal orchestration note",
+                        message_type="system_message",
+                    ),
+                ]
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        history_url = (
+            f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history"
+        )
+        teammate_read = client.get(history_url, headers=teammate_headers)
+        assert teammate_read.status_code == 200, teammate_read.text
+        teammate_history = teammate_read.json()
+        assert teammate_history["run_id"] == run_id
+        assert teammate_history["task_id"] == task_id
+        assert teammate_history["messages"][-2:] == [
+            {"role": "user", "content": "Prepare the daily report"},
+            {"role": "assistant", "content": "The daily report is ready"},
+        ]
+        assert {message["role"] for message in teammate_history["messages"]} <= {
+            "user",
+            "assistant",
+        }
+        assert "private-file" not in teammate_read.text
+        assert "internal orchestration note" not in teammate_read.text
+
+        owner_read = client.get(history_url, headers=admin_headers)
+        assert owner_read.status_code == 200, owner_read.text
+
+        outsider_read = client.get(history_url, headers=outsider_headers)
+        assert outsider_read.status_code == 404, outsider_read.text
+    finally:
+        set_agent_team_scope_hook(None)
+
+
 def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -4643,6 +4754,20 @@ def test_trigger_run_history_tells_an_expired_conversation_from_a_deleted_one() 
     assert detail.status_code == 200, detail.text
     assert detail.json()["status"] == "completed"
     assert detail.json()["task_expired_at"] == expired["task_expired_at"]
+
+    expired_history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{expired_run_id}/history",
+        headers=headers,
+    )
+    assert expired_history.status_code == 410, expired_history.text
+    assert expired_history.json()["detail"] == "Trigger run conversation has expired"
+
+    deleted_history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{deleted_run_id}/history",
+        headers=headers,
+    )
+    assert deleted_history.status_code == 404, deleted_history.text
+    assert deleted_history.json()["detail"] == "Trigger run conversation not found"
 
 
 # --- planned-restart hold (release_hold) -------------------------------------

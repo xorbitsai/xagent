@@ -518,6 +518,122 @@ describe("AgentTriggersDialog", () => {
     expect(within(deletedRow).queryByText("triggers.runs.taskExpired")).not.toBeInTheDocument()
   })
 
+  it("opens routine history inline instead of navigating to the task chat", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              background_job_id: null,
+              status: "completed",
+              source_event_id: "scheduled-report",
+              payload_snapshot: null,
+              idempotency_key: "run-12",
+              error_message: null,
+              started_at: null,
+              finished_at: null,
+              task_expired_at: null,
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(
+          jsonResponse({
+            run_id: 12,
+            task_id: 99,
+            messages: [
+              { role: "user", content: "Prepare the daily report" },
+              { role: "assistant", content: "The daily report is ready" },
+            ],
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult" }))
+
+    expect(await screen.findByText("Prepare the daily report")).toBeInTheDocument()
+    expect(screen.getByText("The daily report is ready")).toBeInTheDocument()
+    expect(screen.getByText("triggers.runs.input")).toBeInTheDocument()
+    expect(screen.getByText("triggers.runs.result")).toBeInTheDocument()
+    expect(routerPushMock).not.toHaveBeenCalled()
+  })
+
+  it("shows a routine history authorization error inline", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              background_job_id: null,
+              status: "completed",
+              source_event_id: "scheduled-report",
+              payload_snapshot: null,
+              idempotency_key: "run-12",
+              error_message: null,
+              started_at: null,
+              finished_at: null,
+              task_expired_at: null,
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(
+          jsonResponse({ detail: "Trigger run is not available" }, { status: 403 }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult" }))
+
+    expect(await screen.findByText("Trigger run is not available")).toBeInTheDocument()
+    expect(screen.queryByText("Connection lost. Reload the page to reconnect.")).not.toBeInTheDocument()
+  })
+
   it("reconciles a card switch from the PATCH response, not just the requested value", async () => {
     apiRequestMock.mockImplementation((url: string, init?: { method?: string }) => {
       if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))

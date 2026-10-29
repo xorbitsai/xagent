@@ -1,7 +1,6 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { useRouter } from "next/navigation"
 import {
   AlertCircle,
   CalendarCheck,
@@ -41,6 +40,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import {
   AgentTrigger,
   AgentTriggerRun,
+  AgentTriggerRunHistory,
   AgentTriggerType,
   GmailAccount,
   StagedTrigger,
@@ -48,6 +48,7 @@ import {
   createOwnerTrigger,
   deleteOwnerTrigger,
   disableOwnerTriggersOfType,
+  getOwnerTriggerRunHistory,
   listGmailAccounts,
   listOwnerTriggerRuns,
   listOwnerTriggers,
@@ -524,7 +525,6 @@ export function AgentTriggersDialog({
   staged = null,
 }: AgentTriggersDialogProps) {
   const { t, locale } = useI18n()
-  const router = useRouter()
   const [liveTriggers, setLiveTriggers] = useState<AgentTrigger[]>([])
   const [activeType, setActiveTypeState] = useState<AgentTriggerType | null>(null)
   // Detail sub-mode: false = the type's trigger list (cards / empty state),
@@ -532,6 +532,11 @@ export function AgentTriggersDialog({
   const [editing, setEditing] = useState(false)
   const [selectedTriggerId, setSelectedTriggerIdState] = useState<number | null>(null)
   const [runs, setRuns] = useState<AgentTriggerRun[]>([])
+  const [expandedRunId, setExpandedRunId] = useState<number | null>(null)
+  const [runHistory, setRunHistory] = useState<AgentTriggerRunHistory | null>(null)
+  const [runHistoryLoading, setRunHistoryLoading] = useState(false)
+  const [runHistoryError, setRunHistoryError] = useState<string | null>(null)
+  const runHistoryRequestRef = useRef(0)
   const [loading, setLoading] = useState(false)
   const [runsLoading, setRunsLoading] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -661,6 +666,14 @@ export function AgentTriggersDialog({
 
   const selectedWebhookUrl = webhookUrl(selectedTrigger)
 
+  const resetRunHistory = useCallback(() => {
+    runHistoryRequestRef.current += 1
+    setExpandedRunId(null)
+    setRunHistory(null)
+    setRunHistoryLoading(false)
+    setRunHistoryError(null)
+  }, [])
+
   const defaultNameForType = useCallback((type: AgentTriggerType) => {
     if (type === "webhook") return t("triggers.defaults.webhookName")
     if (type === "gmail") return t("triggers.defaults.gmailName")
@@ -698,6 +711,7 @@ export function AgentTriggersDialog({
   // Takes the target trigger explicitly so navigation handlers can load runs
   // for a selection they just made (before the state round-trips).
   const loadRunsFor = useCallback(async (trigger: AgentTrigger | null) => {
+    resetRunHistory()
     if (!resolvedOwner || !trigger || trigger.id < 0) {
       setRuns([])
       return
@@ -711,12 +725,48 @@ export function AgentTriggersDialog({
     } finally {
       setRunsLoading(false)
     }
-  }, [resolvedOwner, t])
+  }, [resetRunHistory, resolvedOwner, t])
 
   const loadRuns = useCallback(
     () => loadRunsFor(selectedTrigger),
     [loadRunsFor, selectedTrigger],
   )
+
+  const loadRunHistory = useCallback(async (run: AgentTriggerRun) => {
+    if (!resolvedOwner || run.task_id === null) return
+    const requestId = ++runHistoryRequestRef.current
+    setExpandedRunId(run.id)
+    setRunHistory(null)
+    setRunHistoryError(null)
+    setRunHistoryLoading(true)
+    try {
+      const history = await getOwnerTriggerRunHistory(
+        resolvedOwner,
+        run.trigger_id,
+        run.id,
+      )
+      if (runHistoryRequestRef.current !== requestId) return
+      setRunHistory(history)
+    } catch (err) {
+      if (runHistoryRequestRef.current !== requestId) return
+      console.error(err)
+      setRunHistoryError(
+        err instanceof Error ? err.message : t("triggers.runs.historyLoadFailed"),
+      )
+    } finally {
+      if (runHistoryRequestRef.current === requestId) {
+        setRunHistoryLoading(false)
+      }
+    }
+  }, [resolvedOwner, t])
+
+  const toggleRunHistory = useCallback((run: AgentTriggerRun) => {
+    if (expandedRunId === run.id) {
+      resetRunHistory()
+      return
+    }
+    void loadRunHistory(run)
+  }, [expandedRunId, loadRunHistory, resetRunHistory])
 
   useEffect(() => {
     if (!open) return
@@ -734,9 +784,10 @@ export function AgentTriggersDialog({
     setGmailFiltersOpen(false)
     gmailAccountClearedByUserRef.current = false
     setRuns([])
+    resetRunHistory()
     if (initialType) setForm(emptyForm(initialType))
     void loadTriggers(null)
-  }, [initialType, loadTriggers, open, setActiveType, setSelectedTriggerId])
+  }, [initialType, loadTriggers, open, resetRunHistory, setActiveType, setSelectedTriggerId])
 
   useEffect(() => {
     if (!open) return
@@ -2194,31 +2245,92 @@ export function AgentTriggersDialog({
                 <div className="py-6 text-center text-sm text-muted-foreground">{t("triggers.runs.empty")}</div>
               ) : (
                 runs.slice(0, 5).map((run) => (
-                  <div key={run.id} className="flex items-center gap-3 rounded-md bg-muted/40 px-3 py-2 text-sm">
-                    <span className={cn("font-medium", runStatusClass(run.status))}>
-                      {t(`triggers.runStatus.${run.status}`)}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-muted-foreground">
-                      {run.source_event_id || run.idempotency_key}
-                    </span>
-                    {run.task_id ? (
-                      <Button
-                        variant="link"
-                        className="h-auto p-0 text-xs"
-                        onClick={() => router.push(`/task/${run.task_id}`)}
-                      >
-                        #{run.task_id}
-                      </Button>
-                    ) : run.task_expired_at ? (
-                      <span className="shrink-0 text-xs text-muted-foreground">
-                        {t("triggers.runs.taskExpired", {
-                          date: formatTime(run.task_expired_at, "date"),
-                        })}
+                  <React.Fragment key={run.id}>
+                    <div className="flex items-center gap-3 rounded-md bg-muted/40 px-3 py-2 text-sm">
+                      <span className={cn("font-medium", runStatusClass(run.status))}>
+                        {t(`triggers.runStatus.${run.status}`)}
                       </span>
-                    ) : (
-                      <span className="text-xs text-muted-foreground">-</span>
+                      <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                        {run.source_event_id || run.idempotency_key}
+                      </span>
+                      {run.task_id ? (
+                        <Button
+                          variant="link"
+                          className="h-auto gap-0.5 p-0 text-xs"
+                          aria-expanded={expandedRunId === run.id}
+                          aria-label={t(
+                            expandedRunId === run.id
+                              ? "triggers.runs.hideResult"
+                              : "triggers.runs.viewResult",
+                          )}
+                          onClick={() => toggleRunHistory(run)}
+                        >
+                          #{run.task_id}
+                          <ChevronRight
+                            className={cn(
+                              "h-3 w-3 transition-transform",
+                              expandedRunId === run.id && "rotate-90",
+                            )}
+                          />
+                        </Button>
+                      ) : run.task_expired_at ? (
+                        <span className="shrink-0 text-xs text-muted-foreground">
+                          {t("triggers.runs.taskExpired", {
+                            date: formatTime(run.task_expired_at, "date"),
+                          })}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">-</span>
+                      )}
+                    </div>
+
+                    {expandedRunId === run.id && run.task_id !== null && (
+                      <div className="space-y-3 rounded-md border bg-background p-3">
+                        <div className="text-xs font-semibold text-muted-foreground">
+                          {t("triggers.runs.historyTitle")}
+                        </div>
+                        {runHistoryLoading ? (
+                          <div className="py-3 text-center text-xs text-muted-foreground">
+                            {t("common.loading")}
+                          </div>
+                        ) : runHistoryError ? (
+                          <div className="flex items-center justify-between gap-3 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                            <span>{runHistoryError}</span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 shrink-0 px-2 text-xs"
+                              onClick={() => void loadRunHistory(run)}
+                            >
+                              {t("common.retry")}
+                            </Button>
+                          </div>
+                        ) : runHistory?.messages.length ? (
+                          <div className="space-y-3">
+                            {runHistory.messages.map((message, index) => (
+                              <div key={`${message.role}-${index}`} className="space-y-1">
+                                <div className={FIELD_LABEL_CLASS}>
+                                  {t(
+                                    message.role === "user"
+                                      ? "triggers.runs.input"
+                                      : "triggers.runs.result",
+                                  )}
+                                </div>
+                                <div className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-muted/40 px-3 py-2 text-xs text-foreground">
+                                  {message.content}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="py-3 text-center text-xs text-muted-foreground">
+                            {t("triggers.runs.historyEmpty")}
+                          </div>
+                        )}
+                      </div>
                     )}
-                  </div>
+                  </React.Fragment>
                 ))
               )}
             </div>

@@ -4568,7 +4568,14 @@ Build when you need.`,
       task: "Task",
       created: "Created",
       empty: "No runs yet",
-      taskExpired: "Conversation expired on {date}"
+      taskExpired: "Conversation expired on {date}",
+      viewResult: "View run result",
+      hideResult: "Hide run result",
+      historyTitle: "Run conversation",
+      historyEmpty: "No conversation was recorded for this run",
+      historyLoadFailed: "Failed to load run conversation",
+      input: "Routine input",
+      result: "Agent response"
     },
     validation: {
       name: "Trigger name is required",

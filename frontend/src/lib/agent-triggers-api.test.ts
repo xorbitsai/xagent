@@ -16,6 +16,7 @@ import {
   createOwnerTrigger,
   createStagedTriggers,
   deleteOwnerTrigger,
+  getOwnerTriggerRunHistory,
   listAgentTriggerRuns,
   listOwnerTriggerRuns,
   listOwnerTriggers,
@@ -128,6 +129,30 @@ describe("agent trigger API client", () => {
     expect(runs).toHaveLength(1)
     expect(runs[0].task_id).toBe(99)
   })
+
+  it("loads a run's read-only history from the agent-scoped route", async () => {
+    apiRequestMock.mockResolvedValue(
+      jsonResponse({
+        run_id: 12,
+        task_id: 99,
+        messages: [
+          { role: "user", content: "Generate the report" },
+          { role: "assistant", content: "Report complete" },
+        ],
+      }),
+    )
+
+    const history = await getOwnerTriggerRunHistory(
+      { kind: "agent", id: 42 },
+      7,
+      12,
+    )
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/agents/42/triggers/7/runs/12/history",
+    )
+    expect(history.messages[1].content).toBe("Report complete")
+  })
 })
 
 describe("workforce trigger API client (owner routing)", () => {
@@ -135,7 +160,7 @@ describe("workforce trigger API client (owner routing)", () => {
     apiRequestMock.mockReset()
   })
 
-  it("routes list/create/delete/runs/test to the workforce path", async () => {
+  it("routes list/create/delete/runs/history/test to the workforce path", async () => {
     const owner = { kind: "workforce" as const, id: 5 }
 
     apiRequestMock.mockResolvedValue(jsonResponse([]))
@@ -175,6 +200,14 @@ describe("workforce trigger API client (owner routing)", () => {
     await listOwnerTriggerRuns(owner, 9)
     expect(apiRequestMock).toHaveBeenLastCalledWith(
       "http://api.local/api/workforces/5/triggers/9/runs",
+    )
+
+    apiRequestMock.mockResolvedValue(
+      jsonResponse({ run_id: 12, task_id: 99, messages: [] }),
+    )
+    await getOwnerTriggerRunHistory(owner, 9, 12)
+    expect(apiRequestMock).toHaveBeenLastCalledWith(
+      "http://api.local/api/workforces/5/triggers/9/runs/12/history",
     )
 
     apiRequestMock.mockResolvedValue(

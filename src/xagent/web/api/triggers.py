@@ -12,9 +12,11 @@ from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
+from ..models.task import Task
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
 from ..models.workforce import Workforce
+from ..services.chat_history_service import load_task_transcript
 from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
@@ -121,6 +123,17 @@ class TriggerRunResponse(BaseModel):
     task_expired_at: str | None
     created_at: str | None
     updated_at: str | None
+
+
+class TriggerRunHistoryMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class TriggerRunHistoryResponse(BaseModel):
+    run_id: int
+    task_id: int
+    messages: list[TriggerRunHistoryMessage]
 
 
 class TriggerFireResponse(BaseModel):
@@ -459,6 +472,79 @@ def _trigger_run_detail(
     return _serialize_run(run, payload=payload)
 
 
+def _trigger_run_history(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+) -> TriggerRunHistoryResponse:
+    """Return a run's read-only, client-safe transcript.
+
+    Authorization deliberately happens through the parent trigger route before
+    this helper is called. A routine run remains owned by the user who created
+    the routine, so authorizing against the generic Task/WebSocket endpoints
+    would wrongly reject other teammates who can already view that routine.
+    Keeping this as a dedicated read-only projection avoids widening task
+    ownership or granting access to continue somebody else's conversation.
+    """
+    run = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Trigger run not found")
+    if run.task_id is None:
+        if run.task_expired_at is not None:
+            raise HTTPException(
+                status_code=410,
+                detail="Trigger run conversation has expired",
+            )
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation not found",
+        )
+
+    task_id = int(run.task_id)
+    if db.query(Task.id).filter(Task.id == task_id).first() is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation not found",
+        )
+
+    messages = [
+        TriggerRunHistoryMessage(role=role, content=content)
+        for item in load_task_transcript(db, task_id)
+        if (role := item.get("role")) in {"user", "assistant"}
+        and isinstance(content := item.get("content"), str)
+    ]
+    return TriggerRunHistoryResponse(
+        run_id=int(run.id),
+        task_id=task_id,
+        messages=messages,
+    )
+
+
+@router.get(
+    "/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+    response_model=TriggerRunHistoryResponse,
+)
+def get_trigger_run_history(
+    agent_id: int,
+    trigger_id: int,
+    run_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunHistoryResponse:
+    trigger = _trigger_or_404(
+        db,
+        user_id=int(current_user.id),
+        agent_id=agent_id,
+        trigger_id=trigger_id,
+    )
+    return _trigger_run_history(db, trigger=trigger, run_id=run_id)
+
+
 @router.post(
     "/api/agents/{agent_id}/triggers/{trigger_id}/test",
     response_model=TriggerFireResponse,
@@ -689,6 +775,27 @@ def get_workforce_trigger_run_route(
         request=request,
         user_id=int(current_user.id),
     )
+
+
+@router.get(
+    "/api/workforces/{workforce_id}/triggers/{trigger_id}/runs/{run_id}/history",
+    response_model=TriggerRunHistoryResponse,
+)
+def get_workforce_trigger_run_history_route(
+    workforce_id: int,
+    trigger_id: int,
+    run_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> TriggerRunHistoryResponse:
+    trigger = _workforce_trigger_or_404(
+        db,
+        user=current_user,
+        workforce_id=workforce_id,
+        trigger_id=trigger_id,
+        action="view",
+    )
+    return _trigger_run_history(db, trigger=trigger, run_id=run_id)
 
 
 @router.post(

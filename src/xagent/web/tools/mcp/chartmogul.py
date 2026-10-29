@@ -684,5 +684,76 @@ def chartmogul_delete_opportunity(uuid: str) -> str:
         return _error(str(e))
 
 
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def chartmogul_get_metrics(
+    metric: MetricName,
+    start_date: str,
+    end_date: str,
+    interval: MetricInterval = "month",
+    geo: str | None = None,
+    plans: str | None = None,
+) -> str:
+    """
+    Retrieve an official ChartMogul metric time series (GET /metrics/*).
+    Use this tool for every MRR, ARR, ARPA, ASP, customer-count, churn-rate,
+    or LTV question. Never derive account MRR by summing customer records:
+    ChartMogul's metrics API applies the product's own subscription,
+    expansion, contraction, reactivation, and churn calculations.
+
+    Monetary values are exact two-decimal strings in the ChartMogul account's
+    selected currency. Their lossless integer source values are retained under
+    explicit ``*_cents`` fields. Counts, rates, and percentage-change fields
+    are not currency and remain unchanged.
+
+    metric: one of "all", "mrr", "arr", "arpa", "asp", "customer-count",
+      "customer-churn-rate", "mrr-churn-rate", or "ltv". Use "all" to
+      retrieve every key metric in one request.
+    start_date: inclusive start date in YYYY-MM-DD format.
+    end_date: inclusive end date in YYYY-MM-DD format; must be on or after
+      start_date.
+    interval: one of "day", "week", "month", "quarter", or "year".
+    geo: optional comma-separated ISO 3166-1 alpha-2 country codes.
+    plans: optional comma-separated plan UUIDs, external IDs, or names.
+    """
+    try:
+        endpoint = _METRIC_PATHS.get(metric)
+        if endpoint is None:
+            raise ValueError(
+                "metric must be one of: " + ", ".join(sorted(_METRIC_PATHS))
+            )
+        if interval not in _METRIC_INTERVALS:
+            raise ValueError(
+                "interval must be one of: " + ", ".join(sorted(_METRIC_INTERVALS))
+            )
+        normalized_start = _iso_date(start_date, "start_date")
+        normalized_end = _iso_date(end_date, "end_date")
+        if date.fromisoformat(normalized_start) > date.fromisoformat(normalized_end):
+            raise ValueError("end_date must be on or after start_date")
+
+        result = _request(
+            "GET",
+            endpoint,
+            params={
+                "start-date": normalized_start,
+                "end-date": normalized_end,
+                "interval": interval,
+                "geo": geo,
+                "plans": plans,
+            },
+        )
+        result = _metrics_with_major_units(result, metric, endpoint)
+        return success_with_capped_dict(
+            "metrics", result, extra_fields={"metric": metric}
+        )
+    except Exception as e:
+        logger.exception(f"Error fetching ChartMogul {metric} metrics")
+        return _error(str(e))
+
+
 if __name__ == "__main__":
     mcp.run()

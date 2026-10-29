@@ -1817,10 +1817,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
             "transport": "stdio",
             "provider_name": None,
-            # CRM, not Analytics: the 15 tools this connector exposes are
-            # exclusively customer/contact/opportunity CRUD -- no metrics,
-            # subscription, MRR, or churn endpoints, despite ChartMogul the
-            # product being analytics-branded.
+            # Keep this under CRM because most connector tools manage
+            # customers, contacts, and opportunities. The connector also
+            # exposes ChartMogul's official read-only metrics API for MRR,
+            # ARR, retention, and related analytics.
             "category": "CRM",
             "oauth_scopes": None,
             "is_visible_in_connector": True,

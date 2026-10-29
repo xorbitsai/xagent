@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+from collections.abc import Callable
+from decimal import Decimal
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -41,6 +43,59 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _major_units(cents: Any, field: str) -> str:
+    """Render an integer cents field as an exact two-decimal major-unit value."""
+    if isinstance(cents, bool) or not isinstance(cents, int):
+        raise TypeError(
+            f"ChartMogul returned a non-integer value for {field}: "
+            f"{type(cents).__name__}"
+        )
+    return f"{Decimal(cents) / Decimal(100):.2f}"
+
+
+def _customer_with_major_units(customer: dict[str, Any]) -> dict[str, Any]:
+    """Make ChartMogul customer MRR/ARR safe for user-facing consumption."""
+    normalized = dict(customer)
+    for field in ("mrr", "arr"):
+        if field not in customer or customer[field] is None:
+            continue
+        cents = customer[field]
+        normalized[f"{field}_cents"] = cents
+        normalized[field] = _major_units(cents, field)
+    return normalized
+
+
+def _opportunity_with_major_units(opportunity: dict[str, Any]) -> dict[str, Any]:
+    """Add an exact user-facing amount while preserving the explicit raw field."""
+    normalized = dict(opportunity)
+    cents = opportunity.get("amount_in_cents")
+    if cents is not None:
+        normalized["amount"] = _major_units(cents, "amount_in_cents")
+    return normalized
+
+
+def _entries_with_major_units(
+    result: dict[str, Any],
+    endpoint: str,
+) -> dict[str, Any]:
+    """Normalize monetary fields on one validated customers/opportunities page."""
+    normalizer: Callable[[dict[str, Any]], dict[str, Any]]
+    if endpoint == "/customers":
+        normalizer = _customer_with_major_units
+    elif endpoint == "/opportunities":
+        normalizer = _opportunity_with_major_units
+    else:
+        raise ValueError(f"Unsupported monetary endpoint: {endpoint}")
+    entries: list[dict[str, Any]] = []
+    for entry in result["entries"]:
+        if not isinstance(entry, dict):
+            raise TypeError(
+                f"ChartMogul returned an unexpected response for {endpoint}"
+            )
+        entries.append(normalizer(entry))
+    return {**result, "entries": entries}
 
 
 def _success_with_capped_list(list_field: str, payload: dict[str, Any]) -> str:
@@ -233,6 +288,10 @@ def chartmogul_list_customers(
     ``cursor``/``has_more`` pair -- pass the returned ``cursor`` back in to
     fetch the next page.
 
+    Returned ``mrr`` and ``arr`` values are exact two-decimal strings in each
+    customer's ``currency``. Source integers use the explicit names
+    ``mrr_cents`` and ``arr_cents``.
+
     data_source_uuid: optional, restrict to one connected data source.
     external_id: optional, the customer's id in the connected billing
     system (e.g. a Stripe customer id).
@@ -260,6 +319,7 @@ def chartmogul_list_customers(
             },
         )
         result = _validated_list_result(result, "/customers")
+        result = _entries_with_major_units(result, "/customers")
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul customers: {e}", exc_info=True)
@@ -274,10 +334,13 @@ def chartmogul_create_customer(data: dict[str, Any]) -> str:
     data: a ChartMogul customer object. Must include "data_source_uuid" and
     "external_id" (the id from your billing/CRM system) at minimum; commonly
     also "name", "email", "company", "country", "city", "state", "zip".
+    Returned ``mrr``/``arr`` values use exact two-decimal major units; source
+    integers use ``mrr_cents``/``arr_cents``.
     """
     try:
         result = _request("POST", "/customers", json_data=data)
         result = _validated_dict(result, "/customers")
+        result = _customer_with_major_units(result)
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul customer: {e}", exc_info=True)
@@ -289,12 +352,16 @@ def chartmogul_get_customer(uuid: str) -> str:
     """
     Get one customer by uuid (GET /customers/{uuid}).
 
+    Returned ``mrr`` and ``arr`` values are exact two-decimal strings in the
+    customer's ``currency``; source integers use ``mrr_cents``/``arr_cents``.
+
     uuid: the customer's ChartMogul uuid (e.g. "cus_00000000-0000-0000-0000-000000000000").
     """
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/customers/{safe_uuid}")
         result = _validated_dict(result, "/customers")
+        result = _customer_with_major_units(result)
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error fetching ChartMogul customer {uuid}: {e}", exc_info=True)
@@ -308,11 +375,14 @@ def chartmogul_update_customer(uuid: str, data: dict[str, Any]) -> str:
 
     uuid: the customer's ChartMogul uuid.
     data: fields to change, e.g. {"company": "Acme Inc.", "country": "US"}.
+    Returned ``mrr``/``arr`` values use exact two-decimal major units; source
+    integers use ``mrr_cents``/``arr_cents``.
     """
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/customers/{safe_uuid}", json_data=data)
         result = _validated_dict(result, "/customers")
+        result = _customer_with_major_units(result)
         return success_with_capped_dict("customer", result)
     except Exception as e:
         logger.error(f"Error updating ChartMogul customer {uuid}: {e}", exc_info=True)
@@ -490,6 +560,10 @@ def chartmogul_list_opportunities(
     entries plus a ``cursor``/``has_more`` pair -- pass the returned
     ``cursor`` back in to fetch the next page.
 
+    Each entry with ``amount_in_cents`` also includes ``amount`` as an exact
+    two-decimal string in the entry's ``currency``. Use ``amount`` for
+    user-facing values.
+
     customer_uuid: optional, restrict to one customer's opportunities.
     owner: optional, filter by the owner's email address.
     pipeline: optional, filter by pipeline name.
@@ -518,6 +592,7 @@ def chartmogul_list_opportunities(
             },
         )
         result = _validated_list_result(result, "/opportunities")
+        result = _entries_with_major_units(result, "/opportunities")
         return _success_with_capped_list("entries", result)
     except Exception as e:
         logger.error(f"Error listing ChartMogul opportunities: {e}", exc_info=True)
@@ -533,10 +608,13 @@ def chartmogul_create_opportunity(data: dict[str, Any]) -> str:
     "owner", "pipeline", "pipeline_stage", "estimated_close_date",
     "currency", and "amount_in_cents"; optionally "type",
     "forecast_category", "win_likelihood".
+    The request remains integer cents. The returned opportunity also includes
+    exact two-decimal ``amount`` in ``currency``.
     """
     try:
         result = _request("POST", "/opportunities", json_data=data)
         result = _validated_dict(result, "/opportunities")
+        result = _opportunity_with_major_units(result)
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(f"Error creating ChartMogul opportunity: {e}", exc_info=True)
@@ -548,12 +626,16 @@ def chartmogul_get_opportunity(uuid: str) -> str:
     """
     Get one sales opportunity by uuid (GET /opportunities/{uuid}).
 
+    When present, ``amount`` is an exact two-decimal string in ``currency``;
+    ``amount_in_cents`` remains the explicit source value.
+
     uuid: the opportunity's ChartMogul uuid.
     """
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("GET", f"/opportunities/{safe_uuid}")
         result = _validated_dict(result, "/opportunities")
+        result = _opportunity_with_major_units(result)
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(
@@ -569,11 +651,14 @@ def chartmogul_update_opportunity(uuid: str, data: dict[str, Any]) -> str:
 
     uuid: the opportunity's ChartMogul uuid.
     data: fields to change, e.g. {"pipeline_stage": "Won", "win_likelihood": 100}.
+    Write monetary changes as integer ``amount_in_cents``. The returned
+    opportunity also includes exact two-decimal ``amount`` when available.
     """
     try:
         safe_uuid = url_path_id(uuid, "uuid")
         result = _request("PATCH", f"/opportunities/{safe_uuid}", json_data=data)
         result = _validated_dict(result, "/opportunities")
+        result = _opportunity_with_major_units(result)
         return success_with_capped_dict("opportunity", result)
     except Exception as e:
         logger.error(

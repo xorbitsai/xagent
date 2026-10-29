@@ -306,6 +306,7 @@ async def test_trigger_batch_continues_after_run_replacement(monkeypatch):
             test=False,
             task_owner_user_id=1,
             prompt="run",
+            turn_id=f"turn-{run_id}",
         ),
     )
     begin = AsyncMock(

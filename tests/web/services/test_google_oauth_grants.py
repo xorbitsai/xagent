@@ -113,6 +113,75 @@ def test_shared_grant_resolution_requires_app_client_and_scopes(db_session):
     )
 
 
+def test_newest_association_fails_closed_instead_of_using_older_subject(db_session):
+    db, user = db_session
+    older = _account(db, user, subject="subject-a", token="older-token")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=older,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+    )
+    newer = _account(
+        db,
+        user,
+        subject="subject-b",
+        token="newer-token",
+        scopes="openid",
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=newer,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+    )
+    db.commit()
+
+    assert (
+        resolve_google_shared_oauth_account(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-a",
+            app_id="google-drive",
+            required_scopes=["scope.drive"],
+        )
+        is None
+    )
+
+
+def test_newest_tombstoned_association_does_not_use_older_subject(db_session):
+    db, user = db_session
+    older = _account(db, user, subject="subject-a", token="older-token")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=older,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+    )
+    newer = _account(db, user, subject="subject-b", token="newer-token")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=newer,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+    )
+    newer.access_token = ""
+    newer.refresh_token = None
+    db.commit()
+
+    assert (
+        resolve_google_shared_oauth_account(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-a",
+            app_id="google-drive",
+        )
+        is None
+    )
+
+
 def test_shared_grants_are_isolated_by_resource_owner(db_session):
     db, user = db_session
     ordinary = _account(db, user, token="ordinary-token")
@@ -169,6 +238,40 @@ def test_association_rejects_cross_owner_legacy_account(db_session):
             oauth_client_id="client-a",
             app_id="google-drive",
             legacy_oauth_account=actor_legacy,
+        )
+
+
+def test_association_rejects_legacy_account_without_exact_subject(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    legacy = _account(
+        db,
+        user,
+        subject="",
+        provider="google-drive",
+    )
+
+    with pytest.raises(GoogleOAuthGrantConflict, match="crosses"):
+        create_google_oauth_grant_association(
+            db,
+            oauth_account=shared,
+            oauth_client_id="client-a",
+            app_id="google-drive",
+            legacy_oauth_account=legacy,
+        )
+
+
+def test_association_rejects_shared_account_as_legacy_reference(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+
+    with pytest.raises(GoogleOAuthGrantConflict, match="own legacy"):
+        create_google_oauth_grant_association(
+            db,
+            oauth_account=shared,
+            oauth_client_id="client-a",
+            app_id="google",
+            legacy_oauth_account=shared,
         )
 
 

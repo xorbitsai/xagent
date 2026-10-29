@@ -52,6 +52,37 @@ def test_upgrade_creates_shared_google_grant_schema() -> None:
             "uq_google_oauth_grant_ordinary_identity",
             "uq_google_oauth_grant_actor_identity",
         } <= grant_indexes
+        grant_unique_constraints = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("google_oauth_grants")
+        }
+        assert "uq_google_oauth_grant_account" in grant_unique_constraints
+
+        association_columns = {
+            column["name"]
+            for column in inspector.get_columns("google_oauth_app_associations")
+        }
+        assert {
+            "grant_id",
+            "app_id",
+            "legacy_oauth_account_id",
+            "created_at",
+        } <= association_columns
+        association_unique_constraints = {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints(
+                "google_oauth_app_associations"
+            )
+        }
+        assert {
+            "uq_google_oauth_app_association",
+            "uq_google_oauth_app_association_legacy_account",
+        } <= association_unique_constraints
+        association_indexes = {
+            index["name"]
+            for index in inspector.get_indexes("google_oauth_app_associations")
+        }
+        assert "ix_google_oauth_app_associations_app_id" in association_indexes
 
         command.downgrade(config, DOWN_REVISION)
         inspector = inspect(connection)

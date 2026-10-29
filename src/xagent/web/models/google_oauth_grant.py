@@ -26,6 +26,14 @@ class GoogleOAuthGrant(Base):  # type: ignore[no-any-unimported]
     Token material remains in ``UserOAuth`` so refresh, encryption, reconnect
     tombstones, and key rotation keep one implementation. This row makes the
     dimensions that are unsafe to infer from an app id explicit.
+
+    Shared rows have three lifecycle invariants for the callback/runtime writer:
+    update ``provider='google'`` credentials in place instead of deleting them
+    (the foreign key intentionally cascades); never expose one through the
+    legacy provider-candidate resolver; and route a Gmail association's
+    permanent-invalid transition through Gmail watch quiescing even though the
+    stored provider is ``google``. The association-writing follow-up must keep
+    these invariants before enabling the feature flag.
     """
 
     __tablename__ = "google_oauth_grants"

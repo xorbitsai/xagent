@@ -7,13 +7,18 @@ import re
 from collections.abc import Iterable
 from typing import cast
 
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError
 
 from ..models.google_oauth_grant import (
     GoogleOAuthAppAssociation,
     GoogleOAuthGrant,
 )
-from ..models.user_oauth import UserOAuth
+from ..models.user_oauth import (
+    UserOAuth,
+    is_undecryptable_oauth_token,
+)
 from .user_oauth import (
     normalize_user_oauth_resource_owner_key,
     user_oauth_owner_clause,
@@ -189,9 +194,9 @@ def create_google_oauth_grant_association(
         if (
             int(legacy_oauth_account.user_id) != user_id
             or legacy_oauth_account.resource_owner_key != owner_key
-            or legacy_oauth_account.provider
-            not in {normalized_app_id, GOOGLE_SHARED_OAUTH_PROVIDER}
-            or (legacy_subject and legacy_subject != subject)
+            or legacy_oauth_account.provider != normalized_app_id
+            or not legacy_subject
+            or legacy_subject != subject
         ):
             raise GoogleOAuthGrantConflict(
                 "legacy Google credential crosses the shared grant boundary"
@@ -199,6 +204,10 @@ def create_google_oauth_grant_association(
         if legacy_oauth_account.id is None:
             raise ValueError("legacy Google OAuth account must be persisted")
         legacy_account_id = int(legacy_oauth_account.id)
+        if legacy_account_id == int(oauth_account.id):
+            raise GoogleOAuthGrantConflict(
+                "shared Google credential cannot be its own legacy reference"
+            )
 
     association = (
         db.query(GoogleOAuthAppAssociation)
@@ -209,13 +218,34 @@ def create_google_oauth_grant_association(
         .one_or_none()
     )
     if association is None:
+        if legacy_account_id is not None:
+            existing_legacy_association = (
+                db.query(GoogleOAuthAppAssociation)
+                .filter(
+                    GoogleOAuthAppAssociation.legacy_oauth_account_id
+                    == legacy_account_id
+                )
+                .one_or_none()
+            )
+            if existing_legacy_association is not None:
+                raise GoogleOAuthGrantConflict(
+                    "legacy Google credential is already associated with another app"
+                )
         association = GoogleOAuthAppAssociation(
             grant_id=int(grant.id),
             app_id=normalized_app_id,
             legacy_oauth_account_id=legacy_account_id,
         )
-        db.add(association)
-        db.flush()
+        try:
+            # Translate a concurrent winner of either association uniqueness
+            # race without leaving the caller's transaction unusable.
+            with db.begin_nested():
+                db.add(association)
+                db.flush()
+        except IntegrityError as exc:
+            raise GoogleOAuthGrantConflict(
+                "Google app or legacy credential is already associated"
+            ) from exc
     elif legacy_account_id is not None and association.legacy_oauth_account_id not in {
         None,
         legacy_account_id,
@@ -238,7 +268,12 @@ def resolve_google_shared_oauth_account(
     required_scopes: str | Iterable[str] | None = None,
     lock: bool = False,
 ) -> UserOAuth | None:
-    """Resolve the newest valid association inside one exact owner namespace."""
+    """Resolve the newest association inside one exact owner namespace.
+
+    The newest association is authoritative. An under-scoped, tombstoned, or
+    unreadable newest credential must fall back to the app's legacy row rather
+    than silently selecting an older Google identity.
+    """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
     client_fingerprint = google_oauth_client_fingerprint(oauth_client_id)
@@ -265,16 +300,48 @@ def resolve_google_shared_oauth_account(
         )
         .order_by(GoogleOAuthAppAssociation.id.desc())
     )
-    if lock and db.get_bind().dialect.name != "sqlite":
-        query = query.with_for_update(of=UserOAuth)
-
-    for _grant, oauth_account in query.all():
-        if not google_oauth_grant_covers_scopes(oauth_account, required_scopes):
-            continue
-        if lock and db.get_bind().dialect.name == "sqlite":
-            db.query(UserOAuth).filter(UserOAuth.id == int(oauth_account.id)).update(
-                {UserOAuth.id: UserOAuth.id}, synchronize_session=False
-            )
-            db.refresh(oauth_account)
+    candidate = query.first()
+    if candidate is None:
+        return None
+    _grant, oauth_account = candidate
+    if (
+        not oauth_account.access_token
+        or is_undecryptable_oauth_token(oauth_account.access_token)
+        or not google_oauth_grant_covers_scopes(oauth_account, required_scopes)
+    ):
+        return None
+    if not lock:
         return cast(UserOAuth, oauth_account)
-    return None
+
+    account_id = int(oauth_account.id)
+    try:
+        if db.get_bind().dialect.name == "sqlite":
+            updated = (
+                db.query(UserOAuth)
+                .filter(UserOAuth.id == account_id)
+                .update({UserOAuth.id: UserOAuth.id}, synchronize_session=False)
+            )
+            if updated != 1:
+                db.rollback()
+                return None
+            db.expire_all()
+            locked_candidate = query.filter(UserOAuth.id == account_id).first()
+        else:
+            locked_candidate = (
+                query.filter(UserOAuth.id == account_id)
+                .with_for_update(of=UserOAuth)
+                .first()
+            )
+    except (InvalidRequestError, ObjectDeletedError):
+        db.rollback()
+        return None
+    if locked_candidate is None:
+        return None
+    _locked_grant, locked_account = locked_candidate
+    if (
+        not locked_account.access_token
+        or is_undecryptable_oauth_token(locked_account.access_token)
+        or not google_oauth_grant_covers_scopes(locked_account, required_scopes)
+    ):
+        return None
+    return cast(UserOAuth, locked_account)

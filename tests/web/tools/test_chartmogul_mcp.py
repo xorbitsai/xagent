@@ -3,7 +3,8 @@ from unittest.mock import Mock
 
 import pytest
 
-from xagent.web.tools.mcp import chartmogul, utils as mcp_utils
+from xagent.web.tools.mcp import chartmogul
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 class MockResponse:

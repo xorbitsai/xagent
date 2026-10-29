@@ -2613,3 +2613,424 @@ def test_remove_reaction_reports_error_payload(monkeypatch):
 
     assert result["status"] == "error"
     assert "no_reaction" in result["message"]
+
+
+# ---------------------------------------------------------------------------
+# slack_lookup_user
+# ---------------------------------------------------------------------------
+
+
+def _member(
+    user_id,
+    handle,
+    real_name="",
+    display_name="",
+    **flags,
+):
+    return {
+        "id": user_id,
+        "name": handle,
+        "real_name": real_name,
+        "profile": {"real_name": real_name, "display_name": display_name},
+        **flags,
+    }
+
+
+def _users_list_pages(*pages):
+    """users.list responses, each page pointing at the next with a cursor."""
+    responses = []
+    for index, members in enumerate(pages):
+        next_cursor = f"cursor-{index + 1}" if index + 1 < len(pages) else ""
+        responses.append(
+            MockResponse(
+                {
+                    "ok": True,
+                    "members": members,
+                    "response_metadata": {"next_cursor": next_cursor},
+                }
+            )
+        )
+    return responses
+
+
+async def test_lookup_user_is_discoverable_via_mcp_list_tools():
+    tools = {t.name: t for t in await slack.mcp.list_tools()}
+    tool = tools["slack_lookup_user"]
+    assert tool.inputSchema["required"] == ["query"]
+    description = " ".join((tool.description or "").split())
+    # The two rules the model must not lose: use the mention token, and ask
+    # instead of guessing between several matches.
+    assert '"@Name" is plain text and notifies no one' in description
+    assert "ask the user which one they mean" in description
+    post = " ".join((tools["slack_post_message"].description or "").split())
+    assert "<@USERID>" in post
+    assert "slack_lookup_user" in post
+
+
+def test_lookup_user_by_email_uses_lookup_by_email(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {
+                "ok": True,
+                "user": _member("U0CHELSEA1", "chelsea", "Chelsea Macatulad"),
+            }
+        )
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_lookup_user(" chelsea@example.com "))
+
+    assert result["status"] == "success"
+    assert result["match"] == "email"
+    assert result["users"] == [
+        {
+            "id": "U0CHELSEA1",
+            "handle": "chelsea",
+            "real_name": "Chelsea Macatulad",
+            "display_name": "",
+            "mention": "<@U0CHELSEA1>",
+        }
+    ]
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["method"] == "GET"
+    assert kwargs["url"].endswith("/users.lookupByEmail")
+    assert kwargs["params"] == {"email": "chelsea@example.com"}
+
+
+def test_lookup_user_by_email_reports_not_found(monkeypatch):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "users_not_found"})),
+    )
+
+    result = json.loads(slack.slack_lookup_user("nobody@example.com"))
+
+    assert result["status"] == "success"
+    assert result["users"] == []
+    assert result["match"] == "email"
+    assert "No active Slack member matches" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "query", ["U0CHELSEA1", "<@U0CHELSEA1>", "<@U0CHELSEA1|chelsea>"]
+)
+def test_lookup_user_by_id_or_mention_uses_users_info(monkeypatch, query):
+    mock_request = Mock(
+        return_value=MockResponse(
+            {"ok": True, "user": _member("U0CHELSEA1", "chelsea", "Chelsea M")}
+        )
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_lookup_user(query))
+
+    assert result["match"] == "id"
+    assert [user["mention"] for user in result["users"]] == ["<@U0CHELSEA1>"]
+    kwargs = mock_request.call_args.kwargs
+    assert kwargs["url"].endswith("/users.info")
+    assert kwargs["params"] == {"user": "U0CHELSEA1"}
+
+
+def test_lookup_user_by_id_reports_not_found(monkeypatch):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "user_not_found"})),
+    )
+
+    result = json.loads(slack.slack_lookup_user("U0MISSING1"))
+
+    assert result["status"] == "success"
+    assert result["users"] == []
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [{"deleted": True}, {"is_bot": True}, {"is_app_user": True}],
+)
+def test_lookup_user_by_id_hides_deleted_users_and_bots(monkeypatch, flags):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"ok": True, "user": _member("U0GONE0001", "gone", **flags)}
+            )
+        ),
+    )
+
+    result = json.loads(slack.slack_lookup_user("U0GONE0001"))
+
+    assert result["users"] == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Chelsea Macatulad",
+        "chelsea macatulad",
+        "  CHELSEA   MACATULAD ",
+        "@chelsea.m",
+        "chelsea.m",
+        "Chels",
+    ],
+)
+def test_lookup_user_by_name_finds_exact_names_before_prefixes(monkeypatch, query):
+    members = [
+        _member("U0CHELSEA1", "chelsea.m", "Chelsea Macatulad", "Chels"),
+        _member("U0CHELSEA2", "chelsea.r", "Chelsea Rivera"),
+        _member("U0OTHER001", "pete", "Pete Smith"),
+    ]
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages(members))
+    )
+
+    result = json.loads(slack.slack_lookup_user(query))
+
+    # Every query names U0CHELSEA1 exactly (real name, handle, or display
+    # name), so the prefix match on "Chelsea Rivera" must not dilute it.
+    assert result["match"] == "exact"
+    assert [user["id"] for user in result["users"]] == ["U0CHELSEA1"]
+    assert result["directory_complete"] is True
+
+
+def test_lookup_user_by_name_returns_every_prefix_match_when_ambiguous(monkeypatch):
+    members = [
+        _member("U0CHELSEA1", "chelsea.m", "Chelsea Macatulad"),
+        _member("U0CHELSEA2", "crivera", "Chelsea Rivera"),
+        _member("U0OTHER001", "pete", "Pete Smith"),
+    ]
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages(members))
+    )
+
+    result = json.loads(slack.slack_lookup_user("chelsea"))
+
+    assert result["match"] == "prefix"
+    assert {user["id"] for user in result["users"]} == {"U0CHELSEA1", "U0CHELSEA2"}
+
+
+def test_lookup_user_prefix_requires_every_query_word(monkeypatch):
+    members = [
+        _member("U0CHELSEA1", "chelsea.m", "Chelsea Macatulad"),
+        _member("U0CHELSEA2", "crivera", "Chelsea Rivera"),
+    ]
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages(members))
+    )
+
+    result = json.loads(slack.slack_lookup_user("chel riv"))
+
+    assert [user["id"] for user in result["users"]] == ["U0CHELSEA2"]
+
+
+def test_lookup_user_by_name_matches_slack_normalized_names(monkeypatch):
+    member = _member("U0JOSE0001", "jose", "José García")
+    member["profile"]["real_name_normalized"] = "Jose Garcia"
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages([member]))
+    )
+
+    result = json.loads(slack.slack_lookup_user("Jose Garcia"))
+
+    assert result["match"] == "exact"
+    assert [user["id"] for user in result["users"]] == ["U0JOSE0001"]
+
+
+def test_lookup_user_by_name_skips_deleted_users_bots_and_slackbot(monkeypatch):
+    members = [
+        _member("U0DELETED1", "chelsea.old", "Chelsea Old", deleted=True),
+        _member("B0BOT00001", "chelsea-bot", "Chelsea Bot", is_bot=True),
+        _member("USLACKBOT", "slackbot", "Slackbot"),
+        _member("U0CHELSEA1", "chelsea.m", "Chelsea Macatulad"),
+    ]
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages(members))
+    )
+
+    assert [
+        user["id"] for user in json.loads(slack.slack_lookup_user("chelsea"))["users"]
+    ] == ["U0CHELSEA1"]
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages(members))
+    )
+    assert json.loads(slack.slack_lookup_user("slackbot"))["users"] == []
+
+
+def test_lookup_user_by_name_reports_not_found(monkeypatch):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(side_effect=_users_list_pages([_member("U0PETE0001", "pete", "Pete")])),
+    )
+
+    result = json.loads(slack.slack_lookup_user("chelsea"))
+
+    assert result["status"] == "success"
+    assert result["users"] == []
+    assert result["match"] == "none"
+    assert result["directory_complete"] is True
+    assert "exact name, @handle, or email" in result["message"]
+
+
+def test_lookup_user_scans_every_page_so_a_later_exact_match_wins(monkeypatch):
+    mock_request = Mock(
+        side_effect=_users_list_pages(
+            [_member("U0CHELSEA2", "chelsea.r", "Chelsea Rivera")],
+            [_member("U0CHELSEA1", "chelsea", "Chelsea")],
+        )
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_lookup_user("chelsea"))
+
+    assert result["match"] == "exact"
+    assert [user["id"] for user in result["users"]] == ["U0CHELSEA1"]
+    assert mock_request.call_count == 2
+    first, second = (call.kwargs["params"] for call in mock_request.call_args_list)
+    assert first == {"limit": 200}
+    assert second == {"limit": 200, "cursor": "cursor-1"}
+
+
+def test_lookup_user_keeps_matches_when_a_later_page_fails(monkeypatch):
+    responses = _users_list_pages(
+        [_member("U0CHELSEA1", "chelsea.m", "Chelsea Macatulad")],
+        [],
+    )
+    responses[1] = MockResponse({"ok": False, "error": "internal_error"})
+    monkeypatch.setattr(slack.requests, "request", Mock(side_effect=responses))
+
+    result = json.loads(slack.slack_lookup_user("chelsea"))
+
+    assert result["status"] == "success"
+    assert [user["id"] for user in result["users"]] == ["U0CHELSEA1"]
+    assert result["directory_complete"] is False
+    assert result["error"] == "internal_error"
+
+
+@pytest.mark.parametrize("stop", ["page_failure", "page_cap"])
+def test_lookup_user_never_treats_an_incomplete_exact_match_as_unique(
+    monkeypatch, stop
+):
+    """Display names are not unique and users.list has no defined order: an
+    exact match from a partial scan may hide a same-name member on an unread
+    page, so the result must tell the model not to mention anyone from it."""
+    first_page = [_member("U0CHELSEA1", "cmac", "Chelsea Macatulad", "Chelsea")]
+    hidden_page = [_member("U0CHELSEA2", "crivera", "Chelsea Rivera", "Chelsea")]
+    responses = _users_list_pages(first_page, hidden_page)
+    if stop == "page_failure":
+        responses[1] = MockResponse({"ok": False, "error": "internal_error"})
+    else:
+        monkeypatch.setattr(slack, "MAX_PAGES", 1)
+    monkeypatch.setattr(slack.requests, "request", Mock(side_effect=responses))
+
+    result = json.loads(slack.slack_lookup_user("Chelsea"))
+
+    assert result["match"] == "exact"
+    assert [user["id"] for user in result["users"]] == ["U0CHELSEA1"]
+    assert result["directory_complete"] is False
+    assert "Do not mention anyone from this result" in result["message"]
+    assert "email address or Slack user id" in result["message"]
+
+
+def test_lookup_user_complete_exact_match_carries_no_partial_warning(monkeypatch):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(side_effect=_users_list_pages([_member("U0CHELSEA1", "cmac", "Chelsea")])),
+    )
+
+    result = json.loads(slack.slack_lookup_user("Chelsea"))
+
+    assert result["directory_complete"] is True
+    assert "message" not in result
+
+
+async def test_lookup_user_description_forbids_mentions_from_a_partial_scan():
+    tools = {t.name: t for t in await slack.mcp.list_tools()}
+    description = " ".join((tools["slack_lookup_user"].description or "").split())
+    assert (
+        "even an exact match may not be the only person with that name" in description
+    )
+    assert "do not mention anyone from that result" in description
+
+
+@pytest.mark.parametrize("query", ["chelsea m", "chel mac"])
+def test_lookup_user_prefix_splits_names_on_underscores(monkeypatch, query):
+    # The handle is the only searchable name, so no other variant can mask
+    # the separator; "_" must split words like "." and spaces do.
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            side_effect=_users_list_pages([_member("U0CHELSEA1", "chelsea_macatulad")])
+        ),
+    )
+
+    result = json.loads(slack.slack_lookup_user(query))
+
+    assert result["match"] == "prefix"
+    assert [user["id"] for user in result["users"]] == ["U0CHELSEA1"]
+
+
+def test_lookup_user_marks_directory_incomplete_after_max_pages(monkeypatch):
+    monkeypatch.setattr(slack, "MAX_PAGES", 1)
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(side_effect=_users_list_pages([], [_member("U0LATE0001", "chelsea")])),
+    )
+
+    result = json.loads(slack.slack_lookup_user("chelsea"))
+
+    assert result["users"] == []
+    assert result["directory_complete"] is False
+    assert "in the part of the directory read" in result["message"]
+
+
+def test_lookup_user_bounds_and_flags_truncated_matches(monkeypatch):
+    members = [
+        _member(f"U0SAM{index:05d}", f"sam{index}", f"Sam {index}")
+        for index in range(slack.MAX_USER_MATCHES + 3)
+    ]
+    monkeypatch.setattr(
+        slack.requests, "request", Mock(side_effect=_users_list_pages(members))
+    )
+
+    result = json.loads(slack.slack_lookup_user("sam"))
+
+    assert len(result["users"]) == slack.MAX_USER_MATCHES
+    assert result["truncated"] is True
+
+
+@pytest.mark.parametrize("query", ["chelsea", "chelsea@example.com", "U0CHELSEA1"])
+def test_lookup_user_surfaces_missing_scope_as_reconnect(monkeypatch, query):
+    """A connection made before users:read / users:read.email were requested
+    must tell the user to reconnect, on every lookup path."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {"ok": False, "error": "missing_scope", "needed": "users:read"}
+            )
+        ),
+    )
+
+    result = json.loads(slack.slack_lookup_user(query))
+
+    assert result["status"] == "error"
+    assert "needed: users:read" in result["message"]
+    assert "reconnect the Slack connector" in result["message"]
+
+
+@pytest.mark.parametrize("query", ["", "   ", "@", "<@>"])
+def test_lookup_user_rejects_empty_queries_without_calling_slack(monkeypatch, query):
+    mock_request = Mock()
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_lookup_user(query))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()

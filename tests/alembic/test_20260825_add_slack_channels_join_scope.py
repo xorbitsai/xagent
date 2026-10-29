@@ -674,6 +674,13 @@ def test_merge_provider_default_scopes_is_idempotent(tmp_path):
 
 
 def test_migration_fields_match_registry():
+    """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
+    snapshots, not the app's final values — 20261023_add_slack_users_read_scopes
+    layers the users:read scopes and another description update on top of
+    them, so only a subset check on scopes (every scope this migration
+    granted is still present) holds going forward; the live description is
+    that later migration's CURRENT_DESCRIPTION (see its own
+    test_migration_fields_match_registry for the exact-match check)."""
     from xagent.web.builtin_mcp_registry import (
         get_builtin_oauth_provider_rows,
         get_builtin_public_mcp_app_rows,
@@ -683,12 +690,11 @@ def test_migration_fields_match_registry():
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "slack"
     )
-    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
-    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+    assert set(migration.CURRENT_SCOPES) <= set(registry_row["oauth_scopes"])
     registry_provider = next(
         r for r in get_builtin_oauth_provider_rows() if r["provider_name"] == "slack"
     )
-    assert migration.CURRENT_SCOPES == registry_provider["default_scopes"]
+    assert set(migration.CURRENT_SCOPES) <= set(registry_provider["default_scopes"])
 
 
 def test_previous_fields_match_prior_migrations_current_fields():

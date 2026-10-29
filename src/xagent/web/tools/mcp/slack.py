@@ -53,6 +53,29 @@ _SLACK_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,}$")
 # misread as a bare channel name and prefixed with "#" (which 404s).
 _SLACK_ANY_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{5,}$")
 
+# A Slack user id, for slack_lookup_user: "U..." for workspace members, "W..."
+# for Enterprise Grid users. The mention form ("<@U...>", optionally with a
+# "|label" suffix) is accepted too, because a model resolving someone already
+# mentioned in a message tends to copy that token verbatim.
+_SLACK_USER_ID_PATTERN = re.compile(r"^[UW][A-Z0-9]{5,}$")
+_SLACK_USER_MENTION_PATTERN = re.compile(r"^<@([UW][A-Z0-9]{5,})(?:\|[^>]*)?>$")
+# Deliberately loose: it only decides whether a query goes to
+# users.lookupByEmail (an exact lookup Slack validates itself) instead of a
+# name scan, so it must accept every real address rather than reject odd ones.
+_EMAIL_PATTERN = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
+# Splits a folded name into words for slack_lookup_user's prefix tier, so
+# "chelsea.m", "Chelsea Macatulad" and "chelsea_m" all split on their
+# separators. "_" is a word character to \w, so it is named explicitly;
+# Unicode letters and digits still stay inside words.
+_NAME_WORD_SEPARATOR = re.compile(r"[\W_]+")
+# Upper bound on the members one slack_lookup_user call returns. A name that
+# matches more people than this is too vague to act on anyway; the response
+# flags truncation so the model asks for something more specific.
+MAX_USER_MATCHES = 20
+# Slackbot is a built-in pseudo-user that users.list reports with
+# is_bot=false; no request to mention a person ever means it.
+_SLACKBOT_USER_ID = "USLACKBOT"
+
 
 class _SlackChannelAccessDenied(PermissionError):
     """A trusted runtime policy denied or could not authorize an operation."""
@@ -730,7 +753,11 @@ def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     "U0123456789", to open/post into a 1:1 DM — see
     slack_list_direct_messages' "user" field), or a channel name (e.g.
     "#incidents" or "incidents" — a bare name is normalized to "#incidents").
-    text: the message body (plain text or Slack mrkdwn).
+    text: the message body (plain text or Slack mrkdwn). To @-mention
+    someone, write their mention token "<@USERID>" (e.g. "<@U0123456789>")
+    in the text — a literal "@Name" is plain text and notifies no one.
+    Resolve the id with slack_lookup_user first (its "mention" field is the
+    exact token to use); never guess or invent a user id.
     thread_ts: optional parent message "ts" (from slack_get_channel_history,
     slack_search_messages, or a prior slack_post_message result) to reply
     inside that thread instead of posting to the channel's main timeline.
@@ -999,6 +1026,278 @@ def slack_list_direct_messages(limit: int = 200) -> str:
         return _success(conversations=conversations, truncated=truncated)
     except Exception as e:
         logger.error(f"Error listing Slack direct messages: {e}")
+        return _error(str(e))
+
+
+def _is_person(user: dict[str, Any]) -> bool:
+    """Whether a users.* entry is an active human member a mention could mean.
+
+    Deleted accounts can't be notified, and bots, app users and Slackbot are
+    never who "tag Chelsea" refers to — dropping them here keeps them out of
+    every lookup path (id, email and name) alike.
+    """
+    return not (
+        user.get("deleted") is True
+        or user.get("is_bot") is True
+        or user.get("is_app_user") is True
+        or user.get("id") == _SLACKBOT_USER_ID
+    )
+
+
+def _user_summary(user: dict[str, Any]) -> dict[str, str]:
+    """The fields slack_lookup_user returns for one member.
+
+    Only what identifying and mentioning someone needs: the profile's email,
+    phone and title are left out so a lookup reveals no more than the
+    directory names the model searched by.
+    """
+    profile = user.get("profile") or {}
+    user_id = str(user.get("id") or "")
+    return {
+        "id": user_id,
+        "handle": str(user.get("name") or ""),
+        "real_name": str(user.get("real_name") or profile.get("real_name") or ""),
+        "display_name": str(profile.get("display_name") or ""),
+        "mention": f"<@{user_id}>",
+    }
+
+
+def _fold_name(text: str) -> str:
+    """Case-fold and collapse whitespace so name comparisons ignore both."""
+    return " ".join(text.casefold().split())
+
+
+def _name_variants(user: dict[str, Any]) -> tuple[str, ...]:
+    """Every folded name a member can be searched by: @handle, real name and
+    display name, plus Slack's diacritic-free "_normalized" profile copies so
+    "Jose" finds "José"."""
+    profile = user.get("profile") or {}
+    values = (
+        user.get("name"),
+        user.get("real_name"),
+        profile.get("real_name"),
+        profile.get("display_name"),
+        profile.get("real_name_normalized"),
+        profile.get("display_name_normalized"),
+    )
+    folded = (_fold_name(str(value)) for value in values if value)
+    return tuple(dict.fromkeys(name for name in folded if name))
+
+
+def _name_words(name: str) -> tuple[str, ...]:
+    return tuple(word for word in _NAME_WORD_SEPARATOR.split(name) if word)
+
+
+def _match_name(user: dict[str, Any], needle: str) -> str | None:
+    """Classify how a member matches a folded name query.
+
+    "exact" when some name equals the query outright; "prefix" when every
+    query word starts some word of a single name (so "chel" and "chelsea m"
+    both find "Chelsea Macatulad"); None otherwise.
+    """
+    variants = _name_variants(user)
+    if needle in variants:
+        return "exact"
+    needle_words = _name_words(needle)
+    if needle_words and any(
+        all(
+            any(word.startswith(part) for word in _name_words(variant))
+            for part in needle_words
+        )
+        for variant in variants
+    ):
+        return "prefix"
+    return None
+
+
+def _lookup_one(
+    path: str, params: dict[str, Any], not_found_codes: frozenset[str]
+) -> dict[str, Any] | None:
+    """Fetch the single member an exact lookup (users.info or
+    users.lookupByEmail) names, or None when Slack has no such person.
+
+    Slack's documented not-found codes become None rather than an error so
+    the tool can answer "no match" the same way the name scan does; every
+    other failure — including missing_scope, which _request already turned
+    into the actionable reconnect message — propagates.
+    """
+    try:
+        result = _request("GET", path, params=params)
+    except _SlackAPIError as e:
+        if e.code in not_found_codes:
+            return None
+        raise
+    user = result.get("user") or {}
+    return user if _is_person(user) else None
+
+
+def _lookup_result(
+    users: list[dict[str, Any]],
+    *,
+    match: str,
+    directory_complete: bool = True,
+    error: str | None = None,
+) -> str:
+    """Render slack_lookup_user's response.
+
+    truncated means more members matched than MAX_USER_MATCHES returned;
+    directory_complete=false means the name scan stopped before the end of
+    the directory (a page failed, or MAX_PAGES ran out). No answer from such
+    a scan is authoritative -- not even an exact one: Slack names are not
+    unique and users.list has no defined order, so an unread page may hold
+    another member with the same name. The response says so explicitly so
+    the model asks for an email or user id instead of mentioning a guess.
+    """
+    payload: dict[str, Any] = {
+        "users": [_user_summary(user) for user in users[:MAX_USER_MATCHES]],
+        "match": match,
+        "truncated": len(users) > MAX_USER_MATCHES,
+        "directory_complete": directory_complete,
+    }
+    if error:
+        payload["error"] = error
+    if not users:
+        scope = "" if directory_complete else " in the part of the directory read"
+        payload["message"] = (
+            f"No active Slack member matches this query{scope}. Ask the user "
+            "for the person's exact name, @handle, or email address."
+        )
+    elif not directory_complete:
+        payload["message"] = (
+            "Only part of the Slack directory could be read, so these matches "
+            "may not be the only members with this name. Do not mention anyone "
+            "from this result: ask the user for the person's email address or "
+            "Slack user id and look them up again."
+        )
+    return _success(**payload)
+
+
+def _search_members_by_name(needle: str) -> str:
+    """Scan users.list for members whose name matches ``needle``.
+
+    users.list has no server-side filter, so every page is read and matched
+    locally. The whole directory is scanned before answering because an exact
+    match on a later page must win over prefix matches on an earlier one:
+    exact matches are returned when there are any, otherwise prefix matches.
+
+    Pagination mirrors slack_list_channels: a failure on the first page is
+    an error, while a later failure keeps the matches found so far and marks
+    the answer incomplete instead of discarding them.
+    """
+    exact: list[dict[str, Any]] = []
+    prefix: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages_scanned = 0
+    directory_complete = False
+    page_error: str | None = None
+    for _ in range(MAX_PAGES):
+        params: dict[str, Any] = {"limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            result = _request("GET", "users.list", params=params)
+        except Exception as page_exc:
+            if isinstance(page_exc, _SlackChannelAccessDenied) or not pages_scanned:
+                raise
+            logger.warning(f"Slack member pagination stopped early: {page_exc}")
+            page_error = str(page_exc)
+            break
+        pages_scanned += 1
+        for user in result.get("members") or []:
+            if not _is_person(user):
+                continue
+            kind = _match_name(user, needle)
+            if kind == "exact":
+                exact.append(user)
+            elif kind == "prefix":
+                prefix.append(user)
+        cursor = (result.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            directory_complete = True
+            break
+    if exact:
+        matches, match = exact, "exact"
+    else:
+        matches, match = prefix, "prefix" if prefix else "none"
+    return _lookup_result(
+        matches,
+        match=match,
+        directory_complete=directory_complete,
+        error=page_error,
+    )
+
+
+@mcp.tool()
+def slack_lookup_user(query: str) -> str:
+    """
+    Find Slack workspace members so you can @-mention them, and get the
+    mention token to put in a message.
+    query: one of
+    - an email address (exact lookup, the most reliable when known),
+    - a Slack user id ("U0123456789") or mention ("<@U0123456789>"),
+    - a name: @handle (with or without "@"), real name, or display name,
+      matched case-insensitively — exact matches first; if there are none,
+      members whose name words start with every word of the query (so
+      "chel" or "chelsea m" finds "Chelsea Macatulad").
+    Returns users (id, handle, real_name, display_name, mention) plus
+    match ("id", "email", "exact", "prefix" or "none"). Deleted accounts,
+    bots and app users are never returned.
+    To mention someone with slack_post_message, put their "mention" value
+    (e.g. "<@U0123456789>") in the text — a literal "@Name" is plain text
+    and notifies no one.
+    If more than one member matches, ask the user which one they mean
+    (e.g. with ask_user_question) instead of choosing; never mention someone
+    the user did not clearly identify. If match is "none", ask the user
+    for the person's email address rather than guessing. If
+    directory_complete is false, the directory was only partly read, so
+    even an exact match may not be the only person with that name: do not
+    mention anyone from that result; ask for an email address or Slack user
+    id and look them up again. truncated=true
+    means more members matched than were returned: ask for a more specific
+    name.
+    """
+    try:
+        # Unlike every other tool here, this one reads no conversation, so a
+        # trusted runtime's channel allow-list has nothing to scope it to: it
+        # would expose the whole workspace directory to a runtime that was
+        # only granted specific channels. Such a runtime is also read-only
+        # (_SUPPORTED_POLICY_CAPABILITIES), so it could never post the
+        # mention a lookup exists for. Deny instead of serving it.
+        if _channel_access_policy() is not None:
+            raise _SlackChannelAccessDenied(
+                "Slack runtime policy does not allow workspace member lookups"
+            )
+        raw = query.strip()
+        mention = _SLACK_USER_MENTION_PATTERN.match(raw)
+        if mention:
+            raw = mention.group(1)
+        if not raw:
+            raise ValueError("query must not be empty")
+        if _SLACK_USER_ID_PATTERN.match(raw):
+            user = _lookup_one(
+                "users.info",
+                {"user": raw},
+                frozenset({"user_not_found", "user_not_visible"}),
+            )
+            return _lookup_result([user] if user else [], match="id")
+        if _EMAIL_PATTERN.match(raw):
+            user = _lookup_one(
+                "users.lookupByEmail",
+                {"email": raw},
+                frozenset({"users_not_found"}),
+            )
+            return _lookup_result([user] if user else [], match="email")
+        needle = _fold_name(raw).lstrip("@").strip()
+        # A query with no letters or digits (e.g. a bare "@" or an empty
+        # "<@>") names nobody; scanning the whole directory for it would only
+        # cost requests.
+        if not _name_words(needle):
+            raise ValueError(
+                "query must be a name, @handle, email address, or Slack user id"
+            )
+        return _search_members_by_name(needle)
+    except Exception as e:
+        logger.error(f"Error looking up Slack member: {e}")
         return _error(str(e))
 
 

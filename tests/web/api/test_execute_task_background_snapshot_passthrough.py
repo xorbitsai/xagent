@@ -156,7 +156,34 @@ def _build_db_mock(*, task_row: Any, user_row: Any) -> tuple[MagicMock, _QueryCo
     return db, counter
 
 
-def _common_patches(db: Any, agent_service: Any) -> list[Any]:
+def _completed_finalization() -> SimpleNamespace:
+    return SimpleNamespace(
+        normalized_outputs=[],
+        ai_response="ok",
+        chat_response=None,
+        waiting_for_control=False,
+        terminal_state_committed=True,
+        report=SettlementReport(),
+        final_task_status=TaskStatus.COMPLETED.value,
+        broadcast_meta={
+            "id": 42,
+            "title": "exec-bg test",
+            "description": "x",
+            "execution_mode": "flash",
+            "updated_at": None,
+        },
+        late_result=False,
+        error_code=None,
+        error_details=None,
+    )
+
+
+def _common_patches(
+    db: Any,
+    agent_service: Any,
+    *,
+    finalizer: MagicMock | None = None,
+) -> list[Any]:
     """Stub persistence so this test observes only snapshot handoff."""
 
     return [
@@ -173,25 +200,7 @@ def _common_patches(db: Any, agent_service: Any) -> list[Any]:
         ),
         patch(
             "xagent.web.services.task_execution._finalize_task_execution_result_isolated",
-            return_value=SimpleNamespace(
-                normalized_outputs=[],
-                ai_response="ok",
-                chat_response=None,
-                waiting_for_control=False,
-                terminal_state_committed=True,
-                report=SettlementReport(),
-                final_task_status=TaskStatus.COMPLETED.value,
-                broadcast_meta={
-                    "id": 42,
-                    "title": "exec-bg test",
-                    "description": "x",
-                    "execution_mode": "flash",
-                    "updated_at": None,
-                },
-                late_result=False,
-                error_code=None,
-                error_details=None,
-            ),
+            new=finalizer or MagicMock(return_value=_completed_finalization()),
         ),
         patch(
             "xagent.web.api.websocket.manager.broadcast_to_task",
@@ -264,6 +273,33 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
     forwarded_context = agent_manager.execute_task.await_args.kwargs["context"]
     assert forwarded_context["task_source"] == "trigger"
     assert forwarded_context["run_id"] == "run-snapshot"
+
+
+@pytest.mark.asyncio
+async def test_current_turn_id_reaches_terminal_persistence() -> None:
+    db, _counter = _build_db_mock(task_row=_make_task_orm(), user_row=_make_user_orm())
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
+    finalizer = MagicMock(return_value=_completed_finalization())
+
+    with _Patches(_common_patches(db, agent_service, finalizer=finalizer)):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={"turn_id": "accepted-current-turn"},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_setup_snapshot=snapshot,
+            expected_run_id="run-snapshot",
+        )
+
+    assert finalizer.call_args.kwargs["turn_id"] == "accepted-current-turn"
 
 
 @pytest.mark.asyncio

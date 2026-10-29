@@ -2104,6 +2104,7 @@ def _finalize_task_execution_result_isolated(
     task_lease: TaskLease | None,
     resolved_scope_segments: tuple[str, ...],
     prepared_outputs: _PreparedTaskFileOutputs | None = None,
+    turn_id: str | None = None,
 ) -> _TaskExecutionFinalization:
     """Persist one task result in a worker-owned, ownership-fenced session."""
     from .chat_history_service import persist_assistant_message_no_commit
@@ -2421,6 +2422,7 @@ def _finalize_task_execution_result_isolated(
                         and task_updated.status != TaskStatus.FAILED
                         else None
                     ),
+                    turn_id=turn_id,
                     content_is_reconciled=True,
                 )
                 if (
@@ -2740,6 +2742,15 @@ async def execute_task_background(
                         execution_scope.workspace_segments
                         if execution_scope is not None
                         else ()
+                    ),
+                    # This is the identity of the accepted current turn. Do not
+                    # derive it from task config: a later APPEND on the same task
+                    # must keep its own provenance.
+                    turn_id=(
+                        context_dict.get("turn_id")
+                        if isinstance(context_dict.get("turn_id"), str)
+                        and context_dict.get("turn_id")
+                        else None
                     ),
                 )
             )

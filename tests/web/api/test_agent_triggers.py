@@ -38,10 +38,15 @@ from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,
 )
+from xagent.web.services.chat_history_service import persist_user_message_no_commit
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     load_connector_runtime_view,
     set_connector_runtime_resolver_for_testing,
+)
+from xagent.web.services.task_execution import (
+    _finalize_task_execution_result_isolated,
 )
 from xagent.web.services.task_orchestrator import (
     TurnStarted,
@@ -3663,12 +3668,13 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                 user_id=admin_user_id,
                 title="Shared routine history",
                 description="Prepare the daily report",
-                status=TaskStatus.COMPLETED,
+                status=TaskStatus.RUNNING,
                 agent_id=agent_id,
                 execution_mode="balanced",
                 source="trigger",
                 is_visible=False,
                 input="Prepare the daily report",
+                run_id="routine-execution",
             )
             db.add(task)
             db.flush()
@@ -3694,35 +3700,44 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                 attachments=[{"file_id": "private-file", "name": "input.csv"}],
                 turn_id="routine-turn",
             )
-            assistant_message = TaskChatMessage(
-                task_id=int(task.id),
-                user_id=admin_user_id,
-                role="assistant",
-                content="The daily report is ready",
-                message_type="assistant_response",
-                turn_id="routine-turn",
+            db.add(user_message)
+            db.commit()
+            task_id = int(task.id)
+            run_id = int(run.id)
+        finally:
+            db.close()
+
+        finalized = _finalize_task_execution_result_isolated(
+            task_id=task_id,
+            task_user_id=admin_user_id,
+            pre_run_status=TaskStatus.RUNNING,
+            result={
+                "success": True,
+                "output": "The daily report is ready",
+                "file_outputs": [],
+            },
+            expected_run_id="routine-execution",
+            task_lease=None,
+            resolved_scope_segments=(),
+            turn_id="routine-turn",
+        )
+        assert not finalized.late_result
+
+        db = _direct_db_session()
+        try:
+            assistant_message = (
+                db.query(TaskChatMessage)
+                .filter(
+                    TaskChatMessage.task_id == task_id,
+                    TaskChatMessage.role == "assistant",
+                    TaskChatMessage.turn_id == "routine-turn",
+                )
+                .one()
             )
-            db.add_all([user_message, assistant_message])
-            db.flush()
             db.add_all(
                 [
                     TaskChatMessage(
-                        task_id=int(task.id),
-                        user_id=admin_user_id,
-                        role="assistant",
-                        content="private untrusted failure detail",
-                        message_type="assistant_message",
-                    ),
-                    TaskChatMessage(
-                        task_id=int(task.id),
-                        user_id=admin_user_id,
-                        role="assistant",
-                        content="",
-                        message_type="assistant_response",
-                        interactions=[{"type": "tool_calls", "secret": "do-not-leak"}],
-                    ),
-                    TaskChatMessage(
-                        task_id=int(task.id),
+                        task_id=task_id,
                         user_id=admin_user_id,
                         role="system",
                         content="internal orchestration note",
@@ -3730,7 +3745,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                         turn_id="routine-turn",
                     ),
                     TaskChatMessage(
-                        task_id=int(task.id),
+                        task_id=task_id,
                         user_id=admin_user_id,
                         role="user",
                         content="Use my private connector for a follow-up",
@@ -3738,7 +3753,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                         turn_id="private-turn",
                     ),
                     TaskChatMessage(
-                        task_id=int(task.id),
+                        task_id=task_id,
                         user_id=admin_user_id,
                         role="assistant",
                         content="Private connector result",
@@ -3749,7 +3764,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                     # watermark with a system summary. Display-history reads
                     # must still return the original user-visible rows.
                     TraceEvent(
-                        task_id=int(task.id),
+                        task_id=task_id,
                         event_id="routine-history-compaction",
                         event_type="action_end_compact",
                         timestamp=datetime.now(timezone.utc),
@@ -3763,8 +3778,6 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                 ]
             )
             db.commit()
-            task_id = int(task.id)
-            run_id = int(run.id)
         finally:
             db.close()
 
@@ -3781,7 +3794,6 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
             {"role": "assistant", "content": "The daily report is ready"},
         ]
         assert "private-file" not in teammate_read.text
-        assert "do-not-leak" not in teammate_read.text
         assert "internal orchestration note" not in teammate_read.text
         assert "Earlier routine conversation" not in teammate_read.text
         assert "private connector" not in teammate_read.text.lower()
@@ -3825,6 +3837,204 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
         assert outsider_read.status_code == 404, outsider_read.text
     finally:
         set_agent_team_scope_hook(None)
+
+
+def test_v1_trigger_history_sanitizes_unsafe_and_omits_tool_only_assistants() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "V1 safe routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "V1 safe history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        runs: dict[str, tuple[int, int]] = {}
+        for case, assistant_content, message_type, interactions in [
+            (
+                "unsafe",
+                "private untrusted failure detail",
+                "assistant_message",
+                None,
+            ),
+            (
+                "tool-only",
+                "",
+                "assistant_response",
+                [{"type": "tool_calls", "secret": "do-not-leak"}],
+            ),
+        ]:
+            turn_id = f"{case}-turn"
+            task = Task(
+                user_id=owner_id,
+                title=f"V1 {case} history",
+                description=f"Run {case}",
+                status=TaskStatus.COMPLETED,
+                agent_id=agent_id,
+                execution_mode="balanced",
+                source="trigger",
+                is_visible=False,
+                input=f"Run {case}",
+            )
+            db.add(task)
+            db.flush()
+            run = TriggerRun(
+                trigger_id=trigger_id,
+                task_id=int(task.id),
+                status=TriggerRunStatus.COMPLETED.value,
+                idempotency_key=f"history:v1:{case}",
+            )
+            db.add(run)
+            db.flush()
+            task.agent_config = {
+                "trigger_run_id": int(run.id),
+                TRIGGER_TURN_ID_CONFIG_KEY: turn_id,
+            }
+            db.add_all(
+                [
+                    task,
+                    TaskChatMessage(
+                        task_id=int(task.id),
+                        user_id=owner_id,
+                        role="user",
+                        content=f"Run {case}",
+                        message_type="user_message",
+                        turn_id=turn_id,
+                    ),
+                    TaskChatMessage(
+                        task_id=int(task.id),
+                        user_id=owner_id,
+                        role="assistant",
+                        content=assistant_content,
+                        message_type=message_type,
+                        interactions=interactions,
+                        turn_id=turn_id,
+                    ),
+                ]
+            )
+            runs[case] = (int(run.id), int(task.id))
+        db.commit()
+    finally:
+        db.close()
+
+    unsafe_run_id, unsafe_task_id = runs["unsafe"]
+    unsafe = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{unsafe_run_id}/history",
+        headers=headers,
+    )
+    assert unsafe.status_code == 200, unsafe.text
+    assert unsafe.json() == {
+        "run_id": unsafe_run_id,
+        "task_id": unsafe_task_id,
+        "messages": [
+            {"role": "user", "content": "Run unsafe"},
+            {"role": "assistant", "content": CLIENT_SAFE_TASK_FAILURE},
+        ],
+    }
+    assert "private untrusted failure detail" not in unsafe.text
+
+    tool_run_id, tool_task_id = runs["tool-only"]
+    tool_only = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{tool_run_id}/history",
+        headers=headers,
+    )
+    assert tool_only.status_code == 200, tool_only.text
+    assert tool_only.json() == {
+        "run_id": tool_run_id,
+        "task_id": tool_task_id,
+        "messages": [{"role": "user", "content": "Run tool-only"}],
+    }
+    assert "do-not-leak" not in tool_only.text
+
+
+def test_v2_terminal_persistence_keeps_routine_turn_provenance() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "V2 persisted routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "V2 persisted history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title="V2 persisted routine history",
+            description="V2 persisted prompt",
+            status=TaskStatus.RUNNING,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="V2 persisted prompt",
+            run_id="v2-routine-execution",
+            conversation_storage_version=2,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="history:v2:persisted",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "v2-routine-turn",
+        }
+        persist_user_message_no_commit(
+            db,
+            task_id=int(task.id),
+            user_id=owner_id,
+            content="V2 persisted prompt",
+            turn_id="v2-routine-turn",
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    finalized = _finalize_task_execution_result_isolated(
+        task_id=task_id,
+        task_user_id=owner_id,
+        pre_run_status=TaskStatus.RUNNING,
+        result={
+            "success": True,
+            "output": "V2 persisted result",
+            "file_outputs": [],
+        },
+        expected_run_id="v2-routine-execution",
+        task_lease=None,
+        resolved_scope_segments=(),
+        turn_id="v2-routine-turn",
+    )
+    assert not finalized.late_result
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "V2 persisted prompt"},
+            {"role": "assistant", "content": "V2 persisted result"},
+        ],
+    }
 
 
 def test_trigger_run_history_uses_v2_display_snapshot() -> None:

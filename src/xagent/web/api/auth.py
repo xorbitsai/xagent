@@ -131,6 +131,13 @@ from ..services.user_oauth import (
     normalize_user_oauth_resource_owner_key,
     scoped_user_oauth_query,
 )
+from ..shopify_oauth import (
+    ShopifyOAuthError,
+    fetch_shopify_shop_identity,
+    is_shopify_provider,
+    require_shopify_scopes,
+    verify_shopify_callback,
+)
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 from ..utils.script_json import script_safe_json
 
@@ -605,7 +612,7 @@ def _oauth_scope_separator(provider: str) -> str:
     # Linear's authorize endpoint documents scope as "a comma separated list
     # of scopes" -- unlike most providers here, which accept a space-joined
     # list.
-    if provider.lower() in ("meta", "linear"):
+    if provider.lower() in ("meta", "linear") or is_shopify_provider(provider):
         return ","
     return " "
 
@@ -4812,6 +4819,20 @@ def generic_oauth_callback(
         token_url = account_endpoints.token_url
         userinfo_url = account_endpoints.userinfo_url
         bound_account = account_endpoints.account
+        if is_shopify_provider(provider):
+            try:
+                verify_shopify_callback(
+                    request.query_params.multi_items(),
+                    client_secret=client_secret,
+                    bound_account=bound_account,
+                )
+            except ShopifyOAuthError as exc:
+                _log_oauth_callback_rejection(
+                    provider, exc.reason, app_id=app_id, actor_flow=is_actor_flow
+                )
+                return _oauth_popup_feedback_response(
+                    "Cannot connect Shopify", html.escape(exc.message)
+                )
 
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
@@ -5057,6 +5078,19 @@ def generic_oauth_callback(
                 content=f"<h1>Error exchanging token</h1><p>{message}</p>",
                 status_code=400,
             )
+
+        if bound_account is not None and is_shopify_provider(provider):
+            # The merchant can change scopes on the consent screen, so check
+            # what was granted before storing anything (shopify_oauth).
+            try:
+                token_data["scope"] = require_shopify_scopes(token_data.get("scope"))
+            except ShopifyOAuthError as exc:
+                _log_oauth_callback_rejection(
+                    provider, exc.reason, app_id=app_id, actor_flow=is_actor_flow
+                )
+                return _oauth_popup_feedback_response(
+                    "Cannot connect Shopify", html.escape(exc.message)
+                )
 
         salesforce_instance_url = token_data.get("instance_url")
         if _is_salesforce_provider(provider) and (
@@ -5342,6 +5376,20 @@ def generic_oauth_callback(
                         f"connection: {html.escape(str(e))}</p>"
                     ),
                     status_code=400,
+                )
+        elif bound_account is not None and is_shopify_provider(provider):
+            # Shopify has no userinfo endpoint and authenticates the Admin
+            # API with X-Shopify-Access-Token, not a Bearer header.
+            try:
+                provider_user_id = fetch_shopify_shop_identity(
+                    bound_account, access_token
+                )
+            except ShopifyOAuthError as exc:
+                _log_oauth_callback_rejection(
+                    provider, exc.reason, app_id=app_id, actor_flow=is_actor_flow
+                )
+                return _oauth_popup_feedback_response(
+                    "Error verifying the connected account", html.escape(exc.message)
                 )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}

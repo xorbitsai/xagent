@@ -638,7 +638,8 @@ def test_gmail_tombstone_takes_no_database_write_lock_before_its_own_lock(
     async def dead_refresh(*args, **kwargs):
         raise tool_config._OAuthRefreshPermanentlyInvalid()
 
-    def probe_then_clear(oauth_db, *, oauth_account):
+    def probe_then_clear(oauth_db, *, oauth_account, expected_refresh_token=None):
+        _ = expected_refresh_token
         # Stands in for another Gmail writer that already holds the
         # transition lock and now writes.
         other_writer = sqlite3.connect(database, timeout=0)

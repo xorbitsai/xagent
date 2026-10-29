@@ -47,9 +47,11 @@ from xagent.web.services.gmail_triggers import (
 )
 from xagent.web.services.trigger_providers import (
     GmailProvider,
-    register_trigger_provider,
 )
 from xagent.web.services.trigger_providers import gmail as gmail_trigger_provider
+from xagent.web.services.trigger_providers import (
+    register_trigger_provider,
+)
 
 from .conftest import _direct_db_session, client
 
@@ -3546,6 +3548,133 @@ def test_collect_gmail_pubsub_events_quiesces_structured_revoked_grant() -> None
         db.close()
 
 
+@pytest.mark.parametrize("failure_path", ["history", "message"])
+def test_collect_gmail_pubsub_events_quiesces_authorized_session_refresh(
+    failure_path: str,
+) -> None:
+    class FakeResponse:
+        content = b"{}"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"history": [{"messagesAdded": [{"message": {"id": "message-1"}}]}]}
+
+    class RevokedAuthorizedSession:
+        def request(self, _method: str, url: str, **_kwargs: object) -> FakeResponse:
+            if failure_path == "history" or "/messages/" in url:
+                raise RefreshError(
+                    "invalid_grant: Token has been expired or revoked.",
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "Token has been expired or revoked.",
+                    },
+                )
+            return FakeResponse()
+
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, f"gmail-authorized-session-{failure_path}-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _create_gmail_trigger(
+            db,
+            user,
+            config={
+                "watch_label": "INBOX",
+                "oauth_account_id": int(oauth.id),
+            },
+        )
+        state = _create_gmail_watch_state(
+            db,
+            user,
+            oauth,
+            callback_id=f"cb-authorized-session-{failure_path}",
+        )
+        state.status = TriggerProvisioningStatus.ACTIVE.value
+        db.commit()
+        service = gmail_triggers._GmailApiService(
+            RevokedAuthorizedSession(),
+            attempted_refresh_token="refresh-token",
+        )
+
+        collection = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id=f"pubsub-authorized-session-{failure_path}",
+                ),
+                state=state,
+                service_factory=lambda _db, _oauth: service,
+            )
+        )
+
+        assert collection.events == []
+        assert collection.skipped == 1
+        db.refresh(oauth)
+        db.refresh(state)
+        db.refresh(trigger)
+        assert oauth.access_token == ""
+        assert oauth.refresh_token is None
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+        assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    finally:
+        db.close()
+
+
+def test_collect_gmail_pubsub_events_preserves_concurrent_reconnect() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-concurrent-reconnect-user")
+        oauth = _create_gmail_oauth(db, user)
+        state = _create_gmail_watch_state(
+            db,
+            user,
+            oauth,
+            callback_id="cb-concurrent-reconnect",
+        )
+        state.status = TriggerProvisioningStatus.ACTIVE.value
+        db.commit()
+
+        def superseded_service_factory(_db, oauth_account):
+            setattr(oauth_account, "refresh_token", "new-refresh-token")
+            _db.add(oauth_account)
+            _db.commit()
+            raise GmailOAuthReconnectRequiredError(
+                attempted_refresh_token="refresh-token"
+            )
+
+        with pytest.raises(
+            GmailWatchConfigurationError,
+            match="superseded by newer credentials",
+        ):
+            asyncio.run(
+                collect_gmail_pubsub_events(
+                    db,
+                    GmailPubsubNotification(
+                        email_address="codeacme17@gmail.com",
+                        history_id="222",
+                        pubsub_message_id="pubsub-concurrent-reconnect",
+                    ),
+                    state=state,
+                    service_factory=superseded_service_factory,
+                )
+            )
+
+        db.refresh(oauth)
+        db.refresh(state)
+        assert oauth.access_token == "access-token"
+        assert oauth.refresh_token == "new-refresh-token"
+        assert state.last_error == (
+            "Gmail credential refresh was superseded by newer credentials"
+        )
+    finally:
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_skips_deleted_message_without_failing_batch() -> (
     None
 ):
@@ -4125,18 +4254,43 @@ def test_scan_due_gmail_watch_renewals_quiesces_structured_revoked_grant(
         assert "requires reconnect" in caplog.text
         assert "Traceback" not in caplog.text
 
+        live_user = _create_user(db, "gmail-renewal-live-after-tombstone-user")
+        live_oauth = _create_gmail_oauth(db, live_user)
+        live_oauth.email = "live-after-tombstone@example.com"
+        _create_gmail_trigger(db, live_user)
+        live_state = GmailWatchState(
+            user_id=int(live_user.id),
+            oauth_account_id=int(live_oauth.id),
+            email=str(live_oauth.email),
+            history_id="live-history",
+            watch_expiration=datetime(2026, 6, 29, 12, tzinfo=timezone.utc),
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add_all([live_oauth, live_state])
+        db.commit()
+        attempted_account_ids: list[int] = []
+        renewed_service = _FakeGmailService(
+            {"historyId": "renewed-live", "expiration": "1782864000000"}
+        )
+
+        def live_service_factory(_db, oauth_account):
+            attempted_account_ids.append(int(oauth_account.id))
+            return renewed_service
+
         caplog.clear()
         assert (
             scan_due_gmail_watch_renewals(
                 db,
                 now=datetime(2026, 6, 29, tzinfo=timezone.utc),
-                service_factory=lambda *_args: pytest.fail(
-                    "reconnect tombstone must not be retried"
-                ),
+                service_factory=live_service_factory,
+                limit=1,
             )
-            == 0
+            == 1
         )
-        assert caplog.text == ""
+        assert attempted_account_ids == [int(live_oauth.id)]
+        db.refresh(live_state)
+        assert live_state.history_id == "renewed-live"
+        assert "Traceback" not in caplog.text
     finally:
         db.close()
 

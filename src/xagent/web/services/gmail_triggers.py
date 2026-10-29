@@ -15,8 +15,9 @@ from google.auth.transport.requests import (
     Request,
 )
 from google.oauth2.credentials import Credentials
-from sqlalchemy import String, case, func, or_
+from sqlalchemy import String, case
 from sqlalchemy import cast as sql_cast
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -93,20 +94,29 @@ class _GmailApiRequest:
         session: Any,
         method: str,
         url: str,
+        attempted_refresh_token: str | None = None,
         **kwargs: Any,
     ) -> None:
         self._session = session
         self._method = method
         self._url = url
         self._kwargs = kwargs
+        self._attempted_refresh_token = attempted_refresh_token
 
     def execute(self) -> dict[str, Any]:
-        response = self._session.request(
-            self._method,
-            self._url,
-            timeout=10,
-            **self._kwargs,
-        )
+        try:
+            response = self._session.request(
+                self._method,
+                self._url,
+                timeout=10,
+                **self._kwargs,
+            )
+        except RefreshError as exc:
+            if _is_google_revoked_refresh_exception(exc):
+                raise GmailOAuthReconnectRequiredError(
+                    attempted_refresh_token=self._attempted_refresh_token
+                ) from exc
+            raise
         response.raise_for_status()
         if not response.content:
             return {}
@@ -115,9 +125,15 @@ class _GmailApiRequest:
 
 
 class _GmailMessagesResource:
-    def __init__(self, session: Any, user_id: str) -> None:
+    def __init__(
+        self,
+        session: Any,
+        user_id: str,
+        attempted_refresh_token: str | None,
+    ) -> None:
         self._session = session
         self._user_id = quote(user_id, safe="")
+        self._attempted_refresh_token = attempted_refresh_token
 
     def get(self, **kwargs: Any) -> _GmailApiRequest:
         message_id = quote(str(kwargs.pop("id")), safe="")
@@ -125,28 +141,37 @@ class _GmailMessagesResource:
             self._session,
             "GET",
             f"{GMAIL_API_ROOT}/users/{self._user_id}/messages/{message_id}",
+            attempted_refresh_token=self._attempted_refresh_token,
             params=kwargs,
         )
 
 
 class _GmailHistoryResource:
-    def __init__(self, session: Any, user_id: str) -> None:
+    def __init__(
+        self,
+        session: Any,
+        user_id: str,
+        attempted_refresh_token: str | None,
+    ) -> None:
         self._session = session
         self._user_id = quote(user_id, safe="")
+        self._attempted_refresh_token = attempted_refresh_token
 
     def list(self, **kwargs: Any) -> _GmailApiRequest:
         return _GmailApiRequest(
             self._session,
             "GET",
             f"{GMAIL_API_ROOT}/users/{self._user_id}/history",
+            attempted_refresh_token=self._attempted_refresh_token,
             params=kwargs,
         )
 
 
 class _GmailUsersResource:
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, attempted_refresh_token: str | None) -> None:
         self._session = session
         self._user_id = "me"
+        self._attempted_refresh_token = attempted_refresh_token
 
     def watch(self, *, userId: str, body: dict[str, Any]) -> _GmailApiRequest:
         user_id = quote(userId, safe="")
@@ -154,6 +179,7 @@ class _GmailUsersResource:
             self._session,
             "POST",
             f"{GMAIL_API_ROOT}/users/{user_id}/watch",
+            attempted_refresh_token=self._attempted_refresh_token,
             json=body,
         )
 
@@ -163,21 +189,31 @@ class _GmailUsersResource:
             self._session,
             "POST",
             f"{GMAIL_API_ROOT}/users/{user_id}/stop",
+            attempted_refresh_token=self._attempted_refresh_token,
         )
 
     def history(self) -> _GmailHistoryResource:
-        return _GmailHistoryResource(self._session, self._user_id)
+        return _GmailHistoryResource(
+            self._session,
+            self._user_id,
+            self._attempted_refresh_token,
+        )
 
     def messages(self) -> _GmailMessagesResource:
-        return _GmailMessagesResource(self._session, self._user_id)
+        return _GmailMessagesResource(
+            self._session,
+            self._user_id,
+            self._attempted_refresh_token,
+        )
 
 
 class _GmailApiService:
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, *, attempted_refresh_token: str | None) -> None:
         self._session = session
+        self._attempted_refresh_token = attempted_refresh_token
 
     def users(self) -> _GmailUsersResource:
-        return _GmailUsersResource(self._session)
+        return _GmailUsersResource(self._session, self._attempted_refresh_token)
 
 
 @dataclass(frozen=True)
@@ -279,7 +315,12 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
             setattr(oauth_account, "expires_at", _coerce_utc(creds.expiry))
         db.commit()
 
-    return _GmailApiService(AuthorizedSession(creds))
+    return _GmailApiService(
+        AuthorizedSession(creds),
+        attempted_refresh_token=(
+            str(creds.refresh_token) if creds.refresh_token is not None else None
+        ),
+    )
 
 
 def _exception_status_code(exc: Exception) -> int | None:
@@ -667,6 +708,43 @@ def _get_gmail_message(service: Any, message_id: str) -> dict[str, Any]:
     return response if isinstance(response, dict) else {}
 
 
+async def _quiesce_gmail_oauth_reconnect(
+    db: Session,
+    *,
+    oauth_account: UserOAuth,
+    state_id: int,
+    exc: GmailOAuthReconnectRequiredError,
+) -> GmailPubsubEventCollection:
+    """Persist a reconnect tombstone and acknowledge the current callback."""
+
+    db.rollback()
+    from .gmail_provisioning import mark_gmail_oauth_reconnect_required
+
+    updated = await asyncio.to_thread(
+        mark_gmail_oauth_reconnect_required,
+        db,
+        oauth_account=oauth_account,
+        expected_refresh_token=exc.attempted_refresh_token,
+    )
+    if updated is not None:
+        logger.warning(
+            "Gmail OAuth grant for watch %s requires reconnect; "
+            "acknowledging callback without reading more Gmail data",
+            state_id,
+        )
+        return GmailPubsubEventCollection(events=[], skipped=1)
+
+    replacement_error = GmailWatchConfigurationError(
+        "Gmail credential refresh was superseded by newer credentials"
+    )
+    _record_watch_state_error(
+        db,
+        state_id=state_id,
+        error_message=str(replacement_error),
+    )
+    raise replacement_error from exc
+
+
 async def collect_gmail_pubsub_events(
     db: Session,
     notification: GmailPubsubNotification,
@@ -712,31 +790,12 @@ async def collect_gmail_pubsub_events(
     try:
         service = await asyncio.to_thread(service_factory, db, oauth_account)
     except GmailOAuthReconnectRequiredError as exc:
-        db.rollback()
-        from .gmail_provisioning import mark_gmail_oauth_reconnect_required
-
-        updated = await asyncio.to_thread(
-            mark_gmail_oauth_reconnect_required,
+        return await _quiesce_gmail_oauth_reconnect(
             db,
             oauth_account=oauth_account,
-            expected_refresh_token=exc.attempted_refresh_token,
-        )
-        if updated is not None:
-            logger.warning(
-                "Gmail OAuth grant for watch %s requires reconnect; "
-                "acknowledging callback without reading Gmail history",
-                state_id,
-            )
-            return GmailPubsubEventCollection(events=[], skipped=1)
-        replacement_error = GmailWatchConfigurationError(
-            "Gmail credential refresh was superseded by newer credentials"
-        )
-        _record_watch_state_error(
-            db,
             state_id=state_id,
-            error_message=str(replacement_error),
+            exc=exc,
         )
-        raise replacement_error from exc
     except GmailTriggerError as exc:
         db.rollback()
         _record_watch_state_error(
@@ -752,6 +811,13 @@ async def collect_gmail_pubsub_events(
             _list_added_message_ids,
             service,
             start_history_id=start_history_id,
+        )
+    except GmailOAuthReconnectRequiredError as exc:
+        return await _quiesce_gmail_oauth_reconnect(
+            db,
+            oauth_account=oauth_account,
+            state_id=state_id,
+            exc=exc,
         )
     except Exception as exc:
         if _exception_status_code(exc) not in (400, 404):
@@ -867,6 +933,13 @@ async def collect_gmail_pubsub_events(
                 )
             if not matched:
                 skipped += 1
+        except GmailOAuthReconnectRequiredError as exc:
+            return await _quiesce_gmail_oauth_reconnect(
+                db,
+                oauth_account=oauth_account,
+                state_id=state_id,
+                exc=exc,
+            )
         except Exception as exc:
             logger.error(
                 "Failed to collect Gmail message %s for %s: %s",

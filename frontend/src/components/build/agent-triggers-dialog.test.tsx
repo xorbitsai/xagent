@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
+const authState = vi.hoisted(() => ({ userId: "1", isAdmin: false }))
 const translateMock = vi.hoisted(() => {
   return (key: string, vars?: Record<string, string | number>) => {
     if (vars?.count) return `${key}:${vars.count}`
@@ -24,6 +25,12 @@ vi.mock("@/lib/utils", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: translateMock, locale: "en" }),
+}))
+
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({
+    user: { id: authState.userId, username: "tester", is_admin: authState.isAdmin },
+  }),
 }))
 
 vi.mock("next/navigation", () => ({
@@ -97,6 +104,8 @@ describe("AgentTriggersDialog", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
+    authState.userId = "1"
+    authState.isAdmin = false
     gmailAccounts = [
       { id: 7, provider: "gmail", email: "gerard.santos@gmail.com" },
     ]
@@ -579,6 +588,9 @@ describe("AgentTriggersDialog", () => {
     expect(screen.getByText("triggers.runs.input")).toBeInTheDocument()
     expect(screen.getByText("triggers.runs.result")).toBeInTheDocument()
     expect(routerPushMock).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "triggers.runs.openTask" }))
+    expect(routerPushMock).toHaveBeenCalledWith("/task/99")
   })
 
   it("shows a routine history authorization error inline", async () => {
@@ -630,8 +642,47 @@ describe("AgentTriggersDialog", () => {
     fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
     fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult" }))
 
-    expect(await screen.findByText("Trigger run is not available")).toBeInTheDocument()
+    expect(await screen.findByText("triggers.runs.historyForbidden")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "common.retry" })).not.toBeInTheDocument()
     expect(screen.queryByText("Connection lost. Reload the page to reconnect.")).not.toBeInTheDocument()
+  })
+
+  it("does not show the interactive task link to a teammate who does not own the run", async () => {
+    authState.userId = "2"
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: 99,
+              status: "completed",
+              idempotency_key: "run-12",
+            },
+          ]),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    expect(await screen.findByRole("button", { name: "triggers.runs.viewResult" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "triggers.runs.openTask" })).not.toBeInTheDocument()
   })
 
   it("reconciles a card switch from the PATCH response, not just the requested value", async () => {

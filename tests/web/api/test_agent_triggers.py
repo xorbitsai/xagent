@@ -17,10 +17,16 @@ from xagent.core.utils.encryption import decrypt_value
 from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.mcp import MCPServer, UserMCPServer
-from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
+from xagent.web.models.task import (
+    Task,
+    TaskConnectorRuntimeContext,
+    TaskStatus,
+    TraceEvent,
+)
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerAudit,
+    TriggerAuditOutcome,
     TriggerProvisioningStatus,
     TriggerRun,
     TriggerRunStatus,
@@ -3601,9 +3607,7 @@ def test_trigger_runtime_visibility_uses_trigger_task_owner() -> None:
         set_agent_team_scope_hook(None)
 
 
-def test_team_member_can_read_shared_trigger_run_history_without_task_ownership() -> (
-    None
-):
+def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
     """Routine visibility, not Task ownership, governs the read-only history."""
     admin_headers = _admin_headers()
     teammate_headers = _register_second_user("routine-history-teammate")
@@ -3640,47 +3644,99 @@ def test_team_member_can_read_shared_trigger_run_history_without_task_ownership(
         )
         assert created.status_code == 200, created.text
         trigger_id = int(created.json()["id"])
-        fired = client.post(
-            f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+
+        other_trigger = client.post(
+            f"/api/agents/{agent_id}/triggers",
             headers=admin_headers,
-            json={"payload": {"subject": "daily report"}},
+            json={"type": "webhook", "name": "Other history hook"},
         )
-        assert fired.status_code == 200, fired.text
-        run = fired.json()["trigger_run"]
-        run_id = int(run["id"])
-        task_id = int(run["task_id"])
+        assert other_trigger.status_code == 200, other_trigger.text
+        other_trigger_id = int(other_trigger.json()["id"])
 
         db = _direct_db_session()
         try:
-            task = db.query(Task).filter(Task.id == task_id).one()
-            assert int(task.user_id) == admin_user_id
+            task = Task(
+                user_id=admin_user_id,
+                title="Shared routine history",
+                description="Prepare the daily report",
+                status=TaskStatus.COMPLETED,
+                agent_id=agent_id,
+                execution_mode="balanced",
+                source="trigger",
+                is_visible=False,
+                input="Prepare the daily report",
+            )
+            db.add(task)
+            db.flush()
+            run = TriggerRun(
+                trigger_id=trigger_id,
+                task_id=int(task.id),
+                status=TriggerRunStatus.COMPLETED.value,
+                idempotency_key="history:shared",
+            )
+            db.add(run)
+            db.flush()
+            user_message = TaskChatMessage(
+                task_id=int(task.id),
+                user_id=admin_user_id,
+                role="user",
+                content="Prepare the daily report",
+                message_type="user_message",
+                attachments=[{"file_id": "private-file", "name": "input.csv"}],
+            )
+            assistant_message = TaskChatMessage(
+                task_id=int(task.id),
+                user_id=admin_user_id,
+                role="assistant",
+                content="The daily report is ready",
+                message_type="assistant_response",
+            )
+            db.add_all([user_message, assistant_message])
+            db.flush()
             db.add_all(
                 [
                     TaskChatMessage(
-                        task_id=task_id,
-                        user_id=admin_user_id,
-                        role="user",
-                        content="Prepare the daily report",
-                        message_type="user_message",
-                        attachments=[{"file_id": "private-file", "name": "input.csv"}],
-                    ),
-                    TaskChatMessage(
-                        task_id=task_id,
+                        task_id=int(task.id),
                         user_id=admin_user_id,
                         role="assistant",
-                        content="The daily report is ready",
-                        message_type="assistant_response",
+                        content="private untrusted failure detail",
+                        message_type="assistant_message",
                     ),
                     TaskChatMessage(
-                        task_id=task_id,
+                        task_id=int(task.id),
+                        user_id=admin_user_id,
+                        role="assistant",
+                        content="",
+                        message_type="assistant_response",
+                        interactions=[{"type": "tool_calls", "secret": "do-not-leak"}],
+                    ),
+                    TaskChatMessage(
+                        task_id=int(task.id),
                         user_id=admin_user_id,
                         role="system",
                         content="internal orchestration note",
                         message_type="system_message",
                     ),
+                    # Model-context reads replace everything through this
+                    # watermark with a system summary. Display-history reads
+                    # must still return the original user-visible rows.
+                    TraceEvent(
+                        task_id=int(task.id),
+                        event_id="routine-history-compaction",
+                        event_type="action_end_compact",
+                        timestamp=datetime.now(timezone.utc),
+                        data={
+                            "compact_type": "execution_context",
+                            "strategy": "llm_summary",
+                            "summary": "Earlier routine conversation",
+                            "watermark_message_id": int(assistant_message.id),
+                        },
+                    ),
                 ]
             )
             db.commit()
+            task_id = int(task.id)
+            run_id = int(run.id)
         finally:
             db.close()
 
@@ -3692,16 +3748,40 @@ def test_team_member_can_read_shared_trigger_run_history_without_task_ownership(
         teammate_history = teammate_read.json()
         assert teammate_history["run_id"] == run_id
         assert teammate_history["task_id"] == task_id
-        assert teammate_history["messages"][-2:] == [
+        assert teammate_history["messages"] == [
             {"role": "user", "content": "Prepare the daily report"},
             {"role": "assistant", "content": "The daily report is ready"},
+            {"role": "assistant", "content": "Task execution failed."},
         ]
-        assert {message["role"] for message in teammate_history["messages"]} <= {
-            "user",
-            "assistant",
-        }
         assert "private-file" not in teammate_read.text
+        assert "do-not-leak" not in teammate_read.text
         assert "internal orchestration note" not in teammate_read.text
+        assert "Earlier routine conversation" not in teammate_read.text
+
+        db = _direct_db_session()
+        try:
+            audit = (
+                db.query(TriggerAudit)
+                .filter(
+                    TriggerAudit.trigger_id == trigger_id,
+                    TriggerAudit.outcome == TriggerAuditOutcome.PAYLOAD_READ.value,
+                )
+                .one()
+            )
+            assert audit.detail == {
+                "trigger_run_id": run_id,
+                "user_id": teammate_user_id,
+                "success": True,
+                "surface": "run_history",
+            }
+        finally:
+            db.close()
+
+        cross_trigger_read = client.get(
+            f"/api/agents/{agent_id}/triggers/{other_trigger_id}/runs/{run_id}/history",
+            headers=admin_headers,
+        )
+        assert cross_trigger_read.status_code == 404, cross_trigger_read.text
 
         owner_read = client.get(history_url, headers=admin_headers)
         assert owner_read.status_code == 200, owner_read.text
@@ -3710,6 +3790,76 @@ def test_team_member_can_read_shared_trigger_run_history_without_task_ownership(
         assert outsider_read.status_code == 404, outsider_read.text
     finally:
         set_agent_team_scope_hook(None)
+
+
+def test_trigger_run_history_uses_v2_display_snapshot() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "V2 routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "V2 history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title="V2 routine history",
+            description="V2 prompt",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="V2 prompt",
+            conversation_storage_version=2,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="history:v2",
+        )
+        db.add(run)
+        db.commit()
+        run_id = int(run.id)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    snapshot = MagicMock(
+        messages=(
+            {"role": "user", "content": "V2 prompt"},
+            {"role": "assistant", "content": "V2 result"},
+            {"role": "assistant", "content": ""},
+            {"role": "system", "content": "internal"},
+        )
+    )
+    with patch(
+        "xagent.web.services.task_event_display.load_event_display_snapshot",
+        return_value=snapshot,
+    ) as load_snapshot:
+        history = client.get(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+            headers=headers,
+        )
+
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "V2 prompt"},
+            {"role": "assistant", "content": "V2 result"},
+        ],
+    }
+    load_snapshot.assert_called_once()
 
 
 def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:

@@ -1,6 +1,7 @@
 "use client"
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useRouter } from "next/navigation"
 import {
   AlertCircle,
   CalendarCheck,
@@ -9,6 +10,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Copy,
+  ExternalLink,
   Info,
   Loader2,
   Mail,
@@ -36,11 +38,13 @@ import { Select } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { toast } from "@/components/ui/sonner"
+import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import {
   AgentTrigger,
   AgentTriggerRun,
   AgentTriggerRunHistory,
+  AgentTriggerRunHistoryError,
   AgentTriggerType,
   GmailAccount,
   StagedTrigger,
@@ -109,6 +113,11 @@ interface TriggerFormState extends ScheduleFieldsValue {
   senderFilter: string
   subjectKeyword: string
   oauthAccountId: string
+}
+
+interface RunHistoryErrorState {
+  message: string
+  retryable: boolean
 }
 
 const TRIGGER_TYPES: AgentTriggerType[] = ["webhook", "scheduled", "gmail"]
@@ -525,6 +534,8 @@ export function AgentTriggersDialog({
   staged = null,
 }: AgentTriggersDialogProps) {
   const { t, locale } = useI18n()
+  const { user } = useAuth()
+  const router = useRouter()
   const [liveTriggers, setLiveTriggers] = useState<AgentTrigger[]>([])
   const [activeType, setActiveTypeState] = useState<AgentTriggerType | null>(null)
   // Detail sub-mode: false = the type's trigger list (cards / empty state),
@@ -535,7 +546,7 @@ export function AgentTriggersDialog({
   const [expandedRunId, setExpandedRunId] = useState<number | null>(null)
   const [runHistory, setRunHistory] = useState<AgentTriggerRunHistory | null>(null)
   const [runHistoryLoading, setRunHistoryLoading] = useState(false)
-  const [runHistoryError, setRunHistoryError] = useState<string | null>(null)
+  const [runHistoryError, setRunHistoryError] = useState<RunHistoryErrorState | null>(null)
   const runHistoryRequestRef = useRef(0)
   const [loading, setLoading] = useState(false)
   const [runsLoading, setRunsLoading] = useState(false)
@@ -750,9 +761,19 @@ export function AgentTriggersDialog({
     } catch (err) {
       if (runHistoryRequestRef.current !== requestId) return
       console.error(err)
-      setRunHistoryError(
-        err instanceof Error ? err.message : t("triggers.runs.historyLoadFailed"),
-      )
+      const status = err instanceof AgentTriggerRunHistoryError ? err.status : null
+      const message =
+        status === 410
+          ? t("triggers.runs.historyExpired")
+          : status === 404
+            ? t("triggers.runs.historyUnavailable")
+            : status === 403
+              ? t("triggers.runs.historyForbidden")
+              : t("triggers.runs.historyLoadFailed")
+      setRunHistoryError({
+        message,
+        retryable: status === null || ![403, 404, 410].includes(status),
+      })
     } finally {
       if (runHistoryRequestRef.current === requestId) {
         setRunHistoryLoading(false)
@@ -2254,25 +2275,40 @@ export function AgentTriggersDialog({
                         {run.source_event_id || run.idempotency_key}
                       </span>
                       {run.task_id ? (
-                        <Button
-                          variant="link"
-                          className="h-auto gap-0.5 p-0 text-xs"
-                          aria-expanded={expandedRunId === run.id}
-                          aria-label={t(
-                            expandedRunId === run.id
-                              ? "triggers.runs.hideResult"
-                              : "triggers.runs.viewResult",
-                          )}
-                          onClick={() => toggleRunHistory(run)}
-                        >
-                          #{run.task_id}
-                          <ChevronRight
-                            className={cn(
-                              "h-3 w-3 transition-transform",
-                              expandedRunId === run.id && "rotate-90",
+                        <div className="flex items-center gap-1">
+                          <Button
+                            variant="link"
+                            className="h-auto gap-0.5 p-0 text-xs"
+                            aria-expanded={expandedRunId === run.id}
+                            aria-label={t(
+                              expandedRunId === run.id
+                                ? "triggers.runs.hideResult"
+                                : "triggers.runs.viewResult",
                             )}
-                          />
-                        </Button>
+                            onClick={() => toggleRunHistory(run)}
+                          >
+                            #{run.task_id}
+                            <ChevronRight
+                              className={cn(
+                                "h-3 w-3 transition-transform",
+                                expandedRunId === run.id && "rotate-90",
+                              )}
+                            />
+                          </Button>
+                          {user &&
+                            (user.is_admin || String(user.id) === String(selectedTrigger.user_id)) && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6"
+                                aria-label={t("triggers.runs.openTask")}
+                                onClick={() => router.push(`/task/${run.task_id}`)}
+                              >
+                                <ExternalLink className="h-3 w-3" />
+                              </Button>
+                            )}
+                        </div>
                       ) : run.task_expired_at ? (
                         <span className="shrink-0 text-xs text-muted-foreground">
                           {t("triggers.runs.taskExpired", {
@@ -2284,7 +2320,7 @@ export function AgentTriggersDialog({
                       )}
                     </div>
 
-                    {expandedRunId === run.id && run.task_id !== null && (
+                    {expandedRunId === run.id && (
                       <div className="space-y-3 rounded-md border bg-background p-3">
                         <div className="text-xs font-semibold text-muted-foreground">
                           {t("triggers.runs.historyTitle")}
@@ -2295,16 +2331,18 @@ export function AgentTriggersDialog({
                           </div>
                         ) : runHistoryError ? (
                           <div className="flex items-center justify-between gap-3 rounded-md bg-destructive/10 px-3 py-2 text-xs text-destructive">
-                            <span>{runHistoryError}</span>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 shrink-0 px-2 text-xs"
-                              onClick={() => void loadRunHistory(run)}
-                            >
-                              {t("common.retry")}
-                            </Button>
+                            <span>{runHistoryError.message}</span>
+                            {runHistoryError.retryable && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 shrink-0 px-2 text-xs"
+                                onClick={() => void loadRunHistory(run)}
+                              >
+                                {t("common.retry")}
+                              </Button>
+                            )}
                           </div>
                         ) : runHistory?.messages.length ? (
                           <div className="space-y-3">

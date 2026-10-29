@@ -11,12 +11,13 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.task import Task
 from ..models.trigger import AgentTrigger, TriggerAuditOutcome, TriggerRun
 from ..models.user import User
 from ..models.workforce import Workforce
-from ..services.chat_history_service import load_task_transcript
+from ..services.assistant_history_safety import client_safe_assistant_history_content
 from ..services.gmail_provisioning import reconcile_gmail_trigger_provisioning
 from ..services.trigger_providers import (
     CallbackRequestContext,
@@ -420,13 +421,7 @@ def _trigger_run_detail(
     request: Request,
     user_id: int,
 ) -> TriggerRunResponse:
-    run = (
-        db.query(TriggerRun)
-        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
-        .first()
-    )
-    if run is None:
-        raise HTTPException(status_code=404, detail="Trigger run not found")
+    run = _run_or_404(db, trigger=trigger, run_id=run_id)
 
     payload: Any | None = None
     if include_payload:
@@ -472,11 +467,77 @@ def _trigger_run_detail(
     return _serialize_run(run, payload=payload)
 
 
+def _run_or_404(
+    db: Session,
+    *,
+    trigger: AgentTrigger,
+    run_id: int,
+) -> TriggerRun:
+    run = (
+        db.query(TriggerRun)
+        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Trigger run not found")
+    return run
+
+
+def _display_history_messages(
+    db: Session,
+    *,
+    task: Task,
+) -> list[TriggerRunHistoryMessage]:
+    """Read the full client display transcript, independent of model compaction."""
+    if int(task.conversation_storage_version) == 2:
+        from ..services.task_event_display import load_event_display_snapshot
+
+        rows: list[Any] = list(load_event_display_snapshot(db, int(task.id)).messages)
+    else:
+        rows = list(
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == int(task.id))
+            .order_by(TaskChatMessage.id.asc())
+            .all()
+        )
+
+    messages: list[TriggerRunHistoryMessage] = []
+    for row in rows:
+        if isinstance(row, TaskChatMessage):
+            role = str(row.role)
+            content = str(row.content or "")
+            if role == "assistant":
+                content = client_safe_assistant_history_content(
+                    content=content,
+                    message_type=str(row.message_type or ""),
+                )
+        elif isinstance(row, dict):
+            role = row.get("role")
+            content = row.get("content")
+        else:
+            continue
+        if role not in {"user", "assistant"} or not isinstance(content, str):
+            continue
+        if not content.strip():
+            # Tool-only/empty assistant projections have no safe textual
+            # content on this deliberately text-only read surface.
+            continue
+        messages.append(
+            TriggerRunHistoryMessage(
+                role=cast(Literal["user", "assistant"], role),
+                content=content,
+            )
+        )
+    return messages
+
+
 def _trigger_run_history(
     db: Session,
     *,
     trigger: AgentTrigger,
     run_id: int,
+    request: Request,
+    user_id: int,
 ) -> TriggerRunHistoryResponse:
     """Return a run's read-only, client-safe transcript.
 
@@ -487,13 +548,7 @@ def _trigger_run_history(
     Keeping this as a dedicated read-only projection avoids widening task
     ownership or granting access to continue somebody else's conversation.
     """
-    run = (
-        db.query(TriggerRun)
-        .filter(TriggerRun.id == run_id, TriggerRun.trigger_id == int(trigger.id))
-        .first()
-    )
-    if run is None:
-        raise HTTPException(status_code=404, detail="Trigger run not found")
+    run = _run_or_404(db, trigger=trigger, run_id=run_id)
     if run.task_id is None:
         if run.task_expired_at is not None:
             raise HTTPException(
@@ -506,18 +561,31 @@ def _trigger_run_history(
         )
 
     task_id = int(run.task_id)
-    if db.query(Task.id).filter(Task.id == task_id).first() is None:
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
         raise HTTPException(
             status_code=404,
             detail="Trigger run conversation not found",
         )
 
-    messages = [
-        TriggerRunHistoryMessage(role=role, content=content)
-        for item in load_task_transcript(db, task_id)
-        if (role := item.get("role")) in {"user", "assistant"}
-        and isinstance(content := item.get("content"), str)
-    ]
+    messages = _display_history_messages(db, task=task)
+    # The first user turn is the rendered trigger prompt and may embed the
+    # original event payload. Treat this read like include_payload=True so it
+    # leaves the same durable forensic trail.
+    record_trigger_audit(
+        db,
+        outcome=TriggerAuditOutcome.PAYLOAD_READ,
+        provider=str(trigger.provider) if trigger.provider else None,
+        callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+        trigger_id=int(trigger.id),
+        detail={
+            "trigger_run_id": int(run.id),
+            "user_id": user_id,
+            "success": True,
+            "surface": "run_history",
+        },
+        remote_ip=request.client.host if request.client else None,
+    )
     return TriggerRunHistoryResponse(
         run_id=int(run.id),
         task_id=task_id,
@@ -533,6 +601,7 @@ def get_trigger_run_history(
     agent_id: int,
     trigger_id: int,
     run_id: int,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TriggerRunHistoryResponse:
@@ -542,7 +611,13 @@ def get_trigger_run_history(
         agent_id=agent_id,
         trigger_id=trigger_id,
     )
-    return _trigger_run_history(db, trigger=trigger, run_id=run_id)
+    return _trigger_run_history(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        request=request,
+        user_id=int(current_user.id),
+    )
 
 
 @router.post(
@@ -785,6 +860,7 @@ def get_workforce_trigger_run_history_route(
     workforce_id: int,
     trigger_id: int,
     run_id: int,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> TriggerRunHistoryResponse:
@@ -795,7 +871,13 @@ def get_workforce_trigger_run_history_route(
         trigger_id=trigger_id,
         action="view",
     )
-    return _trigger_run_history(db, trigger=trigger, run_id=run_id)
+    return _trigger_run_history(
+        db,
+        trigger=trigger,
+        run_id=run_id,
+        request=request,
+        user_id=int(current_user.id),
+    )
 
 
 @router.post(

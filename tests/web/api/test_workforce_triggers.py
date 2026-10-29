@@ -426,6 +426,14 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
         "content": "Workforce routine finished",
     }
 
+    outsider_headers = _register_second_user("workforce-history-outsider")
+    outsider_history = client.get(
+        f"/api/workforces/{workforce_id}/triggers/{trigger['id']}"
+        f"/runs/{run_id}/history",
+        headers=outsider_headers,
+    )
+    assert outsider_history.status_code == 403, outsider_history.text
+
 
 def test_workforce_webhook_callback_fires_and_deduplicates(
     mock_bg_scheduler,

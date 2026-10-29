@@ -68,6 +68,16 @@ export interface AgentTriggerRunHistory {
   messages: AgentTriggerRunHistoryMessage[]
 }
 
+export class AgentTriggerRunHistoryError extends Error {
+  readonly status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = "AgentTriggerRunHistoryError"
+    this.status = status
+  }
+}
+
 export interface AgentTriggerPayload {
   type?: AgentTriggerType
   name?: string | null
@@ -346,7 +356,8 @@ export async function getOwnerTriggerRunHistory(
     `${ownerTriggerUrl(owner, triggerId)}/runs/${runId}/history`,
   )
   if (!response.ok) {
-    throw await parseApiError(response, "Failed to load trigger run history")
+    const error = await parseApiError(response, "Failed to load trigger run history")
+    throw new AgentTriggerRunHistoryError(response.status, error.message)
   }
   return response.json()
 }

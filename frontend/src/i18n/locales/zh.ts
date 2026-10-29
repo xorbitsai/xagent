@@ -4569,6 +4569,10 @@ const zh = {
       historyTitle: "运行会话",
       historyEmpty: "此次运行没有可显示的会话记录",
       historyLoadFailed: "加载运行会话失败",
+      historyExpired: "此次运行会话已过期",
+      historyUnavailable: "此次运行会话已不可用",
+      historyForbidden: "你没有权限查看此次运行会话",
+      openTask: "打开任务",
       input: "Routine 输入",
       result: "Agent 回复"
     },

@@ -11,6 +11,7 @@ vi.mock("@/lib/utils", () => ({
 }))
 
 import {
+  AgentTriggerRunHistoryError,
   StagedTrigger,
   createAgentTrigger,
   createOwnerTrigger,
@@ -152,6 +153,19 @@ describe("agent trigger API client", () => {
       "http://api.local/api/agents/42/triggers/7/runs/12/history",
     )
     expect(history.messages[1].content).toBe("Report complete")
+  })
+
+  it("preserves the response status when run history cannot be loaded", async () => {
+    apiRequestMock.mockResolvedValue(
+      jsonResponse({ detail: "Trigger run conversation has expired" }, { status: 410 }),
+    )
+
+    const request = getOwnerTriggerRunHistory({ kind: "agent", id: 42 }, 7, 12)
+
+    await expect(request).rejects.toMatchObject<Partial<AgentTriggerRunHistoryError>>({
+      name: "AgentTriggerRunHistoryError",
+      status: 410,
+    })
   })
 })
 

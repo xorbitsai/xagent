@@ -157,4 +157,4 @@ def test_current_description_matches_registry_and_seed():
 def test_down_revision_matches_current_head():
     migration = _load_migration_module()
 
-    assert migration.down_revision == "20261027_wrap_legacy_password_hashes"
+    assert migration.down_revision == "20261029_google_oauth_grants"

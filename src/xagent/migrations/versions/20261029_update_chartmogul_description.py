@@ -1,7 +1,7 @@
 """update ChartMogul connector description for metrics tools
 
 Revision ID: 20261029_update_chartmogul_description
-Revises: 20261027_wrap_legacy_password_hashes
+Revises: 20261029_google_oauth_grants
 Create Date: 2026-10-29
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261029_update_chartmogul_description"
-down_revision: Union[str, None] = "20261027_wrap_legacy_password_hashes"
+down_revision: Union[str, None] = "20261029_google_oauth_grants"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

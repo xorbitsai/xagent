@@ -52,6 +52,11 @@ MetricInterval = Literal["day", "week", "month", "quarter", "year"]
 
 _METRIC_NAMES = get_args(MetricName)
 _METRIC_INTERVALS = get_args(MetricInterval)
+_METRIC_INTERVALS_BY_NAME = {
+    metric: frozenset(_METRIC_INTERVALS) for metric in _METRIC_NAMES
+}
+_METRIC_INTERVALS_BY_NAME["asp"] = frozenset({"month", "quarter", "year"})
+_METRIC_INTERVALS_BY_NAME["ltv"] = frozenset({"month"})
 _ALL_METRIC_MONEY_ENTRY_FIELDS = ("mrr", "arr", "ltv", "asp", "arpa")
 _ALL_METRIC_MONEY_SUMMARY_FIELDS = (
     "current-mrr",
@@ -132,7 +137,10 @@ def _entries_with_major_units(
 
 
 def _metric_record_with_major_units(
-    record: dict[str, Any], money_fields: tuple[str, ...]
+    record: dict[str, Any],
+    money_fields: tuple[str, ...],
+    *,
+    allow_fractional: bool = False,
 ) -> dict[str, Any]:
     """Normalize known metric money fields and retain their source cents."""
     normalized = dict(record)
@@ -141,7 +149,20 @@ def _metric_record_with_major_units(
             continue
         cents = record[field]
         normalized[f"{field.replace('-', '_')}_cents"] = cents
-        normalized[field] = _major_units(cents, field)
+        if allow_fractional:
+            if isinstance(cents, bool) or not isinstance(cents, (int, float)):
+                raise TypeError(
+                    f"ChartMogul returned a non-numeric value for {field}: "
+                    f"{type(cents).__name__}"
+                )
+            decimal_cents = Decimal(str(cents))
+            if not decimal_cents.is_finite():
+                raise TypeError(
+                    f"ChartMogul returned a non-finite value for {field}: {cents}"
+                )
+            normalized[field] = f"{decimal_cents / Decimal(100):.2f}"
+        else:
+            normalized[field] = _major_units(cents, field)
     return normalized
 
 
@@ -172,14 +193,23 @@ def _metrics_with_major_units(
     else:
         entry_money_fields = ()
         summary_money_fields = ()
+    allow_fractional = metric == "ltv"
 
     return {
         **result,
         "entries": [
-            _metric_record_with_major_units(entry, entry_money_fields)
+            _metric_record_with_major_units(
+                entry,
+                entry_money_fields,
+                allow_fractional=allow_fractional,
+            )
             for entry in entries
         ],
-        "summary": _metric_record_with_major_units(summary, summary_money_fields),
+        "summary": _metric_record_with_major_units(
+            summary,
+            summary_money_fields,
+            allow_fractional=allow_fractional,
+        ),
     }
 
 
@@ -819,7 +849,10 @@ def chartmogul_get_metrics(
     start_date: inclusive start date in YYYY-MM-DD format.
     end_date: inclusive end date in YYYY-MM-DD format; must be on or after
       start_date.
-    interval: one of "day", "week", "month", "quarter", or "year".
+    interval: one of "day", "week", "month", "quarter", or "year" for most
+      metrics. ASP supports only "month", "quarter", and "year". Standalone
+      LTV is monthly-only, so it accepts only "month" and does not send an
+      interval parameter to ChartMogul.
     geo: optional comma-separated ISO 3166-1 alpha-2 country codes.
     plans: optional comma-separated plan UUIDs, external IDs, or names.
     """
@@ -828,9 +861,11 @@ def chartmogul_get_metrics(
             raise ValueError(
                 "metric must be one of: " + ", ".join(sorted(_METRIC_NAMES))
             )
-        if interval not in _METRIC_INTERVALS:
+        allowed_intervals = _METRIC_INTERVALS_BY_NAME[metric]
+        if interval not in allowed_intervals:
             raise ValueError(
-                "interval must be one of: " + ", ".join(sorted(_METRIC_INTERVALS))
+                f"interval for {metric} must be one of: "
+                + ", ".join(sorted(allowed_intervals))
             )
         endpoint = f"/metrics/{metric}"
         normalized_start = _iso_date(start_date, "start_date")
@@ -844,7 +879,7 @@ def chartmogul_get_metrics(
             params={
                 "start-date": normalized_start,
                 "end-date": normalized_end,
-                "interval": interval,
+                "interval": None if metric == "ltv" else interval,
                 "geo": geo,
                 "plans": plans,
             },

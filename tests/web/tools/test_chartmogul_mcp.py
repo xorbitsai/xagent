@@ -761,14 +761,64 @@ def test_get_metrics_count_values_are_not_treated_as_money(monkeypatch):
     assert "plans" not in mock_request.call_args.kwargs["params"]
 
 
-def test_get_metrics_rejects_non_integer_money(monkeypatch):
+def test_get_metrics_asp_allows_documented_quarter_interval(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [{"date": "2026-09-30", "asp": 9900}],
+                "summary": {"current": 9900, "previous": 9500},
+            }
+        )
+    )
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics(
+            "asp", "2026-07-01", "2026-09-30", interval="quarter"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["metrics"]["entries"][0]["asp"] == "99.00"
+    assert mock_request.call_args.kwargs["params"]["interval"] == "quarter"
+
+
+def test_get_metrics_accepts_fractional_ltv_cents(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "entries": [{"date": "2026-09-30", "ltv": 1862989.7959183701}],
+                "summary": {
+                    "current": 1862989.7959183701,
+                    "previous": 1838875.5102040817,
+                },
+            }
+        )
+    )
+    monkeypatch.setattr(chartmogul.requests, "request", mock_request)
+
+    result = json.loads(
+        chartmogul.chartmogul_get_metrics("ltv", "2026-09-01", "2026-09-30")
+    )
+
+    assert result["status"] == "success"
+    entry = result["metrics"]["entries"][0]
+    assert entry["ltv"] == "18629.90"
+    assert entry["ltv_cents"] == 1862989.7959183701
+    assert result["metrics"]["summary"]["current"] == "18629.90"
+    assert result["metrics"]["summary"]["previous"] == "18388.76"
+    assert "interval" not in mock_request.call_args.kwargs["params"]
+
+
+@pytest.mark.parametrize("value", [True, "1862989.7959183701", {}, float("nan")])
+def test_get_metrics_rejects_invalid_ltv_money(monkeypatch, value):
     monkeypatch.setattr(
         chartmogul.requests,
         "request",
         Mock(
             return_value=MockResponse(
                 json_data={
-                    "entries": [{"date": "2026-09-30", "ltv": 145000.5}],
+                    "entries": [{"date": "2026-09-30", "ltv": value}],
                     "summary": {"current": 145000, "previous": 140000},
                 }
             )
@@ -780,7 +830,7 @@ def test_get_metrics_rejects_non_integer_money(monkeypatch):
     )
 
     assert result["status"] == "error"
-    assert "non-integer value for ltv" in result["message"]
+    assert "value for ltv" in result["message"]
 
 
 @pytest.mark.parametrize(
@@ -808,7 +858,9 @@ def test_get_metrics_rejects_invalid_date_ranges(
     ("metric", "interval", "expected_message"),
     [
         ("invoices", "month", "metric must be one of"),
-        ("mrr", "hour", "interval must be one of"),
+        ("mrr", "hour", "interval for mrr must be one of"),
+        ("asp", "day", "interval for asp must be one of"),
+        ("ltv", "year", "interval for ltv must be one of"),
     ],
 )
 def test_get_metrics_rejects_unsupported_values(

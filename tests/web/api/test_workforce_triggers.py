@@ -408,6 +408,7 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
         assert config.get("trigger_id") == trigger["id"]
         assert config.get("trigger_run_id") == int(run.id)
         assert config.get("trigger_test") is True
+        turn_id = str(config[trigger_service.TRIGGER_TURN_ID_CONFIG_KEY])
         db.add(
             TaskChatMessage(
                 task_id=int(task.id),
@@ -415,11 +416,13 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
                 role="assistant",
                 content="Workforce routine finished",
                 message_type="assistant_response",
+                turn_id=turn_id,
             )
         )
         db.commit()
         run_id = int(run.id)
         task_id = int(task.id)
+        task_input = str(task.input)
     finally:
         db.close()
 
@@ -430,10 +433,10 @@ def test_workforce_trigger_test_fire_creates_workforce_run(
     )
     assert history.status_code == 200, history.text
     assert history.json()["task_id"] == task_id
-    assert history.json()["messages"][-1] == {
-        "role": "assistant",
-        "content": "Workforce routine finished",
-    }
+    assert history.json()["messages"] == [
+        {"role": "user", "content": task_input},
+        {"role": "assistant", "content": "Workforce routine finished"},
+    ]
 
     outsider_headers = _register_second_user("workforce-history-outsider")
     outsider_history = client.get(

@@ -32,6 +32,7 @@ from ..services.trigger_rate_limit import (
     should_audit_rate_limited_callback,
 )
 from ..services.triggers import (
+    TRIGGER_TURN_ID_CONFIG_KEY,
     TriggerNotFoundError,
     TriggerRunPreparationError,
     TriggerSecretError,
@@ -519,20 +520,21 @@ def _display_history_messages(
     db: Session,
     *,
     task: Task,
+    initiating_turn_id: str,
 ) -> list[TriggerRunHistoryMessage]:
     """Read only the routine-initiated display turn.
 
     Trigger tasks remain available to their owner for private follow-up turns.
-    Team-visible history therefore starts at the first user row and stops before
-    the next one, while still reading the display projection so model-context
-    compaction cannot remove the original routine input.
+    Team-visible history therefore includes only rows carrying the recorded
+    initiating turn identity, while still reading the display projection so
+    model-context compaction cannot remove the original routine input.
     """
-    rows: list[tuple[Any, Any]]
+    rows: list[tuple[Any, Any, Any]]
     if int(task.conversation_storage_version) == 2:
         from ..services.task_event_display import load_event_display_snapshot
 
         rows = [
-            (row.get("role"), row.get("content"))
+            (row.get("role"), row.get("content"), row.get("turn_id"))
             for row in load_event_display_snapshot(db, int(task.id)).messages
         ]
     else:
@@ -551,16 +553,11 @@ def _display_history_messages(
                     content=stored_content,
                     message_type=str(stored_row.message_type or ""),
                 )
-            rows.append((stored_role, stored_content))
+            rows.append((stored_role, stored_content, stored_row.turn_id))
 
     messages: list[TriggerRunHistoryMessage] = []
-    routine_input_seen = False
-    for role, content in rows:
-        if role == "user":
-            if routine_input_seen:
-                break
-            routine_input_seen = True
-        elif not routine_input_seen:
+    for role, content, turn_id in rows:
+        if turn_id != initiating_turn_id:
             continue
         if role not in {"user", "assistant"} or not isinstance(content, str):
             continue
@@ -614,7 +611,28 @@ def _trigger_run_history(
             detail="Trigger run conversation not found",
         )
 
-    messages = _display_history_messages(db, task=task)
+    task_config = dict(task.agent_config or {})
+    recorded_run_id = task_config.get("trigger_run_id")
+    initiating_turn_id = task_config.get(TRIGGER_TURN_ID_CONFIG_KEY)
+    if (
+        not isinstance(recorded_run_id, int)
+        or recorded_run_id != int(run.id)
+        or not isinstance(initiating_turn_id, str)
+        or not initiating_turn_id
+    ):
+        # Existing Tasks may predate explicit initiating-turn provenance.
+        # Guessing from the first surviving user row can expose a later owner
+        # follow-up, so legacy or mismatched records deliberately fail closed.
+        raise HTTPException(
+            status_code=404,
+            detail="Trigger run conversation history is unavailable",
+        )
+
+    messages = _display_history_messages(
+        db,
+        task=task,
+        initiating_turn_id=initiating_turn_id,
+    )
     # The first user turn is the rendered trigger prompt and may embed the
     # original event payload. Treat this read like include_payload=True so it
     # leaves the same durable forensic trail.

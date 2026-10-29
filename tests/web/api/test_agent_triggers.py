@@ -52,6 +52,7 @@ from xagent.web.services.task_orchestrator import (
 )
 from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
+    TRIGGER_TURN_ID_CONFIG_KEY,
     _coerce_utc,
     _compute_next_run_at,
     _finish_trigger_run_after_task,
@@ -517,6 +518,7 @@ def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
     try:
         task = db.query(Task).filter(Task.id == run_body["task_id"]).one()
         owner_user_id = int(task.user_id)
+        turn_id = str(task.agent_config[TRIGGER_TURN_ID_CONFIG_KEY])
     finally:
         db.close()
     return _PreparedTriggerStart(
@@ -524,6 +526,7 @@ def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
         trigger_id=trigger_id,
         task_id=int(run_body["task_id"]),
         task_owner_user_id=owner_user_id,
+        turn_id=turn_id,
         prompt="finalize",
         trigger_type="webhook",
         test=True,
@@ -3677,6 +3680,11 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
             )
             db.add(run)
             db.flush()
+            task.agent_config = {
+                "trigger_run_id": int(run.id),
+                TRIGGER_TURN_ID_CONFIG_KEY: "routine-turn",
+            }
+            db.add(task)
             user_message = TaskChatMessage(
                 task_id=int(task.id),
                 user_id=admin_user_id,
@@ -3684,6 +3692,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                 content="Prepare the daily report",
                 message_type="user_message",
                 attachments=[{"file_id": "private-file", "name": "input.csv"}],
+                turn_id="routine-turn",
             )
             assistant_message = TaskChatMessage(
                 task_id=int(task.id),
@@ -3691,6 +3700,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                 role="assistant",
                 content="The daily report is ready",
                 message_type="assistant_response",
+                turn_id="routine-turn",
             )
             db.add_all([user_message, assistant_message])
             db.flush()
@@ -3717,6 +3727,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                         role="system",
                         content="internal orchestration note",
                         message_type="system_message",
+                        turn_id="routine-turn",
                     ),
                     TaskChatMessage(
                         task_id=int(task.id),
@@ -3724,6 +3735,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                         role="user",
                         content="Use my private connector for a follow-up",
                         message_type="user_message",
+                        turn_id="private-turn",
                     ),
                     TaskChatMessage(
                         task_id=int(task.id),
@@ -3731,6 +3743,7 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
                         role="assistant",
                         content="Private connector result",
                         message_type="assistant_response",
+                        turn_id="private-turn",
                     ),
                     # Model-context reads replace everything through this
                     # watermark with a system summary. Display-history reads
@@ -3766,7 +3779,6 @@ def test_team_member_can_read_complete_shared_trigger_run_history() -> None:
         assert teammate_history["messages"] == [
             {"role": "user", "content": "Prepare the daily report"},
             {"role": "assistant", "content": "The daily report is ready"},
-            {"role": "assistant", "content": "Task execution failed."},
         ]
         assert "private-file" not in teammate_read.text
         assert "do-not-leak" not in teammate_read.text
@@ -3851,6 +3863,12 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
             idempotency_key="history:v2",
         )
         db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "routine-turn",
+        }
+        db.add(task)
         occurred_at = datetime.now(timezone.utc)
         db.add_all(
             [
@@ -3943,6 +3961,94 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
     }
     assert "private-v2-file" not in history.text
     assert "Private V2" not in history.text
+
+
+def test_trigger_run_history_fails_closed_without_v1_initiating_row() -> None:
+    """A later owner turn must not replace an omitted blank routine input."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, "Blank routine history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Blank history hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title="Blank routine history",
+            description="",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="",
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.COMPLETED.value,
+            idempotency_key="history:blank-v1",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "omitted-routine-turn",
+        }
+        db.add_all(
+            [
+                task,
+                TaskChatMessage(
+                    task_id=int(task.id),
+                    user_id=owner_id,
+                    role="user",
+                    content="Use my private connector",
+                    message_type="user_message",
+                    turn_id="private-turn",
+                ),
+                TaskChatMessage(
+                    task_id=int(task.id),
+                    user_id=owner_id,
+                    role="assistant",
+                    content="Private connector result",
+                    message_type="assistant_response",
+                    turn_id="private-turn",
+                ),
+            ]
+        )
+        db.commit()
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    history_url = f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history"
+    history = client.get(history_url, headers=headers)
+    assert history.status_code == 200, history.text
+    assert history.json()["messages"] == []
+    assert "private connector" not in history.text.lower()
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == history.json()["task_id"]).one()
+        task.agent_config = {"trigger_run_id": run_id}
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+    legacy_history = client.get(history_url, headers=headers)
+    assert legacy_history.status_code == 404, legacy_history.text
+    assert legacy_history.json()["detail"] == (
+        "Trigger run conversation history is unavailable"
+    )
 
 
 def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:
@@ -4190,10 +4296,12 @@ def test_dispatch_claims_pending_trigger_run_once_under_concurrency() -> None:
         db.close()
 
     begin_calls = 0
+    accepted_turn_ids: list[str] = []
 
     async def fake_begin_turn(**kwargs):
         nonlocal begin_calls
         begin_calls += 1
+        accepted_turn_ids.append(str(kwargs["payload"].turn_id))
         await asyncio.sleep(0.05)
 
         async def done() -> None:
@@ -4223,6 +4331,13 @@ def test_dispatch_claims_pending_trigger_run_once_under_concurrency() -> None:
 
     assert results.count(True) == 1
     assert begin_calls == 1
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
+        task = db.query(Task).filter(Task.id == int(run.task_id)).one()
+        assert accepted_turn_ids == [str(task.agent_config[TRIGGER_TURN_ID_CONFIG_KEY])]
+    finally:
+        db.close()
 
 
 def test_scheduled_scan_disables_one_shot_trigger(mock_bg_scheduler) -> None:

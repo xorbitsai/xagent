@@ -20,19 +20,47 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.runner_utils import (
     ensure_user_bin_in_path,
 )
 
+TOOL_RUNNER_PROBE_MARKER = "XAGENT_SANDBOX_TOOL_RUNNER_READY"
+
 
 def _parse_args() -> argparse.Namespace:
     """Parse CLI arguments for sandboxed tool execution."""
     parser = argparse.ArgumentParser(description="Run a sandboxed Xagent tool")
-    parser.add_argument("--execution-spec-b64", required=True)
-    args_group = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="verify that the mounted runner and its imports are readable",
+    )
+    parser.add_argument("--execution-spec-b64")
+    args_group = parser.add_mutually_exclusive_group()
     args_group.add_argument("--args-b64")
     args_group.add_argument("--args-file")
-    parser.add_argument("--result-file", required=True)
+    parser.add_argument("--result-file")
     init_group = parser.add_mutually_exclusive_group()
     init_group.add_argument("--init-params-b64")
     init_group.add_argument("--init-params-file")
-    return parser.parse_args()
+    parsed = parser.parse_args()
+
+    execution_args = (
+        parsed.execution_spec_b64,
+        parsed.args_b64,
+        parsed.args_file,
+        parsed.result_file,
+        parsed.init_params_b64,
+        parsed.init_params_file,
+    )
+    if parsed.probe:
+        if any(value is not None for value in execution_args):
+            parser.error("--probe cannot be combined with execution arguments")
+        return parsed
+
+    if parsed.execution_spec_b64 is None:
+        parser.error("the following arguments are required: --execution-spec-b64")
+    if parsed.args_b64 is None and parsed.args_file is None:
+        parser.error("one of the arguments --args-b64 --args-file is required")
+    if parsed.result_file is None:
+        parser.error("the following arguments are required: --result-file")
+    return parsed
 
 
 def _load_tool_class(import_path: str) -> type[Any]:
@@ -132,6 +160,9 @@ def main() -> None:
     ensure_user_bin_in_path()
     try:
         parsed = _parse_args()
+        if parsed.probe:
+            print(TOOL_RUNNER_PROBE_MARKER)
+            return
         execution_spec = _load_execution_spec(parsed)
         init_params = _load_init_params(parsed.init_params_b64, parsed.init_params_file)
         tool_args = _load_args(parsed.args_b64, parsed.args_file)
@@ -141,7 +172,7 @@ def main() -> None:
 
     result = _execute_from_spec(execution_spec, init_params, tool_args)
 
-    result_path = Path(parsed.result_file)
+    result_path = Path(cast(str, parsed.result_file))
     # ASCII escapes keep lone surrogates (undecodable filenames) encodable.
     result_path.write_text(json.dumps(result), encoding="utf-8")
 

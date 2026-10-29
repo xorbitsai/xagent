@@ -168,6 +168,13 @@ describe("AdminMcpPage app updates", () => {
     expect(zh.adminMcp.apps.form.launchConfigGuidance).toContain("连接器凭证流程")
   })
 
+  it("offers Productivity as an app category", async () => {
+    renderPage([builtinApp])
+    await openEditor("gmail")
+
+    expect(screen.getByText("Productivity")).not.toBeNull()
+  })
+
   it("patches only visibility and applies the authoritative response", async () => {
     const authoritative = {
       ...customApp,

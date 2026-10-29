@@ -616,6 +616,25 @@ async def test_validate_provider_model_listing_honors_caller_supplied_timeout():
         )
 
 
+def test_xinference_tts_models_route_is_removed():
+    """An anonymous caller must not make the server fetch a caller-supplied URL.
+
+    The route took ``base_url`` without authentication (xorbitsai/xagent#3444)
+    and had no callers, so it was removed rather than guarded.
+    """
+    with patch(
+        "xagent.core.model.tts.xinference.XinferenceTTS.list_available_models",
+        return_value=[],
+    ) as list_models:
+        response = client.get(
+            "/api/models/xinference/tts-models",
+            params={"base_url": "http://xinference.example.com:9997"},
+        )
+
+    assert response.status_code == 404
+    list_models.assert_not_called()
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 

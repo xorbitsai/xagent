@@ -827,6 +827,7 @@ export default function AdminMcpPage() {
                               <SelectItem value="Support">Support</SelectItem>
                               <SelectItem value="Marketing">Marketing</SelectItem>
                               <SelectItem value="Scheduling">Scheduling</SelectItem>
+                              <SelectItem value="Productivity">Productivity</SelectItem>
                               <SelectItem value="Payments">Payments</SelectItem>
                               <SelectItem value="Analytics">Analytics</SelectItem>
                               <SelectItem value="Operations">Operations</SelectItem>

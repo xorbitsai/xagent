@@ -287,6 +287,7 @@ PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
 S2S_API_BASE_URL = "XAGENT_S2S_API_BASE_URL"
 TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
 GOOGLE_RESTRICTED_SCOPES_ENABLED = "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED"
+GOOGLE_SHARED_OAUTH_GRANTS_ENABLED = "XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED"
 ZOOM_MEETING_WRITE_ENABLED = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
@@ -2267,6 +2268,16 @@ def get_gmail_callback_base_url() -> str | None:
 def get_google_restricted_scopes() -> bool:
     """Enable Gmail and full Drive authorization only in the review environment."""
     return _get_bool_env(GOOGLE_RESTRICTED_SCOPES_ENABLED, False)
+
+
+def get_google_shared_oauth_grants_enabled() -> bool:
+    """Prefer explicitly-associated shared Google grants at runtime.
+
+    Disabled by default while the shared-grant storage and authorization flow
+    are rolled out separately. Legacy per-app credentials remain the fallback
+    even when the flag is enabled.
+    """
+    return _get_bool_env(GOOGLE_SHARED_OAUTH_GRANTS_ENABLED, False)
 
 
 def get_zoom_meeting_write_enabled() -> bool:

@@ -11,6 +11,7 @@ from .deployment import Deployment, DeploymentOwnerType
 from .expired_task import ExpiredTaskTombstone
 from .global_memory_embedding_authority import GlobalMemoryEmbeddingAuthority
 from .gmail_watch import GmailWatchState
+from .google_oauth_grant import GoogleOAuthAppAssociation, GoogleOAuthGrant
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
 from .mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
@@ -116,6 +117,8 @@ __all__ = [
     "BackgroundJobType",
     "GmailWatchState",
     "GlobalMemoryEmbeddingAuthority",
+    "GoogleOAuthGrant",
+    "GoogleOAuthAppAssociation",
     "KBIngestTarget",
     "TaskChatMessage",
     "UploadedFile",

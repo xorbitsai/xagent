@@ -13,6 +13,7 @@ import cloudpickle
 import pytest
 
 from xagent.core.tools.adapters.vibe.sandboxed_tool.tool_runner import (
+    TOOL_RUNNER_PROBE_MARKER,
     _execute_from_spec,
     _load_args,
     _load_execution_spec,
@@ -252,6 +253,21 @@ class TestValidateSpec:
 
 class TestMain:
     """Tests for main() entrypoint."""
+
+    def test_probe(self, capsys):
+        """Probe mode verifies imports without requiring an execution payload."""
+        with patch("sys.argv", ["tool_runner", "--probe"]):
+            main()
+        assert capsys.readouterr().out.strip() == TOOL_RUNNER_PROBE_MARKER
+
+    def test_probe_rejects_execution_arguments(self):
+        """Probe mode cannot accidentally bypass validation of a tool run."""
+        with patch(
+            "sys.argv",
+            ["tool_runner", "--probe", "--execution-spec-b64", "ignored"],
+        ):
+            with pytest.raises(SystemExit, match="2"):
+                main()
 
     def test_happy_path(self, tmp_path):
         """Successful execution should write result JSON to file."""

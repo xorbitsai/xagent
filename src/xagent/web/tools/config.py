@@ -36,7 +36,7 @@ from weakref import WeakValueDictionary
 import httpx
 from sqlalchemy import text
 
-from ...config import get_uploads_dir
+from ...config import get_google_shared_oauth_grants_enabled, get_uploads_dir
 from ...core.agent.result import (
     ClassifiedToolFailure,
     is_oauth_token_required_code,
@@ -4172,12 +4172,86 @@ class WebToolConfig(BaseToolConfig):
             credential_present=True,
         )
 
+    def _resolve_shared_google_oauth_account(
+        self,
+        oauth_db: Any,
+        *,
+        provider_name: object,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+        resource_owner_key: str | None,
+    ) -> Any | None:
+        """Resolve one explicitly-associated shared grant, or fall back safely."""
+        if (
+            not get_google_shared_oauth_grants_enabled()
+            or str(provider_name).lower() != "google"
+            or not isinstance(app_id, str)
+            or not app_id.strip()
+        ):
+            return None
+
+        from ..api.auth import _resolve_oauth_client_per_field
+        from ..models.oauth_provider import OAuthProvider
+        from ..services.google_oauth_grants import (
+            resolve_google_shared_oauth_account,
+        )
+
+        provider_config = (
+            oauth_db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one_or_none()
+        )
+        if provider_config is None:
+            return None
+        client_id, _client_secret = _resolve_oauth_client_per_field(
+            "google", provider_config
+        )
+        if not client_id:
+            return None
+
+        required_scopes: list[str] = []
+        for candidate in (
+            provider_config.default_scopes or [],
+            (app_info or {}).get("oauth_scopes") or [],
+        ):
+            if isinstance(candidate, str):
+                required_scopes.append(candidate)
+            elif isinstance(candidate, (list, tuple, set)):
+                required_scopes.extend(
+                    scope for scope in candidate if isinstance(scope, str)
+                )
+            elif candidate:
+                # A malformed catalog/provider row must not broaden a shared
+                # credential's authority. The legacy resolver remains the
+                # compatibility fallback for this request.
+                return None
+
+        account = resolve_google_shared_oauth_account(
+            oauth_db,
+            user_id=user_id,
+            resource_owner_key=resource_owner_key,
+            oauth_client_id=client_id,
+            app_id=app_id,
+            required_scopes=required_scopes,
+            lock=True,
+        )
+        logger.info(
+            "OAUTH CONFIG: Checked shared Google grant for app %s user %s owner %s. Found: %s",
+            app_id,
+            user_id,
+            "actor" if resource_owner_key is not None else "ordinary",
+            account is not None,
+        )
+        return account
+
     async def _resolve_actor_oauth_access_token_in_worker(
         self,
         *,
         session_factory: Callable[[], Any],
         provider_name: object,
         app_id: str,
+        app_info: Mapping[str, Any] | None,
         resource_owner_key: str,
         user_id: int,
     ) -> _LegacyOAuthTokenResolution:
@@ -4186,6 +4260,22 @@ class WebToolConfig(BaseToolConfig):
 
         oauth_db = session_factory()
         try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            )
+            if shared_account is not None:
+                return await self._finish_legacy_oauth_access_token_resolution(
+                    oauth_db=oauth_db,
+                    oauth_account=shared_account,
+                    provider_name=provider_name,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                )
             # Lock the current namespace, not a stale row id. Actor callbacks
             # replace credentials with delete-and-insert, so the primary key
             # can change while this resolver waits.
@@ -4241,6 +4331,7 @@ class WebToolConfig(BaseToolConfig):
         *,
         provider_name: object,
         app_id: str,
+        app_info: Mapping[str, Any] | None,
         resource_owner_key: str,
         user_id: int,
     ) -> _LegacyOAuthTokenResolution:
@@ -4263,6 +4354,7 @@ class WebToolConfig(BaseToolConfig):
                         session_factory=session_factory,
                         provider_name=provider_name,
                         app_id=app_id,
+                        app_info=app_info,
                         resource_owner_key=resource_owner_key,
                         user_id=user_id,
                     )
@@ -4295,12 +4387,29 @@ class WebToolConfig(BaseToolConfig):
             return await self._resolve_actor_oauth_access_token(
                 provider_name=provider_name,
                 app_id=app_id,
+                app_info=app_info,
                 resource_owner_key=resource_owner_key,
                 user_id=user_id,
             )
 
         oauth_db = self._new_legacy_oauth_session()
         try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=None,
+            )
+            if shared_account is not None:
+                return await self._finish_legacy_oauth_access_token_resolution(
+                    oauth_db=oauth_db,
+                    oauth_account=shared_account,
+                    provider_name=provider_name,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                )
             if app_id:
                 # A bare provider-level grant (e.g. UserOAuth.provider ==
                 # "meta") never requested this app's own oauth_scopes, so it

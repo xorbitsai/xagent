@@ -9,19 +9,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.web.sandbox_fakes import FakeSandboxService
-from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    SANDBOX_TOOL_RUNNER_PATH,
-)
-from xagent.core.tools.adapters.vibe.sandboxed_tool.tool_runner import (
-    TOOL_RUNNER_PROBE_MARKER,
-)
 from xagent.sandbox.base import (
-    ExecResult,
-    Sandbox,
     SandboxConfig,
     SandboxInfo,
     SandboxMountIntent,
-    SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
 )
@@ -683,64 +674,6 @@ class TestSandboxLifecycleConfig:
         assert service.get_or_create.await_count == 2
         assert service.get_or_create.await_args_list[0].args[0] == "user::42"
         assert service.get_or_create.await_args_list[1].args[0] == "build_preview::42"
-
-
-class TestSandboxCodeMountReadiness:
-    """Verify mounted source before a sandbox enters the usable cache."""
-
-    @pytest.mark.asyncio
-    async def test_probe_runs_through_the_runtime_sandbox(self):
-        service = FakeSandboxService()
-        manager = SandboxManager(service)
-        sandbox = MagicMock(spec=Sandbox)
-        sandbox.name = "user::42"
-        sandbox.exec = AsyncMock(
-            return_value=ExecResult(
-                exit_code=0,
-                stdout=f"{TOOL_RUNNER_PROBE_MARKER}\n",
-                stderr="",
-            )
-        )
-
-        await manager._verify_code_mount_readiness(sandbox)
-
-        sandbox.exec.assert_awaited_once_with(
-            "python",
-            SANDBOX_TOOL_RUNNER_PATH,
-            "--probe",
-            max_output_bytes=4096,
-        )
-
-    @pytest.mark.asyncio
-    async def test_unreadable_mount_fails_before_cache_publish(self):
-        service = FakeSandboxService()
-        sandbox = MagicMock(spec=Sandbox)
-        sandbox.name = "user::42"
-        sandbox.exec = AsyncMock(
-            return_value=ExecResult(
-                exit_code=2,
-                stdout="",
-                stderr="python: can't open file: Permission denied",
-            )
-        )
-        service.get_or_create = AsyncMock(return_value=sandbox)
-        manager = SandboxManager(service)
-
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            patch(
-                "xagent.web.sandbox_manager.build_code_mount_volumes",
-                return_value=[("/private/release/src", "/app/src", "ro")],
-            ),
-            pytest.raises(
-                SandboxRecoveryRequiredError,
-                match="cannot read the mounted XAgent code",
-            ),
-        ):
-            await manager.get_or_create_sandbox("user", "42")
-
-        assert "user::42" not in manager._cache
-        assert "user::42" not in manager._config_cache
 
 
 class TestSandboxLeaseProvider:

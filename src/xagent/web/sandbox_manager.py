@@ -34,11 +34,7 @@ from ..config import (
     get_uploads_dir,
 )
 from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
-    SANDBOX_TOOL_RUNNER_PATH,
     build_code_mount_volumes,
-)
-from ..core.tools.adapters.vibe.sandboxed_tool.tool_runner import (
-    TOOL_RUNNER_PROBE_MARKER,
 )
 from ..core.workspace import scoped_user_root
 from ..sandbox import SandboxService
@@ -77,8 +73,6 @@ _WORKER_LIFECYCLE_MARKER = "::worker::"
 # sites, rather than each falling back to the backend's own (backend-specific,
 # potentially unbounded) default.
 _SANDBOX_STOP_TIMEOUT_SECONDS = 30
-_SANDBOX_CODE_MOUNT_PROBE_TIMEOUT_SECONDS = 30
-_SANDBOX_CODE_MOUNT_PROBE_OUTPUT_BYTES = 4096
 
 
 class SandboxCapacityError(RuntimeError):
@@ -1290,60 +1284,6 @@ class SandboxManager:
             self._backend_probe = await self._service.supports_runtime_spec()
         return self._backend_probe
 
-    async def _verify_code_mount_readiness(self, sandbox: Sandbox) -> None:
-        """Fail before publishing a sandbox whose code mount is unreadable.
-
-        The runner is executed through the sandbox's real runtime identity,
-        so this verifies traversal, file readability, and the imports needed
-        by tool execution.  The probe runs only on a process-local cache miss:
-        once after creation, or once when this process adopts an existing
-        sandbox after restart.
-        """
-        # Production backends always return a Sandbox subclass.  A number of
-        # manager unit tests intentionally use shape-less MagicMocks to focus
-        # on lifecycle bookkeeping; those are not executable sandboxes and
-        # therefore cannot participate in this runtime readiness contract.
-        if not isinstance(sandbox, Sandbox):
-            return
-
-        try:
-            result = await asyncio.wait_for(
-                sandbox.exec(
-                    "python",
-                    SANDBOX_TOOL_RUNNER_PATH,
-                    "--probe",
-                    max_output_bytes=_SANDBOX_CODE_MOUNT_PROBE_OUTPUT_BYTES,
-                ),
-                timeout=_SANDBOX_CODE_MOUNT_PROBE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as exc:
-            raise SandboxRecoveryRequiredError(
-                f"Sandbox {sandbox.name!r} code-mount readiness probe timed out "
-                f"after {_SANDBOX_CODE_MOUNT_PROBE_TIMEOUT_SECONDS}s."
-            ) from exc
-        except Exception as exc:
-            raise SandboxRecoveryRequiredError(
-                f"Sandbox {sandbox.name!r} could not run the code-mount "
-                f"readiness probe at {SANDBOX_TOOL_RUNNER_PATH!r}: {exc}"
-            ) from exc
-
-        if (
-            result.exit_code == 0
-            and TOOL_RUNNER_PROBE_MARKER in result.stdout.splitlines()
-        ):
-            return
-
-        detail = (result.stderr or result.stdout or "no output").strip()
-        if len(detail) > _SANDBOX_CODE_MOUNT_PROBE_OUTPUT_BYTES:
-            detail = detail[:_SANDBOX_CODE_MOUNT_PROBE_OUTPUT_BYTES] + "..."
-        raise SandboxRecoveryRequiredError(
-            f"Sandbox {sandbox.name!r} cannot read the mounted XAgent code as "
-            "its non-root runtime user. Ensure every host path component is "
-            "traversable and the source tree is world-readable (a+rX). "
-            f"Probe path: {SANDBOX_TOOL_RUNNER_PATH!r}; exit="
-            f"{result.exit_code}; output={detail!r}"
-        )
-
     # --- Primary/worker sandbox resolution ---
     #
     # Entry points, all funneling through ``_lifecycle_locked(base_name)``
@@ -1522,7 +1462,6 @@ class SandboxManager:
                         config=config,
                     )
 
-            await self._verify_code_mount_readiness(sandbox)
             self._cache[sandbox_name] = sandbox
             self._config_cache[sandbox_name] = desired
             return sandbox
@@ -1618,7 +1557,6 @@ class SandboxManager:
                 prepare_root=prepare_root,
             )
 
-        await self._verify_code_mount_readiness(sandbox)
         async with self._activity_guard:
             self._cache[sandbox_name] = sandbox
             self._config_cache[sandbox_name] = desired
@@ -1789,7 +1727,6 @@ class SandboxManager:
                 retry_on_already_exists=True,
             )
 
-        await self._verify_code_mount_readiness(sandbox)
         async with self._activity_guard:
             self._cache[sandbox_name] = sandbox
             self._config_cache[sandbox_name] = desired

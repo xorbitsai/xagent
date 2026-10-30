@@ -696,44 +696,91 @@ def gmail_legacy_accounts_for_shared_google_oauth(
     ]
 
 
-def mirror_shared_google_oauth_credentials(
+def scope_valid_gmail_accounts_for_shared_google_oauth(
     db: Session, *, oauth_account: UserOAuth
-) -> int:
-    """Keep scope-valid rollback rows current after callback or refresh."""
+) -> list[UserOAuth]:
+    """Return ordinary Gmail mirrors the current shared scopes can authorize."""
+    return [
+        account
+        for account in _scope_valid_legacy_accounts_for_shared_google_oauth(
+            db, oauth_account=oauth_account
+        )
+        if account.provider == "gmail" and account.resource_owner_key is None
+    ]
+
+
+def _scope_valid_legacy_accounts_for_shared_google_oauth(
+    db: Session, *, oauth_account: UserOAuth
+) -> list[UserOAuth]:
+    """Resolve scope policy through the canonical catalog execution view."""
     if (
         oauth_account.id is None
         or oauth_account.provider != GOOGLE_SHARED_OAUTH_PROVIDER
     ):
-        return 0
-    legacy_accounts = legacy_accounts_for_shared_google_oauth(
-        db, oauth_account_id=int(oauth_account.id)
-    )
-    from ..models.public_mcp import PublicMCPApp
+        return []
 
-    catalog_apps = {
-        app.app_id: app
-        for app in db.query(PublicMCPApp)
-        .filter(
-            PublicMCPApp.app_id.in_(
-                [str(account.provider) for account in legacy_accounts]
-            ),
-            PublicMCPApp.provider_name == GOOGLE_SHARED_OAUTH_PROVIDER,
-        )
-        .all()
-    }
-    mirrored = 0
-    for legacy_account in legacy_accounts:
-        app = catalog_apps.get(str(legacy_account.provider))
-        required_scopes = _strict_google_app_scopes(app) if app is not None else None
+    from ..mcp_apps import get_app_by_id
+
+    scope_valid_accounts: list[UserOAuth] = []
+    for legacy_account in legacy_accounts_for_shared_google_oauth(
+        db, oauth_account_id=int(oauth_account.id)
+    ):
+        app = get_app_by_id(db, str(legacy_account.provider))
+        if app is None or str(app.get("provider") or "").lower() != "google":
+            continue
+        required_scopes = _strict_google_app_scopes(app)
         if required_scopes is None or not google_oauth_grant_covers_scopes(
             oauth_account, required_scopes
         ):
             continue
+        scope_valid_accounts.append(legacy_account)
+    return scope_valid_accounts
+
+
+def mirror_shared_google_oauth_credentials(
+    db: Session, *, oauth_account: UserOAuth
+) -> int:
+    """Keep scope-valid rollback rows current after callback or refresh."""
+    scope_valid_accounts = _scope_valid_legacy_accounts_for_shared_google_oauth(
+        db, oauth_account=oauth_account
+    )
+    for legacy_account in scope_valid_accounts:
         _copy_shared_google_credentials(
             oauth_account, legacy_account, preserve_missing_refresh=True
         )
-        mirrored += 1
-    return mirrored
+    return len(scope_valid_accounts)
+
+
+def _lock_shared_google_accounts_for_detach(
+    db: Session,
+    *,
+    user_id: int,
+    association_filter: Any,
+) -> None:
+    """Take the callback-compatible account-first lock order before detach."""
+    account_ids = sorted(
+        {
+            int(oauth_account_id)
+            for (oauth_account_id,) in db.query(GoogleOAuthGrant.oauth_account_id)
+            .join(
+                GoogleOAuthAppAssociation,
+                GoogleOAuthAppAssociation.grant_id == GoogleOAuthGrant.id,
+            )
+            .filter(
+                GoogleOAuthGrant.user_id == int(user_id),
+                GoogleOAuthGrant.resource_owner_key.is_(None),
+                association_filter,
+            )
+            .all()
+        }
+    )
+    if not account_ids:
+        return
+    account_query = db.query(UserOAuth).filter(UserOAuth.id.in_(account_ids))
+    if db.get_bind().dialect.name == "sqlite":
+        account_query.update({UserOAuth.id: UserOAuth.id}, synchronize_session=False)
+    else:
+        account_query.order_by(UserOAuth.id).with_for_update().all()
 
 
 def detach_google_shared_oauth_app(
@@ -744,6 +791,11 @@ def detach_google_shared_oauth_app(
 ) -> int:
     """Detach an app and delete only shared credentials no sibling still uses."""
     normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
+    _lock_shared_google_accounts_for_detach(
+        db,
+        user_id=int(user_id),
+        association_filter=GoogleOAuthAppAssociation.app_id == normalized_app_id,
+    )
     associations = (
         db.query(GoogleOAuthAppAssociation)
         .join(
@@ -774,6 +826,12 @@ def detach_google_shared_oauth_legacy_account(
     legacy_oauth_account_id: int,
 ) -> int:
     """Detach the exact visible legacy account selected by cloud account UI."""
+    _lock_shared_google_accounts_for_detach(
+        db,
+        user_id=int(user_id),
+        association_filter=GoogleOAuthAppAssociation.legacy_oauth_account_id
+        == int(legacy_oauth_account_id),
+    )
     associations = (
         db.query(GoogleOAuthAppAssociation)
         .join(

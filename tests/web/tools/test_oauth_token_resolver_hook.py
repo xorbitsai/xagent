@@ -1059,16 +1059,16 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     db.add_all(
         [
             PublicMCPApp(
-                app_id="google-drive",
-                name="Google Drive",
+                app_id="test-google-drive",
+                name="Test Google Drive",
                 transport="oauth",
                 provider_name="google",
                 oauth_scopes=["scope.drive"],
                 launch_config={},
             ),
             PublicMCPApp(
-                app_id="google-sheets",
-                name="Google Sheets",
+                app_id="test-google-sheets",
+                name="Test Google Sheets",
                 transport="oauth",
                 provider_name="google",
                 oauth_scopes=["scope.drive"],
@@ -1089,7 +1089,7 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     )
     db.add(shared)
     db.flush()
-    for app_id in ("google-drive", "google-sheets"):
+    for app_id in ("test-google-drive", "test-google-sheets"):
         legacy = UserOAuth(
             user_id=int(user.id),
             provider=app_id,
@@ -1116,7 +1116,7 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     drive_lock_key = config._resolve_actor_oauth_lock_key_in_worker(
         session_factory=isolated_session_factory,
         provider_name="google",
-        app_id="google-drive",
+        app_id="test-google-drive",
         app_info={"oauth_scopes": ["scope.drive"]},
         resource_owner_key=owner_key,
         user_id=int(user.id),
@@ -1124,7 +1124,7 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     sheets_lock_key = config._resolve_actor_oauth_lock_key_in_worker(
         session_factory=isolated_session_factory,
         provider_name="google",
-        app_id="google-sheets",
+        app_id="test-google-sheets",
         app_info={"oauth_scopes": ["scope.drive"]},
         resource_owner_key=owner_key,
         user_id=int(user.id),
@@ -1146,14 +1146,14 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     )
     first = await config._resolve_actor_oauth_access_token(
         provider_name="google",
-        app_id="google-drive",
+        app_id="test-google-drive",
         app_info={"oauth_scopes": ["scope.drive"]},
         resource_owner_key=owner_key,
         user_id=int(user.id),
     )
     second = await config._resolve_actor_oauth_access_token(
         provider_name="google",
-        app_id="google-sheets",
+        app_id="test-google-sheets",
         app_info={"oauth_scopes": ["scope.drive"]},
         resource_owner_key=owner_key,
         user_id=int(user.id),
@@ -1164,7 +1164,7 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     db.expire_all()
     legacy_accounts = (
         db.query(UserOAuth)
-        .filter(UserOAuth.provider.in_(["google-drive", "google-sheets"]))
+        .filter(UserOAuth.provider.in_(["test-google-drive", "test-google-sheets"]))
         .all()
     )
     assert {account.access_token for account in legacy_accounts} == {
@@ -1187,7 +1187,7 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     )
     invalid = await config._resolve_actor_oauth_access_token(
         provider_name="google",
-        app_id="google-drive",
+        app_id="test-google-drive",
         app_info={"oauth_scopes": ["scope.drive"]},
         resource_owner_key=owner_key,
         user_id=int(user.id),

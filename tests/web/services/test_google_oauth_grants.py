@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.database import Base
@@ -570,8 +570,8 @@ def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session
     db, user = db_session
     db.add(
         PublicMCPApp(
-            app_id="google-drive",
-            name="Google Drive",
+            app_id="test-google-drive",
+            name="Test Google Drive",
             transport="oauth",
             provider_name="google",
             oauth_scopes=["scope.drive"],
@@ -579,13 +579,13 @@ def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session
     )
     db.commit()
     shared = _account(db, user)
-    legacy = _account(db, user, provider="google-drive")
+    legacy = _account(db, user, provider="test-google-drive")
     legacy.refresh_token = "rollback-refresh"
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,
         oauth_client_id="client-a",
-        app_id="google-drive",
+        app_id="test-google-drive",
         legacy_oauth_account=legacy,
     )
     shared.access_token = "new-shared-access"
@@ -597,27 +597,62 @@ def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session
     assert legacy.refresh_token == "rollback-refresh"
 
 
+def test_mirror_uses_canonical_builtin_scope_policy(db_session):
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            # Deliberately stale. The trusted builtin registry requires a real
+            # Drive scope and must override this persisted value.
+            oauth_scopes=["scope.drive"],
+        )
+    )
+    db.commit()
+    shared = _account(db, user, token="new-shared", scopes="scope.drive")
+    legacy = _account(
+        db,
+        user,
+        provider="google-drive",
+        token="existing-drive",
+        scopes="scope.drive",
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    assert mirror_shared_google_oauth_credentials(db, oauth_account=shared) == 0
+    assert legacy.access_token == "existing-drive"
+
+
 def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
     db, user = db_session
     db.add_all(
         [
             PublicMCPApp(
-                app_id="google-drive",
-                name="Google Drive",
+                app_id="test-google-drive",
+                name="Test Google Drive",
                 transport="oauth",
                 provider_name="google",
                 oauth_scopes=["scope.drive"],
             ),
             PublicMCPApp(
-                app_id="google-sheets",
-                name="Google Sheets",
+                app_id="test-google-sheets",
+                name="Test Google Sheets",
                 transport="oauth",
                 provider_name="google",
                 oauth_scopes=["scope.sheets"],
             ),
             PublicMCPApp(
-                app_id="google-calendar",
-                name="Google Calendar",
+                app_id="test-google-calendar",
+                name="Test Google Calendar",
                 transport="oauth",
                 provider_name="google",
                 oauth_scopes=["scope.calendar"],
@@ -635,7 +670,7 @@ def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
     drive = _account(
         db,
         user,
-        provider="google-drive",
+        provider="test-google-drive",
         token="revoked-drive-access",
         scopes="openid scope.drive",
     )
@@ -643,7 +678,7 @@ def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
     sheets = _account(
         db,
         user,
-        provider="google-sheets",
+        provider="test-google-sheets",
         token="revoked-sheets-access",
         scopes="openid scope.sheets",
     )
@@ -651,7 +686,7 @@ def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
     calendar = _account(
         db,
         user,
-        provider="google-calendar",
+        provider="test-google-calendar",
         token="existing-calendar-access",
         scopes="openid scope.calendar",
     )
@@ -660,21 +695,21 @@ def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
         db,
         oauth_account=shared,
         oauth_client_id="client-a",
-        app_id="google-drive",
+        app_id="test-google-drive",
         legacy_oauth_account=drive,
     )
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,
         oauth_client_id="client-a",
-        app_id="google-sheets",
+        app_id="test-google-sheets",
         legacy_oauth_account=sheets,
     )
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,
         oauth_client_id="client-a",
-        app_id="google-calendar",
+        app_id="test-google-calendar",
         legacy_oauth_account=calendar,
     )
     db.commit()
@@ -684,7 +719,7 @@ def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
         user_id=int(user.id),
         resource_owner_key=None,
         oauth_client_id="client-a",
-        app_id="google-sheets",
+        app_id="test-google-sheets",
         google_subject="google-subject",
         access_token="reconnected-access",
         refresh_token="reconnected-refresh",
@@ -878,3 +913,42 @@ def test_detach_exact_legacy_account_preserves_then_removes_shared_grant(db_sess
     db.commit()
     assert db.get(UserOAuth, int(shared.id)) is None
     assert db.query(GoogleOAuthGrant).count() == 0
+
+
+def test_detach_locks_shared_account_before_deleting_association(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    legacy = _account(db, user, provider="test-google-drive")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="test-google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    statements: list[str] = []
+
+    def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append("".join(statement.lower().split()))
+
+    event.listen(db.get_bind(), "before_cursor_execute", observe_sql)
+    try:
+        detach_google_shared_oauth_app(
+            db, user_id=int(user.id), app_id="test-google-drive"
+        )
+        db.flush()
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", observe_sql)
+
+    account_lock = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("updateuser_oauthsetid=")
+    )
+    association_delete = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("deletefromgoogle_oauth_app_associations")
+    )
+    assert account_lock < association_delete

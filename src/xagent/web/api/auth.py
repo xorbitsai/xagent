@@ -291,7 +291,11 @@ def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> 
 
 
 def _run_post_commit_oauth_side_effects(
-    db: Session, *, user_id: int, connector_key: str
+    db: Session,
+    *,
+    user_id: int,
+    connector_key: str,
+    provision_gmail: bool = False,
 ) -> None:
     """Run the OAuth callback's post-commit work; never raise.
 
@@ -330,7 +334,7 @@ def _run_post_commit_oauth_side_effects(
     would strand needs a user-visible signal instead.
     """
     try:
-        if connector_key == "gmail":
+        if connector_key == "gmail" or provision_gmail:
             _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
     except Exception:
         logger.warning(
@@ -5530,6 +5534,7 @@ def generic_oauth_callback(
                 )
                 return _actor_oauth_flow_rejected_response(rejection_reason)
 
+        provision_gmail_after_shared_callback = False
         if user_id:
             if is_actor_flow:
                 # Serialize replacement in the stable user namespace.
@@ -5822,6 +5827,16 @@ def generic_oauth_callback(
                             legacy_oauth_account=oauth_account,
                         )
                     )
+                    if resource_owner_key is None:
+                        from ..services.google_oauth_grants import (
+                            scope_valid_gmail_accounts_for_shared_google_oauth,
+                        )
+
+                        provision_gmail_after_shared_callback = bool(
+                            scope_valid_gmail_accounts_for_shared_google_oauth(
+                                db, oauth_account=_shared_account
+                            )
+                        )
                 except GoogleOAuthRefreshTokenRequired:
                     db.rollback()
                     if payload.get("google_forced_consent") is True:
@@ -5992,7 +6007,10 @@ def generic_oauth_callback(
             # there, not here.
             if not is_actor_flow:
                 _run_post_commit_oauth_side_effects(
-                    db, user_id=user_id, connector_key=(app_id or provider)
+                    db,
+                    user_id=user_id,
+                    connector_key=(app_id or provider),
+                    provision_gmail=provision_gmail_after_shared_callback,
                 )
 
         from urllib.parse import urlparse

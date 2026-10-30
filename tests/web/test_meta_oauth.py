@@ -33,6 +33,9 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import gmail_provisioning
+from xagent.web.services.google_oauth_grants import (
+    create_google_oauth_grant_association,
+)
 from xagent.web.tools import config as tool_config
 from xagent.web.tools.config import WebToolConfig
 
@@ -229,6 +232,113 @@ async def test_google_shared_callback_dual_writes_for_instant_rollback(
     )
 
     assert resolved.access_token == "shared-access"
+
+
+def test_shared_sibling_callback_reprovisions_mirrored_gmail(db_session, monkeypatch):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    gmail_app = get_builtin_public_mcp_app("gmail")
+    assert gmail_app is not None
+    db.add(PublicMCPApp(**gmail_app))
+    db.add(
+        PublicMCPApp(
+            app_id="test-google-drive",
+            name="Test Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+            is_visible_in_connector=True,
+            launch_config={
+                "command": "python",
+                "args": ["-m", "drive"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+    gmail_scope = "https://www.googleapis.com/auth/gmail.modify"
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="google-subject",
+        access_token="expired-shared",
+        refresh_token="expired-refresh",
+        scope=f"{gmail_scope} scope.drive",
+        email="alice@example.com",
+    )
+    gmail = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        provider_user_id="google-subject",
+        access_token="",
+        refresh_token=None,
+        scope=gmail_scope,
+        email="alice@example.com",
+    )
+    drive = UserOAuth(
+        user_id=int(user.id),
+        provider="test-google-drive",
+        provider_user_id="google-subject",
+        access_token="expired-drive",
+        refresh_token="expired-refresh",
+        scope="scope.drive",
+        email="alice@example.com",
+    )
+    db.add_all([shared, gmail, drive])
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="gmail",
+        legacy_oauth_account=gmail,
+    )
+    db.commit()
+    state = _shared_google_state(
+        user,
+        "test-google-drive",
+        [gmail_scope, "scope.drive"],
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "reconnected-access",
+                    "refresh_token": "reconnected-refresh",
+                    "token_type": "Bearer",
+                    "scope": f"{gmail_scope} scope.drive",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+    provision = Mock()
+    monkeypatch.setattr(
+        auth_api, "_best_effort_ensure_gmail_watches_for_user", provision
+    )
+
+    response = generic_oauth_callback(
+        "google",
+        SimpleNamespace(query_params={"code": "code", "state": state}),
+        db,
+        _google_provider(),
+    )
+
+    assert response.status_code == 200
+    db.refresh(gmail)
+    assert gmail.access_token == "reconnected-access"
+    assert gmail.refresh_token == "reconnected-refresh"
+    provision.assert_called_once_with(db, user_id=int(user.id))
 
 
 def test_google_shared_callback_retries_with_consent_for_new_subject_without_refresh(

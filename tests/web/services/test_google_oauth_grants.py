@@ -799,6 +799,60 @@ def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
     assert db.query(GoogleOAuthAppAssociation).count() == 0
 
 
+def test_detach_actor_app_is_scoped_to_the_exact_owner(db_session):
+    db, user = db_session
+    owner = "toby:workspace:alice"
+    ordinary_shared = _account(db, user, subject="ordinary-subject")
+    ordinary_legacy = _account(
+        db,
+        user,
+        subject="ordinary-subject",
+        provider="google-sheets",
+    )
+    actor_shared = _account(db, user, owner=owner, subject="actor-subject")
+    actor_legacy = _account(
+        db,
+        user,
+        owner=owner,
+        subject="actor-subject",
+        provider="google-sheets",
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=ordinary_shared,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        legacy_oauth_account=ordinary_legacy,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=actor_shared,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        legacy_oauth_account=actor_legacy,
+    )
+    db.commit()
+
+    assert (
+        detach_google_shared_oauth_app(
+            db,
+            user_id=int(user.id),
+            app_id="google-sheets",
+            resource_owner_key=owner,
+        )
+        == 1
+    )
+    db.commit()
+
+    assert db.get(UserOAuth, int(actor_shared.id)) is None
+    assert db.get(UserOAuth, int(actor_legacy.id)) is not None
+    assert db.get(UserOAuth, int(ordinary_shared.id)) is not None
+    assert db.get(UserOAuth, int(ordinary_legacy.id)) is not None
+    assert db.query(GoogleOAuthGrant).count() == 1
+    remaining = db.query(GoogleOAuthAppAssociation).one()
+    assert remaining.legacy_oauth_account_id == int(ordinary_legacy.id)
+
+
 def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session):
     db, user = db_session
     db.add(

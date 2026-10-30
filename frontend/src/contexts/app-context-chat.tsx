@@ -2344,7 +2344,16 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
         snapshot.runId,
         snapshot.stateVersion,
       )
-      const autoResumeEndedAt = !autoResume && typeof snapshot.runId === "string"
+      const recoveryExplicitlyEnded = hasOwn(recoveryView, "auto_resume")
+        && recoveryView.auto_resume === null
+      const outcomeEnded = (
+        snapshot.outcome === "cancelled"
+        || snapshot.outcome === "already_cancelled"
+        || snapshot.outcome === "resume_in_progress"
+      )
+      const autoResumeEndedAt = !autoResume
+        && (recoveryExplicitlyEnded || outcomeEnded)
+        && typeof snapshot.runId === "string"
         ? { runId: snapshot.runId, stateVersion: snapshot.stateVersion }
         : undefined
 

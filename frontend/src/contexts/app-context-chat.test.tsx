@@ -3847,6 +3847,59 @@ describe("AppProvider websocket message routing", () => {
     expect(state.currentTask?.controlState).toBe("resume_requested")
   })
 
+  it("keeps a same-fence schedule when a not-pending snapshot cannot read recovery", () => {
+    const currentTask = {
+      id: "1",
+      title: "Test task",
+      status: "paused" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      runId: "run-1",
+      stateVersion: 5,
+      controlState: "paused" as const,
+      autoResume: {
+        status: "scheduled" as const,
+        attempt: 1,
+        runId: "run-1",
+        stateVersion: 5,
+      },
+    }
+    const reconciled = projectAppState({
+      ...createInitialState(), taskId: 1, currentTask,
+    }, {
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: {
+        taskId: 1,
+        outcome: "not_pending",
+        status: "paused",
+        controlState: "paused",
+        runId: "run-1",
+        stateVersion: 5,
+        autoRecovery: null,
+        notice: null,
+      },
+    })
+
+    expect(reconciled.currentTask?.autoResume).toEqual(currentTask.autoResume)
+    expect(reconciled.currentTask?.autoResumeEndedAt).toBeUndefined()
+
+    const updated = projectAppState(reconciled, {
+      type: "APPLY_AUTO_RESUME_NOTICE",
+      payload: {
+        taskId: 1,
+        reason: "lease_expired",
+        notice: {
+          status: "scheduled",
+          attempt: 2,
+          runId: "run-1",
+          stateVersion: 5,
+        },
+      },
+    })
+    expect(updated.currentTask?.autoResume).toMatchObject({ status: "scheduled", attempt: 2 })
+  })
+
   it("ignores a stale automatic-resume cancellation snapshot", () => {
     const currentTask = {
       id: "1",

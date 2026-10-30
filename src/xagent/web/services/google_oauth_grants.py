@@ -975,9 +975,11 @@ def _lock_shared_google_accounts_for_detach(
     db: Session,
     *,
     user_id: int,
+    resource_owner_key: str | None,
     association_filter: Any,
 ) -> None:
     """Take the callback-compatible account-first lock order before detach."""
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     account_ids = sorted(
         {
             int(oauth_account_id)
@@ -988,7 +990,7 @@ def _lock_shared_google_accounts_for_detach(
             )
             .filter(
                 GoogleOAuthGrant.user_id == int(user_id),
-                GoogleOAuthGrant.resource_owner_key.is_(None),
+                _grant_owner_clause(owner_key),
                 association_filter,
             )
             .all()
@@ -1002,12 +1004,14 @@ def detach_google_shared_oauth_app(
     *,
     user_id: int,
     app_id: str,
+    resource_owner_key: str | None = None,
 ) -> int:
-    """Detach an app and delete only shared credentials no sibling still uses."""
+    """Detach an owner-scoped app and delete credentials no sibling still uses."""
     normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
     return _detach_google_shared_associations(
         db,
         user_id=int(user_id),
+        resource_owner_key=resource_owner_key,
         association_filter=GoogleOAuthAppAssociation.app_id == normalized_app_id,
     )
 
@@ -1016,12 +1020,15 @@ def _detach_google_shared_associations(
     db: Session,
     *,
     user_id: int,
+    resource_owner_key: str | None,
     association_filter: Any,
 ) -> int:
-    """Detach matching ordinary associations under the shared lock order."""
+    """Detach matching owner-scoped associations under the shared lock order."""
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     _lock_shared_google_accounts_for_detach(
         db,
         user_id=int(user_id),
+        resource_owner_key=owner_key,
         association_filter=association_filter,
     )
     associations = (
@@ -1032,7 +1039,7 @@ def _detach_google_shared_associations(
         )
         .filter(
             GoogleOAuthGrant.user_id == int(user_id),
-            GoogleOAuthGrant.resource_owner_key.is_(None),
+            _grant_owner_clause(owner_key),
             association_filter,
         )
         .with_for_update()
@@ -1057,6 +1064,7 @@ def detach_google_shared_oauth_legacy_account(
     return _detach_google_shared_associations(
         db,
         user_id=int(user_id),
+        resource_owner_key=None,
         association_filter=GoogleOAuthAppAssociation.legacy_oauth_account_id
         == int(legacy_oauth_account_id),
     )

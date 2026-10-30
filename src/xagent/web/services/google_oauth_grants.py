@@ -432,13 +432,38 @@ def write_google_shared_oauth_callback(
             .one_or_none()
         )
         if existing_shared_account is None:
-            shared_account = UserOAuth(
+            candidate = UserOAuth(
                 user_id=int(user_id),
                 provider=GOOGLE_SHARED_OAUTH_PROVIDER,
                 resource_owner_key=owner_key,
                 provider_user_id=subject,
+                access_token=access_token,
             )
-            db.add(shared_account)
+            try:
+                with db.begin_nested():
+                    db.add(candidate)
+                    db.flush()
+                shared_account = candidate
+            except IntegrityError as exc:
+                # A caller outside the HTTP callback may not hold the user-row
+                # lock. Recover the concurrent winner without poisoning the
+                # surrounding credential transaction.
+                concurrent_winner = (
+                    db.query(UserOAuth)
+                    .filter(
+                        UserOAuth.user_id == int(user_id),
+                        user_oauth_owner_clause(owner_key),
+                        UserOAuth.provider == GOOGLE_SHARED_OAUTH_PROVIDER,
+                        UserOAuth.provider_user_id == subject,
+                    )
+                    .with_for_update()
+                    .one_or_none()
+                )
+                if concurrent_winner is None:
+                    raise GoogleOAuthGrantConflict(
+                        "shared Google credential could not be created"
+                    ) from exc
+                shared_account = concurrent_winner
         else:
             shared_account = existing_shared_account
     else:

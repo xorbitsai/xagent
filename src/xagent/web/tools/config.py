@@ -4053,6 +4053,18 @@ class WebToolConfig(BaseToolConfig):
             str(oauth_account.provider) == "google"
             and oauth_account.resource_owner_key is None
         )
+        shared_gmail_refresh_tokens: dict[int, str | None] = {}
+        if shared_google_account:
+            from ..services.google_oauth_grants import (
+                gmail_legacy_accounts_for_shared_google_oauth,
+            )
+
+            shared_gmail_refresh_tokens = {
+                int(account.id): cast(str | None, account.refresh_token)
+                for account in gmail_legacy_accounts_for_shared_google_oauth(
+                    oauth_db, oauth_account_id=account_id
+                )
+            }
         permanently_invalid = False
         try:
             is_valid = await refresh_oauth_token_if_needed(
@@ -4176,16 +4188,22 @@ class WebToolConfig(BaseToolConfig):
                         oauth_db, oauth_account_id=int(oauth_account.id)
                     )
                     for gmail_account in gmail_accounts:
+                        gmail_account_id = int(gmail_account.id)
+                        if gmail_account_id not in shared_gmail_refresh_tokens:
+                            # The association appeared while the failed refresh
+                            # was in flight; it was not authorized by that
+                            # attempt and must not be quiesced by it.
+                            continue
                         mark_gmail_oauth_reconnect_required(
                             oauth_db,
                             oauth_account=gmail_account,
-                            # The shared refresh path may have rotated before
-                            # mirroring existed. Fence against replacement of
-                            # this exact legacy row, not against the possibly
-                            # newer token stored on the shared row.
-                            expected_refresh_token=cast(
-                                str | None, gmail_account.refresh_token
-                            ),
+                            # Fence on the mirror value observed before the
+                            # refresh await. A concurrent reconnect changes the
+                            # row and therefore supersedes this failure, while
+                            # a historically stale mirror is still quiesced.
+                            expected_refresh_token=shared_gmail_refresh_tokens[
+                                gmail_account_id
+                            ],
                         )
                     shared_reread_query = scoped_user_oauth_query(
                         oauth_db, user_id=user_id, resource_owner_key=None
@@ -4221,8 +4239,32 @@ class WebToolConfig(BaseToolConfig):
                 mirror_shared_google_oauth_credentials,
             )
 
+            if oauth_db.is_modified(oauth_account, include_collections=False):
+                oauth_db.flush([oauth_account])
+            shared_query = scoped_user_oauth_query(
+                oauth_db,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            ).filter(UserOAuth.id == account_id)
+            if oauth_db.get_bind().dialect.name == "sqlite":
+                shared_query.update(
+                    {UserOAuth.id: UserOAuth.id}, synchronize_session=False
+                )
+            else:
+                shared_query = shared_query.with_for_update()
+            current_shared = shared_query.populate_existing().one_or_none()
+            if current_shared is None:
+                oauth_db.rollback()
+                return _LegacyOAuthTokenResolution(
+                    access_token=None,
+                    refresh_failed=True,
+                    credential_present=False,
+                )
+            oauth_account = current_shared
             mirror_shared_google_oauth_credentials(
-                oauth_db, oauth_account=oauth_account
+                oauth_db,
+                oauth_account=oauth_account,
+                skip_gmail_tombstones=True,
             )
 
         access_token = str(oauth_account.access_token)

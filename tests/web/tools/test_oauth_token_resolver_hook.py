@@ -1493,7 +1493,7 @@ async def test_permanently_invalid_shared_google_grant_quiesces_gmail_watch(
 
 
 @pytest.mark.asyncio
-async def test_shared_google_gmail_association_added_during_refresh_keeps_lock_order(
+async def test_shared_google_gmail_association_added_during_refresh_is_not_quiesced(
     db_session,
     monkeypatch,
 ):
@@ -1600,8 +1600,12 @@ async def test_shared_google_gmail_association_added_during_refresh_keeps_lock_o
     finally:
         event.remove(db.get_bind(), "before_cursor_execute", observe_sql)
 
-    assert events[0:2] == ["association", "gmail-transition"]
-    assert "row-lock" in events[2:]
+    assert events[0] == "association"
+    assert "gmail-transition" not in events
+    assert "row-lock" in events[1:]
+    db.refresh(gmail)
+    assert gmail.access_token == "expired-shared-token"
+    assert gmail.refresh_token == "expired-shared-refresh"
 
 
 @pytest.mark.asyncio

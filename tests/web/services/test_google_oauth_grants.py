@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
+from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
 from xagent.web.models.google_oauth_grant import (
     GoogleOAuthAppAssociation,
@@ -15,6 +16,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.google_oauth_grants import (
     GoogleOAuthGrantConflict,
+    GoogleOAuthRefreshTokenRequired,
     create_google_oauth_grant_association,
     detach_google_shared_oauth_app,
     detach_google_shared_oauth_legacy_account,
@@ -344,6 +346,27 @@ def test_authorization_context_uses_only_exact_app_legacy_bridge(db_session):
         provider="google-calendar",
         scopes="scope.calendar",
     )
+    shared = _account(
+        db,
+        user,
+        subject="other-google-subject",
+        scopes="openid https://www.googleapis.com/auth/gmail.modify",
+    )
+    gmail = _account(
+        db,
+        user,
+        subject="other-google-subject",
+        provider="gmail",
+        scopes="https://www.googleapis.com/auth/gmail.modify",
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="gmail",
+        legacy_oauth_account=gmail,
+    )
+    db.commit()
 
     context = google_oauth_authorization_context(
         db,
@@ -353,7 +376,7 @@ def test_authorization_context_uses_only_exact_app_legacy_bridge(db_session):
         app_id="google-drive",
     )
 
-    assert context.has_refresh_token is False
+    assert context.has_refresh_token is True
     assert context.scopes == frozenset({"openid", "scope.drive"})
 
 
@@ -447,6 +470,50 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
     }
 
 
+def test_client_rotation_requires_a_fresh_refresh_token(db_session):
+    db, user = db_session
+    legacy = _account(db, user, provider="google-drive")
+    write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        google_subject="google-subject",
+        access_token="shared-access",
+        refresh_token="client-a-refresh",
+        granted_scopes="openid scope.drive",
+        requested_scopes=["openid", "scope.drive"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    with pytest.raises(GoogleOAuthRefreshTokenRequired):
+        write_google_shared_oauth_callback(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-b",
+            app_id="google-drive",
+            google_subject="google-subject",
+            access_token="client-b-access",
+            refresh_token=None,
+            granted_scopes="openid scope.drive",
+            requested_scopes=["openid", "scope.drive"],
+            email="alice@example.com",
+            token_type="Bearer",
+            expires_at=None,
+            legacy_oauth_account=legacy,
+        )
+    db.rollback()
+    assert db.query(GoogleOAuthGrant).one().oauth_client_fingerprint == (
+        google_oauth_client_fingerprint("client-a")
+    )
+
+
 def test_callback_writer_adopts_existing_unowned_bare_google_account(db_session):
     db, user = db_session
     bare = _account(
@@ -516,6 +583,59 @@ def test_resolver_rejects_association_after_legacy_link_is_deleted(db_session):
         )
         is None
     )
+
+
+def test_callback_removes_orphaned_association_after_subject_switch(db_session):
+    db, user = db_session
+    old_shared = _account(db, user, subject="subject-a", token="old-shared")
+    old_legacy = _account(
+        db,
+        user,
+        subject="subject-a",
+        provider="google-drive",
+        token="old-legacy",
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=old_shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=old_legacy,
+    )
+    db.commit()
+    old_shared_id = int(old_shared.id)
+    db.delete(old_legacy)
+    db.commit()
+
+    new_legacy = _account(
+        db,
+        user,
+        subject="subject-b",
+        provider="google-drive",
+        token="new-legacy",
+    )
+    write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        google_subject="subject-b",
+        access_token="new-shared",
+        refresh_token="new-refresh",
+        granted_scopes="openid scope.drive",
+        requested_scopes=["openid", "scope.drive"],
+        email="b@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=new_legacy,
+    )
+    db.commit()
+
+    assert db.get(UserOAuth, old_shared_id) is None
+    assert db.query(GoogleOAuthGrant).one().google_subject == "subject-b"
+    association = db.query(GoogleOAuthAppAssociation).one()
+    assert association.legacy_oauth_account_id == int(new_legacy.id)
 
 
 def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
@@ -630,6 +750,35 @@ def test_mirror_uses_canonical_builtin_scope_policy(db_session):
 
     assert mirror_shared_google_oauth_credentials(db, oauth_account=shared) == 0
     assert legacy.access_token == "existing-drive"
+
+
+def test_runtime_mirror_does_not_revive_a_gmail_reconnect_tombstone(db_session):
+    db, user = db_session
+    gmail_app = get_builtin_public_mcp_app("gmail")
+    assert gmail_app is not None
+    scopes = " ".join(gmail_app["oauth_scopes"])
+    shared = _account(db, user, token="live-shared", scopes=scopes)
+    gmail = _account(db, user, provider="gmail", token="", scopes=scopes)
+    gmail.refresh_token = None
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="gmail",
+        legacy_oauth_account=gmail,
+    )
+    db.commit()
+
+    assert (
+        mirror_shared_google_oauth_credentials(
+            db,
+            oauth_account=shared,
+            skip_gmail_tombstones=True,
+        )
+        == 0
+    )
+    assert gmail.access_token == ""
+    assert gmail.refresh_token is None
 
 
 def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
@@ -830,13 +979,19 @@ async def test_adopting_bare_google_row_preserves_covered_connected_sibling(
     db.commit()
 
     sheets_legacy = db.query(UserOAuth).filter_by(provider="test-google-sheets").one()
+    slides_tombstone = (
+        db.query(UserOAuth).filter_by(provider="test-google-slides").one()
+    )
     assert shared.id == bare.id
     assert sheets_legacy.access_token == "adopted-access"
     assert db.query(UserOAuth).filter_by(provider="test-google-calendar").count() == 0
-    assert db.query(UserOAuth).filter_by(provider="test-google-slides").count() == 0
+    assert slides_tombstone.access_token == ""
+    assert slides_tombstone.refresh_token is None
+    assert slides_tombstone.provider_user_id == "google-subject"
     assert {row.app_id for row in db.query(GoogleOAuthAppAssociation).all()} == {
         "test-google-drive",
         "test-google-sheets",
+        "test-google-slides",
     }
     assert (
         resolve_google_shared_oauth_account(
@@ -952,3 +1107,57 @@ def test_detach_locks_shared_account_before_deleting_association(db_session):
         if statement.startswith("deletefromgoogle_oauth_app_associations")
     )
     assert account_lock < association_delete
+
+
+def test_callback_locks_shared_account_before_grant(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    legacy = _account(db, user, provider="test-google-drive")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="test-google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    statements: list[str] = []
+
+    def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
+        statements.append("".join(statement.lower().split()))
+
+    event.listen(db.get_bind(), "before_cursor_execute", observe_sql)
+    try:
+        write_google_shared_oauth_callback(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-a",
+            app_id="test-google-drive",
+            google_subject="google-subject",
+            access_token="reconnected-access",
+            refresh_token="reconnected-refresh",
+            granted_scopes="openid scope.drive",
+            requested_scopes=["openid", "scope.drive"],
+            email="alice@example.com",
+            token_type="Bearer",
+            expires_at=None,
+            legacy_oauth_account=legacy,
+        )
+        db.flush()
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", observe_sql)
+
+    account_lock = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("updateuser_oauthsetid=")
+    )
+    grant_lock = next(
+        index
+        for index, statement in enumerate(statements)
+        if index > account_lock
+        and statement.startswith("select")
+        and "fromgoogle_oauth_grants" in statement
+    )
+    assert account_lock < grant_lock

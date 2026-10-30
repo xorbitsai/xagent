@@ -5255,6 +5255,15 @@ def _detach_shared_google_grant_for_disconnect(
     detach_google_shared_oauth_app(db, user_id=user_id, app_id=app_id)
 
 
+def _legacy_disconnect_provider_keys(
+    provider: object, provider_keys: Sequence[str]
+) -> list[str]:
+    """Keep the shared Google key out of legacy bulk deletion."""
+    if normalize_catalog_key(provider) != "google":
+        return list(provider_keys)
+    return [key for key in provider_keys if normalize_catalog_key(key) != "google"]
+
+
 def _teardown_mcp_app_server_locally(
     server_id: int,
     *,
@@ -5411,12 +5420,9 @@ def _teardown_mcp_app_server_locally(
             # already uses a shared grant during rollout. Never send the bare
             # ``google`` key through the bulk delete: the orphan cleanup below
             # removes it only after proving that no Google sibling remains.
-            if normalize_catalog_key(provider) == "google":
-                providers_to_delete = [
-                    key
-                    for key in providers_to_delete
-                    if normalize_catalog_key(key) != "google"
-                ]
+            providers_to_delete = _legacy_disconnect_provider_keys(
+                provider, providers_to_delete
+            )
             if providers_to_delete:
                 builtin_oauth_revocations.extend(
                     _snapshot_builtin_oauth_revocations(
@@ -5740,12 +5746,9 @@ async def delete_mcp_server(
                 )
                 # Mixed rollout state is valid: this app may still be legacy
                 # while a connected sibling already owns the shared row.
-                if normalize_catalog_key(provider) == "google":
-                    providers_to_delete = [
-                        key
-                        for key in providers_to_delete
-                        if normalize_catalog_key(key) != "google"
-                    ]
+                providers_to_delete = _legacy_disconnect_provider_keys(
+                    provider, providers_to_delete
+                )
                 if providers_to_delete:
                     builtin_oauth_revocations.extend(
                         _snapshot_builtin_oauth_revocations(

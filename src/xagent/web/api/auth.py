@@ -4097,6 +4097,7 @@ def _generic_oauth_login(
     )
 
     google_shared_has_refresh_token = False
+    google_restricted_scopes = False
     google_shared_mode = (
         get_google_shared_oauth_grants_enabled()
         and provider.lower() == "google"
@@ -4105,9 +4106,9 @@ def _generic_oauth_login(
         and app_info is not None
     )
     if provider.lower() == "google":
-        restricted_scopes = get_google_restricted_scopes()
+        google_restricted_scopes = get_google_restricted_scopes()
         # Provider defaults and custom apps must obey the same review gate.
-        if not restricted_scopes and GOOGLE_RESTRICTED_SCOPES.intersection(
+        if not google_restricted_scopes and GOOGLE_RESTRICTED_SCOPES.intersection(
             scopes + app_optional_scopes
         ):
             logger.warning("Rejected Google restricted scopes: app_id=%s", app_id)
@@ -4131,7 +4132,7 @@ def _generic_oauth_login(
                 app_id=cast(str, app_id),
             )
             reusable_scopes = set(context.scopes)
-            if not restricted_scopes:
+            if not google_restricted_scopes:
                 reusable_scopes.difference_update(GOOGLE_RESTRICTED_SCOPES)
             scopes = sorted(set(scopes).union(reusable_scopes))
             scope_str = _oauth_scope_separator(provider).join(scopes)
@@ -4154,10 +4155,11 @@ def _generic_oauth_login(
         "state": state,
     }
     if provider.lower() == "google":
-        restricted_scopes = get_google_restricted_scopes()
         params["access_type"] = "offline"
         # Closed environments must not aggregate historical restricted grants.
-        params["include_granted_scopes"] = "true" if restricted_scopes else "false"
+        params["include_granted_scopes"] = (
+            "true" if google_restricted_scopes else "false"
+        )
         # Repeated prompt=consent calls mint additional refresh tokens until
         # Google evicts an older one. Once this owner/client boundary has a
         # reusable token, account selection is enough; incremental scopes are
@@ -5640,6 +5642,12 @@ def generic_oauth_callback(
                 )
             ):
                 db.rollback()
+                _log_oauth_callback_rejection(
+                    provider,
+                    "shared_google_rollout_changed",
+                    app_id=app_id,
+                    actor_flow=is_actor_flow,
+                )
                 return HTMLResponse(
                     content=(
                         "<h1>Google connection rollout changed</h1>"
@@ -5669,6 +5677,12 @@ def generic_oauth_callback(
                     )
                     if grant_owned_account is not None:
                         db.rollback()
+                        _log_oauth_callback_rejection(
+                            provider,
+                            "shared_google_row_replacement_rejected",
+                            app_id=app_id,
+                            actor_flow=is_actor_flow,
+                        )
                         return HTMLResponse(
                             content=(
                                 "<h1>Cannot replace a shared Google connection</h1>"
@@ -5677,9 +5691,6 @@ def generic_oauth_callback(
                             ),
                             status_code=409,
                         )
-                if connector_key == "google":
-                    from ..models.google_oauth_grant import GoogleOAuthGrant
-
                     grant_account_ids = db.query(GoogleOAuthGrant.oauth_account_id)
                     (
                         scoped_user_oauth_query(
@@ -5856,16 +5867,27 @@ def generic_oauth_callback(
                         )
                     if is_actor_flow:
                         assert resource_owner_key is not None
-                        retry_response = start_builtin_oauth_for_resource_owner(
-                            provider=provider,
-                            app_id=cast(str, app_id),
-                            user=retry_user,
-                            resource_owner_key=resource_owner_key,
-                            redirect=payload.get("redirect"),
-                            db=db,
-                            db_provider=db_provider,
-                            force_google_consent=True,
-                        )
+                        try:
+                            retry_response = start_builtin_oauth_for_resource_owner(
+                                provider=provider,
+                                app_id=cast(str, app_id),
+                                user=retry_user,
+                                resource_owner_key=resource_owner_key,
+                                redirect=payload.get("redirect"),
+                                db=db,
+                                db_provider=db_provider,
+                                force_google_consent=True,
+                            )
+                        except ValueError:
+                            db.rollback()
+                            rejection_reason = "link_changed_before_consent_retry"
+                            _log_oauth_callback_rejection(
+                                provider,
+                                rejection_reason,
+                                app_id=app_id,
+                                actor_flow=True,
+                            )
+                            return _actor_oauth_flow_rejected_response(rejection_reason)
                         if isinstance(retry_response, RedirectResponse):
                             # This callback is the transaction owner for the
                             # replacement actor flow. Persist its new nonce
@@ -5883,7 +5905,7 @@ def generic_oauth_callback(
                         db_provider=db_provider,
                         trusted_user_id=user_id,
                         trusted_session_epoch=cast(
-                            str | None, retry_user.session_epoch
+                            str | None, payload.get("session_epoch")
                         ),
                         resource_owner_key=None,
                         actor_flow_nonce=None,
@@ -5892,6 +5914,12 @@ def generic_oauth_callback(
                     )
                 except GoogleOAuthScopeConsentRequired as exc:
                     db.rollback()
+                    _log_oauth_callback_rejection(
+                        provider,
+                        "shared_google_scopes_declined",
+                        app_id=app_id,
+                        actor_flow=is_actor_flow,
+                    )
                     missing = ", ".join(
                         html.escape(scope) for scope in exc.missing_scopes
                     )
@@ -6006,11 +6034,14 @@ def generic_oauth_callback(
             # change what this callback returns. Add new post-commit work
             # there, not here.
             if not is_actor_flow:
+                side_effect_kwargs: dict[str, Any] = {}
+                if provision_gmail_after_shared_callback:
+                    side_effect_kwargs["provision_gmail"] = True
                 _run_post_commit_oauth_side_effects(
                     db,
                     user_id=user_id,
                     connector_key=(app_id or provider),
-                    provision_gmail=provision_gmail_after_shared_callback,
+                    **side_effect_kwargs,
                 )
 
         from urllib.parse import urlparse

@@ -134,6 +134,13 @@ async def test_cloud_account_delete_removes_last_shared_google_grant(
     ordinary_id = int(ordinary.id)
     shared_id = int(shared.id)
 
+    accounts = await list_connected_accounts(provider=None, db=db, user=user)
+    assert [account["id"] for account in accounts] == [ordinary_id]
+    with pytest.raises(HTTPException) as exc_info:
+        await delete_connected_account(shared_id, db=db, user=user)
+    assert exc_info.value.status_code == 404
+    assert db.get(UserOAuth, shared_id) is not None
+
     await delete_connected_account(ordinary_id, db=db, user=user)
 
     assert db.get(UserOAuth, ordinary_id) is None

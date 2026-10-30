@@ -92,11 +92,15 @@ def google_oauth_authorization_context(
     oauth_client_id: str,
     app_id: str,
 ) -> GoogleOAuthAuthorizationContext:
-    """Return reusable scopes/token state inside the exact owner/client boundary.
+    """Return app-local scopes and whether any shared token can be reused.
 
-    The app's legacy row participates only as a rollout bridge. It lets the
-    first shared callback preserve an already-issued refresh token when Google
-    omits one, without treating another app's legacy credential as shared.
+    Account selection happens after this authorization request, so scopes from
+    a shared row cannot safely be requested here: that row may belong to a
+    different Google subject than the account the user selects. The app's
+    legacy row is the only safe scope bridge. A shared refresh token may still
+    suppress an unnecessary consent prompt; if another subject is selected and
+    Google omits offline access, the callback retries that exact choice with
+    forced consent.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     client_fingerprint = google_oauth_client_fingerprint(oauth_client_id)
@@ -126,7 +130,7 @@ def google_oauth_authorization_context(
         .all()
     )
     scopes: set[str] = set()
-    for account in [*shared_accounts, *legacy_accounts]:
+    for account in legacy_accounts:
         scopes.update(normalize_google_oauth_scopes(account.scope))
     has_refresh_token = False
     for account in shared_accounts:
@@ -174,12 +178,8 @@ def _validate_shared_account(
         raise GoogleOAuthGrantConflict("shared Google grant subject does not match")
 
 
-def _strict_google_app_scopes(app: Mapping[str, Any] | Any) -> frozenset[str] | None:
-    raw_scopes = (
-        app.get("oauth_scopes")
-        if isinstance(app, Mapping)
-        else getattr(app, "oauth_scopes", None)
-    )
+def _strict_google_app_scopes(app: Mapping[str, Any]) -> frozenset[str] | None:
+    raw_scopes = app.get("oauth_scopes")
     if raw_scopes is None:
         return None
     if not isinstance(raw_scopes, (list, tuple, set)) or any(
@@ -417,6 +417,120 @@ def create_google_oauth_grant_association(
     return association
 
 
+def _lock_google_oauth_accounts(db: Session, account_ids: Iterable[int]) -> None:
+    """Lock shared credential rows in stable order before their grant rows."""
+    normalized_ids = sorted({int(account_id) for account_id in account_ids})
+    if not normalized_ids:
+        return
+    account_query = db.query(UserOAuth).filter(UserOAuth.id.in_(normalized_ids))
+    if db.get_bind().dialect.name == "sqlite":
+        account_query.update({UserOAuth.id: UserOAuth.id}, synchronize_session=False)
+    else:
+        account_query.order_by(UserOAuth.id).with_for_update().all()
+
+
+def _lock_google_identity_grants(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    google_subject: str,
+) -> list[GoogleOAuthGrant]:
+    """Lock an identity's accounts first, then return its locked grants."""
+    identity_filter = (
+        GoogleOAuthGrant.user_id == int(user_id),
+        GoogleOAuthGrant.google_subject == google_subject,
+        _grant_owner_clause(resource_owner_key),
+    )
+    account_ids = [
+        int(account_id)
+        for (account_id,) in db.query(GoogleOAuthGrant.oauth_account_id)
+        .filter(*identity_filter)
+        .all()
+    ]
+    _lock_google_oauth_accounts(db, account_ids)
+    return cast(
+        list[GoogleOAuthGrant],
+        db.query(GoogleOAuthGrant)
+        .filter(*identity_filter)
+        .order_by(GoogleOAuthGrant.id)
+        .with_for_update()
+        .all(),
+    )
+
+
+def _remove_stale_legacy_associations(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    app_id: str,
+) -> None:
+    """Drop links orphaned when this app switched to another Google subject."""
+    legacy_account = aliased(UserOAuth)
+    stale_legacy_clause = or_(
+        GoogleOAuthAppAssociation.legacy_oauth_account_id.is_(None),
+        legacy_account.id.is_(None),
+        legacy_account.user_id != GoogleOAuthGrant.user_id,
+        legacy_account.provider != GoogleOAuthAppAssociation.app_id,
+        legacy_account.provider_user_id.is_(None),
+        legacy_account.provider_user_id != GoogleOAuthGrant.google_subject,
+        and_(
+            GoogleOAuthGrant.resource_owner_key.is_(None),
+            legacy_account.resource_owner_key.is_not(None),
+        ),
+        and_(
+            GoogleOAuthGrant.resource_owner_key.is_not(None),
+            or_(
+                legacy_account.resource_owner_key.is_(None),
+                legacy_account.resource_owner_key
+                != GoogleOAuthGrant.resource_owner_key,
+            ),
+        ),
+    )
+    association_filter = (
+        GoogleOAuthGrant.user_id == int(user_id),
+        _grant_owner_clause(resource_owner_key),
+        GoogleOAuthAppAssociation.app_id == app_id,
+        stale_legacy_clause,
+    )
+    account_ids = [
+        int(account_id)
+        for (account_id,) in db.query(GoogleOAuthGrant.oauth_account_id)
+        .join(
+            GoogleOAuthAppAssociation,
+            GoogleOAuthAppAssociation.grant_id == GoogleOAuthGrant.id,
+        )
+        .outerjoin(
+            legacy_account,
+            legacy_account.id == GoogleOAuthAppAssociation.legacy_oauth_account_id,
+        )
+        .filter(*association_filter)
+        .all()
+    ]
+    _lock_google_oauth_accounts(db, account_ids)
+    associations = (
+        db.query(GoogleOAuthAppAssociation)
+        .join(
+            GoogleOAuthGrant,
+            GoogleOAuthGrant.id == GoogleOAuthAppAssociation.grant_id,
+        )
+        .outerjoin(
+            legacy_account,
+            legacy_account.id == GoogleOAuthAppAssociation.legacy_oauth_account_id,
+        )
+        .filter(*association_filter)
+        .with_for_update(of=GoogleOAuthAppAssociation)
+        .all()
+    )
+    grant_ids = {int(association.grant_id) for association in associations}
+    for association in associations:
+        db.delete(association)
+    if associations:
+        db.flush()
+        _delete_orphaned_google_grants(db, grant_ids=grant_ids)
+
+
 def write_google_shared_oauth_callback(
     db: Session,
     *,
@@ -455,36 +569,38 @@ def write_google_shared_oauth_callback(
         )
 
     legacy_refresh_token = legacy_oauth_account.refresh_token
-    exact_grant = (
-        db.query(GoogleOAuthGrant)
-        .filter(
-            GoogleOAuthGrant.user_id == int(user_id),
-            GoogleOAuthGrant.google_subject == subject,
-            GoogleOAuthGrant.oauth_client_fingerprint == client_fingerprint,
-            _grant_owner_clause(owner_key),
-        )
-        .with_for_update()
-        .one_or_none()
+    _remove_stale_legacy_associations(
+        db,
+        user_id=int(user_id),
+        resource_owner_key=owner_key,
+        app_id=normalized_app_id,
     )
-    grant = exact_grant
+    identity_grants = _lock_google_identity_grants(
+        db,
+        user_id=int(user_id),
+        resource_owner_key=owner_key,
+        google_subject=subject,
+    )
+    exact_grants = [
+        candidate
+        for candidate in identity_grants
+        if candidate.oauth_client_fingerprint == client_fingerprint
+    ]
+    if len(exact_grants) > 1:
+        raise GoogleOAuthGrantConflict(
+            "Google identity resolves to multiple current-client grants"
+        )
+    grant = exact_grants[0] if exact_grants else None
+    client_fingerprint_migrated = False
     if grant is None:
         # A deployment may rotate its Google client id. The callback proves a
         # fresh authorization under the new client, so migrate the sole
         # identity row in place rather than replacing its credential row and
         # cascading every app association.
-        identity_grants = (
-            db.query(GoogleOAuthGrant)
-            .filter(
-                GoogleOAuthGrant.user_id == int(user_id),
-                GoogleOAuthGrant.google_subject == subject,
-                _grant_owner_clause(owner_key),
-            )
-            .with_for_update()
-            .all()
-        )
         if len(identity_grants) == 1:
             grant = identity_grants[0]
             setattr(grant, "oauth_client_fingerprint", client_fingerprint)
+            client_fingerprint_migrated = True
         elif len(identity_grants) > 1:
             raise GoogleOAuthGrantConflict(
                 "Google identity resolves to multiple client grants"
@@ -561,8 +677,10 @@ def write_google_shared_oauth_callback(
         )
 
     shared_refresh_token = shared_account.refresh_token
-    resolved_refresh_token = (
-        refresh_token or shared_refresh_token or legacy_refresh_token
+    resolved_refresh_token = refresh_token or (
+        None
+        if client_fingerprint_migrated
+        else shared_refresh_token or legacy_refresh_token
     )
     if not resolved_refresh_token or is_undecryptable_oauth_token(
         resolved_refresh_token
@@ -598,9 +716,7 @@ def write_google_shared_oauth_callback(
     # that the old bare scope set had already authorized, and keep every new
     # association behind the same owner/subject/client boundary.
     for sibling_app_id, sibling_required_scopes in adopted_bare_apps:
-        if sibling_app_id == normalized_app_id or not google_oauth_grant_covers_scopes(
-            shared_account, sibling_required_scopes
-        ):
+        if sibling_app_id == normalized_app_id:
             continue
         sibling_rows = (
             db.query(UserOAuth)
@@ -616,6 +732,14 @@ def write_google_shared_oauth_callback(
             (row for row in sibling_rows if str(row.provider_user_id or "") == subject),
             None,
         )
+        shared_covers_sibling = google_oauth_grant_covers_scopes(
+            shared_account, sibling_required_scopes
+        )
+        if sibling_legacy is not None and not shared_covers_sibling:
+            # This app already has an independent credential. Leave it intact
+            # instead of replacing a working fallback with an under-scoped
+            # shared grant.
+            continue
         if sibling_legacy is None:
             # Do not make the adopted bare identity replace an app-specific
             # connection that already points at another Google account.
@@ -631,9 +755,19 @@ def write_google_shared_oauth_callback(
             db.add(sibling_legacy)
             db.flush()
         setattr(sibling_legacy, "provider_user_id", subject)
-        _copy_shared_google_credentials(
-            shared_account, sibling_legacy, preserve_missing_refresh=False
-        )
+        if shared_covers_sibling:
+            _copy_shared_google_credentials(
+                shared_account, sibling_legacy, preserve_missing_refresh=False
+            )
+        else:
+            # Consuming the bare row removes its implicit provider fallback.
+            # Keep an explicit reconnect tombstone so the sibling is not
+            # silently presented as never connected.
+            setattr(sibling_legacy, "access_token", "")
+            setattr(sibling_legacy, "refresh_token", None)
+            setattr(sibling_legacy, "expires_at", None)
+            setattr(sibling_legacy, "scope", " ".join(sorted(sibling_required_scopes)))
+            setattr(sibling_legacy, "email", shared_account.email)
         create_google_oauth_grant_association(
             db,
             oauth_account=shared_account,
@@ -738,17 +872,29 @@ def _scope_valid_legacy_accounts_for_shared_google_oauth(
 
 
 def mirror_shared_google_oauth_credentials(
-    db: Session, *, oauth_account: UserOAuth
+    db: Session,
+    *,
+    oauth_account: UserOAuth,
+    skip_gmail_tombstones: bool = False,
 ) -> int:
     """Keep scope-valid rollback rows current after callback or refresh."""
     scope_valid_accounts = _scope_valid_legacy_accounts_for_shared_google_oauth(
         db, oauth_account=oauth_account
     )
+    mirrored = 0
     for legacy_account in scope_valid_accounts:
+        if (
+            skip_gmail_tombstones
+            and legacy_account.provider == "gmail"
+            and not legacy_account.access_token
+            and legacy_account.refresh_token is None
+        ):
+            continue
         _copy_shared_google_credentials(
             oauth_account, legacy_account, preserve_missing_refresh=True
         )
-    return len(scope_valid_accounts)
+        mirrored += 1
+    return mirrored
 
 
 def _lock_shared_google_accounts_for_detach(
@@ -774,13 +920,7 @@ def _lock_shared_google_accounts_for_detach(
             .all()
         }
     )
-    if not account_ids:
-        return
-    account_query = db.query(UserOAuth).filter(UserOAuth.id.in_(account_ids))
-    if db.get_bind().dialect.name == "sqlite":
-        account_query.update({UserOAuth.id: UserOAuth.id}, synchronize_session=False)
-    else:
-        account_query.order_by(UserOAuth.id).with_for_update().all()
+    _lock_google_oauth_accounts(db, account_ids)
 
 
 def detach_google_shared_oauth_app(
@@ -791,10 +931,24 @@ def detach_google_shared_oauth_app(
 ) -> int:
     """Detach an app and delete only shared credentials no sibling still uses."""
     normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
-    _lock_shared_google_accounts_for_detach(
+    return _detach_google_shared_associations(
         db,
         user_id=int(user_id),
         association_filter=GoogleOAuthAppAssociation.app_id == normalized_app_id,
+    )
+
+
+def _detach_google_shared_associations(
+    db: Session,
+    *,
+    user_id: int,
+    association_filter: Any,
+) -> int:
+    """Detach matching ordinary associations under the shared lock order."""
+    _lock_shared_google_accounts_for_detach(
+        db,
+        user_id=int(user_id),
+        association_filter=association_filter,
     )
     associations = (
         db.query(GoogleOAuthAppAssociation)
@@ -805,7 +959,7 @@ def detach_google_shared_oauth_app(
         .filter(
             GoogleOAuthGrant.user_id == int(user_id),
             GoogleOAuthGrant.resource_owner_key.is_(None),
-            GoogleOAuthAppAssociation.app_id == normalized_app_id,
+            association_filter,
         )
         .with_for_update()
         .all()
@@ -826,34 +980,12 @@ def detach_google_shared_oauth_legacy_account(
     legacy_oauth_account_id: int,
 ) -> int:
     """Detach the exact visible legacy account selected by cloud account UI."""
-    _lock_shared_google_accounts_for_detach(
+    return _detach_google_shared_associations(
         db,
         user_id=int(user_id),
         association_filter=GoogleOAuthAppAssociation.legacy_oauth_account_id
         == int(legacy_oauth_account_id),
     )
-    associations = (
-        db.query(GoogleOAuthAppAssociation)
-        .join(
-            GoogleOAuthGrant,
-            GoogleOAuthGrant.id == GoogleOAuthAppAssociation.grant_id,
-        )
-        .filter(
-            GoogleOAuthGrant.user_id == int(user_id),
-            GoogleOAuthGrant.resource_owner_key.is_(None),
-            GoogleOAuthAppAssociation.legacy_oauth_account_id
-            == int(legacy_oauth_account_id),
-        )
-        .with_for_update()
-        .all()
-    )
-    grant_ids = {int(association.grant_id) for association in associations}
-    for association in associations:
-        db.delete(association)
-    db.flush()
-
-    _delete_orphaned_google_grants(db, grant_ids=grant_ids)
-    return len(associations)
 
 
 def _delete_orphaned_google_grants(db: Session, *, grant_ids: Iterable[int]) -> None:
@@ -862,7 +994,10 @@ def _delete_orphaned_google_grants(db: Session, *, grant_ids: Iterable[int]) -> 
     for grant_id in grant_ids:
         sibling_exists = (
             db.query(GoogleOAuthAppAssociation.id)
-            .filter(GoogleOAuthAppAssociation.grant_id == grant_id)
+            .filter(
+                GoogleOAuthAppAssociation.grant_id == grant_id,
+                GoogleOAuthAppAssociation.legacy_oauth_account_id.is_not(None),
+            )
             .first()
             is not None
         )

@@ -506,3 +506,45 @@ class TestTheChangedCallers:
 
         email, status, _account_id = summaries["hubspot"]
         assert (email, status) == (None, "needs_reconnect")
+
+    def test_summaries_hide_grant_owned_shared_google_row(self, db):
+        from xagent.web.api.mcp import _oauth_account_summaries
+        from xagent.web.models.user import User
+        from xagent.web.models.user_oauth import UserOAuth
+        from xagent.web.services.google_oauth_grants import (
+            create_google_oauth_grant_association,
+        )
+
+        user = User(username="shared-google-owner", password_hash="h", is_admin=False)
+        db.add(user)
+        db.flush()
+        shared = UserOAuth(
+            user_id=int(user.id),
+            provider="google",
+            provider_user_id="google-subject",
+            access_token="shared-token",
+            refresh_token="shared-refresh",
+            scope="scope.drive",
+        )
+        legacy = UserOAuth(
+            user_id=int(user.id),
+            provider="google-drive",
+            provider_user_id="google-subject",
+            access_token="shared-token",
+            refresh_token="shared-refresh",
+            scope="scope.drive",
+        )
+        db.add_all([shared, legacy])
+        db.flush()
+        create_google_oauth_grant_association(
+            db,
+            oauth_account=shared,
+            oauth_client_id="client-a",
+            app_id="google-drive",
+            legacy_oauth_account=legacy,
+        )
+        db.commit()
+
+        summaries = _oauth_account_summaries(db, int(user.id))
+
+        assert set(summaries) == {"google-drive"}

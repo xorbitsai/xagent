@@ -14,6 +14,7 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services import google_oauth_grants as google_oauth_grants_service
 from xagent.web.services.google_oauth_grants import (
     GoogleOAuthGrantConflict,
     GoogleOAuthRefreshTokenRequired,
@@ -332,7 +333,7 @@ def test_association_is_idempotent_and_preserves_legacy_reference(db_session):
         )
 
 
-def test_authorization_context_uses_only_exact_app_legacy_bridge(db_session):
+def test_authorization_context_never_reuses_stored_scope_metadata(db_session):
     db, user = db_session
     _account(
         db,
@@ -377,7 +378,6 @@ def test_authorization_context_uses_only_exact_app_legacy_bridge(db_session):
     )
 
     assert context.has_refresh_token is True
-    assert context.scopes == frozenset({"openid", "scope.drive"})
 
 
 def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
@@ -758,8 +758,8 @@ def test_runtime_mirror_does_not_revive_a_gmail_reconnect_tombstone(db_session):
     assert gmail_app is not None
     scopes = " ".join(gmail_app["oauth_scopes"])
     shared = _account(db, user, token="live-shared", scopes=scopes)
-    gmail = _account(db, user, provider="gmail", token="", scopes=scopes)
-    gmail.refresh_token = None
+    gmail = _account(db, user, provider="gmail", token="live-gmail", scopes=scopes)
+    gmail.refresh_token = "live-refresh"
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,
@@ -768,6 +768,18 @@ def test_runtime_mirror_does_not_revive_a_gmail_reconnect_tombstone(db_session):
         legacy_oauth_account=gmail,
     )
     db.commit()
+    gmail_id = int(gmail.id)
+    # Keep the live object in this session's identity map while the mailbox
+    # transition commits a tombstone through another transaction.
+    assert gmail.access_token == "live-gmail"
+    isolated_session_factory = sessionmaker(bind=db.get_bind(), autoflush=False)
+    with isolated_session_factory() as transition_db:
+        transitioned = transition_db.get(UserOAuth, gmail_id)
+        assert transitioned is not None
+        transitioned.access_token = ""
+        transitioned.refresh_token = None
+        transitioned.expires_at = None
+        transition_db.commit()
 
     assert (
         mirror_shared_google_oauth_credentials(
@@ -777,6 +789,7 @@ def test_runtime_mirror_does_not_revive_a_gmail_reconnect_tombstone(db_session):
         )
         == 0
     )
+    db.refresh(gmail)
     assert gmail.access_token == ""
     assert gmail.refresh_token is None
 
@@ -1109,7 +1122,7 @@ def test_detach_locks_shared_account_before_deleting_association(db_session):
     assert account_lock < association_delete
 
 
-def test_callback_locks_shared_account_before_grant(db_session):
+def test_callback_locks_shared_account_before_grant(db_session, monkeypatch):
     db, user = db_session
     shared = _account(db, user)
     legacy = _account(db, user, provider="test-google-drive")
@@ -1121,12 +1134,26 @@ def test_callback_locks_shared_account_before_grant(db_session):
         legacy_oauth_account=legacy,
     )
     db.commit()
-    statements: list[str] = []
+    lock_events: list[str] = []
+    original_account_lock = google_oauth_grants_service._lock_google_oauth_accounts
 
-    def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
-        statements.append("".join(statement.lower().split()))
+    def observe_account_lock(lock_db, account_ids):
+        lock_events.append("account")
+        return original_account_lock(lock_db, account_ids)
 
-    event.listen(db.get_bind(), "before_cursor_execute", observe_sql)
+    def observe_orm_execute(execute_state):
+        statement = execute_state.statement
+        if getattr(
+            statement, "_for_update_arg", None
+        ) is not None and "FROM google_oauth_grants" in str(statement):
+            lock_events.append("grant")
+
+    monkeypatch.setattr(
+        google_oauth_grants_service,
+        "_lock_google_oauth_accounts",
+        observe_account_lock,
+    )
+    event.listen(db, "do_orm_execute", observe_orm_execute)
     try:
         write_google_shared_oauth_callback(
             db,
@@ -1146,18 +1173,10 @@ def test_callback_locks_shared_account_before_grant(db_session):
         )
         db.flush()
     finally:
-        event.remove(db.get_bind(), "before_cursor_execute", observe_sql)
+        event.remove(db, "do_orm_execute", observe_orm_execute)
 
-    account_lock = next(
-        index
-        for index, statement in enumerate(statements)
-        if statement.startswith("updateuser_oauthsetid=")
-    )
-    grant_lock = next(
-        index
-        for index, statement in enumerate(statements)
-        if index > account_lock
-        and statement.startswith("select")
-        and "fromgoogle_oauth_grants" in statement
-    )
-    assert account_lock < grant_lock
+    def account_lock_precedes_grant(events: list[str]) -> bool:
+        return events.index("account") < events.index("grant")
+
+    assert account_lock_precedes_grant(lock_events)
+    assert not account_lock_precedes_grant(["grant", "account"])

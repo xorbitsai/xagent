@@ -50,7 +50,6 @@ class GoogleOAuthScopeConsentRequired(ValueError):
 class GoogleOAuthAuthorizationContext:
     """Existing authority that may be reused by one Google authorization."""
 
-    scopes: frozenset[str]
     has_refresh_token: bool
 
 
@@ -92,19 +91,21 @@ def google_oauth_authorization_context(
     oauth_client_id: str,
     app_id: str,
 ) -> GoogleOAuthAuthorizationContext:
-    """Return app-local scopes and whether any shared token can be reused.
+    """Return whether any shared token can suppress the first consent prompt.
 
     Account selection happens after this authorization request, so scopes from
-    a shared row cannot safely be requested here: that row may belong to a
-    different Google subject than the account the user selects. The app's
-    legacy row is the only safe scope bridge. A shared refresh token may still
-    suppress an unnecessary consent prompt; if another subject is selected and
-    Google omits offline access, the callback retries that exact choice with
-    forced consent.
+    stored credentials cannot safely be requested here: a rollback mirror may
+    contain the full scope set of a formerly shared token, including scopes for
+    sibling apps that have since been detached. The caller already derives the
+    current app's required scopes from provider defaults and the canonical app
+    catalog, which is the only authority used for a new authorization. A shared
+    refresh token may still suppress an unnecessary consent prompt; if another
+    subject is selected and Google omits offline access, the callback retries
+    with forced consent.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     client_fingerprint = google_oauth_client_fingerprint(oauth_client_id)
-    normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
+    _normalized_nonempty(app_id, field="Google app id")
     shared_accounts = (
         db.query(UserOAuth)
         .join(GoogleOAuthGrant, GoogleOAuthGrant.oauth_account_id == UserOAuth.id)
@@ -120,26 +121,12 @@ def google_oauth_authorization_context(
         )
         .all()
     )
-    legacy_accounts = (
-        db.query(UserOAuth)
-        .filter(
-            UserOAuth.user_id == int(user_id),
-            user_oauth_owner_clause(owner_key),
-            UserOAuth.provider == normalized_app_id,
-        )
-        .all()
-    )
-    scopes: set[str] = set()
-    for account in legacy_accounts:
-        scopes.update(normalize_google_oauth_scopes(account.scope))
     has_refresh_token = False
     for account in shared_accounts:
         refresh_token = account.refresh_token
         if refresh_token and not is_undecryptable_oauth_token(refresh_token):
             has_refresh_token = True
-    return GoogleOAuthAuthorizationContext(
-        scopes=frozenset(scopes), has_refresh_token=has_refresh_token
-    )
+    return GoogleOAuthAuthorizationContext(has_refresh_token=has_refresh_token)
 
 
 def _normalized_nonempty(value: object, *, field: str) -> str:
@@ -427,6 +414,40 @@ def _lock_google_oauth_accounts(db: Session, account_ids: Iterable[int]) -> None
         account_query.update({UserOAuth.id: UserOAuth.id}, synchronize_session=False)
     else:
         account_query.order_by(UserOAuth.id).with_for_update().all()
+
+
+def lock_google_shared_accounts_for_app_replacement(
+    db: Session,
+    *,
+    user_id: int,
+    resource_owner_key: str | None,
+    app_id: str,
+) -> None:
+    """Lock old shared rows before a callback replaces an app's legacy row.
+
+    The generic callback owns legacy-row replacement, while the shared-grant
+    service owns grant/association updates. Taking the shared account lock at
+    the outer boundary keeps the end-to-end order account-first when a user
+    switches Google subjects and prevents a runtime mirror (shared then legacy)
+    from deadlocking with callback replacement (legacy then shared).
+    """
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    normalized_app_id = _normalized_nonempty(app_id, field="Google app id")
+    account_ids = [
+        int(account_id)
+        for (account_id,) in db.query(GoogleOAuthGrant.oauth_account_id)
+        .join(
+            GoogleOAuthAppAssociation,
+            GoogleOAuthAppAssociation.grant_id == GoogleOAuthGrant.id,
+        )
+        .filter(
+            GoogleOAuthGrant.user_id == int(user_id),
+            _grant_owner_clause(owner_key),
+            GoogleOAuthAppAssociation.app_id == normalized_app_id,
+        )
+        .all()
+    ]
+    _lock_google_oauth_accounts(db, account_ids)
 
 
 def _lock_google_identity_grants(
@@ -812,6 +833,7 @@ def legacy_accounts_for_shared_google_oauth(
                     UserOAuth.resource_owner_key == GoogleOAuthGrant.resource_owner_key,
                 ),
             )
+            .populate_existing()
             .all()
         ),
     )
@@ -878,10 +900,24 @@ def mirror_shared_google_oauth_credentials(
     skip_gmail_tombstones: bool = False,
 ) -> int:
     """Keep scope-valid rollback rows current after callback or refresh."""
+    if oauth_account.id is None:
+        return 0
+    legacy_account_ids = [
+        int(account.id)
+        for account in legacy_accounts_for_shared_google_oauth(
+            db, oauth_account_id=int(oauth_account.id)
+        )
+    ]
+    # Runtime refresh and callback both hold the shared row before entering
+    # this helper. Lock mirrors in stable order and force a database reload so
+    # a Gmail mailbox transition committed during provider I/O cannot be
+    # revived from the session identity map.
+    _lock_google_oauth_accounts(db, legacy_account_ids)
     scope_valid_accounts = _scope_valid_legacy_accounts_for_shared_google_oauth(
         db, oauth_account=oauth_account
     )
     mirrored = 0
+    mirrored_accounts: list[UserOAuth] = []
     for legacy_account in scope_valid_accounts:
         if (
             skip_gmail_tombstones
@@ -894,6 +930,12 @@ def mirror_shared_google_oauth_credentials(
             oauth_account, legacy_account, preserve_missing_refresh=True
         )
         mirrored += 1
+        mirrored_accounts.append(legacy_account)
+    if mirrored_accounts:
+        # Callers may immediately run another populate_existing() query (for
+        # example, Gmail post-callback provisioning). Persist the mirror inside
+        # this transaction first so that re-read cannot discard pending values.
+        db.flush(mirrored_accounts)
     return mirrored
 
 

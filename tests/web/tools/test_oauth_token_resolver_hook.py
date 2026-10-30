@@ -1041,6 +1041,124 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
 
 
 @pytest.mark.asyncio
+async def test_shared_refresh_generation_fence_preserves_newer_callback(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            default_scopes=["openid"],
+        )
+    )
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    drive_app = (
+        db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == "resolver-google-drive")
+        .one()
+    )
+    drive_app.oauth_scopes = ["scope.drive"]
+    calendar_app = PublicMCPApp(
+        app_id="test-google-calendar",
+        name="Test Google Calendar",
+        transport="oauth",
+        provider_name="google",
+        oauth_scopes=["scope.calendar"],
+        launch_config={},
+    )
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="google-subject",
+        access_token="drive-only-access",
+        refresh_token="drive-only-refresh",
+        scope="openid scope.drive",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    drive = UserOAuth(
+        user_id=int(user.id),
+        provider="resolver-google-drive",
+        provider_user_id="google-subject",
+        access_token="drive-only-access",
+    )
+    calendar = UserOAuth(
+        user_id=int(user.id),
+        provider="test-google-calendar",
+        provider_user_id="google-subject",
+        access_token="old-calendar-access",
+    )
+    db.add_all([calendar_app, shared, drive, calendar])
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="resolver-google-drive",
+        legacy_oauth_account=drive,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="test-google-calendar",
+        legacy_oauth_account=calendar,
+    )
+    db.commit()
+    shared_id = int(shared.id)
+    calendar_id = int(calendar.id)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+    observed_flush_options: list[bool] = []
+
+    async def delayed_refresh(
+        _db, oauth_account, _provider_name, *, flush_changes=True
+    ):
+        observed_flush_options.append(flush_changes)
+        with isolated_session_factory() as callback_db:
+            callback_shared = callback_db.get(UserOAuth, shared_id)
+            callback_calendar = callback_db.get(UserOAuth, calendar_id)
+            assert callback_shared is not None
+            assert callback_calendar is not None
+            callback_shared.access_token = "callback-access"
+            callback_shared.refresh_token = "callback-refresh"
+            callback_shared.scope = "openid scope.drive scope.calendar"
+            callback_shared.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+            callback_calendar.access_token = "callback-access"
+            callback_calendar.refresh_token = "callback-refresh"
+            callback_calendar.scope = callback_shared.scope
+            callback_db.commit()
+        oauth_account.access_token = "stale-refresh-access"
+        oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+        return True
+
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    monkeypatch.setattr(
+        web_tools_config, "refresh_oauth_token_if_needed", delayed_refresh
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert observed_flush_options == [False]
+    assert _access_token_env(configs[0]) == "callback-access"
+    with isolated_session_factory() as verification_db:
+        persisted_shared = verification_db.get(UserOAuth, shared_id)
+        persisted_calendar = verification_db.get(UserOAuth, calendar_id)
+        assert persisted_shared is not None
+        assert persisted_shared.access_token == "callback-access"
+        assert persisted_shared.scope == "openid scope.drive scope.calendar"
+        assert persisted_calendar is not None
+        assert persisted_calendar.access_token == "callback-access"
+
+
+@pytest.mark.asyncio
 async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     db_session, monkeypatch
 ):

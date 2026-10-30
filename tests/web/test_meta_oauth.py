@@ -8,7 +8,7 @@ from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
@@ -33,6 +33,7 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import gmail_provisioning
+from xagent.web.services import google_oauth_grants as google_oauth_grants_service
 from xagent.web.services.google_oauth_grants import (
     create_google_oauth_grant_association,
 )
@@ -357,15 +358,30 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
             launch_config={"command": "python", "args": ["-m", "sheets"]},
         )
     )
-    db.add(
-        UserOAuth(
-            user_id=int(user.id),
-            provider="google",
-            provider_user_id="subject-a",
-            access_token="existing-access",
-            refresh_token="existing-refresh",
-            scope="openid scope.drive",
-        )
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="subject-a",
+        access_token="existing-access",
+        refresh_token="existing-refresh",
+        scope="openid scope.drive",
+    )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="google-sheets",
+        provider_user_id="subject-a",
+        access_token="existing-access",
+        refresh_token="existing-refresh",
+        scope="openid scope.sheets",
+    )
+    db.add_all([shared, legacy])
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="test-client-id",
+        app_id="google-sheets",
+        legacy_oauth_account=legacy,
     )
     db.commit()
     request = SimpleNamespace(
@@ -395,10 +411,33 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
         "get",
         Mock(return_value=MockResponse({"sub": "subject-b", "email": "b@example.com"})),
     )
+    lock_order: list[str] = []
+    original_outer_lock = (
+        google_oauth_grants_service.lock_google_shared_accounts_for_app_replacement
+    )
 
-    response = generic_oauth_callback("google", request, db, _google_provider())
+    def observe_outer_lock(*args, **kwargs):
+        lock_order.append("shared-lock")
+        return original_outer_lock(*args, **kwargs)
+
+    def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
+        if "delete from user_oauth" in statement.lower():
+            lock_order.append("legacy-delete")
+
+    monkeypatch.setattr(
+        google_oauth_grants_service,
+        "lock_google_shared_accounts_for_app_replacement",
+        observe_outer_lock,
+    )
+    event.listen(db.get_bind(), "before_cursor_execute", observe_sql)
+
+    try:
+        response = generic_oauth_callback("google", request, db, _google_provider())
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", observe_sql)
 
     assert response.status_code == 307
+    assert lock_order.index("shared-lock") < lock_order.index("legacy-delete")
     params = parse_qs(urlparse(response.headers["location"]).query)
     assert params["prompt"] == ["consent"]
     retry_state = auth_api.verify_token(params["state"][0])
@@ -816,6 +855,144 @@ def test_shared_google_state_preserves_refresh_if_flag_changes_before_callback(
     assert legacy.access_token == "new-access"
     assert legacy.refresh_token == "old-refresh"
     assert db.query(GoogleOAuthGrant).count() == 0
+
+
+def test_shared_google_state_rejects_flag_change_without_refresh_fallback(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "false")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "drive"]},
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "new-access",
+                    "token_type": "Bearer",
+                    "scope": "openid scope.drive",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback(
+        "google",
+        SimpleNamespace(
+            query_params={
+                "code": "code",
+                "state": _shared_google_state(
+                    user, "google-drive", ["openid", "scope.drive"]
+                ),
+            }
+        ),
+        db,
+        _google_provider(),
+    )
+
+    assert response.status_code == 409
+    assert db.query(UserOAuth).count() == 0
+
+
+def test_bare_google_callback_cannot_replace_grant_owned_shared_row(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="google-subject",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="openid scope.drive",
+    )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="google-drive",
+        provider_user_id="google-subject",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="openid scope.drive",
+    )
+    db.add_all([shared, legacy])
+    db.flush()
+    association = create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    shared_id = int(shared.id)
+    association_id = int(association.id)
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": int(user.id),
+            "provider": "google",
+            "app_id": None,
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "bare-access",
+                    "refresh_token": "bare-refresh",
+                    "token_type": "Bearer",
+                    "scope": "openid",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback(
+        "google",
+        SimpleNamespace(query_params={"code": "code", "state": state}),
+        db,
+        _google_provider(),
+    )
+
+    assert response.status_code == 409
+    db.expire_all()
+    preserved = db.get(UserOAuth, shared_id)
+    assert preserved is not None
+    assert preserved.access_token == "shared-access"
+    assert db.get(GoogleOAuthAppAssociation, association_id) is not None
 
 
 @pytest.mark.asyncio

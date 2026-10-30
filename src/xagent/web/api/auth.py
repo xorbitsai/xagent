@@ -4131,10 +4131,6 @@ def _generic_oauth_login(
                 oauth_client_id=client_id,
                 app_id=cast(str, app_id),
             )
-            reusable_scopes = set(context.scopes)
-            if not google_restricted_scopes:
-                reusable_scopes.difference_update(GOOGLE_RESTRICTED_SCOPES)
-            scopes = sorted(set(scopes).union(reusable_scopes))
             scope_str = _oauth_scope_separator(provider).join(scopes)
             google_shared_has_refresh_token = context.has_refresh_token
             state_payload.update(
@@ -5654,6 +5650,21 @@ def generic_oauth_callback(
                         "<p>Please close this window and connect again.</p>"
                     ),
                     status_code=409,
+                )
+            if google_shared_state:
+                from ..services.google_oauth_grants import (
+                    lock_google_shared_accounts_for_app_replacement,
+                )
+
+                # Runtime refresh/mirroring locks the shared row before any
+                # legacy mirror. Take that same outer lock before the generic
+                # callback queries, deletes, or replaces the app-local row;
+                # the service writer alone is too late for a subject switch.
+                lock_google_shared_accounts_for_app_replacement(
+                    db,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                    app_id=cast(str, app_id),
                 )
             if oauth_account is None:
                 if connector_key == "google":

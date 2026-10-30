@@ -251,7 +251,9 @@ def test_google_drive_login_does_not_reuse_previous_granted_scopes(db_session):
     }
 
 
-def test_google_shared_login_reuses_scopes_without_reconsent(db_session, monkeypatch):
+def test_google_shared_login_uses_catalog_scopes_not_stale_mirror(
+    db_session, monkeypatch
+):
     monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
     db, user = db_session
     db.add(
@@ -313,14 +315,12 @@ def test_google_shared_login_reuses_scopes_without_reconsent(db_session, monkeyp
     assert set(params["scope"][0].split()) == {
         "openid",
         "https://www.googleapis.com/auth/drive.file",
-        "scope.existing",
     }
     state = verify_token(params["state"][0])
     assert state["google_shared_mode"] is True
     assert set(state["google_shared_scopes"]) == {
         "openid",
         "https://www.googleapis.com/auth/drive.file",
-        "scope.existing",
     }
 
 

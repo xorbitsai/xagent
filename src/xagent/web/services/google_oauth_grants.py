@@ -51,6 +51,7 @@ class GoogleOAuthAuthorizationContext:
     """Existing authority that may be reused by one Google authorization."""
 
     has_refresh_token: bool
+    associated_scopes: frozenset[str]
 
 
 def google_oauth_client_fingerprint(client_id: str) -> str:
@@ -91,24 +92,20 @@ def google_oauth_authorization_context(
     oauth_client_id: str,
     app_id: str,
 ) -> GoogleOAuthAuthorizationContext:
-    """Return whether any shared token can suppress the first consent prompt.
+    """Return reusable authority for one Google authorization request.
 
-    Account selection happens after this authorization request, so scopes from
-    stored credentials cannot safely be requested here: a rollback mirror may
-    contain the full scope set of a formerly shared token, including scopes for
-    sibling apps that have since been detached. The caller already derives the
-    current app's required scopes from provider defaults and the canonical app
-    catalog, which is the only authority used for a new authorization. A shared
-    refresh token may still suppress an unnecessary consent prompt; if another
-    subject is selected and Google omits offline access, the callback retries
-    with forced consent.
+    Stored scope strings are deliberately not trusted: rollback mirrors can
+    retain scopes for detached apps. Instead, rebuild the union from current,
+    valid associations and the canonical app catalog. If account selection is
+    ambiguous, only an existing association for the requested app selects a
+    grant; otherwise the current app remains the sole requested authority.
     """
     owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
     client_fingerprint = google_oauth_client_fingerprint(oauth_client_id)
     _normalized_nonempty(app_id, field="Google app id")
-    shared_accounts = (
-        db.query(UserOAuth)
-        .join(GoogleOAuthGrant, GoogleOAuthGrant.oauth_account_id == UserOAuth.id)
+    shared_rows = (
+        db.query(GoogleOAuthGrant, UserOAuth)
+        .join(UserOAuth, UserOAuth.id == GoogleOAuthGrant.oauth_account_id)
         .filter(
             GoogleOAuthGrant.user_id == int(user_id),
             GoogleOAuthGrant.oauth_client_fingerprint == client_fingerprint,
@@ -122,11 +119,46 @@ def google_oauth_authorization_context(
         .all()
     )
     has_refresh_token = False
-    for account in shared_accounts:
+    valid_apps_by_grant: dict[int, set[str]] = {}
+    for grant, account in shared_rows:
         refresh_token = account.refresh_token
         if refresh_token and not is_undecryptable_oauth_token(refresh_token):
             has_refresh_token = True
-    return GoogleOAuthAuthorizationContext(has_refresh_token=has_refresh_token)
+        grant_id = int(grant.id)
+        valid_apps_by_grant[grant_id] = {
+            str(legacy_account.provider)
+            for legacy_account in legacy_accounts_for_shared_google_oauth(
+                db, oauth_account_id=int(account.id)
+            )
+        }
+
+    app_grant_ids = [
+        grant_id
+        for grant_id, app_ids in valid_apps_by_grant.items()
+        if app_id in app_ids
+    ]
+    target_grant_id: int | None = None
+    if len(app_grant_ids) == 1:
+        target_grant_id = app_grant_ids[0]
+    elif len(shared_rows) == 1:
+        target_grant_id = int(shared_rows[0][0].id)
+
+    associated_scopes: set[str] = set()
+    if target_grant_id is not None:
+        from ..mcp_apps import get_app_by_id
+
+        for associated_app_id in valid_apps_by_grant.get(target_grant_id, set()):
+            app = get_app_by_id(db, associated_app_id)
+            if app is None or str(app.get("provider") or "").lower() != "google":
+                continue
+            app_scopes = _strict_google_app_scopes(app)
+            if app_scopes is not None:
+                associated_scopes.update(app_scopes)
+
+    return GoogleOAuthAuthorizationContext(
+        has_refresh_token=has_refresh_token,
+        associated_scopes=frozenset(associated_scopes),
+    )
 
 
 def _normalized_nonempty(value: object, *, field: str) -> str:

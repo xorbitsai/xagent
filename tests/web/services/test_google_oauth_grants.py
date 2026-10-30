@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import pytest
 from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.orm import Query, sessionmaker
 
 from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
 from xagent.web.models.database import Base
@@ -333,8 +334,18 @@ def test_association_is_idempotent_and_preserves_legacy_reference(db_session):
         )
 
 
-def test_authorization_context_never_reuses_stored_scope_metadata(db_session):
+def test_authorization_context_rebuilds_scopes_from_current_catalog_links(db_session):
     db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="test-google-mail",
+            name="Test Google Mail",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["https://www.googleapis.com/auth/gmail.modify"],
+        )
+    )
+    db.commit()
     _account(
         db,
         user,
@@ -357,14 +368,14 @@ def test_authorization_context_never_reuses_stored_scope_metadata(db_session):
         db,
         user,
         subject="other-google-subject",
-        provider="gmail",
+        provider="test-google-mail",
         scopes="https://www.googleapis.com/auth/gmail.modify",
     )
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,
         oauth_client_id="client-a",
-        app_id="gmail",
+        app_id="test-google-mail",
         legacy_oauth_account=gmail,
     )
     db.commit()
@@ -378,6 +389,108 @@ def test_authorization_context_never_reuses_stored_scope_metadata(db_session):
     )
 
     assert context.has_refresh_token is True
+    assert "scope.drive" not in context.associated_scopes
+    assert "scope.calendar" not in context.associated_scopes
+    assert "https://www.googleapis.com/auth/gmail.modify" in context.associated_scopes
+
+
+def test_sequential_callbacks_request_and_resolve_one_shared_scope_union(db_session):
+    db, user = db_session
+    db.add_all(
+        [
+            PublicMCPApp(
+                app_id="test-google-drive",
+                name="Test Google Drive",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.drive"],
+            ),
+            PublicMCPApp(
+                app_id="test-google-docs",
+                name="Test Google Docs",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.docs"],
+            ),
+        ]
+    )
+    db.commit()
+    drive = _account(
+        db,
+        user,
+        provider="test-google-drive",
+        token="drive-access",
+        scopes="openid scope.drive",
+    )
+    shared, _drive_mirror, _drive_association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="test-google-drive",
+        google_subject="google-subject",
+        access_token="drive-access",
+        refresh_token="shared-refresh",
+        granted_scopes="openid scope.drive",
+        requested_scopes=["openid", "scope.drive"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=drive,
+    )
+    db.commit()
+
+    context = google_oauth_authorization_context(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="test-google-docs",
+    )
+    assert context.associated_scopes == frozenset({"scope.drive"})
+
+    docs = _account(
+        db,
+        user,
+        provider="test-google-docs",
+        token="docs-access",
+        scopes="openid scope.drive scope.docs",
+    )
+    updated, _docs_mirror, _docs_association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="test-google-docs",
+        google_subject="google-subject",
+        access_token="docs-access",
+        refresh_token=None,
+        granted_scopes="openid scope.drive scope.docs",
+        requested_scopes=["openid", "scope.drive", "scope.docs"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=docs,
+    )
+    db.commit()
+
+    assert updated.id == shared.id
+    assert updated.refresh_token == "shared-refresh"
+    assert set(str(updated.scope).split()) == {"openid", "scope.drive", "scope.docs"}
+    for app_id, required_scope in (
+        ("test-google-drive", "scope.drive"),
+        ("test-google-docs", "scope.docs"),
+    ):
+        resolved = resolve_google_shared_oauth_account(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-a",
+            app_id=app_id,
+            required_scopes=[required_scope],
+        )
+        assert resolved is not None
+        assert resolved.id == shared.id
 
 
 def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
@@ -1180,3 +1293,64 @@ def test_callback_locks_shared_account_before_grant(db_session, monkeypatch):
 
     assert account_lock_precedes_grant(lock_events)
     assert not account_lock_precedes_grant(["grant", "account"])
+
+
+def test_postgresql_shared_lock_queries_compile_for_update_of(db_session, monkeypatch):
+    db, user = db_session
+    shared = _account(db, user)
+    legacy = _account(db, user, provider="test-google-drive")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="test-google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    lock_statements = []
+    original_with_for_update = Query.with_for_update
+
+    def capture_for_update(query, *args, **kwargs):
+        locked_query = original_with_for_update(query, *args, **kwargs)
+        lock_statements.append(locked_query.statement)
+        return locked_query
+
+    monkeypatch.setattr(Query, "with_for_update", capture_for_update)
+    monkeypatch.setattr(db.get_bind().dialect, "name", "postgresql")
+
+    resolved = resolve_google_shared_oauth_account(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="test-google-drive",
+        required_scopes=["scope.drive"],
+        lock=True,
+    )
+    assert resolved is not None
+
+    legacy.provider_user_id = "different-google-subject"
+    db.flush()
+    google_oauth_grants_service._remove_stale_legacy_associations(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        app_id="test-google-drive",
+    )
+
+    compiled_locks = [
+        " ".join(
+            str(
+                statement.compile(
+                    dialect=postgresql.dialect(),
+                    compile_kwargs={"literal_binds": True},
+                )
+            ).split()
+        ).lower()
+        for statement in lock_statements
+    ]
+    assert any("for update of user_oauth" in sql for sql in compiled_locks)
+    assert any(
+        "for update of google_oauth_app_associations" in sql for sql in compiled_locks
+    )

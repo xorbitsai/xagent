@@ -4131,6 +4131,10 @@ def _generic_oauth_login(
                 oauth_client_id=client_id,
                 app_id=cast(str, app_id),
             )
+            associated_scopes = set(context.associated_scopes)
+            if not google_restricted_scopes:
+                associated_scopes.difference_update(GOOGLE_RESTRICTED_SCOPES)
+            scopes = sorted(set(scopes).union(associated_scopes))
             scope_str = _oauth_scope_separator(provider).join(scopes)
             google_shared_has_refresh_token = context.has_refresh_token
             state_payload.update(

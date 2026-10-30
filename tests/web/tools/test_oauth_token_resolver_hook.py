@@ -988,7 +988,9 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
     ).get_mcp_server_configs()
     assert _access_token_env(configs[0]) == "shared-token"
     db.refresh(legacy)
-    assert legacy.access_token == "shared-token"
+    # An unexpired read must not take writer locks or rewrite every mirror.
+    # Callback and actual refresh paths own rollback synchronization.
+    assert legacy.access_token == "legacy-token"
 
     shared.scope = "openid"
     legacy.access_token = "legacy-under-scoped"

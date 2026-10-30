@@ -251,27 +251,55 @@ def test_google_drive_login_does_not_reuse_previous_granted_scopes(db_session):
     }
 
 
+@pytest.mark.parametrize(
+    ("associated_scope", "restricted_enabled", "expect_associated_scope"),
+    [
+        ("scope.catalog.associated", False, True),
+        ("https://www.googleapis.com/auth/gmail.modify", False, False),
+        ("https://www.googleapis.com/auth/gmail.modify", True, True),
+    ],
+)
 def test_google_shared_login_uses_catalog_scopes_not_stale_mirror(
-    db_session, monkeypatch
+    db_session,
+    monkeypatch,
+    associated_scope,
+    restricted_enabled,
+    expect_associated_scope,
 ):
     monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    monkeypatch.setenv(
+        "XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", str(restricted_enabled)
+    )
     db, user = db_session
-    db.add(
-        PublicMCPApp(
-            app_id="google-drive",
-            name="Google Drive",
-            description="Drive",
-            transport="oauth",
-            provider_name="google",
-            category="Support",
-            oauth_scopes=["scope.drive.file"],
-            is_visible_in_connector=True,
-            launch_config={},
-        )
+    db.add_all(
+        [
+            PublicMCPApp(
+                app_id="test-associated-google-app",
+                name="Associated Google App",
+                description="Associated app",
+                transport="oauth",
+                provider_name="google",
+                category="Support",
+                oauth_scopes=[associated_scope],
+                is_visible_in_connector=True,
+                launch_config={},
+            ),
+            PublicMCPApp(
+                app_id="test-current-google-app",
+                name="Current Google App",
+                description="Current app",
+                transport="oauth",
+                provider_name="google",
+                category="Support",
+                oauth_scopes=["scope.catalog.current"],
+                is_visible_in_connector=True,
+                launch_config={},
+            ),
+        ]
     )
     legacy = UserOAuth(
         user_id=int(user.id),
-        provider="google-drive",
+        provider="test-associated-google-app",
         provider_user_id="subject-a",
         access_token="legacy-access",
         refresh_token="legacy-refresh",
@@ -291,7 +319,7 @@ def test_google_shared_login_uses_catalog_scopes_not_stale_mirror(
         db,
         oauth_account=shared,
         oauth_client_id="test-client-id",
-        app_id="google-drive",
+        app_id="test-associated-google-app",
         legacy_oauth_account=legacy,
     )
     db.commit()
@@ -304,7 +332,7 @@ def test_google_shared_login_uses_catalog_scopes_not_stale_mirror(
     response = generic_oauth_login(
         provider="google",
         token=_token_for(user),
-        app_id="google-drive",
+        app_id="test-current-google-app",
         redirect=None,
         db=db,
         db_provider=provider,
@@ -312,16 +340,13 @@ def test_google_shared_login_uses_catalog_scopes_not_stale_mirror(
 
     params = parse_qs(urlparse(_location(response)).query)
     assert params["prompt"] == ["select_account"]
-    assert set(params["scope"][0].split()) == {
-        "openid",
-        "https://www.googleapis.com/auth/drive.file",
-    }
+    expected_scopes = {"openid", "scope.catalog.current"}
+    if expect_associated_scope:
+        expected_scopes.add(associated_scope)
+    assert set(params["scope"][0].split()) == expected_scopes
     state = verify_token(params["state"][0])
     assert state["google_shared_mode"] is True
-    assert set(state["google_shared_scopes"]) == {
-        "openid",
-        "https://www.googleapis.com/auth/drive.file",
-    }
+    assert set(state["google_shared_scopes"]) == expected_scopes
 
 
 @pytest.mark.parametrize("enabled", [False, True])

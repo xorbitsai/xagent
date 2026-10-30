@@ -15,13 +15,20 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp, type SessionAttachmentsConfig, type TaskAutoResume } from "@/contexts/app-context-chat"
+import { toast } from "@/components/ui/sonner"
+import {
+  parseAutoResumeNotice,
+  useApp,
+  type SessionAttachmentsConfig,
+  type TaskAutoResume,
+} from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
+import { apiRequest } from "@/lib/api-wrapper"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
-import { cn } from "@/lib/utils"
+import { cn, getApiUrl } from "@/lib/utils"
 
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
@@ -300,6 +307,7 @@ export function TaskConversationPanel({
   const [dagLayout, setDagLayout] = useState<"TB" | "LR">("TB")
   const [leftWidth, setLeftWidth] = useState(50)
   const [isDragging, setIsDragging] = useState(false)
+  const [isCancellingAutoResume, setIsCancellingAutoResume] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const userMessageContextBadges = useMemo(() => {
@@ -891,6 +899,84 @@ export function TaskConversationPanel({
   const showStoppedResumeAction = autoResume?.status === "stopped"
     && !isSupersededAutoResume
     && taskControlsEnabled
+  const showCancelAutoResumeAction = autoResume?.status === "scheduled"
+    && taskControlsEnabled
+  const cancelAutoResume = useCallback(async () => {
+    if (
+      isCancellingAutoResume
+      || state.taskId === null
+      || autoResume?.status !== "scheduled"
+    ) return
+
+    const taskId = state.taskId
+    const runId = autoResume.runId
+    setIsCancellingAutoResume(true)
+    try {
+      const response = await apiRequest(
+        `${getApiUrl()}/api/chat/task/${taskId}/auto-resume/cancel`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ run_id: runId }),
+        },
+      )
+      const result = await response.json().catch(() => null) as Record<string, unknown> | null
+      if (!response.ok) {
+        const detail = result?.detail
+        const code = detail && typeof detail === "object" && "code" in detail
+          ? (detail as { code?: unknown }).code
+          : undefined
+        toast.error(t(
+          code === "auto_resume_cancel_raced"
+            ? "taskInterruption.autoResumeCancelRaced"
+            : "taskInterruption.autoResumeCancelFailed",
+        ))
+        return
+      }
+
+      const notice = result?.notice
+      const autoRecovery = result?.auto_recovery
+      const autoResumeView = autoRecovery && typeof autoRecovery === "object"
+        ? (autoRecovery as { auto_resume?: unknown }).auto_resume
+        : undefined
+      const taskIdFromResult = typeof result?.task_id === "number" ? result.task_id : taskId
+      const runIdFromResult = typeof result?.run_id === "string" ? result.run_id : runId
+      const stateVersion = typeof result?.state_version === "number"
+        ? result.state_version
+        : autoResume.stateVersion
+      const recoveryMessage = notice && typeof notice === "object"
+        ? notice as Record<string, unknown>
+        : autoResumeView && typeof autoResumeView === "object"
+          ? {
+            task_id: taskIdFromResult,
+            run_id: runIdFromResult,
+            state_version: stateVersion,
+            auto_resume: autoResumeView,
+          }
+          : null
+
+      if (recoveryMessage) {
+        // The endpoint returns the same recovery notice it broadcasts. Apply
+        // it immediately; the reducer's task/run/version fence also makes a
+        // response harmless if the visitor switched tasks while it was in flight.
+        const parsed = parseAutoResumeNotice(recoveryMessage)
+        if (parsed) dispatch({ type: "APPLY_AUTO_RESUME_NOTICE", payload: parsed })
+      }
+
+      if (result?.outcome === "not_pending") requestStatus()
+    } catch {
+      toast.error(t("taskInterruption.autoResumeCancelFailed"))
+    } finally {
+      setIsCancellingAutoResume(false)
+    }
+  }, [
+    autoResume,
+    dispatch,
+    isCancellingAutoResume,
+    requestStatus,
+    state.taskId,
+    t,
+  ])
   // The virtual message belongs to the latest turn, so it follows that turn's
   // stopped record the same way the process groups above do, including taking
   // no task-id failure reference. It only appears while the turn has no answer
@@ -940,6 +1026,20 @@ export function TaskConversationPanel({
                 ? autoResumeNotice(autoResume, t, locale)
                 : t(interruptionNoticeKey(interruptionReason as string))}
             </span>
+            {showCancelAutoResumeAction && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={isCancellingAutoResume}
+                onClick={() => void cancelAutoResume()}
+                className="shrink-0 border-amber-400 bg-transparent hover:bg-amber-100 dark:hover:bg-amber-900"
+              >
+                {t(isCancellingAutoResume
+                  ? "taskInterruption.cancellingAutoResume"
+                  : "taskInterruption.cancelAutoResume")}
+              </Button>
+            )}
             {showStoppedResumeAction && (
               <Button
                 type="button"

@@ -1,3 +1,5 @@
+import { withAuthCoordination } from "./auth-coordination"
+
 export const AUTH_CACHE_KEY = "auth_cache"
 export const AUTH_LOGIN_INTENT_KEY = "auth_login_intent"
 export const AUTH_REVOKED_LOGIN_INTENT_KEY = "auth_revoked_login_intent"
@@ -396,8 +398,6 @@ type AuthMutationAttempt<T> =
 async function withMutationLock<T>(conditional: boolean, action: (context: AuthMutationContext) => Promise<T>): Promise<AuthMutationAttempt<T>> {
   const storage = getAuthStorage()
   if (!storage) return { status: "unavailable", reason: "storage_unavailable" }
-  const locks = typeof navigator === "undefined" ? undefined : navigator.locks
-  if (!locks && conditional) return { status: "unavailable", reason: "coordination_unavailable" }
   let shouldDispatch = false
   const run = async (): Promise<AuthMutationAttempt<T>> => {
     let snapshot: Map<string, string | null> | null = null
@@ -424,12 +424,12 @@ async function withMutationLock<T>(conditional: boolean, action: (context: AuthM
     }
   }
   try {
-    return locks ? await locks.request(AUTH_MUTATION_LOCK, run) : await run()
-  } catch {
-    return { status: "unavailable", reason: "operation_failed" }
+    const coordinated = await withAuthCoordination(AUTH_MUTATION_LOCK, run)
+    if (!conditional && coordinated.status === "unavailable" && coordinated.reason === "coordination_unavailable") return run()
+    return coordinated.status === "completed" ? coordinated.value : coordinated
   } finally {
     // A same-tab observer may synchronously read storage, so publication must
-    // happen only after the Web Lock callback has returned successfully.
+    // happen only after the coordination callback has returned successfully.
     if (shouldDispatch) dispatchAuthTokenUpdated()
   }
 }

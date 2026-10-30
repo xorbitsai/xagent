@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import "fake-indexeddb/auto"
 import {
   AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, AUTH_OIDC_INTENT_KEY, AUTH_REVOKED_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
   AUTH_TOKEN_UPDATED_EVENT, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, commitAuthSessionRefresh, compareAuthSession, createAuthSession,
@@ -54,6 +55,17 @@ describe("auth cache lineage", () => {
     await expect(migrateLegacyAuthSession()).resolves.toEqual({ status: "unavailable", reason: "storage_unavailable" })
     expect(["superseded", "unavailable"]).toContain((await createAuthSession({ user, access_token: "access" })).status)
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", reason: "storage_unavailable", credentialsCleared: false })
+  })
+  it("fails a conditional mutation when auth storage cannot be snapshotted", async () => {
+    const originalGetItem = localStorage.getItem.bind(localStorage)
+    let reads = 0
+    vi.spyOn(localStorage, "getItem").mockImplementation(key => {
+      reads += 1
+      if (reads > 1) throw new Error("snapshot read failed")
+      return originalGetItem(key)
+    })
+
+    await expect(claimAuthLoginIntent()).resolves.toEqual({ status: "unavailable", reason: "storage_unavailable" })
   })
   it("does not create a bearer session without the login intent that authorized it", async () => {
     expect(await createAuthSession({ user, access_token: "late-access" })).toEqual({ status: "superseded" })
@@ -242,17 +254,15 @@ describe("auth cache lineage", () => {
     expect((await updateAuthSessionUser(zero, { id: "other", username: "other" })).status).toBe("invalid")
     expect((await updateAuthSessionUser(zero, { id: 0, username: "zero-2", email: null, is_admin: true })).status).toBe("updated")
   })
-  it("reports coordination_unavailable and makes zero storage mutations for conditional operations without locks", async () => {
+  it("commits conditional auth mutations through IndexedDB when Web Locks are unavailable", async () => {
     const captured = await created()
     const claim = await claimAuthLoginIntent()
     expect(claim.status).toBe("claimed")
     if (claim.status !== "claimed") throw new Error("expected login intent")
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
-    const before = localStorage.getItem(AUTH_CACHE_KEY)
-    expect(await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })).toEqual({ status: "unavailable", reason: "coordination_unavailable" })
-    expect(await createAuthSession({ user, access_token: "late" }, claim.intent)).toEqual({ status: "unavailable", reason: "coordination_unavailable" })
-    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
-    expect(current().snapshot.accessToken).toBe("access")
+    await expect(commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })).resolves.toMatchObject({ status: "updated" })
+    await expect(createAuthSession({ user, access_token: "late" }, claim.intent)).resolves.toMatchObject({ status: "created" })
+    expect(current().snapshot.accessToken).toBe("late")
   })
   it("does not let old same-user lineage clear a replacement", async () => {
     const old = await created({ user, access_token: "old", refresh_token: "r" })
@@ -341,12 +351,19 @@ describe("auth cache lineage", () => {
 
     expect(takeOidcAuthLoginIntent()).toEqual({ status: "unavailable", reason: "storage_unavailable" })
   })
-  it.each(["claim", "oidc_claim", "create", "migrate", "refresh", "profile", "clear"] as const)("reports coordination_unavailable without changing any auth-owned key for %s", async operation => {
+  it.each([
+    ["claim", "claimed"],
+    ["oidc_claim", "claimed"],
+    ["create", "created"],
+    ["migrate", "advanced"],
+    ["refresh", "updated"],
+    ["profile", "updated"],
+    ["clear", "cleared"],
+  ] as const)("runs %s through IndexedDB coordination when Web Locks are unavailable", async (operation, expectedStatus) => {
     const captured = await created()
     const pending = await claimAuthLoginIntent()
     expect(pending.status).toBe("claimed")
     if (pending.status !== "claimed") throw new Error("expected pending intent")
-    const before = authStorageSnapshot()
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
 
     const result = await ({
@@ -359,8 +376,7 @@ describe("auth cache lineage", () => {
       clear: () => clearAuthSessionIfCurrent(captured),
     })[operation]()
 
-    expect(result).toEqual({ status: "unavailable", reason: "coordination_unavailable" })
-    expect(authStorageSnapshot()).toEqual(before)
+    expect(result.status).toBe(expectedStatus)
   })
   it("returns discriminated conditional-clear outcomes", async () => {
     const currentSession = await created()
@@ -369,7 +385,21 @@ describe("auth cache lineage", () => {
     const replacement = await created({ user, access_token: "replacement" })
     await expect(clearAuthSessionIfCurrent(currentSession)).resolves.toEqual({ status: "not_current" })
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
-    await expect(clearAuthSessionIfCurrent(replacement)).resolves.toEqual({ status: "unavailable", reason: "coordination_unavailable" })
+    await expect(clearAuthSessionIfCurrent(replacement)).resolves.toEqual({ status: "cleared" })
+  })
+  it("keeps a newer no-lock login and rejects a stale response after logout", async () => {
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    const stale = await claimAuthLoginIntent()
+    const current = await claimAuthLoginIntent()
+    expect(stale.status).toBe("claimed")
+    expect(current.status).toBe("claimed")
+    if (stale.status !== "claimed" || current.status !== "claimed") throw new Error("expected login intents")
+
+    await expect(createAuthSession({ user, access_token: "stale" }, stale.intent)).resolves.toEqual({ status: "superseded" })
+    await expect(createAuthSession({ user, access_token: "current" }, current.intent)).resolves.toMatchObject({ status: "created" })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+    await expect(createAuthSession({ user, access_token: "late" }, current.intent)).resolves.toEqual({ status: "superseded" })
+    expect(inspectAuthSession().status).toBe("absent")
   })
   it("rejects malformed login and refresh payloads without writing", async () => {
     const invalid = await createAuthSession({ user: { id: "", username: "alice" }, access_token: "access" })
@@ -435,6 +465,18 @@ describe("auth cache lineage", () => {
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
     expect(inspectAuthSession().status).toBe("absent")
+  })
+  it("allows explicit logout when no coordination primitive is available", async () => {
+    await created()
+    const indexedDbDescriptor = Object.getOwnPropertyDescriptor(globalThis, "indexedDB")
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    Object.defineProperty(globalThis, "indexedDB", { configurable: true, value: undefined })
+    try {
+      await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+      expect(inspectAuthSession().status).toBe("absent")
+    } finally {
+      if (indexedDbDescriptor) Object.defineProperty(globalThis, "indexedDB", indexedDbDescriptor)
+    }
   })
   it("removes credentials and invalidates the old login intent when barrier persistence fails", async () => {
     const claim = await claimAuthLoginIntent()

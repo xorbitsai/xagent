@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
 
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.orm import Session, aliased
 from sqlalchemy.orm.exc import ObjectDeletedError
@@ -516,10 +517,10 @@ def write_google_shared_oauth_callback(
     return shared_account, legacy_oauth_account, association
 
 
-def gmail_legacy_accounts_for_shared_google_oauth(
+def legacy_accounts_for_shared_google_oauth(
     db: Session, *, oauth_account_id: int
 ) -> list[UserOAuth]:
-    """Return ordinary Gmail rows whose watches depend on a shared grant."""
+    """Return valid legacy mirrors linked to one shared credential."""
     return cast(
         list[UserOAuth],
         (
@@ -534,13 +535,66 @@ def gmail_legacy_accounts_for_shared_google_oauth(
             )
             .filter(
                 GoogleOAuthGrant.oauth_account_id == int(oauth_account_id),
-                GoogleOAuthAppAssociation.app_id == "gmail",
-                UserOAuth.provider == "gmail",
-                UserOAuth.resource_owner_key.is_(None),
+                UserOAuth.user_id == GoogleOAuthGrant.user_id,
+                UserOAuth.provider == GoogleOAuthAppAssociation.app_id,
+                UserOAuth.provider_user_id == GoogleOAuthGrant.google_subject,
+                or_(
+                    and_(
+                        GoogleOAuthGrant.resource_owner_key.is_(None),
+                        UserOAuth.resource_owner_key.is_(None),
+                    ),
+                    UserOAuth.resource_owner_key == GoogleOAuthGrant.resource_owner_key,
+                ),
             )
             .all()
         ),
     )
+
+
+def gmail_legacy_accounts_for_shared_google_oauth(
+    db: Session, *, oauth_account_id: int
+) -> list[UserOAuth]:
+    """Return ordinary Gmail rows whose watches depend on a shared grant."""
+    return [
+        account
+        for account in legacy_accounts_for_shared_google_oauth(
+            db, oauth_account_id=oauth_account_id
+        )
+        if account.provider == "gmail" and account.resource_owner_key is None
+    ]
+
+
+def mirror_shared_google_oauth_credentials(
+    db: Session, *, oauth_account: UserOAuth
+) -> int:
+    """Keep rollback-compatible per-app rows current after token refresh."""
+    if (
+        oauth_account.id is None
+        or oauth_account.provider != GOOGLE_SHARED_OAUTH_PROVIDER
+    ):
+        return 0
+    legacy_accounts = legacy_accounts_for_shared_google_oauth(
+        db, oauth_account_id=int(oauth_account.id)
+    )
+    for legacy_account in legacy_accounts:
+        for field in (
+            "access_token",
+            "refresh_token",
+            "expires_at",
+            "token_type",
+            "scope",
+            "email",
+            "instance_url",
+        ):
+            value = getattr(oauth_account, field)
+            if field == "refresh_token" and (
+                not value or is_undecryptable_oauth_token(value)
+            ):
+                # A damaged shared row must not erase the legacy recovery
+                # token that exists specifically to make rollback possible.
+                continue
+            setattr(legacy_account, field, value)
+    return len(legacy_accounts)
 
 
 def detach_google_shared_oauth_app(

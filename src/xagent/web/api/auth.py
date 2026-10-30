@@ -4136,6 +4136,8 @@ def _generic_oauth_login(
                 google_shared_mode=True,
                 google_shared_scopes=scopes,
             )
+            if force_google_consent:
+                state_payload["google_forced_consent"] = True
 
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
@@ -5822,6 +5824,15 @@ def generic_oauth_callback(
                     )
                 except GoogleOAuthRefreshTokenRequired:
                     db.rollback()
+                    if payload.get("google_forced_consent") is True:
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Google did not provide offline access</h1>"
+                                "<p>Please remove this app from your Google Account "
+                                "permissions, then connect it again.</p>"
+                            ),
+                            status_code=400,
+                        )
                     retry_user = db.get(User, user_id)
                     if retry_user is None:
                         return HTMLResponse(
@@ -5830,7 +5841,7 @@ def generic_oauth_callback(
                         )
                     if is_actor_flow:
                         assert resource_owner_key is not None
-                        return start_builtin_oauth_for_resource_owner(
+                        retry_response = start_builtin_oauth_for_resource_owner(
                             provider=provider,
                             app_id=cast(str, app_id),
                             user=retry_user,
@@ -5840,6 +5851,14 @@ def generic_oauth_callback(
                             db_provider=db_provider,
                             force_google_consent=True,
                         )
+                        if isinstance(retry_response, RedirectResponse):
+                            # This callback is the transaction owner for the
+                            # replacement actor flow. Persist its new nonce
+                            # before returning the redirect and browser cookie.
+                            db.commit()
+                        else:
+                            db.rollback()
+                        return retry_response
                     return _generic_oauth_login(
                         provider,
                         token=None,

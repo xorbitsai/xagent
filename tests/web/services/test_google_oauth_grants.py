@@ -18,6 +18,7 @@ from xagent.web.services.google_oauth_grants import (
     google_oauth_authorization_context,
     google_oauth_client_fingerprint,
     google_oauth_grant_covers_scopes,
+    mirror_shared_google_oauth_credentials,
     resolve_google_shared_oauth_account,
     write_google_shared_oauth_callback,
 )
@@ -559,3 +560,24 @@ def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
     assert db.query(UserOAuth).filter_by(provider="google").count() == 0
     assert db.query(GoogleOAuthGrant).count() == 0
     assert db.query(GoogleOAuthAppAssociation).count() == 0
+
+
+def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    legacy = _account(db, user, provider="google-drive")
+    legacy.refresh_token = "rollback-refresh"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=legacy,
+    )
+    shared.access_token = "new-shared-access"
+    shared.refresh_token = None
+
+    assert mirror_shared_google_oauth_credentials(db, oauth_account=shared) == 1
+
+    assert legacy.access_token == "new-shared-access"
+    assert legacy.refresh_token == "rollback-refresh"

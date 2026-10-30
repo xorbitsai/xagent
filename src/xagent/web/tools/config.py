@@ -4186,7 +4186,13 @@ class WebToolConfig(BaseToolConfig):
                         mark_gmail_oauth_reconnect_required(
                             oauth_db,
                             oauth_account=gmail_account,
-                            expected_refresh_token=attempted_refresh_token,
+                            # The shared refresh path may have rotated before
+                            # mirroring existed. Fence against replacement of
+                            # this exact legacy row, not against the possibly
+                            # newer token stored on the shared row.
+                            expected_refresh_token=cast(
+                                str | None, gmail_account.refresh_token
+                            ),
                         )
                     shared_reread_query = scoped_user_oauth_query(
                         oauth_db, user_id=user_id, resource_owner_key=None
@@ -4215,6 +4221,15 @@ class WebToolConfig(BaseToolConfig):
                 access_token=None,
                 refresh_failed=True,
                 credential_present=True,
+            )
+
+        if str(oauth_account.provider) == "google":
+            from ..services.google_oauth_grants import (
+                mirror_shared_google_oauth_credentials,
+            )
+
+            mirror_shared_google_oauth_credentials(
+                oauth_db, oauth_account=oauth_account
             )
 
         access_token = str(oauth_account.access_token)

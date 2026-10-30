@@ -5246,13 +5246,13 @@ def _snapshot_builtin_oauth_revocations(
 
 def _detach_shared_google_grant_for_disconnect(
     db: Session, *, user_id: int, provider: object, app_id: object
-) -> bool:
-    """Detach one ordinary Google app and report whether it used sharing."""
+) -> None:
+    """Detach one ordinary Google app from any explicit shared grant."""
     if normalize_catalog_key(provider) != "google" or not isinstance(app_id, str):
-        return False
+        return
     from ..services.google_oauth_grants import detach_google_shared_oauth_app
 
-    return bool(detach_google_shared_oauth_app(db, user_id=user_id, app_id=app_id))
+    detach_google_shared_oauth_app(db, user_id=user_id, app_id=app_id)
 
 
 def _teardown_mcp_app_server_locally(
@@ -5401,13 +5401,17 @@ def _teardown_mcp_app_server_locally(
 
         if str(server.transport or "").lower() == "oauth":
             provider = expected_app.provider_name
-            detached_shared_google = _detach_shared_google_grant_for_disconnect(
+            _detach_shared_google_grant_for_disconnect(
                 db, user_id=user_id, provider=provider, app_id=app_id
             )
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
                 expected_app, [provider, app_id]
             )
-            if detached_shared_google:
+            # A legacy-only Google app can coexist with a sibling app that
+            # already uses a shared grant during rollout. Never send the bare
+            # ``google`` key through the bulk delete: the orphan cleanup below
+            # removes it only after proving that no Google sibling remains.
+            if normalize_catalog_key(provider) == "google":
                 providers_to_delete = [
                     key
                     for key in providers_to_delete
@@ -5718,7 +5722,7 @@ async def delete_mcp_server(
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
-                detached_shared_google = _detach_shared_google_grant_for_disconnect(
+                _detach_shared_google_grant_for_disconnect(
                     db,
                     user_id=int(user_id),
                     provider=provider,
@@ -5734,7 +5738,9 @@ async def delete_mcp_server(
                 providers_to_delete = restrict_to_app_scoped_oauth_grant(
                     app_info, [provider, app_id]
                 )
-                if detached_shared_google:
+                # Mixed rollout state is valid: this app may still be legacy
+                # while a connected sibling already owns the shared row.
+                if normalize_catalog_key(provider) == "google":
                     providers_to_delete = [
                         key
                         for key in providers_to_delete

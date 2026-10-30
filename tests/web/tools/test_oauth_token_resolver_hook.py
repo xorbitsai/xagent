@@ -987,13 +987,15 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
     assert _access_token_env(configs[0]) == "shared-token"
+    db.refresh(legacy)
+    assert legacy.access_token == "shared-token"
 
     shared.scope = "openid"
     db.commit()
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "legacy-token"
+    assert _access_token_env(configs[0]) == "shared-token"
 
     shared.scope = "openid scope.drive"
     shared.access_token = ""
@@ -1002,7 +1004,7 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "legacy-token"
+    assert _access_token_env(configs[0]) == "shared-token"
 
     shared.access_token = "shared-token"
     shared.refresh_token = "shared-refresh"
@@ -1011,7 +1013,7 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "legacy-token"
+    assert _access_token_env(configs[0]) == "shared-token"
 
     app.oauth_scopes = ["scope.drive"]
     provider_config.client_id = ""
@@ -1020,7 +1022,7 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "legacy-token"
+    assert _access_token_env(configs[0]) == "shared-token"
 
     provider_config.client_id = encrypt_value("google-client-id")
     app.oauth_scopes = ["scope.drive"]
@@ -1030,7 +1032,7 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "legacy-token"
+    assert _access_token_env(configs[0]) == "shared-token"
 
 
 @pytest.mark.asyncio
@@ -1110,6 +1112,7 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
         observed_tokens.append(str(oauth_account.access_token))
         if len(observed_tokens) == 1:
             oauth_account.access_token = "refreshed-shared-token"
+            oauth_account.refresh_token = "rotated-shared-refresh"
             oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
         return True
 
@@ -1133,6 +1136,18 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
 
     assert first.access_token == "refreshed-shared-token"
     assert second.access_token == "refreshed-shared-token"
+    db.expire_all()
+    legacy_accounts = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.provider.in_(["google-drive", "google-sheets"]))
+        .all()
+    )
+    assert {account.access_token for account in legacy_accounts} == {
+        "refreshed-shared-token"
+    }
+    assert {account.refresh_token for account in legacy_accounts} == {
+        "rotated-shared-refresh"
+    }
     assert observed_tokens == ["expired-shared-token", "refreshed-shared-token"]
     with isolated_session_factory() as verification_db:
         refreshed_account = verification_db.get(UserOAuth, int(shared.id))
@@ -1398,7 +1413,7 @@ async def test_permanently_invalid_shared_google_grant_quiesces_gmail_watch(
     )
     legacy.provider_user_id = "google-subject"
     legacy.email = "alice@example.com"
-    legacy.refresh_token = "expired-shared-refresh"
+    legacy.refresh_token = "stale-legacy-refresh"
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,

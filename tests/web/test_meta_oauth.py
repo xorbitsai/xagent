@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
@@ -17,6 +18,9 @@ from tests.shared.oauth_browser_fixture import (
 )
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
+from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+from xagent.web.mcp_apps import ensure_builtin_oauth_server_definition
+from xagent.web.models.actor_oauth_flow import ActorOAuthFlowState
 from xagent.web.models.database import Base
 from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.google_oauth_grant import (
@@ -115,16 +119,21 @@ def _google_provider() -> SimpleNamespace:
     )
 
 
-def _shared_google_state(user: User, app_id: str, scopes: list[str]) -> str:
+def _shared_google_state(
+    user: User, app_id: str, scopes: list[str], *, forced_consent: bool = False
+) -> str:
+    data = {
+        "type": "oauth_state",
+        "user_id": user.id,
+        "provider": "google",
+        "app_id": app_id,
+        "google_shared_mode": True,
+        "google_shared_scopes": scopes,
+    }
+    if forced_consent:
+        data["google_forced_consent"] = True
     return create_access_token(
-        data={
-            "type": "oauth_state",
-            "user_id": user.id,
-            "provider": "google",
-            "app_id": app_id,
-            "google_shared_mode": True,
-            "google_shared_scopes": scopes,
-        },
+        data=data,
         expires_delta=timedelta(minutes=10),
     )
 
@@ -258,11 +267,145 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
     assert params["prompt"] == ["consent"]
     retry_state = auth_api.verify_token(params["state"][0])
     assert retry_state["google_shared_mode"] is True
+    assert retry_state["google_forced_consent"] is True
     assert retry_state["app_id"] == "google-sheets"
     assert (
         db.query(UserOAuth).filter(UserOAuth.provider_user_id == "subject-b").count()
         == 0
     )
+
+
+def test_google_shared_callback_stops_retrying_after_forced_consent(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-sheets",
+            name="Google Sheets",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.sheets"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "sheets"]},
+        )
+    )
+    db.commit()
+    request = SimpleNamespace(
+        query_params={
+            "code": "code",
+            "state": _shared_google_state(
+                user,
+                "google-sheets",
+                ["openid", "scope.sheets"],
+                forced_consent=True,
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "subject-b-access",
+                    "token_type": "Bearer",
+                    "scope": "openid scope.sheets",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"sub": "subject-b", "email": "b@example.com"})),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 400
+    assert "did not provide offline access" in response.body.decode()
+    assert db.query(UserOAuth).count() == 0
+
+
+def test_actor_google_shared_consent_retry_persists_replacement_flow(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    app = get_builtin_public_mcp_app("google-sheets")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    db.commit()
+    server = ensure_builtin_oauth_server_definition(db, app_id="google-sheets")
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="google",
+        app_id="google-sheets",
+        user=user,
+        resource_owner_key="toby:workspace:actor",
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=_google_provider(),
+    )
+    db.commit()
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    cookies = SimpleCookie()
+    cookies.load(start.headers["set-cookie"])
+    actor_cookie = next(
+        (name, morsel.value)
+        for name, morsel in cookies.items()
+        if name.startswith("xagent_actor_oauth_")
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "actor-access",
+                    "token_type": "Bearer",
+                    "scope": "openid scope.sheets",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "actor-subject", "email": "a@example.com"}
+            )
+        ),
+    )
+
+    response = auth_api.generic_oauth_callback(
+        "google",
+        SimpleNamespace(
+            query_params={"code": "code", "state": state},
+            cookies={actor_cookie[0]: actor_cookie[1]},
+        ),
+        db,
+        _google_provider(),
+    )
+
+    assert response.status_code == 307
+    params = parse_qs(urlparse(response.headers["location"]).query)
+    assert params["prompt"] == ["consent"]
+    retry_state = auth_api.verify_token(params["state"][0])
+    assert retry_state["google_forced_consent"] is True
+    assert db.query(ActorOAuthFlowState).count() == 1
 
 
 def test_google_shared_callback_reports_missing_scope(db_session, monkeypatch):
@@ -444,8 +587,9 @@ def test_shared_google_state_preserves_refresh_if_flag_changes_before_callback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("drive_has_shared_association", [True, False])
 async def test_disconnecting_one_shared_google_app_preserves_sibling_grant(
-    db_session, monkeypatch
+    db_session, monkeypatch, drive_has_shared_association
 ):
     monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
     db, user = db_session
@@ -514,6 +658,17 @@ async def test_disconnecting_one_shared_google_app_preserves_sibling_grant(
             _google_provider(),
         )
         assert response.status_code == 200
+
+    if not drive_has_shared_association:
+        # Reproduce a gradual-rollout mix: Drive is still legacy-only while
+        # Sheets already relies on the shared row.
+        drive_association = (
+            db.query(GoogleOAuthAppAssociation)
+            .filter(GoogleOAuthAppAssociation.app_id == "google-drive")
+            .one()
+        )
+        db.delete(drive_association)
+        db.commit()
 
     from xagent.web.api.mcp import delete_mcp_server
 

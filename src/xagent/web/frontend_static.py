@@ -7,13 +7,14 @@ there the export directory is absent and the backend stays API-only.
 
 Next static export emits one HTML file per route. Dynamic routes ([id]/[token])
 are emitted as a ``__shell__`` placeholder file (see the server wrappers under
-``frontend/src/app``); the matching client page reads the real id from the URL.
-This module reconstructs the route table from those files so an arbitrary URL
-resolves to the correct HTML shell.
+``frontend/src/app``). This module resolves real URLs to those shells and binds
+their Flight route parameters so the client page's ``useParams()`` receives
+the requested id, rather than the build-time placeholder.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -21,6 +22,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 
 from .browser_security import page_security_headers
 
@@ -69,6 +71,23 @@ def _build_shell_patterns(dist_dir: Path) -> list[tuple[re.Pattern[str], Path]]:
     return patterns
 
 
+def _render_shell(file: Path, value: str) -> str:
+    """Bind a shell's dynamic segment in its serialized Next Flight data."""
+    # Flight interprets a leading "$" as a reference unless it is doubled.
+    flight_value = "$" + value if value.startswith("$") else value
+    literal = json.dumps(flight_value, ensure_ascii=True)
+    # HTML embeds the Flight stream inside an inline script. Keep user input
+    # out of HTML syntax even after decoding the outer JavaScript string.
+    for char, escaped in (("<", r"\u003c"), (">", r"\u003e"), ("&", r"\u0026")):
+        literal = literal.replace(char, escaped)
+    placeholder = json.dumps(_SHELL_TOKEN)
+    if file.suffix == ".html":
+        # self.__next_f.push([1, "<Flight data>"]) adds a second JSON layer.
+        placeholder = json.dumps(placeholder)[1:-1]
+        literal = json.dumps(literal)[1:-1]
+    return file.read_text(encoding="utf-8").replace(placeholder, literal)
+
+
 def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     """Serve the frontend static export from ``dist_dir`` on ``app``.
 
@@ -92,16 +111,25 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
     resolved_root = dist_dir.resolve()
     backend_prefixes = _collect_backend_prefixes(app)
 
-    def _file_response(file: Path, *, status_code: int = 200) -> FileResponse:
+    def _file_response(
+        file: Path, *, status_code: int = 200, shell_value: str | None = None
+    ) -> Response:
         headers = None
         if file.suffix.lower() == ".html":
             route = file.resolve().relative_to(resolved_root).as_posix()
             headers = page_security_headers(
                 embeddable=route == "widget.html" or route.startswith("widget/")
             )
+        if shell_value is not None:
+            return Response(
+                _render_shell(file, shell_value),
+                status_code=status_code,
+                headers=headers,
+                media_type="text/html" if file.suffix == ".html" else "text/plain",
+            )
         return FileResponse(file, status_code=status_code, headers=headers)
 
-    def _resolve(rel_path: str) -> Path | None:
+    def _resolve(rel_path: str) -> tuple[Path, str | None] | None:
         # Reject path traversal: the request path must stay within dist_dir.
         try:
             (resolved_root / rel_path).resolve().relative_to(resolved_root)
@@ -111,7 +139,7 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
         # Exact asset (favicon, images, and static routes' own .html/.txt files).
         candidate = dist_dir / rel_path
         if rel_path and candidate.is_file():
-            return candidate
+            return candidate, None
 
         # Next prefetches a route's RSC flight payload at "<route>.txt". Match it
         # against the route table on the base path and serve the .txt variant, so
@@ -124,21 +152,25 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
         # Static route emitted as "<name>.html" / "<name>.txt".
         static_file = dist_dir / f"{lookup}{ext}"
         if lookup and static_file.is_file():
-            return static_file
+            return static_file, None
 
         # Directory index (HTML navigations only).
         if not is_rsc:
             index = candidate / "index.html"
             if candidate.is_dir() and index.is_file():
-                return index
+                return index, None
 
         # Dynamic route -> shell, in the format the request asked for.
         for pattern, target in shell_patterns:
             if pattern.match(lookup):
+                # Exported pages currently have one dynamic path segment,
+                # including nested routes such as workforces/<id>/run.
+                segments = target.relative_to(dist_dir).with_suffix("").parts
+                value = lookup.split("/")[segments.index(_SHELL_TOKEN)]
                 if is_rsc:
                     txt = target.with_suffix(".txt")
-                    return txt if txt.is_file() else target
-                return target
+                    return (txt if txt.is_file() else target), value
+                return target, value
         return None
 
     @app.get("/{full_path:path}", include_in_schema=False)
@@ -155,7 +187,12 @@ def mount_frontend(app: FastAPI, dist_dir: Path) -> bool:
 
         resolved = _resolve(full_path)
         if resolved is not None:
-            return _file_response(resolved)
+            file, shell_value = resolved
+            if shell_value is not None:
+                return await run_in_threadpool(
+                    _file_response, file, shell_value=shell_value
+                )
+            return _file_response(file)
 
         if not_found.is_file():
             return _file_response(not_found, status_code=404)

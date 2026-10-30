@@ -5,9 +5,11 @@ route-resolution logic can be exercised without a Node toolchain.
 """
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -25,6 +27,47 @@ from xagent.web.frontend_static import (
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def _write_flight_shell(dist: Path, route: str, parameter: str) -> None:
+    """Include the canonical URL and router tree that Next's useParams reads."""
+    segments = route.split("/")
+    tree: list = ["__PAGE__", {}]
+    for segment in reversed(segments):
+        tree = [
+            [parameter, segment, "d"] if segment == "__shell__" else segment,
+            {"children": tree},
+        ]
+    tree = ["", {"children": tree}]
+    flight = "0:" + json.dumps({"c": ["", *segments], "f": [[tree]]}) + "\n"
+    _write(dist / f"{route}.txt", flight)
+    _write(
+        dist / f"{route}.html",
+        "<html><body><script>self.__next_f.push("
+        + json.dumps([1, flight])
+        + ")</script></body></html>",
+    )
+
+
+def _flight_model(content: str, *, html: bool) -> dict:
+    if html:
+        script = re.search(r"self\.__next_f\.push\((.*?)\)</script>", content)
+        assert script is not None
+        content = json.loads(script.group(1))[1]
+    return json.loads(content.removeprefix("0:"))
+
+
+def _route_parameters(model: dict) -> dict[str, str]:
+    tree = model["f"][0][0]
+    parameters = {}
+    while tree:
+        segment, children = tree
+        if isinstance(segment, list):
+            name, value, _ = segment
+            # Flight escapes literal strings beginning with "$" as "$$...".
+            parameters[name] = value[1:] if value.startswith("$$") else value
+        tree = children.get("children")
+    return parameters
 
 
 @pytest.fixture
@@ -247,6 +290,81 @@ class TestServeSpa:
             r = client.get(path)
             assert "TOPSECRET" not in r.text
             assert r.status_code == 404
+
+
+class TestDynamicRouteParameters:
+    @pytest.mark.parametrize("suffix", ["", ".txt"])
+    @pytest.mark.parametrize(
+        ("route", "parameter", "value"),
+        [
+            ("task/__shell__", "id", "6"),
+            ("agent/__shell__", "id", "42"),
+            ("build/__shell__", "id", "19"),
+            ("templates/__shell__", "id", "12"),
+            ("share/__shell__", "token", "shared-token"),
+            ("widget/chat/__shell__", "token", "widget-token"),
+            ("workforces/__shell__", "id", "workforce-1"),
+            ("workforces/__shell__/run", "id", "workforce-1"),
+            ("skill-hub/__shell__", "name", "my-skill"),
+        ],
+    )
+    def test_binds_real_parameters_in_html_and_prefetched_flight(
+        self, dist_dir: Path, route: str, parameter: str, value: str, suffix: str
+    ):
+        _write_flight_shell(dist_dir, route, parameter)
+        client = TestClient(_app_with_backend_routes(dist_dir))
+        path = route.replace("__shell__", value)
+
+        response = client.get(f"/{path}{suffix}?_rsc=prefetch")
+
+        assert response.status_code == 200
+        model = _flight_model(response.text, html=not suffix)
+        assert model["c"] == ["", *path.split("/")]
+        assert _route_parameters(model) == {parameter: value}
+        if not suffix:
+            if route.startswith("widget/"):
+                assert "x-frame-options" not in response.headers
+            else:
+                assert response.headers["x-frame-options"] == "DENY"
+
+    @pytest.mark.parametrize("suffix", ["", ".txt"])
+    def test_switching_tasks_does_not_reuse_another_tasks_parameters(
+        self, dist_dir: Path, suffix: str
+    ):
+        _write_flight_shell(dist_dir, "task/__shell__", "id")
+        client = TestClient(_app_with_backend_routes(dist_dir))
+
+        for task_id in ("6", "7", "6"):
+            response = client.get(f"/task/{task_id}{suffix}")
+            model = _flight_model(response.text, html=not suffix)
+            assert _route_parameters(model) == {"id": task_id}
+        assert "__shell__" in (dist_dir / "task/__shell__.txt").read_text()
+
+    @pytest.mark.parametrize("suffix", ["", ".txt"])
+    @pytest.mark.parametrize(
+        "value", ['技能-😀 "quoted" \\ & <tag>', "$1", "__shell__-skill"]
+    )
+    def test_parameter_values_preserve_json_and_flight_string_encoding(
+        self, dist_dir: Path, suffix: str, value: str
+    ):
+        _write_flight_shell(dist_dir, "skill-hub/__shell__", "name")
+        client = TestClient(_app_with_backend_routes(dist_dir))
+
+        response = client.get(f"/skill-hub/{quote(value, safe='')}{suffix}")
+
+        assert response.status_code == 200
+        model = _flight_model(response.text, html=not suffix)
+        assert _route_parameters(model) == {"name": value}
+        assert "<tag>" not in response.text
+        if not suffix:
+            assert response.text.count("<script>") == 1
+            assert response.text.count("</script>") == 1
+
+    def test_exact_static_assets_are_not_rewritten(self, dist_dir: Path):
+        content = '{"message":"__shell__"}'
+        _write(dist_dir / "metadata.txt", content)
+        client = TestClient(_app_with_backend_routes(dist_dir))
+        assert client.get("/metadata.txt").text == content
 
 
 class TestMountFrontend:

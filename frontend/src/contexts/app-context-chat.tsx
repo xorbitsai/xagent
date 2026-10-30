@@ -22,6 +22,7 @@ import {
 import { useConnectorRuntimeDialogActionsIfMounted } from "@/contexts/connector-runtime-dialog-context"
 import { FIRST_GATE_CLEARED_MESSAGE_KEY, isConnectorRuntimeDialogTriggerCode, shouldHoldFirstMessage } from "@/lib/connector-runtime-api"
 import { getAgentTaskHref } from "@/lib/agent-ui-access"
+import type { AutoResumeCancelSnapshot } from "@/lib/task-auto-resume-api"
 
 interface WebSocketMessage {
   type: string
@@ -105,6 +106,7 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "UPDATE_STEP",
   "UPDATE_TASK_STATUS",
   "APPLY_AUTO_RESUME_NOTICE",
+  "RECONCILE_AUTO_RESUME_CANCEL",
   "SET_CURRENT_TASK",
   "SET_PROCESSING",
   "SET_HISTORY_LOADING",
@@ -1541,6 +1543,7 @@ type AppAction =
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; completionOutcome?: TaskCompletionOutcome; waitingQuestion?: string; waitingInteractions?: Interaction[]; waitingRequestId?: string; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; autoRecovery?: TaskAutoRecovery; updatedAt?: string } }
   | { type: "APPLY_AUTO_RESUME_NOTICE"; payload: { taskId: number; reason?: string; notice: TaskAutoResume; knownVersion?: number } }
+  | { type: "RECONCILE_AUTO_RESUME_CANCEL"; payload: AutoResumeCancelSnapshot }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "RESET_DAG_STATE" }
@@ -2170,6 +2173,49 @@ export function projectAppState(state: AppState, action: AppAction): AppState {
       return paused.currentTask
         ? { ...paused, isProcessing: false, currentTask: { ...paused.currentTask, autoResume: notice } }
         : paused
+    }
+
+    case "RECONCILE_AUTO_RESUME_CANCEL": {
+      const snapshot = action.payload
+      const task = state.currentTask
+      if (!task || task.id !== String(snapshot.taskId)) return state
+      if (task.stateVersion !== undefined && snapshot.stateVersion < task.stateVersion) return state
+      if (
+        task.stateVersion === snapshot.stateVersion
+        && task.runId != null
+        && task.runId !== snapshot.runId
+      ) return state
+
+      const recoveryView = asMessageRecord(snapshot.autoRecovery)
+      const autoResume = parseAutoResumeAtFence(
+        recoveryView.auto_resume,
+        snapshot.runId,
+        snapshot.stateVersion,
+      )
+      const autoResumeEndedAt = !autoResume && typeof snapshot.runId === "string"
+        ? { runId: snapshot.runId, stateVersion: snapshot.stateVersion }
+        : undefined
+
+      // The endpoint response is the authoritative view at this fence. Apply
+      // it locally even if websocket delivery or a later status replay is
+      // unavailable; the task-id guard makes an in-flight task switch safe.
+      return projectAppState(state, {
+        type: "SET_CURRENT_TASK",
+        payload: {
+          ...task,
+          status: snapshot.status,
+          runId: snapshot.runId,
+          stateVersion: snapshot.stateVersion,
+          controlState: snapshot.controlState,
+          autoRecovery: normalizeAutoRecovery(
+            snapshot.autoRecovery,
+            snapshot.runId,
+            snapshot.stateVersion,
+          ),
+          autoResume,
+          autoResumeEndedAt,
+        },
+      })
     }
 
     case "SET_DAG_EXECUTION":

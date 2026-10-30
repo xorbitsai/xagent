@@ -3752,6 +3752,127 @@ describe("AppProvider websocket message routing", () => {
     expect(state.currentTask?.dagTerminatedAtProvisional).toBe(true)
   })
 
+  it("reconciles an automatic-resume cancellation from the endpoint snapshot", () => {
+    const state = projectAppState({
+      ...createInitialState(),
+      taskId: 1,
+      currentTask: {
+        id: "1",
+        title: "Test task",
+        status: "paused",
+        description: "Test task",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:00:01Z",
+        runId: "run-1",
+        stateVersion: 4,
+        controlState: "paused",
+        autoResume: {
+          status: "scheduled",
+          attempt: 1,
+          runId: "run-1",
+          stateVersion: 4,
+        },
+      },
+    }, {
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: {
+        taskId: 1,
+        outcome: "cancelled",
+        status: "paused",
+        controlState: "paused",
+        runId: "run-1",
+        stateVersion: 5,
+        autoRecovery: {
+          reason: "lease_expired",
+          auto_resume: { status: "stopped", stop_reason: "cancelled", attempt: 1 },
+        },
+        notice: null,
+      },
+    })
+
+    expect(state.currentTask).toMatchObject({
+      status: "paused",
+      runId: "run-1",
+      stateVersion: 5,
+      controlState: "paused",
+      autoRecovery: { reason: "lease_expired", runId: "run-1", stateVersion: 5 },
+      autoResume: {
+        status: "stopped",
+        stopReason: "cancelled",
+        runId: "run-1",
+        stateVersion: 5,
+      },
+    })
+  })
+
+  it("clears a scheduled notice when resume already started, without a status replay", () => {
+    const currentTask = {
+      id: "1",
+      title: "Test task",
+      status: "paused" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      runId: "run-1",
+      stateVersion: 4,
+      controlState: "paused" as const,
+      autoResume: {
+        status: "scheduled" as const,
+        runId: "run-1",
+        stateVersion: 4,
+      },
+    }
+    const state = projectAppState({
+      ...createInitialState(), taskId: 1, currentTask,
+    }, {
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: {
+        taskId: 1,
+        outcome: "resume_in_progress",
+        status: "paused",
+        controlState: "resume_requested",
+        runId: "run-1",
+        stateVersion: 5,
+        autoRecovery: null,
+        notice: null,
+      },
+    })
+
+    expect(state.currentTask?.autoResume).toBeUndefined()
+    expect(state.currentTask?.autoResumeEndedAt).toEqual({ runId: "run-1", stateVersion: 5 })
+    expect(state.currentTask?.controlState).toBe("resume_requested")
+  })
+
+  it("ignores a stale automatic-resume cancellation snapshot", () => {
+    const currentTask = {
+      id: "1",
+      title: "Test task",
+      status: "running" as const,
+      description: "Test task",
+      createdAt: "2026-05-27T05:00:00Z",
+      updatedAt: "2026-05-27T05:00:01Z",
+      runId: "run-2",
+      stateVersion: 6,
+      controlState: "running" as const,
+    }
+    const initial = { ...createInitialState(), taskId: 1, currentTask }
+    const state = projectAppState(initial, {
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: {
+        taskId: 1,
+        outcome: "already_cancelled",
+        status: "paused",
+        controlState: "paused",
+        runId: "run-1",
+        stateVersion: 5,
+        autoRecovery: null,
+        notice: null,
+      },
+    })
+
+    expect(state).toBe(initial)
+  })
+
   it("restores a reloaded pause's reason from history's reasserted task_paused", async () => {
     render(
       <AppProvider token="token">

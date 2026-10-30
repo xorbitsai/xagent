@@ -34,8 +34,9 @@ const resumeTaskMock = vi.hoisted(() => vi.fn())
 const stopTaskMock = vi.hoisted(() => vi.fn())
 const requestStatusMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
-const apiRequestMock = vi.hoisted(() => vi.fn())
+const cancelTaskAutoResumeMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastInfoMock = vi.hoisted(() => vi.fn())
 const getFileDownloadUrlMock = vi.hoisted(() => vi.fn())
 const fileAccessRequestMock = vi.hoisted(() => vi.fn())
 const appControls = vi.hoisted(() => ({
@@ -208,8 +209,8 @@ vi.mock("@/components/chat/ChatMessage", async () => {
 })
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }))
-vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
-vi.mock("@/components/ui/sonner", () => ({ toast: { error: toastErrorMock } }))
+vi.mock("@/lib/task-auto-resume-api", () => ({ cancelTaskAutoResume: cancelTaskAutoResumeMock }))
+vi.mock("@/components/ui/sonner", () => ({ toast: { error: toastErrorMock, info: toastInfoMock } }))
 vi.mock("@/components/file/docx-preview-renderer", () => ({ DocxPreviewRenderer: () => null }))
 vi.mock("@/components/file/excel-preview-renderer", () => ({ ExcelPreviewRenderer: () => null }))
 vi.mock("@/components/file/pptx-preview-renderer", () => ({ PptxPreviewRenderer: () => null }))
@@ -297,8 +298,9 @@ describe("TaskConversationPanel", () => {
     stopTaskMock.mockReset()
     requestStatusMock.mockReset()
     dispatchMock.mockReset()
-    apiRequestMock.mockReset()
+    cancelTaskAutoResumeMock.mockReset()
     toastErrorMock.mockReset()
+    toastInfoMock.mockReset()
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
@@ -427,55 +429,31 @@ describe("TaskConversationPanel", () => {
       status: "paused",
       autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
     }
-    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
-      task_id: 42,
+    const snapshot = {
+      taskId: 42,
       outcome: "cancelled",
       status: "paused",
-      control_state: "paused",
-      run_id: "run-1",
-      state_version: 4,
-      auto_recovery: {
+      controlState: "paused",
+      runId: "run-1",
+      stateVersion: 5,
+      autoRecovery: {
         run_id: "run-1",
-        state_version: 4,
+        state_version: 5,
         auto_resume: { status: "stopped", stop_reason: "cancelled", attempt: 1 },
       },
-      notice: {
-        type: "task_recovery_update",
-        task_id: 42,
-        run_id: "run-1",
-        state_version: 4,
-        auto_resume: { status: "stopped", stop_reason: "cancelled", attempt: 1 },
-      },
-    }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      notice: null,
+    } as const
+    cancelTaskAutoResumeMock.mockResolvedValue({ ok: true, snapshot })
 
     render(<TaskConversationPanel mode="page" />)
 
     fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
 
-    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(1))
-    expect(apiRequestMock).toHaveBeenCalledWith(
-      expect.stringMatching(/\/api\/chat\/task\/42\/auto-resume\/cancel$/),
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({ run_id: "run-1" }),
-      }),
-    )
+    await waitFor(() => expect(cancelTaskAutoResumeMock).toHaveBeenCalledWith(42, "run-1"))
     await waitFor(() => expect(dispatchMock).toHaveBeenCalledWith({
-      type: "APPLY_AUTO_RESUME_NOTICE",
-      payload: {
-        taskId: 42,
-        notice: {
-          status: "stopped",
-          stopReason: "cancelled",
-          nextAttemptAt: undefined,
-          attempt: 1,
-          runId: "run-1",
-          stateVersion: 4,
-        },
-        reason: undefined,
-      },
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: snapshot,
     }))
-    expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
   })
 
   it("does not offer cancellation once automatic resume is under way", () => {
@@ -489,24 +467,89 @@ describe("TaskConversationPanel", () => {
     expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
   })
 
-  it("reports a concurrent cancel race and keeps the action available", async () => {
+  it.each([
+    ["already_cancelled", null],
+    ["resume_in_progress", "taskInterruption.autoResumeAlreadyStarted"],
+    ["not_pending", "taskInterruption.autoResumeNotPending"],
+  ] as const)("reconciles the %s cancellation outcome", async (outcome, infoKey) => {
     appState.currentTask = {
       id: "42",
       status: "paused",
       autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
     }
-    apiRequestMock.mockResolvedValue(new Response(JSON.stringify({
-      detail: { code: "auto_resume_cancel_raced" },
-    }), { status: 409, headers: { "Content-Type": "application/json" } }))
+    const snapshot = {
+      taskId: 42,
+      outcome,
+      status: outcome === "not_pending" ? "running" : "paused",
+      controlState: outcome === "resume_in_progress" ? "resume_requested" : "paused",
+      runId: "run-1",
+      stateVersion: 5,
+      autoRecovery: outcome === "already_cancelled"
+        ? { auto_resume: { status: "stopped", stop_reason: "cancelled", attempt: 1 } }
+        : null,
+      notice: null,
+    }
+    cancelTaskAutoResumeMock.mockResolvedValue({ ok: true, snapshot })
     render(<TaskConversationPanel mode="page" />)
 
     fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
 
-    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(
-      "taskInterruption.autoResumeCancelRaced",
-    ))
+    await waitFor(() => expect(dispatchMock).toHaveBeenCalledWith({
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: snapshot,
+    }))
+    if (infoKey) expect(toastInfoMock).toHaveBeenCalledWith(infoKey)
+    else expect(toastInfoMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [{ kind: "transport" }, "taskInterruption.autoResumeCancelFailed"],
+    [{ kind: "http", status: 409, code: "auto_resume_cancel_raced" }, "taskInterruption.autoResumeCancelRaced"],
+    [{ kind: "http", status: 404 }, "taskInterruption.autoResumeCancelUnavailable"],
+    [{ kind: "http", status: 410, code: "task_expired" }, "taskInterruption.autoResumeCancelUnavailable"],
+    [{ kind: "http", status: 409, code: "auto_resume_not_cancellable" }, "taskInterruption.autoResumeNotCancellable"],
+    [{ kind: "http", status: 422 }, "taskInterruption.autoResumeCancelRejected"],
+    [{ kind: "http", status: 500 }, "taskInterruption.autoResumeCancelFailed"],
+  ] as const)("reports cancellation failure %#", async (failure, errorKey) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    cancelTaskAutoResumeMock.mockResolvedValue({ ok: false, failure })
+    render(<TaskConversationPanel mode="page" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(errorKey))
     expect(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" })).toBeEnabled()
     expect(dispatchMock).not.toHaveBeenCalled()
+  })
+
+  it("disables the cancellation action while the request is in flight", async () => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    let resolveCancel!: (value: unknown) => void
+    cancelTaskAutoResumeMock.mockReturnValue(new Promise(resolve => { resolveCancel = resolve }))
+    render(<TaskConversationPanel mode="page" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
+
+    const cancelling = await screen.findByRole("button", {
+      name: "taskInterruption.cancellingAutoResume",
+    })
+    expect(cancelling).toBeDisabled()
+
+    await act(async () => resolveCancel({
+      ok: false,
+      failure: { kind: "transport" },
+    }))
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "taskInterruption.cancelAutoResume",
+    })).toBeEnabled())
   })
 
   it("does not offer manual resume when task controls are disabled", () => {

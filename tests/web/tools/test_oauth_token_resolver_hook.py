@@ -1354,6 +1354,93 @@ async def test_permanently_invalid_gmail_refresh_quiesces_watch_state(
 
 
 @pytest.mark.asyncio
+async def test_permanently_invalid_shared_google_grant_quiesces_gmail_watch(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            default_scopes=[],
+        )
+    )
+    oauth_server = _add_oauth_server(
+        db,
+        user,
+        name="Gmail",
+        app_id="gmail",
+        provider="google",
+        launch_config=_launch_config("GMAIL_ACCESS_TOKEN"),
+    )
+    shared = _add_user_oauth(
+        db, user, provider="google", access_token="expired-shared-token"
+    )
+    shared.provider_user_id = "google-subject"
+    legacy = _add_user_oauth(
+        db, user, provider="gmail", access_token="expired-shared-token"
+    )
+    legacy.provider_user_id = "google-subject"
+    legacy.email = "alice@example.com"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="gmail",
+        legacy_oauth_account=legacy,
+    )
+    watch = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(legacy.id),
+        email="alice@example.com",
+        history_id="history-1",
+        topic_name="projects/demo/topics/xagent-gmail-alice",
+        watch_expiration=datetime.now(timezone.utc) + timedelta(days=1),
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db.add(watch)
+    db.commit()
+    shared_id = int(shared.id)
+    watch_id = int(watch.id)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["Gmail"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        oauth_server,
+        reason="oauth_token_refresh_failed",
+        oauth_token_required=True,
+    )
+    with isolated_session_factory() as verification_db:
+        shared_tombstone = verification_db.get(UserOAuth, shared_id)
+        quiesced_watch = verification_db.get(GmailWatchState, watch_id)
+        assert shared_tombstone is not None
+        assert shared_tombstone.access_token == ""
+        assert shared_tombstone.refresh_token is None
+        assert quiesced_watch is not None
+        assert quiesced_watch.status == TriggerProvisioningStatus.FAILED.value
+        assert quiesced_watch.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+        assert quiesced_watch.watch_expiration is None
+
+
+@pytest.mark.asyncio
 async def test_user_oauth_refresh_generic_invalid_grant_retains_row(
     db_session, monkeypatch
 ):

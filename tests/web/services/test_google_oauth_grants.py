@@ -5,14 +5,21 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.database import Base
+from xagent.web.models.google_oauth_grant import (
+    GoogleOAuthAppAssociation,
+    GoogleOAuthGrant,
+)
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.google_oauth_grants import (
     GoogleOAuthGrantConflict,
     create_google_oauth_grant_association,
+    detach_google_shared_oauth_app,
+    google_oauth_authorization_context,
     google_oauth_client_fingerprint,
     google_oauth_grant_covers_scopes,
     resolve_google_shared_oauth_account,
+    write_google_shared_oauth_callback,
 )
 
 
@@ -307,3 +314,169 @@ def test_association_is_idempotent_and_preserves_legacy_reference(db_session):
             oauth_client_id="client-b",
             app_id="google-drive",
         )
+
+
+def test_authorization_context_uses_only_exact_app_legacy_bridge(db_session):
+    db, user = db_session
+    _account(
+        db,
+        user,
+        provider="google-drive",
+        scopes="openid scope.drive",
+    )
+    _account(
+        db,
+        user,
+        provider="google-calendar",
+        scopes="scope.calendar",
+    )
+
+    context = google_oauth_authorization_context(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+    )
+
+    assert context.has_refresh_token is False
+    assert context.scopes == frozenset({"openid", "scope.drive"})
+
+
+def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
+    db, user = db_session
+    legacy = _account(
+        db,
+        user,
+        provider="google-drive",
+        token="legacy-access",
+        scopes="openid scope.drive",
+    )
+
+    shared, mirrored, association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        google_subject="google-subject",
+        access_token="shared-access-1",
+        refresh_token=None,
+        granted_scopes="openid scope.drive",
+        requested_scopes=["openid", "scope.drive"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    shared_id = int(shared.id)
+
+    assert mirrored.id == legacy.id
+    assert shared.refresh_token == "refresh"
+    assert mirrored.refresh_token == "refresh"
+    assert association.legacy_oauth_account_id == legacy.id
+    assert db.query(GoogleOAuthGrant).count() == 1
+    assert db.query(GoogleOAuthAppAssociation).count() == 1
+
+    updated, updated_legacy, updated_association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        google_subject="google-subject",
+        access_token="shared-access-2",
+        refresh_token=None,
+        granted_scopes="scope.sheets",
+        requested_scopes=["scope.sheets"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    assert int(updated.id) == shared_id
+    assert updated.access_token == "shared-access-2"
+    assert updated.refresh_token == "refresh"
+    assert set(str(updated.scope).split()) == {
+        "openid",
+        "scope.drive",
+        "scope.sheets",
+    }
+    assert updated_legacy.access_token == "shared-access-2"
+    assert updated_association.id == association.id
+
+    rotated, _rotated_legacy, _rotated_association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-b",
+        app_id="google-drive",
+        google_subject="google-subject",
+        access_token="shared-access-3",
+        refresh_token="rotated-refresh",
+        granted_scopes="openid scope.drive scope.sheets",
+        requested_scopes=["scope.drive"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    assert int(rotated.id) == shared_id
+    assert db.query(GoogleOAuthGrant).one().oauth_client_fingerprint == (
+        google_oauth_client_fingerprint("client-b")
+    )
+
+
+def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    drive = _account(db, user, provider="google-drive")
+    sheets = _account(db, user, provider="google-sheets")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=drive,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        legacy_oauth_account=sheets,
+    )
+    db.commit()
+
+    assert (
+        detach_google_shared_oauth_app(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            app_id="google-drive",
+        )
+        == 1
+    )
+    db.commit()
+    assert db.query(UserOAuth).filter_by(provider="google").one().id == shared.id
+    assert db.query(GoogleOAuthGrant).count() == 1
+    assert db.query(GoogleOAuthAppAssociation).count() == 1
+
+    assert (
+        detach_google_shared_oauth_app(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            app_id="google-sheets",
+        )
+        == 1
+    )
+    db.commit()
+    assert db.query(UserOAuth).filter_by(provider="google").count() == 0
+    assert db.query(GoogleOAuthGrant).count() == 0
+    assert db.query(GoogleOAuthAppAssociation).count() == 0

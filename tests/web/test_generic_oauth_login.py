@@ -42,6 +42,9 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.oauth_provider_quirks import requires_pkce
+from xagent.web.services.google_oauth_grants import (
+    create_google_oauth_grant_association,
+)
 
 XERO_APP_SCOPES = [
     "openid",
@@ -245,6 +248,79 @@ def test_google_drive_login_does_not_reuse_previous_granted_scopes(db_session):
     assert set(params["scope"][0].split()) == {
         "openid",
         "https://www.googleapis.com/auth/drive.file",
+    }
+
+
+def test_google_shared_login_reuses_scopes_without_reconsent(db_session, monkeypatch):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            description="Drive",
+            transport="oauth",
+            provider_name="google",
+            category="Support",
+            oauth_scopes=["scope.drive.file"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="google-drive",
+        provider_user_id="subject-a",
+        access_token="legacy-access",
+        refresh_token="legacy-refresh",
+        scope="openid scope.existing",
+    )
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="subject-a",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="openid scope.existing",
+    )
+    db.add_all([legacy, shared])
+    db.flush()
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="test-client-id",
+        app_id="google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    provider = _provider(
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/api/auth/google/callback",
+    )
+
+    response = generic_oauth_login(
+        provider="google",
+        token=_token_for(user),
+        app_id="google-drive",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    params = parse_qs(urlparse(_location(response)).query)
+    assert params["prompt"] == ["select_account"]
+    assert set(params["scope"][0].split()) == {
+        "openid",
+        "https://www.googleapis.com/auth/drive.file",
+        "scope.existing",
+    }
+    state = verify_token(params["state"][0])
+    assert state["google_shared_mode"] is True
+    assert set(state["google_shared_scopes"]) == {
+        "openid",
+        "https://www.googleapis.com/auth/drive.file",
+        "scope.existing",
     }
 
 

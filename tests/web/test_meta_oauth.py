@@ -18,6 +18,10 @@ from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
 from xagent.web.models.database import Base
 from xagent.web.models.gmail_watch import GmailWatchState
+from xagent.web.models.google_oauth_grant import (
+    GoogleOAuthAppAssociation,
+    GoogleOAuthGrant,
+)
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -107,6 +111,73 @@ def _google_provider() -> SimpleNamespace:
         email_path="email",
         default_scopes=["https://www.googleapis.com/auth/gmail.modify"],
     )
+
+
+def test_google_shared_callback_dual_writes_for_instant_rollback(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "drive"]},
+        )
+    )
+    db.commit()
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "google-drive",
+            "google_shared_mode": True,
+            "google_shared_scopes": ["openid", "scope.drive"],
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "shared-access",
+                    "refresh_token": "shared-refresh",
+                    "token_type": "Bearer",
+                    "scope": "openid scope.drive",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    shared = db.query(UserOAuth).filter_by(provider="google").one()
+    legacy = db.query(UserOAuth).filter_by(provider="google-drive").one()
+    association = db.query(GoogleOAuthAppAssociation).one()
+    grant = db.query(GoogleOAuthGrant).one()
+    assert shared.access_token == legacy.access_token == "shared-access"
+    assert shared.refresh_token == legacy.refresh_token == "shared-refresh"
+    assert grant.oauth_account_id == shared.id
+    assert association.legacy_oauth_account_id == legacy.id
 
 
 def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(

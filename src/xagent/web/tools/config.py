@@ -4152,6 +4152,46 @@ class WebToolConfig(BaseToolConfig):
                         oauth_account=oauth_account,
                         expected_refresh_token=attempted_refresh_token,
                     )
+                elif (
+                    str(oauth_account.provider) == "google"
+                    and oauth_account.resource_owner_key is None
+                ):
+                    # A shared row deliberately uses provider="google", but a
+                    # Gmail association still owns watch state on its mirrored
+                    # legacy row. Quiesce that mailbox before tombstoning the
+                    # shared token so a dead grant cannot leave an ACTIVE watch
+                    # retrying indefinitely.
+                    from ..services.gmail_provisioning import (
+                        mark_gmail_oauth_reconnect_required,
+                    )
+                    from ..services.google_oauth_grants import (
+                        gmail_legacy_accounts_for_shared_google_oauth,
+                    )
+
+                    gmail_accounts = gmail_legacy_accounts_for_shared_google_oauth(
+                        oauth_db, oauth_account_id=int(oauth_account.id)
+                    )
+                    for gmail_account in gmail_accounts:
+                        mark_gmail_oauth_reconnect_required(
+                            oauth_db,
+                            oauth_account=gmail_account,
+                            expected_refresh_token=attempted_refresh_token,
+                        )
+                    oauth_account = (
+                        scoped_user_oauth_query(
+                            oauth_db, user_id=user_id, resource_owner_key=None
+                        )
+                        .filter(UserOAuth.id == account_id)
+                        .populate_existing()
+                        .first()
+                    )
+                    if (
+                        oauth_account is not None
+                        and oauth_account.refresh_token == attempted_refresh_token
+                    ):
+                        oauth_account.access_token = ""
+                        oauth_account.refresh_token = None
+                        oauth_account.expires_at = None
                 else:
                     oauth_account.access_token = ""
                     oauth_account.refresh_token = None

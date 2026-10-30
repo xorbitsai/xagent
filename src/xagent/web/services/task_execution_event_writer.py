@@ -148,6 +148,7 @@ def _append_fact_reporting_insert_no_commit(
     payload: dict[str, Any],
     scope_id: str = "root",
     run_id: str | None = None,
+    turn_id: str | None = None,
 ) -> tuple[TaskExecutionEvent, bool]:
     """``append_fact_no_commit`` that also says whether it inserted the row."""
     return _append_task_execution_event_no_commit(
@@ -159,7 +160,7 @@ def _append_fact_reporting_insert_no_commit(
             payload=payload,
             scope_id=scope_id,
             run_id=run_id,
-            turn_id=None,
+            turn_id=turn_id,
             assistant_message_id=None,
             tool_attempt_id=None,
             occurred_at=None,
@@ -279,7 +280,11 @@ def stage_delivery_fact_no_commit(
 
 
 def stage_result_fact_no_commit(
-    db: Session, task: Task, result: dict[str, Any]
+    db: Session,
+    task: Task,
+    result: dict[str, Any],
+    *,
+    turn_id: str | None = None,
 ) -> FactWitness | None:
     """Stage the run's ``execution_settled`` fact.
 
@@ -295,6 +300,7 @@ def stage_result_fact_no_commit(
         kind="execution_settled",
         key=key,
         run_id=cast(str | None, task.run_id),
+        turn_id=turn_id,
         payload={"status": task.status.value, "result": result},
     )
     if not inserted:

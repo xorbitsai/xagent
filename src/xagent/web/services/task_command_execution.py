@@ -2188,6 +2188,7 @@ async def handle_task_message(
                                 agent_service.tracer, "records_execution_events", False
                             )
                             is True,
+                            turn_id=turn_id,
                         )
                     )
                 supports_live_control = getattr(

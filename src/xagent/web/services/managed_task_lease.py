@@ -190,6 +190,7 @@ def finalize_managed_task_lease_result(
             interruption_pause_result()
             if paused
             else dict(execution_result or {"error": error_message}),
+            turn_id=turn_id,
         )
         if completion is not None:
             from ..models.task_command import TaskExecutionCommand

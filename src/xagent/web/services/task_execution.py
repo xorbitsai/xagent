@@ -804,6 +804,7 @@ def _persist_agent_outbound_event(
     task_id: int,
     event: Dict[str, Any],
     *,
+    turn_id: str | None = None,
     authoritative: bool = False,
     rerun: bool = False,
 ) -> None:
@@ -932,6 +933,7 @@ def _persist_agent_outbound_event(
                 run_id=cast(str | None, task.run_id),
                 assistant_message_id=metadata.get("assistant_message_id"),
                 tool_attempt_id=metadata.get("tool_attempt_id"),
+                turn_id=turn_id,
                 payload={"data": data, "protocol_event_id": trace_event.event_id},
                 occurred_at=event_time,
             )
@@ -990,6 +992,7 @@ def _persist_agent_outbound_event(
                     interactions=interactions,
                     source_event_id=str(trace_event.event_id),
                     execution_event_id=execution_event_id,
+                    turn_id=turn_id,
                 )
 
         if authoritative:
@@ -1046,7 +1049,10 @@ def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
 
 
 async def _persist_authoritative_outbound_event(
-    task_id: int, event: Dict[str, Any]
+    task_id: int,
+    event: Dict[str, Any],
+    *,
+    turn_id: str | None = None,
 ) -> None:
     """Persist an authoritative outbound event, rerunning transient failures.
 
@@ -1066,7 +1072,11 @@ async def _persist_authoritative_outbound_event(
         rerun = attempts > 1
         await run_db_io_cancellation_safe(
             lambda: _persist_agent_outbound_event(
-                task_id, candidate, authoritative=True, rerun=rerun
+                task_id,
+                candidate,
+                turn_id=turn_id,
+                authoritative=True,
+                rerun=rerun,
             )
         )
         return candidate
@@ -1087,7 +1097,12 @@ async def _persist_authoritative_outbound_event(
     event.update(persisted)
 
 
-def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) -> Any:
+def make_agent_outbound_handler(
+    task_id: int,
+    *,
+    authoritative: bool = False,
+    turn_id: str | None = None,
+) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
     async def handle_outbound_message(payload: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -1111,7 +1126,9 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
                 payload_type, task_id, dict(payload)
             )
             if authoritative:
-                await _persist_authoritative_outbound_event(task_id, final_answer_event)
+                await _persist_authoritative_outbound_event(
+                    task_id, final_answer_event, turn_id=turn_id
+                )
             await publish_task_event(final_answer_event, task_id)
             return None
 
@@ -1136,10 +1153,10 @@ def make_agent_outbound_handler(task_id: int, *, authoritative: bool = False) ->
             event_id=payload.get("event_id"),
         )
         if authoritative:
-            await _persist_authoritative_outbound_event(task_id, event)
+            await _persist_authoritative_outbound_event(task_id, event, turn_id=turn_id)
         else:
             await run_db_io_cancellation_safe(
-                lambda: _persist_agent_outbound_event(task_id, event)
+                lambda: _persist_agent_outbound_event(task_id, event, turn_id=turn_id)
             )
         await publish_task_event(event, task_id)
         return cast(Dict[str, Any], event["data"]) if authoritative else None
@@ -2446,6 +2463,7 @@ def _finalize_task_execution_result_isolated(
                     interruption_pause_result()
                     if interruption_pause_reason is not None
                     else result,
+                    turn_id=turn_id,
                 )
                 finalize_db.flush()
                 broadcast_meta = _finalization_broadcast_meta(task_updated)
@@ -2645,6 +2663,12 @@ async def execute_task_background(
                             agent_service.tracer, "records_execution_events", False
                         )
                         is True,
+                        turn_id=(
+                            context_dict.get("turn_id")
+                            if isinstance(context_dict.get("turn_id"), str)
+                            and context_dict.get("turn_id")
+                            else None
+                        ),
                     )
                 )
             agent_service.set_conversation_history(
@@ -3354,6 +3378,7 @@ def _finalize_resumed_task(
             db,
             task,
             interruption_pause_result() if pause_reason is not None else result,
+            turn_id=_latest_result_user_turn_id(result),
         )
         if task.channel_id is not None and final_task_status in {
             TaskStatus.COMPLETED,
@@ -3426,6 +3451,7 @@ def _settle_resumed_task_lease(
     lease: TaskLease,
     *,
     error_message: str | None,
+    turn_id: str | None = None,
     interruption: InterruptionReason | None = None,
     report: SettlementReport | None = None,
 ) -> bool:
@@ -3441,11 +3467,13 @@ def _settle_resumed_task_lease(
             error_message=error_message,
             client_error_message=error_message,
             client_message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+            turn_id=turn_id,
             report=report,
         )
     return settle_task_lease_isolated(
         lease,
         error_message=error_message,
+        turn_id=turn_id,
         interruption=interruption,
         report=report,
     )
@@ -3777,6 +3805,7 @@ async def execute_resume_background(
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
                     error_message="resume cancelled during lease acquisition",
+                    turn_id=delivery_turn_id,
                 ),
             )
             if prior_status_box:
@@ -3987,6 +4016,7 @@ async def execute_resume_background(
                         agent_service.tracer, "records_execution_events", False
                     )
                     is True,
+                    turn_id=delivery_turn_id,
                 )
             )
 
@@ -4780,6 +4810,7 @@ async def execute_resume_background(
                                 lambda: _settle_resumed_task_lease(
                                     lease,
                                     error_message=settlement_error,
+                                    turn_id=delivery_turn_id,
                                     # An explicit cancel is not an
                                     # interruption to resume from.
                                     interruption=(

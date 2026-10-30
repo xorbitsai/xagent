@@ -287,8 +287,17 @@ async def test_current_turn_id_reaches_terminal_persistence() -> None:
         ),
     )
     finalizer = MagicMock(return_value=_completed_finalization())
+    outbound_factory = MagicMock(return_value=AsyncMock())
 
-    with _Patches(_common_patches(db, agent_service, finalizer=finalizer)):
+    with _Patches(
+        [
+            *_common_patches(db, agent_service, finalizer=finalizer),
+            patch(
+                "xagent.web.services.task_execution.make_agent_outbound_handler",
+                new=outbound_factory,
+            ),
+        ]
+    ):
         await execute_task_background(
             task_id=42,
             user_message="hi",
@@ -300,6 +309,7 @@ async def test_current_turn_id_reaches_terminal_persistence() -> None:
         )
 
     assert finalizer.call_args.kwargs["turn_id"] == "accepted-current-turn"
+    assert outbound_factory.call_args.kwargs["turn_id"] == "accepted-current-turn"
 
 
 @pytest.mark.asyncio

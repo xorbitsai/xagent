@@ -465,6 +465,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     lambda: settle_task_lease_isolated(
                         handoff.claimed.task_lease,
                         error_message="Channel execution scheduling failed",
+                        turn_id=start.turn_id,
                     )
                 )
                 raise
@@ -493,6 +494,7 @@ async def _execute_task_start(command: ClaimedTaskCommand) -> SettledTaskCommand
                     lambda: settle_task_lease_isolated(
                         handoff.claimed.task_lease,
                         error_message="Existing execution scheduling failed",
+                        turn_id=start.turn_id,
                     )
                 )
                 raise

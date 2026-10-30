@@ -52,6 +52,7 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_execution_event import TaskExecutionEvent
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerRun,
@@ -670,7 +671,10 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     assert task.control_state == started.control_state == "running"
     delivery = (
         db_session.query(TaskChatMessage)
-        .filter(TaskChatMessage.turn_id == payload.turn_id)
+        .filter(
+            TaskChatMessage.turn_id == payload.turn_id,
+            TaskChatMessage.role == "user",
+        )
         .one()
     )
     assert delivery.delivery_status == DELIVERY_DISPATCHED
@@ -1364,7 +1368,10 @@ async def test_begin_turn_marks_failed_when_schedule_raises(
     assert task.status == TaskStatus.FAILED
     delivery = (
         db_session.query(TaskChatMessage)
-        .filter(TaskChatMessage.turn_id == payload.turn_id)
+        .filter(
+            TaskChatMessage.turn_id == payload.turn_id,
+            TaskChatMessage.role == "user",
+        )
         .one()
     )
     assert delivery.delivery_status == DELIVERY_FAILED
@@ -1478,10 +1485,16 @@ def test_error_settlement_releases_terminal_lease_without_reporting_failure(
     assert persisted.lease_expires_at is None
 
 
-def test_error_settlement_persists_client_safe_history(db_session) -> None:
+@pytest.mark.parametrize("storage_version", [1, 2])
+def test_error_settlement_persists_client_safe_history(
+    db_session, storage_version: int
+) -> None:
     secret = "orchestrator-provider-secret"
+    turn_id = f"settlement-turn-v{storage_version}"
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.conversation_storage_version = storage_version
+    db_session.commit()
     task_id = int(task.id)
     lease = acquire_task_lease_isolated(task_id)
     assert lease is not None
@@ -1490,6 +1503,7 @@ def test_error_settlement_persists_client_safe_history(db_session) -> None:
         settle_task_lease_isolated(
             lease,
             error_message=f"setup/run failed: {secret}",
+            turn_id=turn_id,
         )
         is True
     )
@@ -1508,6 +1522,19 @@ def test_error_settlement_persists_client_safe_history(db_session) -> None:
     )
     assert len(messages) == 1
     assert messages[0].content == "Task execution failed."
+    assert messages[0].turn_id == turn_id
+    if storage_version == 2:
+        facts = (
+            db_session.query(TaskExecutionEvent)
+            .filter(TaskExecutionEvent.task_id == task_id)
+            .order_by(TaskExecutionEvent.sequence)
+            .all()
+        )
+        assert [fact.kind for fact in facts] == [
+            "assistant_message",
+            "execution_settled",
+        ]
+        assert [fact.turn_id for fact in facts] == [turn_id, turn_id]
     assert secret not in messages[0].content
 
 
@@ -3784,7 +3811,10 @@ def _delivery_status(db, turn_id: str) -> str | None:
     db.expire_all()
     row = (
         db.query(TaskChatMessage)
-        .filter(TaskChatMessage.turn_id == turn_id)
+        .filter(
+            TaskChatMessage.turn_id == turn_id,
+            TaskChatMessage.role == "user",
+        )
         .one_or_none()
     )
     return None if row is None else str(row.delivery_status)

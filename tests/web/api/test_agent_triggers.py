@@ -47,6 +47,7 @@ from xagent.web.services.connector_runtime import (
 )
 from xagent.web.services.task_execution import (
     _finalize_task_execution_result_isolated,
+    _persist_agent_outbound_event,
 )
 from xagent.web.services.task_orchestrator import (
     TurnStarted,
@@ -501,6 +502,17 @@ def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
     assert task_error == safe_error
     assert run_finished_at is not None
     assert private_detail not in str(final_state)
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json()["messages"][-1] == {
+        "role": "assistant",
+        "content": safe_error,
+    }
+    assert private_detail not in history.text
 
 
 def _fire_test_run(headers: dict[str, str]) -> _PreparedTriggerStart:
@@ -3949,6 +3961,128 @@ def test_v1_trigger_history_sanitizes_unsafe_and_omits_tool_only_assistants() ->
         "messages": [{"role": "user", "content": "Run tool-only"}],
     }
     assert "do-not-leak" not in tool_only.text
+
+
+@pytest.mark.parametrize(
+    ("storage_version", "authoritative"),
+    [(1, False), (2, True)],
+)
+def test_trigger_history_keeps_same_turn_question_and_excludes_later_question(
+    storage_version: int,
+    authoritative: bool,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, f"V{storage_version} routine question history")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": f"V{storage_version} question hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title=f"V{storage_version} routine question history",
+            description="Routine question prompt",
+            status=TaskStatus.WAITING_FOR_USER,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="Routine question prompt",
+            run_id=f"v{storage_version}-question-run",
+            conversation_storage_version=storage_version,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.RUNNING.value,
+            idempotency_key=f"history:v{storage_version}:question",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: "routine-question-turn",
+        }
+        persist_user_message_no_commit(
+            db,
+            task_id=int(task.id),
+            user_id=owner_id,
+            content="Routine question prompt",
+            turn_id="routine-question-turn",
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    def persist_question(event_id: str, question: str, turn_id: str) -> None:
+        _persist_agent_outbound_event(
+            task_id,
+            {
+                "event_type": "agent_message",
+                "event_id": event_id,
+                "data": {
+                    "event_id": event_id,
+                    "message": question,
+                    "message_type": "question",
+                    "expect_response": True,
+                    "visible": True,
+                    "metadata": {},
+                },
+            },
+            turn_id=turn_id,
+            authoritative=authoritative,
+        )
+
+    persist_question(
+        f"v{storage_version}-routine-question",
+        "Choose the report format",
+        "routine-question-turn",
+    )
+
+    db = _direct_db_session()
+    try:
+        persist_user_message_no_commit(
+            db,
+            task_id=task_id,
+            user_id=owner_id,
+            content="Owner private follow-up",
+            turn_id="private-question-turn",
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    persist_question(
+        f"v{storage_version}-private-question",
+        "Choose a private connector account",
+        "private-question-turn",
+    )
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "Routine question prompt"},
+            {"role": "assistant", "content": "Choose the report format"},
+        ],
+    }
+    assert "private connector" not in history.text.lower()
 
 
 def test_v2_terminal_persistence_keeps_routine_turn_provenance() -> None:

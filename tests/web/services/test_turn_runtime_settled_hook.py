@@ -238,6 +238,10 @@ async def drive_resume_background(
                 return_value=True,
             ),
             patch(
+                "xagent.web.services.task_execution.load_routine_history_turn_id",
+                return_value=None,
+            ),
+            patch(
                 "xagent.web.api.websocket.manager",
                 MagicMock(broadcast_to_task=AsyncMock()),
             ),

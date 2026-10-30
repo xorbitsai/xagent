@@ -757,7 +757,11 @@ async def test_background_failure_uses_worker_owned_setup_and_terminal_sessions(
     def load_snapshot(*_args, **_kwargs):
         setup_threads.append(threading.get_ident())
         return SimpleNamespace(
-            task=SimpleNamespace(user_id=1, status=TaskStatus.RUNNING),
+            task=SimpleNamespace(
+                user_id=1,
+                status=TaskStatus.RUNNING,
+                run_id=None,
+            ),
             runtime_user=SimpleNamespace(id=1, is_admin=False),
         )
 
@@ -768,6 +772,7 @@ async def test_background_failure_uses_worker_owned_setup_and_terminal_sessions(
         event_type="agent_error",
         expected_run_id=None,
         only_if_running=False,
+        turn_id=None,
     ):
         payload_calls.append((threading.get_ident(), only_if_running))
         return {"type": event_type, "message": message}

@@ -100,6 +100,7 @@ def _bg_patches(db: Any) -> list[Any]:
             status=TaskStatus.RUNNING,
             agent_id=None,
             source=None,
+            run_id=None,
         ),
         runtime_user=SimpleNamespace(id=1, is_admin=False),
         agent=None,
@@ -145,6 +146,17 @@ def _bg_patches(db: Any) -> list[Any]:
             "xagent.web.api.websocket.manager", MagicMock(broadcast_to_task=AsyncMock())
         ),
     ]
+
+
+@pytest.fixture(autouse=True)
+def _stub_routine_history_turn_lookup():
+    """Scope tests do not configure persistence for resume provenance."""
+
+    with patch(
+        "xagent.web.services.task_execution.load_routine_history_turn_id",
+        return_value=None,
+    ):
+        yield
 
 
 class _Patches:
@@ -363,6 +375,7 @@ async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None
                 status=TaskStatus.RUNNING,
                 agent_id=None,
                 source=None,
+                run_id=None,
             ),
             runtime_user=SimpleNamespace(id=1, is_admin=False),
             agent=None,
@@ -1506,6 +1519,7 @@ def _fake_acquire_with_prior_status(lease: TaskLease, prior_status: TaskStatus):
         refuse_terminal_status: bool = False,
         run_not_resumable_out: list[bool] | None = None,
         ended_status_out: list[Any] | None = None,
+        history_turn_id_out: list[str | None] | None = None,
     ) -> TaskLease:
         if prior_status_out is not None:
             prior_status_out.append(prior_status)

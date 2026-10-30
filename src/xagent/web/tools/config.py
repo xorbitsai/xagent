@@ -4049,20 +4049,10 @@ class WebToolConfig(BaseToolConfig):
         account_id = int(oauth_account.id)
         attempted_refresh_token = oauth_account.refresh_token
         ordinary_gmail = is_ordinary_gmail(oauth_account)
-        shared_google_gmail = False
-        if (
+        shared_google_account = (
             str(oauth_account.provider) == "google"
             and oauth_account.resource_owner_key is None
-        ):
-            from ..services.google_oauth_grants import (
-                gmail_legacy_accounts_for_shared_google_oauth,
-            )
-
-            shared_google_gmail = bool(
-                gmail_legacy_accounts_for_shared_google_oauth(
-                    oauth_db, oauth_account_id=account_id
-                )
-            )
+        )
         permanently_invalid = False
         try:
             is_valid = await refresh_oauth_token_if_needed(
@@ -4117,7 +4107,7 @@ class WebToolConfig(BaseToolConfig):
                 ).filter(UserOAuth.id == account_id)
                 if oauth_db.get_bind().dialect.name != "sqlite":
                     reread_query = reread_query.with_for_update()
-                elif not ordinary_gmail and not shared_google_gmail:
+                elif not ordinary_gmail and not shared_google_account:
                     oauth_db.execute(
                         text("UPDATE user_oauth SET id = id WHERE id = :id"),
                         {"id": account_id},
@@ -4177,6 +4167,9 @@ class WebToolConfig(BaseToolConfig):
                     # retrying indefinitely.
                     from ..services.gmail_provisioning import (
                         mark_gmail_oauth_reconnect_required,
+                    )
+                    from ..services.google_oauth_grants import (
+                        gmail_legacy_accounts_for_shared_google_oauth,
                     )
 
                     gmail_accounts = gmail_legacy_accounts_for_shared_google_oauth(

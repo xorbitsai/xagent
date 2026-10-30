@@ -921,6 +921,15 @@ async def delete_connected_account(
         ),
     )
 
+    from ..services.google_oauth_grants import (
+        detach_google_shared_oauth_legacy_account,
+    )
+
+    detach_google_shared_oauth_legacy_account(
+        db,
+        user_id=cast(int, user.id),
+        legacy_oauth_account_id=int(account.id),
+    )
     db.delete(account)
     db.commit()
 

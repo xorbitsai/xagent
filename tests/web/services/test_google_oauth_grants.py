@@ -9,12 +9,15 @@ from xagent.web.models.google_oauth_grant import (
     GoogleOAuthAppAssociation,
     GoogleOAuthGrant,
 )
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.google_oauth_grants import (
     GoogleOAuthGrantConflict,
     create_google_oauth_grant_association,
     detach_google_shared_oauth_app,
+    detach_google_shared_oauth_legacy_account,
     google_oauth_authorization_context,
     google_oauth_client_fingerprint,
     google_oauth_grant_covers_scopes,
@@ -22,6 +25,7 @@ from xagent.web.services.google_oauth_grants import (
     resolve_google_shared_oauth_account,
     write_google_shared_oauth_callback,
 )
+from xagent.web.tools.config import WebToolConfig
 
 
 @pytest.fixture()
@@ -564,6 +568,16 @@ def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
 
 def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session):
     db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+        )
+    )
+    db.commit()
     shared = _account(db, user)
     legacy = _account(db, user, provider="google-drive")
     legacy.refresh_token = "rollback-refresh"
@@ -581,3 +595,286 @@ def test_mirror_preserves_legacy_refresh_when_shared_token_is_missing(db_session
 
     assert legacy.access_token == "new-shared-access"
     assert legacy.refresh_token == "rollback-refresh"
+
+
+def test_callback_immediately_repairs_scope_valid_sibling_mirror(db_session):
+    db, user = db_session
+    db.add_all(
+        [
+            PublicMCPApp(
+                app_id="google-drive",
+                name="Google Drive",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.drive"],
+            ),
+            PublicMCPApp(
+                app_id="google-sheets",
+                name="Google Sheets",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.sheets"],
+            ),
+            PublicMCPApp(
+                app_id="google-calendar",
+                name="Google Calendar",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.calendar"],
+            ),
+        ]
+    )
+    db.commit()
+    shared = _account(
+        db,
+        user,
+        token="revoked-shared-access",
+        scopes="openid scope.drive scope.sheets",
+    )
+    shared.refresh_token = "revoked-shared-refresh"
+    drive = _account(
+        db,
+        user,
+        provider="google-drive",
+        token="revoked-drive-access",
+        scopes="openid scope.drive",
+    )
+    drive.refresh_token = "revoked-drive-refresh"
+    sheets = _account(
+        db,
+        user,
+        provider="google-sheets",
+        token="revoked-sheets-access",
+        scopes="openid scope.sheets",
+    )
+    sheets.refresh_token = "revoked-sheets-refresh"
+    calendar = _account(
+        db,
+        user,
+        provider="google-calendar",
+        token="existing-calendar-access",
+        scopes="openid scope.calendar",
+    )
+    calendar.refresh_token = "existing-calendar-refresh"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=drive,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        legacy_oauth_account=sheets,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-calendar",
+        legacy_oauth_account=calendar,
+    )
+    db.commit()
+
+    write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        google_subject="google-subject",
+        access_token="reconnected-access",
+        refresh_token="reconnected-refresh",
+        granted_scopes="openid scope.drive scope.sheets",
+        requested_scopes=["openid", "scope.drive", "scope.sheets"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=sheets,
+    )
+    db.commit()
+
+    db.refresh(drive)
+    db.refresh(calendar)
+    assert drive.access_token == "reconnected-access"
+    assert drive.refresh_token == "reconnected-refresh"
+    assert calendar.access_token == "existing-calendar-access"
+    assert calendar.refresh_token == "existing-calendar-refresh"
+
+
+@pytest.mark.asyncio
+async def test_adopting_bare_google_row_preserves_covered_connected_sibling(
+    db_session, monkeypatch
+):
+    db, user = db_session
+    bare = _account(
+        db,
+        user,
+        token="bare-access",
+        scopes="openid scope.drive scope.sheets scope.slides",
+    )
+    apps = [
+        PublicMCPApp(
+            app_id="test-google-drive",
+            name="Test Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+        ),
+        PublicMCPApp(
+            app_id="test-google-sheets",
+            name="Test Google Sheets",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.sheets"],
+        ),
+        PublicMCPApp(
+            app_id="test-google-calendar",
+            name="Test Google Calendar",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.calendar"],
+        ),
+        PublicMCPApp(
+            app_id="test-google-slides",
+            name="Test Google Slides",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.slides"],
+        ),
+    ]
+    db.add_all(apps)
+    db.flush()
+    for app in apps[1:]:
+        server = MCPServer(
+            name=app.name,
+            managed="external",
+            transport="oauth",
+            auth={"app_id": app.app_id, "provider": "google"},
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=int(user.id),
+                mcpserver_id=int(server.id),
+                is_owner=True,
+                is_active=True,
+            )
+        )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="test-google-drive",
+        provider_user_id="google-subject",
+        access_token="drive-legacy-access",
+        refresh_token="drive-legacy-refresh",
+        scope="openid scope.drive",
+    )
+    db.add(legacy)
+    db.commit()
+
+    shared, _mirrored, _association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="test-google-drive",
+        google_subject="google-subject",
+        access_token="adopted-access",
+        refresh_token="adopted-refresh",
+        granted_scopes="openid scope.drive scope.sheets",
+        requested_scopes=["openid", "scope.drive", "scope.sheets"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    sheets_legacy = db.query(UserOAuth).filter_by(provider="test-google-sheets").one()
+    assert shared.id == bare.id
+    assert sheets_legacy.access_token == "adopted-access"
+    assert db.query(UserOAuth).filter_by(provider="test-google-calendar").count() == 0
+    assert db.query(UserOAuth).filter_by(provider="test-google-slides").count() == 0
+    assert {row.app_id for row in db.query(GoogleOAuthAppAssociation).all()} == {
+        "test-google-drive",
+        "test-google-sheets",
+    }
+    assert (
+        resolve_google_shared_oauth_account(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-a",
+            app_id="test-google-sheets",
+            required_scopes=["scope.sheets"],
+        )
+        == shared
+    )
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "false")
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+    config = WebToolConfig(
+        db=db,
+        request=None,
+        user=user,
+        user_id=int(user.id),
+        workspace_config={"base_dir": "/tmp", "task_id": "task-1"},
+        db_factory=isolated_session_factory,
+    )
+    resolved = await config._resolve_legacy_oauth_access_token(
+        provider_name="google",
+        app_id="test-google-sheets",
+        app_info={"oauth_scopes": ["scope.sheets"]},
+    )
+    assert resolved.access_token == "adopted-access"
+
+
+def test_detach_exact_legacy_account_preserves_then_removes_shared_grant(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    drive = _account(db, user, provider="google-drive")
+    sheets = _account(db, user, provider="google-sheets")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=drive,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        legacy_oauth_account=sheets,
+    )
+    db.commit()
+
+    assert (
+        detach_google_shared_oauth_legacy_account(
+            db,
+            user_id=int(user.id),
+            legacy_oauth_account_id=int(drive.id),
+        )
+        == 1
+    )
+    db.commit()
+    assert db.get(UserOAuth, int(shared.id)) is not None
+    assert db.query(GoogleOAuthAppAssociation).one().app_id == "google-sheets"
+
+    assert (
+        detach_google_shared_oauth_legacy_account(
+            db,
+            user_id=int(user.id),
+            legacy_oauth_account_id=int(sheets.id),
+        )
+        == 1
+    )
+    db.commit()
+    assert db.get(UserOAuth, int(shared.id)) is None
+    assert db.query(GoogleOAuthGrant).count() == 0

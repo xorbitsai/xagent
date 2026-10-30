@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.runtime import PatternRuntime
@@ -991,48 +991,53 @@ async def test_shared_google_grant_preferred_with_scope_check_and_legacy_fallbac
     assert legacy.access_token == "shared-token"
 
     shared.scope = "openid"
+    legacy.access_token = "legacy-under-scoped"
     db.commit()
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "shared-token"
+    assert _access_token_env(configs[0]) == "legacy-under-scoped"
 
     shared.scope = "openid scope.drive"
     shared.access_token = ""
     shared.refresh_token = None
+    legacy.access_token = "legacy-missing-shared"
     db.commit()
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "shared-token"
+    assert _access_token_env(configs[0]) == "legacy-missing-shared"
 
     shared.access_token = "shared-token"
     shared.refresh_token = "shared-refresh"
     app.oauth_scopes = ["scope.drive", 42]
+    legacy.access_token = "legacy-malformed-scope"
     db.commit()
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "shared-token"
+    assert _access_token_env(configs[0]) == "legacy-malformed-scope"
 
     app.oauth_scopes = ["scope.drive"]
     provider_config.client_id = ""
+    legacy.access_token = "legacy-missing-client"
     monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
     db.commit()
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "shared-token"
+    assert _access_token_env(configs[0]) == "legacy-missing-client"
 
     provider_config.client_id = encrypt_value("google-client-id")
     app.oauth_scopes = ["scope.drive"]
     shared.scope = "openid scope.drive"
+    legacy.access_token = "legacy-flag-off"
     db.commit()
     monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "false")
     configs = await _tool_config(
         db, user, db_factory=isolated_session_factory
     ).get_mcp_server_configs()
-    assert _access_token_env(configs[0]) == "shared-token"
+    assert _access_token_env(configs[0]) == "legacy-flag-off"
 
 
 @pytest.mark.asyncio
@@ -1050,6 +1055,26 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
             token_url="https://oauth2.googleapis.com/token",
             default_scopes=["openid"],
         )
+    )
+    db.add_all(
+        [
+            PublicMCPApp(
+                app_id="google-drive",
+                name="Google Drive",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.drive"],
+                launch_config={},
+            ),
+            PublicMCPApp(
+                app_id="google-sheets",
+                name="Google Sheets",
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=["scope.drive"],
+                launch_config={},
+            ),
+        ]
     )
     owner_key = "toby:workspace:actor"
     shared = UserOAuth(
@@ -1465,6 +1490,118 @@ async def test_permanently_invalid_shared_google_grant_quiesces_gmail_watch(
         assert quiesced_watch.status == TriggerProvisioningStatus.FAILED.value
         assert quiesced_watch.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
         assert quiesced_watch.watch_expiration is None
+
+
+@pytest.mark.asyncio
+async def test_shared_google_gmail_association_added_during_refresh_keeps_lock_order(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            default_scopes=[],
+        )
+    )
+    _add_oauth_server(
+        db,
+        user,
+        name="Google Drive",
+        app_id="google-drive",
+        provider="google",
+        launch_config=_launch_config(),
+    )
+    shared = _add_user_oauth(
+        db, user, provider="google", access_token="expired-shared-token"
+    )
+    shared.provider_user_id = "google-subject"
+    shared.refresh_token = "expired-shared-refresh"
+    shared.scope = (
+        "https://www.googleapis.com/auth/drive "
+        "https://www.googleapis.com/auth/drive.file"
+    )
+    drive = _add_user_oauth(
+        db, user, provider="google-drive", access_token="expired-shared-token"
+    )
+    drive.provider_user_id = "google-subject"
+    gmail = _add_user_oauth(
+        db, user, provider="gmail", access_token="expired-shared-token"
+    )
+    gmail.provider_user_id = "google-subject"
+    gmail.email = "alice@example.com"
+    gmail.refresh_token = "expired-shared-refresh"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="google-drive",
+        legacy_oauth_account=drive,
+    )
+    db.commit()
+    shared_id = int(shared.id)
+    gmail_id = int(gmail.id)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+    events: list[str] = []
+
+    def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
+        compact_statement = "".join(statement.lower().split())
+        if compact_statement.startswith("updateuser_oauthsetid=id"):
+            events.append("row-lock")
+
+    event.listen(db.get_bind(), "before_cursor_execute", observe_sql)
+
+    async def add_gmail_then_fail(*args, **kwargs):
+        with isolated_session_factory() as callback_db:
+            callback_shared = callback_db.get(UserOAuth, shared_id)
+            callback_gmail = callback_db.get(UserOAuth, gmail_id)
+            assert callback_shared is not None
+            assert callback_gmail is not None
+            create_google_oauth_grant_association(
+                callback_db,
+                oauth_account=callback_shared,
+                oauth_client_id="google-client-id",
+                app_id="gmail",
+                legacy_oauth_account=callback_gmail,
+            )
+            callback_db.commit()
+        events.clear()
+        events.append("association")
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    from xagent.web.services import gmail_provisioning
+
+    original_mark = gmail_provisioning.mark_gmail_oauth_reconnect_required
+
+    def observe_gmail_transition(*args, **kwargs):
+        events.append("gmail-transition")
+        return original_mark(*args, **kwargs)
+
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    monkeypatch.setattr(
+        web_tools_config, "refresh_oauth_token_if_needed", add_gmail_then_fail
+    )
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "mark_gmail_oauth_reconnect_required",
+        observe_gmail_transition,
+    )
+    try:
+        await _tool_config(
+            db, user, db_factory=isolated_session_factory
+        ).get_mcp_server_configs()
+    finally:
+        event.remove(db.get_bind(), "before_cursor_execute", observe_sql)
+
+    assert events[0:2] == ["association", "gmail-transition"]
+    assert "row-lock" in events[2:]
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, cast
@@ -172,6 +172,80 @@ def _validate_shared_account(
         )
     if str(oauth_account.provider_user_id or "") != google_subject:
         raise GoogleOAuthGrantConflict("shared Google grant subject does not match")
+
+
+def _strict_google_app_scopes(app: Mapping[str, Any] | Any) -> frozenset[str] | None:
+    raw_scopes = (
+        app.get("oauth_scopes")
+        if isinstance(app, Mapping)
+        else getattr(app, "oauth_scopes", None)
+    )
+    if raw_scopes is None:
+        return None
+    if not isinstance(raw_scopes, (list, tuple, set)) or any(
+        not isinstance(scope, str) or not scope.strip() for scope in raw_scopes
+    ):
+        return None
+    return normalize_google_oauth_scopes(raw_scopes)
+
+
+def _connected_google_apps_covered_by_bare_account(
+    db: Session, *, user_id: int, oauth_account: UserOAuth
+) -> tuple[tuple[str, frozenset[str]], ...]:
+    """Return personal Google apps whose existing bare authority was valid."""
+    if oauth_account.resource_owner_key is not None:
+        return ()
+
+    from ..mcp_apps import get_app_for_mcp_server
+    from ..models.mcp import MCPServer, UserMCPServer
+
+    granted_scopes = normalize_google_oauth_scopes(oauth_account.scope)
+    apps_by_id: dict[str, frozenset[str]] = {}
+    servers = (
+        db.query(MCPServer)
+        .join(UserMCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(
+            UserMCPServer.user_id == int(user_id),
+            UserMCPServer.is_active.is_(True),
+        )
+        .all()
+    )
+    for server in servers:
+        app = get_app_for_mcp_server(db, server)
+        if app is None or str(app.get("provider") or "").lower() != "google":
+            continue
+        app_id = app.get("id")
+        required_scopes = _strict_google_app_scopes(app)
+        if (
+            isinstance(app_id, str)
+            and app_id
+            and required_scopes is not None
+            and required_scopes.issubset(granted_scopes)
+        ):
+            apps_by_id[app_id] = required_scopes
+    return tuple(sorted(apps_by_id.items()))
+
+
+def _copy_shared_google_credentials(
+    source: UserOAuth, target: UserOAuth, *, preserve_missing_refresh: bool
+) -> None:
+    for field in (
+        "access_token",
+        "refresh_token",
+        "expires_at",
+        "token_type",
+        "scope",
+        "email",
+        "instance_url",
+    ):
+        value = getattr(source, field)
+        if (
+            field == "refresh_token"
+            and preserve_missing_refresh
+            and (not value or is_undecryptable_oauth_token(value))
+        ):
+            continue
+        setattr(target, field, value)
 
 
 def create_google_oauth_grant_association(
@@ -417,6 +491,7 @@ def write_google_shared_oauth_callback(
             )
 
     shared_account: UserOAuth
+    adopted_bare_apps: tuple[tuple[str, frozenset[str]], ...] = ()
     if grant is None:
         # A pre-rollout bare Google login already occupies this provider and
         # subject uniqueness boundary. Adopt it in place so enabling shared
@@ -467,6 +542,9 @@ def write_google_shared_oauth_callback(
                 shared_account = concurrent_winner
         else:
             shared_account = existing_shared_account
+            adopted_bare_apps = _connected_google_apps_covered_by_bare_account(
+                db, user_id=int(user_id), oauth_account=shared_account
+            )
     else:
         shared_account = (
             db.query(UserOAuth)
@@ -514,6 +592,60 @@ def write_google_shared_oauth_callback(
         app_id=normalized_app_id,
         legacy_oauth_account=legacy_oauth_account,
     )
+
+    # Once a pre-rollout bare row becomes grant-owned it can no longer serve
+    # as an implicit provider fallback. Preserve only connected sibling apps
+    # that the old bare scope set had already authorized, and keep every new
+    # association behind the same owner/subject/client boundary.
+    for sibling_app_id, sibling_required_scopes in adopted_bare_apps:
+        if sibling_app_id == normalized_app_id or not google_oauth_grant_covers_scopes(
+            shared_account, sibling_required_scopes
+        ):
+            continue
+        sibling_rows = (
+            db.query(UserOAuth)
+            .filter(
+                UserOAuth.user_id == int(user_id),
+                user_oauth_owner_clause(owner_key),
+                UserOAuth.provider == sibling_app_id,
+            )
+            .order_by(UserOAuth.id.desc())
+            .all()
+        )
+        sibling_legacy = next(
+            (row for row in sibling_rows if str(row.provider_user_id or "") == subject),
+            None,
+        )
+        if sibling_legacy is None:
+            # Do not make the adopted bare identity replace an app-specific
+            # connection that already points at another Google account.
+            if sibling_rows:
+                continue
+            sibling_legacy = UserOAuth(
+                user_id=int(user_id),
+                provider=sibling_app_id,
+                resource_owner_key=owner_key,
+                provider_user_id=subject,
+                access_token=access_token,
+            )
+            db.add(sibling_legacy)
+            db.flush()
+        setattr(sibling_legacy, "provider_user_id", subject)
+        _copy_shared_google_credentials(
+            shared_account, sibling_legacy, preserve_missing_refresh=False
+        )
+        create_google_oauth_grant_association(
+            db,
+            oauth_account=shared_account,
+            oauth_client_id=oauth_client_id,
+            app_id=sibling_app_id,
+            legacy_oauth_account=sibling_legacy,
+        )
+
+    # A reconnect repairs the whole accepted shared authority immediately,
+    # before a feature-flag rollback or a direct legacy consumer can run.
+    # The helper skips catalog apps whose required scopes are not covered.
+    mirror_shared_google_oauth_credentials(db, oauth_account=shared_account)
     return shared_account, legacy_oauth_account, association
 
 
@@ -567,7 +699,7 @@ def gmail_legacy_accounts_for_shared_google_oauth(
 def mirror_shared_google_oauth_credentials(
     db: Session, *, oauth_account: UserOAuth
 ) -> int:
-    """Keep rollback-compatible per-app rows current after token refresh."""
+    """Keep scope-valid rollback rows current after callback or refresh."""
     if (
         oauth_account.id is None
         or oauth_account.provider != GOOGLE_SHARED_OAUTH_PROVIDER
@@ -576,25 +708,32 @@ def mirror_shared_google_oauth_credentials(
     legacy_accounts = legacy_accounts_for_shared_google_oauth(
         db, oauth_account_id=int(oauth_account.id)
     )
+    from ..models.public_mcp import PublicMCPApp
+
+    catalog_apps = {
+        app.app_id: app
+        for app in db.query(PublicMCPApp)
+        .filter(
+            PublicMCPApp.app_id.in_(
+                [str(account.provider) for account in legacy_accounts]
+            ),
+            PublicMCPApp.provider_name == GOOGLE_SHARED_OAUTH_PROVIDER,
+        )
+        .all()
+    }
+    mirrored = 0
     for legacy_account in legacy_accounts:
-        for field in (
-            "access_token",
-            "refresh_token",
-            "expires_at",
-            "token_type",
-            "scope",
-            "email",
-            "instance_url",
+        app = catalog_apps.get(str(legacy_account.provider))
+        required_scopes = _strict_google_app_scopes(app) if app is not None else None
+        if required_scopes is None or not google_oauth_grant_covers_scopes(
+            oauth_account, required_scopes
         ):
-            value = getattr(oauth_account, field)
-            if field == "refresh_token" and (
-                not value or is_undecryptable_oauth_token(value)
-            ):
-                # A damaged shared row must not erase the legacy recovery
-                # token that exists specifically to make rollback possible.
-                continue
-            setattr(legacy_account, field, value)
-    return len(legacy_accounts)
+            continue
+        _copy_shared_google_credentials(
+            oauth_account, legacy_account, preserve_missing_refresh=True
+        )
+        mirrored += 1
+    return mirrored
 
 
 def detach_google_shared_oauth_app(
@@ -623,6 +762,44 @@ def detach_google_shared_oauth_app(
     for association in associations:
         db.delete(association)
     db.flush()
+
+    _delete_orphaned_google_grants(db, grant_ids=grant_ids)
+    return len(associations)
+
+
+def detach_google_shared_oauth_legacy_account(
+    db: Session,
+    *,
+    user_id: int,
+    legacy_oauth_account_id: int,
+) -> int:
+    """Detach the exact visible legacy account selected by cloud account UI."""
+    associations = (
+        db.query(GoogleOAuthAppAssociation)
+        .join(
+            GoogleOAuthGrant,
+            GoogleOAuthGrant.id == GoogleOAuthAppAssociation.grant_id,
+        )
+        .filter(
+            GoogleOAuthGrant.user_id == int(user_id),
+            GoogleOAuthGrant.resource_owner_key.is_(None),
+            GoogleOAuthAppAssociation.legacy_oauth_account_id
+            == int(legacy_oauth_account_id),
+        )
+        .with_for_update()
+        .all()
+    )
+    grant_ids = {int(association.grant_id) for association in associations}
+    for association in associations:
+        db.delete(association)
+    db.flush()
+
+    _delete_orphaned_google_grants(db, grant_ids=grant_ids)
+    return len(associations)
+
+
+def _delete_orphaned_google_grants(db: Session, *, grant_ids: Iterable[int]) -> None:
+    """Delete shared credentials after their last explicit app link is gone."""
 
     for grant_id in grant_ids:
         sibling_exists = (
@@ -655,7 +832,6 @@ def detach_google_shared_oauth_app(
             # retain an orphan boundary row.
             db.flush()
             db.delete(oauth_account)
-    return len(associations)
 
 
 def resolve_google_shared_oauth_account(

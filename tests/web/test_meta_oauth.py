@@ -34,6 +34,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import gmail_provisioning
 from xagent.web.tools import config as tool_config
+from xagent.web.tools.config import WebToolConfig
 
 
 class MockResponse:
@@ -138,7 +139,8 @@ def _shared_google_state(
     )
 
 
-def test_google_shared_callback_dual_writes_for_instant_rollback(
+@pytest.mark.asyncio
+async def test_google_shared_callback_dual_writes_for_instant_rollback(
     db_session, monkeypatch
 ):
     monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
@@ -203,6 +205,30 @@ def test_google_shared_callback_dual_writes_for_instant_rollback(
     assert shared.refresh_token == legacy.refresh_token == "shared-refresh"
     assert grant.oauth_account_id == shared.id
     assert association.legacy_oauth_account_id == legacy.id
+
+    # Exercise the real rollout fallback without first resolving the shared
+    # row (which would itself mirror credentials and make this test vacuous).
+    shared.access_token = "must-not-be-selected"
+    db.commit()
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "false")
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+    config = WebToolConfig(
+        db=db,
+        request=None,
+        user=user,
+        user_id=int(user.id),
+        workspace_config={"base_dir": "/tmp", "task_id": "task-1"},
+        db_factory=isolated_session_factory,
+    )
+    resolved = await config._resolve_legacy_oauth_access_token(
+        provider_name="google",
+        app_id="google-drive",
+        app_info={"oauth_scopes": ["scope.drive"]},
+    )
+
+    assert resolved.access_token == "shared-access"
 
 
 def test_google_shared_callback_retries_with_consent_for_new_subject_without_refresh(
@@ -406,6 +432,102 @@ def test_actor_google_shared_consent_retry_persists_replacement_flow(
     retry_state = auth_api.verify_token(params["state"][0])
     assert retry_state["google_forced_consent"] is True
     assert db.query(ActorOAuthFlowState).count() == 1
+
+
+def test_actor_google_shared_callback_persists_only_actor_namespace(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    app = get_builtin_public_mcp_app("google-sheets")
+    assert app is not None
+    db.add(PublicMCPApp(**app))
+    db.commit()
+    server = ensure_builtin_oauth_server_definition(db, app_id="google-sheets")
+    db.add(
+        UserMCPServer(
+            user_id=int(user.id),
+            mcpserver_id=int(server.id),
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    owner_key = "toby:workspace:actor"
+    start = auth_api.start_builtin_oauth_for_resource_owner(
+        provider="google",
+        app_id="google-sheets",
+        user=user,
+        resource_owner_key=owner_key,
+        redirect="https://app.example.com/settings",
+        db=db,
+        db_provider=_google_provider(),
+    )
+    db.commit()
+    state = parse_qs(urlparse(start.headers["location"]).query)["state"][0]
+    state_payload = auth_api.verify_token(state)
+    granted_scope = " ".join(state_payload["google_shared_scopes"])
+    cookies = SimpleCookie()
+    cookies.load(start.headers["set-cookie"])
+    actor_cookie = next(
+        (name, morsel.value)
+        for name, morsel in cookies.items()
+        if name.startswith("xagent_actor_oauth_")
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "actor-access",
+                    "refresh_token": "actor-refresh",
+                    "token_type": "Bearer",
+                    "scope": granted_scope,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "actor-subject", "email": "actor@example.com"}
+            )
+        ),
+    )
+
+    response = auth_api.generic_oauth_callback(
+        "google",
+        SimpleNamespace(
+            query_params={"code": "code", "state": state},
+            cookies={actor_cookie[0]: actor_cookie[1]},
+        ),
+        db,
+        _google_provider(),
+    )
+
+    assert response.status_code == 200
+    accounts = db.query(UserOAuth).order_by(UserOAuth.id).all()
+    assert {account.provider for account in accounts} == {
+        "google",
+        "google-sheets",
+    }
+    assert {account.resource_owner_key for account in accounts} == {owner_key}
+    assert (
+        db.query(UserOAuth).filter(UserOAuth.resource_owner_key.is_(None)).count() == 0
+    )
+    shared = next(account for account in accounts if account.provider == "google")
+    legacy = next(
+        account for account in accounts if account.provider == "google-sheets"
+    )
+    grant = db.query(GoogleOAuthGrant).one()
+    association = db.query(GoogleOAuthAppAssociation).one()
+    assert grant.oauth_account_id == shared.id
+    assert grant.resource_owner_key == owner_key
+    assert association.legacy_oauth_account_id == legacy.id
+    assert db.query(ActorOAuthFlowState).count() == 0
 
 
 def test_google_shared_callback_reports_missing_scope(db_session, monkeypatch):

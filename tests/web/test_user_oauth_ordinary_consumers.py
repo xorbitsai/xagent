@@ -11,6 +11,10 @@ from xagent.web.api.cloud_storage import (
     list_connected_accounts,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.google_oauth_grant import (
+    GoogleOAuthAppAssociation,
+    GoogleOAuthGrant,
+)
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_provisioning import (
@@ -18,6 +22,9 @@ from xagent.web.services.gmail_provisioning import (
     ensure_gmail_mailbox_provisioned,
 )
 from xagent.web.services.gmail_triggers import GmailOAuthReconnectRequiredError
+from xagent.web.services.google_oauth_grants import (
+    create_google_oauth_grant_association,
+)
 from xagent.web.services.triggers import TriggerServiceError, _resolve_gmail_resource
 
 ACTOR = "toby:slack:41:UALICE"
@@ -97,6 +104,95 @@ async def test_cloud_account_delete_cannot_address_an_actor_row(oauth_rows) -> N
 
     assert exc_info.value.status_code == 404
     assert db.get(UserOAuth, int(actor.id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_cloud_account_delete_removes_last_shared_google_grant(
+    oauth_rows,
+) -> None:
+    db, user, ordinary, _actor, _actor_gmail = oauth_rows
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="ordinary",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="scope.drive",
+    )
+    db.add(shared)
+    db.flush()
+    ordinary.refresh_token = "shared-refresh"
+    ordinary.scope = "scope.drive"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=ordinary,
+    )
+    db.commit()
+    ordinary_id = int(ordinary.id)
+    shared_id = int(shared.id)
+
+    await delete_connected_account(ordinary_id, db=db, user=user)
+
+    assert db.get(UserOAuth, ordinary_id) is None
+    assert db.get(UserOAuth, shared_id) is None
+    assert db.query(GoogleOAuthGrant).count() == 0
+    assert db.query(GoogleOAuthAppAssociation).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_cloud_account_delete_preserves_shared_google_sibling(oauth_rows) -> None:
+    db, user, ordinary, _actor, _actor_gmail = oauth_rows
+    shared = UserOAuth(
+        user_id=int(user.id),
+        provider="google",
+        provider_user_id="ordinary",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="scope.drive scope.sheets",
+    )
+    sheets = UserOAuth(
+        user_id=int(user.id),
+        provider="google-sheets",
+        provider_user_id="ordinary",
+        access_token="shared-access",
+        refresh_token="shared-refresh",
+        scope="scope.drive scope.sheets",
+    )
+    db.add_all([shared, sheets])
+    db.flush()
+    ordinary.refresh_token = "shared-refresh"
+    ordinary.scope = "scope.drive scope.sheets"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=ordinary,
+    )
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-sheets",
+        legacy_oauth_account=sheets,
+    )
+    db.commit()
+    ordinary_id = int(ordinary.id)
+    shared_id = int(shared.id)
+    sheets_id = int(sheets.id)
+
+    await delete_connected_account(ordinary_id, db=db, user=user)
+
+    assert db.get(UserOAuth, ordinary_id) is None
+    assert db.get(UserOAuth, shared_id) is not None
+    assert db.get(UserOAuth, sheets_id) is not None
+    assert db.query(GoogleOAuthGrant).count() == 1
+    association = db.query(GoogleOAuthAppAssociation).one()
+    assert association.app_id == "google-sheets"
+    assert association.legacy_oauth_account_id == sheets_id
 
 
 def test_cloud_credentials_cannot_select_an_actor_row_by_id(oauth_rows) -> None:

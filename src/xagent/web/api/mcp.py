@@ -2612,8 +2612,18 @@ def _oauth_account_summaries(
         user_id=user_id,
         resource_owner_key=None,
     )
+    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+    shared_google_account_ids = {
+        int(account_id)
+        for (account_id,) in db.query(GoogleOAuthGrant.oauth_account_id)
+        .filter(GoogleOAuthGrant.user_id == int(user_id))
+        .all()
+    }
     summaries: dict[str, tuple[Optional[str], str, int]] = {}
     for oauth in oauth_accounts:
+        if int(oauth.id) in shared_google_account_ids:
+            continue
         provider = str(oauth.provider)
         account_id = int(oauth.id)
         existing = summaries.get(provider)
@@ -5234,6 +5244,17 @@ def _snapshot_builtin_oauth_revocations(
     return resolved
 
 
+def _detach_shared_google_grant_for_disconnect(
+    db: Session, *, user_id: int, provider: object, app_id: object
+) -> bool:
+    """Detach one ordinary Google app and report whether it used sharing."""
+    if normalize_catalog_key(provider) != "google" or not isinstance(app_id, str):
+        return False
+    from ..services.google_oauth_grants import detach_google_shared_oauth_app
+
+    return bool(detach_google_shared_oauth_app(db, user_id=user_id, app_id=app_id))
+
+
 def _teardown_mcp_app_server_locally(
     server_id: int,
     *,
@@ -5380,20 +5401,18 @@ def _teardown_mcp_app_server_locally(
 
         if str(server.transport or "").lower() == "oauth":
             provider = expected_app.provider_name
-            if normalize_catalog_key(provider) == "google":
-                from ..services.google_oauth_grants import (
-                    detach_google_shared_oauth_app,
-                )
-
-                detach_google_shared_oauth_app(
-                    db,
-                    user_id=user_id,
-                    resource_owner_key=None,
-                    app_id=app_id,
-                )
+            detached_shared_google = _detach_shared_google_grant_for_disconnect(
+                db, user_id=user_id, provider=provider, app_id=app_id
+            )
             providers_to_delete = restrict_to_app_scoped_oauth_grant(
                 expected_app, [provider, app_id]
             )
+            if detached_shared_google:
+                providers_to_delete = [
+                    key
+                    for key in providers_to_delete
+                    if normalize_catalog_key(key) != "google"
+                ]
             if providers_to_delete:
                 builtin_oauth_revocations.extend(
                     _snapshot_builtin_oauth_revocations(
@@ -5699,22 +5718,12 @@ async def delete_mcp_server(
             if app_info:
                 provider = app_info.get("provider")
                 app_id = app_info.get("id")
-
-                if (
-                    normalize_catalog_key(provider) == "google"
-                    and isinstance(app_id, str)
-                    and app_id
-                ):
-                    from ..services.google_oauth_grants import (
-                        detach_google_shared_oauth_app,
-                    )
-
-                    detach_google_shared_oauth_app(
-                        db,
-                        user_id=int(user_id),
-                        resource_owner_key=None,
-                        app_id=app_id,
-                    )
+                detached_shared_google = _detach_shared_google_grant_for_disconnect(
+                    db,
+                    user_id=int(user_id),
+                    provider=provider,
+                    app_id=app_id,
+                )
 
                 # Delete tokens for this specific app. For apps in
                 # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT this must stay
@@ -5725,6 +5734,12 @@ async def delete_mcp_server(
                 providers_to_delete = restrict_to_app_scoped_oauth_grant(
                     app_info, [provider, app_id]
                 )
+                if detached_shared_google:
+                    providers_to_delete = [
+                        key
+                        for key in providers_to_delete
+                        if normalize_catalog_key(key) != "google"
+                    ]
                 if providers_to_delete:
                     builtin_oauth_revocations.extend(
                         _snapshot_builtin_oauth_revocations(

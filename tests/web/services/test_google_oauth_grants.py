@@ -65,11 +65,13 @@ def _account(
 def test_shared_grant_resolution_requires_app_client_and_scopes(db_session):
     db, user = db_session
     account = _account(db, user)
+    legacy = _account(db, user, provider="google-sheets")
     association = create_google_oauth_grant_association(
         db,
         oauth_account=account,
         oauth_client_id="client-a",
         app_id="google-sheets",
+        legacy_oauth_account=legacy,
     )
     db.commit()
 
@@ -199,11 +201,18 @@ def test_shared_grants_are_isolated_by_resource_owner(db_session):
         token="actor-token",
     )
     for account in (ordinary, actor):
+        legacy = _account(
+            db,
+            user,
+            owner=account.resource_owner_key,
+            provider="google-drive",
+        )
         create_google_oauth_grant_association(
             db,
             oauth_account=account,
             oauth_client_id="client-a",
             app_id="google-drive",
+            legacy_oauth_account=legacy,
         )
     db.commit()
 
@@ -400,11 +409,7 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
     assert int(updated.id) == shared_id
     assert updated.access_token == "shared-access-2"
     assert updated.refresh_token == "refresh"
-    assert set(str(updated.scope).split()) == {
-        "openid",
-        "scope.drive",
-        "scope.sheets",
-    }
+    assert set(str(updated.scope).split()) == {"scope.sheets"}
     assert updated_legacy.access_token == "shared-access-2"
     assert updated_association.id == association.id
 
@@ -429,6 +434,82 @@ def test_callback_writer_preserves_refresh_and_shared_primary_key(db_session):
     assert int(rotated.id) == shared_id
     assert db.query(GoogleOAuthGrant).one().oauth_client_fingerprint == (
         google_oauth_client_fingerprint("client-b")
+    )
+    assert set(str(rotated.scope).split()) == {
+        "openid",
+        "scope.drive",
+        "scope.sheets",
+    }
+
+
+def test_callback_writer_adopts_existing_unowned_bare_google_account(db_session):
+    db, user = db_session
+    bare = _account(
+        db,
+        user,
+        subject="google-subject",
+        token="old-bare-access",
+        scopes="openid",
+    )
+    legacy = _account(
+        db,
+        user,
+        provider="google-drive",
+        token="legacy-access",
+        scopes="openid scope.drive",
+    )
+
+    shared, mirrored, association = write_google_shared_oauth_callback(
+        db,
+        user_id=int(user.id),
+        resource_owner_key=None,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        google_subject="google-subject",
+        access_token="new-shared-access",
+        refresh_token="new-shared-refresh",
+        granted_scopes="openid scope.drive",
+        requested_scopes=["openid", "scope.drive"],
+        email="alice@example.com",
+        token_type="Bearer",
+        expires_at=None,
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    assert shared.id == bare.id
+    assert mirrored.id == legacy.id
+    assert association.legacy_oauth_account_id == legacy.id
+    assert db.query(UserOAuth).filter_by(provider="google").count() == 1
+    assert shared.access_token == "new-shared-access"
+
+
+def test_resolver_rejects_association_after_legacy_link_is_deleted(db_session):
+    db, user = db_session
+    shared = _account(db, user)
+    legacy = _account(db, user, provider="google-drive")
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="client-a",
+        app_id="google-drive",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+
+    db.delete(legacy)
+    db.commit()
+
+    assert (
+        resolve_google_shared_oauth_account(
+            db,
+            user_id=int(user.id),
+            resource_owner_key=None,
+            oauth_client_id="client-a",
+            app_id="google-drive",
+            required_scopes=["scope.drive"],
+        )
+        is None
     )
 
 
@@ -457,7 +538,6 @@ def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
         detach_google_shared_oauth_app(
             db,
             user_id=int(user.id),
-            resource_owner_key=None,
             app_id="google-drive",
         )
         == 1
@@ -471,7 +551,6 @@ def test_detach_keeps_shared_grant_until_last_app_is_removed(db_session):
         detach_google_shared_oauth_app(
             db,
             user_id=int(user.id),
-            resource_owner_key=None,
             app_id="google-sheets",
         )
         == 1

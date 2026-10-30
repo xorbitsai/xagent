@@ -1063,11 +1063,21 @@ async def test_actor_apps_share_grant_lock_and_observe_refresh_writeback(
     db.add(shared)
     db.flush()
     for app_id in ("google-drive", "google-sheets"):
+        legacy = UserOAuth(
+            user_id=int(user.id),
+            provider=app_id,
+            resource_owner_key=owner_key,
+            provider_user_id="google-subject",
+            access_token="legacy-token",
+        )
+        db.add(legacy)
+        db.flush()
         create_google_oauth_grant_association(
             db,
             oauth_account=shared,
             oauth_client_id="google-client-id",
             app_id=app_id,
+            legacy_oauth_account=legacy,
         )
     db.commit()
     isolated_session_factory = sessionmaker(
@@ -1382,11 +1392,13 @@ async def test_permanently_invalid_shared_google_grant_quiesces_gmail_watch(
         db, user, provider="google", access_token="expired-shared-token"
     )
     shared.provider_user_id = "google-subject"
+    shared.refresh_token = "expired-shared-refresh"
     legacy = _add_user_oauth(
         db, user, provider="gmail", access_token="expired-shared-token"
     )
     legacy.provider_user_id = "google-subject"
     legacy.email = "alice@example.com"
+    legacy.refresh_token = "expired-shared-refresh"
     create_google_oauth_grant_association(
         db,
         oauth_account=shared,
@@ -1438,6 +1450,93 @@ async def test_permanently_invalid_shared_google_grant_quiesces_gmail_watch(
         assert quiesced_watch.status == TriggerProvisioningStatus.FAILED.value
         assert quiesced_watch.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
         assert quiesced_watch.watch_expiration is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_shared_google_refresh_does_not_clear_superseding_reconnect(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("google-client-id"),
+            client_secret=encrypt_value("google-client-secret"),
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            default_scopes=[],
+        )
+    )
+    _add_oauth_server(
+        db,
+        user,
+        name="Gmail",
+        app_id="gmail",
+        provider="google",
+        launch_config=_launch_config("GMAIL_ACCESS_TOKEN"),
+    )
+    shared = _add_user_oauth(
+        db, user, provider="google", access_token="expired-shared-token"
+    )
+    shared.provider_user_id = "google-subject"
+    shared.refresh_token = "superseded-refresh"
+    legacy = _add_user_oauth(
+        db, user, provider="gmail", access_token="expired-shared-token"
+    )
+    legacy.provider_user_id = "google-subject"
+    legacy.email = "alice@example.com"
+    legacy.refresh_token = "superseded-refresh"
+    create_google_oauth_grant_association(
+        db,
+        oauth_account=shared,
+        oauth_client_id="google-client-id",
+        app_id="gmail",
+        legacy_oauth_account=legacy,
+    )
+    db.commit()
+    shared_id = int(shared.id)
+    original_refresh = str(shared.refresh_token)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    async def fail_refresh(*args, **kwargs):
+        raise web_tools_config._OAuthRefreshPermanentlyInvalid()
+
+    observed_expected_tokens: list[str | None] = []
+
+    def reconnect_while_quiescing(_db, *, oauth_account, expected_refresh_token=None):
+        observed_expected_tokens.append(expected_refresh_token)
+        with isolated_session_factory() as reconnect_db:
+            reconnected = reconnect_db.get(UserOAuth, shared_id)
+            assert reconnected is not None
+            reconnected.access_token = "reconnected-access"
+            reconnected.refresh_token = "reconnected-refresh"
+            reconnect_db.commit()
+        return None
+
+    from xagent.web.services import gmail_provisioning
+
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "mark_gmail_oauth_reconnect_required",
+        reconnect_while_quiescing,
+    )
+
+    await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert observed_expected_tokens == [original_refresh]
+    with isolated_session_factory() as verification_db:
+        preserved = verification_db.get(UserOAuth, shared_id)
+        assert preserved is not None
+        assert preserved.access_token == "reconnected-access"
+        assert preserved.refresh_token == "reconnected-refresh"
 
 
 @pytest.mark.asyncio

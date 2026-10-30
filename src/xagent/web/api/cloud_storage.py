@@ -712,6 +712,9 @@ async def list_connected_accounts(
         user_id=cast(int, user.id),
         resource_owner_key=None,
     )
+    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+    query = query.filter(~UserOAuth.id.in_(db.query(GoogleOAuthGrant.oauth_account_id)))
 
     if provider:
         query = query.filter(UserOAuth.provider == provider)
@@ -889,6 +892,16 @@ async def delete_connected_account(
     )
 
     if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+
+    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+    if (
+        db.query(GoogleOAuthGrant.id)
+        .filter(GoogleOAuthGrant.oauth_account_id == int(account.id))
+        .first()
+        is not None
+    ):
         raise HTTPException(status_code=404, detail="Account not found")
 
     # Snapshot before the delete: it's a bulk-free single-row delete here,

@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import create_engine
@@ -104,12 +105,27 @@ def _google_provider() -> SimpleNamespace:
         provider_name="google",
         client_id=encrypt_value("google-client-id"),
         client_secret=encrypt_value("google-client-secret"),
+        auth_url="https://accounts.google.com/o/oauth2/v2/auth",
         token_url="https://oauth2.googleapis.com/token",
         redirect_uri="https://app.example.com/api/auth/google/callback",
         userinfo_url="https://openidconnect.googleapis.com/v1/userinfo",
         user_id_path="sub",
         email_path="email",
         default_scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    )
+
+
+def _shared_google_state(user: User, app_id: str, scopes: list[str]) -> str:
+    return create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": app_id,
+            "google_shared_mode": True,
+            "google_shared_scopes": scopes,
+        },
+        expires_delta=timedelta(minutes=10),
     )
 
 
@@ -178,6 +194,338 @@ def test_google_shared_callback_dual_writes_for_instant_rollback(
     assert shared.refresh_token == legacy.refresh_token == "shared-refresh"
     assert grant.oauth_account_id == shared.id
     assert association.legacy_oauth_account_id == legacy.id
+
+
+def test_google_shared_callback_retries_with_consent_for_new_subject_without_refresh(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-sheets",
+            name="Google Sheets",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.sheets"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "sheets"]},
+        )
+    )
+    db.add(
+        UserOAuth(
+            user_id=int(user.id),
+            provider="google",
+            provider_user_id="subject-a",
+            access_token="existing-access",
+            refresh_token="existing-refresh",
+            scope="openid scope.drive",
+        )
+    )
+    db.commit()
+    request = SimpleNamespace(
+        query_params={
+            "code": "code",
+            "state": _shared_google_state(
+                user, "google-sheets", ["openid", "scope.sheets"]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "subject-b-access",
+                    "token_type": "Bearer",
+                    "scope": "openid scope.sheets",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"sub": "subject-b", "email": "b@example.com"})),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 307
+    params = parse_qs(urlparse(response.headers["location"]).query)
+    assert params["prompt"] == ["consent"]
+    retry_state = auth_api.verify_token(params["state"][0])
+    assert retry_state["google_shared_mode"] is True
+    assert retry_state["app_id"] == "google-sheets"
+    assert (
+        db.query(UserOAuth).filter(UserOAuth.provider_user_id == "subject-b").count()
+        == 0
+    )
+
+
+def test_google_shared_callback_reports_missing_scope(db_session, monkeypatch):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "drive"]},
+        )
+    )
+    db.commit()
+    request = SimpleNamespace(
+        query_params={
+            "code": "code",
+            "state": _shared_google_state(
+                user, "google-drive", ["openid", "scope.drive"]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "shared-access",
+                    "refresh_token": "shared-refresh",
+                    "token_type": "Bearer",
+                    "scope": "openid",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 400
+    assert "Required Google permissions were not granted" in response.body.decode()
+    assert "scope.drive" in response.body.decode()
+    assert db.query(UserOAuth).count() == 0
+
+
+def test_google_shared_callback_drops_restricted_scope_from_old_state(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    monkeypatch.setenv("XAGENT_GOOGLE_RESTRICTED_SCOPES_ENABLED", "false")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["openid"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "drive"]},
+        )
+    )
+    db.commit()
+    request = SimpleNamespace(
+        query_params={
+            "code": "code",
+            "state": _shared_google_state(user, "google-drive", ["openid"]),
+        }
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "shared-access",
+                    "refresh_token": "shared-refresh",
+                    "token_type": "Bearer",
+                    "scope": "openid https://www.googleapis.com/auth/drive",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    shared = db.query(UserOAuth).filter_by(provider="google").one()
+    legacy = db.query(UserOAuth).filter_by(provider="google-drive").one()
+    assert shared.scope == legacy.scope == "openid"
+
+
+def test_shared_google_state_preserves_refresh_if_flag_changes_before_callback(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "false")
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="google-drive",
+            name="Google Drive",
+            transport="oauth",
+            provider_name="google",
+            oauth_scopes=["scope.drive"],
+            is_visible_in_connector=True,
+            launch_config={"command": "python", "args": ["-m", "drive"]},
+        )
+    )
+    legacy = UserOAuth(
+        user_id=int(user.id),
+        provider="google-drive",
+        provider_user_id="google-subject",
+        access_token="old-access",
+        refresh_token="old-refresh",
+        scope="openid scope.drive",
+    )
+    db.add(legacy)
+    db.commit()
+    request = SimpleNamespace(
+        query_params={
+            "code": "code",
+            "state": _shared_google_state(
+                user, "google-drive", ["openid", "scope.drive"]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "new-access",
+                    "token_type": "Bearer",
+                    "scope": "openid scope.drive",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    db.refresh(legacy)
+    assert legacy.access_token == "new-access"
+    assert legacy.refresh_token == "old-refresh"
+    assert db.query(GoogleOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_disconnecting_one_shared_google_app_preserves_sibling_grant(
+    db_session, monkeypatch
+):
+    monkeypatch.setenv("XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED", "true")
+    db, user = db_session
+    for app_id, name, scope in (
+        ("google-drive", "Google Drive", "scope.drive"),
+        ("google-sheets", "Google Sheets", "scope.sheets"),
+    ):
+        db.add(
+            PublicMCPApp(
+                app_id=app_id,
+                name=name,
+                transport="oauth",
+                provider_name="google",
+                oauth_scopes=[scope],
+                is_visible_in_connector=True,
+                launch_config={"command": "python", "args": ["-m", app_id]},
+            )
+        )
+    db.commit()
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            side_effect=[
+                MockResponse(
+                    {
+                        "access_token": "drive-access",
+                        "refresh_token": "shared-refresh",
+                        "token_type": "Bearer",
+                        "scope": "openid scope.drive",
+                    }
+                ),
+                MockResponse(
+                    {
+                        "access_token": "sheets-access",
+                        "refresh_token": "shared-refresh",
+                        "token_type": "Bearer",
+                        "scope": "openid scope.drive scope.sheets",
+                    }
+                ),
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-subject", "email": "alice@example.com"}
+            )
+        ),
+    )
+    for app_id, scope in (
+        ("google-drive", "scope.drive"),
+        ("google-sheets", "scope.sheets"),
+    ):
+        response = generic_oauth_callback(
+            "google",
+            SimpleNamespace(
+                query_params={
+                    "code": f"{app_id}-code",
+                    "state": _shared_google_state(user, app_id, ["openid", scope]),
+                }
+            ),
+            db,
+            _google_provider(),
+        )
+        assert response.status_code == 200
+
+    from xagent.web.api.mcp import delete_mcp_server
+
+    drive_server = db.query(MCPServer).filter(MCPServer.name == "Google Drive").one()
+    await delete_mcp_server(drive_server.id, current_user=user, db=db)
+
+    assert db.query(UserOAuth).filter_by(provider="google-drive").count() == 0
+    assert db.query(UserOAuth).filter_by(provider="google-sheets").count() == 1
+    assert db.query(UserOAuth).filter_by(provider="google").count() == 1
+    assert db.query(GoogleOAuthGrant).count() == 1
+    association = db.query(GoogleOAuthAppAssociation).one()
+    assert association.app_id == "google-sheets"
 
 
 def test_gmail_callback_best_effort_registers_watch_after_oauth_commit(

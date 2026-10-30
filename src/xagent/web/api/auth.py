@@ -3041,6 +3041,7 @@ def generic_oauth_login(
     db: Optional[Session] = None,
     db_provider: Optional[Any] = None,
     account: Optional[str] = None,
+    force_google_consent: bool = False,
 ) -> Any:
     """Start ordinary OAuth with a per-state browser-binding cookie."""
     return _generic_oauth_login(
@@ -3054,6 +3055,7 @@ def generic_oauth_login(
         resource_owner_key=None,
         actor_flow_nonce=None,
         account=account,
+        force_google_consent=force_google_consent,
     )
 
 
@@ -3444,6 +3446,7 @@ def start_builtin_oauth_for_resource_owner(
     db: Session,
     db_provider: Any,
     account: str | None = None,
+    force_google_consent: bool = False,
 ) -> Any:
     """Start actor OAuth; the caller owns the surrounding transaction."""
     if not isinstance(app_id, str) or not app_id.strip():
@@ -3478,6 +3481,7 @@ def start_builtin_oauth_for_resource_owner(
         resource_owner_key=owner_key,
         actor_flow_nonce=nonce_digest,
         account=account,
+        force_google_consent=force_google_consent,
     )
     if not isinstance(response, RedirectResponse):
         return response
@@ -3866,6 +3870,7 @@ def _generic_oauth_login(
     actor_flow_nonce: str | None,
     account: str | None,
     trusted_session_epoch: str | None = None,
+    force_google_consent: bool = False,
 ) -> Any:
     """Build an ordinary or trusted actor provider authorization redirect."""
     if db is None:
@@ -4153,7 +4158,9 @@ def _generic_oauth_login(
         # requested explicitly above and the callback preserves that token.
         params["prompt"] = (
             "select_account"
-            if google_shared_mode and google_shared_has_refresh_token
+            if google_shared_mode
+            and google_shared_has_refresh_token
+            and not force_google_consent
             else "consent"
         )
     if provider.lower() == "zoom":
@@ -5547,9 +5554,8 @@ def generic_oauth_callback(
                     content="<h1>Error: Invalid or expired state</h1>", status_code=400
                 )
             google_shared_scopes_claim = payload.get("google_shared_scopes")
-            google_shared_callback = bool(
-                get_google_shared_oauth_grants_enabled()
-                and provider.lower() == "google"
+            google_shared_state = bool(
+                provider.lower() == "google"
                 and payload.get("google_shared_mode") is True
                 and isinstance(app_id, str)
                 and app_id.strip()
@@ -5560,6 +5566,9 @@ def generic_oauth_callback(
                     isinstance(scope, str) and bool(scope.strip())
                     for scope in google_shared_scopes_claim
                 )
+            )
+            google_shared_callback = bool(
+                get_google_shared_oauth_grants_enabled() and google_shared_state
             )
             if google_shared_callback and not provider_user_id:
                 db.rollback()
@@ -5578,7 +5587,7 @@ def generic_oauth_callback(
                     status_code=400,
                 )
             connector_key = app_id or provider
-            if google_shared_callback:
+            if google_shared_state:
                 # Preserve an exact same-subject legacy row so an incremental
                 # response that omits refresh_token can reuse the credential
                 # proved by the previous callback. Never reuse it after the
@@ -5596,6 +5605,15 @@ def generic_oauth_callback(
                     .order_by(UserOAuth.id.desc())
                     .first()
                 )
+                if oauth_account is None:
+                    oauth_account = _matching_gmail_reconnect_tombstone(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                        connector_key=connector_key,
+                        provider_user_id=provider_user_id,
+                        email=email,
+                    )
             else:
                 oauth_account = _matching_gmail_reconnect_tombstone(
                     db,
@@ -5605,13 +5623,76 @@ def generic_oauth_callback(
                     provider_user_id=provider_user_id,
                     email=email,
                 )
-            if oauth_account is None:
-                delete_scoped_user_oauth_accounts(
-                    db,
-                    user_id=user_id,
-                    resource_owner_key=resource_owner_key,
-                    providers=[connector_key],
+            if (
+                google_shared_state
+                and not google_shared_callback
+                and not token_data.get("refresh_token")
+                and (
+                    oauth_account is None
+                    or not getattr(oauth_account, "refresh_token", None)
                 )
+            ):
+                db.rollback()
+                return HTMLResponse(
+                    content=(
+                        "<h1>Google connection rollout changed</h1>"
+                        "<p>Please close this window and connect again.</p>"
+                    ),
+                    status_code=409,
+                )
+            if oauth_account is None:
+                if connector_key == "google":
+                    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+                    grant_owned_account = (
+                        scoped_user_oauth_query(
+                            db,
+                            user_id=user_id,
+                            resource_owner_key=resource_owner_key,
+                        )
+                        .join(
+                            GoogleOAuthGrant,
+                            GoogleOAuthGrant.oauth_account_id == UserOAuth.id,
+                        )
+                        .filter(
+                            UserOAuth.provider == "google",
+                            UserOAuth.provider_user_id == str(provider_user_id),
+                        )
+                        .first()
+                    )
+                    if grant_owned_account is not None:
+                        db.rollback()
+                        return HTMLResponse(
+                            content=(
+                                "<h1>Cannot replace a shared Google connection</h1>"
+                                "<p>Reconnect this account from a Google connector "
+                                "instead.</p>"
+                            ),
+                            status_code=409,
+                        )
+                if connector_key == "google":
+                    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+                    grant_account_ids = db.query(GoogleOAuthGrant.oauth_account_id)
+                    (
+                        scoped_user_oauth_query(
+                            db,
+                            user_id=user_id,
+                            resource_owner_key=resource_owner_key,
+                        )
+                        .filter(
+                            UserOAuth.provider == connector_key,
+                            ~UserOAuth.id.in_(grant_account_ids),
+                        )
+                        .delete(synchronize_session=False)
+                    )
+                else:
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=user_id,
+                        resource_owner_key=resource_owner_key,
+                        providers=[connector_key],
+                    )
                 oauth_account = UserOAuth(
                     user_id=user_id,
                     provider=connector_key,
@@ -5626,7 +5707,7 @@ def generic_oauth_callback(
                     scoped_user_oauth_query(
                         db,
                         user_id=user_id,
-                        resource_owner_key=None,
+                        resource_owner_key=resource_owner_key,
                     )
                     .filter(
                         UserOAuth.provider == connector_key,
@@ -5657,9 +5738,21 @@ def generic_oauth_callback(
             token_scope = token_data.get("scope", "")
             if isinstance(token_scope, list):
                 token_scope = " ".join(str(scope) for scope in token_scope)
+            if google_shared_state and not get_google_restricted_scopes():
+                from ..services.google_oauth_grants import (
+                    normalize_google_oauth_scopes,
+                )
+
+                token_scope = " ".join(
+                    sorted(
+                        normalize_google_oauth_scopes(token_scope).difference(
+                            GOOGLE_RESTRICTED_SCOPES
+                        )
+                    )
+                )
             setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
-            if not google_shared_callback:
+            if not google_shared_state:
                 setattr(oauth_account, "refresh_token", None)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
@@ -5697,6 +5790,8 @@ def generic_oauth_callback(
 
             if google_shared_callback:
                 from ..services.google_oauth_grants import (
+                    GoogleOAuthRefreshTokenRequired,
+                    GoogleOAuthScopeConsentRequired,
                     write_google_shared_oauth_callback,
                 )
 
@@ -5725,7 +5820,55 @@ def generic_oauth_callback(
                             legacy_oauth_account=oauth_account,
                         )
                     )
-                except ValueError as exc:
+                except GoogleOAuthRefreshTokenRequired:
+                    db.rollback()
+                    retry_user = db.get(User, user_id)
+                    if retry_user is None:
+                        return HTMLResponse(
+                            content="<h1>Error: Invalid or expired state</h1>",
+                            status_code=400,
+                        )
+                    if is_actor_flow:
+                        assert resource_owner_key is not None
+                        return start_builtin_oauth_for_resource_owner(
+                            provider=provider,
+                            app_id=cast(str, app_id),
+                            user=retry_user,
+                            resource_owner_key=resource_owner_key,
+                            redirect=payload.get("redirect"),
+                            db=db,
+                            db_provider=db_provider,
+                            force_google_consent=True,
+                        )
+                    return _generic_oauth_login(
+                        provider,
+                        token=None,
+                        app_id=cast(str, app_id),
+                        redirect=payload.get("redirect"),
+                        db=db,
+                        db_provider=db_provider,
+                        trusted_user_id=user_id,
+                        trusted_session_epoch=cast(
+                            str | None, retry_user.session_epoch
+                        ),
+                        resource_owner_key=None,
+                        actor_flow_nonce=None,
+                        account=None,
+                        force_google_consent=True,
+                    )
+                except GoogleOAuthScopeConsentRequired as exc:
+                    db.rollback()
+                    missing = ", ".join(
+                        html.escape(scope) for scope in exc.missing_scopes
+                    )
+                    return HTMLResponse(
+                        content=(
+                            "<h1>Required Google permissions were not granted</h1>"
+                            f"<p>Please reconnect and approve: {missing}</p>"
+                        ),
+                        status_code=400,
+                    )
+                except (ValueError, IntegrityError) as exc:
                     db.rollback()
                     logger.warning(
                         "Rejected shared Google callback: app_id=%s "

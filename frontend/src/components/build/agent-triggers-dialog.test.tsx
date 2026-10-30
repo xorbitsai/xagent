@@ -608,6 +608,75 @@ describe("AgentTriggersDialog", () => {
     expect(screen.getByText("The daily report is ready")).toBeInTheDocument()
   })
 
+  it("clears expanded history when refresh reports that its task expired", async () => {
+    let runRequestCount = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        runRequestCount += 1
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: 12,
+              trigger_id: 9,
+              task_id: runRequestCount === 1 ? 99 : null,
+              background_job_id: null,
+              status: "completed",
+              source_event_id: "scheduled-report",
+              payload_snapshot: null,
+              idempotency_key: "run-12",
+              error_message: null,
+              started_at: null,
+              finished_at: null,
+              task_expired_at:
+                runRequestCount === 1 ? null : "2026-09-01T08:30:00+00:00",
+              created_at: null,
+              updated_at: null,
+            },
+          ]),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs/12/history") {
+        return Promise.resolve(
+          jsonResponse({
+            run_id: 12,
+            task_id: 99,
+            messages: [
+              { role: "user", content: "Prepare the daily report" },
+              { role: "assistant", content: "The daily report is ready" },
+            ],
+          }),
+        )
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(
+      await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }),
+    )
+    expect(await screen.findByText("The daily report is ready")).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("button", { name: "common.refresh" }))
+
+    expect(await screen.findByText("triggers.runs.taskExpired")).toBeInTheDocument()
+    expect(screen.queryByText("Prepare the daily report")).not.toBeInTheDocument()
+    expect(screen.queryByText("The daily report is ready")).not.toBeInTheDocument()
+  })
+
   it("ignores a stale routine history response after another run is expanded", async () => {
     let resolveFirstHistory!: (value: Response) => void
     const firstHistory = new Promise<Response>((resolve) => {

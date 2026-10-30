@@ -1528,6 +1528,29 @@ def _claim_turn_no_commit(
         payload=payload,
         kind=kind,
     )
+    if kind is TurnKind.CREATE and accepted.task_source == "trigger":
+        from .routine_history_provenance import (
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+            TRIGGER_TURN_ID_CONFIG_KEY,
+        )
+
+        task_config = dict(accepted.agent_config or {})
+        trigger_run_id = (context or {}).get("trigger_run_id")
+        if (
+            not isinstance(trigger_run_id, int)
+            or task_config.get("trigger_run_id") != trigger_run_id
+            or task_config.get(TRIGGER_TURN_ID_CONFIG_KEY) != payload.turn_id
+        ):
+            raise TaskTurnError("trigger_history_identity_changed")
+        recorded_run_id = task_config.get(TRIGGER_TASK_RUN_ID_CONFIG_KEY)
+        if recorded_run_id not in (None, accepted.run_id):
+            raise TaskTurnError("trigger_history_identity_changed")
+        task_config[TRIGGER_TASK_RUN_ID_CONFIG_KEY] = accepted.run_id
+        db.query(Task).filter(Task.id == task_id).update(
+            {Task.agent_config: task_config},
+            synchronize_session=False,
+        )
+        accepted = replace(accepted, agent_config=task_config)
     if enqueues_task_turns():
         from .task_runtime_secrets import bind_runtime_values_to_run
         from .task_start_protocol import TaskStartPayload, stage_task_start_command

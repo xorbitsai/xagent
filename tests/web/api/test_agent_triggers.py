@@ -56,6 +56,13 @@ from xagent.web.services.task_execution import (
     _finalize_task_execution_result_isolated,
     _persist_agent_outbound_event,
 )
+from xagent.web.services.task_lease_recovery import (
+    recover_task_lease_candidate_isolated,
+)
+from xagent.web.services.task_lease_service import (
+    get_expired_task_lease_candidates,
+    utc_now,
+)
 from xagent.web.services.task_orchestrator import (
     TurnStarted,
 )
@@ -670,6 +677,33 @@ def test_mark_trigger_run_started_keeps_a_run_the_task_already_settled() -> None
         assert run.finished_at is not None
         assert trigger.last_run_at is not None
         assert trigger.last_error is None
+    finally:
+        db.close()
+
+
+def test_delayed_started_marker_cannot_bind_a_later_private_run() -> None:
+    headers = _admin_headers()
+    start = _fire_test_run(headers)
+    routine_run_id = "accepted-routine-run"
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == start.task_id).one()
+        task.agent_config = {
+            **dict(task.agent_config or {}),
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY: routine_run_id,
+        }
+        task.run_id = "later-private-run"
+        db.add(task)
+        db.commit()
+    finally:
+        db.close()
+
+    _mark_trigger_run_started(start)
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == start.task_id).one()
+        assert task.agent_config[TRIGGER_TASK_RUN_ID_CONFIG_KEY] == routine_run_id
     finally:
         db.close()
 
@@ -4200,6 +4234,97 @@ def test_v2_terminal_persistence_keeps_routine_turn_provenance() -> None:
         "messages": [
             {"role": "user", "content": "V2 persisted prompt"},
             {"role": "assistant", "content": "V2 persisted result"},
+        ],
+    }
+
+
+@pytest.mark.parametrize("storage_version", [1, 2])
+def test_trigger_history_includes_lease_expiry_failure(
+    storage_version: int,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, f"V{storage_version} expired routine")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": f"V{storage_version} expiry hook"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+    task_run_id = f"v{storage_version}-expired-routine-run"
+    turn_id = f"v{storage_version}-expired-routine-turn"
+
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(User).filter(User.username == "admin").one().id)
+        task = Task(
+            user_id=owner_id,
+            title=f"V{storage_version} expired routine",
+            description="Prepare the expired report",
+            status=TaskStatus.RUNNING,
+            agent_id=agent_id,
+            execution_mode="balanced",
+            source="trigger",
+            is_visible=False,
+            input="Prepare the expired report",
+            run_id=task_run_id,
+            runner_id="expired-routine-runner",
+            lease_expires_at=utc_now() - timedelta(seconds=5),
+            last_heartbeat_at=utc_now() - timedelta(seconds=10),
+            state_version=3,
+            control_state="running",
+            conversation_storage_version=storage_version,
+        )
+        db.add(task)
+        db.flush()
+        run = TriggerRun(
+            trigger_id=trigger_id,
+            task_id=int(task.id),
+            status=TriggerRunStatus.RUNNING.value,
+            idempotency_key=f"history:v{storage_version}:lease-expiry",
+        )
+        db.add(run)
+        db.flush()
+        task.agent_config = {
+            "trigger_run_id": int(run.id),
+            TRIGGER_TURN_ID_CONFIG_KEY: turn_id,
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY: task_run_id,
+        }
+        persist_user_message_no_commit(
+            db,
+            task_id=int(task.id),
+            user_id=owner_id,
+            content="Prepare the expired report",
+            turn_id=turn_id,
+        )
+        db.add(task)
+        db.commit()
+        candidate = get_expired_task_lease_candidates(
+            db,
+            cutoff=utc_now(),
+            limit=1,
+        )[0]
+        task_id = int(task.id)
+        run_id = int(run.id)
+    finally:
+        db.close()
+
+    assert (
+        recover_task_lease_candidate_isolated(candidate, recovered_at=utc_now())
+        == TaskStatus.FAILED
+    )
+
+    history = client.get(
+        f"/api/agents/{agent_id}/triggers/{trigger_id}/runs/{run_id}/history",
+        headers=headers,
+    )
+    assert history.status_code == 200, history.text
+    assert history.json() == {
+        "run_id": run_id,
+        "task_id": task_id,
+        "messages": [
+            {"role": "user", "content": "Prepare the expired report"},
+            {"role": "assistant", "content": CLIENT_SAFE_TASK_FAILURE},
         ],
     }
 

@@ -89,6 +89,79 @@ async def test_sdk_create_and_append_return_durable_acceptance(ingress):
 
 
 @pytest.mark.asyncio
+async def test_trigger_create_binds_history_before_shared_worker_handoff(ingress):
+    from xagent.web.services.routine_history_provenance import (
+        TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+        TRIGGER_TURN_ID_CONFIG_KEY,
+        routine_history_turn_id,
+    )
+    from xagent.web.services.task_orchestrator import (
+        TaskTurnOrchestrator,
+        TaskTurnPayload,
+        TurnKind,
+    )
+
+    owner, agent = ingress
+    turn_id = "routine-create-turn"
+    context = {
+        "trigger_id": 41,
+        "trigger_run_id": 73,
+        "trigger_type": "scheduled",
+        "trigger_test": False,
+    }
+    with get_session_local()() as db:
+        task = Task(
+            user_id=owner,
+            agent_id=agent,
+            title="queued routine",
+            description="prepare report",
+            execution_mode="balanced",
+            source="trigger",
+            status=TaskStatus.PENDING,
+            agent_config={
+                **context,
+                TRIGGER_TURN_ID_CONFIG_KEY: turn_id,
+            },
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+
+    started = await TaskTurnOrchestrator.begin_turn(
+        task_id=task_id,
+        task_owner_user_id=owner,
+        payload=TaskTurnPayload("prepare report", turn_id=turn_id),
+        kind=TurnKind.CREATE,
+        context=context,
+        actor_user_id=owner,
+    )
+
+    with get_session_local()() as db:
+        task = db.get(Task, task_id)
+        command = db.query(TaskExecutionCommand).one()
+        assert task is not None
+        assert task.run_id is None
+        assert command.target_run_id == started.run_id
+        assert task.agent_config[TRIGGER_TASK_RUN_ID_CONFIG_KEY] == started.run_id
+        assert (
+            routine_history_turn_id(
+                task,
+                "resumed-turn",
+                expected_run_id=started.run_id,
+            )
+            == turn_id
+        )
+        assert (
+            routine_history_turn_id(
+                task,
+                "private-turn",
+                expected_run_id="later-private-run",
+            )
+            == "private-turn"
+        )
+
+
+@pytest.mark.asyncio
 async def test_a2a_create_commits_start_without_local_execution(ingress):
     owner, agent = ingress
     result = await task_start.start_a2a_turn(

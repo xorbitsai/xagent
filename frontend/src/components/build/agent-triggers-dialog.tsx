@@ -726,7 +726,11 @@ export function AgentTriggersDialog({
   }, [resolvedOwner, setSelectedTriggerId, t])
 
   const loadRunHistory = useCallback(async (run: AgentTriggerRun) => {
-    if (!resolvedOwner || run.task_id === null) return
+    if (!resolvedOwner) return
+    if (run.task_id === null) {
+      resetRunHistory()
+      return
+    }
     const requestId = ++runHistoryRequestRef.current
     setExpandedRunId(run.id)
     setRunHistory(null)
@@ -757,7 +761,7 @@ export function AgentTriggersDialog({
         setRunHistoryLoading(false)
       }
     }
-  }, [resolvedOwner, t])
+  }, [resetRunHistory, resolvedOwner, t])
 
   // Takes the target trigger explicitly so navigation handlers can load runs
   // for a selection they just made (before the state round-trips). A manual

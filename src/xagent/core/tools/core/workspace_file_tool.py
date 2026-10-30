@@ -1010,8 +1010,11 @@ class WorkspaceFileOperations:
         rejected rather than ignored.
 
         One read returns at most read_page_chars characters, the page size
-        this instance was built with (see __init__). The listing pages by
-        entry count, so it does not use the page size.
+        this instance was built with (see __init__). A paged reply supplies
+        page.next_offset; callers must preserve the same selection and use
+        that exact continuation rather than calculate one from the stored
+        file size. The listing pages by entry count, so it does not use the
+        page size.
 
         Rejections come back as classified failures rather than exceptions,
         because the caller records the return value as the tool observation

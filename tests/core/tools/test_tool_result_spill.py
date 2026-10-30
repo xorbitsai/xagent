@@ -513,9 +513,9 @@ def test_read_tool_name_and_truncated_instruction_are_pinned():
     # what the model sees when one read goes over the cap.
     assert SPILL_READ_TOOL_NAME == "read_tool_result"
     assert SPILL_READ_TRUNCATED_INSTRUCTION == (
-        "Call read_tool_result again with a narrower start/end range to read "
-        "fewer items, or with the same start/end and a larger offset to "
-        "continue reading within them."
+        "Call read_tool_result again with the same path, start, and end and "
+        "page.next_offset as offset. Continue until page.next_offset is null; "
+        "do not calculate offsets from the stored file size."
     )
     assert SPILL_READ_MAX_CHARS == 12_000
 
@@ -572,8 +572,13 @@ def test_read_spilled_result_pages_at_page_chars_without_a_gap(tmp_path):
         "content_preview": line[:8_000],
         "content_truncated": True,
         "original_chars": 15_000,
+        "stored_chars": 15_000,
+        "selected_chars": 15_000,
         "item_count": 1,
+        "selection": {"start": 1, "end": 1, "item_count": 1},
+        "valid_offset_range": {"start": 0, "end": 14_999},
         "offset": 0,
+        "page": {"start_offset": 0, "end_offset": 8_000, "next_offset": 8_000},
         "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
     }
     assert second == {
@@ -581,10 +586,94 @@ def test_read_spilled_result_pages_at_page_chars_without_a_gap(tmp_path):
         "content_preview": line[8_000:],
         "content_truncated": False,
         "original_chars": 15_000,
+        "stored_chars": 15_000,
+        "selected_chars": 15_000,
         "item_count": 1,
+        "selection": {"start": 1, "end": 1, "item_count": 1},
+        "valid_offset_range": {"start": 0, "end": 14_999},
         "offset": 8_000,
+        "page": {"start_offset": 8_000, "end_offset": 15_000, "next_offset": None},
     }
     assert first["content_preview"] + second["content_preview"] == line
+
+
+def test_read_spilled_result_reports_selection_and_continuation_for_large_object(
+    tmp_path,
+):
+    """A selected object entry is smaller than the stored object.
+
+    The reader must distinguish those lengths and return the next character
+    offset itself, including when the selected text contains multi-byte Unicode.
+    Following only that continuation must reconstruct the selection exactly once.
+    """
+    value = {
+        "first": "甲🙂" * 13_500,
+        "second": "乙🚀" * 13_500,
+    }
+    stored = json.dumps(value, ensure_ascii=False)
+    selected = json.dumps({"first": value["first"]}, ensure_ascii=False, default=str)
+    rel = _write_spill_file(str(tmp_path), "acme", stored, "object")
+
+    pages = []
+    offset = 0
+    while True:
+        page = read_spilled_result(
+            tmp_path, rel, start=1, end=1, offset=offset, page_chars=12_000
+        )
+        pages.append(page)
+        assert page["stored_chars"] == len(stored)
+        assert page["selected_chars"] == len(selected)
+        assert page["original_chars"] == len(selected)
+        assert page["item_count"] == 2
+        assert page["selection"] == {"start": 1, "end": 1, "item_count": 1}
+        assert page["valid_offset_range"] == {
+            "start": 0,
+            "end": len(selected) - 1,
+        }
+        assert page["page"]["start_offset"] == offset
+        assert page["page"]["end_offset"] == offset + len(page["content_preview"])
+        offset = page["page"]["next_offset"]
+        if offset is None:
+            break
+
+    assert "".join(page["content_preview"] for page in pages) == selected
+    assert [page["page"]["start_offset"] for page in pages] == [
+        0,
+        12_000,
+        24_000,
+    ]
+
+
+def test_read_spilled_result_bad_offset_returns_recoverable_selection_diagnostic(
+    tmp_path,
+):
+    value = {"first": "x" * 40_000, "second": "y" * 40_000}
+    stored = json.dumps(value)
+    selected = json.dumps({"first": value["first"]})
+    rel = _write_spill_file(str(tmp_path), "acme", stored, "object")
+
+    result = read_spilled_result(
+        tmp_path, rel, start=1, end=1, offset=55_000, page_chars=12_000
+    )
+
+    assert result["success"] is False
+    assert result["is_error"] is True
+    assert result["status"] == "error"
+    assert result["output"] == {
+        "message": SPILL_READ_UNAVAILABLE_MESSAGES["invalid_range"],
+        "relative_path": rel,
+        "requested_offset": 55_000,
+        "stored_chars": len(stored),
+        "selected_chars": len(selected),
+        "item_count": 2,
+        "selection": {"start": 1, "end": 1, "item_count": 1},
+        "valid_offset_range": {"start": 0, "end": len(selected) - 1},
+        "restart_offset": 0,
+        "instruction": (
+            "Retry the same path, start, and end with offset 0, then follow "
+            "page.next_offset from each successful reply until it is null."
+        ),
+    }
 
 
 def test_read_spilled_result_whole_reply_threshold_follows_page_chars(tmp_path):
@@ -603,8 +692,13 @@ def test_read_spilled_result_whole_reply_threshold_follows_page_chars(tmp_path):
         "content_preview": text[:8_000],
         "content_truncated": True,
         "original_chars": 10_000,
+        "stored_chars": 10_000,
+        "selected_chars": 10_000,
         "item_count": 1,
+        "selection": {"start": 1, "end": 1, "item_count": 1},
+        "valid_offset_range": {"start": 0, "end": 9_999},
         "offset": 0,
+        "page": {"start_offset": 0, "end_offset": 8_000, "next_offset": 8_000},
         "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
     }
 

@@ -126,9 +126,9 @@ SPILL_READ_UNAVAILABLE_MESSAGES = {
 SPILL_READ_TOOL_NAME = "read_tool_result"
 SPILL_READ_MAX_CHARS = 12_000
 SPILL_READ_TRUNCATED_INSTRUCTION = (
-    "Call read_tool_result again with a narrower start/end range to read "
-    "fewer items, or with the same start/end and a larger offset to "
-    "continue reading within them."
+    "Call read_tool_result again with the same path, start, and end and "
+    "page.next_offset as offset. Continue until page.next_offset is null; "
+    "do not calculate offsets from the stored file size."
 )
 
 # The union of every key the two OutputFilteredToolWrapper bypass branches
@@ -522,7 +522,10 @@ def _spill_slice(kind: str, value: Any, content: str, first: int, last: int) -> 
 
 
 def spill_read_unavailable(
-    reason: str, item_count: int | None = None
+    reason: str,
+    item_count: int | None = None,
+    *,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a classified-failure result for one read_tool_result rejection.
 
@@ -547,7 +550,10 @@ def spill_read_unavailable(
         message = f"start exceeds the item count ({item_count})."
     else:
         message = SPILL_READ_UNAVAILABLE_MESSAGES[reason]
-    return {"success": False, "is_error": True, "status": "error", "output": message}
+    output: str | dict[str, Any] = message
+    if details is not None:
+        output = {"message": message, **details}
+    return {"success": False, "is_error": True, "status": "error", "output": output}
 
 
 def spill_read_page_chars(max_chars: int) -> int:
@@ -612,8 +618,14 @@ def read_spilled_result(
     -- one long line of text, or one large array element or object entry --
     is read to its end, since no start/end range is narrower than one item.
     A reply that is not the whole selected text uses the preview shape
-    below, which says where it starts, how long the whole text is, how many
-    items the stored result holds, and whether more follows.
+    below. ``stored_chars`` is the whole file length while
+    ``selected_chars`` (and the legacy ``original_chars`` alias) is the
+    rendered length of the effective selection. ``selection`` states the
+    effective item bounds after an end beyond the stored item count is
+    narrowed. ``page`` gives half-open character bounds and the exact
+    ``next_offset`` to use; callers must follow that value rather than
+    deriving an offset from either length. Offsets count decoded Python
+    Unicode characters, not UTF-8 bytes.
 
     ``page_chars`` is set by the engine, never by the model: the tool that
     wraps this function computes it once with spill_read_page_chars and
@@ -722,17 +734,60 @@ def read_spilled_result(
 
     if offset == 0 and len(output) <= page_chars:
         return {"relative_path": relative_path, "output": output}
-    # offset 0 always starts inside the text, even an empty one; any other
-    # offset has to name a character that exists.
-    if offset > 0 and offset >= len(output):
-        return spill_read_unavailable("invalid_range")
     if parsed is None:
         # Only a reply that cannot carry the whole text states the item
         # count, so only this path parses a file read without a range.
         parsed = _spill_kind_of(content)
-    item_count = _spill_item_count(parsed[0], parsed[1], content)
-    window_end = offset + page_chars
-    truncated = window_end < len(output)
+        item_count = _spill_item_count(parsed[0], parsed[1], content)
+        selection_start: int | None = 1 if item_count else None
+        selection_end: int | None = item_count if item_count else None
+    else:
+        item_count = _spill_item_count(parsed[0], parsed[1], content)
+        # first/last were computed with the effective (clamped) bounds in
+        # the ranged branch above.
+        selection_start = first
+        selection_end = last
+    selection_item_count = (
+        0
+        if selection_start is None or selection_end is None
+        else selection_end - selection_start + 1
+    )
+    selection = {
+        "start": selection_start,
+        "end": selection_end,
+        "item_count": selection_item_count,
+    }
+    valid_offset_range = {
+        "start": 0,
+        "end": len(output) - 1 if output else None,
+    }
+    # offset 0 always starts inside the text, even an empty one; any other
+    # offset has to name a character that exists. A positive out-of-range
+    # request includes enough selection metadata to recover without using
+    # the whole stored-file length as an offset or silently clamping past
+    # unread characters.
+    if offset > 0 and offset >= len(output):
+        return spill_read_unavailable(
+            "invalid_range",
+            details={
+                "relative_path": relative_path,
+                "requested_offset": offset,
+                "stored_chars": len(content),
+                "selected_chars": len(output),
+                "item_count": item_count,
+                "selection": selection,
+                "valid_offset_range": valid_offset_range,
+                "restart_offset": 0,
+                "instruction": (
+                    "Retry the same path, start, and end with offset 0, then "
+                    "follow page.next_offset from each successful reply until "
+                    "it is null."
+                ),
+            },
+        )
+    page_end = min(offset + page_chars, len(output))
+    truncated = page_end < len(output)
+    next_offset = page_end if truncated else None
     # Mirror read_file's over-limit shape (execution.py's
     # READ_FILE_CONTEXT_LIMIT branch): no "output" key, so
     # _format_tool_result renders the whole dict and the instruction
@@ -740,11 +795,20 @@ def read_spilled_result(
     # of the selected text follows this preview.
     preview: dict[str, Any] = {
         "relative_path": relative_path,
-        "content_preview": output[offset:window_end],
+        "content_preview": output[offset:page_end],
         "content_truncated": truncated,
         "original_chars": len(output),
+        "stored_chars": len(content),
+        "selected_chars": len(output),
         "item_count": item_count,
+        "selection": selection,
+        "valid_offset_range": valid_offset_range,
         "offset": offset,
+        "page": {
+            "start_offset": offset,
+            "end_offset": page_end,
+            "next_offset": next_offset,
+        },
     }
     if truncated:
         preview["instruction"] = SPILL_READ_TRUNCATED_INSTRUCTION

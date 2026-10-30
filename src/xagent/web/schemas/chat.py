@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ...core.task_runtime import MAX_TASK_RUNTIME_EXTENSIONS
 from .connector_runtime import ConnectorRuntimeRequirementsModel
@@ -259,3 +259,36 @@ class InterventionResponse(BaseModel):
     success: bool
     message: str
     updated_status: Optional[ExecutionStatus] = None
+
+
+class AutoResumeCancelRequest(BaseModel):
+    """Cancel a paused task's pending automatic resume.
+
+    ``run_id``: the run whose notice the person saw; when the task has moved
+    to another run since, nothing is cancelled (``not_pending``).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class AutoResumeCancelResponse(BaseModel):
+    """What a cancel did, and the task as it stands afterwards.
+
+    ``status`` / ``control_state`` / ``run_id`` / ``state_version`` /
+    ``auto_recovery`` read as ``GET /api/chat/task/{id}`` reads them.
+    ``notice`` is the ``task_recovery_update`` broadcast for a ``cancelled``
+    outcome, the same message; ``None`` otherwise.
+    """
+
+    task_id: int
+    outcome: Literal[
+        "cancelled", "already_cancelled", "resume_in_progress", "not_pending"
+    ]
+    status: str
+    control_state: str
+    run_id: Optional[str] = None
+    state_version: int
+    auto_recovery: Optional[Dict[str, Any]] = None
+    notice: Optional[Dict[str, Any]] = None

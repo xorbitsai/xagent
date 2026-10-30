@@ -428,20 +428,30 @@ def trigger_error_for_recorded(
     return default
 
 
-async def publish_recovery_notices(notices: Iterable[RecoveryNotice]) -> None:
-    """Broadcast committed notices; best effort, a failure is only logged."""
+async def publish_recovery_notices(
+    notices: Iterable[RecoveryNotice],
+) -> tuple[dict[str, Any], ...]:
+    """Broadcast committed notices; best effort, a failure is only logged.
+
+    Returns each notice's message as built for the broadcast (timestamp
+    included), whether or not that broadcast went through.
+    """
 
     from .task_events import publish_task_event
 
+    messages: list[dict[str, Any]] = []
     for notice in notices:
+        message = notice.message()
+        messages.append(message)
         try:
-            await publish_task_event(notice.message(), notice.task_id)
+            await publish_task_event(message, notice.task_id)
         except Exception:
             logger.warning(
                 "task_recovery_update committed but broadcast failed for task %s",
                 notice.task_id,
                 exc_info=True,
             )
+    return tuple(messages)
 
 
 # --------------------------------------------------------------------------
@@ -2382,7 +2392,7 @@ def supersede_pending_auto_resume_for_append_no_commit(db: Session, task: Task) 
 
 
 def cancel_pending_auto_resume_no_commit(
-    db: Session, task: Task, *, at: str
+    db: Session, task: Task, *, at: str, actor_user_id: int | None = None
 ) -> AutoResumeCancel:
     """A person stops the automatic resume ``task``'s paused run waits for;
     no commit.
@@ -2391,9 +2401,12 @@ def cancel_pending_auto_resume_no_commit(
     read (selected ``FOR UPDATE``, or refreshed after it); lock order is the
     module's, ``tasks`` then the recovery row, then reads of commands.
     ``at`` names the caller (e.g. ``channel_stop``) in the event, the log
-    and the metrics. ``raced``: the first write's compare-and-swap, which
-    also re-checks the recovery row as read, lost (SQLite ignores the row
-    locks), and nothing was written; the caller may read again and retry.
+    and the metrics; ``actor_user_id``, when given, the person who cancelled
+    (an admin may cancel another user's task), in the event.
+
+    ``raced``: the first write's compare-and-swap, which also re-checks the
+    recovery row as read, lost (SQLite ignores the row locks), and nothing
+    was written; the caller may read again and retry.
     Once it lands nothing else can move either row -- the locks on
     PostgreSQL, the write lock it took on SQLite -- so a later write that
     misses raises instead. On any exception the caller rolls back.
@@ -2464,6 +2477,7 @@ def cancel_pending_auto_resume_no_commit(
             "from": from_state.value,
             "task_version": task_version,
             "paused_state_version": paused_state_version,
+            **({} if actor_user_id is None else {"actor_user_id": actor_user_id}),
         },
         stop=_CANCELLED_STOP,
         fenced=True,

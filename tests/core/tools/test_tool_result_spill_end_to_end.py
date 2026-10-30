@@ -190,6 +190,9 @@ async def test_an_oversized_single_item_is_read_back_with_offset(tmp_path):
     assert first["content_truncated"] is True
     assert first["offset"] == 0
     assert first["original_chars"] == len(expected)
+    assert first["selected_chars"] == len(expected)
+    assert first["stored_chars"] > first["selected_chars"]
+    assert first["selection"] == {"start": 1, "end": 1, "item_count": 1}
     assert len(first["content_preview"]) == SPILL_READ_MAX_CHARS
 
     pieces = [first["content_preview"]]
@@ -200,13 +203,40 @@ async def test_an_oversized_single_item_is_read_back_with_offset(tmp_path):
                 "path": relative_path,
                 "start": 1,
                 "end": 1,
-                "offset": reply["offset"] + len(reply["content_preview"]),
+                "offset": reply["page"]["next_offset"],
             }
         )
         pieces.append(reply["content_preview"])
     assert "instruction" not in reply
+    assert reply["page"]["next_offset"] is None
     assert "".join(pieces) == expected
     assert json.loads("".join(pieces)) == rows[:1]
+
+
+@pytest.mark.asyncio
+async def test_bad_offset_is_model_visible_and_recoverable_through_native_reader(
+    tmp_path,
+):
+    rows = ["a" * 40_000, "b" * 40_000]
+    tools = await _tool_set(tmp_path, _returning("acme_rows", lambda: {"rows": rows}))
+    workspace = _bound_workspace(tools)
+    ctx = _context_for(workspace)
+    result = await _only_tool_named(tools, "acme_rows").run_json_async({})
+    ctx.add_tool_result("acme_rows", result)
+    (relative_path,) = [record["relative_path"] for record in ctx.spilled_results]
+    reader = _only_tool_named(tools, SPILL_READ_TOOL_NAME)
+
+    reply = await reader.run_json_async(
+        {"path": relative_path, "start": 1, "end": 1, "offset": 55_000}
+    )
+    observation = ctx.add_tool_result(SPILL_READ_TOOL_NAME, reply)
+
+    assert reply["output"]["requested_offset"] == 55_000
+    assert reply["output"]["stored_chars"] > reply["output"]["selected_chars"]
+    assert reply["output"]["restart_offset"] == 0
+    assert "requested_offset" in observation.content
+    assert "restart_offset" in observation.content
+    assert "55000" in observation.content
 
 
 @pytest.mark.asyncio

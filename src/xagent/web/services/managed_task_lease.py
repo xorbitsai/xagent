@@ -20,11 +20,13 @@ from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from .db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
+    task_returned,
 )
 from .execution_result_projection import (
     completion_outcome_for_status,
     interrupted_channel_result,
 )
+from .release_hold import release_hold
 from .task_lease_service import (
     TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR,
     TaskLease,
@@ -345,7 +347,16 @@ def _release_managed_task_lease_sync(lease: TaskLease) -> bool:
 
 @dataclass
 class ManagedTaskLease:
-    """Keep a pre-acquired lease alive and release it exactly once."""
+    """Keep a pre-acquired lease alive and release it exactly once.
+
+    The one settlement seam of every inline transport (Toby, the Slack,
+    Telegram and Feishu bots, channel runtime). A ``finalize_result`` or
+    ``close`` that does not confirm the release -- heartbeat lost or unhealthy,
+    the exact lease no longer matched, the write raised -- leaves the lease to
+    TTL recovery and is recorded as unsettled release evidence
+    (``release_hold.record_unsettled``). A repeated call on an already closed
+    lease attempts nothing and records nothing.
+    """
 
     lease: TaskLease
     stop_event: asyncio.Event
@@ -357,7 +368,7 @@ class ManagedTaskLease:
             return False
         self._closed = True
         cleanup_task = asyncio.create_task(self._close_resources())
-        return await drain_async_task_cancellation_safe(cleanup_task)
+        return await self._confirmed(cleanup_task, "close")
 
     async def finalize_result(
         self,
@@ -386,7 +397,24 @@ class ManagedTaskLease:
                 execution_result=execution_result,
             )
         )
-        return await drain_async_task_cancellation_safe(cleanup_task)
+        return await self._confirmed(cleanup_task, "finalize")
+
+    async def _confirmed(self, cleanup_task: asyncio.Task[bool], action: str) -> bool:
+        """Drain one settlement attempt; record it unless the release was confirmed.
+
+        Decided on the attempt's own result: a caller cancelled meanwhile
+        still gets ``CancelledError`` once the attempt is drained, whether the
+        release committed or not.
+        """
+        try:
+            return await drain_async_task_cancellation_safe(cleanup_task)
+        finally:
+            if not (task_returned(cleanup_task) and cleanup_task.result()):
+                release_hold.record_unsettled(
+                    "managed_lease",
+                    f"task:{self.lease.task_id}",
+                    f"managed lease {action} not confirmed; run left to TTL recovery",
+                )
 
     async def _stop_heartbeat_for_settlement(self) -> bool:
         heartbeat_outcome = await stop_task_lease_heartbeat(

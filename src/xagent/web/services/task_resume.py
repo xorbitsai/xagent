@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any, NoReturn, assert_never
 from uuid import uuid4
@@ -30,7 +31,9 @@ from .db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
+    task_returned,
 )
+from .release_hold import release_hold
 from .task_execution_controller import TaskControlState
 from .task_interaction_close import (
     ActiveInteractionAbsent,
@@ -424,6 +427,30 @@ def _update_a2a_resume_input_sync(
         return True
 
 
+async def _record_unless_restored(
+    task_id: int, restore: Callable[[], Coroutine[Any, Any, bool]]
+) -> bool:
+    """Run one prelease restore to completion; record it unless it was confirmed.
+
+    A prelease that cannot be restored (heartbeat failed or lost, the exact
+    lease no longer matched, the write raised) is retained for TTL recovery.
+    That is sticky unsettled evidence for a pooled release
+    (``release_hold.record_unsettled``), not a recovery. The restore runs as
+    its own task and is drained before a caller cancellation propagates, so
+    the record follows what the restore did, not how the wait ended.
+    """
+    restoring = asyncio.create_task(restore())
+    try:
+        return await drain_async_task_cancellation_safe(restoring)
+    finally:
+        if not (task_returned(restoring) and restoring.result()):
+            release_hold.record_unsettled(
+                "prelease",
+                f"task:{task_id}",
+                "prelease not restored; run left to TTL recovery",
+            )
+
+
 async def resume_a2a_task(
     *,
     agent_id: int,
@@ -491,6 +518,9 @@ async def resume_a2a_task(
         if prelease_cleanup_done:
             return False
         prelease_cleanup_done = True
+        return await _record_unless_restored(task_id, restore_prelease)
+
+    async def restore_prelease() -> bool:
         try:
             outcome = await stop_task_lease_heartbeat(
                 heartbeat_task,
@@ -1095,6 +1125,9 @@ async def resume_task_reply(
         if prelease_cleanup_done:
             return False
         prelease_cleanup_done = True
+        return await _record_unless_restored(task_id, restore_prelease)
+
+    async def restore_prelease() -> bool:
         try:
             outcome = await stop_task_lease_heartbeat(heartbeat_task, heartbeat_stop)
         except BaseException:

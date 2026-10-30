@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from typing import Callable, Iterator, TypeVar
+from typing import Any, Callable, Iterator, TypeVar
 
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -118,6 +118,17 @@ async def run_db_io_cancellation_safe(operation: Callable[[], _T]) -> _T:
     if cancellation is not None:
         raise cancellation
     return result
+
+
+def task_returned(task: asyncio.Task[Any]) -> bool:
+    """Whether a finished ``task`` returned, rather than raised or was cancelled.
+
+    For deciding on a drained settlement's own outcome. A caller cancelled
+    while it ran gets ``CancelledError`` from the wait either way
+    (:func:`await_task_settlement`), so how the wait ended cannot tell a
+    committed release from a failed one; the task can.
+    """
+    return task.done() and not task.cancelled() and task.exception() is None
 
 
 async def drain_async_task_cancellation_safe(task: asyncio.Task[_T]) -> _T:

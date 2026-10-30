@@ -109,6 +109,27 @@ def _release_held_delivery_no_commit(
     return int(held)
 
 
+def settle_channel_reply_after_cancel_no_commit(
+    db: Session, *, task_id: int, run_id: str, channel_id: int
+) -> int | None:
+    """The channel reply of ``run_id`` once a person cancelled its automatic
+    resume: "interrupted" (first writer wins, whatever a later resume by
+    hand answers), and its pending reply claimable now. Returns the START
+    whose held reply was released. Caller holds the ``tasks`` row lock; lock
+    order: tasks, the recovery row, commands, deliveries. Without a stored
+    START or a delivery row (no shared execution) both steps do nothing."""
+
+    stamp_channel_result_no_commit(
+        db,
+        task_id=task_id,
+        run_id=run_id,
+        channel_result=interrupted_channel_result(),
+    )
+    return _release_held_delivery_no_commit(
+        db, task_id=task_id, run_id=run_id, channel_id=channel_id
+    )
+
+
 def _idle(db: Session, task: Task) -> bool:
     """Nothing of ``task`` runs or will run: it rests (paused by a person or
     ended) and no command that starts a run is unfinished. A queued
@@ -206,17 +227,8 @@ def _stop_once_no_commit(
     if cancel.raced:
         return None
     if cancel.cancelled:
-        run_id = str(cancel.run_id)
-        # First writer wins: the run's reply is "stopped", whatever a later
-        # resume by hand answers.
-        stamp_channel_result_no_commit(
-            db,
-            task_id=task_id,
-            run_id=run_id,
-            channel_result=interrupted_channel_result(),
-        )
-        held = _release_held_delivery_no_commit(
-            db, task_id=task_id, run_id=run_id, channel_id=channel_id
+        held = settle_channel_reply_after_cancel_no_commit(
+            db, task_id=task_id, run_id=str(cancel.run_id), channel_id=channel_id
         )
         notices = (cancel.notice,) if cancel.notice is not None else ()
         return (

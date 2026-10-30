@@ -74,16 +74,39 @@ def upgrade() -> None:
         return
 
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+
+    # is_visible_in_connector is load-bearing for the release gate this row
+    # ships behind: without it the column filter below would drop the key and
+    # the table default (TRUE) would seed the row visible. Checked before the
+    # collision branch so both paths are covered. A plain RuntimeError rather
+    # than assert: assertions are stripped under `python -O`/PYTHONOPTIMIZE,
+    # which would silently defeat this guard. Same guard as the zendesk/chrome
+    # seeds.
+    if "is_visible_in_connector" not in columns:
+        raise RuntimeError(
+            "public_mcp_apps.is_visible_in_connector is missing; the freshdesk "
+            "row must not seed visible"
+        )
+
     existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
     if APP_ID in existing:
+        # A pre-existing row (e.g. hand-created by an operator) keeps its own
+        # visibility, and the builtin registry overlays the real launch_config
+        # onto any row with this app_id, so a visible one would become a
+        # working connector. Force it hidden; its other fields are left alone.
+        bind.execute(
+            sa.update(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            .values(is_visible_in_connector=False)
+        )
         return
 
-    # Silently degrades rather than failing outright (this table is never
-    # expected to be missing a column that predates this migration by
-    # months), but the app_id-exists guard above means a row seeded here
-    # while a column was missing can never self-heal on a later re-run --
-    # so at least surface which keys were dropped instead of leaving no
-    # trace at all.
+    # Any other missing column degrades rather than failing outright (this
+    # table is never expected to be missing a column that predates this
+    # migration by months), but the app_id-exists guard above means a row
+    # seeded here while a column was missing can never self-heal on a later
+    # re-run -- so at least surface which keys were dropped instead of
+    # leaving no trace at all.
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:
         logger.warning(
@@ -106,9 +129,13 @@ def downgrade() -> None:
     # already connected are intentionally left in place -- connect-driven rows
     # are not owned by this migration and are cleaned up through the normal
     # disconnect path. Matches chartmogul's/posthog's identical downgrade.
+    #
     # Only rows still matching this migration's own seed snapshot are removed.
-    # upgrade() skips seeding when the app_id already exists, so an
-    # unconditional delete by app_id would drop a row this migration never
-    # created -- the same reason atlassian/miro/fireflies/rocketlane use this
-    # helper.
+    # upgrade()'s collision branch adopts a pre-existing row by flipping only
+    # is_visible_in_connector and leaves its other fields as the operator set
+    # them, so an unconditional delete by app_id would destroy that operator's
+    # own row -- the same reason atlassian/miro/fireflies/rocketlane use this
+    # helper. An adopted row that differs from the snapshot is therefore left
+    # in place as a hidden orphan: downgrade does not restore the visibility
+    # it had before upgrade().
     delete_unmodified_seeded_rows(bind, PUBLIC_MCP_APPS_TABLE, [ROW])

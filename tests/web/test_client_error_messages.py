@@ -125,6 +125,13 @@ def test_client_error_codes_have_fixed_safe_fallbacks() -> None:
             "New work is briefly paused for a service update. "
             "Nothing was started; please try again in a moment."
         ),
+        "auto_resume_not_cancellable": (
+            "Automatic resume of a task created through the API cannot be "
+            "cancelled here."
+        ),
+        "auto_resume_cancel_raced": (
+            "The task changed while cancelling its automatic resume; please try again."
+        ),
     }
 
 

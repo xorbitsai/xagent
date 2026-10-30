@@ -2182,6 +2182,7 @@ def jira_list_comments(
     limit: int = 50,
     start_at: int = 0,
     raw_fields: bool = False,
+    tail: bool = False,
 ) -> str:
     """
     List comments on an issue (id, body, author, visibility, jsd_public,
@@ -2193,6 +2194,13 @@ def jira_list_comments(
     is null.
     start_at: offset into the full comment list -- pass the previous
     response's next_start_at to fetch the next page (0 to start over).
+    tail: with start_at=0, discover Jira's current total and fetch the last
+    `limit` comments in Jira's original order. This is a bounded forward-page
+    lookup, not descending-order support. If the total changes between the
+    discovery and tail requests, the tool relocates the page at most twice;
+    a still-changing final response remains truthful through its own total,
+    truncated, and next_start_at fields. Do not combine tail=true with a
+    non-zero start_at; follow a returned next_start_at with tail=false.
     A comment body longer than _COMMENT_BODY_MAX_CHARS is truncated
     with body_truncated set to true on that comment; if the whole page
     still doesn't fit the tool output limit even after that, fewer
@@ -2221,15 +2229,74 @@ def jira_list_comments(
     try:
         max_results = clamp_limit(limit, max_limit=MAX_LIMIT)
         offset = clamp_offset(start_at)
-        result = _request(
-            "GET",
-            cloud_id,
-            _issue_path(issue_key, "/comment"),
-            params={"maxResults": max_results, "startAt": offset},
-        )
+        if tail and offset:
+            return _error(
+                "tail=true requires start_at=0; follow next_start_at with tail=false"
+            )
+
+        comment_path = _issue_path(issue_key, "/comment")
+
+        def request_page(page_offset: int, page_limit: int) -> dict[str, Any] | None:
+            page = _request(
+                "GET",
+                cloud_id,
+                comment_path,
+                params={"maxResults": page_limit, "startAt": page_offset},
+            )
+            return page if isinstance(page, dict) else None
+
+        result: dict[str, Any] | None
+        if tail:
+            # The first one-comment page is a bounded total probe. When it is
+            # already the whole result (zero or one comment), reuse it rather
+            # than issuing an identical second request.
+            result = request_page(0, 1)
+            if result is None:
+                return _error("Unexpected response format from Jira comments API")
+            probe_comments = result.get("comments") or []
+            if not isinstance(probe_comments, list):
+                return _error("Unexpected response format from Jira comments API")
+            probe_total = result.get("total")
+            total = (
+                probe_total
+                if isinstance(probe_total, int) and not isinstance(probe_total, bool)
+                else len(probe_comments)
+            )
+            if total > len(probe_comments):
+                offset = max(total - max_results, 0)
+                # A comment can arrive or be deleted between the total probe
+                # and the page request. Recompute the desired tail start from
+                # each truthful response, but cap relocation to two retries so
+                # a busy issue cannot keep one tool call running forever.
+                for relocation in range(3):
+                    result = request_page(offset, max_results)
+                    if result is None:
+                        return _error(
+                            "Unexpected response format from Jira comments API"
+                        )
+                    raw_page = result.get("comments") or []
+                    if not isinstance(raw_page, list):
+                        return _error(
+                            "Unexpected response format from Jira comments API"
+                        )
+                    raw_page_total = result.get("total")
+                    page_total = (
+                        raw_page_total
+                        if isinstance(raw_page_total, int)
+                        and not isinstance(raw_page_total, bool)
+                        else offset + len(raw_page)
+                    )
+                    desired_offset = max(page_total - max_results, 0)
+                    if desired_offset == offset or relocation == 2:
+                        break
+                    offset = desired_offset
+        else:
+            result = request_page(offset, max_results)
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira comments API")
         raw_comments = result.get("comments") or []
+        if not isinstance(raw_comments, list):
+            return _error("Unexpected response format from Jira comments API")
         raw_total = result.get("total")
         # bool is a subclass of int in Python -- exclude it explicitly (as
         # _approximate_count already does for its own count field), or a

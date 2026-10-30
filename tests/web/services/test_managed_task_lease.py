@@ -853,3 +853,145 @@ def test_finalize_without_execution_result_creates_no_interaction_row_in_native_
     db_session.refresh(task)
     assert task.runner_id == lease.runner_id
     assert db_session.query(TaskInteractionRequest).count() == 0
+
+
+# --- unsettled evidence for a pooled release ------------------------------------
+#
+# ``ManagedTaskLease`` is the one settlement seam of every inline transport
+# (Toby, the Slack/Telegram/Feishu bots, channel runtime): a finalize or close
+# that does not confirm its release leaves the lease to TTL recovery, which a
+# pooled release must see as sticky ``unsettled`` evidence. A confirmed
+# release, or a repeated call on an already closed lease, records nothing.
+
+
+def _unsettled_total() -> int:
+    from xagent.web.services import release_hold as release_hold_module
+
+    return release_hold_module.release_hold.unsettled_total
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    [
+        (test_managed_lease_releases_terminal_task, 0),
+        (test_managed_lease_fails_an_unfinished_task, 0),
+        (test_managed_finalize_stops_heartbeat_before_exact_settlement, 0),
+        (test_managed_lease_heartbeat_timeout_skips_release_checkout, 1),
+    ],
+    ids=lambda value: getattr(value, "__name__", str(value)),
+)
+async def test_managed_lease_records_unsettled_only_when_the_lease_is_retained(
+    db_session, scenario, expected: int
+) -> None:
+    before = _unsettled_total()
+    kwargs = (
+        {"db_session": db_session}
+        if "db_session" in inspect.signature(scenario).parameters
+        else {}
+    )
+    await scenario(**kwargs)
+    assert _unsettled_total() - before == expected
+
+
+def _managed_for_fault() -> ManagedTaskLease:
+    return ManagedTaskLease(
+        lease=TaskLease(task_id=31, runner_id="runner-a", run_id="run-a"),
+        stop_event=asyncio.Event(),
+        heartbeat_task=asyncio.create_task(asyncio.sleep(0)),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["raises", "not_confirmed"])
+async def test_managed_finalize_fault_records_unsettled(fault: str) -> None:
+    managed = _managed_for_fault()
+
+    async def finalize(*_args, **_kwargs) -> bool:
+        if fault == "raises":
+            raise RuntimeError("settlement write fault")
+        return False
+
+    before = _unsettled_total()
+    with (
+        patch(
+            "xagent.web.services.managed_task_lease.stop_task_lease_heartbeat",
+            new=AsyncMock(return_value=TaskLeaseHeartbeatOutcome()),
+        ),
+        patch(
+            "xagent.web.services.managed_task_lease."
+            "finalize_managed_task_lease_result_isolated",
+            side_effect=finalize,
+        ),
+    ):
+        if fault == "raises":
+            with pytest.raises(RuntimeError):
+                await managed.finalize_result(status=TaskStatus.FAILED)
+        else:
+            assert await managed.finalize_result(status=TaskStatus.FAILED) is False
+        # The lease is closed now: a later close is a no-op, not new evidence.
+        assert await managed.close() is False
+    assert _unsettled_total() - before == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_close_release_fault_records_unsettled() -> None:
+    managed = _managed_for_fault()
+    before = _unsettled_total()
+    with (
+        patch(
+            "xagent.web.services.managed_task_lease.stop_task_lease_heartbeat",
+            new=AsyncMock(return_value=TaskLeaseHeartbeatOutcome()),
+        ),
+        patch(
+            "xagent.web.services.managed_task_lease._release_managed_task_lease_sync",
+            side_effect=RuntimeError("release write fault"),
+        ),
+    ):
+        assert await managed.close() is False
+    assert _unsettled_total() - before == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected"), [("released", 0), ("not_confirmed", 1), ("raises", 1)]
+)
+async def test_managed_finalize_under_caller_cancel_records_its_own_outcome(
+    outcome: str, expected: int
+) -> None:
+    """A caller cancelled mid-settlement still sees ``CancelledError``.
+
+    The record follows what the drained settlement actually did: a release
+    that committed while the caller was being cancelled is no evidence of a
+    retained lease, while one that failed or raised still is.
+    """
+    managed = _managed_for_fault()
+    entered, proceed = asyncio.Event(), asyncio.Event()
+
+    async def finalize(*_args, **_kwargs) -> bool:
+        entered.set()
+        await proceed.wait()
+        if outcome == "raises":
+            raise RuntimeError("settlement write fault")
+        return outcome == "released"
+
+    before = _unsettled_total()
+    with (
+        patch(
+            "xagent.web.services.managed_task_lease.stop_task_lease_heartbeat",
+            new=AsyncMock(return_value=TaskLeaseHeartbeatOutcome()),
+        ),
+        patch(
+            "xagent.web.services.managed_task_lease."
+            "finalize_managed_task_lease_result_isolated",
+            side_effect=finalize,
+        ),
+    ):
+        caller = asyncio.create_task(managed.finalize_result(status=TaskStatus.FAILED))
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        caller.cancel()
+        await asyncio.sleep(0)
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(caller, timeout=5)
+    assert _unsettled_total() - before == expected

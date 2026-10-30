@@ -766,8 +766,17 @@ class TestReadToolResult:
             "content_preview": "y" * SPILL_READ_MAX_CHARS,
             "content_truncated": True,
             "original_chars": 20_000,
+            "stored_chars": 20_000,
+            "selected_chars": 20_000,
             "item_count": 1,
+            "selection": {"start": 1, "end": 1, "item_count": 1},
+            "valid_offset_range": {"start": 0, "end": 19_999},
             "offset": 0,
+            "page": {
+                "start_offset": 0,
+                "end_offset": SPILL_READ_MAX_CHARS,
+                "next_offset": SPILL_READ_MAX_CHARS,
+            },
             "instruction": SPILL_READ_TRUNCATED_INSTRUCTION,
         }
 
@@ -868,19 +877,30 @@ class TestReadToolResult:
             "content_preview": "c",
             "content_truncated": False,
             "original_chars": 3,
+            "stored_chars": 3,
+            "selected_chars": 3,
             "item_count": 1,
+            "selection": {"start": 1, "end": 1, "item_count": 1},
+            "valid_offset_range": {"start": 0, "end": 2},
             "offset": 2,
+            "page": {"start_offset": 2, "end_offset": 3, "next_offset": None},
         }
-        assert tools.read_tool_result(rel, offset=3) == spill_read_unavailable(
-            "invalid_range"
-        )
+        bad_offset = tools.read_tool_result(rel, offset=3)
+        assert bad_offset["output"]["requested_offset"] == 3
+        assert bad_offset["output"]["selected_chars"] == 3
+        assert bad_offset["output"]["valid_offset_range"] == {"start": 0, "end": 2}
+        assert bad_offset["output"]["restart_offset"] == 0
         assert tools.read_tool_result(empty, offset=0) == {
             "relative_path": empty,
             "output": "",
         }
-        assert tools.read_tool_result(empty, offset=1) == spill_read_unavailable(
-            "invalid_range"
-        )
+        empty_bad_offset = tools.read_tool_result(empty, offset=1)
+        assert empty_bad_offset["output"]["requested_offset"] == 1
+        assert empty_bad_offset["output"]["selected_chars"] == 0
+        assert empty_bad_offset["output"]["valid_offset_range"] == {
+            "start": 0,
+            "end": None,
+        }
 
     @pytest.mark.usefixtures("mock_workspace_db")
     @pytest.mark.parametrize("path", [None, "  "])

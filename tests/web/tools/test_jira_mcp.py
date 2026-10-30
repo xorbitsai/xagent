@@ -3287,6 +3287,207 @@ def test_list_comments_paginates_with_start_at(monkeypatch):
     assert comment_call.kwargs["params"]["startAt"] == 1
 
 
+def test_list_comments_tail_discovers_total_then_reads_bounded_tail(monkeypatch):
+    comments = [{"id": str(i), "body": f"comment-{i}"} for i in range(45, 50)]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"comments": [{"id": "0"}], "total": 50}),
+            MockResponse(json_data={"comments": comments, "total": 50}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", limit=5, tail=True)
+    )
+
+    assert result["total"] == 50
+    assert result["returned_count"] == 5
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
+    assert [comment["id"] for comment in result["comments"]] == [
+        "45",
+        "46",
+        "47",
+        "48",
+        "49",
+    ]
+    assert [call.kwargs["params"] for call in mock_request.call_args_list] == [
+        {"maxResults": 1, "startAt": 0},
+        {"maxResults": 5, "startAt": 45},
+    ]
+
+
+def test_list_comments_tail_relocates_when_total_grows(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"comments": [{"id": "0"}], "total": 50}),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": str(i)} for i in range(45, 50)],
+                    "total": 52,
+                }
+            ),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": str(i)} for i in range(47, 52)],
+                    "total": 52,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", limit=5, tail=True)
+    )
+
+    assert result["total"] == 52
+    assert [comment["id"] for comment in result["comments"]] == [
+        "47",
+        "48",
+        "49",
+        "50",
+        "51",
+    ]
+    assert [
+        call.kwargs["params"]["startAt"] for call in mock_request.call_args_list
+    ] == [
+        0,
+        45,
+        47,
+    ]
+
+
+def test_list_comments_tail_relocates_when_total_shrinks(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"comments": [{"id": "0"}], "total": 50}),
+            MockResponse(json_data={"comments": [], "total": 4}),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": str(i)} for i in range(4)],
+                    "total": 4,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", limit=5, tail=True)
+    )
+
+    assert result["total"] == 4
+    assert [comment["id"] for comment in result["comments"]] == ["0", "1", "2", "3"]
+    assert [
+        call.kwargs["params"]["startAt"] for call in mock_request.call_args_list
+    ] == [
+        0,
+        45,
+        0,
+    ]
+
+
+def test_list_comments_tail_stops_relocating_when_total_keeps_changing(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"comments": [{"id": "0"}], "total": 50}),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": str(i)} for i in range(45, 50)],
+                    "total": 52,
+                }
+            ),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": str(i)} for i in range(47, 52)],
+                    "total": 54,
+                }
+            ),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": str(i)} for i in range(49, 54)],
+                    "total": 56,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", limit=5, tail=True)
+    )
+
+    assert result["total"] == 56
+    assert [comment["id"] for comment in result["comments"]] == [
+        "49",
+        "50",
+        "51",
+        "52",
+        "53",
+    ]
+    assert result["truncated"] is True
+    assert result["next_start_at"] == 54
+    assert [
+        call.kwargs["params"]["startAt"] for call in mock_request.call_args_list
+    ] == [0, 45, 47, 49]
+
+
+def test_list_comments_tail_preserves_page_size_adaptation(monkeypatch):
+    raw_comments = [_raw_comment_with_body(str(i), 200) for i in range(30, 50)]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data={"comments": [{"id": "0"}], "total": 50}),
+            MockResponse(json_data={"comments": raw_comments, "total": 50}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+    monkeypatch.setattr(jira, "get_tool_max_output_length", lambda: 1500)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", limit=20, tail=True)
+    )
+
+    assert result["status"] == "success"
+    assert 0 < result["returned_count"] < 20
+    assert result["truncated"] is True
+    assert result["next_start_at"] == 30 + result["returned_count"]
+    assert mock_request.call_args_list[1].kwargs["params"] == {
+        "maxResults": 20,
+        "startAt": 30,
+    }
+
+
+def test_list_comments_tail_empty_result_reuses_probe(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"comments": [], "total": 0})
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", limit=5, tail=True)
+    )
+
+    assert result["total"] == 0
+    assert result["comments"] == []
+    assert result["next_start_at"] is None
+    assert mock_request.call_count == 1
+
+
+def test_list_comments_tail_rejects_explicit_continuation(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_list_comments("ENG-1", cloud_id="cloud-a", start_at=5, tail=True)
+    )
+
+    assert result["status"] == "error"
+    assert "tail=true requires start_at=0" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_comments_empty_page_never_repeats_offset(monkeypatch):
     mock_request = Mock(
         side_effect=[

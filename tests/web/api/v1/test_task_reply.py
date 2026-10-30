@@ -9,6 +9,7 @@ up a real background execution, these tests patch the analogous
 """
 
 import asyncio
+import contextlib
 import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1725,3 +1726,51 @@ async def test_reply_rejected_by_the_worker_handoff_replays_as_not_accepted(
         }
     finally:
         await task_coordinator_runtime.close_task_coordinators()
+
+
+@pytest.mark.parametrize(("restored", "expected"), [(True, 0), (False, 1)])
+def test_reply_prelease_retained_for_recovery_records_unsettled(
+    mock_start_task, restored: bool, expected: int
+):
+    """A rejected reply's prelease either is restored or is sticky unsettled evidence.
+
+    The fenced rejection restores the prelease (the case above). When that
+    restore is not confirmed, the run is retained for TTL recovery, which a
+    pooled release must see before it may stop this process.
+    """
+    from xagent.web.services import release_hold as release_hold_module
+
+    hold = release_hold_module.release_hold
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id=f"prelease-{restored}")
+    _seed_active_interaction_row(
+        task_id, run_id=f"prelease-{restored}", idempotency_key=f"prelease-q-{restored}"
+    )
+    post = AsyncMock(return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE)
+    agent_patch, _agent = _patch_agent_service(post)
+    restore_patch = (
+        contextlib.nullcontext()
+        if restored
+        else patch(
+            "xagent.web.services.task_resume._restore_reply_prelease_isolated",
+            new=AsyncMock(return_value=False),
+        )
+    )
+    before = hold.unsettled_total
+    with (
+        agent_patch,
+        restore_patch,
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+    assert response.status_code == 409, response.text
+    assert hold.unsettled_total - before == expected
+    if expected:
+        assert hold.snapshot()["unsettled"][-1]["kind"] == "prelease"

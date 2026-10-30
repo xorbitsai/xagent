@@ -2989,6 +2989,8 @@ async def execute_task_background(
                     e,
                     exc_info=True,
                 )
+                # Unsettled evidence is recorded once, by ``_schedule_bg``,
+                # which defers this same timeout to TTL recovery.
                 raise
 
             logger.error(
@@ -4770,6 +4772,7 @@ async def execute_resume_background(
             nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
             nonlocal settlement_error
             nonlocal prepared_outputs
+            settlement_returned = False
 
             try:
                 # Finalize any tracker that did not reach the normal completion
@@ -4962,6 +4965,13 @@ async def execute_resume_background(
                                     report=settlement_report,
                                 )
                             )
+                        # Returned, not raised: no retention to record, even
+                        # for ``False`` -- it also means a pre-existing
+                        # terminal or control outcome was reconciled and
+                        # released, or a cancel path (external, A2A, question
+                        # cancel) already released this run. Same rule as
+                        # ``_schedule_bg``.
+                        settlement_returned = True
                         if settled:
                             lease_released = True
                             if settlement_report.paused:
@@ -5010,6 +5020,18 @@ async def execute_resume_background(
                             exc_info=True,
                         )
             finally:
+                # Every "retaining lease for TTL recovery" branch above (pool
+                # timeouts, unhealthy heartbeat, unresolvable checkpoint, a
+                # restore that failed or matched no row, a settlement that
+                # raised) ends here with the lease unreleased. Settlement is
+                # then unproven, whatever the counts say once this handle
+                # leaves the manager.
+                if lease is not None and not lease_released and not settlement_returned:
+                    release_hold.record_unsettled(
+                        "resume_lease",
+                        f"task:{task_id}",
+                        "run lease retained for TTL recovery",
+                    )
                 _clear_task_pause_accepted(task_id)
                 background_task_manager.cleanup_task(
                     task_id,

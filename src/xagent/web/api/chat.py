@@ -34,7 +34,12 @@ from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.task_execution_event import TaskExecutionEvent
 from ..models.user import User
 from ..models.user_channel import UserChannel
-from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..schemas.chat import (
+    AutoResumeCancelRequest,
+    AutoResumeCancelResponse,
+    TaskCreateRequest,
+    TaskCreateResponse,
+)
 from ..schemas.connector_runtime import (
     ConnectorRuntimeRequirementsModel,
     ConnectorRuntimeValuesRequest,
@@ -91,6 +96,10 @@ from ..services.task_runtime import (
     get_task_runtime_public_metadata,
     sanitize_client_agent_config,
     validate_task_extension_requests,
+)
+from ..services.web_auto_resume_cancel import (
+    WebAutoResumeCancelOutcome,
+    cancel_auto_resume_for_web,
 )
 from ..services.workforce_runtime import resolve_workforce_task_runtime
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
@@ -1273,6 +1282,70 @@ def get_task_agent_execution(
     if task is None:
         _raise_task_expired_or_not_found(db, user, task_id)
     return load_agent_execution_detail(db, task, worker_task_id)
+
+
+@chat_router.post(
+    "/task/{task_id}/auto-resume/cancel", response_model=AutoResumeCancelResponse
+)
+async def cancel_task_auto_resume(
+    task_id: int,
+    body: Optional[AutoResumeCancelRequest] = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> AutoResumeCancelResponse:
+    """Cancel the automatic resume a paused task's run waits for.
+
+    The task's owner or an admin, as for ``GET /task/{id}``; anyone else
+    reads 404 and an expired task 410. A settled answer is 200 with its
+    ``outcome``; an SDK task is 409 ``auto_resume_not_cancellable`` and a
+    cancel that kept losing a race 409 ``auto_resume_cancel_raced`` (retry).
+    """
+
+    def _visible_sync() -> None:
+        query = db.query(Task.id).filter(Task.id == task_id)
+        if not user.is_admin:
+            query = query.filter(Task.user_id == user.id)
+        if query.first() is None:
+            _raise_task_expired_or_not_found(db, user, task_id)
+        # Hold no connection (nor a SQLite read lock) across the write.
+        release_db_connection_if_clean(db)
+
+    # Unlocked first: no caller queues on another user's task row lock.
+    await asyncio.to_thread(_visible_sync)
+    result = await cancel_auto_resume_for_web(
+        task_id=task_id,
+        actor_user_id=int(user.id),
+        actor_is_admin=bool(user.is_admin),
+        expected_run_id=body.run_id if body is not None else None,
+    )
+    logger.info(
+        "Web auto-resume cancel task=%s actor=%s admin=%s outcome=%s",
+        task_id,
+        user.id,
+        bool(user.is_admin),
+        result.outcome.value,
+    )
+    if result.outcome is WebAutoResumeCancelOutcome.NOT_CANCELLABLE:
+        code = ClientErrorCode.AUTO_RESUME_NOT_CANCELLABLE
+        raise HTTPException(
+            status_code=409,
+            detail={"code": code.value, "message": client_error_message(code)},
+        )
+    if result.outcome is WebAutoResumeCancelOutcome.RACED:
+        code = ClientErrorCode.AUTO_RESUME_CANCEL_RACED
+        raise HTTPException(
+            status_code=409,
+            detail={"code": code.value, "message": client_error_message(code)},
+        )
+    if result.task is None:
+        # Deleted (or out of reach) since the check above: never returns.
+        await asyncio.to_thread(_raise_task_expired_or_not_found, db, user, task_id)
+    return AutoResumeCancelResponse(
+        task_id=task_id,
+        outcome=result.outcome.value,
+        notice=result.messages[0] if result.messages else None,
+        **result.task,
+    )
 
 
 @chat_router.get("/task/{task_id}/status")

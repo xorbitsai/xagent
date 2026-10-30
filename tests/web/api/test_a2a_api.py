@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -3898,3 +3899,58 @@ def test_message_send_proven_absent_write_asks_for_a_new_message_id() -> None:
             db.close()
     finally:
         manager.remove_context(str(task_id))
+
+
+@pytest.mark.parametrize(("restored", "expected"), [(True, 0), (False, 1)])
+def test_a2a_prelease_retained_for_recovery_records_unsettled(
+    restored: bool, expected: int
+):
+    """A not-accepted A2A reply restores its prelease or leaves sticky unsettled evidence."""
+    from xagent.web.services import release_hold as release_hold_module
+
+    hold = release_hold_module.release_hold
+    agent_id, full_key, task_id, _row_id = _seed_outcome_unknown_a2a_task(
+        f"prelease-{restored}"
+    )
+    agent = MagicMock(
+        post_user_message=AsyncMock(
+            return_value=UserMessageInjectionOutcome.REJECTED_RETRYABLE
+        )
+    )
+    restore_patch = (
+        contextlib.nullcontext()
+        if restored
+        else patch(
+            "xagent.web.services.task_resume._restore_a2a_resume_prelease_isolated",
+            new=AsyncMock(return_value=False),
+        )
+    )
+    before = hold.unsettled_total
+    with (
+        restore_patch,
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch(
+            "xagent.web.services.task_resume._schedule_waiting_a2a_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": f"prelease-reply-{restored}",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "fenced reply"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+    assert response.status_code == 400, response.text
+    assert hold.unsettled_total - before == expected
+    if expected:
+        assert hold.snapshot()["unsettled"][-1]["kind"] == "prelease"

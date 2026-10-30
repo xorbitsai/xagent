@@ -2233,3 +2233,53 @@ def test_delayed_workforce_running_projection_cannot_resurrect_terminal_run(
     persisted_run = db_session.get(WorkforceRun, int(run.id))
     assert persisted_run.status == "completed"
     assert persisted_run.completed_at is not None
+
+
+# --- unsettled evidence for a pooled release ------------------------------------
+#
+# A lease this manager acquired itself (``manage_task_lease=True``) is either
+# released here or left to TTL recovery. The scenarios above already drive
+# each outcome with the real ``execute_task``; re-run unchanged, the process
+# hold's sticky ``unsettled_total`` must grow by one exactly when the lease
+# was not released, and never on a confirmed release.
+
+UNSETTLED_SCENARIOS = [
+    (test_execute_task_persists_final_usage_before_releasing_lease, 0),
+    (test_execute_task_cancellation_during_workforce_sync_releases_lease, 0),
+    (test_execute_task_cancellation_during_tracker_start_releases_lease, 0),
+    (test_execute_task_cleans_up_when_sandbox_acquire_raises, 0),
+    (test_execute_task_managed_lease_loss_skips_usage_and_release, 1),
+    (test_execute_task_workforce_pool_timeout_stops_tracker_checkout, 1),
+    (test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch, 1),
+    (test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease, 1),
+    (test_execute_task_tracker_pool_timeout_stops_execution_and_release, 1),
+    (test_execute_task_releases_sandbox_when_lease_release_raises, 1),
+    (test_execute_task_final_usage_pool_timeout_retains_lease, 1),
+    (test_execute_task_heartbeat_pool_timeout_retains_lease, 1),
+    (test_execute_task_heartbeat_loss_after_result_rejects_success, 1),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scenario", "expected"),
+    UNSETTLED_SCENARIOS,
+    ids=[scenario.__name__ for scenario, _ in UNSETTLED_SCENARIOS],
+)
+async def test_managed_execute_records_unsettled_only_when_the_lease_is_retained(
+    request: pytest.FixtureRequest, scenario, expected: int
+) -> None:
+    import inspect
+
+    from xagent.web.services import release_hold as release_hold_module
+
+    hold = release_hold_module.release_hold
+    kwargs = {
+        name: request.getfixturevalue(name)
+        for name in inspect.signature(scenario).parameters
+    }
+    before = hold.unsettled_total
+    await scenario(**kwargs)
+    assert hold.unsettled_total - before == expected
+    if expected:
+        assert hold.snapshot()["unsettled"][-1]["kind"] == "managed_execution_lease"

@@ -123,6 +123,7 @@ from .memory_policy import (
     memory_retrieval_scope_fingerprint,
     resolve_trusted_memory_policy,
 )
+from .release_hold import release_hold
 from .task_execution_context_service import (
     load_task_execution_recovery_state,
     materialize_task_execution_recovery_state,
@@ -4275,6 +4276,9 @@ class AgentServiceManager:
                 heartbeat_pool_timeout: BaseException | None = None
                 heartbeat_lost = False
                 primary_error: BaseException | None = None
+                # Set only by a confirmed release of the lease this manager
+                # acquired; anything else leaves that lease to TTL recovery.
+                managed_lease_released = False
                 try:
                     # Persist usage before stopping/releasing the lease. Otherwise a
                     # replacement run can acquire ownership and then receive a late
@@ -4354,10 +4358,12 @@ class AgentServiceManager:
                                 final_status = TaskStatus.COMPLETED
                             else:
                                 final_status = TaskStatus.FAILED
-                        await run_db_io_cancellation_safe(
-                            lambda: _release_managed_task_lease_isolated(
-                                lease,
-                                status=final_status,
+                        managed_lease_released = bool(
+                            await run_db_io_cancellation_safe(
+                                lambda: _release_managed_task_lease_isolated(
+                                    lease,
+                                    status=final_status,
+                                )
                             )
                         )
                     if pre_run_pool_timeout is not None:
@@ -4368,6 +4374,21 @@ class AgentServiceManager:
                         raise heartbeat_pool_timeout
                 except BaseException as exc:
                     primary_error = exc
+
+                if (
+                    manage_task_lease
+                    and lease is not None
+                    and not managed_lease_released
+                ):
+                    # Lease loss, an unhealthy heartbeat, a pool timeout or a
+                    # failed release: the manager's own run is retained for
+                    # TTL recovery, which a pooled release must not read as
+                    # settled.
+                    release_hold.record_unsettled(
+                        "managed_execution_lease",
+                        f"task:{tracker_task_id}",
+                        "manager-acquired lease not released; left to TTL recovery",
+                    )
 
                 try:
                     await self._release_sandbox_task(sandbox_task_key)

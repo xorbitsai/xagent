@@ -1971,3 +1971,68 @@ async def test_new_run_result_pause_announces_its_resume_through_the_runner(
         task.state_version,
     )
     assert update["auto_resume"]["status"] == "scheduled"
+
+
+@pytest.mark.asyncio
+async def test_run_pool_timeout_leaves_the_unsettled_record_to_its_scheduler(
+    canonical, monkeypatch
+):
+    """``execute_task_background`` re-raises a pool timeout without recording.
+
+    The run lease belongs to ``_schedule_bg``, which defers that same timeout
+    to TTL recovery and records it once (``test_task_orchestrator``'s
+    ``UNSETTLED_SCENARIOS``). A second record here would count one retained
+    lease twice.
+    """
+    from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+
+    from xagent.web.services import release_hold as release_hold_module
+    from xagent.web.services import task_execution as task_execution_service
+
+    factory, _tid = canonical
+    ids = _projected_task(factory)
+    lease = _prepare_run(factory, ids, checkpoint=False)
+    monkeypatch.setattr(
+        "xagent.web.services.task_setup_snapshot.get_session_local", lambda: factory
+    )
+    from xagent.web.services.task_setup_snapshot import load_task_setup_snapshot_sync
+
+    snapshot = load_task_setup_snapshot_sync(ids["task"], ids["user"])
+
+    class Manager:
+        def __getattr__(self, _name: str) -> Any:
+            return MagicMock()
+
+        async def wait_for_previous(self, _task_id: int) -> None:
+            return None
+
+    class AgentManager:
+        async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
+            return MagicMock()
+
+        async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+            raise SQLAlchemyTimeoutError("QueuePool limit reached")
+
+    async def publish(_event: dict[str, Any], _task_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(task_execution_service, "background_task_manager", Manager())
+    monkeypatch.setattr("xagent.web.services.task_events.publish_task_event", publish)
+    monkeypatch.setattr(
+        "xagent.web.services.task_event_display.publish_task_result", publish
+    )
+    before = release_hold_module.release_hold.unsettled_total
+    with pytest.raises(SQLAlchemyTimeoutError):
+        await task_execution_service.execute_task_background(
+            task_id=ids["task"],
+            user_message="2+2",
+            context={"turn_id": ids["turn_id"]},
+            agent_manager=AgentManager(),
+            task_owner_user_id=ids["user"],
+            llm_user_message="2+2",
+            task_setup_snapshot=snapshot,
+            expected_run_id=lease.run_id,
+            task_lease=lease,
+            resolved_execution_scope=None,
+        )
+    assert release_hold_module.release_hold.unsettled_total == before

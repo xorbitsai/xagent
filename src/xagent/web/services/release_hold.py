@@ -22,6 +22,24 @@ publish:
   responsibility moves without an instant where both counts are zero.
   :func:`execution_status` combines this ledger with the manager's own tables.
 
+A pooled host (one web process plus shared-execution workers, each with its
+own interpreter and so its own hold) needs two more answers from every worker:
+
+- **Will this worker start any further command attempt?**
+  :meth:`ReleaseHold.seal` closes the hold *and* refuses every new command
+  attempt -- controls included -- at the dispatcher entry
+  (:meth:`ReleaseHold.try_begin_attempt`). It never cancels an attempt that
+  was already counted; those settle and leave the ledger, and only a later
+  status read can prove that they did.
+- **Did everything that left the counts actually settle?** Counts reach zero
+  both when an owner released its task lease and when it gave up and left
+  the lease to TTL recovery. :meth:`ReleaseHold.record_unsettled` marks the
+  second case: ``unsettled_total`` only grows for the life of the process
+  (``reopen`` does not clear it), with a bounded list of the latest entries
+  for diagnostics. A host must treat ``unsettled_total > 0`` as "cannot prove
+  settled"; this module never decides that for it, and ``busy`` keeps its
+  meaning.
+
 Nothing here cancels, times out or queues work. Default state is open with an
 empty ledger, so a process that never closes the hold behaves exactly as
 before -- the ledger only adds counting around existing code paths.
@@ -30,8 +48,9 @@ Constraints:
 
 - Event-loop thread only. Every caller runs on the loop that owns the tracked
   executions (async handlers, ASGI middleware, dispatcher workers).
-- One process. A pooled deployment would need every process to report; the
-  host must refuse such a topology rather than read one process as idle.
+- One process. Each interpreter has its own hold; a pooled host must collect
+  every process's ``execution_status`` and treat a missing report as busy,
+  never read one process as the whole pool.
 - Stdlib only at import time: ``task_execution`` imports this module, so it
   must stay a leaf to avoid import cycles.
 """
@@ -42,13 +61,17 @@ import asyncio
 import itertools
 import logging
 import time
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# How many unsettled entries are kept for diagnostics. ``unsettled_total`` keeps
+# counting past it; dropping old entries never lowers the blocking count.
+UNSETTLED_DIAGNOSTICS_LIMIT = 50
 
 
 @dataclass(frozen=True)
@@ -95,10 +118,24 @@ class ReleaseHold:
         self._keys = itertools.count()
         # Refusals since the hold last closed, by entry kind; diagnostics only.
         self._refused: Counter[str] = Counter()
+        self._sealed = False
+        # Sticky for the life of the process: the blocking evidence.
+        self._unsettled_total = 0
+        self._unsettled: deque[dict[str, str]] = deque(
+            maxlen=UNSETTLED_DIAGNOSTICS_LIMIT
+        )
 
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    @property
+    def unsettled_total(self) -> int:
+        return self._unsettled_total
 
     def close(self, reason: str) -> None:
         """Refuse new execution from now on; idempotent."""
@@ -108,8 +145,28 @@ class ReleaseHold:
         self._closed = True
         self._reason = reason
 
+    def seal(self, reason: str) -> None:
+        """Close, and refuse every new command attempt from now on; idempotent.
+
+        Synchronous on the event-loop thread, so an attempt either registered
+        before this call (and stays counted until it returns) or is refused by
+        :meth:`try_begin_attempt` after it. Only :meth:`reopen` lifts a seal.
+
+        Pending commands stay in the database for the successor: a task owner
+        on this process no longer keeps its lease for them and releases on its
+        next idle check (``TaskCoordinator._release_if_idle``).
+        """
+        self.close(reason)
+        if not self._sealed:
+            logger.info("Command attempts sealed (%s)", reason)
+        self._sealed = True
+
     def reopen(self) -> None:
-        """Admit new execution again on this same process; idempotent."""
+        """Admit new execution again on this same process; idempotent.
+
+        Lifts a seal too. ``unsettled_total`` is deliberately kept: reopening
+        proves nothing about work that was left to recovery.
+        """
         if self._closed:
             logger.info(
                 "Execution admission reopened (%s); refused while held: %s",
@@ -117,6 +174,7 @@ class ReleaseHold:
                 dict(self._refused),
             )
         self._closed = False
+        self._sealed = False
         self._reason = None
 
     def _register(self, kind: str, identity: str) -> HoldToken:
@@ -143,6 +201,39 @@ class ReleaseHold:
             )
             return None
         return self._register(kind, identity)
+
+    def try_begin_attempt(self, kind: str, identity: str = "") -> HoldToken | None:
+        """Register one command attempt, or ``None`` once sealed.
+
+        Unlike :meth:`try_admit` this passes while merely closed: a closed
+        worker still applies controls and input for active tasks. The token
+        covers the whole attempt -- candidate query, ownership wait, apply --
+        so a status read during any of it reports busy. Refusals are counted
+        but not logged: idle dispatcher workers poll every half second.
+        """
+        if self._sealed:
+            self._refused[kind] += 1
+            return None
+        return self._register(kind, identity)
+
+    def record_unsettled(self, kind: str, identity: str, reason: str) -> None:
+        """Note responsibility that ended here without proof that it settled.
+
+        For ownership left to TTL recovery: an unconfirmed lease release, a
+        claim left by an interrupted command, a settlement that could not
+        commit. Not a failure report and not a recovery -- it only says this
+        process cannot vouch that the work settled. Never called on a
+        proven-successful path.
+        """
+        self._unsettled_total += 1
+        self._unsettled.append({"kind": kind, "identity": identity, "reason": reason})
+        logger.warning(
+            "Unsettled %s %s left for recovery (%s); unsettled_total=%d",
+            kind,
+            identity,
+            reason,
+            self._unsettled_total,
+        )
 
     @contextmanager
     def admit(self, kind: str, identity: str = "") -> Iterator[None]:
@@ -177,6 +268,7 @@ class ReleaseHold:
         now = time.monotonic()
         return {
             "closed": self._closed,
+            "sealed": self._sealed,
             "reason": self._reason,
             "refused": dict(self._refused),
             "responsibilities": [
@@ -187,6 +279,8 @@ class ReleaseHold:
                 }
                 for item in self._responsibilities.values()
             ],
+            "unsettled_total": self._unsettled_total,
+            "unsettled": list(self._unsettled),
         }
 
 
@@ -198,11 +292,17 @@ def execution_status() -> dict[str, Any]:
 
     ``busy`` is true while any of these is non-zero: a hand-off responsibility
     in the ledger, a live execution handle, a resume coordinator or its
-    pre-registration reservation, a dispatcher slot reservation, or a detached
-    prompt dispatch. Each component is reported so a waiting release can log
-    *why* it waits.
+    pre-registration reservation, a dispatcher slot reservation, a detached
+    prompt dispatch, or a shared-execution task coordinator on this loop
+    (always zero in combined mode). Each component is reported so a waiting
+    release can log *why* it waits.
+
+    ``sealed`` and ``unsettled_total`` (with the bounded ``unsettled`` list)
+    are reported beside ``busy`` and never change it; a pooled host blocks on
+    ``unsettled_total > 0`` itself.
     """
     from .task_command_transport import prompt_dispatch_count
+    from .task_coordinator_runtime import live_coordinator_count
     from .task_execution import background_task_manager
 
     ledger = release_hold.snapshot()
@@ -210,9 +310,13 @@ def execution_status() -> dict[str, Any]:
         **background_task_manager.release_counts(),
         "prompt_dispatches": prompt_dispatch_count(),
         "responsibilities": len(ledger["responsibilities"]),
+        "task_coordinators": live_coordinator_count(),
     }
     return {
         "busy": any(counts.values()),
         "counts": counts,
         "hold": ledger,
+        "sealed": ledger["sealed"],
+        "unsettled_total": ledger["unsettled_total"],
+        "unsettled": ledger["unsettled"],
     }

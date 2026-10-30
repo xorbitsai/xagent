@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -384,6 +384,7 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
         legacy_oauth_account=legacy,
     )
     db.commit()
+    shared_id = int(shared.id)
     request = SimpleNamespace(
         query_params={
             "code": "code",
@@ -392,6 +393,9 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
             ),
         }
     )
+    # The callback runs in a fresh request in production. Do not retain the
+    # legacy row in this test session while the subject-switch path deletes it.
+    db.expunge(legacy)
     monkeypatch.setattr(
         auth_api.requests,
         "post",
@@ -412,13 +416,14 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
         Mock(return_value=MockResponse({"sub": "subject-b", "email": "b@example.com"})),
     )
     lock_order: list[str] = []
-    original_outer_lock = (
-        google_oauth_grants_service.lock_google_shared_accounts_for_app_replacement
-    )
+    locked_account_ids: list[tuple[int, ...]] = []
+    original_account_lock = google_oauth_grants_service._lock_google_oauth_accounts
 
-    def observe_outer_lock(*args, **kwargs):
+    def observe_account_lock(lock_db, account_ids):
+        normalized_ids = tuple(sorted({int(account_id) for account_id in account_ids}))
         lock_order.append("shared-lock")
-        return original_outer_lock(*args, **kwargs)
+        locked_account_ids.append(normalized_ids)
+        return original_account_lock(lock_db, normalized_ids)
 
     def observe_sql(_conn, _cursor, statement, _parameters, _context, _many):
         if "delete from user_oauth" in statement.lower():
@@ -426,8 +431,8 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
 
     monkeypatch.setattr(
         google_oauth_grants_service,
-        "lock_google_shared_accounts_for_app_replacement",
-        observe_outer_lock,
+        "_lock_google_oauth_accounts",
+        observe_account_lock,
     )
     event.listen(db.get_bind(), "before_cursor_execute", observe_sql)
 
@@ -438,6 +443,7 @@ def test_google_shared_callback_retries_with_consent_for_new_subject_without_ref
 
     assert response.status_code == 307
     assert lock_order.index("shared-lock") < lock_order.index("legacy-delete")
+    assert (shared_id,) in locked_account_ids
     params = parse_qs(urlparse(response.headers["location"]).query)
     assert params["prompt"] == ["consent"]
     retry_state = auth_api.verify_token(params["state"][0])
@@ -1629,10 +1635,7 @@ def test_oauth_callback_rejects_an_invalid_user_id_claim_before_exchange(
         provision,
     )
 
-    try:
-        response = generic_oauth_callback("google", request, db, _google_provider())
-    except Exception as exc:
-        pytest.fail(f"invalid user ID claim escaped the callback: {exc!r}")
+    response = generic_oauth_callback("google", request, db, _google_provider())
 
     assert response.status_code == 400
     assert "Invalid or expired state" in response.body.decode()
@@ -2016,7 +2019,7 @@ async def test_meta_expired_token_refresh_uses_fb_exchange_token(
         provider="facebook",
         access_token="old-long-token",
         refresh_token=None,
-        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
         provider_user_id="meta-user-1",
     )
     db.add(oauth_account)
@@ -2096,7 +2099,7 @@ async def test_meta_refresh_with_revoked_session_raises_permanent(
         provider="facebook",
         access_token="old-long-token",
         refresh_token=None,
-        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
         provider_user_id="meta-user-1",
     )
     db.add(oauth_account)

@@ -115,6 +115,17 @@ def test_probe_shape():
     assert get_unprobeable_reason("not-an-app") is None
 
 
+def test_key_scoped_probes_stay_inside_the_catalog_description():
+    """The catalog descriptions list feature flags and customers; /users/@me/
+    and /v1/account need scopes they never ask for."""
+    assert get_connector_probe("posthog") == ConnectorProbe(
+        "posthog_list_feature_flags", {"limit": 1}
+    )
+    assert get_connector_probe("stripe") == ConnectorProbe(
+        "stripe_list_customers", {"limit": 1}
+    )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("app_id", sorted(CONNECTOR_PROBES))
 async def test_declared_tool_is_registered_with_those_arguments(app_id):

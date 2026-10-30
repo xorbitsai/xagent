@@ -17,6 +17,7 @@ from xagent.web.services.gmail_provisioning import (
     GmailProvisioningError,
     ensure_gmail_mailbox_provisioned,
 )
+from xagent.web.services.gmail_triggers import GmailOAuthReconnectRequiredError
 from xagent.web.services.triggers import TriggerServiceError, _resolve_gmail_resource
 
 ACTOR = "toby:slack:41:UALICE"
@@ -149,7 +150,7 @@ def test_gmail_consumers_require_reconnect_for_a_token_cleared_row(
     db.commit()
     db.refresh(tombstone)
 
-    with pytest.raises(GmailProvisioningError, match="reconnect required"):
+    with pytest.raises(GmailOAuthReconnectRequiredError, match="reconnect required"):
         ensure_gmail_mailbox_provisioned(db, tombstone)
 
     with pytest.raises(TriggerServiceError, match="reconnect required"):

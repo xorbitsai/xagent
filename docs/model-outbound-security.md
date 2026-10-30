@@ -41,8 +41,9 @@ IPv4 destinations remain forbidden. Other translation prefixes are not inferred.
 
 These settings are read only from process environment through config.py.
 Serialized model/tool parameters cannot enable exceptions. They apply only to
-the migrated model clients, not MCP, SaaS connectors, web fetches or third-party
-reference-image/audio downloads. Those inputs use the bounded public downloader.
+the migrated model clients, not MCP (see `mcp-outbound-security.md`), SaaS
+connectors, web fetches or third-party reference-image/audio downloads. Those
+inputs use the bounded public downloader.
 
 ## Proxy and redirect compatibility
 

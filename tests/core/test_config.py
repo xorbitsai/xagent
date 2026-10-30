@@ -297,6 +297,20 @@ def test_google_scope_config(monkeypatch, value):
 
 
 @pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
+def test_google_shared_oauth_grants_config(monkeypatch, value):
+    flag = "XAGENT_GOOGLE_SHARED_OAUTH_GRANTS_ENABLED"
+    if value is None:
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, value)
+
+    assert flag == config.GOOGLE_SHARED_OAUTH_GRANTS_ENABLED
+    assert config.get_google_shared_oauth_grants_enabled() is (
+        value in {"true", "1", "ON"}
+    )
+
+
+@pytest.mark.parametrize("value", [None, "false", "", "invalid", "true", "1", "ON"])
 def test_zoom_meeting_write_config(monkeypatch, value):
     flag = "XAGENT_ZOOM_MEETING_WRITE_ENABLED"
     if value is None:

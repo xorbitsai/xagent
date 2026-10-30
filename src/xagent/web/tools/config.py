@@ -36,7 +36,7 @@ from weakref import WeakValueDictionary
 import httpx
 from sqlalchemy import text
 
-from ...config import get_uploads_dir
+from ...config import get_google_shared_oauth_grants_enabled, get_uploads_dir
 from ...core.agent.result import (
     ClassifiedToolFailure,
     is_oauth_token_required_code,
@@ -646,13 +646,13 @@ def _oauth_launch_config_env_mapping(
 def _actor_oauth_refresh_lock(
     user_id: int,
     resource_owner_key: str,
-    app_id: str,
+    credential_key: str,
 ) -> asyncio.Lock:
     key = (
         id(asyncio.get_running_loop()),
         user_id,
         resource_owner_key,
-        app_id,
+        credential_key,
     )
     lock = _ACTOR_OAUTH_REFRESH_LOCKS.get(key)
     if lock is None:
@@ -4150,6 +4150,7 @@ class WebToolConfig(BaseToolConfig):
                     mark_gmail_oauth_reconnect_required(
                         oauth_db,
                         oauth_account=oauth_account,
+                        expected_refresh_token=attempted_refresh_token,
                     )
                 else:
                     oauth_account.access_token = ""
@@ -4171,12 +4172,120 @@ class WebToolConfig(BaseToolConfig):
             credential_present=True,
         )
 
+    def _resolve_shared_google_oauth_account(
+        self,
+        oauth_db: Any,
+        *,
+        provider_name: object,
+        app_id: object,
+        app_info: Mapping[str, Any] | None,
+        user_id: int,
+        resource_owner_key: str | None,
+        lock: bool | None = None,
+    ) -> Any | None:
+        """Resolve one explicitly-associated shared grant, or fall back safely."""
+        if (
+            not get_google_shared_oauth_grants_enabled()
+            or str(provider_name).lower() != "google"
+            or not isinstance(app_id, str)
+            or not app_id.strip()
+        ):
+            return None
+
+        from ..api.auth import _resolve_oauth_client_per_field
+        from ..models.oauth_provider import OAuthProvider
+        from ..services.google_oauth_grants import (
+            resolve_google_shared_oauth_account,
+        )
+
+        provider_config = (
+            oauth_db.query(OAuthProvider)
+            .filter(OAuthProvider.provider_name == "google")
+            .one_or_none()
+        )
+        if provider_config is None:
+            return None
+        client_id, _client_secret = _resolve_oauth_client_per_field(
+            "google", provider_config
+        )
+        if not client_id:
+            return None
+
+        required_scopes: list[str] = []
+        for candidate in (
+            provider_config.default_scopes or [],
+            (app_info or {}).get("oauth_scopes") or [],
+        ):
+            if isinstance(candidate, str):
+                required_scopes.append(candidate)
+            elif isinstance(candidate, (list, tuple, set)):
+                if any(not isinstance(scope, str) for scope in candidate):
+                    return None
+                required_scopes.extend(candidate)
+            elif candidate:
+                # A malformed catalog/provider row must not broaden a shared
+                # credential's authority. The legacy resolver remains the
+                # compatibility fallback for this request.
+                return None
+
+        account = resolve_google_shared_oauth_account(
+            oauth_db,
+            user_id=user_id,
+            resource_owner_key=resource_owner_key,
+            oauth_client_id=client_id,
+            app_id=app_id,
+            required_scopes=required_scopes,
+            # Ordinary refreshes retain their re-read-and-compare concurrency
+            # semantics. Holding a database row lock across an async provider
+            # request can deadlock the event loop. Actor refreshes run on a
+            # worker thread behind an in-process credential lock.
+            lock=resource_owner_key is not None if lock is None else lock,
+        )
+        logger.info(
+            "OAUTH CONFIG: Checked shared Google grant for app %s user %s owner %s. Found: %s",
+            app_id,
+            user_id,
+            "actor" if resource_owner_key is not None else "ordinary",
+            account is not None,
+        )
+        return account
+
+    def _resolve_actor_oauth_lock_key_in_worker(
+        self,
+        *,
+        session_factory: Callable[[], Any],
+        provider_name: object,
+        app_id: str,
+        app_info: Mapping[str, Any] | None,
+        resource_owner_key: str,
+        user_id: int,
+    ) -> str:
+        """Choose one process lock shared by every app using the same grant."""
+        oauth_db = session_factory()
+        try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+                lock=False,
+            )
+            if shared_account is not None:
+                return f"shared-google:{int(shared_account.id)}"
+            return f"legacy-app:{app_id}"
+        finally:
+            oauth_db.rollback()
+            oauth_db.close()
+
     async def _resolve_actor_oauth_access_token_in_worker(
         self,
         *,
         session_factory: Callable[[], Any],
         provider_name: object,
         app_id: str,
+        app_info: Mapping[str, Any] | None,
         resource_owner_key: str,
         user_id: int,
     ) -> _LegacyOAuthTokenResolution:
@@ -4185,6 +4294,22 @@ class WebToolConfig(BaseToolConfig):
 
         oauth_db = session_factory()
         try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=resource_owner_key,
+            )
+            if shared_account is not None:
+                return await self._finish_legacy_oauth_access_token_resolution(
+                    oauth_db=oauth_db,
+                    oauth_account=shared_account,
+                    provider_name=provider_name,
+                    user_id=user_id,
+                    resource_owner_key=resource_owner_key,
+                )
             # Lock the current namespace, not a stale row id. Actor callbacks
             # replace credentials with delete-and-insert, so the primary key
             # can change while this resolver waits.
@@ -4240,28 +4365,39 @@ class WebToolConfig(BaseToolConfig):
         *,
         provider_name: object,
         app_id: str,
+        app_info: Mapping[str, Any] | None,
         resource_owner_key: str,
         user_id: int,
     ) -> _LegacyOAuthTokenResolution:
         from ..services.db_runtime import run_db_io_cancellation_safe
 
-        # Same-process waiters must not open a Session or reserve a pooled
-        # connection. The stable namespace also survives callback replacement
-        # of the credential row.
+        session_factory = self._legacy_oauth_session_factory()
+        credential_key = await run_db_io_cancellation_safe(
+            lambda: self._resolve_actor_oauth_lock_key_in_worker(
+                session_factory=session_factory,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                resource_owner_key=resource_owner_key,
+                user_id=user_id,
+            )
+        )
+        # Same-process waiters must not reserve a pooled connection while
+        # waiting. Apps associated with one shared credential use one lock.
         actor_refresh_lock = _actor_oauth_refresh_lock(
             user_id,
             resource_owner_key,
-            app_id,
+            credential_key,
         )
         await actor_refresh_lock.acquire()
         try:
-            session_factory = self._legacy_oauth_session_factory()
             return await run_db_io_cancellation_safe(
                 lambda: asyncio.run(
                     self._resolve_actor_oauth_access_token_in_worker(
                         session_factory=session_factory,
                         provider_name=provider_name,
                         app_id=app_id,
+                        app_info=app_info,
                         resource_owner_key=resource_owner_key,
                         user_id=user_id,
                     )
@@ -4294,12 +4430,29 @@ class WebToolConfig(BaseToolConfig):
             return await self._resolve_actor_oauth_access_token(
                 provider_name=provider_name,
                 app_id=app_id,
+                app_info=app_info,
                 resource_owner_key=resource_owner_key,
                 user_id=user_id,
             )
 
         oauth_db = self._new_legacy_oauth_session()
         try:
+            shared_account = self._resolve_shared_google_oauth_account(
+                oauth_db,
+                provider_name=provider_name,
+                app_id=app_id,
+                app_info=app_info,
+                user_id=user_id,
+                resource_owner_key=None,
+            )
+            if shared_account is not None:
+                return await self._finish_legacy_oauth_access_token_resolution(
+                    oauth_db=oauth_db,
+                    oauth_account=shared_account,
+                    provider_name=provider_name,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                )
             if app_id:
                 # A bare provider-level grant (e.g. UserOAuth.provider ==
                 # "meta") never requested this app's own oauth_scopes, so it
@@ -4310,22 +4463,30 @@ class WebToolConfig(BaseToolConfig):
                 providers_to_check = restrict_to_app_scoped_oauth_grant(
                     policy_app, provider_candidates
                 )
-                oauth_account = (
-                    scoped_user_oauth_query(
-                        oauth_db,
-                        user_id=user_id,
-                        resource_owner_key=None,
+                oauth_account_query = scoped_user_oauth_query(
+                    oauth_db,
+                    user_id=user_id,
+                    resource_owner_key=None,
+                ).filter(UserOAuth.provider.in_(providers_to_check))
+                if str(provider_name).lower() == "google":
+                    # A provider='google' row owned by the shared-grant table
+                    # is reachable only through its explicit app association,
+                    # client fingerprint, and scope checks above. Never let a
+                    # newer shared row bypass those gates through the legacy
+                    # provider-candidate path, including while the flag is off.
+                    from ..models.google_oauth_grant import GoogleOAuthGrant
+
+                    oauth_account_query = oauth_account_query.filter(
+                        UserOAuth.id.notin_(
+                            oauth_db.query(GoogleOAuthGrant.oauth_account_id)
+                        )
                     )
-                    .filter(UserOAuth.provider.in_(providers_to_check))
-                    # Deterministic tie-break for the rare case of more than
-                    # one row for this (user, provider) set (e.g. a provider
-                    # whose identity backfill can't always derive a non-NULL
-                    # provider_user_id, like Employment Hero with zero
-                    # accessible organisations) -- most-recently-created wins,
-                    # rather than an arbitrary, backend-dependent row order.
-                    .order_by(UserOAuth.id.desc())
-                    .first()
-                )
+                # Deterministic tie-break for the rare case of more than one
+                # row for this provider set: most-recently-created wins rather
+                # than an arbitrary, backend-dependent row order.
+                oauth_account = oauth_account_query.order_by(
+                    UserOAuth.id.desc()
+                ).first()
                 logger.info(
                     "OAUTH CONFIG: Checked providers %s for user %s. Found: %s",
                     providers_to_check,

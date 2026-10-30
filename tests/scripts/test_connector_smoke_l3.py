@@ -348,7 +348,7 @@ class FakeDeployment:
         self.probes: dict[int, tuple[int, Any]] = {
             7: _ok("github_get_current_user", 7, "github"),
             3: _refused(400, "unprobeable", code="unprobeable", reason="covered_by_l2"),
-            5: _ok("stripe_get_account_info", 5, "stripe"),
+            5: _ok("stripe_list_customers", 5, "stripe"),
         }
         self.slow: set[int] = set()
         self.errors: set[int] = set()
@@ -425,7 +425,7 @@ def test_every_connected_connector_is_probed_once_in_order() -> None:
     assert lines[:3] == [
         "PASS l3:github: github_get_current_user",
         "SKIP l3:notion: unprobeable (covered_by_l2)",
-        "PASS l3:stripe: stripe_get_account_info",
+        "PASS l3:stripe: stripe_list_customers",
     ]
     assert lines[3].startswith("2 checks, 0 failed, 1 skipped in ")
     # Sorted by app id, POST only, no tool name or arguments in the request.
@@ -454,7 +454,7 @@ def test_a_failed_probe_fails_the_run_and_the_others_still_run() -> None:
 
     assert code == 1
     assert "FAIL l3:github: unexpected probe result (status_not_success)" in lines
-    assert "PASS l3:stripe: stripe_get_account_info" in lines
+    assert "PASS l3:stripe: stripe_list_customers" in lines
 
 
 def test_a_timed_out_probe_fails_and_the_run_continues() -> None:
@@ -465,7 +465,7 @@ def test_a_timed_out_probe_fails_and_the_run_continues() -> None:
 
     assert code == 1
     assert "FAIL l3:github: timed out after 5s" in lines
-    assert "PASS l3:stripe: stripe_get_account_info" in lines
+    assert "PASS l3:stripe: stripe_list_customers" in lines
 
 
 def test_probe_requests_use_the_probe_timeout() -> None:
@@ -502,7 +502,7 @@ def test_a_request_that_gets_no_answer_fails_and_the_run_continues() -> None:
 
     assert code == 1
     assert "FAIL l3:github: POST request failed: ConnectError" in lines
-    assert "PASS l3:stripe: stripe_get_account_info" in lines
+    assert "PASS l3:stripe: stripe_list_customers" in lines
 
 
 def test_an_account_outside_the_allowlist_stops_the_run_at_once() -> None:

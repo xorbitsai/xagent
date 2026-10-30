@@ -102,6 +102,7 @@ from .routine_history_provenance import (
 )
 from .task_auto_recovery import (
     InterruptionDecision,
+    InterruptionOutcome,
     InterruptionSettlementDeferred,
     apply_interruption_outcome_no_commit,
     decide_interruption,
@@ -124,6 +125,7 @@ from .task_lease_service import (
     current_task_lease,
     lock_task_lease_for_settlement_no_commit,
     lock_task_lease_no_commit,
+    log_unknown_tool_effect_settlement,
     task_lease_attempt_predicate,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
@@ -166,9 +168,10 @@ from .db_runtime import (
 )
 from .db_write_retry import (
     bound_rerun_lock_wait_no_commit,
+    connection_was_lost,
     retry_db_write_async,
 )
-from .execution_event_signals import report_commit_failure
+from .execution_event_signals import report_commit_failure, report_unknown_outcome
 from .execution_result_projection import (
     FailedResultPresentation,
     completion_outcome_for_status,
@@ -2033,6 +2036,8 @@ def _commit_finalization_or_reconcile(
     *,
     task_id: int,
     witness: _FinalizationWitness | None,
+    run_id: str | None = None,
+    storage: str = "unknown",
 ) -> None:
     """Commit one result transition, or prove an unacknowledged COMMIT applied.
 
@@ -2048,6 +2053,17 @@ def _commit_finalization_or_reconcile(
     row stands for every write in it. Without a witness (a legacy branch
     that inserts no row, or a replayed fact), or when the read-back cannot
     decide, the commit error is re-raised unchanged.
+
+    Operator signals (``report_unknown_outcome``, with the task's ``run_id``
+    and ``storage``): ``finalize_ack_reconciled`` when the read-back proves
+    the commit applied, and ``finalize_ack_unresolved`` when the commit error
+    is re-raised although it is not known whether the commit applied (no
+    witness to read back, or the read-back itself failed) and the commit
+    error is a dropped connection (``connection_was_lost``), the only
+    failure that can hide an applied COMMIT. A read-back that completes and
+    finds the witness absent, or any other commit error (a deadlock, a
+    serialization failure, a locked SQLite database), means the commit did
+    not apply: a plain failure, not reported here.
     """
     try:
         finalize_db.commit()
@@ -2061,23 +2077,36 @@ def _commit_finalization_or_reconcile(
                 task_id,
                 exc_info=True,
             )
-        if witness is None:
-            raise
-        try:
-            committed = _finalization_witness_committed(witness)
-        except Exception:
-            logger.warning(
-                "Task %s finalization commit read-back failed",
-                task_id,
-                exc_info=True,
-            )
-            committed = False
+        # Only a dropped connection can lose the acknowledgement of a COMMIT
+        # that applied; any other commit error is the server refusing it.
+        may_have_applied = connection_was_lost(commit_error)
+        committed = False
+        read_back_failed = False
+        if witness is not None:
+            try:
+                committed = _finalization_witness_committed(witness)
+            except Exception:
+                logger.warning(
+                    "Task %s finalization commit read-back failed",
+                    task_id,
+                    exc_info=True,
+                )
+                read_back_failed = True
         if not committed:
+            if may_have_applied and (witness is None or read_back_failed):
+                report_unknown_outcome(
+                    "finalize_ack_unresolved",
+                    task_id=task_id,
+                    run_id=run_id,
+                    storage=storage,
+                )
             raise commit_error
-        logger.warning(
-            "Task %s result commit was not acknowledged but is committed; "
-            "continuing with the committed result",
-            task_id,
+        report_unknown_outcome(
+            "finalize_ack_reconciled",
+            task_id=task_id,
+            run_id=run_id,
+            storage=storage,
+            level=logging.INFO,
         )
 
 
@@ -2261,6 +2290,9 @@ def _finalize_task_execution_result_isolated(
         final_task_status = pre_run_status.value
         # Set only when this transaction settles the result as FAILED.
         presentation: FailedResultPresentation | None = None
+        # Set when it fails the run as an unknown tool effect; reported only
+        # once the transaction has committed.
+        unknown_tool_effect: InterruptionDecision | None = None
 
         if task_updated is not None:
             task_agent_config: dict[str, Any] = (
@@ -2413,6 +2445,11 @@ def _finalize_task_execution_result_isolated(
                         _apply_result_interruption(
                             finalize_db, task_updated, interruption, result
                         )
+                        if (
+                            interruption.outcome
+                            is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+                        ):
+                            unknown_tool_effect = interruption
             else:
                 waiting_for_control = True
                 terminal_state_committed = True
@@ -2493,6 +2530,13 @@ def _finalize_task_execution_result_isolated(
                 )
                 finalize_db.flush()
                 broadcast_meta = _finalization_broadcast_meta(task_updated)
+                # Read before COMMIT: the row's attributes expire on a failed one.
+                finalize_storage = (
+                    "v2" if task_updated.conversation_storage_version == 2 else "v1"
+                )
+                finalize_run_id = (
+                    task_lease.run_id if task_lease is not None else expected_run_id
+                )
                 _commit_finalization_or_reconcile(
                     finalize_db,
                     task_id=task_id,
@@ -2502,9 +2546,18 @@ def _finalize_task_execution_result_isolated(
                         if task_lease is not None
                         else None
                     ),
+                    run_id=finalize_run_id,
+                    storage=finalize_storage,
                 )
                 metadata_committed = True
                 terminal_state_committed = True
+                if unknown_tool_effect is not None:
+                    # Committed, or its lost acknowledgement proven applied.
+                    log_unknown_tool_effect_settlement(
+                        task_id,
+                        finalize_run_id,
+                        unknown_tool_effect.unknown_tool_attempt_id,
+                    )
             else:
                 broadcast_meta = _finalization_broadcast_meta(task_updated)
         else:
@@ -3075,6 +3128,7 @@ def _acquire_resume_task_lease(
     refuse_terminal_status: bool = False,
     run_not_resumable_out: list[bool] | None = None,
     ended_status_out: list[TaskStatus] | None = None,
+    history_turn_id_out: list[str | None] | None = None,
 ) -> TaskLease | None:
     """Validate and claim a resume lease in one worker transaction.
 
@@ -3100,6 +3154,14 @@ def _acquire_resume_task_lease(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None and history_turn_id_out is not None:
+            history_turn_id_out.append(
+                routine_history_turn_id(
+                    task,
+                    None,
+                    expected_run_id=expected_run_id or task.run_id,
+                )
+            )
         if (
             task is not None
             and task_owner_user_id is not None
@@ -3460,9 +3522,30 @@ def _finalize_resumed_task(
         # A lost acknowledgement here is not reconciled yet: the lease is
         # released in this transaction, so only the result fact's witness
         # (returned above) can prove the commit. That belongs with the
-        # same-identity retry work.
-        db.commit()
+        # same-identity retry work. Until then a COMMIT that fails on a
+        # dropped connection may have applied, so it is reported as an
+        # unreconciled outcome; any other commit error did not apply.
+        # Read before COMMIT: the row's attributes expire on a failed one.
+        resume_storage = "v2" if task.conversation_storage_version == 2 else "v1"
+        try:
+            db.commit()
+        except Exception as commit_error:
+            if connection_was_lost(commit_error):
+                report_unknown_outcome(
+                    "resume_finalize_unreconciled",
+                    task_id=task_id,
+                    run_id=task_lease.run_id,
+                    storage=resume_storage,
+                )
+            raise
         metadata_committed = True
+        if (
+            interruption is not None
+            and interruption.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+        ):
+            log_unknown_tool_effect_settlement(
+                task_id, task_lease.run_id, interruption.unknown_tool_attempt_id
+            )
         finalized["lease_released"] = True
         finalized["final_status"] = final_task_status.value
         # Filled only now that the commit succeeded.
@@ -3607,6 +3690,7 @@ async def execute_resume_background(
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
     lease: TaskLease | None = preacquired_lease
+    lease_was_preacquired = preacquired_lease is not None
     lease_released = False
     settlement_error: str | None = None
     settlement_interruption: InterruptionReason | None = None
@@ -3829,6 +3913,7 @@ async def execute_resume_background(
             prior_status_box: list[TaskStatus] = []
             run_not_resumable_box: list[bool] = []
             ended_status_box: list[TaskStatus] = []
+            history_turn_id_box: list[str | None] = []
             lease = await acquire_task_lease_cancellation_safe(
                 lambda: _acquire_resume_task_lease(
                     task_id,
@@ -3838,6 +3923,7 @@ async def execute_resume_background(
                     refuse_terminal_status=refuse_terminal_status,
                     run_not_resumable_out=run_not_resumable_box,
                     ended_status_out=ended_status_box,
+                    history_turn_id_out=history_turn_id_box,
                 ),
                 lambda acquired: _settle_resumed_task_lease(
                     acquired,
@@ -3847,6 +3933,8 @@ async def execute_resume_background(
             )
             if prior_status_box:
                 resume_prior_status = prior_status_box[0]
+            if history_turn_id_box:
+                history_turn_id = history_turn_id_box[0] or delivery_turn_id
             if (
                 lease is None
                 and refuse_terminal_status
@@ -4039,13 +4127,16 @@ async def execute_resume_background(
             assert lease_stop_event is not None
             assert lease_heartbeat_task is not None
 
-        history_turn_id = await run_db_io_cancellation_safe(
-            lambda: load_routine_history_turn_id(
-                task_id,
-                delivery_turn_id,
-                expected_run_id=lease.run_id if lease is not None else expected_run_id,
+        if lease_was_preacquired:
+            history_turn_id = await run_db_io_cancellation_safe(
+                lambda: load_routine_history_turn_id(
+                    task_id,
+                    delivery_turn_id,
+                    expected_run_id=(
+                        lease.run_id if lease is not None else expected_run_id
+                    ),
+                )
             )
-        )
 
         # The resumed agent may have been rebuilt from history with no
         # outbound message handler, in which case the runtime drops the
@@ -4535,6 +4626,11 @@ async def execute_resume_background(
             # Failing it here could fail a resumable run; keep the exact
             # lease and let TTL recovery decide once the read works.
             defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+            report_unknown_outcome(
+                "settlement_deferred",
+                task_id=task_id,
+                run_id=lease.run_id if lease is not None else None,
+            )
             logger.error(
                 "task_id=%s component=resume interrupted run's checkpoint "
                 "unresolvable; retaining lease for TTL recovery: %s",
@@ -4897,7 +4993,16 @@ async def execute_resume_background(
                                         task_id,
                                         exc_info=True,
                                     )
-                    except Exception:
+                    except Exception as settle_err:
+                        if isinstance(settle_err, InterruptionSettlementDeferred):
+                            # Raised by the settlement itself; the run-phase
+                            # catch above returns before settling, so this is
+                            # a different occurrence from that one.
+                            report_unknown_outcome(
+                                "settlement_deferred",
+                                task_id=task_id,
+                                run_id=lease.run_id,
+                            )
                         logger.error(
                             "resume lease settlement failed for task %s; "
                             "retaining lease for TTL recovery",

@@ -711,6 +711,23 @@ def test_main_reports_a_database_failure_by_class_only(tmp_path, monkeypatch):
     assert output.splitlines() == ["FAIL database: OperationalError"]
 
 
+def test_main_rejects_invalid_mcp_policy_before_checking_rows(monkeypatch):
+    monkeypatch.setenv("XAGENT_MCP_PRIVATE_ENDPOINTS", "http://mcp-tools:8000/mcp")
+    monkeypatch.setattr(
+        connector_readiness,
+        "_load_app_rows",
+        lambda: pytest.fail("rows loaded before policy validation"),
+    )
+
+    code, output = _run()
+
+    assert code == 1
+    assert output.splitlines() == [
+        "FAIL configuration: Invalid deployment MCP network policy "
+        "configuration: XAGENT_MCP_PRIVATE_ENDPOINTS"
+    ]
+
+
 def test_main_total_timeout_flag(database, monkeypatch):
     monkeypatch.setenv("XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS", "5")
     hang = {"command": sys.executable, "args": ["-c", "import sys; sys.stdin.read()"]}

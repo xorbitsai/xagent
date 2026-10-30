@@ -66,26 +66,50 @@ literal format strings.
 
 ### (1) V2 event commit failures
 
-- `xagent.trace.database.writes`, attribute `outcome`: `succeeded`,
-  `retryable_failed` (one failed attempt that the caller may rerun), `failed`.
-- `xagent.execution_event.write.retries`, attributes `site` and `outcome`.
-  Sites sharing the counter: `trace_fact`, `input_accept`, `outbound`.
-  `outcome` is `retried` (an attempt was rerun), `recovered` (a rerun
-  succeeded) or `failed` (a write that was retried at least once ended in
-  failure). A failure on the first attempt that is not retryable is counted in
-  `xagent.trace.database.writes{outcome="failed"}` only.
-- Logs: WARNING `Trace event commit attempt failed for task %s: %s` per
-  retryable attempt; ERROR `Required trace event persistence failed for task %s
-  after retries: %s` when retries are used up; ERROR `Required trace event
-  persistence failed for task %s: %s` for a non-retryable failure of a required
-  event. The writer then raises "Conversation event commit failed" and the run
-  is aborted and settled by the existing failure path.
+- `xagent.execution_event.commit.failures`, attributes `site`
+  (`trace_fact`, `outbound`, `input_accept`, `terminal_failure`), `error.type`
+  (the first cause that is not the persistence wrapper, e.g.
+  `OperationalError`, `ExecutionEventConflict`,
+  `ToolAttemptAlreadyStartedError`, `TaskLeaseLostError`) and
+  `storage="v2"`. One count per failed write, after retries are used up or
+  for a failure that is not retryable.
+- With it, one ERROR line per failed write:
+  `execution_event_commit_failed task_id=... run_id=... storage=v2
+  component=execution-events site=... error_type=... sqlstate=... retried=...`,
+  plus `tool_attempt_id=...` for tool events. It carries no exception text;
+  this is the only ERROR a failed V2 write logs.
+- `xagent.execution_event.write.retries`, attributes `site` and `outcome`:
+  `retried` (an attempt was rerun), `recovered` (a rerun succeeded) or
+  `failed` (a write that was retried at least once ended in failure). Each
+  retryable trace-fact attempt also logs WARNING `Trace event commit attempt failed for
+  task %s: %s`.
+- `xagent.trace.database.writes`, attributes `outcome` (`succeeded`,
+  `retryable_failed`, `failed`) and `storage` (`v1`/`v2`).
+- After a failed write the run is aborted and settled by the existing failure
+  path.
 
 ### (2) Unknown outcomes
 
-- WARNING `Task %s run %s settles as an unknown tool effect (verdict
-  unknown_tool_effect)`: a run ended without a result while a tool attempt had
-  a start fact and no committed outcome.
+- `xagent.execution_event.unknown_outcomes`, attributes `operation` (the
+  kind) and `storage` (`v1`, `v2`, or `unknown` where the storage version is
+  not in scope). One count per occurrence, with one line
+  `execution_event_outcome_unknown task_id=... run_id=... storage=...
+  component=execution-events kind=... ref=...`. Kinds:
+  - `tool_effect`: a run was settled as an unknown tool effect; `ref` is the
+    tool attempt id. Reported once, after the settlement committed (a
+    settlement that rolls back reports nothing; lease recovery reports it
+    later).
+  - `turn_commit`, `command_commit`: a turn or command acceptance whose
+    COMMIT outcome could not be reconciled; `ref` is the turn id.
+  - `finalize_ack_unresolved`: a finalize COMMIT lost its acknowledgement
+    (dropped connection) and the read-back could not decide.
+  - `resume_finalize_unreconciled`: the same for a resumed run's finalize,
+    which has no read-back yet.
+  - `settlement_deferred`: settlement could not decide from the checkpoint
+    and left the lease to TTL recovery.
+  - `finalize_ack_reconciled` (INFO): a lost acknowledgement the read-back
+    proved applied. A confirmed success counted for visibility; exclude it
+    from alerts on this counter.
 - WARNING `Settlement unknown-effect classification unavailable: task_id=...`
   and WARNING `Event recovery unavailable: task_id=...`: the classification
   read itself failed; the degradation `checkpoint_recovery_unavailable` is set.
@@ -94,10 +118,10 @@ literal format strings.
   replay is unsafe.` (or `... stopped with an unknown tool effect ...` when the
   run settled itself). The admin endpoint reports only `has_error_message`.
 - A start fact exists for an attempt id that is started again:
-  `Tool attempt already started; result reconciliation required` is raised
-  rather than re-executing the tool.
-- No metric counts unknown outcomes today; use the logs above and the
-  `open_tool_attempts` section of the admin endpoint.
+  `ToolAttemptAlreadyStartedError` (`Tool attempt already started; result
+  reconciliation required`) is raised rather than re-executing the tool.
+- Use the `open_tool_attempts` section of the admin endpoint to see every
+  attempt in a task's log that started without a committed outcome.
 
 ### (3) Reconnect duplicates and gaps
 
@@ -113,6 +137,24 @@ literal format strings.
 
 ### (4) Recovery refusals
 
+- `xagent.execution_event.recovery.refusals`, attributes `operation` (the
+  reader: `owner_check`, `checkpoint`, `tool_outcome`), `outcome` and
+  `storage="v2"`, with one line `execution_event_recovery_refused task_id=...
+  run_id=... storage=v2 component=execution-events reader=... outcome=...`
+  (plus `tool_attempt_id=...` for tool outcomes). Levels by outcome:
+  - INFO: `lease_mismatch`, `task_ended`, `task_missing`. Normal fencing:
+    another owner took over or the task already finished.
+  - WARNING: `unknown_tool_effect`, `unavailable`, `page_limit`.
+  - ERROR: `corrupt`.
+- It counts refused reads, including the classification probes made by the
+  lease-recovery sweep, settlement and auto-recovery decisions. A stuck task
+  can count once per sweep; it is neither a per-task nor a per-resume count.
+- Not reported yet: refusals raised while choosing the checkpoint partition on
+  the root read path (lease or run mismatch, `active_run`,
+  `superseded_legacy`, a missing task without a lease, stale widening, a
+  failed run-tagged probe, session checkout), and a corrupt checkpoint found
+  by the setup-time history read. The degradations and resume logs below
+  still cover most of them.
 - Degradations (names on `/health`, details in the admin endpoint on the
   process that set them): `checkpoint_load_unavailable` (an execution-event
   checkpoint read failed; cleared by the next successful read),

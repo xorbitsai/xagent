@@ -94,7 +94,7 @@ from .db_write_retry import (
     bound_rerun_lock_wait_no_commit,
     retry_db_write_async,
 )
-from .execution_event_signals import report_commit_failure
+from .execution_event_signals import report_commit_failure, report_unknown_outcome
 from .external_task_cancel import (
     EXTERNAL_TASK_SOURCE,
     EXTERNAL_TURN_INTERRUPTED_MESSAGE,
@@ -137,13 +137,14 @@ from .task_lease_service import (
     fail_and_release_task_lease_no_commit,
     get_runner_id,
     lock_task_lease_for_settlement_no_commit,
+    log_unknown_tool_effect_settlement,
     pause_and_release_task_lease_no_commit,
     release_task_lease,
-    run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
     run_while_task_lease_owned,
     stop_task_lease_heartbeat,
     task_lease_attempt_predicate,
+    unknown_tool_effect_of_run,
     utc_now,
     validate_preacquired_task_lease_isolated,
 )
@@ -1588,6 +1589,21 @@ def _claim_turn_no_commit(
     return _ClaimedTurn(**vars(accepted), task_lease=lease)
 
 
+def _report_turn_commit_unknown(
+    task_id: int, payload: TaskTurnPayload, claimed: _PreparedTurn
+) -> None:
+    """Report one turn acceptance whose COMMIT outcome could not be resolved.
+
+    No storage version is in scope at the raise sites, so it is ``unknown``.
+    """
+    report_unknown_outcome(
+        "turn_commit",
+        task_id=task_id,
+        run_id=claimed.run_id or None,
+        ref=payload.turn_id,
+    )
+
+
 def _begin_turn_atomic_sync(
     task_id: int,
     task_owner_user_id: int,
@@ -1659,6 +1675,7 @@ def _begin_turn_atomic_sync(
             ):
                 invalidate_task_cache_best_effort(task_id)
                 return result
+            _report_turn_commit_unknown(task_id, payload, result)
             raise TaskTurnCommitOutcomeUnknown(
                 task_id, payload.turn_id
             ) from commit_error
@@ -1814,6 +1831,7 @@ def commit_claimed_turn_or_reconcile(
             claimed=claimed,
         ):
             return
+        _report_turn_commit_unknown(task_id, payload, claimed)
         raise TaskTurnCommitOutcomeUnknown(task_id, payload.turn_id) from commit_error
 
 
@@ -2110,6 +2128,17 @@ def settle_task_lease_isolated(
                         error_message=error_message,
                     )
                 if failed:
+                    # Reported only once this settlement has committed.
+                    unknown_tool_effect = (
+                        decision is not None
+                        and decision.outcome
+                        is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+                    )
+                    unknown_tool_attempt_id = (
+                        decision.unknown_tool_attempt_id
+                        if decision is not None
+                        else None
+                    )
                     # The fenced UPDATE bypassed the identity map, and the
                     # decision may have loaded this row before it.
                     settle_db.expire_all()
@@ -2121,14 +2150,18 @@ def settle_task_lease_isolated(
                         turn_id,
                         expected_run_id=lease.run_id,
                     )
-                    if (
-                        classify_unknown_tool_effect
+                    unknown = (
+                        unknown_tool_effect_of_run(settle_db, lease)
+                        if classify_unknown_tool_effect
                         and (
                             decision is None
                             or decision.outcome is InterruptionOutcome.LEGACY
                         )
-                        and run_has_unknown_tool_effect(settle_db, lease)
-                    ):
+                        else None
+                    )
+                    if unknown is not None:
+                        unknown_tool_effect = True
+                        unknown_tool_attempt_id = unknown.tool_attempt_id
                         error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
                         setattr(task, "error_message", error_message)
                         if decision is not None:
@@ -2176,6 +2209,10 @@ def settle_task_lease_isolated(
                         else {}
                     )
                     settle_db.commit()
+                    if unknown_tool_effect:
+                        log_unknown_tool_effect_settlement(
+                            lease.task_id, lease.run_id, unknown_tool_attempt_id
+                        )
                     if report is not None:
                         report.control_state = dict(event_state)
                     invalidate_task_cache_best_effort(lease.task_id)
@@ -2776,6 +2813,11 @@ def _schedule_bg(
                     # checkpoint. Settling here would fail a run that may be
                     # resumable; keep the lease and let TTL recovery decide.
                     defer_settlement_to_ttl_recovery = True
+                    report_unknown_outcome(
+                        "settlement_deferred",
+                        task_id=task_id,
+                        run_id=lease.run_id if lease is not None else run_id,
+                    )
                     logger.error(
                         "task_id=%s component=settlement interrupted run's "
                         "checkpoint unresolvable; retaining lease for TTL "
@@ -2989,6 +3031,15 @@ def _schedule_bg(
                         # Preserve the concrete lease on failure. Its TTL is the
                         # recovery path; clearing it here would create an ownerless
                         # RUNNING row and permit an overlapping execution.
+                        if isinstance(settle_err, InterruptionSettlementDeferred):
+                            # Raised by the settlement itself, not by the run
+                            # (which skips settlement when it defers), so it is
+                            # a different occurrence from the one above.
+                            report_unknown_outcome(
+                                "settlement_deferred",
+                                task_id=task_id,
+                                run_id=lease.run_id,
+                            )
                         logger.error(
                             "task %s lease settlement failed: %s; "
                             "retaining lease for TTL recovery",

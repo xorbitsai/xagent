@@ -8,6 +8,13 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .....config import (
+    MCP_PRIVATE_CIDRS,
+    MCP_PRIVATE_ENDPOINTS,
+    get_mcp_private_cidrs,
+    get_mcp_private_endpoints,
+)
+from ....model.network_policy import PrivateEndpointPolicy
 from ....utils.public_http_transport import PublicHttpTransport, UnsafePublicHttpTarget
 from ..web_content import get_trusted_proxy_url
 
@@ -41,6 +48,19 @@ def _origin(url: str) -> str:
     return f"{parsed.scheme}://{host}:{port}"
 
 
+class MCPNetworkPolicy(PrivateEndpointPolicy):
+    label = "MCP"
+    noun = "MCP"
+    endpoints_variable = MCP_PRIVATE_ENDPOINTS
+    cidrs_variable = MCP_PRIVATE_CIDRS
+
+    def private_endpoints(self) -> list[str]:
+        return get_mcp_private_endpoints()
+
+    def private_cidrs(self) -> list[str]:
+        return get_mcp_private_cidrs()
+
+
 class MCPHttpTransport(PublicHttpTransport):
     """Public-only, with every request bound to this MCP server's origin."""
 
@@ -49,7 +69,13 @@ class MCPHttpTransport(PublicHttpTransport):
 
     def __init__(self, endpoint_url: str) -> None:
         self._origin = _origin(endpoint_url)
-        super().__init__(proxy_url=get_trusted_proxy_url())
+        policy = MCPNetworkPolicy()
+        # Unlisted origins keep the shared public-only resolver, unchanged by
+        # approvals for other servers.
+        super().__init__(
+            proxy_url=get_trusted_proxy_url(),
+            _policy=policy if policy.approves(endpoint_url) else None,
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         # Bind at HTTPX's public transport entrypoint, not an implementation

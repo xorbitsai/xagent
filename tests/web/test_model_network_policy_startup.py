@@ -1,4 +1,4 @@
-"""Bad operator model policy fails before either host admits work."""
+"""Bad operator model or MCP policy fails before either host admits work."""
 
 from unittest.mock import Mock
 
@@ -14,9 +14,11 @@ from xagent.core.utils.security import PrivateNetworkHostError
     [
         ("XAGENT_MODEL_PRIVATE_ENDPOINTS", "http://localhost:9997/not-an-origin"),
         ("XAGENT_MODEL_PRIVATE_CIDRS", "10.0.0.1/8"),
+        ("XAGENT_MCP_PRIVATE_ENDPOINTS", "http://mcp-tools:8000/mcp"),
+        ("XAGENT_MCP_PRIVATE_CIDRS", "169.254.0.0/16"),
     ],
 )
-async def test_invalid_model_policy_fails_before_host_initialization(
+async def test_invalid_network_policy_fails_before_host_initialization(
     monkeypatch, host, variable, value
 ):
     monkeypatch.setenv(variable, value)

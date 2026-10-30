@@ -373,12 +373,15 @@ class CheckpointRecoveryResolution:
     pattern state -- and ``None`` for every other verdict. ``encoded`` marks
     a legacy ``trace_events`` payload, whose snapshot may still hold storage
     refs (``decode_trace_event_data`` resolves them); a version-two
-    ``recovery_state`` payload is always inline.
+    ``recovery_state`` payload is always inline. ``tool_attempt_id`` names
+    the attempt an ``UNKNOWN_TOOL_EFFECT`` verdict was reached on, when the
+    read knew it (the first one found; an identifier only).
     """
 
     verdict: CheckpointRecoveryVerdict
     checkpoint: dict[str, Any] | None = None
     encoded: bool = False
+    tool_attempt_id: str | None = None
 
 
 def _checkpoint_row_matches_candidate(
@@ -523,30 +526,17 @@ def _recoverable_trace_row(row: TraceEvent) -> CheckpointRecoveryResolution:
     )
 
 
-def _resolve_event_checkpoint_recovery(
-    db: Session,
-    *,
-    task_id: int,
-    run_id: str | None,
-) -> CheckpointRecoveryVerdict:
-    """Classify one V2 run from its committed recovery facts.
-
-    ``CheckpointUnavailableError`` and ``SQLAlchemyError`` propagate: the
-    caller decides whether an undetermined read is retried or deferred.
-    """
-
-    return _resolve_event_checkpoint_recovery_with_data(
-        db, task_id=task_id, run_id=run_id
-    ).verdict
-
-
 def _resolve_event_checkpoint_recovery_with_data(
     db: Session,
     *,
     task_id: int,
     run_id: str | None,
 ) -> CheckpointRecoveryResolution:
-    """``_resolve_event_checkpoint_recovery`` keeping the checkpoint it read."""
+    """Classify one V2 run from its committed recovery facts.
+
+    ``CheckpointUnavailableError`` and ``SQLAlchemyError`` propagate: the
+    caller decides whether an undetermined read is retried or deferred.
+    """
 
     from ...core.agent.checkpoint import (
         CheckpointAccessRefusedError,
@@ -565,9 +555,10 @@ def _resolve_event_checkpoint_recovery_with_data(
             execution_id=str(task_id),
             run_id=run_id,
         )
-    except UnknownToolEffectError:
+    except UnknownToolEffectError as unknown:
         return CheckpointRecoveryResolution(
-            CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+            CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT,
+            tool_attempt_id=unknown.tool_attempt_id,
         )
     except (CheckpointCorruptError, CheckpointAccessRefusedError):
         return CheckpointRecoveryResolution(CheckpointRecoveryVerdict.NOT_RECOVERABLE)
@@ -578,15 +569,21 @@ def _resolve_event_checkpoint_recovery_with_data(
     )
 
 
-def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
-    """Whether a V2 run that ended without a result left a tool effect unknown.
+def unknown_tool_effect_of_run(
+    db: Session, lease: TaskLease
+) -> CheckpointRecoveryResolution | None:
+    """The unknown tool effect a V2 run that ended without a result left, if any.
 
     Uses the classification lease recovery applies to an expired run: the
     run's latest checkpoint names a started tool attempt with no committed
-    outcome. Legacy (V1) tasks are never classified. A read that cannot be
-    completed raises -- after the same degradation signal recovery's read
-    registers -- so the caller rolls back and leaves the exact lease to TTL
-    recovery, which repeats this classification.
+    outcome. Returns that ``UNKNOWN_TOOL_EFFECT`` resolution (with the
+    attempt, when known), else ``None``. Legacy (V1) tasks are never
+    classified. A read that cannot be completed raises -- after the same
+    degradation signal recovery's read registers -- so the caller rolls back
+    and leaves the exact lease to TTL recovery, which repeats this
+    classification. It reports nothing: the settling caller reports the
+    occurrence once its transaction commits
+    (``log_unknown_tool_effect_settlement``).
     """
 
     from ...core.agent.checkpoint import CheckpointUnavailableError
@@ -594,8 +591,8 @@ def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
 
     try:
         if not uses_execution_events(db, lease.task_id):
-            return False
-        verdict = _resolve_event_checkpoint_recovery(
+            return None
+        resolution = _resolve_event_checkpoint_recovery_with_data(
             db, task_id=lease.task_id, run_id=lease.run_id
         )
     except (CheckpointUnavailableError, SQLAlchemyError) as exc:
@@ -606,20 +603,31 @@ def run_has_unknown_tool_effect(db: Session, lease: TaskLease) -> bool:
         )
         register_degradation(CHECKPOINT_RECOVERY_UNAVAILABLE, detail)
         raise
-    if verdict is not CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
-        return False
-    log_unknown_tool_effect_settlement(lease.task_id, lease.run_id)
-    return True
+    if resolution.verdict is not CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT:
+        return None
+    return resolution
 
 
-def log_unknown_tool_effect_settlement(task_id: int, run_id: str | None) -> None:
-    """The operator signal of a run settled as an unknown tool effect."""
+def log_unknown_tool_effect_settlement(
+    task_id: int, run_id: str | None, tool_attempt_id: str | None = None
+) -> None:
+    """The operator signal of a run settled as an unknown tool effect.
 
-    logger.warning(
-        "Task %s run %s settles as an unknown tool effect (verdict %s)",
-        task_id,
-        run_id,
-        CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT.value,
+    Only the V2 event-log checkpoint read yields this verdict, so the storage
+    is always ``v2``. ``tool_attempt_id`` is the attempt the verdict was
+    reached on, reported as ``ref``. Call it once per task settled, after the
+    settlement committed: a settlement that rolls back leaves the run to TTL
+    recovery, which reports it once its own transaction commits.
+    """
+
+    from .execution_event_signals import report_unknown_outcome
+
+    report_unknown_outcome(
+        "tool_effect",
+        task_id=task_id,
+        run_id=run_id,
+        ref=tool_attempt_id,
+        storage="v2",
     )
 
 

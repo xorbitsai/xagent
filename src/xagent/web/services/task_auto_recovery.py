@@ -80,7 +80,6 @@ from .task_lease_service import (
     TaskLease,
     TaskLeaseRecoveryCandidate,
     lock_task_lease_for_settlement_no_commit,
-    log_unknown_tool_effect_settlement,
     resolve_checkpoint_recovery_with_data,
     task_lease_attempt_predicate,
     utc_now,
@@ -952,11 +951,16 @@ class InterruptionDecision:
 
     ``reason`` is what the recovery row records; ``resolution`` is the
     checkpoint a pause resumes from (``None`` otherwise).
+    ``unknown_tool_attempt_id`` is, for ``FAIL_UNKNOWN_TOOL_EFFECT``, the
+    attempt the verdict was reached on when known: the settling caller
+    reports it (``log_unknown_tool_effect_settlement``) once its
+    transaction commits.
     """
 
     outcome: InterruptionOutcome
     reason: InterruptionReason
     resolution: CheckpointRecoveryResolution | None = None
+    unknown_tool_attempt_id: str | None = None
 
     @property
     def pause(self) -> bool:
@@ -1015,7 +1019,9 @@ def decide_interruption(
     2. The run's checkpoint, resolved as lease recovery resolves it:
        ``UNKNOWN_TOOL_EFFECT`` and ``NOT_RECOVERABLE`` fail, ``RECOVERABLE``
        pauses -- as a user pause when the run was PAUSE_REQUESTED (the user
-       already decided), else for ``reason``.
+       already decided), else for ``reason``. Nothing is reported here: the
+       settling caller reports an unknown tool effect once its settlement
+       commits, so a settlement that rolls back reports nothing.
     3. ``INDETERMINATE``, or a database connectivity failure while reading
        eligibility or the checkpoint, raises
        :class:`InterruptionSettlementDeferred` so every settling path keeps
@@ -1066,12 +1072,15 @@ def decide_interruption(
             f"task {task.id}: checkpoint of interrupted run {task.run_id} "
             "is not resolvable now"
         )
-    if outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT:
-        log_unknown_tool_effect_settlement(candidate.task_id, candidate.run_id)
     return InterruptionDecision(
         outcome,
         recorded,
         resolution if outcome is InterruptionOutcome.PAUSE else None,
+        unknown_tool_attempt_id=(
+            resolution.tool_attempt_id
+            if outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
+            else None
+        ),
     )
 
 

@@ -31,10 +31,11 @@ from .task_lease_service import (
     TaskLeaseHeartbeatOutcome,
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
+    log_unknown_tool_effect_settlement,
     release_task_lease_no_commit,
-    run_has_unknown_tool_effect,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
+    unknown_tool_effect_of_run,
 )
 from .task_settlement_report import RecordedInterruption, SettlementReport
 from .workforce_runtime import sync_workforce_run_status
@@ -105,6 +106,10 @@ def finalize_managed_task_lease_result(
 
     run_error = error_message
     recorded: RecordedInterruption | None = None
+    # Set when this settlement fails the run as an unknown tool effect;
+    # reported only once its transaction has committed.
+    unknown_tool_effect = False
+    unknown_tool_attempt_id: str | None = None
     try:
         interruption: InterruptionDecision | None = None
         if settle_interruption and status == TaskStatus.FAILED:
@@ -119,6 +124,8 @@ def finalize_managed_task_lease_result(
             and interruption.outcome is InterruptionOutcome.FAIL_UNKNOWN_TOOL_EFFECT
         ):
             error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+            unknown_tool_effect = True
+            unknown_tool_attempt_id = interruption.unknown_tool_attempt_id
         # For a pause this generic release is equivalent to
         # ``pause_and_release_task_lease_no_commit``: it does not itself
         # require RUNNING, but decide_owned_run_interruption has just locked
@@ -127,12 +134,12 @@ def finalize_managed_task_lease_result(
             db.rollback()
             return False
 
-        if (
-            status == TaskStatus.FAILED
-            and execution_result is None
-            and run_has_unknown_tool_effect(db, lease)
-        ):
-            error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+        if status == TaskStatus.FAILED and execution_result is None:
+            unknown = unknown_tool_effect_of_run(db, lease)
+            if unknown is not None:
+                error_message = TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR
+                unknown_tool_effect = True
+                unknown_tool_attempt_id = unknown.tool_attempt_id
         db.expire_all()
         task = db.query(Task).filter(Task.id == lease.task_id).one()
         setattr(
@@ -242,6 +249,10 @@ def finalize_managed_task_lease_result(
         db.rollback()
         raise
 
+    if unknown_tool_effect:
+        log_unknown_tool_effect_settlement(
+            lease.task_id, lease.run_id, unknown_tool_attempt_id
+        )
     if paused_state is not None and interruption is not None:
         if report is not None:
             report.control_state = dict(paused_state)

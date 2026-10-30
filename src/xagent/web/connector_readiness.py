@@ -455,6 +455,15 @@ def main(argv: Sequence[str] | None = None, *, out: TextIO | None = None) -> int
     )
     args = parser.parse_args(argv)
 
+    from ..core.tools.core.mcp.http import MCPNetworkPolicy
+    from ..core.utils.security import PrivateNetworkHostError
+
+    try:
+        MCPNetworkPolicy()
+    except PrivateNetworkHostError as exc:
+        print(f"FAIL configuration: {exc}", file=out)
+        return 1
+
     from ..config import get_mcp_tool_init_timeout_seconds
     from .builtin_mcp_registry import get_builtin_public_mcp_app_rows
     from .oauth_readiness import _parse_exclude

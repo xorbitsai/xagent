@@ -9,15 +9,52 @@ and private cloud addresses, including servers marked `managed: "internal"`.
 That label describes lifecycle/ownership, not permission to bypass SSRF policy.
 The model-only private allowlist does not authorize MCP endpoints.
 
+## Operator-only private MCP endpoints
+
+An operator can approve specific private HTTP/SSE/streamable-HTTP MCP servers
+by configuring BOTH XAGENT_MCP_PRIVATE_ENDPOINTS (exact HTTP(S) origins,
+including ports) and XAGENT_MCP_PRIVATE_CIDRS (approved DNS address ranges):
+
+    XAGENT_MCP_PRIVATE_ENDPOINTS=http://mcp-tools:8000,http://10.0.3.7:9000
+    XAGENT_MCP_PRIVATE_CIDRS=172.20.0.0/16,10.0.3.7/32
+
+The rules match the model exceptions in `model-outbound-security.md`: paths,
+query strings, userinfo and wildcard origins are rejected; every DNS answer
+must be public or inside an approved range for a listed origin; a different
+protocol or port does not inherit approval; metadata, link-local, multicast,
+unspecified and reserved addresses stay forbidden. Invalid entries fail web and
+worker startup with the variable name. The settings are read only from process
+environment, so users who create MCP servers cannot enable them. Requests stay
+bound to the configured origin and redirects to another origin are refused.
+
+The approval is deployment-wide: any user allowed to create an MCP server can
+point one at an approved origin, under any path. List only origins that every
+such user may reach, and do not use broad CIDRs without that review.
+
+Dual-stack localhost commonly resolves to BOTH 127.0.0.1 and ::1, so approving
+`http://localhost:8000` needs both `127.0.0.1/32` and `::1/128`, or use an exact
+literal origin such as `http://127.0.0.1:8000`. Well-known NAT64 answers in
+64:ff9b::/96 are classified by their embedded IPv4 destination, as described in
+`model-outbound-security.md`. Origins that are not listed keep the default
+public-only behavior unchanged.
+
+These settings cover only the HTTP transports used to load and call tools.
+`POST /api/mcp/test-connection` still rejects an approved private origin even
+though loading the server works, and private servers that need MCP OAuth
+discovery or refresh are not supported. WebSocket MCP servers keep their
+existing policy, and the model allowlist still does not apply to MCP. Do not
+enable `XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS` to work around either. With a
+trusted egress proxy enabled, the proxy must also allow the private origin.
+
 For an internal server, migrate to a reviewed stdio connector when the server
 supports that transport, or provide a public HTTPS endpoint with authentication
 and appropriate network controls. Custom stdio programs run in the configured
 code sandbox as its unprivileged user and fail closed when no sandbox is
 available. Their commands, working directories, dependencies, and any private
 network access must therefore exist explicitly inside that sandbox.
-An HTTP-only private server that cannot use either option is not supported by
-this default transport. A future private MCP allowlist needs a separate design;
-do not disable validation or use the OAuth development flag as a runtime bypass.
+An HTTP-only private server that cannot use either option needs the operator
+allowlist above; do not disable validation or use the OAuth development flag
+as a runtime bypass.
 
 `XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS` is a development-only exception for MCP
 OAuth discovery/token exchange, MCP OAuth grant refresh (including runtime

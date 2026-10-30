@@ -476,8 +476,8 @@ async def test_team_owned_catalog_row_is_probed_with_the_team(db_users, monkeypa
     db.commit()
     _team_owns(server)
     adapter = _Adapter(
-        "stripe_get_account_info",
-        _text_result(json.dumps({"status": "success", "account": {"id": "a"}})),
+        "stripe_list_customers",
+        _text_result(json.dumps({"status": "success", "customers": []})),
     )
     monkeypatch.setattr(LOADER, _ProbeLoader(adapter))
 
@@ -486,7 +486,7 @@ async def test_team_owned_catalog_row_is_probed_with_the_team(db_users, monkeypa
     )
 
     assert result.outcome is ConnectorProbeOutcome.OK
-    assert adapter.calls == [{}]
+    assert adapter.calls == [{"limit": 1}]
 
 
 # --- actor stdio -------------------------------------------------------------
@@ -739,8 +739,8 @@ async def test_actor_stdio_probe_runs_the_declared_tool(
 ):
     db, user = db_users
     adapter = _Adapter(
-        "posthog_get_current_user",
-        _text_result(json.dumps({"status": "success", "user": {"id": 1}})),
+        "posthog_list_feature_flags",
+        _text_result(json.dumps({"status": "success", "feature_flags": []})),
     )
     loader = _ProbeLoader(adapter)
     monkeypatch.setattr(LOADER, loader)
@@ -752,7 +752,7 @@ async def test_actor_stdio_probe_runs_the_declared_tool(
     assert result.outcome is ConnectorProbeOutcome.OK
     assert result.server_id is None
     assert result.app_id == STDIO_APP_ID
-    assert result.tool == "posthog_get_current_user"
+    assert result.tool == "posthog_list_feature_flags"
     ((connections, kwargs),) = loader.calls
     assert set(connections) == {STDIO_APP_ID}
     assert kwargs["connector_refs"] == {}

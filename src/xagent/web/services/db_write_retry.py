@@ -20,6 +20,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Iterator, TypeVar
 
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -70,6 +71,27 @@ def database_sqlstate(error: BaseException) -> str | None:
         if state:
             return str(state)
     return None
+
+
+def connection_was_lost(error: BaseException) -> bool:
+    """Whether ``error`` or a link of its cause chain is a dropped connection.
+
+    The one failure that can hide an applied COMMIT: psycopg2 reports a lost
+    COMMIT acknowledgement as a dropped connection (SQLAlchemy marks it
+    ``connection_invalidated``) and carries no SQLSTATE, since the loss is
+    client-side. Every other COMMIT error -- a deadlock, a serialization
+    failure, SQLite's "database is locked", an integrity violation -- is
+    the server refusing it, so the commit did not apply. This is narrower
+    than :func:`is_database_unavailable`, which counts every
+    ``OperationalError`` as transient. ``InterfaceError`` (the DBAPI
+    connection-level class, raised for an already-closed connection) counts
+    too.
+    """
+    return any(
+        getattr(link, "connection_invalidated", False)
+        or isinstance(link, sa_exc.InterfaceError)
+        for link in cause_links(error)
+    )
 
 
 def is_retryable_database_error(error: BaseException) -> bool:

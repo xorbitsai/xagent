@@ -46,6 +46,7 @@ from xagent.web.services.gmail_provisioning import (
     release_gmail_mailbox_if_unused,
     sweep_gmail_provisioning,
 )
+from xagent.web.services.gmail_triggers import GmailOAuthReconnectRequiredError
 from xagent.web.services.trigger_providers import gmail as gmail_trigger_provider
 
 
@@ -1917,6 +1918,138 @@ def test_token_cleared_gmail_account_quiesces_watch_and_trigger(
     assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
     assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
     assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 0
+
+    repeated = mark_gmail_oauth_reconnect_required(
+        db_session,
+        oauth_account=account,
+        expected_refresh_token="refresh-token",
+    )
+    assert repeated is not None
+    db_session.refresh(state)
+    db_session.refresh(trigger)
+    assert state.last_error == GMAIL_RECONNECT_REQUIRED_ERROR
+    assert trigger.provisioning_error == GMAIL_RECONNECT_REQUIRED_ERROR
+
+
+def test_sweep_excludes_reconnect_tombstones_before_limit(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    tombstone = _create_oauth(
+        db_session,
+        user,
+        email="tombstone@gmail.example",
+    )
+    setattr(tombstone, "access_token", "")
+    setattr(tombstone, "refresh_token", None)
+    _create_gmail_trigger(db_session, user, agent, tombstone)
+    tombstone_state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(tombstone.id),
+        email=str(tombstone.email),
+        history_id="dead-history",
+        topic_name="projects/demo-project/topics/dead",
+        status=TriggerProvisioningStatus.FAILED.value,
+        last_error=GMAIL_RECONNECT_REQUIRED_ERROR,
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+    )
+
+    live = _create_oauth(db_session, user, email="live@gmail.example")
+    _create_gmail_trigger(db_session, user, agent, live)
+    live_state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(live.id),
+        email=str(live.email),
+        history_id="live-history",
+        topic_name="projects/demo-project/topics/live",
+        status=TriggerProvisioningStatus.FAILED.value,
+        last_error="transient failure",
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    db_session.add_all([tombstone_state, live_state])
+    db_session.commit()
+    attempted_account_ids: list[int] = []
+
+    def service_factory(_db: Session, account: UserOAuth) -> FakeGmailService:
+        attempted_account_ids.append(int(account.id))
+        return FakeGmailService()
+
+    attempts = sweep_gmail_provisioning(
+        db_session,
+        limit=1,
+        service_factory=service_factory,
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert attempts == 1
+    assert attempted_account_ids == [int(live.id)]
+    db_session.refresh(live_state)
+    assert live_state.status == TriggerProvisioningStatus.ACTIVE.value
+
+
+def test_mark_gmail_reconnect_preserves_newer_refresh_token(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    account.refresh_token = "new-refresh-token"
+    account.expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="hist-newer-token",
+        topic_name="projects/demo-project/topics/xagent-gmail-newer",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    updated = mark_gmail_oauth_reconnect_required(
+        db_session,
+        oauth_account=account,
+        expected_refresh_token="superseded-refresh-token",
+    )
+
+    assert updated is None
+    db_session.refresh(account)
+    db_session.refresh(state)
+    assert account.access_token == "access-token"
+    assert account.refresh_token == "new-refresh-token"
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+
+
+def test_provisioning_records_superseded_refresh_without_clearing_new_credentials(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    account.refresh_token = "refresh-token"
+    db_session.commit()
+
+    def reconnect_then_fail(db: Session, oauth_account: UserOAuth) -> None:
+        setattr(oauth_account, "refresh_token", "new-refresh-token")
+        db.add(oauth_account)
+        db.commit()
+        raise GmailOAuthReconnectRequiredError(attempted_refresh_token="refresh-token")
+
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=reconnect_then_fail,
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    db_session.refresh(account)
+    assert account.access_token == "access-token"
+    assert account.refresh_token == "new-refresh-token"
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert state.last_error == (
+        "Gmail credential refresh was superseded by newer credentials"
+    )
 
 
 def test_mark_gmail_oauth_reconnect_required_serializes_with_the_transition_lock(

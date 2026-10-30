@@ -403,6 +403,7 @@ def success_with_capped_dict(
     *,
     extra_fields: dict[str, Any] | None = None,
     critical_fields: dict[str, Any] | None = None,
+    keep_list_tail: bool = False,
 ) -> str:
     """Build a ``{"status": "success", ...}`` payload, trimming a dict
     until it fits the platform's output limit.
@@ -469,6 +470,11 @@ def success_with_capped_dict(
     up to and including mid-string. Reserved envelope keys cannot be
     overridden by either extra_fields or critical_fields, and the two must
     not share a key.
+
+    ``keep_list_tail`` changes list truncation to retain the newest/end of
+    each list instead of the oldest/start. Use it for ascending time series
+    where recent values are more useful than historical values. It does not
+    affect dict-key truncation or callers that leave it at the default.
 
     If the payload is still too large once ``data`` itself is fully
     truncated, the last resort walks a ladder from most to least
@@ -576,7 +582,11 @@ def success_with_capped_dict(
         )
         target_value = working[target_key]
         if isinstance(target_value, list):
-            working[target_key] = target_value[: len(target_value) // 2]
+            retained_length = len(target_value) // 2
+            if keep_list_tail and retained_length:
+                working[target_key] = target_value[-retained_length:]
+            else:
+                working[target_key] = target_value[:retained_length]
         else:
             halved = _halve_dict_keys(target_value)
             if halved is not None:

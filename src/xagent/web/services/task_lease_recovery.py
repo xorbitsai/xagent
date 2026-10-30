@@ -26,6 +26,7 @@ from .task_lease_service import (
     TaskLeaseRecoveryCandidate,
     get_expired_task_lease_candidates,
     get_next_expired_task_lease_candidate_for_update,
+    log_unknown_tool_effect_settlement,
     recover_expired_task_lease_no_commit,
     resolve_checkpoint_recovery_with_data,
     utc_now,
@@ -72,6 +73,10 @@ class TaskLeaseRecovery:
 
     status: TaskStatus
     pause: LeaseRecoveryPause | None = None
+    # The run was failed as an unknown tool effect (on this attempt, when
+    # known); reported once its transaction commits.
+    unknown_tool_effect: bool = False
+    unknown_tool_attempt_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -399,7 +404,13 @@ def stage_task_lease_recovery_no_commit(
     if trigger_error is not None:
         sync_trigger_run_status(db, task, next_status, error_message=trigger_error)
     if next_status != TaskStatus.PAUSED:
-        return TaskLeaseRecovery(next_status)
+        return TaskLeaseRecovery(
+            next_status,
+            unknown_tool_effect=(
+                verdict is CheckpointRecoveryVerdict.UNKNOWN_TOOL_EFFECT
+            ),
+            unknown_tool_attempt_id=resolution.tool_attempt_id,
+        )
     return TaskLeaseRecovery(
         next_status,
         LeaseRecoveryPause(
@@ -448,21 +459,26 @@ def _commit_task_lease_recovery(
         except Exception:
             db.rollback()
             raise
-    _record_recovered_task_lease(candidate, staged.status)
+    _record_recovered_task_lease(candidate, staged)
     return staged
 
 
 def _record_recovered_task_lease(
     candidate: TaskLeaseRecoveryCandidate,
-    recovered: TaskStatus,
+    recovered: TaskLeaseRecovery,
 ) -> None:
     """Publish post-commit effects for one successfully recovered lease."""
 
+    if recovered.unknown_tool_effect:
+        # Once per task, after the transaction that settled it committed.
+        log_unknown_tool_effect_settlement(
+            candidate.task_id, candidate.run_id, recovered.unknown_tool_attempt_id
+        )
     invalidate_task_cache_best_effort(candidate.task_id)
     logger.warning(
         "Recovered expired task lease: task=%s status=%s runner=%s run=%s",
         candidate.task_id,
-        recovered.value,
+        recovered.status.value,
         candidate.runner_id,
         candidate.run_id,
     )
@@ -606,7 +622,7 @@ def _recover_expired_task_leases_batch_with_postgresql_locks(
             cursor = candidate.cursor
             if recovered is not None:
                 recovered_count += 1
-                _record_recovered_task_lease(candidate, recovered.status)
+                _record_recovered_task_lease(candidate, recovered)
                 if recovered.pause is not None:
                     paused.append(recovered.pause)
     except Exception as exc:

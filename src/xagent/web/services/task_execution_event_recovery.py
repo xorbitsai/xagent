@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -20,7 +20,34 @@ from ...core.agent.checkpoint import (
 from ...core.agent.result import CONTROL_TOOL_NAMES
 from ..models.task import Task, TaskStatus
 from ..models.task_execution_event import TaskExecutionEvent
+from .execution_event_signals import report_recovery_refusal
 from .task_lease_service import current_task_lease, task_lease_attempt_predicate
+
+_E = TypeVar("_E", bound=BaseException)
+
+
+def _refused(
+    error: _E,
+    reader: str,
+    outcome: str,
+    *,
+    task_id: int,
+    run_id: str | None = None,
+    tool_attempt_id: str | None = None,
+) -> _E:
+    """Report a refusal where it is first raised, then hand the error back.
+
+    Nothing in this module reports a refusal again as it propagates. Callers
+    outside it report only refusals they raise or convert themselves.
+    """
+    report_recovery_refusal(
+        reader,
+        outcome,
+        task_id=task_id,
+        run_id=run_id,
+        tool_attempt_id=tool_attempt_id,
+    )
+    return error
 
 
 def event_checkpoint_data(event: TaskExecutionEvent) -> dict[str, Any]:
@@ -47,8 +74,15 @@ def check_recovery_owner(db: Session, task_id: int) -> None:
     query = select(Task.status).where(Task.id == task_id)
     if lease is not None:
         if lease.task_id != task_id:
-            raise CheckpointAccessRefusedError(
-                "Recovery reader is bound to another task", reason="lease_mismatch"
+            raise _refused(
+                CheckpointAccessRefusedError(
+                    "Recovery reader is bound to another task",
+                    reason="lease_mismatch",
+                ),
+                "owner_check",
+                "lease_mismatch",
+                task_id=task_id,
+                run_id=lease.run_id,
             )
         query = query.where(
             Task.runner_id == lease.runner_id,
@@ -57,13 +91,26 @@ def check_recovery_owner(db: Session, task_id: int) -> None:
         )
     status = db.scalar(query)
     if status is None:
-        raise CheckpointAccessRefusedError(
-            "Recovery reader lost its task lease", reason="lease_mismatch"
+        raise _refused(
+            CheckpointAccessRefusedError(
+                "Recovery reader lost its task lease", reason="lease_mismatch"
+            ),
+            "owner_check",
+            # Without a lease the query is by id alone: the task row is gone.
+            "task_missing" if lease is None else "lease_mismatch",
+            task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
         )
     # Coordinator cancellation can settle a task without releasing its lease.
     # This live status check also covers settlements committed after horizon H.
     if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}:
-        raise CheckpointAccessRefusedError("Recovery task has already ended")
+        raise _refused(
+            CheckpointAccessRefusedError("Recovery task has already ended"),
+            "owner_check",
+            "task_ended",
+            task_id=task_id,
+            run_id=lease.run_id if lease is not None else None,
+        )
 
 
 def read_event_checkpoint(
@@ -75,11 +122,26 @@ def read_event_checkpoint(
     run_id: str | None,
     filter_run: bool = True,
 ) -> dict[str, Any] | None:
+    def corrupt(message: str) -> CheckpointCorruptError:
+        return _refused(
+            CheckpointCorruptError(message),
+            "checkpoint",
+            "corrupt",
+            task_id=task_id,
+            run_id=run_id,
+        )
+
     horizon = db.scalar(
         select(Task.conversation_event_sequence).where(Task.id == task_id)
     )
     if horizon is None:
-        raise CheckpointUnavailableError("Recovery task no longer exists")
+        raise _refused(
+            CheckpointUnavailableError("Recovery task no longer exists"),
+            "checkpoint",
+            "task_missing",
+            task_id=task_id,
+            run_id=run_id,
+        )
     query = select(TaskExecutionEvent).where(
         TaskExecutionEvent.task_id == task_id,
         TaskExecutionEvent.scope_id == scope_id,
@@ -110,7 +172,12 @@ def read_event_checkpoint(
                 identity = checkpoint_execution_id(raw_data)
                 if identity and identity != execution_id:
                     continue
-            data = event_checkpoint_data(event)
+            try:
+                data = event_checkpoint_data(event)
+            except CheckpointCorruptError as error:
+                raise _refused(
+                    error, "checkpoint", "corrupt", task_id=task_id, run_id=run_id
+                )
             if scope_id == "root":
                 settlement = db.scalar(
                     select(TaskExecutionEvent)
@@ -132,29 +199,33 @@ def read_event_checkpoint(
                         or settlement.payload.get("status")
                         not in {status.value for status in TaskStatus}
                     ):
-                        raise CheckpointCorruptError("Unreadable execution settlement")
+                        raise corrupt("Unreadable execution settlement")
                     if settlement.payload["status"] in {
                         TaskStatus.COMPLETED.value,
                         TaskStatus.FAILED.value,
                     }:
-                        raise CheckpointAccessRefusedError(
-                            "Execution was already settled; its checkpoint cannot be resumed"
+                        raise _refused(
+                            CheckpointAccessRefusedError(
+                                "Execution was already settled; its checkpoint cannot be resumed"
+                            ),
+                            "checkpoint",
+                            "task_ended",
+                            task_id=task_id,
+                            run_id=run_id,
                         )
             snapshot = data["snapshot"]
             state = snapshot.get("pattern_state") or {}
             if snapshot.get("pattern") == "AutoPattern":
                 if not isinstance(state, dict):
-                    raise CheckpointCorruptError("Unreadable Auto recovery state")
+                    raise corrupt("Unreadable Auto recovery state")
                 decision = state.get("decision") or {}
                 if not isinstance(decision, dict):
-                    raise CheckpointCorruptError("Unreadable Auto decision")
+                    raise corrupt("Unreadable Auto decision")
                 action = decision.get("action")
                 if action not in ("react", "plan_execute", "final_answer") and (
                     state.get("react_state") or state.get("dag_state")
                 ):
-                    raise CheckpointCorruptError(
-                        "Auto child state has no recognized decision"
-                    )
+                    raise corrupt("Auto child state has no recognized decision")
                 state = (
                     state.get("react_state")
                     if action == "react"
@@ -165,22 +236,22 @@ def read_event_checkpoint(
             if not isinstance(state, dict) or not isinstance(
                 state.get("active_step_pattern_states", {}), dict
             ):
-                raise CheckpointCorruptError("Unreadable recovery pattern state")
+                raise corrupt("Unreadable recovery pattern state")
             states = [state, *state.get("active_step_pattern_states", {}).values()]
             for pattern_state in states:
                 if not isinstance(pattern_state, dict) or not isinstance(
                     pattern_state.get("pending_tool_calls", []), list
                 ):
-                    raise CheckpointCorruptError("Unreadable pending tool state")
+                    raise corrupt("Unreadable pending tool state")
                 for call in pattern_state.get("pending_tool_calls", []):
                     if not isinstance(call, dict) or not call.get("name"):
-                        raise CheckpointCorruptError("Unreadable pending tool call")
+                        raise corrupt("Unreadable pending tool call")
                     if call.get("name") in CONTROL_TOOL_NAMES:
                         continue
                     if not call.get("tool_attempt_id") or not call.get(
                         "assistant_message_id"
                     ):
-                        raise CheckpointCorruptError(
+                        raise corrupt(
                             "Pending tool call has no durable attempt identity"
                         )
                     read_committed_tool_outcome(
@@ -189,10 +260,17 @@ def read_event_checkpoint(
                         scope_id=scope_id,
                         tool_call=call,
                         through_sequence=int(horizon),
+                        run_id=run_id,
                     )
             return deepcopy(data)
         before, limit = int(page[-1].sequence), 100
-    raise CheckpointUnavailableError("Recovery event scan exceeded its page limit")
+    raise _refused(
+        CheckpointUnavailableError("Recovery event scan exceeded its page limit"),
+        "checkpoint",
+        "page_limit",
+        task_id=task_id,
+        run_id=run_id,
+    )
 
 
 def read_committed_tool_outcome(
@@ -202,8 +280,23 @@ def read_committed_tool_outcome(
     scope_id: str,
     tool_call: dict[str, Any],
     through_sequence: int | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any] | None:
-    """Return an occurrence's committed outcome, or refuse an unknown effect."""
+    """Return an occurrence's committed outcome, or refuse an unknown effect.
+
+    ``run_id`` only labels refusal signals; it never narrows the read.
+    """
+
+    def refused(error: _E, outcome: str) -> _E:
+        return _refused(
+            error,
+            "tool_outcome",
+            outcome,
+            task_id=task_id,
+            run_id=run_id,
+            tool_attempt_id=str(tool_call["tool_attempt_id"]),
+        )
+
     query = (
         select(TaskExecutionEvent)
         .where(
@@ -231,17 +324,27 @@ def read_committed_tool_outcome(
             or data.get("tool_name") != tool_call["name"]
             or data.get("tool_call_id") != tool_call.get("id")
         ):
-            raise CheckpointCorruptError(
-                "Tool attempt facts do not match the saved call"
+            raise refused(
+                CheckpointCorruptError(
+                    "Tool attempt facts do not match the saved call"
+                ),
+                "corrupt",
             )
         if event.kind in {"tool_execution_end", "tool_execution_failed"}:
             if data.get("interrupted") is True:
-                raise UnknownToolEffectError(
-                    "Interrupted tool attempt has no confirmed result"
+                raise refused(
+                    UnknownToolEffectError(
+                        "Interrupted tool attempt has no confirmed result",
+                        tool_attempt_id=str(tool_call["tool_attempt_id"]),
+                    ),
+                    "unknown_tool_effect",
                 )
             if "result" not in data:
-                raise CheckpointCorruptError(
-                    "Committed tool outcome has no reusable result"
+                raise refused(
+                    CheckpointCorruptError(
+                        "Committed tool outcome has no reusable result"
+                    ),
+                    "corrupt",
                 )
             outcome = {
                 "result": deepcopy(data["result"]),
@@ -250,8 +353,12 @@ def read_committed_tool_outcome(
                 else None,
             }
     if outcome is None:
-        raise UnknownToolEffectError(
-            "Tool attempt started without a committed result; automatic replay is unsafe"
+        raise refused(
+            UnknownToolEffectError(
+                "Tool attempt started without a committed result; automatic replay is unsafe",
+                tool_attempt_id=str(tool_call["tool_attempt_id"]),
+            ),
+            "unknown_tool_effect",
         )
     return outcome
 

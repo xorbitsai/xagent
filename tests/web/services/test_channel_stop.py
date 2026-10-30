@@ -393,6 +393,31 @@ def test_a_second_stop_finds_nothing_to_stop(channel):
     assert _snapshot(channel) == after
 
 
+def test_only_a_committed_cancel_drops_the_task_cache(channel, monkeypatch):
+    invalidate = Mock()
+    monkeypatch.setattr(channel_stop, "invalidate_task_cache_best_effort", invalidate)
+    _record(channel, state="dispatched", command_status="pending")
+
+    assert _stop(channel).outcome is ChannelStopOutcome.CANCELLED
+    invalidate.assert_called_once_with(channel.task_id)
+
+    # Nothing written: nothing to drop.
+    assert _stop(channel).outcome is ChannelStopOutcome.IDLE
+    invalidate.assert_called_once()
+
+
+def test_a_cancel_that_keeps_racing_drops_nothing(channel, monkeypatch):
+    invalidate = Mock()
+    monkeypatch.setattr(channel_stop, "invalidate_task_cache_best_effort", invalidate)
+    monkeypatch.setattr(
+        channel_stop, "cancel_pending_auto_resume_no_commit", lambda *a, **k: RACED
+    )
+    _record(channel)
+
+    assert _stop(channel).outcome is ChannelStopOutcome.ACTIVE
+    invalidate.assert_not_called()
+
+
 # --------------------------------------------------------------------------
 # S5. No tracked turn: pause the run this chat waits for
 # --------------------------------------------------------------------------

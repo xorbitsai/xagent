@@ -1,11 +1,16 @@
-"""Default-public model policy with explicit, deployment-owned private exceptions."""
+"""Default-public outbound policy with explicit, deployment-owned private exceptions."""
 
 import asyncio
 import ipaddress
 import socket
 from urllib.parse import urlsplit
 
-from ...config import get_model_private_cidrs, get_model_private_endpoints
+from ...config import (
+    MODEL_PRIVATE_CIDRS,
+    MODEL_PRIVATE_ENDPOINTS,
+    get_model_private_cidrs,
+    get_model_private_endpoints,
+)
 from ..utils.security import (
     PrivateNetworkHostError,
     reject_private_network_host,
@@ -51,31 +56,44 @@ def _hard_deny(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
-def _parts(url: str) -> tuple[str, str, int]:
+def _parts(url: str, label: str) -> tuple[str, str, int]:
     # Reuse the shared normalized shape/port/userinfo checks. Only the final
-    # destination decision is model-specific; input downloads never use it.
+    # destination decision is policy-specific; input downloads never use it.
     parsed = validate_public_http_url_shape(url, host_validator=lambda host: None)
     host = str(parsed.hostname).rstrip(".")
     if host in _METADATA_HOSTS:
-        raise PrivateNetworkHostError("Model metadata destinations are forbidden")
+        raise PrivateNetworkHostError(f"{label} metadata destinations are forbidden")
     try:
         address = _address(host)
     except ValueError:
         pass
     else:
         if _hard_deny(address):
-            raise PrivateNetworkHostError("Model metadata/unsafe address is forbidden")
+            raise PrivateNetworkHostError(
+                f"{label} metadata/unsafe address is forbidden"
+            )
     return parsed.scheme, host, parsed.port or (443 if parsed.scheme == "https" else 80)
 
 
-class ModelNetworkPolicy:
+class PrivateEndpointPolicy:
+    label: str
+    noun: str
+    endpoints_variable: str
+    cidrs_variable: str
+
+    def private_endpoints(self) -> list[str]:
+        raise NotImplementedError
+
+    def private_cidrs(self) -> list[str]:
+        raise NotImplementedError
+
     def __init__(self) -> None:
-        variable = "XAGENT_MODEL_PRIVATE_ENDPOINTS"
+        variable = self.endpoints_variable
         try:
-            endpoints = get_model_private_endpoints()
+            endpoints = self.private_endpoints()
             origins = set()
             for url in endpoints:
-                origin = _parts(url)
+                origin = _parts(url, self.label)
                 parsed = urlsplit(url)
                 if (
                     "*" in str(parsed.hostname)
@@ -83,25 +101,32 @@ class ModelNetworkPolicy:
                     or parsed.query
                     or parsed.fragment
                 ):
-                    raise ValueError("Private model endpoints must be exact origins")
+                    raise ValueError("Private endpoints must be exact origins")
                 origins.add(origin)
             self.origins = frozenset(origins)
-            variable = "XAGENT_MODEL_PRIVATE_CIDRS"
+            variable = self.cidrs_variable
             self.networks = tuple(
-                ipaddress.ip_network(value) for value in get_model_private_cidrs()
+                ipaddress.ip_network(value) for value in self.private_cidrs()
             )
             for network in self.networks:
                 if network.is_global or _hard_deny(network.network_address):
-                    raise ValueError("Private model CIDRs must be safe private ranges")
+                    raise ValueError("Private CIDRs must be safe private ranges")
         except ValueError:
             # Invalid operator configuration is terminal too, not an SDK
             # connection failure worth retrying. Do not echo configured URLs.
             raise PrivateNetworkHostError(
-                f"Invalid deployment model network policy configuration: {variable}"
+                f"Invalid deployment {self.noun} network policy "
+                f"configuration: {variable}"
             ) from None
 
+    def approves(self, url: str) -> bool:
+        try:
+            return _parts(url, self.label) in self.origins
+        except ValueError:
+            return False
+
     def destination(self, url: str) -> tuple[str, int]:
-        return self._destination(_parts(url))
+        return self._destination(_parts(url, self.label))
 
     def _destination(self, origin: tuple[str, str, int]) -> tuple[str, int]:
         try:
@@ -115,12 +140,12 @@ class ModelNetworkPolicy:
 
     def _validate_addresses(self, approved: bool, addresses: list[str]) -> None:
         if not addresses:
-            raise PrivateNetworkHostError("Model host did not resolve")
+            raise PrivateNetworkHostError(f"{self.label} host did not resolve")
         for value in addresses:
             address = _address(value)
             if _hard_deny(address):
                 raise PrivateNetworkHostError(
-                    "Model metadata/unsafe address is forbidden"
+                    f"{self.label} metadata/unsafe address is forbidden"
                 )
             if address.is_global:
                 continue
@@ -130,16 +155,17 @@ class ModelNetworkPolicy:
                 if address.version == network.version
             ):
                 raise PrivateNetworkHostError(
-                    "Private model destination is not approved by deployment policy"
+                    f"Private {self.noun} destination is not approved "
+                    "by deployment policy"
                 )
 
     def validate_resolved(self, url: str, addresses: list[str]) -> None:
-        origin = _parts(url)
+        origin = _parts(url, self.label)
         self._destination(origin)
         self._validate_addresses(origin in self.origins, addresses)
 
     def resolve_sync(self, url: str) -> list[str]:
-        origin = _parts(url)
+        origin = _parts(url, self.label)
         host, port = self._destination(origin)
         # Preserve a caller's DNS root label: dropping it can make the resolver
         # search unrelated deployment domains for an otherwise exact origin.
@@ -156,3 +182,16 @@ class ModelNetworkPolicy:
 
     async def resolve(self, url: str) -> list[str]:
         return await asyncio.to_thread(self.resolve_sync, url)
+
+
+class ModelNetworkPolicy(PrivateEndpointPolicy):
+    label = "Model"
+    noun = "model"
+    endpoints_variable = MODEL_PRIVATE_ENDPOINTS
+    cidrs_variable = MODEL_PRIVATE_CIDRS
+
+    def private_endpoints(self) -> list[str]:
+        return get_model_private_endpoints()
+
+    def private_cidrs(self) -> list[str]:
+        return get_model_private_cidrs()

@@ -255,3 +255,106 @@ def test_policy_absence_preserves_legacy_user_id_posting(monkeypatch) -> None:
 
     assert result["status"] == "success"
     assert request.call_args.kwargs["json"]["channel"] == "U0123456789"
+
+
+WRITE_TOOLS = {
+    "slack_join_channel",
+    "slack_post_message",
+    "slack_add_reaction",
+    "slack_remove_reaction",
+    "slack_upload_file",
+}
+
+
+def _tool_names() -> set[str]:
+    import asyncio
+
+    return {tool.name for tool in asyncio.run(slack.mcp.list_tools())}
+
+
+@pytest.fixture
+def _restore_registry(monkeypatch):
+    # The server object is module-global; give each test its own tool table.
+    manager = slack.mcp._tool_manager
+    monkeypatch.setattr(manager, "_tools", dict(manager._tools))
+
+
+def test_write_tools_are_the_ones_classified_as_writes() -> None:
+    assert slack._WRITE_TOOL_NAMES == WRITE_TOOLS
+
+
+def test_the_tools_a_policy_refuses_are_exactly_the_classified_writes(
+    monkeypatch,
+) -> None:
+    # Ties the classification to enforcement: a tool that checks the write
+    # capability but is registered with plain ``@mcp.tool()`` would stay on
+    # offer under a policy, and this test would catch it.
+    import asyncio
+
+    _install_policy(monkeypatch)
+    response = Mock(
+        status_code=200, json=Mock(return_value={"ok": True}), raise_for_status=Mock()
+    )
+    monkeypatch.setattr(slack.requests, "request", Mock(return_value=response))
+
+    refused = set()
+    for tool in asyncio.run(slack.mcp.list_tools()):
+        schema = tool.inputSchema
+        args = {name: ALLOWED for name in schema.get("required", [])}
+        result = json.loads(slack.mcp._tool_manager.get_tool(tool.name).fn(**args))
+        if "does not allow this operation" in result.get("message", ""):
+            refused.add(tool.name)
+
+    assert refused == slack._WRITE_TOOL_NAMES
+
+
+def test_a_policy_server_offers_no_write_tools(monkeypatch, _restore_registry) -> None:
+    _install_policy(monkeypatch)
+    before = _tool_names()
+
+    slack._drop_tools_the_policy_forbids()
+
+    after = _tool_names()
+    assert after == before - WRITE_TOOLS
+    assert {"slack_get_channel_history", "slack_search_messages"} <= after
+
+
+def test_a_server_without_a_policy_keeps_every_tool(
+    monkeypatch, _restore_registry
+) -> None:
+    monkeypatch.delenv(slack._CHANNEL_ACCESS_POLICY_ENV_VAR, raising=False)
+    before = _tool_names()
+
+    slack._drop_tools_the_policy_forbids()
+
+    assert _tool_names() == before
+    assert WRITE_TOOLS <= before
+
+
+def test_the_server_entry_point_drops_write_tools_before_serving(
+    monkeypatch,
+) -> None:
+    # Production launches ``python -m xagent.web.tools.mcp.slack``; the drop
+    # must happen in that entry point and before the server starts serving.
+    import asyncio
+    import runpy
+    import sys
+
+    from mcp.server.fastmcp import FastMCP
+
+    _install_policy(monkeypatch)
+    # Execute a fresh copy as ``__main__``, as ``python -m`` does, instead of
+    # re-running the already imported module object.
+    monkeypatch.delitem(sys.modules, slack.__name__)
+    served: list[set[str]] = []
+
+    def run(self, *args, **kwargs) -> None:
+        served.append({tool.name for tool in asyncio.run(self.list_tools())})
+
+    monkeypatch.setattr(FastMCP, "run", run)
+
+    runpy.run_module("xagent.web.tools.mcp.slack", run_name="__main__")
+
+    assert len(served) == 1
+    assert served[0].isdisjoint(WRITE_TOOLS)
+    assert "slack_get_channel_history" in served[0]

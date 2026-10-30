@@ -106,9 +106,11 @@ CONNECTOR_PROBES: Mapping[str, ConnectorProbe] = {
     "myob": ConnectorProbe("myob_get_business_info"),
     # API key
     "aws": ConnectorProbe("aws_get_caller_identity"),
-    "posthog": ConnectorProbe("posthog_get_current_user"),
+    # /users/@me/ needs user:read, which the catalog description never asks for.
+    "posthog": ConnectorProbe("posthog_list_feature_flags", {"limit": 1}),
     "mixpanel": ConnectorProbe("mixpanel_list_event_names", {"limit": 1}),
-    "stripe": ConnectorProbe("stripe_get_account_info"),
+    # /v1/account needs Accounts Read, which the catalog description never asks for.
+    "stripe": ConnectorProbe("stripe_list_customers", {"limit": 1}),
     "freshdesk": ConnectorProbe("freshdesk_list_agents", {"per_page": 1}),
     "chartmogul": ConnectorProbe("chartmogul_list_customers", {"per_page": 1}),
     "shopify": ConnectorProbe("shopify_validate_connection"),

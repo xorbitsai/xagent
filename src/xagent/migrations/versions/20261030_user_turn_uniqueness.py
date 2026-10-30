@@ -1,7 +1,7 @@
 """Limit chat turn uniqueness to user input rows.
 
 Revision ID: 20261030_user_turn_uniqueness
-Revises: 20261027_wrap_legacy_password_hashes
+Revises: 20261029_update_chartmogul_description
 """
 
 from typing import Sequence, Union
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20261030_user_turn_uniqueness"
-down_revision: Union[str, None] = "20261027_wrap_legacy_password_hashes"
+down_revision: Union[str, None] = "20261029_update_chartmogul_description"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

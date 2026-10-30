@@ -106,6 +106,7 @@ from .db_runtime import (
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
+from .execution_event_signals import report_unknown_outcome
 from .external_task_cancel import (
     EXTERNAL_CANCEL_BROADCAST_REJECTION_REASONS,
     EXTERNAL_COMMAND_SCOPE,
@@ -855,8 +856,11 @@ def _claim_user_message_delivery_isolated(
                         error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE,
                     )
             claim_snapshot = _snapshot_user_message_delivery(claim)
+            # A failed flush wrote nothing; only a failed COMMIT is unknown.
+            flushed = False
             try:
                 db.flush()
+                flushed = True
                 db.commit()
             except Exception as commit_error:
                 _retire_command_session_best_effort(db, task_id=task_id)
@@ -869,6 +873,15 @@ def _claim_user_message_delivery_isolated(
                     expected_run_id=expected_run_id,
                     expected_status=expected_status,
                 ):
+                    if flushed:
+                        # No storage version is in scope here: reported as
+                        # unknown.
+                        report_unknown_outcome(
+                            "command_commit",
+                            task_id=task_id,
+                            run_id=expected_run_id,
+                            ref=turn_id,
+                        )
                     raise _TaskCommandCommitOutcomeUnknown(
                         f"live delivery {turn_id} has an unknown commit outcome"
                     ) from commit_error
@@ -1273,8 +1286,11 @@ def _prepare_task_message_sync(
             db.expire(task)
             db.refresh(task)
             routing = _load_task_command_routing_snapshot(db, task)
+            # A failed flush wrote nothing; only a failed COMMIT is unknown.
+            flushed = False
             try:
                 db.flush()
+                flushed = True
                 db.commit()
             except Exception as commit_error:
                 _retire_command_session_best_effort(
@@ -1290,6 +1306,13 @@ def _prepare_task_message_sync(
                     expected_run_id=routing.run_id,
                     expected_status=TaskStatus.RUNNING,
                 ):
+                    if flushed:
+                        report_unknown_outcome(
+                            "command_commit",
+                            task_id=routing.task_id,
+                            run_id=routing.run_id,
+                            ref=turn_id,
+                        )
                     raise _TaskCommandCommitOutcomeUnknown(
                         f"created task turn {turn_id} has an unknown commit outcome"
                     ) from commit_error

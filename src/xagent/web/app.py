@@ -1867,8 +1867,10 @@ async def startup_event() -> None:
 
     validate_auth_config()
     from ..core.model.network_policy import ModelNetworkPolicy
+    from ..core.tools.core.mcp.http import MCPNetworkPolicy
 
     ModelNetworkPolicy()  # Fail before admitting work if operator policy is invalid.
+    MCPNetworkPolicy()
     from .services.auth_attempts import validate_auth_attempt_storage
 
     await asyncio.to_thread(validate_auth_attempt_storage)

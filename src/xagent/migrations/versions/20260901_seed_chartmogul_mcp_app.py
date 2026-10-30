@@ -39,7 +39,7 @@ APP_ID = "chartmogul"
 ROW = {
     "app_id": APP_ID,
     "name": "ChartMogul",
-    "description": "Connect your ChartMogul account (with a per-user API key from Profile -> API keys) to look up and manage customers, contacts, and sales opportunities.",
+    "description": "Connect your ChartMogul account (with a per-user API key from Profile -> API keys) to manage customers, contacts, and sales opportunities, and analyze MRR, ARR, churn, LTV, and other subscription metrics.",
     "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
     "transport": "stdio",
     "provider_name": None,

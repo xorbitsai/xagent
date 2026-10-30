@@ -94,7 +94,14 @@ class UnknownToolEffectError(CheckpointReadError):
 
     Unlike a transient read failure, retrying this checkpoint cannot establish
     whether the tool performed its side effect before interruption.
+
+    ``tool_attempt_id`` names the attempt whose effect is unknown, when the
+    raiser knows it (an identifier only, for operator signals).
     """
+
+    def __init__(self, *args: object, tool_attempt_id: str | None = None) -> None:
+        super().__init__(*args)
+        self.tool_attempt_id = tool_attempt_id
 
 
 class CheckpointCorruptError(CheckpointReadError):

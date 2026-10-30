@@ -292,9 +292,9 @@ failure.
 
 - Each probe is one read-only, idempotent vendor call that asks for the
   smallest page the tool accepts, for example `github_get_current_user`,
-  `slack_list_channels` with `limit=1`, `stripe_get_account_info`. Nothing is
-  written at the vendor. Intercom's probe is a read through Intercom's
-  `POST /conversations/search`.
+  `slack_list_channels` with `limit=1`, `stripe_list_customers` with
+  `limit=1`. Nothing is written at the vendor. Intercom's probe is a read
+  through Intercom's `POST /conversations/search`.
 - The connector is started exactly as in L2, including the token refresh, so
   L2's side effects apply.
 - The server runs one probe per web process at a time. A probe that overlaps

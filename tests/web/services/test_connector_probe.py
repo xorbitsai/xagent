@@ -138,8 +138,8 @@ def _connect_catalog_stripe(db, user) -> MCPServer:
 
 
 def _stripe_ok() -> _Adapter:
-    payload = {"status": "success", "account": {"id": "acct_1"}}
-    return _Adapter("stripe_get_account_info", _text_result(json.dumps(payload)))
+    payload = {"status": "success", "customers": [], "truncated": False}
+    return _Adapter("stripe_list_customers", _text_result(json.dumps(payload)))
 
 
 class _ForbiddenSandboxManager:
@@ -569,9 +569,9 @@ async def test_catalog_api_key_row_passes_its_declared_probe(db_users, monkeypat
     result = await run_connector_probe(db, user=user, server_id=server.id)
 
     assert result == ConnectorProbeResult(
-        ConnectorProbeOutcome.OK, server.id, "stripe", "stripe_get_account_info", None
+        ConnectorProbeOutcome.OK, server.id, "stripe", "stripe_list_customers", None
     )
-    assert adapter.calls == [{}]
+    assert adapter.calls == [{"limit": 1}]
 
 
 @pytest.mark.asyncio
@@ -651,7 +651,7 @@ async def test_a_catalog_row_a_task_would_sandbox_fails_closed(db_users, monkeyp
 
     assert result.outcome is ConnectorProbeOutcome.UNSUPPORTED
     assert result.reason == "sandboxed"
-    assert result.tool == "stripe_get_account_info"
+    assert result.tool == "stripe_list_customers"
     assert loader.calls == []
 
 

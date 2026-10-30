@@ -42,6 +42,7 @@ from .task_command_transport import (
     stage_task_command,
 )
 from .task_execution_controller import TaskControlState
+from .task_orchestrator import invalidate_task_cache_best_effort
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,11 @@ def stop_channel_task_sync(
         break
     else:
         logger.warning("Channel stop of task %s kept losing a race", task_id)
+    if result.outcome is ChannelStopOutcome.CANCELLED:
+        # The cancel moved ``state_version``; a cached detail or status read
+        # keyed on ``updated_at`` (one-second resolution on SQLite) would
+        # otherwise keep serving the old fence.
+        invalidate_task_cache_best_effort(task_id)
     if staged:
         notify_task_command_dispatcher()
     increment_counter(

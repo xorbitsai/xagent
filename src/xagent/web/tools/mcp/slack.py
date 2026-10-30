@@ -4,6 +4,7 @@ import math
 import os
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,36 @@ _SLACK_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,}$")
 # post into a DM, so that id must pass through unchanged rather than being
 # misread as a bare channel name and prefixed with "#" (which 404s).
 _SLACK_ANY_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{5,}$")
+
+
+# Tools that need the ``write`` capability. A trusted runtime policy only ever
+# grants ``read`` (``_SUPPORTED_POLICY_CAPABILITIES``), so under a policy every
+# one of these fails before reaching Slack. ``_drop_tools_the_policy_forbids``
+# removes them at startup instead of offering the model tools that cannot work.
+_WRITE_TOOL_NAMES: set[str] = set()
+
+
+def _write_tool(fn: Callable[..., str]) -> Callable[..., str]:
+    """Register ``fn`` as an MCP tool that writes to Slack."""
+
+    _WRITE_TOOL_NAMES.add(fn.__name__)
+    return mcp.tool()(fn)
+
+
+def _drop_tools_the_policy_forbids() -> None:
+    """Hide the write tools from a server started under a runtime policy.
+
+    The policy arrives in the environment when the process starts and a
+    refreshed policy relaunches it, so this one startup check covers the whole
+    life of the server. Without a policy (standalone use, or a user's own
+    Slack token) every tool stays available. The per-call capability check in
+    each write tool remains the enforcement; this only stops offering them.
+    """
+
+    if os.environ.get(_CHANNEL_ACCESS_POLICY_ENV_VAR) is None:
+        return
+    for name in sorted(_WRITE_TOOL_NAMES):
+        mcp.remove_tool(name)
 
 
 class _SlackChannelAccessDenied(PermissionError):
@@ -555,7 +586,7 @@ def _request_requiring_membership(
         ) from None
 
 
-@mcp.tool()
+@_write_tool
 def slack_join_channel(channel: str) -> str:
     """
     Add the bot to a public channel so it can read, post, react, and upload
@@ -722,7 +753,7 @@ def slack_list_channels(
         return _error(str(e))
 
 
-@mcp.tool()
+@_write_tool
 def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     """
     Post a message to a Slack channel, DM, or as a threaded reply.
@@ -1243,7 +1274,7 @@ def _set_reaction(action: str, channel: str, timestamp: str, emoji_name: str) ->
         return _error(str(e))
 
 
-@mcp.tool()
+@_write_tool
 def slack_add_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     """
     Add an emoji reaction to a message.
@@ -1261,7 +1292,7 @@ def slack_add_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     return _set_reaction("add", channel, timestamp, emoji_name)
 
 
-@mcp.tool()
+@_write_tool
 def slack_remove_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     """
     Remove an emoji reaction the bot previously added from a message.
@@ -1271,7 +1302,7 @@ def slack_remove_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     return _set_reaction("remove", channel, timestamp, emoji_name)
 
 
-@mcp.tool()
+@_write_tool
 def slack_upload_file(
     channel: str,
     file_path: str,
@@ -1374,4 +1405,5 @@ def slack_upload_file(
 
 
 if __name__ == "__main__":
+    _drop_tools_the_policy_forbids()
     mcp.run()

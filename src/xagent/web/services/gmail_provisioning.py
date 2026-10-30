@@ -45,7 +45,11 @@ from ..models.trigger import (
     TriggerType,
 )
 from ..models.user_oauth import UserOAuth
-from .gmail_triggers import gmail_binding_id, is_legacy_gmail_binding
+from .gmail_triggers import (
+    GmailOAuthReconnectRequiredError,
+    gmail_binding_id,
+    is_legacy_gmail_binding,
+)
 from .time_utils import coerce_utc as _coerce_utc
 from .user_oauth import (
     GMAIL_OAUTH_PROVIDER,
@@ -79,6 +83,13 @@ GMAIL_ACCOUNT_UNAVAILABLE_ERROR = "Gmail account is unavailable"
 GMAIL_RECONNECT_REQUIRED_ERROR = (
     "Gmail OAuth credentials are unavailable; reconnect required"
 )
+
+
+class _ExpectedRefreshTokenUnset:
+    pass
+
+
+_EXPECTED_REFRESH_TOKEN_UNSET = _ExpectedRefreshTokenUnset()
 GMAIL_INVALID_OAUTH_ACCOUNT_BINDING_ERROR = (
     "Gmail trigger has an invalid OAuth account binding"
 )
@@ -99,8 +110,13 @@ def gmail_watch_disabled_error() -> str:
 
 
 def mark_gmail_oauth_reconnect_required(
-    db: Session, *, oauth_account: UserOAuth
-) -> int:
+    db: Session,
+    *,
+    oauth_account: UserOAuth,
+    expected_refresh_token: str | None | _ExpectedRefreshTokenUnset = (
+        _EXPECTED_REFRESH_TOKEN_UNSET
+    ),
+) -> int | None:
     """Clear a permanently-invalid Gmail grant and quiesce its watch state.
 
     Callers must not clear ``oauth_account``'s token fields themselves for an
@@ -116,6 +132,13 @@ def mark_gmail_oauth_reconnect_required(
     already holding the lock) would leave the grant tombstoned with its
     watch still reporting ACTIVE, the exact state this function exists to
     prevent.
+
+    When ``expected_refresh_token`` is supplied (including an explicit
+    ``None``), the token is re-read after acquiring the mailbox lock and
+    compared before any write. ``None`` is returned only if the account is no
+    longer an ordinary account for this user or a concurrent reconnect
+    installed different live credentials. An already-cleared reconnect
+    tombstone is an idempotent success.
     """
     if not is_ordinary_gmail(oauth_account):
         return 0
@@ -125,63 +148,111 @@ def mark_gmail_oauth_reconnect_required(
     email = str(oauth_account.email or "").strip().lower()
 
     with _gmail_watch_transition_lock(db, account_id) as transition_db:
-        transition_db.query(UserOAuth).filter(UserOAuth.id == account_id).update(
+        updated = _mark_gmail_oauth_reconnect_required_locked(
+            transition_db,
+            account_id=account_id,
+            user_id=user_id,
+            email=email,
+            expected_refresh_token=expected_refresh_token,
+        )
+        if updated is None:
+            transition_db.rollback()
+        else:
+            transition_db.commit()
+
+    if updated is not None:
+        db.expire(oauth_account)
+    return updated
+
+
+def _mark_gmail_oauth_reconnect_required_locked(
+    db: Session,
+    *,
+    account_id: int,
+    user_id: int,
+    email: str,
+    expected_refresh_token: str | None | _ExpectedRefreshTokenUnset,
+) -> int | None:
+    """Apply the reconnect tombstone while the mailbox lock is already held.
+
+    ``None`` means the account disappeared, changed ownership, or received
+    different live credentials while the failed request was in flight. An
+    existing reconnect tombstone is accepted so concurrent losers do not
+    overwrite the sentinel error with a false "superseded" failure.
+    """
+    current_account = (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.id == account_id,
+            UserOAuth.user_id == user_id,
+            ordinary_gmail_clause(),
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if current_account is None:
+        return None
+
+    already_tombstoned = (
+        current_account.refresh_token is None and not current_account.access_token
+    )
+    if (
+        expected_refresh_token is not _EXPECTED_REFRESH_TOKEN_UNSET
+        and current_account.refresh_token != expected_refresh_token
+        and not already_tombstoned
+    ):
+        return None
+
+    setattr(current_account, "access_token", "")
+    setattr(current_account, "refresh_token", None)
+    setattr(current_account, "expires_at", None)
+    db.add(current_account)
+
+    updated = (
+        db.query(GmailWatchState)
+        .filter(
+            GmailWatchState.oauth_account_id == account_id,
+            GmailWatchState.user_id == user_id,
+        )
+        .update(
             {
-                UserOAuth.access_token: "",
-                UserOAuth.refresh_token: None,
-                UserOAuth.expires_at: None,
+                GmailWatchState.status: TriggerProvisioningStatus.FAILED.value,
+                GmailWatchState.last_error: GMAIL_RECONNECT_REQUIRED_ERROR,
+                GmailWatchState.watch_expiration: None,
             },
             synchronize_session=False,
         )
+    )
 
-        updated = (
-            transition_db.query(GmailWatchState)
-            .filter(
-                GmailWatchState.oauth_account_id == account_id,
-                GmailWatchState.user_id == user_id,
-            )
-            .update(
-                {
-                    GmailWatchState.status: TriggerProvisioningStatus.FAILED.value,
-                    GmailWatchState.last_error: GMAIL_RECONNECT_REQUIRED_ERROR,
-                    GmailWatchState.watch_expiration: None,
-                },
-                synchronize_session=False,
-            )
+    triggers = (
+        db.query(AgentTrigger)
+        .filter(
+            AgentTrigger.user_id == user_id,
+            AgentTrigger.type == TriggerType.GMAIL.value,
+            AgentTrigger.enabled.is_(True),
         )
-
-        triggers = (
-            transition_db.query(AgentTrigger)
-            .filter(
-                AgentTrigger.user_id == user_id,
-                AgentTrigger.type == TriggerType.GMAIL.value,
-                AgentTrigger.enabled.is_(True),
+        .all()
+    )
+    for trigger in triggers:
+        bound_account_id = gmail_binding_id(trigger.config)
+        if bound_account_id is not None:
+            matches = bound_account_id == account_id
+        else:
+            matches = bool(
+                is_legacy_gmail_binding(trigger.config)
+                and email
+                and str(trigger.resource_id or "").strip().lower() == email
             )
-            .all()
+        if not matches:
+            continue
+        setattr(
+            trigger,
+            "provisioning_status",
+            TriggerProvisioningStatus.FAILED.value,
         )
-        for trigger in triggers:
-            bound_account_id = gmail_binding_id(trigger.config)
-            if bound_account_id is not None:
-                matches = bound_account_id == account_id
-            else:
-                matches = bool(
-                    is_legacy_gmail_binding(trigger.config)
-                    and email
-                    and str(trigger.resource_id or "").strip().lower() == email
-                )
-            if not matches:
-                continue
-            setattr(
-                trigger,
-                "provisioning_status",
-                TriggerProvisioningStatus.FAILED.value,
-            )
-            setattr(trigger, "provisioning_error", GMAIL_RECONNECT_REQUIRED_ERROR)
-            transition_db.add(trigger)
-            updated += 1
-        transition_db.commit()
-
-    db.expire(oauth_account)
+        setattr(trigger, "provisioning_error", GMAIL_RECONNECT_REQUIRED_ERROR)
+        db.add(trigger)
+        updated += 1
     return int(updated)
 
 
@@ -1162,7 +1233,7 @@ def ensure_gmail_mailbox_provisioned(
             "Gmail watch provisioning requires an ordinary Gmail account"
         )
     if not oauth_account.access_token:
-        raise GmailProvisioningError(GMAIL_RECONNECT_REQUIRED_ERROR)
+        raise GmailOAuthReconnectRequiredError()
 
     oauth_account_id = int(oauth_account.id)
     oauth_account_user_id = int(oauth_account.user_id)
@@ -1180,7 +1251,7 @@ def ensure_gmail_mailbox_provisioned(
         if transition_account is None or not is_ordinary_gmail(transition_account):
             raise GmailProvisioningError("ordinary Gmail account not found")
         if not transition_account.access_token:
-            raise GmailProvisioningError(GMAIL_RECONNECT_REQUIRED_ERROR)
+            raise GmailOAuthReconnectRequiredError()
         state = _ensure_gmail_mailbox_provisioned_locked(
             transition_db,
             transition_account,
@@ -1266,6 +1337,28 @@ def _ensure_gmail_mailbox_provisioned_locked(
         history_id, watch_expiration = _register_gmail_watch(service, topic_path)
     except Exception as exc:
         db.rollback()
+        failure: Exception = exc
+        if isinstance(exc, GmailOAuthReconnectRequiredError):
+            reconnect_updated = _mark_gmail_oauth_reconnect_required_locked(
+                db,
+                account_id=int(oauth_account.id),
+                user_id=int(oauth_account.user_id),
+                email=email,
+                expected_refresh_token=exc.attempted_refresh_token,
+            )
+            if reconnect_updated is not None:
+                db.commit()
+                state = (
+                    db.query(GmailWatchState)
+                    .filter(GmailWatchState.id == state_id)
+                    .populate_existing()
+                    .one()
+                )
+                logger.warning("Gmail OAuth grant for %s requires reconnect", email)
+                return state
+            failure = GmailProvisioningError(
+                "Gmail credential refresh was superseded by newer credentials"
+            )
         ordinary_account_exists = (
             db.query(UserOAuth.id)
             .filter(
@@ -1281,17 +1374,19 @@ def _ensure_gmail_mailbox_provisioned_locked(
             .update(
                 {
                     GmailWatchState.status: TriggerProvisioningStatus.FAILED.value,
-                    GmailWatchState.last_error: str(exc),
+                    GmailWatchState.last_error: str(failure),
                 },
                 synchronize_session=False,
             )
         )
         if updated == 0:
             db.rollback()
-            raise GmailProvisioningError("ordinary Gmail ownership changed") from exc
+            raise GmailProvisioningError(
+                "ordinary Gmail ownership changed"
+            ) from failure
         db.commit()
         state = db.query(GmailWatchState).filter(GmailWatchState.id == state_id).one()
-        logger.warning("Gmail provisioning failed for %s: %s", email, exc)
+        logger.warning("Gmail provisioning failed for %s: %s", email, failure)
         return state
 
     transition_values: dict[Any, Any] = {
@@ -1360,6 +1455,12 @@ def _provision_in_fresh_session(oauth_account_id: int) -> None:
             )
             return
         ensure_gmail_mailbox_provisioned(db, oauth_account)
+    except GmailOAuthReconnectRequiredError:
+        db.rollback()
+        logger.warning(
+            "Skipping background Gmail provisioning for reconnect tombstone %s",
+            oauth_account_id,
+        )
     except Exception:
         logger.exception(
             "Background Gmail provisioning failed for account %s", oauth_account_id
@@ -1956,6 +2057,8 @@ def sweep_gmail_provisioning(
         )
         .filter(
             ordinary_gmail_clause(),
+            UserOAuth.access_token.is_not(None),
+            UserOAuth.access_token != "",
             (GmailWatchState.status == TriggerProvisioningStatus.FAILED.value)
             | (
                 (GmailWatchState.status == TriggerProvisioningStatus.PENDING.value)
@@ -1990,6 +2093,8 @@ def sweep_gmail_provisioning(
         )
         if oauth_account is None or not is_ordinary_gmail(oauth_account):
             continue
+        if not oauth_account.access_token:
+            continue
         state_id = int(state.id)
         try:
             ensure_gmail_mailbox_provisioned(
@@ -1999,6 +2104,13 @@ def sweep_gmail_provisioning(
                 publisher_factory=publisher_factory,
                 subscriber_factory=subscriber_factory,
             )
+        except GmailOAuthReconnectRequiredError:
+            db.rollback()
+            logger.warning(
+                "Skipping Gmail provisioning sweep for reconnect tombstone %s",
+                state_id,
+            )
+            continue
         except Exception as exc:
             db.rollback()
             ordinary_account_exists = (
@@ -2116,6 +2228,13 @@ def best_effort_provision_gmail_watches_for_user(
             continue
         try:
             ensure_gmail_mailbox_provisioned(db, account)
+        except GmailOAuthReconnectRequiredError:
+            db.rollback()
+            logger.warning(
+                "Skipping Gmail watch provisioning for reconnect tombstone %s %s",
+                email,
+                context,
+            )
         except Exception as exc:
             db.rollback()
             logger.warning(

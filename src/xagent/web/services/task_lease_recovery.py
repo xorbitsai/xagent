@@ -375,8 +375,19 @@ def stage_task_lease_recovery_no_commit(
     from .task_auto_resume import trigger_error_for_recorded
     from .task_execution_controller import task_control_snapshot
     from .task_execution_event_writer import stage_result_fact_no_commit
+    from .routine_history_provenance import routine_history_turn_id
 
-    stage_result_fact_no_commit(db, task, {"error": task_error})
+    history_turn_id = routine_history_turn_id(
+        task,
+        None,
+        expected_run_id=candidate.run_id,
+    )
+    stage_result_fact_no_commit(
+        db,
+        task,
+        {"error": task_error},
+        turn_id=history_turn_id,
+    )
     sync_workforce_run_status(db, task, next_status)
     # A scheduled automatic resume keeps the TriggerRun RUNNING: the resumed
     # run settles it.

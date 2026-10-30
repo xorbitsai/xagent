@@ -22,6 +22,7 @@ from .database import Base
 # out of "pending" quickly, so the predicate is highly selective and a
 # partial index keeps the sweep from scanning the whole table as it grows.
 _PENDING_DELIVERY_CLAUSE = text("delivery_status = 'pending'")
+_USER_TURN_CLAUSE = text("role = 'user'")
 
 
 class TaskChatMessage(Base):  # type: ignore
@@ -35,6 +36,8 @@ class TaskChatMessage(Base):  # type: ignore
             "role",
             "turn_id",
             unique=True,
+            sqlite_where=_USER_TURN_CLAUSE,
+            postgresql_where=_USER_TURN_CLAUSE,
         ),
         # task_id: the per-task reconciliation call (used both from the
         # lease-recovery fenced transaction and from the isolated sweep's

@@ -38,7 +38,10 @@ from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,
 )
-from xagent.web.services.chat_history_service import persist_user_message_no_commit
+from xagent.web.services.chat_history_service import (
+    persist_assistant_message_no_commit,
+    persist_user_message_no_commit,
+)
 from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
@@ -51,6 +54,10 @@ from xagent.web.services.task_execution import (
 )
 from xagent.web.services.task_orchestrator import (
     TurnStarted,
+)
+from xagent.web.services.routine_history_provenance import (
+    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+    routine_history_turn_id,
 )
 from xagent.web.services.task_orchestrator import _schedule_bg as _real_schedule_bg
 from xagent.web.services.task_orchestrator import (
@@ -4010,6 +4017,7 @@ def test_trigger_history_keeps_same_turn_question_and_excludes_later_question(
         task.agent_config = {
             "trigger_run_id": int(run.id),
             TRIGGER_TURN_ID_CONFIG_KEY: "routine-question-turn",
+            TRIGGER_TASK_RUN_ID_CONFIG_KEY: str(task.run_id),
         }
         persist_user_message_no_commit(
             db,
@@ -4059,6 +4067,30 @@ def test_trigger_history_keeps_same_turn_question_and_excludes_later_question(
             content="Owner private follow-up",
             turn_id="private-question-turn",
         )
+        task = db.get(Task, task_id)
+        assert task is not None
+        resumed_history_turn = routine_history_turn_id(
+            task,
+            "private-question-turn",
+            expected_run_id=str(task.run_id),
+        )
+        assert resumed_history_turn == "routine-question-turn"
+        assert (
+            routine_history_turn_id(
+                task,
+                "private-question-turn",
+                expected_run_id="later-owner-run",
+            )
+            == "private-question-turn"
+        )
+        persist_assistant_message_no_commit(
+            db,
+            task_id=task_id,
+            user_id=owner_id,
+            content="The report is ready",
+            message_type="assistant_response",
+            turn_id=resumed_history_turn,
+        )
         db.commit()
     finally:
         db.close()
@@ -4080,6 +4112,7 @@ def test_trigger_history_keeps_same_turn_question_and_excludes_later_question(
         "messages": [
             {"role": "user", "content": "Routine question prompt"},
             {"role": "assistant", "content": "Choose the report format"},
+            {"role": "assistant", "content": "The report is ready"},
         ],
     }
     assert "private connector" not in history.text.lower()
@@ -4196,7 +4229,7 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
             is_visible=False,
             input="V2 prompt",
             conversation_storage_version=2,
-            conversation_event_sequence=5,
+            conversation_event_sequence=6,
         )
         db.add(task)
         db.flush()
@@ -4282,6 +4315,23 @@ def test_trigger_run_history_uses_v2_display_snapshot() -> None:
                     ),
                 ]
             ]
+        )
+        # A later private turn may contain a malformed fact. The shared
+        # routine read must neither deserialize it nor fail because of it.
+        db.add(
+            TaskExecutionEvent(
+                event_id="00000000-0000-0000-0000-000000000006",
+                task_id=int(task.id),
+                sequence=6,
+                scope_id="root",
+                run_id="private-run",
+                turn_id="private-turn",
+                idempotency_key="v2-history:malformed-private",
+                kind="assistant_message",
+                payload_version=1,
+                payload="malformed-private-payload",
+                occurred_at=occurred_at + timedelta(seconds=6),
+            )
         )
         db.commit()
         run_id = int(run.id)

@@ -19,7 +19,11 @@ async def test_question_identity_is_shared_by_runtime_persistence_and_broadcast(
     broadcast: list[dict[str, Any]] = []
 
     def fake_persist(
-        _task_id: int, event: dict[str, Any], *, authoritative: bool = False
+        _task_id: int,
+        event: dict[str, Any],
+        *,
+        authoritative: bool = False,
+        turn_id: str | None = None,
     ) -> None:
         persisted.append(dict(event))
 

@@ -54,6 +54,8 @@ from ..services.triggers import (
 from ..services.workforce_access import ensure_workforce_access
 from ..utils.db_timezone import format_datetime_for_api
 
+_RUN_HISTORY_MESSAGE_LIMIT = 200
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["triggers"])
@@ -494,26 +496,16 @@ def _audit_payload_read(
         detail["surface"] = surface
     if error is not None:
         detail["error"] = error
-    if best_effort:
-        record_trigger_audit_best_effort(
-            db,
-            outcome=TriggerAuditOutcome.PAYLOAD_READ,
-            provider=str(trigger.provider) if trigger.provider else None,
-            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
-            trigger_id=int(trigger.id),
-            detail=detail,
-            remote_ip=request.client.host if request.client else None,
-        )
-    else:
-        record_trigger_audit(
-            db,
-            outcome=TriggerAuditOutcome.PAYLOAD_READ,
-            provider=str(trigger.provider) if trigger.provider else None,
-            callback_id=str(trigger.callback_id) if trigger.callback_id else None,
-            trigger_id=int(trigger.id),
-            detail=detail,
-            remote_ip=request.client.host if request.client else None,
-        )
+    audit = record_trigger_audit_best_effort if best_effort else record_trigger_audit
+    audit(
+        db,
+        outcome=TriggerAuditOutcome.PAYLOAD_READ,
+        provider=str(trigger.provider) if trigger.provider else None,
+        callback_id=str(trigger.callback_id) if trigger.callback_id else None,
+        trigger_id=int(trigger.id),
+        detail=detail,
+        remote_ip=request.client.host if request.client else None,
+    )
 
 
 def _display_history_messages(
@@ -531,17 +523,26 @@ def _display_history_messages(
     """
     rows: list[tuple[Any, Any, Any]]
     if int(task.conversation_storage_version) == 2:
-        from ..services.task_event_display import load_event_display_snapshot
+        from ..services.task_event_display import load_event_display_messages_for_turn
 
         rows = [
             (row.get("role"), row.get("content"), row.get("turn_id"))
-            for row in load_event_display_snapshot(db, int(task.id)).messages
+            for row in load_event_display_messages_for_turn(
+                db,
+                int(task.id),
+                initiating_turn_id,
+                limit=_RUN_HISTORY_MESSAGE_LIMIT,
+            )
         ]
     else:
-        stored_rows = list(
+        stored_rows = (
             db.query(TaskChatMessage)
-            .filter(TaskChatMessage.task_id == int(task.id))
+            .filter(
+                TaskChatMessage.task_id == int(task.id),
+                TaskChatMessage.turn_id == initiating_turn_id,
+            )
             .order_by(TaskChatMessage.id.asc())
+            .limit(_RUN_HISTORY_MESSAGE_LIMIT)
             .all()
         )
         rows = []

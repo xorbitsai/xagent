@@ -593,6 +593,82 @@ describe("AgentTriggersDialog", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "triggers.runs.openTask" }))
     expect(routerPushMock).toHaveBeenCalledWith("/task/99")
+
+    fireEvent.click(screen.getByRole("button", { name: "common.refresh" }))
+    await waitFor(() => {
+      expect(
+        apiRequestMock.mock.calls.filter(
+          ([url]) => url === "http://api.local/api/agents/42/triggers/9/runs/12/history",
+        ),
+      ).toHaveLength(2)
+    })
+    expect(
+      screen.getByRole("button", { name: "triggers.runs.hideResult #99" }),
+    ).toHaveAttribute("aria-expanded", "true")
+    expect(screen.getByText("The daily report is ready")).toBeInTheDocument()
+  })
+
+  it("ignores a stale routine history response after another run is expanded", async () => {
+    let resolveFirstHistory!: (value: Response) => void
+    const firstHistory = new Promise<Response>((resolve) => {
+      resolveFirstHistory = resolve
+    })
+    const runs = [
+      {
+        id: 12, trigger_id: 9, task_id: 99, background_job_id: null,
+        status: "completed", source_event_id: "first", payload_snapshot: null,
+        idempotency_key: "run-12", error_message: null, started_at: null,
+        finished_at: null, task_expired_at: null, created_at: null, updated_at: null,
+      },
+      {
+        id: 13, trigger_id: 9, task_id: 100, background_job_id: null,
+        status: "completed", source_event_id: "second", payload_snapshot: null,
+        idempotency_key: "run-13", error_message: null, started_at: null,
+        finished_at: null, task_expired_at: null, created_at: null, updated_at: null,
+      },
+    ]
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === GMAIL_ACCOUNTS_URL) return Promise.resolve(jsonResponse(gmailAccounts))
+      if (url === "http://api.local/api/agents/42/triggers") {
+        return Promise.resolve(jsonResponse([baseTrigger9]))
+      }
+      if (url === "http://api.local/api/agents/42/triggers/9/runs") {
+        return Promise.resolve(jsonResponse(runs))
+      }
+      if (url.endsWith("/runs/12/history")) return firstHistory
+      if (url.endsWith("/runs/13/history")) {
+        return Promise.resolve(jsonResponse({
+          run_id: 13,
+          task_id: 100,
+          messages: [{ role: "assistant", content: "Second run result" }],
+        }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(
+      <AgentTriggersDialog
+        agentId={42}
+        open
+        onOpenChange={vi.fn()}
+        gmailConnection={{ isConnected: true, connectedAccount: null }}
+      />,
+    )
+    fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.edit" }))
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.runs.viewResult #99" }))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.runs.viewResult #100" }))
+    expect(await screen.findByText("Second run result")).toBeInTheDocument()
+
+    resolveFirstHistory(jsonResponse({
+      run_id: 12,
+      task_id: 99,
+      messages: [{ role: "assistant", content: "Stale first result" }],
+    }))
+    await waitFor(() => {
+      expect(screen.queryByText("Stale first result")).not.toBeInTheDocument()
+    })
+    expect(screen.getByText("Second run result")).toBeInTheDocument()
   })
 
   it("shows a workforce routine history authorization error inline", async () => {

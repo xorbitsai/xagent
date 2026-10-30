@@ -461,9 +461,9 @@ async def _run_turn_with_broken_finalize_commit(
     original_execute = Session.execute
     original_stage = task_execution.stage_result_fact_no_commit
 
-    def stage(db, task, result):
+    def stage(db, task, result, *, turn_id=None):
         target[:] = [db]
-        return original_stage(db, task, result)
+        return original_stage(db, task, result, turn_id=turn_id)
 
     def broken_commit(self):
         if not (target and target[0] is self):

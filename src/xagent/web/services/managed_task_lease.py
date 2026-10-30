@@ -147,6 +147,13 @@ def finalize_managed_task_lease_result(
                 is_failure=status == TaskStatus.FAILED,
             )
         )
+        from .routine_history_provenance import routine_history_turn_id
+
+        history_turn_id = routine_history_turn_id(
+            task,
+            turn_id,
+            expected_run_id=lease.run_id,
+        )
         if status == TaskStatus.FAILED:
             diagnostic_error = (error_message or "").strip()
             setattr(
@@ -179,7 +186,7 @@ def finalize_managed_task_lease_result(
                 content=history_content,
                 interactions=(interactions if status != TaskStatus.FAILED else None),
                 message_type=history_message_type,
-                turn_id=turn_id,
+                turn_id=history_turn_id,
             )
         stage_result_fact_no_commit(
             db,
@@ -190,7 +197,7 @@ def finalize_managed_task_lease_result(
             interruption_pause_result()
             if paused
             else dict(execution_result or {"error": error_message}),
-            turn_id=turn_id,
+            turn_id=history_turn_id,
         )
         if completion is not None:
             from ..models.task_command import TaskExecutionCommand

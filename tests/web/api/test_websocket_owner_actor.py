@@ -4195,7 +4195,10 @@ async def test_execute_resume_background_persists_missing_checkpoint_failure(
     assert "No resumable execution checkpoint" in str(task.error_message)
     delivery = (
         db_session.query(TaskChatMessage)
-        .filter(TaskChatMessage.turn_id == "deferred-failure-turn")
+        .filter(
+            TaskChatMessage.turn_id == "deferred-failure-turn",
+            TaskChatMessage.role == "user",
+        )
         .one()
     )
     assert delivery.delivery_status == DELIVERY_FAILED
@@ -4624,7 +4627,10 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
     db_session.expire_all()
     delivery = (
         db_session.query(TaskChatMessage)
-        .filter(TaskChatMessage.turn_id == "deferred-injection-failure")
+        .filter(
+            TaskChatMessage.turn_id == "deferred-injection-failure",
+            TaskChatMessage.role == "user",
+        )
         .one()
     )
     assert delivery.delivery_status == (

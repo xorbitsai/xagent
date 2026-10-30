@@ -725,30 +725,6 @@ export function AgentTriggersDialog({
     }
   }, [resolvedOwner, setSelectedTriggerId, t])
 
-  // Takes the target trigger explicitly so navigation handlers can load runs
-  // for a selection they just made (before the state round-trips).
-  const loadRunsFor = useCallback(async (trigger: AgentTrigger | null) => {
-    resetRunHistory()
-    if (!resolvedOwner || !trigger || trigger.id < 0) {
-      setRuns([])
-      return
-    }
-    setRunsLoading(true)
-    try {
-      setRuns(await listOwnerTriggerRuns(resolvedOwner, trigger.id))
-    } catch (err) {
-      console.error(err)
-      toast.error(err instanceof Error ? err.message : t("triggers.messages.runsLoadFailed"))
-    } finally {
-      setRunsLoading(false)
-    }
-  }, [resetRunHistory, resolvedOwner, t])
-
-  const loadRuns = useCallback(
-    () => loadRunsFor(selectedTrigger),
-    [loadRunsFor, selectedTrigger],
-  )
-
   const loadRunHistory = useCallback(async (run: AgentTriggerRun) => {
     if (!resolvedOwner || run.task_id === null) return
     const requestId = ++runHistoryRequestRef.current
@@ -782,6 +758,45 @@ export function AgentTriggersDialog({
       }
     }
   }, [resolvedOwner, t])
+
+  // Takes the target trigger explicitly so navigation handlers can load runs
+  // for a selection they just made (before the state round-trips). A manual
+  // refresh preserves and re-fetches an expanded run; navigation resets it.
+  const loadRunsFor = useCallback(async (
+    trigger: AgentTrigger | null,
+    preserveExpanded = false,
+  ) => {
+    const preservedRunId = preserveExpanded ? expandedRunId : null
+    if (!preserveExpanded) resetRunHistory()
+    if (!resolvedOwner || !trigger || trigger.id < 0) {
+      setRuns([])
+      if (preserveExpanded) resetRunHistory()
+      return
+    }
+    setRunsLoading(true)
+    try {
+      const loadedRuns = await listOwnerTriggerRuns(resolvedOwner, trigger.id)
+      setRuns(loadedRuns)
+      if (preservedRunId !== null) {
+        const preservedRun = loadedRuns.find((run) => run.id === preservedRunId)
+        if (preservedRun) {
+          await loadRunHistory(preservedRun)
+        } else {
+          resetRunHistory()
+        }
+      }
+    } catch (err) {
+      console.error(err)
+      toast.error(err instanceof Error ? err.message : t("triggers.messages.runsLoadFailed"))
+    } finally {
+      setRunsLoading(false)
+    }
+  }, [expandedRunId, loadRunHistory, resetRunHistory, resolvedOwner, t])
+
+  const loadRuns = useCallback(
+    () => loadRunsFor(selectedTrigger, true),
+    [loadRunsFor, selectedTrigger],
+  )
 
   const toggleRunHistory = useCallback((run: AgentTriggerRun) => {
     if (expandedRunId === run.id) {

@@ -1984,6 +1984,13 @@ def _pause_interrupted_run_no_commit(
         return None
     db.expire_all()
     task = db.query(Task).filter(Task.id == lease.task_id).one()
+    from .routine_history_provenance import routine_history_turn_id
+
+    turn_id = routine_history_turn_id(
+        task,
+        turn_id,
+        expected_run_id=lease.run_id,
+    )
     recorded = apply_interruption_outcome_no_commit(
         db, task=task, decision=decision, error=error
     )
@@ -2107,6 +2114,13 @@ def settle_task_lease_isolated(
                     # decision may have loaded this row before it.
                     settle_db.expire_all()
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
+                    from .routine_history_provenance import routine_history_turn_id
+
+                    history_turn_id = routine_history_turn_id(
+                        task,
+                        turn_id,
+                        expected_run_id=lease.run_id,
+                    )
                     if (
                         classify_unknown_tool_effect
                         and (
@@ -2136,7 +2150,7 @@ def settle_task_lease_isolated(
                             user_id=int(task.user_id),
                             content=client_error_message,
                             message_type=client_message_type,
-                            turn_id=turn_id,
+                            turn_id=history_turn_id,
                         )
                     from .task_execution_event_writer import stage_result_fact_no_commit
 
@@ -2144,7 +2158,7 @@ def settle_task_lease_isolated(
                         settle_db,
                         task,
                         {"error": error_message},
-                        turn_id=turn_id,
+                        turn_id=history_turn_id,
                     )
                     if get_shared_task_execution_enabled():
                         from .task_runtime_secrets import (

@@ -2181,6 +2181,13 @@ async def handle_task_message(
                     connector_runtime_turn_id=turn_id,
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
+                    from .routine_history_provenance import routine_history_turn_id
+
+                    history_turn_id = routine_history_turn_id(
+                        task_setup_snapshot.task,
+                        turn_id,
+                        expected_run_id=task_run_id,
+                    )
                     agent_service.set_outbound_message_handler(
                         task_execution_service.make_agent_outbound_handler(
                             task_id,
@@ -2188,7 +2195,7 @@ async def handle_task_message(
                                 agent_service.tracer, "records_execution_events", False
                             )
                             is True,
-                            turn_id=turn_id,
+                            turn_id=history_turn_id,
                         )
                     )
                 supports_live_control = getattr(

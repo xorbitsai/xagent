@@ -400,6 +400,43 @@ def load_event_display_snapshot(
     )
 
 
+def load_event_display_messages_for_turn(
+    db: Session,
+    task_id: int,
+    turn_id: str,
+    *,
+    limit: int,
+    scope_id: str = "root",
+) -> tuple[dict[str, Any], ...]:
+    """Load a bounded transcript projection for one authorized turn only.
+
+    Routine history must not deserialize unrelated private facts: besides
+    wasting an unbounded read, one malformed later fact could otherwise make
+    an earlier, valid routine transcript unavailable.
+    """
+
+    horizon = display_horizon(db, task_id)
+    facts = db.scalars(
+        select(TaskExecutionEvent)
+        .where(
+            TaskExecutionEvent.task_id == task_id,
+            TaskExecutionEvent.scope_id == scope_id,
+            TaskExecutionEvent.sequence <= horizon,
+            TaskExecutionEvent.turn_id == turn_id,
+            TaskExecutionEvent.kind.in_(
+                ("input_accepted", "assistant_message", "agent_message")
+            ),
+        )
+        .order_by(TaskExecutionEvent.sequence.asc())
+        .limit(limit)
+    ).all()
+    return tuple(
+        message
+        for fact in facts
+        if (message := project_event_message(fact)) is not None
+    )
+
+
 def load_live_display_event(
     db: Session, task_id: int, protocol_event_id: str, *, scope_id: str = "root"
 ) -> dict[str, Any] | None:

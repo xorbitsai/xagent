@@ -52,6 +52,10 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
 )
+from .routine_history_provenance import (
+    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+    TRIGGER_TURN_ID_CONFIG_KEY,
+)
 from .time_utils import coerce_utc as _coerce_utc
 from .trigger_providers.base import TriggerConfigError
 from .trigger_providers.registry import maybe_get_trigger_provider
@@ -75,13 +79,6 @@ _TRIGGER_SCOPE_PAYLOAD_KEYS = (
 )
 
 _TRIGGER_NAME_MAX_LENGTH = 200
-
-# Persisted on trigger-owned Tasks and passed through to the task turn. The
-# history API uses this server-generated identity as its privacy boundary;
-# never infer the routine turn from whichever transcript row happens to be
-# first.
-TRIGGER_TURN_ID_CONFIG_KEY = "trigger_turn_id"
-
 
 class TriggerServiceError(ValueError):
     """Validation or state error raised by trigger service helpers."""
@@ -1829,7 +1826,8 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
         trigger = (
             db.query(AgentTrigger).filter(AgentTrigger.id == start.trigger_id).first()
         )
-        if run is None or trigger is None:
+        task = db.query(Task).filter(Task.id == start.task_id).first()
+        if run is None or trigger is None or task is None:
             return
         started_at = run.started_at or _now()
         # The task runs in the background from begin_turn on, so it can fail
@@ -1851,6 +1849,16 @@ def _mark_trigger_run_started(start: _PreparedTriggerStart) -> None:
             )
             .execution_options(synchronize_session=False)
         )
+        task_config = dict(task.agent_config or {})
+        if (
+            task_config.get("trigger_run_id") == start.run_id
+            and task_config.get(TRIGGER_TURN_ID_CONFIG_KEY) == start.turn_id
+            and isinstance(task.run_id, str)
+            and task.run_id
+        ):
+            task_config[TRIGGER_TASK_RUN_ID_CONFIG_KEY] = task.run_id
+            setattr(task, "agent_config", task_config)
+            db.add(task)
         # The start succeeded either way. last_error records start failures
         # only (_mark_run_failed), so whatever it holds is an earlier run's.
         setattr(trigger, "last_run_at", started_at)

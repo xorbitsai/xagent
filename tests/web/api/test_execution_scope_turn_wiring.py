@@ -1063,11 +1063,13 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
         injection_outcome_unknown: bool = False,
         interruption: Any = None,
         report: SettlementReport | None = None,
+        turn_id: str | None = None,
     ) -> None:
         assert acquired_lease is lease
         assert error_message is None
         assert report == SettlementReport()
         assert interruption is None
+        assert turn_id is None
         worker_events.append(("release", threading.get_ident()))
 
     class FakeTracker:
@@ -1119,6 +1121,10 @@ async def test_resume_db_lifecycle_runs_in_short_session_workers() -> None:
             patch(
                 "xagent.web.services.task_execution.stop_task_lease_heartbeat",
                 new=AsyncMock(),
+            ),
+            patch(
+                "xagent.web.services.task_execution.load_routine_history_turn_id",
+                return_value=None,
             ),
             patch(
                 "xagent.web.api.websocket.manager",

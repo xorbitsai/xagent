@@ -1,5 +1,5 @@
-from alembic import command
 import pytest
+from alembic import command
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 

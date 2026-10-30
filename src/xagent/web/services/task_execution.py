@@ -668,7 +668,7 @@ def _terminal_task_error_payload(
             history_turn_id = routine_history_turn_id(
                 task,
                 turn_id,
-                expected_run_id=expected_run_id or task.run_id,
+                expected_run_id=expected_run_id or cast(str | None, task.run_id),
             )
             sync_workforce_run_status(db, task, TaskStatus.FAILED)
             # Persist the error as an assistant message so failures that
@@ -3159,7 +3159,7 @@ def _acquire_resume_task_lease(
                 routine_history_turn_id(
                     task,
                     None,
-                    expected_run_id=expected_run_id or task.run_id,
+                    expected_run_id=expected_run_id or cast(str | None, task.run_id),
                 )
             )
         if (

@@ -45,16 +45,16 @@ from .connector_runtime import (
     prepare_create_connector_runtime,
     reject_ephemeral_connector_runtime_payload,
 )
+from .routine_history_provenance import (
+    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+    TRIGGER_TURN_ID_CONFIG_KEY,
+)
 from .task_orchestrator import (
     TaskTurnError,
     TaskTurnNotFoundError,
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
-)
-from .routine_history_provenance import (
-    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
-    TRIGGER_TURN_ID_CONFIG_KEY,
 )
 from .time_utils import coerce_utc as _coerce_utc
 from .trigger_providers.base import TriggerConfigError
@@ -79,6 +79,7 @@ _TRIGGER_SCOPE_PAYLOAD_KEYS = (
 )
 
 _TRIGGER_NAME_MAX_LENGTH = 200
+
 
 class TriggerServiceError(ValueError):
     """Validation or state error raised by trigger service helpers."""

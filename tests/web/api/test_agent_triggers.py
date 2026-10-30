@@ -48,16 +48,16 @@ from xagent.web.services.connector_runtime import (
     load_connector_runtime_view,
     set_connector_runtime_resolver_for_testing,
 )
+from xagent.web.services.routine_history_provenance import (
+    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
+    routine_history_turn_id,
+)
 from xagent.web.services.task_execution import (
     _finalize_task_execution_result_isolated,
     _persist_agent_outbound_event,
 )
 from xagent.web.services.task_orchestrator import (
     TurnStarted,
-)
-from xagent.web.services.routine_history_provenance import (
-    TRIGGER_TASK_RUN_ID_CONFIG_KEY,
-    routine_history_turn_id,
 )
 from xagent.web.services.task_orchestrator import _schedule_bg as _real_schedule_bg
 from xagent.web.services.task_orchestrator import (

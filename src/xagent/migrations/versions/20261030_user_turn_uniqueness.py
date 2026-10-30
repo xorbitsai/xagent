@@ -26,8 +26,7 @@ def _has_index() -> bool:
     if not _has_table():
         return False
     return any(
-        index["name"] == INDEX
-        for index in sa.inspect(op.get_bind()).get_indexes(TABLE)
+        index["name"] == INDEX for index in sa.inspect(op.get_bind()).get_indexes(TABLE)
     )
 
 

@@ -189,21 +189,26 @@ def load_agent_execution_detail(
         status = "interrupted"
     if event_horizon is not None:
         from ..models.task_execution_event import TaskExecutionEvent
+        from .execution_event_signals import measure_execution_event_read
         from .task_event_display import convert_display_event
 
-        facts = (
-            db.query(TaskExecutionEvent)
-            .filter(
-                TaskExecutionEvent.task_id == task_id,
-                TaskExecutionEvent.scope_id == "root",
-                TaskExecutionEvent.sequence <= event_horizon,
-                TaskExecutionEvent.kind == "task_update_general",
-                TaskExecutionEvent.payload["data"]["worker_task_id"].as_string()
-                == worker_task_id,
+        # The root-scope summary rows grow with the task's history; measured
+        # as a display read of its own, next to the child-scope one above.
+        with measure_execution_event_read("display", task_id=task_id) as read:
+            facts = (
+                db.query(TaskExecutionEvent)
+                .filter(
+                    TaskExecutionEvent.task_id == task_id,
+                    TaskExecutionEvent.scope_id == "root",
+                    TaskExecutionEvent.sequence <= event_horizon,
+                    TaskExecutionEvent.kind == "task_update_general",
+                    TaskExecutionEvent.payload["data"]["worker_task_id"].as_string()
+                    == worker_task_id,
+                )
+                .order_by(TaskExecutionEvent.sequence)
+                .all()
             )
-            .order_by(TaskExecutionEvent.sequence)
-            .all()
-        )
+            read.rows = len(facts)
         summary_data = [
             {**event["data"], "event_type": event["event_type"]}
             for fact in facts

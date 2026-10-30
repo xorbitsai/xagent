@@ -15,10 +15,19 @@ import { TaskFileManager } from "@/components/file/task-file-manager"
 import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
-import { useApp, type SessionAttachmentsConfig, type TaskAutoResume } from "@/contexts/app-context-chat"
+import { toast } from "@/components/ui/sonner"
+import {
+  useApp,
+  type SessionAttachmentsConfig,
+  type TaskAutoResume,
+} from "@/contexts/app-context-chat"
 import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
+import {
+  cancelTaskAutoResume,
+  type CancelTaskAutoResumeFailure,
+} from "@/lib/task-auto-resume-api"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
 import { cn } from "@/lib/utils"
@@ -126,6 +135,23 @@ const autoResumeNotice = (
       time: at.toLocaleTimeString(locale, { hour: "2-digit", minute: "2-digit" }),
     })
     : t("taskInterruption.autoResumeScheduled")
+}
+
+const cancelAutoResumeErrorKey = (failure: CancelTaskAutoResumeFailure) => {
+  if (failure.kind !== "http") return "taskInterruption.autoResumeCancelFailed" as const
+  if (failure.code === "auto_resume_cancel_raced") {
+    return "taskInterruption.autoResumeCancelRaced" as const
+  }
+  if (failure.code === "auto_resume_not_cancellable") {
+    return "taskInterruption.autoResumeNotCancellable" as const
+  }
+  if (failure.code === "task_expired" || failure.status === 404 || failure.status === 410) {
+    return "taskInterruption.autoResumeCancelUnavailable" as const
+  }
+  if (failure.status >= 500 || failure.status === 408 || failure.status === 429) {
+    return "taskInterruption.autoResumeCancelFailed" as const
+  }
+  return "taskInterruption.autoResumeCancelRejected" as const
 }
 
 const toTimestampMs = (timestamp: unknown): number => {
@@ -300,6 +326,7 @@ export function TaskConversationPanel({
   const [dagLayout, setDagLayout] = useState<"TB" | "LR">("TB")
   const [leftWidth, setLeftWidth] = useState(50)
   const [isDragging, setIsDragging] = useState(false)
+  const [isCancellingAutoResume, setIsCancellingAutoResume] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const userMessageContextBadges = useMemo(() => {
@@ -891,6 +918,41 @@ export function TaskConversationPanel({
   const showStoppedResumeAction = autoResume?.status === "stopped"
     && !isSupersededAutoResume
     && taskControlsEnabled
+  const showCancelAutoResumeAction = autoResume?.status === "scheduled"
+    && taskControlsEnabled
+  const cancelAutoResume = useCallback(async () => {
+    if (
+      isCancellingAutoResume
+      || state.taskId === null
+      || autoResume?.status !== "scheduled"
+    ) return
+
+    const taskId = state.taskId
+    const runId = autoResume.runId
+    setIsCancellingAutoResume(true)
+    try {
+      const result = await cancelTaskAutoResume(taskId, runId)
+      if (!result.ok) {
+        toast.error(t(cancelAutoResumeErrorKey(result.failure)))
+        return
+      }
+
+      dispatch({ type: "RECONCILE_AUTO_RESUME_CANCEL", payload: result.snapshot })
+      if (result.snapshot.outcome === "resume_in_progress") {
+        toast.info(t("taskInterruption.autoResumeAlreadyStarted"))
+      } else if (result.snapshot.outcome === "not_pending") {
+        toast.info(t("taskInterruption.autoResumeNotPending"))
+      }
+    } finally {
+      setIsCancellingAutoResume(false)
+    }
+  }, [
+    autoResume,
+    dispatch,
+    isCancellingAutoResume,
+    state.taskId,
+    t,
+  ])
   // The virtual message belongs to the latest turn, so it follows that turn's
   // stopped record the same way the process groups above do, including taking
   // no task-id failure reference. It only appears while the turn has no answer
@@ -940,6 +1002,20 @@ export function TaskConversationPanel({
                 ? autoResumeNotice(autoResume, t, locale)
                 : t(interruptionNoticeKey(interruptionReason as string))}
             </span>
+            {showCancelAutoResumeAction && (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={isCancellingAutoResume}
+                onClick={() => void cancelAutoResume()}
+                className="shrink-0 border-amber-400 bg-transparent hover:bg-amber-100 dark:hover:bg-amber-900"
+              >
+                {t(isCancellingAutoResume
+                  ? "taskInterruption.cancellingAutoResume"
+                  : "taskInterruption.cancelAutoResume")}
+              </Button>
+            )}
             {showStoppedResumeAction && (
               <Button
                 type="button"

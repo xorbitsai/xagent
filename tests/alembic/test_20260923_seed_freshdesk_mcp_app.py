@@ -261,7 +261,8 @@ def test_seed_row_matches_registry():
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "freshdesk"
     )
-    assert migration.ROW == registry_row
+    # Seeded hidden; 20261028_enable_freshdesk flips the row visible.
+    assert migration.ROW == {**registry_row, "is_visible_in_connector": False}
 
 
 def test_seed_row_classifies_api_key():

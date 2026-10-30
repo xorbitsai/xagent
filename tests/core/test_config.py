@@ -4287,6 +4287,106 @@ def test_execution_budget_env_default_cannot_exceed_maximum(monkeypatch):
         get_execution_budget_defaults()
 
 
+_READ_BUDGET_GETTERS = [
+    ("XAGENT_EXECUTION_EVENT_READ_ROW_BUDGETS", "get_execution_event_read_row_budgets"),
+    (
+        "XAGENT_EXECUTION_EVENT_READ_DURATION_BUDGETS_MS",
+        "get_execution_event_read_duration_budgets_ms",
+    ),
+]
+
+
+@pytest.mark.parametrize("env_var,getter", _READ_BUDGET_GETTERS)
+@pytest.mark.parametrize("value", [None, "", "   ", " , "])
+def test_execution_event_read_budgets_unset_or_empty_means_no_budget(
+    monkeypatch, env_var, getter, value
+):
+    from xagent import config
+
+    if value is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, value)
+    assert dict(getattr(config, getter)()) == {}
+
+
+@pytest.mark.parametrize("env_var,getter", _READ_BUDGET_GETTERS)
+def test_execution_event_read_budgets_parse_operations_and_default(
+    monkeypatch, env_var, getter
+):
+    from xagent import config
+
+    monkeypatch.setenv(env_var, "model=2000, reconnect = 20000 ,*=50000,")
+    assert dict(getattr(config, getter)()) == {
+        "model": 2000,
+        "reconnect": 20000,
+        "*": 50000,
+    }
+    monkeypatch.setenv(env_var, "Tool_Outcome=7")
+    assert dict(getattr(config, getter)()) == {"tool_outcome": 7}
+    monkeypatch.setenv(
+        env_var, "model=1,display=2,reconnect=3,checkpoint=4,tool_outcome=5"
+    )
+    assert dict(getattr(config, getter)()) == {
+        "model": 1,
+        "display": 2,
+        "reconnect": 3,
+        "checkpoint": 4,
+        "tool_outcome": 5,
+    }
+
+
+@pytest.mark.parametrize("env_var,getter", _READ_BUDGET_GETTERS)
+@pytest.mark.parametrize(
+    "value,message",
+    [
+        ("model=abc", "positive integer"),
+        ("model=1.5", "positive integer"),
+        ("model=", "positive integer"),
+        ("model=-5", "positive integer"),
+        ("model=0", "positive integer"),
+        ("*=0", "positive integer"),
+        ("model", "<operation>=<positive integer>"),
+        ("=5", "unknown operation"),
+        ("models=5", "unknown operation"),
+        ("replay=5", "unknown operation"),
+        ("model=1,model=2", "duplicate"),
+    ],
+)
+def test_execution_event_read_budgets_invalid_values_raise(
+    monkeypatch, env_var, getter, value, message
+):
+    from xagent import config
+
+    monkeypatch.setenv(env_var, value)
+    with pytest.raises(ValueError, match=message) as error:
+        getattr(config, getter)()
+    assert env_var in str(error.value)
+
+
+@pytest.mark.parametrize("env_var,getter", _READ_BUDGET_GETTERS)
+def test_execution_event_read_budgets_cache_by_raw_value_and_follow_env(
+    monkeypatch, env_var, getter
+):
+    from xagent import config
+
+    config._parse_execution_event_read_budgets.cache_clear()
+    monkeypatch.setenv(env_var, "model=10")
+    first = getattr(config, getter)()
+    parses = config._parse_execution_event_read_budgets.cache_info()
+    assert getattr(config, getter)() is first
+    after = config._parse_execution_event_read_budgets.cache_info()
+    assert (after.misses, after.hits) == (parses.misses, parses.hits + 1)
+
+    monkeypatch.setenv(env_var, "model=20")
+    assert dict(getattr(config, getter)()) == {"model": 20}
+    monkeypatch.delenv(env_var)
+    assert dict(getattr(config, getter)()) == {}
+    # A cached result cannot be mutated by a caller.
+    with pytest.raises(TypeError):
+        first["model"] = 1  # type: ignore[index]
+
+
 @pytest.mark.parametrize("value", [None, "", "   ", " development ", "DEVELOPMENT"])
 def test_environment_defaults_and_normalizes_development(monkeypatch, value):
     monkeypatch.delenv("ENVIRONMENT", raising=False)

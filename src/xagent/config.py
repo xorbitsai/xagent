@@ -21,13 +21,16 @@ from __future__ import annotations
 
 import base64
 import enum
+import functools
 import json
 import logging
 import math
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -1339,6 +1342,87 @@ def get_execution_budget_defaults() -> dict[str, int | None]:
             f"{EXECUTION_BUDGET_MAX_TOKENS}"
         )
     return values
+
+
+EXECUTION_EVENT_READ_ROW_BUDGETS = "XAGENT_EXECUTION_EVENT_READ_ROW_BUDGETS"
+EXECUTION_EVENT_READ_DURATION_BUDGETS_MS = (
+    "XAGENT_EXECUTION_EVENT_READ_DURATION_BUDGETS_MS"
+)
+# The V2 execution-event readers a budget can name, and the key that applies
+# to every operation not listed.
+EXECUTION_EVENT_READ_OPERATIONS = (
+    "model",
+    "display",
+    "reconnect",
+    "checkpoint",
+    "tool_outcome",
+)
+EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY = "*"
+
+
+@functools.lru_cache(maxsize=16)
+def _parse_execution_event_read_budgets(env_var: str, raw: str) -> Mapping[str, int]:
+    """Parse ``model=2000,*=50000``; cached per raw value, errors are not."""
+    budgets: dict[str, int] = {}
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        name, separator, number = (part.strip() for part in token.partition("="))
+        if not separator:
+            raise ValueError(
+                f"Invalid {env_var}: {token!r} must be <operation>=<positive integer>"
+            )
+        name = name.lower()
+        if name != EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY and (
+            name not in EXECUTION_EVENT_READ_OPERATIONS
+        ):
+            raise ValueError(
+                f"Invalid {env_var}: unknown operation {name!r}; expected one of "
+                f"{', '.join(EXECUTION_EVENT_READ_OPERATIONS)} or "
+                f"{EXECUTION_EVENT_READ_DEFAULT_BUDGET_KEY!r}"
+            )
+        if name in budgets:
+            raise ValueError(f"Invalid {env_var}: duplicate operation {name!r}")
+        if not (number.isascii() and number.isdigit()) or int(number) <= 0:
+            raise ValueError(
+                f"Invalid {env_var}: {name!r} needs a positive integer, got {number!r}"
+            )
+        budgets[name] = int(number)
+    return MappingProxyType(budgets)
+
+
+def _get_execution_event_read_budgets(env_var: str) -> Mapping[str, int]:
+    return _parse_execution_event_read_budgets(env_var, os.getenv(env_var) or "")
+
+
+def get_execution_event_read_row_budgets() -> Mapping[str, int]:
+    """Per-operation row budgets for V2 execution-event reads.
+
+    Priority:
+        1. XAGENT_EXECUTION_EVENT_READ_ROW_BUDGETS, e.g.
+           ``model=2000,reconnect=20000,*=50000``
+        2. Default: empty (measure only, no budget)
+
+    ``*`` applies to operations not listed. Budgets only report; they never
+    refuse or truncate a read. The parsed result is cached by the raw value,
+    so a changed environment takes effect without re-parsing on every read.
+
+    Raises:
+        ValueError: Malformed entry, unknown operation, duplicate, or a value
+            that is not a positive integer.
+    """
+    return _get_execution_event_read_budgets(EXECUTION_EVENT_READ_ROW_BUDGETS)
+
+
+def get_execution_event_read_duration_budgets_ms() -> Mapping[str, int]:
+    """Per-operation duration budgets (milliseconds) for V2 event reads.
+
+    Same format, caching and semantics as
+    :func:`get_execution_event_read_row_budgets`, read from
+    XAGENT_EXECUTION_EVENT_READ_DURATION_BUDGETS_MS.
+    """
+    return _get_execution_event_read_budgets(EXECUTION_EVENT_READ_DURATION_BUDGETS_MS)
 
 
 def get_tool_parallel_enabled() -> bool:

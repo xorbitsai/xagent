@@ -1774,14 +1774,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "provider_name": None,
             "category": "Support",
             "oauth_scopes": None,
-            # Hidden until manually verified against a live account, same as
-            # the zendesk and intercom rows above: nothing here has been run
-            # against a real tenant, and this connector can reply to tickets,
-            # which emails the requester. is_visible_in_connector is not
-            # builtin-protected, so flipping it needs no redeploy -- and a
-            # follow-up migration flips it once verification lands
-            # (xorbitsai/xagent-saas#1409).
-            "is_visible_in_connector": False,
+            # First shipped hidden pending a check against a live Freshdesk
+            # account, because this connector can reply to tickets, which
+            # emails the requester (xorbitsai/xagent#3415). The seed migration
+            # still inserts the row hidden; 20261028_enable_freshdesk then
+            # flips it.
+            "is_visible_in_connector": True,
             # Key-based (non-oauth), like chartmogul/posthog/stripe: Freshdesk
             # has no OAuth flow for its REST API, only a per-user API key from
             # Profile settings -> Your API Key, sent as the HTTP Basic Auth

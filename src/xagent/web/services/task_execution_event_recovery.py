@@ -20,7 +20,11 @@ from ...core.agent.checkpoint import (
 from ...core.agent.result import CONTROL_TOOL_NAMES
 from ..models.task import Task, TaskStatus
 from ..models.task_execution_event import TaskExecutionEvent
-from .execution_event_signals import report_recovery_refusal
+from .execution_event_signals import (
+    ExecutionEventReadMeasurement,
+    measure_execution_event_read,
+    report_recovery_refusal,
+)
 from .task_lease_service import current_task_lease, task_lease_attempt_predicate
 
 _E = TypeVar("_E", bound=BaseException)
@@ -122,6 +126,29 @@ def read_event_checkpoint(
     run_id: str | None,
     filter_run: bool = True,
 ) -> dict[str, Any] | None:
+    # The pending-tool reads below are measured as part of this one read.
+    with measure_execution_event_read("checkpoint", task_id=task_id) as read:
+        return _read_event_checkpoint(
+            db,
+            task_id=task_id,
+            scope_id=scope_id,
+            execution_id=execution_id,
+            run_id=run_id,
+            filter_run=filter_run,
+            read=read,
+        )
+
+
+def _read_event_checkpoint(
+    db: Session,
+    *,
+    task_id: int,
+    scope_id: str,
+    execution_id: str,
+    run_id: str | None,
+    filter_run: bool,
+    read: ExecutionEventReadMeasurement,
+) -> dict[str, Any] | None:
     def corrupt(message: str) -> CheckpointCorruptError:
         return _refused(
             CheckpointCorruptError(message),
@@ -162,6 +189,7 @@ def read_event_checkpoint(
                 .limit(limit)
             )
         )
+        read.rows = (read.rows or 0) + len(page)
         if not page:
             return None
         for event in page:
@@ -286,7 +314,28 @@ def read_committed_tool_outcome(
 
     ``run_id`` only labels refusal signals; it never narrows the read.
     """
+    with measure_execution_event_read("tool_outcome", task_id=task_id) as read:
+        return _read_committed_tool_outcome(
+            db,
+            task_id=task_id,
+            scope_id=scope_id,
+            tool_call=tool_call,
+            through_sequence=through_sequence,
+            run_id=run_id,
+            read=read,
+        )
 
+
+def _read_committed_tool_outcome(
+    db: Session,
+    *,
+    task_id: int,
+    scope_id: str,
+    tool_call: dict[str, Any],
+    through_sequence: int | None,
+    run_id: str | None,
+    read: ExecutionEventReadMeasurement,
+) -> dict[str, Any] | None:
     def refused(error: _E, outcome: str) -> _E:
         return _refused(
             error,
@@ -312,6 +361,7 @@ def read_committed_tool_outcome(
     if through_sequence is not None:
         query = query.where(TaskExecutionEvent.sequence <= through_sequence)
     rows = list(db.scalars(query))
+    read.rows = len(rows)
     if not rows:
         return None
     outcome = None

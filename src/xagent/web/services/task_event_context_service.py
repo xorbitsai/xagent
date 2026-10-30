@@ -34,6 +34,10 @@ from .assistant_history_safety import (
     client_safe_assistant_history_content,
 )
 from .chat_history_service import _MAX_HISTORICAL_IMAGE_CONTEXT_REFS
+from .execution_event_signals import (
+    ExecutionEventReadMeasurement,
+    measure_execution_event_read,
+)
 from .task_conversation_context_service import _resolve_tool_result
 from .task_execution_context_service import summarize_execution_failure_event
 from .task_execution_event_store import MAX_EXECUTION_EVENT_PAGE_SIZE
@@ -467,6 +471,24 @@ def load_task_event_context(
     before_message_id: int | None = None,
     before_turn_id: str | None = None,
 ) -> TaskEventContext:
+    with measure_execution_event_read("model", task_id=task_id) as read:
+        return _load_task_event_context(
+            db,
+            task_id,
+            before_message_id=before_message_id,
+            before_turn_id=before_turn_id,
+            read=read,
+        )
+
+
+def _load_task_event_context(
+    db: Session,
+    task_id: int,
+    *,
+    before_message_id: int | None,
+    before_turn_id: str | None,
+    read: ExecutionEventReadMeasurement,
+) -> TaskEventContext:
     horizon = db.scalar(
         select(Task.conversation_event_sequence).where(Task.id == task_id)
     )
@@ -508,7 +530,9 @@ def load_task_event_context(
             )
         horizon = min(horizon, boundary - 1)
 
-    return _project(db, task_id, horizon, _load_model_events(db, task_id, horizon))
+    events = _load_model_events(db, task_id, horizon)
+    read.rows = len(events)
+    return _project(db, task_id, horizon, events)
 
 
 def _project(

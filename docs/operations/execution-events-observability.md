@@ -177,8 +177,33 @@ literal format strings.
 
 ### (5) Read budget
 
-No signals exist yet. Nothing in the metrics, logs or admin endpoint reports
-event-read budget consumption or exhaustion. Further signals will be added.
+- The main V2 event-log readers listed below are measured as
+  `xagent.execution_event.read.duration` (ms) and
+  `xagent.execution_event.read.rows`, attributes `operation`, `storage="v2"`
+  and, for `reconnect`, `outcome` (`cache_hit` or `loaded`). Other event-log
+  queries (point lookups, the admin diagnostics endpoint and smaller readers)
+  are not measured. Operations and what `rows` counts:
+  - `model`: model-context events loaded;
+  - `display`: display facts loaded, and for a delegated agent's detail the
+    root-scope summary rows of that agent (a read of its own);
+  - `reconnect`: frames replayed to a client (its duration includes cache I/O
+    and projection work);
+  - `checkpoint`: recovery-state rows scanned (nested tool-outcome reads add
+    to the duration, not the rows);
+  - `tool_outcome`: rows read for one tool attempt.
+  A measured read made inside another one is counted once, as the outer one.
+- Optional budgets, observe-only: `XAGENT_EXECUTION_EVENT_READ_ROW_BUDGETS`
+  and `XAGENT_EXECUTION_EVENT_READ_DURATION_BUDGETS_MS`, e.g.
+  `model=2000,reconnect=20000,*=50000` (see `example.env`). A read over its
+  budget increments `xagent.execution_event.read.budget_exceeded`
+  (`outcome` is `rows` or `duration`) and logs one WARNING
+  `execution_event_read_budget_exceeded task_id=... operation=... rows=...
+  duration_ms=... budget_rows=... budget_ms=...`. Budgets never refuse or
+  truncate a read, and a cache-hit reconnect is never compared with them. An
+  invalid value logs `execution_event_read_budget_config_invalid` once and is
+  treated as no budget.
+- Before budgets are set, watch the p95 and maximum of the two histograms per
+  operation.
 
 ## 3. Triaging one task with the admin endpoint
 

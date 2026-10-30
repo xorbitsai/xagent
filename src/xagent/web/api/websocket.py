@@ -98,6 +98,10 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.execution_budget import budget_policy_provider
+from ..services.execution_event_signals import (
+    ExecutionEventReadMeasurement,
+    measure_execution_event_read,
+)
 from ..services.file_reference_output_service import (
     load_assistant_file_reference_records,
     reconcile_assistant_file_references,
@@ -2250,6 +2254,17 @@ def _history_task_info(
 def _load_event_historical_stream_snapshot(
     db: Any, task: Any
 ) -> _HistoricalStreamSnapshot:
+    # Measured once per replay, cache hit or not; the display-facts read inside
+    # is part of this operation.
+    with measure_execution_event_read("reconnect", task_id=int(task.id)) as read:
+        snapshot = _build_event_historical_stream_snapshot(db, task, read)
+        read.rows = len(snapshot.events)
+        return snapshot
+
+
+def _build_event_historical_stream_snapshot(
+    db: Any, task: Any, read: ExecutionEventReadMeasurement
+) -> _HistoricalStreamSnapshot:
     from ..services.task_event_display import (
         display_horizon,
         load_event_display_snapshot,
@@ -2282,8 +2297,10 @@ def _load_event_historical_stream_snapshot(
     cache_key = web_task_history_key(task_id)
     cached = cache_get(cache_key) if release_db_connection_if_clean(db) else None
     if isinstance(cached, dict) and cached.get("event_version") == version:
+        read.outcome = "cache_hit"
         return _HistoricalStreamSnapshot(events=tuple(cached["events"]))
 
+    read.outcome = "loaded"
     snapshot = load_event_display_snapshot(
         db,
         task_id,

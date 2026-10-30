@@ -1,5 +1,5 @@
 import React from "react"
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { ComposerAttachmentStatus } from "@/components/chat/ChatInput"
@@ -32,6 +32,11 @@ const sendMessageMock = vi.hoisted(() => vi.fn())
 const pauseTaskMock = vi.hoisted(() => vi.fn())
 const resumeTaskMock = vi.hoisted(() => vi.fn())
 const stopTaskMock = vi.hoisted(() => vi.fn())
+const requestStatusMock = vi.hoisted(() => vi.fn())
+const dispatchMock = vi.hoisted(() => vi.fn())
+const cancelTaskAutoResumeMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastInfoMock = vi.hoisted(() => vi.fn())
 const getFileDownloadUrlMock = vi.hoisted(() => vi.fn())
 const fileAccessRequestMock = vi.hoisted(() => vi.fn())
 const appControls = vi.hoisted(() => ({
@@ -65,7 +70,8 @@ const chatInputProps = vi.hoisted(() => ({
   },
 }))
 
-vi.mock("@/contexts/app-context-chat", () => ({
+vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/contexts/app-context-chat")>(),
   useApp: () => ({
     state: appState,
     filesDisabled: appControls.filesDisabled,
@@ -79,8 +85,8 @@ vi.mock("@/contexts/app-context-chat", () => ({
     stopState: appControls.stopState,
     openFilePreview: openFilePreviewMock,
     closeFilePreview: vi.fn(),
-    requestStatus: vi.fn(),
-    dispatch: vi.fn(),
+    requestStatus: requestStatusMock,
+    dispatch: dispatchMock,
     getFileDownloadUrl: getFileDownloadUrlMock,
     isConversationResetPending: appControls.isConversationResetPending,
     isMessageDeliveryPending: appControls.isMessageDeliveryPending,
@@ -203,7 +209,8 @@ vi.mock("@/components/chat/ChatMessage", async () => {
 })
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }))
-vi.mock("@/lib/api-wrapper", () => ({ apiRequest: vi.fn() }))
+vi.mock("@/lib/task-auto-resume-api", () => ({ cancelTaskAutoResume: cancelTaskAutoResumeMock }))
+vi.mock("@/components/ui/sonner", () => ({ toast: { error: toastErrorMock, info: toastInfoMock } }))
 vi.mock("@/components/file/docx-preview-renderer", () => ({ DocxPreviewRenderer: () => null }))
 vi.mock("@/components/file/excel-preview-renderer", () => ({ ExcelPreviewRenderer: () => null }))
 vi.mock("@/components/file/pptx-preview-renderer", () => ({ PptxPreviewRenderer: () => null }))
@@ -289,6 +296,11 @@ describe("TaskConversationPanel", () => {
     pauseTaskMock.mockReset()
     resumeTaskMock.mockReset()
     stopTaskMock.mockReset()
+    requestStatusMock.mockReset()
+    dispatchMock.mockReset()
+    cancelTaskAutoResumeMock.mockReset()
+    toastErrorMock.mockReset()
+    toastInfoMock.mockReset()
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
@@ -411,14 +423,133 @@ describe("TaskConversationPanel", () => {
     expect(chatInputProps.current?.onResume).toBeUndefined()
   })
 
-  it.each(["scheduled", "resuming"])("does not add a notice action while automatic resume is %s", (status) => {
+  it("cancels a scheduled automatic resume at its run fence", async () => {
     appState.currentTask = {
       id: "42",
       status: "paused",
-      autoResume: { status, runId: "run-1", stateVersion: 4 },
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    const snapshot = {
+      taskId: 42,
+      outcome: "cancelled",
+      status: "paused",
+      controlState: "paused",
+      runId: "run-1",
+      stateVersion: 5,
+      autoRecovery: {
+        run_id: "run-1",
+        state_version: 5,
+        auto_resume: { status: "stopped", stop_reason: "cancelled", attempt: 1 },
+      },
+      notice: null,
+    } as const
+    cancelTaskAutoResumeMock.mockResolvedValue({ ok: true, snapshot })
+
+    render(<TaskConversationPanel mode="page" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
+
+    await waitFor(() => expect(cancelTaskAutoResumeMock).toHaveBeenCalledWith(42, "run-1"))
+    await waitFor(() => expect(dispatchMock).toHaveBeenCalledWith({
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: snapshot,
+    }))
+  })
+
+  it("does not offer cancellation once automatic resume is under way", () => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "resuming", runId: "run-1", stateVersion: 4 },
     }
     render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByRole("button", { name: "taskInterruption.cancelAutoResume" })).not.toBeInTheDocument()
     expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ["already_cancelled", null],
+    ["resume_in_progress", "taskInterruption.autoResumeAlreadyStarted"],
+    ["not_pending", "taskInterruption.autoResumeNotPending"],
+  ] as const)("reconciles the %s cancellation outcome", async (outcome, infoKey) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    const snapshot = {
+      taskId: 42,
+      outcome,
+      status: outcome === "not_pending" ? "running" : "paused",
+      controlState: outcome === "resume_in_progress" ? "resume_requested" : "paused",
+      runId: "run-1",
+      stateVersion: 5,
+      autoRecovery: outcome === "already_cancelled"
+        ? { auto_resume: { status: "stopped", stop_reason: "cancelled", attempt: 1 } }
+        : null,
+      notice: null,
+    }
+    cancelTaskAutoResumeMock.mockResolvedValue({ ok: true, snapshot })
+    render(<TaskConversationPanel mode="page" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
+
+    await waitFor(() => expect(dispatchMock).toHaveBeenCalledWith({
+      type: "RECONCILE_AUTO_RESUME_CANCEL",
+      payload: snapshot,
+    }))
+    if (infoKey) expect(toastInfoMock).toHaveBeenCalledWith(infoKey)
+    else expect(toastInfoMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [{ kind: "transport" }, "taskInterruption.autoResumeCancelFailed"],
+    [{ kind: "http", status: 409, code: "auto_resume_cancel_raced" }, "taskInterruption.autoResumeCancelRaced"],
+    [{ kind: "http", status: 404 }, "taskInterruption.autoResumeCancelUnavailable"],
+    [{ kind: "http", status: 410, code: "task_expired" }, "taskInterruption.autoResumeCancelUnavailable"],
+    [{ kind: "http", status: 409, code: "auto_resume_not_cancellable" }, "taskInterruption.autoResumeNotCancellable"],
+    [{ kind: "http", status: 422 }, "taskInterruption.autoResumeCancelRejected"],
+    [{ kind: "http", status: 500 }, "taskInterruption.autoResumeCancelFailed"],
+  ] as const)("reports cancellation failure %#", async (failure, errorKey) => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    cancelTaskAutoResumeMock.mockResolvedValue({ ok: false, failure })
+    render(<TaskConversationPanel mode="page" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(errorKey))
+    expect(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" })).toBeEnabled()
+    expect(dispatchMock).not.toHaveBeenCalled()
+  })
+
+  it("disables the cancellation action while the request is in flight", async () => {
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    let resolveCancel!: (value: unknown) => void
+    cancelTaskAutoResumeMock.mockReturnValue(new Promise(resolve => { resolveCancel = resolve }))
+    render(<TaskConversationPanel mode="page" />)
+
+    fireEvent.click(screen.getByRole("button", { name: "taskInterruption.cancelAutoResume" }))
+
+    const cancelling = await screen.findByRole("button", {
+      name: "taskInterruption.cancellingAutoResume",
+    })
+    expect(cancelling).toBeDisabled()
+
+    await act(async () => resolveCancel({
+      ok: false,
+      failure: { kind: "transport" },
+    }))
+    await waitFor(() => expect(screen.getByRole("button", {
+      name: "taskInterruption.cancelAutoResume",
+    })).toBeEnabled())
   })
 
   it("does not offer manual resume when task controls are disabled", () => {
@@ -436,6 +567,17 @@ describe("TaskConversationPanel", () => {
     render(<TaskConversationPanel mode="page" />)
     expect(screen.queryByRole("button", { name: "agent.input.actions.resumeTask" })).not.toBeInTheDocument()
     expect(chatInputProps.current?.onResume).toBeUndefined()
+  })
+
+  it("does not offer automatic-resume cancellation when task controls are disabled", () => {
+    appControls.taskControlsEnabled = false
+    appState.currentTask = {
+      id: "42",
+      status: "paused",
+      autoResume: { status: "scheduled", runId: "run-1", stateVersion: 4 },
+    }
+    render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByRole("button", { name: "taskInterruption.cancelAutoResume" })).not.toBeInTheDocument()
   })
 
   it("keeps the resume button outside the interruption live region", () => {

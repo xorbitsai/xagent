@@ -22,6 +22,7 @@ from .assistant_history_safety import (
     client_safe_assistant_history_content,
 )
 from .client_error_messages import CLIENT_SAFE_TASK_FAILURE
+from .execution_event_signals import measure_execution_event_read
 from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
 from .task_event_trace_handler import is_agent_checkpoint_data, serialize_trace_data
 from .task_execution_event_store import MAX_EXECUTION_EVENT_PAGE_SIZE
@@ -89,6 +90,30 @@ def load_display_facts(
     after_sequence: int = 0,
     source: str | None = None,
     kinds: tuple[str, ...] | None = None,
+) -> list[TaskExecutionEvent]:
+    with measure_execution_event_read("display", task_id=task_id) as read:
+        events = _load_display_facts(
+            db,
+            task_id,
+            scope_id=scope_id,
+            through_sequence=through_sequence,
+            after_sequence=after_sequence,
+            source=source,
+            kinds=kinds,
+        )
+        read.rows = len(events)
+        return events
+
+
+def _load_display_facts(
+    db: Session,
+    task_id: int,
+    *,
+    scope_id: str,
+    through_sequence: int,
+    after_sequence: int,
+    source: str | None,
+    kinds: tuple[str, ...] | None,
 ) -> list[TaskExecutionEvent]:
     events: list[TaskExecutionEvent] = []
     after = after_sequence

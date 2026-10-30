@@ -125,6 +125,39 @@ def test_records_counter_and_explicit_bucket_histogram_in_otel(
     )
 
 
+def test_execution_event_read_histograms_use_duration_and_row_buckets(
+    otel_backend: tuple[RuntimePerformanceTelemetry, InMemoryMetricReader],
+) -> None:
+    telemetry, reader = otel_backend
+
+    telemetry.observe("xagent.execution_event.read.duration", 42.0, unit="ms")
+    telemetry.observe("xagent.execution_event.read.rows", 30_000, unit="{row}")
+
+    metrics = _metrics(reader)
+    duration = metrics["xagent.execution_event.read.duration"].data.data_points[0]
+    rows = metrics["xagent.execution_event.read.rows"].data.data_points[0]
+    assert tuple(duration.explicit_bounds) == runtime_metrics._DURATION_BUCKETS_MS
+    # The generic count buckets stop at 1024; reads reach tens of thousands.
+    assert tuple(rows.explicit_bounds) == (
+        0.0,
+        1.0,
+        10.0,
+        50.0,
+        100.0,
+        250.0,
+        500.0,
+        1_000.0,
+        2_500.0,
+        5_000.0,
+        10_000.0,
+        25_000.0,
+        50_000.0,
+        100_000.0,
+    )
+    assert rows.bucket_counts[rows.explicit_bounds.index(50_000.0)] == 1
+    assert rows.sum == 30_000
+
+
 def test_attribute_allowlist_and_cardinality_guard_exclude_sensitive_values(
     otel_backend: tuple[RuntimePerformanceTelemetry, InMemoryMetricReader],
 ) -> None:

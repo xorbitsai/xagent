@@ -1424,19 +1424,6 @@ def test_update_ticket_validates_its_body_ids_too(
     assert recorder.calls == []
 
 
-def test_the_catalog_row_ships_hidden_until_verified():
-    """Nothing here has been run against a live tenant and the connector can
-    email a requester, so it ships hidden like zendesk and intercom.
-    """
-    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
-
-    rows = {r["app_id"]: r for r in get_builtin_public_mcp_app_rows()}
-    assert rows["freshdesk"]["is_visible_in_connector"] is False
-    assert rows["zendesk"]["is_visible_in_connector"] is False, (
-        "the precedent this follows"
-    )
-
-
 def test_create_ticket_sends_normalized_identifiers(
     monkeypatch: pytest.MonkeyPatch, configured_env: None
 ):

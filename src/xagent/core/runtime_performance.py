@@ -104,6 +104,25 @@ _COUNT_BUCKETS = (
     1_024.0,
 )
 
+# Event-log read sizes reach tens of thousands of rows; the count buckets
+# above stop at 1024.
+_ROW_BUCKETS = (
+    0.0,
+    1.0,
+    10.0,
+    50.0,
+    100.0,
+    250.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    5_000.0,
+    10_000.0,
+    25_000.0,
+    50_000.0,
+    100_000.0,
+)
+
 _DURATION_METRICS = frozenset(
     {
         "xagent.auth.login.password_verify.duration",
@@ -113,6 +132,7 @@ _DURATION_METRICS = frozenset(
         "xagent.auth.login.sync_commit.duration",
         "xagent.agent.checkpoint_gate.exclusive.duration",
         "xagent.event_loop.lag",
+        "xagent.execution_event.read.duration",
         "xagent.thread_pool.execution.duration",
         "xagent.thread_pool.queue_wait.duration",
         "xagent.thread_pool.total.duration",
@@ -134,6 +154,7 @@ _BYTE_METRICS = frozenset(
     }
 )
 _COUNT_METRICS = frozenset({"xagent.websocket.broadcast.fanout"})
+_ROW_METRICS = frozenset({"xagent.execution_event.read.rows"})
 
 
 class RuntimePerformanceTelemetry:
@@ -316,6 +337,13 @@ def _histogram_views() -> list[View]:
             aggregation=ExplicitBucketHistogramAggregation(_COUNT_BUCKETS),
         )
         for metric in sorted(_COUNT_METRICS)
+    )
+    views.extend(
+        View(
+            instrument_name=metric,
+            aggregation=ExplicitBucketHistogramAggregation(_ROW_BUCKETS),
+        )
+        for metric in sorted(_ROW_METRICS)
     )
     return views
 

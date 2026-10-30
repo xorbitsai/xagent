@@ -77,7 +77,16 @@ async def test_resume_exits_record_unsettled_only_when_the_lease_is_retained(
     kwargs: dict[str, Any] = (
         {"caplog": caplog} if "caplog" in inspect.signature(scenario).parameters else {}
     )
-    await scenario(**kwargs)
+    # These scenarios normally run in test_execution_scope_turn_wiring, whose
+    # autouse fixture stubs this unrelated provenance lookup. Replaying the
+    # test functions directly does not carry that fixture across modules, so
+    # preserve their original environment while this meta-test measures only
+    # release-hold accounting.
+    with patch(
+        "xagent.web.services.task_execution.load_routine_history_turn_id",
+        return_value=None,
+    ):
+        await scenario(**kwargs)
     assert hold.unsettled_total - before == expected
     if expected:
         assert hold.snapshot()["unsettled"][-1]["kind"] == "resume_lease"

@@ -571,6 +571,8 @@ class Task(Base):  # type: ignore
     # The kind of SDK credential that created the task: NULL for a runtime
     # (agent or workforce) key and for every path that is not the SDK,
     # 'personal' for a personal key. Written once, when the task is created.
+    # The v1 task scopes match on it: a runtime key reaches only NULL rows,
+    # a personal key only its holder's 'personal' rows.
     sdk_credential_kind = Column(
         String(16),
         CheckConstraint(

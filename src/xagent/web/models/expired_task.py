@@ -42,8 +42,9 @@ class ExpiredTaskTombstone(Base):  # type: ignore
         nullable=False,
         index=True,
     )
-    #: v1 agent-key ownership. SET NULL mirrors what agent deletion does to
-    #: the live task (``stage_delete_agent`` nulls ``Task.agent_id``).
+    #: v1 agent-key ownership; the personal-key scope also requires it to be
+    #: set. SET NULL mirrors what agent deletion does to the live task
+    #: (``stage_delete_agent`` nulls ``Task.agent_id``).
     agent_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("agents.id", ondelete="SET NULL"),

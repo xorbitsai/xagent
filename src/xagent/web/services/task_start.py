@@ -13,7 +13,7 @@ import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, cast
+from typing import Any, Literal, Optional, cast
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -28,6 +28,7 @@ from ..models.task_input_receipt import TaskInputReceipt
 from ..models.workforce import WorkforceRun
 from .a2a_protocol import A2ATaskSnapshot, new_context_id, task_context_id
 from .a2a_task_read import load_a2a_task_snapshot
+from .agent_store import AgentStore
 from .connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -106,10 +107,27 @@ class TaskStartRejected(Exception):
 
 @dataclass(frozen=True)
 class SdkTaskScope:
-    """Authenticated SDK owner; exactly one owner ID is set."""
+    """Authenticated SDK owner; exactly one owner ID is set.
+
+    ``agent_id`` or ``workforce_id`` is the owner a runtime key is bound to;
+    ``user_id`` is the holder of a personal key. A scope with none of them
+    set matches no task.
+    """
 
     agent_id: int | None
     workforce_id: int | None
+    user_id: int | None = None
+
+
+SdkCredentialKind = Literal["runtime", "personal"]
+_PERSONAL_CREDENTIAL = "personal"
+# ``tasks.sdk_credential_kind`` for each SDK credential kind. A runtime key
+# stores NULL, which is also what every other task writer leaves, so a task
+# created before the column existed reads as a runtime-key task.
+_SDK_CREDENTIAL_KIND_COLUMN: dict[str, str | None] = {
+    "runtime": None,
+    "personal": _PERSONAL_CREDENTIAL,
+}
 
 
 @dataclass(frozen=True)
@@ -274,15 +292,23 @@ def _prepare_created_task_isolated(
     timezone: str | None = None,
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
+    credential_kind: SdkCredentialKind,
 ) -> _PreparedCreateTaskStart:
     """Create, claim, and commit the first turn in one DB transaction."""
 
+    stored_credential_kind = _SDK_CREDENTIAL_KIND_COLUMN[credential_kind]
     SessionLocal = get_session_local()
     db = SessionLocal()
     payload: TaskTurnPayload | None = None
     owned_task_id = 0
     try:
-        agent = db.get(Agent, agent_id)
+        if stored_credential_kind == _PERSONAL_CREDENTIAL:
+            # A personal key runs only an agent its holder can see. Nothing
+            # the agent declares, and no file or connector input, is read
+            # before this check.
+            agent = AgentStore(db).get_owned_agent(task_owner_user_id, agent_id)
+        else:
+            agent = db.get(Agent, agent_id)
         if agent is None:
             raise TaskStartRejected("agent_not_found")
         prompt_context_value = _prompt_context_value_for_agent(prompt_context, agent)
@@ -301,6 +327,7 @@ def _prepare_created_task_isolated(
             agent_id=agent_id,
             input=message,
             source="sdk",
+            sdk_credential_kind=stored_credential_kind,
             is_visible=False,
             requested_dispatch_class=requested_dispatch_class,
             dispatch_priority=requested_priority,
@@ -399,6 +426,7 @@ def validate_sdk_owner_scope(
     *,
     request_agent_id: int | None,
     request_workforce_id: int | None,
+    task_agent_id: int,
 ) -> None:
     """Validate a request body's owner-scoping fields against the key.
 
@@ -407,10 +435,12 @@ def validate_sdk_owner_scope(
     agent-bound key must pass a matching ``agent_id`` and no
     ``workforce_id``; a workforce-bound key must not pass ``agent_id``
     and, if it passes ``workforce_id``, it must match the bound
-    workforce. Task ownership itself must already be resolved (e.g. via
-    :func:`resolve_sdk_task`) before calling this, so an unrelated
-    task stays an opaque ``task_not_found`` even when the body also
-    names the wrong owner.
+    workforce; a personal key may pass ``agent_id`` only as the task's
+    own ``task_agent_id`` and never passes ``workforce_id``. A scope with
+    no owner is ``task_not_found``. Task ownership itself must already be
+    resolved (e.g. via :func:`resolve_sdk_task`) before calling this, so
+    an unrelated task stays an opaque ``task_not_found`` even when the
+    body also names the wrong owner.
     """
     if scope.agent_id is not None:
         if request_agent_id is None:
@@ -419,8 +449,7 @@ def validate_sdk_owner_scope(
             raise TaskStartRejected("agent_not_found")
         if request_workforce_id is not None:
             raise TaskStartRejected("workforce_not_found")
-    else:
-        assert scope.workforce_id is not None
+    elif scope.workforce_id is not None:
         if request_agent_id is not None:
             raise TaskStartRejected("agent_not_found")
         if (
@@ -428,6 +457,31 @@ def validate_sdk_owner_scope(
             and request_workforce_id != scope.workforce_id
         ):
             raise TaskStartRejected("workforce_not_found")
+    elif scope.user_id is not None:
+        if request_agent_id is not None and request_agent_id != task_agent_id:
+            raise TaskStartRejected("agent_not_found")
+        if request_workforce_id is not None:
+            raise TaskStartRejected("workforce_not_found")
+    else:
+        raise TaskStartRejected("task_not_found")
+
+
+def ensure_sdk_task_agent_reachable(
+    db: Session, scope: SdkTaskScope, task: Task
+) -> None:
+    """Raise ``agent_not_found`` unless a personal key's holder can still run
+    the task's agent.
+
+    Called by the writes that start work on an existing task (append,
+    reply), in the session that authorized the task and before anything
+    the agent declares is read. A runtime key is bound to its agent or
+    workforce, so nothing is re-checked for one.
+    """
+    if scope.user_id is None:
+        return
+    agent = AgentStore(db).get_owned_agent(int(task.user_id), int(task.agent_id))
+    if agent is None:
+        raise TaskStartRejected("agent_not_found")
 
 
 def _prepare_append_turn_isolated(
@@ -457,7 +511,9 @@ def _prepare_append_turn_isolated(
             scope,
             request_agent_id=request_agent_id,
             request_workforce_id=request_workforce_id,
+            task_agent_id=int(task.agent_id),
         )
+        ensure_sdk_task_agent_reachable(db, scope, task)
 
         runtime_agent = db.get(Agent, int(task.agent_id))
         if runtime_agent is None:
@@ -550,11 +606,17 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
       2. Belongs to the key's owner -- directly (``Task.agent_id`` for
          an agent-bound key) or through a workforce run
          (``WorkforceRun.task_id`` for a workforce-bound key; the
-         binding is 1:1 unique).
+         binding is 1:1 unique) -- and was created by that kind of key:
+         a runtime key reaches only tasks whose ``sdk_credential_kind``
+         is NULL. A personal key reaches only tasks its holder owns
+         (``Task.user_id``), that a personal key created
+         (``sdk_credential_kind == "personal"``) and whose agent still
+         exists.
       3. Was created by the SDK (``source == "sdk"``).
 
-    Any other case — missing row, row belongs to a different owner,
-    or row was created by the Web UI / internal paths — raises
+    A scope with no owner matches nothing. Any other case — missing row,
+    row belongs to a different owner or credential kind, or row was
+    created by the Web UI / internal paths — raises
     :class:`TaskStartRejected` with ``task_not_found``. Missing and
     inaccessible tasks share one rejection so adapters can preserve
     non-disclosing error responses.
@@ -587,25 +649,38 @@ def resolve_sdk_task(task_id: int, scope: SdkTaskScope, db: Session) -> Task:
             ``task_expired`` (with ``task_id`` and ``expired_at``) when
             retention expired a task the calling key could have seen.
     """
-    # This predicate (source == "sdk", plus the key's agent or workforce)
-    # must stay column-for-column identical to the tombstone predicate in
-    # _raise_if_expired_for_scope below -- otherwise a key could see a task
-    # live that its tombstone would hide, or vice versa, after retention
-    # deletes the row. tests/web/api/v1/test_expired_tasks.py's
+    # This predicate (source == "sdk", plus the key's agent, workforce or
+    # holder and the credential kind) must stay column-for-column identical
+    # to the tombstone predicate in _raise_if_expired_for_scope below --
+    # otherwise a key could see a task live that its tombstone would hide,
+    # or vice versa, after retention deletes the row.
+    # tests/web/api/v1/test_expired_tasks.py's
     # test_resolve_sdk_task_live_and_tombstone_predicates_agree checks the
-    # two predicates against each other across agent/workforce keys and
-    # task sources; update it alongside either predicate.
+    # two predicates against each other across agent, workforce and
+    # personal keys, credential kinds and task sources; update it alongside
+    # either predicate.
     query = db.query(Task).filter(
         Task.id == task_id,
         Task.source == "sdk",
     )
     if scope.agent_id is not None:
-        query = query.filter(Task.agent_id == scope.agent_id)
-    else:
-        assert scope.workforce_id is not None
-        query = query.join(WorkforceRun, WorkforceRun.task_id == Task.id).filter(
-            WorkforceRun.workforce_id == scope.workforce_id
+        query = query.filter(
+            Task.agent_id == scope.agent_id,
+            Task.sdk_credential_kind.is_(None),
         )
+    elif scope.workforce_id is not None:
+        query = query.join(WorkforceRun, WorkforceRun.task_id == Task.id).filter(
+            WorkforceRun.workforce_id == scope.workforce_id,
+            Task.sdk_credential_kind.is_(None),
+        )
+    elif scope.user_id is not None:
+        query = query.filter(
+            Task.user_id == scope.user_id,
+            Task.sdk_credential_kind == _PERSONAL_CREDENTIAL,
+            Task.agent_id.is_not(None),
+        )
+    else:
+        raise TaskStartRejected("task_not_found")
     task = query.first()
     if task is None:
         _raise_if_expired_for_scope(task_id, scope, db)
@@ -617,8 +692,10 @@ def _raise_if_expired_for_scope(task_id: int, scope: SdkTaskScope, db: Session) 
     """Raise ``task_expired`` if retention expired a task ``scope`` could see.
 
     The tombstone is held to :func:`resolve_sdk_task`'s own predicate,
-    column for column: ``source == "sdk"``, and the key's agent or
-    workforce. The workforce is read from the tombstone rather than
+    column for column: ``source == "sdk"``, the key's agent, workforce or
+    holder, and the credential kind (NULL for a runtime key; ``personal``
+    with an agent still set for a personal key). A scope with no owner
+    matches no tombstone. The workforce is read from the tombstone rather than
     through ``WorkforceRun``: the purge SETs ``WorkforceRun.task_id``
     NULL, so the join the live lookup uses can no longer prove the
     binding, and the tombstone recorded it before the delete for exactly
@@ -636,9 +713,25 @@ def _raise_if_expired_for_scope(task_id: int, scope: SdkTaskScope, db: Session) 
     if tombstone is None or tombstone.source != "sdk":
         return
     if scope.agent_id is not None:
-        if tombstone.agent_id != scope.agent_id:
+        if (
+            tombstone.agent_id != scope.agent_id
+            or tombstone.sdk_credential_kind is not None
+        ):
             return
-    elif tombstone.workforce_id != scope.workforce_id:
+    elif scope.workforce_id is not None:
+        if (
+            tombstone.workforce_id != scope.workforce_id
+            or tombstone.sdk_credential_kind is not None
+        ):
+            return
+    elif scope.user_id is not None:
+        if (
+            tombstone.user_id != scope.user_id
+            or tombstone.sdk_credential_kind != _PERSONAL_CREDENTIAL
+            or tombstone.agent_id is None
+        ):
+            return
+    else:
         return
     raise TaskStartRejected(
         "task_expired",
@@ -659,7 +752,16 @@ async def create_sdk_task(
     requested_dispatch_class: str | None = None,
     requested_priority: int | None = None,
     prompt_context: dict[str, Any] | None = None,
+    credential_kind: SdkCredentialKind,
 ) -> TaskStartResult:
+    """Create an SDK task and schedule its first turn.
+
+    ``credential_kind`` is the kind of key that authorized the call and is
+    recorded on the task. For ``"personal"``, the agent must be one
+    ``task_owner_user_id`` can see; otherwise the caller has already bound
+    ``agent_id`` to the key.
+    """
+
     async def _prepare_and_schedule() -> tuple[_PreparedCreateTaskStart, TurnStarted]:
         prepared = await run_db_io_cancellation_safe(
             lambda: _prepare_created_task_isolated(
@@ -673,6 +775,7 @@ async def create_sdk_task(
                 timezone=timezone,
                 requested_dispatch_class=requested_dispatch_class,
                 requested_priority=requested_priority,
+                credential_kind=credential_kind,
             )
         )
         try:

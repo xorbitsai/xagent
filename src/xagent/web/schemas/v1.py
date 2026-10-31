@@ -91,16 +91,18 @@ class ConnectorRuntimeContextBody(BaseModel):
 class CreateTaskRequest(BaseModel):
     """Body for ``POST /v1/chat/tasks``.
 
-    ``agent_id`` is required and must match the agent bound to the
-    presented API key; the server enforces ``body.agent_id ==
-    authed.agent.id`` and returns 404 ``agent_not_found`` on mismatch.
+    ``agent_id`` is required. With an agent key it must be the agent the
+    key is bound to; with a personal key it may be any agent the key
+    holder can see, and the task then runs as the holder. Anything else
+    returns 404 ``agent_not_found``.
     """
 
     agent_id: int = Field(
         ...,
         description=(
-            "Target agent's primary key. Must match the agent the "
-            "presented API key is bound to."
+            "Target agent's primary key. With an agent key, must match the "
+            "agent the key is bound to; with a personal key, any agent the "
+            "key holder can see."
         ),
     )
     message: MessageBody = Field(..., description="First user message of the task.")
@@ -115,7 +117,7 @@ class CreateTaskRequest(BaseModel):
             "is 4096 UTF-8 bytes of the rendered form: JSON with sorted keys, "
             "default separators (``, `` and ``: ``), non-ASCII kept as-is, and "
             "backticks escaped to ``\\u0060`` (six bytes); a client measuring "
-            "compact JSON undercounts."
+            "compact JSON undercounts. Not accepted with a personal key (422)."
         ),
     )
     metadata: Optional[Dict[str, Any]] = Field(
@@ -475,9 +477,10 @@ class AppendMessageRequest(BaseModel):
     forward-compat and Python/TS SDK symmetry: agent-bound keys pass
     ``agent_id`` (required for that case; the endpoint returns 422 if
     omitted with an agent key), workforce-bound keys optionally pass
-    ``workforce_id``. Both are optional at the schema level so one
-    request model serves both owner types; the endpoint enforces the
-    per-owner requirement.
+    ``workforce_id``, and personal keys optionally pass ``agent_id``,
+    which must then be the task's agent. Both are optional at the schema
+    level so one request model serves every key type; the endpoint
+    enforces the per-owner requirement.
     """
 
     agent_id: Optional[int] = Field(
@@ -485,7 +488,8 @@ class AppendMessageRequest(BaseModel):
         description=(
             "Target agent's primary key. Required for agent-bound keys; "
             "must match the agent the key is bound to and the task's "
-            "agent_id. Omit for workforce-bound keys."
+            "agent_id. Optional for personal keys; when provided, must "
+            "match the task's agent_id. Omit for workforce-bound keys."
         ),
     )
     workforce_id: Optional[int] = Field(
@@ -493,7 +497,7 @@ class AppendMessageRequest(BaseModel):
         description=(
             "Target workforce's primary key. Optional for workforce-bound "
             "keys; must match the workforce the key is bound to when "
-            "provided. Omit for agent-bound keys."
+            "provided. Omit for agent-bound and personal keys."
         ),
     )
     message: MessageBody = Field(..., description="Next user message in the task.")
@@ -503,9 +507,10 @@ class AppendMessageRequest(BaseModel):
             "Trusted reference data stored on the task. A non-empty object "
             "fully replaces the stored context for this and later turns; an "
             "empty object clears it so later turns carry none; omitted or null "
-            "replays the stored value. Not accepted with a workforce key. Key "
-            "and value rules, signing and the 4096-byte limit (measured on the "
-            "rendered JSON, not compact JSON) are the same as on task create."
+            "replays the stored value. Not accepted with a workforce key or a "
+            "personal key (422). Key and value rules, signing and the "
+            "4096-byte limit (measured on the rendered JSON, not compact "
+            "JSON) are the same as on task create."
         ),
     )
     metadata: Optional[Dict[str, Any]] = Field(
@@ -575,7 +580,8 @@ class ReplyRequest(BaseModel):
     starting a new turn. Owner-scoping fields have the same shape and
     semantics as :class:`AppendMessageRequest`: agent-bound keys pass
     ``agent_id`` (required), workforce-bound keys optionally pass
-    ``workforce_id``.
+    ``workforce_id``, and personal keys optionally pass ``agent_id``
+    (the task's agent).
 
     Deliberately narrower than :class:`AppendMessageRequest`:
 
@@ -602,7 +608,8 @@ class ReplyRequest(BaseModel):
         description=(
             "Target agent's primary key. Required for agent-bound keys; "
             "must match the agent the key is bound to and the task's "
-            "agent_id. Omit for workforce-bound keys."
+            "agent_id. Optional for personal keys; when provided, must "
+            "match the task's agent_id. Omit for workforce-bound keys."
         ),
     )
     workforce_id: Optional[int] = Field(
@@ -610,7 +617,7 @@ class ReplyRequest(BaseModel):
         description=(
             "Target workforce's primary key. Optional for workforce-bound "
             "keys; must match the workforce the key is bound to when "
-            "provided. Omit for agent-bound keys."
+            "provided. Omit for agent-bound and personal keys."
         ),
     )
     message: MessageBody = Field(

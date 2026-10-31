@@ -84,6 +84,24 @@ function normalizedValues(model: Model): string[] {
   return [...values];
 }
 
+// Same mapping as validate_candidate_modalities on the backend, which rejects a
+// routing candidate whose profile image, audio or video inputs differ from the
+// model abilities.
+const MODALITY_ABILITIES: Record<string, string> = {
+  image: "vision",
+  audio: "audio",
+  video: "video",
+};
+
+function modalitiesMatch(model: Model, profile: RouterProfile): boolean {
+  const abilities = model.abilities || [];
+  return Object.entries(MODALITY_ABILITIES).every(
+    ([modality, ability]) =>
+      profile.input_modalities.includes(modality) ===
+      abilities.includes(ability),
+  );
+}
+
 export function guessProfile(
   model: Model,
   profiles: RouterProfile[],
@@ -93,7 +111,10 @@ export function guessProfile(
     const profileValues = [profile.id, ...(profile.aliases || [])].map((value) =>
       value.trim().toLowerCase(),
     );
-    return profileValues.some((value) => modelValues.has(value));
+    return (
+      profileValues.some((value) => modelValues.has(value)) &&
+      modalitiesMatch(model, profile)
+    );
   })?.id;
 }
 

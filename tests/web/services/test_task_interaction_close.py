@@ -941,6 +941,98 @@ def test_every_call_site_of_active_interaction_id_sync_names_unavailable() -> No
     assert offenders == []
 
 
+_READ_STATE_NAMES = frozenset(
+    {
+        "ActiveInteractionFound",
+        "ActiveInteractionAbsent",
+        "ActiveInteractionUnavailable",
+    }
+)
+
+
+def _function_defs(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _enclosing_function(tree: ast.Module, lineno: int) -> str | None:
+    """Name of the innermost function definition spanning ``lineno``."""
+    best = None
+    for node in _function_defs(tree):
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            if best is None or node.lineno > best.lineno:
+                best = node
+    return best.name if best is not None else None
+
+
+def _reader_call_sites() -> list[tuple[str, str | None, ast.Module]]:
+    """``(file name, enclosing function, parsed module)`` for every
+    production call of ``active_interaction_id_sync``."""
+    sites = []
+    for path in _scan_root(_CLOSE_MODULE_STEM):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == _READER_NAME) or (
+                isinstance(func, ast.Attribute) and func.attr == _READER_NAME
+            ):
+                sites.append((path.name, _enclosing_function(tree, node.lineno), tree))
+    return sites
+
+
+def test_active_interaction_id_sync_is_called_from_exactly_four_production_functions():
+    """The reader has four production callers: the resume command seam and
+    the three sites that inject a message into a waiting run and then close
+    its active row. A fifth caller has to decide what each of the three
+    read states means for it, so adding one fails here first."""
+    assert sorted((name, func) for name, func, _ in _reader_call_sites()) == [
+        ("task_command_execution.py", "handle_task_message"),
+        ("task_command_execution.py", "resume_task"),
+        ("task_resume.py", "resume_a2a_task"),
+        ("task_resume.py", "resume_task_reply"),
+    ]
+
+
+def _is_read_state_check(test: ast.expr) -> bool:
+    """``isinstance(<x>, <one of the three read states>)``."""
+    return (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "isinstance"
+        and len(test.args) == 2
+        and isinstance(test.args[1], ast.Name)
+        and test.args[1].id in _READ_STATE_NAMES
+    )
+
+
+def test_only_resume_task_returns_from_a_branch_on_the_active_interaction_read():
+    """Only the resume command seam turns the read's result into a decision
+    that ends the call (a refusal or a skip). The three injection sites
+    branch on the same result but always go on to inject the message, so
+    none of their branches on it returns."""
+    returning = set()
+    for name, func_name, tree in _reader_call_sites():
+        for func in _function_defs(tree):
+            if func.name != func_name:
+                continue
+            for node in ast.walk(func):
+                if isinstance(node, ast.If) and _is_read_state_check(node.test):
+                    returns = [
+                        inner
+                        for statement in node.body
+                        for inner in ast.walk(statement)
+                        if isinstance(inner, ast.Return)
+                    ]
+                    if returns:
+                        returning.add((name, func_name))
+    assert returning == {("task_command_execution.py", "resume_task")}
+
+
 # --------------------------------------------------------------------------
 # Statement-count pin for the marker gate: on every deployment today (the
 # protocol marker is NULL for every task -- see active_interaction_id_sync's

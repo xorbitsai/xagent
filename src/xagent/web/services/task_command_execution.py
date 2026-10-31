@@ -619,9 +619,11 @@ class ResumeCommandOutcome(str, enum.Enum):
     ALREADY_IN_PROGRESS = "already_in_progress"
     DEFERRED = "deferred"
     REJECTED = "rejected"
-    # An automatic resume that no longer applies (the task moved on, or
-    # automatic resume was switched off). A success: the command completes
-    # without an error reply.
+    # An automatic resume that does not go ahead this time: the task moved
+    # on, automatic resume was switched off, the task has an unanswered
+    # question that waits for its user, or its active interaction row could
+    # not be read and housekeeping tries again later. A success: the
+    # command completes without an error reply.
     AUTO_SKIPPED = "auto_skipped"
 
 
@@ -3742,10 +3744,11 @@ async def resume_task(
                     # sees the unchanged fence and reschedules it, so a run
                     # that keeps waiting is eventually stopped as
                     # ``exhausted`` rather than as waiting on its user.
-                    # Unreachable until a task records
-                    # ``interaction_protocol_version``; the change that makes
-                    # it reachable should stop the row here instead
-                    # (``manual``, ``interaction_pending``).
+                    # Reached only for a task whose
+                    # ``interaction_protocol_version`` is set. This must stop
+                    # the row here instead (``manual``,
+                    # ``interaction_pending``) before native publication is
+                    # enabled on any deployment.
                     logger.info(
                         "auto resume skipped task_id=%s run_id=%s "
                         "why=interaction_pending component=auto-resume",
@@ -3792,30 +3795,76 @@ async def resume_task(
                     reason_code="interaction_pending",
                 )
         elif isinstance(active_interaction_read, ActiveInteractionUnavailable):
-            # Same action as the ActiveInteractionAbsent branch below -- the
-            # resume proceeds -- but deliberately its own branch rather than
-            # a shared one. This is the arm that turns into a refusal, and
-            # refusing here is wired by the change that first writes
-            # tasks.interaction_protocol_version = 1. Until that marker can
-            # be 1, nothing in src/ having written it to anything but NULL,
-            # a read that could not be made cannot be hiding a live native
-            # interaction row: refusing today would cost a refused resume on
-            # every waiting task, including the ones that provably carry no
-            # question at all. Keeping the branch separate is what lets that
-            # later change edit one branch's action and touch neither of the
-            # other two.
+            # Its own branch, not folded into ActiveInteractionAbsent's: a
+            # read that could not be made may be hiding a live native row,
+            # so what to do depends on whether native rows can exist here.
+            # Only a process whose frozen rollout mode is native and that
+            # runs shared task execution can publish them, so only there is
+            # the resume refused; anywhere else it proceeds, as it does on
+            # ActiveInteractionAbsent. This is the one place the rollout
+            # mode decides anything about an existing row (see
+            # interaction_rollout's module docstring); the
+            # ActiveInteractionFound and ActiveInteractionAbsent branches
+            # never consult it.
             #
-            # Logged at info, not warning: the read itself already logs one
-            # warning for this same incident (see
-            # active_interaction_id_sync), and a second warning-level line
-            # would double-count one read failure.
-            logger.info(
-                "the active interaction read was unavailable (reason=%s) for "
-                "task_id=%s run_id=%s; the resume proceeds",
-                active_interaction_read.reason,
-                task_id,
-                task_fields.run_id,
+            # The proceed line is logged at info: the read itself already
+            # logged a warning for this incident (see
+            # active_interaction_id_sync). A refusal is its own outcome for
+            # the user, so it logs its own warning.
+            from .interaction_rollout import (
+                native_publication_enabled_in_this_process,
             )
+
+            if not native_publication_enabled_in_this_process():
+                logger.info(
+                    "the active interaction read was unavailable (reason=%s) "
+                    "for task_id=%s run_id=%s; the resume proceeds",
+                    active_interaction_read.reason,
+                    task_id,
+                    task_fields.run_id,
+                )
+            elif auto_resume is not None:
+                # The read may succeed on the sweeper's next attempt, so
+                # this skips rather than refuses: a refused automatic resume
+                # stops automatic recovery for the run, while a skipped one
+                # leaves housekeeping to schedule it again.
+                logger.info(
+                    "auto resume skipped task_id=%s run_id=%s "
+                    "why=interaction_unverifiable component=auto-resume",
+                    task_id,
+                    task_fields.run_id,
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.AUTO_SKIPPED,
+                    "Automatic resume skipped (interaction_unverifiable)",
+                    reason_code="interaction_unverifiable",
+                )
+            else:
+                logger.warning(
+                    "resume refused for task_id=%s run_id=%s: the active "
+                    "interaction read was unavailable (reason=%s)",
+                    task_id,
+                    task_fields.run_id,
+                    active_interaction_read.reason,
+                )
+                reason = (
+                    "We couldn't check this task's pending questions; please try again."
+                )
+                await reply(
+                    {
+                        "type": "error",
+                        "message": (
+                            "We couldn't check this task's pending questions; "
+                            "please try again."
+                        ),
+                        "task": {"id": task_id, **resume_control_state},
+                    },
+                )
+                return ResumeCommandResult(
+                    ResumeCommandOutcome.REJECTED,
+                    reason,
+                    reason_code="interaction_unverifiable",
+                )
         elif isinstance(active_interaction_read, ActiveInteractionAbsent):
             # Nothing to do: no native interaction row is waiting on an
             # answer, so this gate lets the resume through.

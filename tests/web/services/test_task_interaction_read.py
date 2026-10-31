@@ -18,8 +18,14 @@ import pytest
 from sqlalchemy import Select, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
+import xagent.web.models.database as database
 import xagent.web.services.chat_history_service as chat_history_service
+import xagent.web.services.interaction_rollout as ir
 import xagent.web.services.task_interaction_service as interaction_service_module
+import xagent.web.services.task_stream_snapshot as task_stream_snapshot
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.task_interaction_schema_shared import (
     anchor_event_id,
     make_task,
@@ -1229,3 +1235,60 @@ def test_a_recheck_that_finds_an_active_row_counts_no_read_fallback(
     assert question == "Which environment?"
     assert interactions is not None
     assert _read_fallback_count() == before
+
+
+# ---------------------------------------------------------------------------
+# The stream snapshot loader reads the pending question through this
+# adapter, and what it returns must not depend on the rollout policy.
+# ---------------------------------------------------------------------------
+
+
+def test_stream_snapshot_reads_the_same_question_under_every_rollout_state(
+    _db: Session, _session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``load_task_stream_snapshots`` gives a waiting task the same pending
+    question with the rollout policy uninitialized, frozen in ``legacy``
+    mode, and frozen in ``native`` mode with this task's source allowed:
+    the rollout mode decides only whether a new native row is produced,
+    never what a reader sees."""
+    task = _make_task(_db, marker=None)
+    task.status = TaskStatus.WAITING_FOR_USER
+    _db.commit()
+    _db.refresh(task)
+    persist_assistant_message(
+        _db,
+        int(task.id),
+        int(task.user_id),
+        "A live question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Live"}],
+    )
+    monkeypatch.setattr(database, "_SessionLocal", _session_factory)
+    source = ir.gating_key(task)
+    assert source is not None
+
+    def _read() -> tuple[Any, Any]:
+        (snapshot,) = task_stream_snapshot.load_task_stream_snapshots([int(task.id)])
+        return snapshot["question"], snapshot["interactions"]
+
+    monkeypatch.setattr(ir, "_policy", None)
+    uninitialized = _read()
+    install_interaction_rollout_policy(
+        monkeypatch, mode="legacy", shared_task_execution=True
+    )
+    legacy = _read()
+    install_interaction_rollout_policy(
+        monkeypatch,
+        mode="native",
+        shared_task_execution=True,
+        native_sources=frozenset({source}),
+    )
+    native = _read()
+
+    expected = (
+        read_surface.get_pending_interaction_question(_db, task)[0],
+        [{"type": "text_input", "label": "Live"}],
+    )
+    assert uninitialized == expected
+    assert legacy == expected
+    assert native == expected

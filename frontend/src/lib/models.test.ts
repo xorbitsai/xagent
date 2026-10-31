@@ -15,6 +15,7 @@ import {
   parseModelList,
   parseUserDefaultModels,
   resolveTaskLlmSelection,
+  supportsBatchAsr,
 } from "./models"
 
 const mockedRequest = vi.mocked(apiRequest)
@@ -160,6 +161,25 @@ describe("hostnameFromUrl", () => {
   it("returns empty string for non-absolute urls instead of a garbled fallback", () => {
     expect(hostnameFromUrl("/v1")).toBe("")
     expect(hostnameFromUrl("not a url")).toBe("")
+  })
+})
+
+describe("batch ASR availability", () => {
+  it("filters custom realtime rows while retaining file ASR models and their metadata", () => {
+    const realtime = model({
+      model_id: "my-custom-live-model",
+      category: "speech",
+      model_provider: " ElevenLabs ",
+      model_name: "scribe_v2_realtime",
+      abilities: ["asr"],
+    })
+    const batch = { ...realtime, id: 2, model_id: "file-asr", model_name: "scribe_v2" }
+    const tts = { ...realtime, id: 3, model_id: "tts", abilities: ["tts"] }
+    const models = parseModelList([realtime, batch, tts])!
+
+    expect(models.filter(supportsBatchAsr).map(model => model.model_id)).toEqual(["file-asr"])
+    expect(models[0].abilities).toEqual(["asr"])
+    expect(supportsBatchAsr({ ...batch, model_provider: "xinference" })).toBe(true)
   })
 })
 

@@ -52,6 +52,18 @@ export interface Model {
 export const isBuiltinModel = (model: { model_id?: string | null }): boolean =>
   Boolean(model.model_id?.startsWith("platform/"));
 
+// Existing microphone uploads and ASR defaults need file transcription, even
+// when a manually saved realtime-only model carries generic ASR metadata.
+export function supportsBatchAsr(model: unknown): boolean {
+  if (!isJsonRecord(model) || !Array.isArray(model.abilities) || !model.abilities.includes('asr')) {
+    return false;
+  }
+  const provider = typeof model.model_provider === 'string'
+    ? model.model_provider.trim().toLowerCase()
+    : '';
+  return provider !== 'elevenlabs' || model.model_name !== 'scribe_v2_realtime';
+}
+
 // Host (including port) extracted from a base URL, for disambiguating
 // same-named models across endpoints. Uses `.host` so non-standard ports
 // (xinference :9997, Ollama :11434) survive. Returns "" for empty or

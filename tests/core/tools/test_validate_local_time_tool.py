@@ -157,7 +157,34 @@ def test_zone_name_is_case_insensitive() -> None:
     )
 
 
-@pytest.mark.parametrize("zone", ["Not/AZone", "", "   ", "/etc/passwd"])
+@pytest.mark.parametrize(
+    ("supplied", "zone"),
+    [
+        ("Melbourne", "Australia/Melbourne"),
+        ("Sydney", "Australia/Sydney"),
+        ("Wellington", "Pacific/Auckland"),
+        ("Pacific Time (US & Canada)", "America/Los_Angeles"),
+        (" pacific time (us & canada) ", "America/Los_Angeles"),
+        ("Toronto", "America/Toronto"),
+    ],
+)
+def test_a_common_alias_resolves_to_its_iana_zone(supplied: str, zone: str) -> None:
+    result = validate_local_time("2026-07-15 12:00", supplied)
+
+    assert result.timezone == zone
+    assert result.mappings == validate_local_time("2026-07-15 12:00", zone).mappings
+
+
+def test_an_alias_outside_region_city_is_still_rejected() -> None:
+    # The Rails table maps this one to Etc/GMT+12, which the Region/City guard
+    # refuses whatever name reached it.
+    with pytest.raises(ValueError, match="Region/City"):
+        validate_local_time("2026-07-15 12:00", "International Date Line West")
+
+
+@pytest.mark.parametrize(
+    "zone", ["Not/AZone", "", "   ", "/etc/passwd", "Indianapolis", "Gotham"]
+)
 def test_unknown_zone_is_rejected(zone: str) -> None:
     with pytest.raises(ValueError, match="Unknown IANA timezone"):
         validate_local_time("2026-06-01 09:00", zone)

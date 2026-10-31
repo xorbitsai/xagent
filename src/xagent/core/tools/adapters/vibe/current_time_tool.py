@@ -1,12 +1,11 @@
 import re
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from typing import Any, Literal, Mapping, Optional, Type
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from pydantic import BaseModel, Field
 
 from .....web.tools.config import WebToolConfig
+from ....utils.timezones import resolve_zone
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .factory import register_tool
 
@@ -53,30 +52,6 @@ class CurrentTimeResult(BaseModel):
     )
 
 
-@lru_cache(maxsize=1)
-def _zone_by_lowercase() -> dict[str, str]:
-    return {name.lower(): name for name in available_timezones()}
-
-
-def _resolve_zone(name: Optional[str]) -> Optional[ZoneInfo]:
-    # Always resolve through the canonical map rather than ZoneInfo(name)
-    # directly: ZoneInfo.key echoes whatever string it was given, and
-    # tzdata lookup is case-sensitive on Linux but not on macOS, so the
-    # reported zone would otherwise vary by input case and filesystem.
-    # The map guarantees a canonical key (e.g. "australia/melbourne" ->
-    # "Australia/Melbourne") and identical behavior across platforms.
-    # An unusable name comes from the model, so it degrades to UTC.
-    if not isinstance(name, str) or not name.strip():
-        return None
-    canonical = _zone_by_lowercase().get(name.strip().lower())
-    if canonical is None:
-        return None
-    try:
-        return ZoneInfo(canonical)
-    except (ZoneInfoNotFoundError, ValueError, OSError, KeyError):
-        return None
-
-
 def _format_offset(offset: timedelta) -> str:
     # Seconds are shown only when non-zero: dropping them would contradict the
     # local/utc pair reported beside this string. Liberia ran -00:44:30 until
@@ -92,7 +67,9 @@ def _format_offset(offset: timedelta) -> str:
 def current_time(timezone_name: Optional[str] = None) -> CurrentTimeResult:
     """Read the wall clock now, in UTC and optionally in a named zone."""
     now_utc = _now()
-    zone = _resolve_zone(timezone_name)
+    # An unusable name comes from the model, so it degrades to UTC; the
+    # 'timezone' field of the result says so.
+    zone = resolve_zone(timezone_name)
     local = now_utc.astimezone(zone) if zone is not None else now_utc
     # local is always aware, so utcoffset() is never None; the fallback only
     # satisfies the type checker.
@@ -174,9 +151,8 @@ class ValidateLocalTimeArgs(BaseModel):
             "IANA zone name in Region/City form, for example "
             "'Australia/Sydney'. When the question does not name a zone, copy "
             "the one from the system prompt's date-and-time line rather than "
-            "the example here. An abbreviation ('EST'), a bare city "
-            "('Sydney'), an 'Etc/*' name, or an unknown name is an error, not "
-            "a fallback to UTC."
+            "the example here. An abbreviation ('EST'), an 'Etc/*' name, or "
+            "an unknown name is an error, not a fallback to UTC."
         )
     )
 
@@ -201,7 +177,7 @@ class ValidateLocalTimeResult(BaseModel):
     )
     # Field name is the wire contract; it locally shadows the datetime.timezone
     # import, which this class body does not use.
-    timezone: str = Field(description="The resolved (case-normalized) zone name.")
+    timezone: str = Field(description="The canonical IANA name of the resolved zone.")
 
 
 def _stamp(moment: datetime) -> str:
@@ -223,7 +199,7 @@ def _mapping(local: datetime, utc: datetime) -> LocalTimeMapping:
 
 def validate_local_time(local_time: str, timezone_name: str) -> ValidateLocalTimeResult:
     """Resolve a wall-clock time in a zone to every UTC instant it names."""
-    zone = _resolve_zone(timezone_name)
+    zone = resolve_zone(timezone_name)
     if zone is None:
         raise ValueError(f"Unknown IANA timezone: {timezone_name!r}")
     # Region/City only (plus UTC). These are all real tzdata entries that do

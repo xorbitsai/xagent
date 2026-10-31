@@ -645,6 +645,27 @@ class ElevenLabsTTS(BaseTTS):
             **request_kwargs,
         }
 
+    def _synthesis_error(
+        self, exc: Exception, *, streaming: bool = False
+    ) -> RuntimeError:
+        error_text = str(exc)
+        if self.api_key:
+            error_text = error_text.replace(self.api_key, "[REDACTED]")
+        if "invalid_uid" in error_text or "invalid ID has been received" in error_text:
+            message = (
+                "ElevenLabs rejected the provided voice ID. ElevenLabs voice IDs "
+                "are account-specific opaque values: call list_tts_voices or "
+                "clone_tts_voice and use an exact returned voice_id, or omit voice "
+                "to use the configured default."
+            )
+        else:
+            prefix = (
+                "ElevenLabs TTS stream failed" if streaming else "ElevenLabs TTS failed"
+            )
+            message = f"{prefix}: {redact_sensitive_text(error_text)}"
+        logger.error("%s", message)
+        return RuntimeError(message)
+
     async def synthesize(
         self,
         text: str,
@@ -679,25 +700,7 @@ class ElevenLabsTTS(BaseTTS):
                 stream,
             )
         except Exception as exc:
-            error_text = str(exc)
-            if (
-                "invalid_uid" in error_text
-                or "invalid ID has been received" in error_text
-            ):
-                message = (
-                    "ElevenLabs rejected the provided voice ID. ElevenLabs voice IDs "
-                    "are account-specific opaque values: call list_tts_voices or "
-                    "clone_tts_voice and use an exact returned voice_id, or omit voice "
-                    "to use the configured default."
-                )
-                logger.error("ElevenLabs TTS failed: %s", message)
-                raise RuntimeError(message) from exc
-            redacted_error = redact_sensitive_text(str(exc))
-            logger.error(
-                "ElevenLabs TTS failed: %s",
-                redacted_error,
-            )
-            raise RuntimeError(f"ElevenLabs TTS failed: {redacted_error}") from exc
+            raise self._synthesis_error(exc) from exc
         finally:
             # Once accepted, ElevenLabs charges for the text it was sent --
             # the aliased text, not the caller's -- whether or not the audio
@@ -793,12 +796,7 @@ class ElevenLabsTTS(BaseTTS):
             if not received_audio:
                 raise RuntimeError("ElevenLabs TTS returned no audio data")
         except Exception as exc:
-            detail = str(exc)
-            if self.api_key:
-                detail = detail.replace(self.api_key, "[REDACTED]")
-            raise RuntimeError(
-                f"ElevenLabs TTS stream failed: {redact_sensitive_text(detail)}"
-            ) from None
+            raise self._synthesis_error(exc, streaming=True) from None
         finally:
             record_charge()
 

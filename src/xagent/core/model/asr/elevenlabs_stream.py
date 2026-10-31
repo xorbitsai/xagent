@@ -60,6 +60,7 @@ class ElevenLabsASRStream(ASRStreamSession):
         self.session_id = session_id
         self._timeout = timeout
         self._closed = False
+        self._send_error: Exception | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._audio_bytes = 0
@@ -128,6 +129,7 @@ class ElevenLabsASRStream(ASRStreamSession):
                     params=params,
                     headers={"xi-api-key": provider.api_key},
                     heartbeat=20,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=1),
                 ),
                 timeout,
             )
@@ -177,7 +179,14 @@ class ElevenLabsASRStream(ASRStreamSession):
             async with self._send_lock:
                 if self._closed:
                     raise RuntimeError("ASR stream is closed")
-                await asyncio.wait_for(self._socket.send_json(payload), self._timeout)
+                try:
+                    await asyncio.wait_for(
+                        self._socket.send_json(payload), self._timeout
+                    )
+                except Exception as exc:
+                    if not self._closed:
+                        self._send_error = exc
+                    raise
                 self._audio_bytes += audio_bytes
         except BaseException:
             await self.aclose()
@@ -220,12 +229,14 @@ class ElevenLabsASRStream(ASRStreamSession):
         segment_id = 0
         try:
             if self._closed:
+                if self._send_error is not None:
+                    raise self._send_error
                 return
             yield ASRStreamEvent(type="session_started", session_id=self.session_id)
             while not self._closed:
                 message = await self._socket.receive()
                 if self._closed:
-                    return
+                    break
                 data = self._message_data(message, self._provider.api_key)
                 message_type = data.get("message_type")
                 if message_type not in {"partial_transcript", "committed_transcript"}:
@@ -242,6 +253,8 @@ class ElevenLabsASRStream(ASRStreamSession):
                 )
                 if final:
                     segment_id += 1
+            if self._send_error is not None:
+                raise self._send_error
         finally:
             await self.aclose()
 

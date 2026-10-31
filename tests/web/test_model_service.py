@@ -1,6 +1,7 @@
 """Test model service functionality"""
 
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,6 +44,47 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+def test_batch_asr_registry_and_shared_default_skip_live_only_models(monkeypatch):
+    live = SimpleNamespace(
+        id=1,
+        model_provider="elevenlabs",
+        model_name="scribe_v2_realtime",
+        abilities=["asr"],
+        base_url=None,
+    )
+    batch = SimpleNamespace(
+        id=2,
+        model_provider="elevenlabs",
+        model_name="scribe_v2",
+        abilities=["asr"],
+        base_url=None,
+    )
+    db = MagicMock()
+    query = db.query.return_value
+    query.filter.return_value = query
+    query.join.return_value = query
+    query.first.return_value = SimpleNamespace(model=live)
+    monkeypatch.setattr(
+        "xagent.web.services.model_service._is_model_visible_to_user",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service._get_visible_user_ids", lambda *args: [1]
+    )
+    with patch("xagent.core.model.asr.adapter.get_asr_model_instance") as factory:
+        query.all.return_value = [live, batch]
+        models = get_asr_models(db, user_id=1)
+        assert list(models) == ["scribe_v2"]
+        factory.assert_called_once_with(batch)
+        factory.reset_mock()
+        query.all.return_value = [
+            SimpleNamespace(model=live),
+            SimpleNamespace(model=batch),
+        ]
+        assert get_default_asr_model(1, db=db) is factory.return_value
+        factory.assert_called_once_with(batch)
 
 
 @pytest.fixture

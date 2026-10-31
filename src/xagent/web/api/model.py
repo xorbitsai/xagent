@@ -47,6 +47,7 @@ from xagent.core.model.providers import (
 )
 from xagent.core.utils.security import redact_sensitive_text
 
+from ...core.model.asr.adapter import supports_batch_asr
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.auto_model import AutoModelCandidate, AutoModelConfig
 from ..models.database import get_db
@@ -323,7 +324,11 @@ def _iter_accessible_asr_models(db: Session, user: User) -> list[DBModel]:
     seen_model_ids: set[int] = set()
     for db_model, _user_model in rows:
         model_pk = int(db_model.id)
-        if model_pk in seen_model_ids or not _model_has_ability(db_model, "asr"):
+        if (
+            model_pk in seen_model_ids
+            or not _model_has_ability(db_model, "asr")
+            or not supports_batch_asr(db_model)
+        ):
             continue
         seen_model_ids.add(model_pk)
         models.append(db_model)
@@ -339,7 +344,11 @@ def _resolve_asr_model_for_transcription(
         _, db_model, _user_model = _resolve_accessible_model(
             db, user, requested_model_id
         )
-        if db_model.category != "speech" or not _model_has_ability(db_model, "asr"):
+        if (
+            db_model.category != "speech"
+            or not _model_has_ability(db_model, "asr")
+            or not supports_batch_asr(db_model)
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Selected model does not support ASR transcription",
@@ -360,7 +369,9 @@ def _resolve_asr_model_for_transcription(
     default_model: Optional[DBModel] = None
     if asr_default and asr_default.model:
         default_model = cast(DBModel, asr_default.model)
-        if not _model_has_ability(default_model, "asr"):
+        if not _model_has_ability(default_model, "asr") or not supports_batch_asr(
+            default_model
+        ):
             default_model = None
 
     if default_model:
@@ -494,6 +505,8 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         return False
     current_category = str(getattr(model, "category", ""))
     if current_category != expected_category:
+        return False
+    if config_type in {"asr", "speech"} and not supports_batch_asr(model):
         return False
 
     abilities = getattr(model, "abilities", None) or []

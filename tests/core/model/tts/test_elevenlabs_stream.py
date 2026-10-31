@@ -3,13 +3,14 @@
 import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 from elevenlabs.client import AsyncElevenLabs
 
 from xagent.core.model import media_metering
+from xagent.core.model.chat.token_context import TokenContextManager
 from xagent.core.model.tts import ElevenLabsTTS, TTSChunk, XinferenceTTS
 from xagent.core.model.tts import elevenlabs as tts_module
 
@@ -106,6 +107,69 @@ async def test_cancel_while_waiting_for_first_audio_closes_and_bills_acceptance(
     assert closed.is_set()
     provider.usage.assert_called_once()
     assert provider.usage.call_args.args[2] == 5
+
+
+async def test_complete_multichunk_stream_uses_cloned_voice_and_bills_once(
+    monkeypatch, provider
+):
+    async def audio():
+        yield b"first"
+        yield b"second"
+
+    requests, closed = install_stream(monkeypatch, provider, audio())
+    clone = AsyncMock(return_value="cloned-voice")
+    monkeypatch.setattr(provider.model, "_get_or_create_cloned_voice", clone)
+    chunks = [
+        chunk.audio
+        async for chunk in provider.model.synthesize_stream(
+            "Hello", reference_audio="reference.wav"
+        )
+    ]
+    assert chunks == [b"first", b"second"]
+    clone.assert_awaited_once_with("reference.wav")
+    assert requests[0]["voice_id"] == "cloned-voice"
+    assert "reference_audio" not in requests[0]
+    assert closed.is_set()
+    provider.usage.assert_called_once()
+
+
+@pytest.mark.parametrize("finish", ["iterate", "close"])
+async def test_stream_usage_remains_in_the_originating_context(
+    monkeypatch, provider, finish
+):
+    async def audio():
+        yield b"first"
+        yield b"second"
+
+    install_stream(monkeypatch, provider, audio())
+    monkeypatch.setattr(
+        tts_module, "record_provider_usage", media_metering.record_provider_usage
+    )
+    with TokenContextManager() as opening:
+        stream = provider.model.synthesize_stream("Hello")
+        await anext(stream)
+        with TokenContextManager() as consuming:
+            if finish == "iterate":
+                assert [chunk.audio async for chunk in stream] == [b"second"]
+            else:
+                await stream.aclose()
+    rows = [row for row in opening.get_usage().details if row.get("type") == "media"]
+    assert len(rows) == 1
+    assert rows[0]["quantity"] == 5
+    assert not consuming.get_usage().details
+
+
+async def test_stream_invalid_voice_uses_batch_guidance_and_logs_safely(
+    monkeypatch, provider, caplog
+):
+    install_stream(
+        monkeypatch, provider, None, error=RuntimeError("invalid_uid test-secret")
+    )
+    with pytest.raises(RuntimeError, match="list_tts_voices") as error:
+        await anext(provider.model.synthesize_stream("Hello"))
+    assert "test-secret" not in str(error.value)
+    assert "test-secret" not in caplog.text
+    assert "provided voice ID" in caplog.text
 
 
 @pytest.mark.parametrize("chunks", [[], [b""], ["invalid audio"]])

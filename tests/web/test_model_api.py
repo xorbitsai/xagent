@@ -348,6 +348,95 @@ def test_user_creation_rejects_platform_namespace(
         db.close()
 
 
+@pytest.fixture
+def realtime_asr_record(regular_headers, sample_speech_model_data):
+    payload = {
+        **sample_speech_model_data,
+        "model_id": "live-only-asr",
+        "model_name": "scribe_v2_realtime",
+        "model_provider": "elevenlabs",
+        "abilities": ["asr"],
+    }
+    response = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_file_transcription_rejects_live_only_asr_before_provider_call(
+    realtime_asr_record, regular_headers, explicit
+):
+    with patch("xagent.core.model.asr.adapter.get_asr_model_instance") as factory:
+        response = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+            data={"model_id": realtime_asr_record["model_id"]} if explicit else {},
+        )
+    assert response.status_code == (400 if explicit else 404), response.text
+    factory.assert_not_called()
+
+
+def test_live_only_asr_cannot_become_file_asr_default(
+    realtime_asr_record, regular_headers
+):
+    response = client.post(
+        "/api/models/user-default",
+        headers=regular_headers,
+        json={"model_id": realtime_asr_record["id"], "config_type": "asr"},
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("legacy_default", [False, True])
+def test_file_asr_resolution_skips_realtime_candidates_and_legacy_defaults(
+    realtime_asr_record,
+    regular_user,
+    regular_headers,
+    sample_speech_model_data,
+    legacy_default,
+):
+    response = client.post(
+        "/api/models/",
+        headers=regular_headers,
+        json={
+            **sample_speech_model_data,
+            "model_id": "batch-asr",
+            "model_name": "scribe_v2",
+            "model_provider": "elevenlabs",
+            "abilities": ["asr"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    if legacy_default:
+        db = next(get_db())
+        try:
+            db.add(
+                UserDefaultModel(
+                    user_id=regular_user["id"],
+                    model_id=realtime_asr_record["id"],
+                    config_type="asr",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+    fake = SimpleNamespace(
+        transcribe=AsyncMock(return_value="recognized"), aclose=AsyncMock()
+    )
+    with patch(
+        "xagent.core.model.asr.adapter.get_asr_model_instance", return_value=fake
+    ) as factory:
+        transcribed = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+        )
+    assert transcribed.status_code == 200, transcribed.text
+    assert transcribed.json()["model_id"] == "batch-asr"
+    assert factory.call_args.args[0].model_name == "scribe_v2"
+
+
 @pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
 def test_user_creation_rejects_auto_router_namespace(
     test_db, regular_headers, sample_model_data, path

@@ -52,15 +52,6 @@ _ELEVENLABS_ASR_MODELS: tuple[dict[str, Any], ...] = (
         "name": "Scribe v1",
         "description": "ElevenLabs speech-to-text model",
     },
-    {
-        "id": REALTIME_ASR_MODEL,
-        "object": "model",
-        "owned_by": "elevenlabs",
-        "category": "speech",
-        "abilities": ["asr"],
-        "name": "Scribe v2 Realtime",
-        "description": "Live audio transcription with server VAD or manual commits",
-    },
 )
 
 _ELEVENLABS_STT_PROVIDER_OPTION_FIELDS = (

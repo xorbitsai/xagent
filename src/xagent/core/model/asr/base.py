@@ -68,7 +68,9 @@ class ASRStreamSession(ABC):
 
     Closing or cancelling discards pending audio; it does not commit a turn.
     Consumers should use the async context manager to release the connection
-    when stopping iteration early.
+    when stopping iteration early. Close the session before the opening
+    ``usage_scope`` or ``TokenContextManager`` exits: usage is flushed to that
+    scope on close and cannot be delivered after the scope has already exited.
     """
 
     @abstractmethod
@@ -82,9 +84,6 @@ class ASRStreamSession(ABC):
 
     @abstractmethod
     async def aclose(self) -> None: ...
-
-    async def cancel(self) -> None:
-        await self.aclose()
 
     async def __aenter__(self) -> ASRStreamSession:
         return self

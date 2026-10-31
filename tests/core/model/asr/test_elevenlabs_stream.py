@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
+from aiohttp import web
 
 from xagent.core.model.asr import ASRStreamEvent, ElevenLabsASR, XinferenceASR
 from xagent.core.model.asr import elevenlabs_stream as stream_module
@@ -124,7 +125,7 @@ async def test_manual_commit_and_cancel_do_not_submit_extra_audio(transport):
         "commit": True,
         "sample_rate": 8000,
     }
-    await stream.cancel()
+    await stream.aclose()
     assert len(t.socket.sent) == 2
     with pytest.raises(StopAsyncIteration):
         await anext(aiter(stream))
@@ -234,6 +235,116 @@ async def test_cancelling_pending_send_releases_transport(transport):
     assert t.socket.close_count == 1
     t.client.close.assert_awaited_once()
     assert not t.model._streams
+
+
+@pytest.mark.parametrize(
+    "send_error", [ConnectionError("send failed"), TimeoutError("send timed out")]
+)
+async def test_send_failure_is_visible_to_a_pending_receiver(transport, send_error):
+    t = transport
+    stream = await t.model.open_stream()
+    events = aiter(stream)
+    await anext(events)
+    receiver = asyncio.create_task(anext(events))
+    await t.socket.waiting.wait()
+    t.socket.send_json = AsyncMock(side_effect=send_error)
+    with pytest.raises(type(send_error), match=str(send_error)):
+        await stream.send_audio(b"\x00\x00")
+    with pytest.raises(type(send_error), match=str(send_error)):
+        await receiver
+    assert t.socket.close_count == 1
+    t.client.close.assert_awaited_once()
+
+
+async def test_owner_close_flushes_an_established_session_to_its_opening_context(
+    transport,
+):
+    owner = ContextVar("owner_close_usage", default="none")
+    seen = []
+    transport.usage.side_effect = lambda *args, **kwargs: seen.append(owner.get())
+    token = owner.set("opening")
+    try:
+        stream = await transport.model.open_stream()
+        await stream.send_audio(b"\x00\x00" * 8000)
+        owner.set("closing")
+        await asyncio.create_task(transport.model.aclose())
+        assert seen == ["opening"]
+        assert transport.usage.call_args.args[2] == 0.5
+        assert transport.socket.close_count == 1
+        transport.client.close.assert_awaited_once()
+        assert not transport.model._streams
+    finally:
+        owner.reset(token)
+
+
+async def test_first_message_auth_error_closes_both_resources_and_redacts_key(
+    transport,
+):
+    t = transport
+    t.socket.messages.get_nowait()
+    t.socket.messages.put_nowait(
+        message({"message_type": "auth_error", "error": "invalid test-secret"})
+    )
+    with pytest.raises(RuntimeError, match="auth|invalid") as error:
+        await t.model.open_stream()
+    assert "test-secret" not in str(error.value)
+    assert t.socket.close_count == 1
+    t.client.close.assert_awaited_once()
+    t.usage.assert_not_called()
+
+
+async def test_external_close_ends_a_pending_receive_normally(transport):
+    t = transport
+    stream = await t.model.open_stream()
+    events = aiter(stream)
+    await anext(events)
+    receiver = asyncio.create_task(anext(events))
+    await t.socket.waiting.wait()
+    await asyncio.create_task(stream.aclose())
+    with pytest.raises(StopAsyncIteration):
+        await receiver
+    assert t.socket.close_count == 1
+    t.client.close.assert_awaited_once()
+
+
+async def test_realtime_model_is_not_advertised_to_existing_batch_consumers():
+    models = await ElevenLabsASR.async_list_available_models()
+    assert {model["id"] for model in models} == {"scribe_v1", "scribe_v2"}
+
+
+async def test_close_does_not_wait_for_the_default_ten_second_peer_timeout(monkeypatch):
+    release = asyncio.Event()
+
+    async def unresponsive_peer(request):
+        socket = web.WebSocketResponse(autoclose=False)
+        await socket.prepare(request)
+        await socket.send_json(
+            {"message_type": "session_started", "session_id": "unresponsive"}
+        )
+        # Do not read or acknowledge the client's close frame until cleanup.
+        await release.wait()
+        return socket
+
+    app = web.Application()
+    app.router.add_get("/v1/speech-to-text/realtime", unresponsive_peer)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_ENDPOINTS", base)
+    monkeypatch.setenv("XAGENT_MODEL_PRIVATE_CIDRS", "127.0.0.1/32")
+    model = ElevenLabsASR(model="scribe_v2_realtime", api_key="test-key", base_url=base)
+    try:
+        session = await model.open_stream()
+        await asyncio.wait_for(session.aclose(), 3)
+        assert session._socket.closed and session._client.closed
+        assert not model._streams
+    finally:
+        release.set()
+        await model.aclose()
+        await runner.cleanup()
 
 
 async def test_startup_timeout_closes_transport(transport):

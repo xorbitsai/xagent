@@ -9,7 +9,9 @@ import mimetypes
 import os
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Iterable
+from contextlib import aclosing
+from contextvars import copy_context
 from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -19,6 +21,7 @@ from ..chat.token_context import MediaCallType
 from ..media_metering import (
     BilledStream,
     elevenlabs_billed_units,
+    iter_billed_stream,
     read_billed_stream,
     record_provider_usage,
 )
@@ -27,7 +30,7 @@ from ..public_elevenlabs import (
     close_public_elevenlabs_sync_http_client,
     create_public_elevenlabs_client,
 )
-from .base import BaseTTS, TTSResult
+from .base import BaseTTS, TTSChunk, TTSResult
 
 logger = logging.getLogger(__name__)
 
@@ -600,18 +603,15 @@ class ElevenLabsTTS(BaseTTS):
                 f"ElevenLabs voice deletion failed: {redacted_error}"
             ) from exc
 
-    async def synthesize(
+    def _synthesis_request(
         self,
         text: str,
         voice: Optional[str] = None,
         language: Optional[str] = None,
         format: Optional[str] = None,
         sample_rate: Optional[int] = None,
-        verbose: bool = False,
         **kwargs: Any,
-    ) -> Union[bytes, TTSResult]:
-        reference_audio = kwargs.pop("reference_audio", None)
-        voice_id = voice or self.voice
+    ) -> dict[str, Any]:
         final_output_format = self._resolve_output_format(
             format or self.output_format, sample_rate or self.sample_rate
         )
@@ -620,7 +620,6 @@ class ElevenLabsTTS(BaseTTS):
             sample_rate,
             final_output_format,
         )
-        final_sample_rate = _sample_rate_from_output_format(final_output_format)
         language_code = kwargs.pop("language_code", None) or language or self.language
         voice_settings = kwargs.pop("voice_settings", None)
         pronunciation_aliases = kwargs.pop("pronunciation_aliases", None)
@@ -638,21 +637,44 @@ class ElevenLabsTTS(BaseTTS):
                 voice_settings
             )
 
+        return {
+            "text": synthesis_text,
+            "voice_id": voice or self.voice,
+            "model_id": self.model,
+            "output_format": final_output_format,
+            **request_kwargs,
+        }
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        verbose: bool = False,
+        **kwargs: Any,
+    ) -> Union[bytes, TTSResult]:
+        reference_audio = kwargs.pop("reference_audio", None)
+        request = self._synthesis_request(
+            text, voice, language, format, sample_rate, **kwargs
+        )
+        final_output_format = request["output_format"]
+        final_sample_rate = _sample_rate_from_output_format(final_output_format)
+        language_code = request.get("language_code")
+        synthesis_text = request["text"]
+
         client = self._ensure_async_client()
         stream = BilledStream()
         try:
             if reference_audio:
-                voice_id = await self._get_or_create_cloned_voice(reference_audio)
+                request["voice_id"] = await self._get_or_create_cloned_voice(
+                    reference_audio
+                )
             audio = await read_billed_stream(
                 client.text_to_speech,
                 "convert",
-                {
-                    "text": synthesis_text,
-                    "voice_id": voice_id,
-                    "model_id": self.model,
-                    "output_format": final_output_format,
-                    **request_kwargs,
-                },
+                request,
                 self._coerce_audio_bytes,
                 stream,
             )
@@ -701,10 +723,84 @@ class ElevenLabsTTS(BaseTTS):
             language=language_code,
             raw_response={
                 "model": self.model,
-                "voice_id": voice_id,
+                "voice_id": request["voice_id"],
                 "output_format": final_output_format,
             },
         )
+
+    @property
+    def supports_streaming(self) -> bool:
+        return True
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[TTSChunk, None]:
+        """Yield provider audio immediately; callers close the iterator on interruption."""
+        reference_audio = kwargs.pop("reference_audio", None)
+        request = self._synthesis_request(
+            text, voice, language, format, sample_rate, **kwargs
+        )
+        output_format = request["output_format"]
+        client = self._ensure_async_client()
+        state = BilledStream()
+        usage_context = copy_context()
+        recorded = False
+
+        def record_charge() -> None:
+            nonlocal recorded
+            if state.accepted and not recorded:
+                recorded = True
+                usage_context.run(
+                    record_provider_usage,
+                    self,
+                    MediaCallType.TTS,
+                    len(request["text"]),
+                    provider_billed_units=elevenlabs_billed_units(state.headers),
+                )
+
+        received_audio = False
+        try:
+            if reference_audio:
+                request["voice_id"] = await self._get_or_create_cloned_voice(
+                    reference_audio
+                )
+            async with aclosing(
+                iter_billed_stream(
+                    client.text_to_speech,
+                    "stream",
+                    request,
+                    self._coerce_audio_bytes,
+                    state,
+                )
+            ) as stream:
+                async for audio in stream:
+                    # Charge before yielding, including when the consumer never
+                    # resumes the iterator after its first audio fragment.
+                    record_charge()
+                    if audio:
+                        received_audio = True
+                        yield TTSChunk(
+                            audio=audio,
+                            format=_extension_from_output_format(output_format),
+                            sample_rate=_sample_rate_from_output_format(output_format),
+                        )
+            if not received_audio:
+                raise RuntimeError("ElevenLabs TTS returned no audio data")
+        except Exception as exc:
+            detail = str(exc)
+            if self.api_key:
+                detail = detail.replace(self.api_key, "[REDACTED]")
+            raise RuntimeError(
+                f"ElevenLabs TTS stream failed: {redact_sensitive_text(detail)}"
+            ) from None
+        finally:
+            record_charge()
 
     @property
     def abilities(self) -> list[str]:

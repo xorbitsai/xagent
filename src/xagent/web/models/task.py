@@ -568,6 +568,18 @@ class Task(Base):  # type: ignore
         index=True,
     )
 
+    # The kind of SDK credential that created the task: NULL for a runtime
+    # (agent or workforce) key and for every path that is not the SDK,
+    # 'personal' for a personal key. Written once, when the task is created.
+    sdk_credential_kind = Column(
+        String(16),
+        CheckConstraint(
+            "sdk_credential_kind IS NULL OR sdk_credential_kind = 'personal'",
+            name="ck_tasks_sdk_credential_kind",
+        ),
+        nullable=True,
+    )
+
     # The dispatch class the caller declared at creation, stored as sent whether
     # or not a deployment accepts it; acceptance is decided as each command is
     # enqueued.

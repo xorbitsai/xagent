@@ -42,6 +42,28 @@ class TestClaudeLLM:
         assert "claude-3-5-sonnet" not in llm.model_name
 
     @pytest.mark.asyncio
+    async def test_default_model_request_omits_rejected_params(self, mocker):
+        llm = ClaudeLLM(api_key="test-key")
+        client = mocker.AsyncMock()
+        client.messages.create.return_value = SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text="Done")],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+        llm._client = client
+
+        await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            temperature=0.1,
+            thinking={"type": "enabled", "budget_tokens": 2048},
+        )
+
+        kwargs = client.messages.create.call_args.kwargs
+        assert kwargs["model"] == DEFAULT_CLAUDE_MODEL
+        assert "temperature" not in kwargs
+        assert kwargs["thinking"] == {"type": "adaptive"}
+
+    @pytest.mark.asyncio
     async def test_auto_only_model_normalizes_required_tool_choice(self, mocker):
         llm = ClaudeLLM(model_name="claude-opus-5-5-20261001", api_key="test-key")
         client = mocker.AsyncMock()

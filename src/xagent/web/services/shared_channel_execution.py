@@ -748,7 +748,7 @@ async def execute_channel_background(
     from ..user_isolated_memory import UserContext
     from .agent_service_manager import get_agent_manager
     from .execution_result_projection import project_execution_result_for_channel
-    from .managed_task_lease import finalize_managed_task_lease_result
+    from .managed_task_lease import finalize_managed_task_lease_result_sync
     from .task_execution_context_service import (
         materialize_task_execution_recovery_state,
     )
@@ -847,24 +847,24 @@ async def execute_channel_background(
             report = SettlementReport()
 
             def finalize() -> bool:
-                with get_session_local()() as db:
-                    return finalize_managed_task_lease_result(
-                        db,
-                        lease,
-                        status=projection.task_status,
-                        assistant_content=projection.transcript_content,
-                        turn_id=command.command_id,
-                        interactions=projection.interactions,
-                        message_type=projection.message_type,
-                        error_message=projection.diagnostic_error,
-                        execution_result=result,
-                        completion=(command.id, durable_result),
-                        # An interrupted run may rest PAUSED instead; its channel
-                        # then reads "interrupted", as after lease recovery, or
-                        # waits for the automatic resume the pause scheduled.
-                        settle_interruption=True,
-                        report=report,
-                    )
+                # Owned Sessions: a lost COMMIT acknowledgement is confirmed
+                # by the result fact's witness instead of raising.
+                return finalize_managed_task_lease_result_sync(
+                    lease,
+                    status=projection.task_status,
+                    assistant_content=projection.transcript_content,
+                    turn_id=command.command_id,
+                    interactions=projection.interactions,
+                    message_type=projection.message_type,
+                    error_message=projection.diagnostic_error,
+                    execution_result=result,
+                    completion=(command.id, durable_result),
+                    # An interrupted run may rest PAUSED instead; its channel
+                    # then reads "interrupted", as after lease recovery, or
+                    # waits for the automatic resume the pause scheduled.
+                    settle_interruption=True,
+                    report=report,
+                )
 
             if not await run_db_io_cancellation_safe(finalize):
                 raise TaskLeaseLostError("Channel result no longer owns its execution")

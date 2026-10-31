@@ -11,10 +11,11 @@ reported. Task ids appear in logs only, never as metric attributes.
 ``report_commit_failure`` covers failed event commits.
 ``report_unknown_outcome`` covers cases where the system does not know whether
 something durable happened (a tool's external effect, a turn or command
-acceptance, a finalize whose acknowledgement was lost, a settlement deferred
-to lease recovery). One of its kinds, ``finalize_ack_reconciled``, is a
-confirmed success counted for visibility only: alerts on the unknown-outcome
-counter must exclude it.
+acceptance, a finalize or settlement whose acknowledgement was lost, a
+settlement deferred to lease recovery). Two of its kinds,
+``finalize_ack_reconciled`` and ``settlement_ack_reconciled``, are confirmed
+successes counted for visibility only: alerts on the unknown-outcome counter
+must exclude them.
 ``report_recovery_refusal`` covers recovery reads that refuse to resume a task.
 Its counter counts refused reads, including classification probes, so it is
 neither a per-task nor a per-resume count; see that helper for known gaps.
@@ -340,11 +341,12 @@ def report_unknown_outcome(
     ``kind`` names the case and is the counter's ``operation`` attribute, so
     it must stay a small fixed set: ``tool_effect``, ``turn_commit``,
     ``command_commit``, ``finalize_ack_unresolved``,
-    ``resume_finalize_unreconciled``, ``settlement_deferred`` -- and
-    ``finalize_ack_reconciled``, which is not unknown but a confirmed success
-    (the read-back proved a lost acknowledgement's COMMIT applied), reported
-    at INFO and counted for visibility only: alerts on this counter must
-    exclude it. ``storage`` is ``v1``, ``v2`` or ``unknown``; ``turn_commit``,
+    ``settlement_ack_unresolved``, ``resume_finalize_unreconciled``,
+    ``settlement_deferred`` -- and ``finalize_ack_reconciled`` and
+    ``settlement_ack_reconciled``, which are not unknown but confirmed
+    successes (the read-back proved a lost acknowledgement's COMMIT applied),
+    reported at INFO and counted for visibility only: alerts on this counter
+    must exclude them. ``storage`` is ``v1``, ``v2`` or ``unknown``; ``turn_commit``,
     ``command_commit`` and ``settlement_deferred`` report ``unknown`` because
     the storage version is not in scope where they occur. ``ref`` is an
     identifier only (a turn id, a command id, a tool attempt id), never

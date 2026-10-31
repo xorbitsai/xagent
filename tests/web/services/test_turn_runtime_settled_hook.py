@@ -98,6 +98,7 @@ async def drive_channel_background(
     monkeypatch: pytest.MonkeyPatch,
     *,
     fail_before_execute: str | None = None,
+    run_db_io: AsyncMock | None = None,
 ) -> None:
     outcome = agent_outcome(path)
     tracer = SimpleNamespace(add_handler=Mock(), remove_handler=Mock())
@@ -166,7 +167,7 @@ async def drive_channel_background(
     monkeypatch.setattr(
         shared_channel_execution,
         "run_db_io_cancellation_safe",
-        AsyncMock(return_value=True),
+        run_db_io or AsyncMock(return_value=True),
     )
 
     snapshot = SimpleNamespace(

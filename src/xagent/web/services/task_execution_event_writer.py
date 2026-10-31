@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.orm.attributes import set_committed_value
 
@@ -59,6 +59,35 @@ def fact_witness_committed_no_commit(db: Session, witness: FactWitness) -> bool:
         )
         is not None
     )
+
+
+# Bound the read-back's wait for an in-flight COMMIT on PostgreSQL. SQLite's
+# busy timeout bounds the same wait there.
+_WITNESS_READ_BACK_LOCK_TIMEOUT = "5s"
+
+
+def fact_witness_committed(witness: FactWitness) -> bool:
+    """Whether ``witness``'s transaction committed, read in a fresh Session.
+
+    The writing transaction held the task row until its COMMIT resolved;
+    taking the same lock first waits for that outcome, so an applied COMMIT
+    is never read as absent. It is this session's only lock, so it cannot
+    invert an order. Raises when the read itself fails: the outcome is then
+    undecided.
+    """
+    from ..models.database import get_session_local
+
+    with get_session_local()() as read_db:
+        try:
+            if read_db.get_bind().dialect.name == "postgresql":
+                read_db.execute(
+                    text("SELECT set_config('lock_timeout', :lock, true)"),
+                    {"lock": _WITNESS_READ_BACK_LOCK_TIMEOUT},
+                )
+            lock_task_execution_events_no_commit(read_db, witness.task_id)
+            return fact_witness_committed_no_commit(read_db, witness)
+        finally:
+            read_db.rollback()
 
 
 def uses_execution_events(db: Session, task_id: int) -> bool:

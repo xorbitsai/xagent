@@ -23,11 +23,11 @@ from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services.managed_task_lease import (
     ManagedTaskLease,
-    _finalize_managed_task_lease_result_sync,
     claim_managed_task_lease,
     claim_managed_task_lease_isolated,
     finalize_managed_task_lease_result,
     finalize_managed_task_lease_result_isolated,
+    finalize_managed_task_lease_result_sync,
     start_managed_task_lease,
 )
 from xagent.web.services.task_lease_service import (
@@ -174,7 +174,7 @@ async def test_isolated_finalize_keeps_event_loop_responsive(
 
     monkeypatch.setattr(
         "xagent.web.services.managed_task_lease."
-        "_finalize_managed_task_lease_result_sync",
+        "finalize_managed_task_lease_result_sync",
         blocking_finalize,
     )
 
@@ -561,7 +561,7 @@ def test_execution_result_identity_at_finalize_sync(
     )
 
     assert (
-        _finalize_managed_task_lease_result_sync(
+        finalize_managed_task_lease_result_sync(
             TaskLease(task_id=202, runner_id="runner-a", run_id="run-a"),
             status=TaskStatus.COMPLETED,
             execution_result=sentinel,
@@ -585,7 +585,7 @@ async def test_execution_result_identity_at_finalize_isolated(
 
     monkeypatch.setattr(
         managed_task_lease,
-        "_finalize_managed_task_lease_result_sync",
+        "finalize_managed_task_lease_result_sync",
         capture_sync,
     )
 

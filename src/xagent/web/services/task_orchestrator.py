@@ -92,8 +92,10 @@ from .db_runtime import (
     task_returned,
 )
 from .db_write_retry import (
+    CommitAttempt,
     bound_rerun_lock_wait_no_commit,
     retry_db_write_async,
+    run_with_commit_witness_sync,
 )
 from .execution_event_signals import report_commit_failure, report_unknown_outcome
 from .external_task_cancel import (
@@ -2024,11 +2026,13 @@ def _pause_interrupted_run_no_commit(
     *,
     error: str,
     turn_id: str | None = None,
+    attempt: CommitAttempt | None = None,
 ) -> tuple[dict[str, Any], RecordedInterruption | None] | None:
     """Pause and release an interrupted run with its projections, uncommitted.
 
     Returns the paused control snapshot and what was recorded for automatic
-    recovery, or ``None`` when the fenced write missed. This path keeps its
+    recovery, or ``None`` when the fenced write missed. ``attempt`` receives
+    the witness of the result fact this transaction stages. This path keeps its
     own writer rather than the ORM transition the result paths use: like
     ``fail_and_release_task_lease_no_commit`` it settles and releases in one
     fenced UPDATE (RUNNING, exact run and attempt), which is what this
@@ -2052,7 +2056,11 @@ def _pause_interrupted_run_no_commit(
     recorded = apply_interruption_outcome_no_commit(
         db, task=task, decision=decision, error=error
     )
-    stage_result_fact_no_commit(db, task, interruption_pause_result(), turn_id=turn_id)
+    witness = stage_result_fact_no_commit(
+        db, task, interruption_pause_result(), turn_id=turn_id
+    )
+    if attempt is not None:
+        attempt.witness = witness
     logger.warning(
         "task_id=%s run_id=%s component=settlement paused interrupted run "
         "(reason=%s): %s",
@@ -2121,7 +2129,48 @@ def settle_task_lease_isolated(
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
-    ownerless RUNNING task.
+    ownerless RUNNING task. A V2 settlement whose COMMIT failed retryably is
+    first read back by its result fact's witness
+    (``run_with_commit_witness_sync``): a lost acknowledgement whose COMMIT
+    applied returns ``True`` as if it had been acknowledged, and one that
+    did not apply is rerun. The exception types are unchanged; after reruns
+    the last attempt's error is raised.
+    """
+    return run_with_commit_witness_sync(
+        lambda attempt: _settle_task_lease_attempt(
+            lease,
+            error_message=error_message,
+            client_error_message=client_error_message,
+            client_message_type=client_message_type,
+            turn_id=turn_id,
+            classify_unknown_tool_effect=classify_unknown_tool_effect,
+            interruption=interruption,
+            report=report,
+            attempt=attempt,
+        ),
+        site="settlement",
+        task_id=lease.task_id,
+        run_id=lease.run_id,
+    )
+
+
+def _settle_task_lease_attempt(
+    lease: TaskLease,
+    *,
+    error_message: str | None,
+    client_error_message: str,
+    client_message_type: str,
+    turn_id: str | None,
+    classify_unknown_tool_effect: bool,
+    interruption: InterruptionReason | None,
+    report: SettlementReport | None,
+    attempt: CommitAttempt | None = None,
+) -> bool:
+    """One transaction of ``settle_task_lease_isolated``.
+
+    With an ``attempt``, a rerun bounds its lock waits, and a settlement that
+    stages a V2 result fact leaves its witness and its post-commit step there
+    for the retry driver.
     """
     from ..models.database import get_session_local
     from .chat_history_service import persist_assistant_message_no_commit
@@ -2131,6 +2180,8 @@ def settle_task_lease_isolated(
     SessionLocal = get_session_local()
     with SessionLocal() as settle_db:
         try:
+            if attempt is not None and attempt.rerun:
+                bound_rerun_lock_wait_no_commit(settle_db)
             if error_message is not None:
                 decision = (
                     decide_owned_run_interruption(settle_db, lease, interruption)
@@ -2144,16 +2195,24 @@ def settle_task_lease_isolated(
                         decision,
                         error=error_message,
                         turn_id=turn_id,
+                        attempt=attempt,
                     )
                     if paused is not None:
                         paused_state, recorded = paused
+                        paused_for = decision.reason
+
+                        def confirm_pause() -> bool:
+                            if report is not None:
+                                report.control_state = dict(paused_state)
+                                report.paused_for = paused_for
+                                report.recovery = recorded
+                            invalidate_task_cache_best_effort(lease.task_id)
+                            return True
+
+                        if attempt is not None:
+                            attempt.confirm = confirm_pause
                         settle_db.commit()
-                        if report is not None:
-                            report.control_state = dict(paused_state)
-                            report.paused_for = decision.reason
-                            report.recovery = recorded
-                        invalidate_task_cache_best_effort(lease.task_id)
-                        return True
+                        return confirm_pause()
                     failed = False
                 else:
                     if (
@@ -2227,12 +2286,14 @@ def settle_task_lease_isolated(
                         )
                     from .task_execution_event_writer import stage_result_fact_no_commit
 
-                    stage_result_fact_no_commit(
+                    witness = stage_result_fact_no_commit(
                         settle_db,
                         task,
                         {"error": error_message},
                         turn_id=history_turn_id,
                     )
+                    if attempt is not None:
+                        attempt.witness = witness
                     if get_shared_task_execution_enabled():
                         from .task_runtime_secrets import (
                             delete_runtime_values_no_commit,
@@ -2248,15 +2309,21 @@ def settle_task_lease_isolated(
                         if task.conversation_storage_version == 2
                         else {}
                     )
+
+                    def confirm_failure() -> bool:
+                        if unknown_tool_effect:
+                            log_unknown_tool_effect_settlement(
+                                lease.task_id, lease.run_id, unknown_tool_attempt_id
+                            )
+                        if report is not None:
+                            report.control_state = dict(event_state)
+                        invalidate_task_cache_best_effort(lease.task_id)
+                        return True
+
+                    if attempt is not None:
+                        attempt.confirm = confirm_failure
                     settle_db.commit()
-                    if unknown_tool_effect:
-                        log_unknown_tool_effect_settlement(
-                            lease.task_id, lease.run_id, unknown_tool_attempt_id
-                        )
-                    if report is not None:
-                        report.control_state = dict(event_state)
-                    invalidate_task_cache_best_effort(lease.task_id)
-                    return True
+                    return confirm_failure()
 
                 # The task may already have committed a terminal/control state.
                 # Clear the failed conditional UPDATE transaction before the

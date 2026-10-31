@@ -2,10 +2,17 @@
 
 A V2 execution fact is committed under a fixed identity, so a transient
 database failure (deadlock, lock timeout, dropped connection) can be answered
-by running the same write again instead of aborting the run. The driver here
-retries only the database write it is handed: callers must make that
-operation an idempotent rerun under the same fact identity, and must treat a
-retryable failure as possibly committed.
+by running the same write again instead of aborting the run. The drivers here
+retry only the database write they are handed, and treat a retryable
+failure as possibly committed:
+
+- ``retry_db_write_async`` reruns the write as is; callers make
+  that operation an idempotent rerun under the same fact identity.
+- ``run_with_commit_witness_sync`` is for fenced writes (settlements), whose
+  rerun after an applied COMMIT would miss its own fence. The attempt
+  records the witness of the result fact it staged; after a retryable error
+  the witness is read back, and only an attempt proven not to have
+  committed is rerun.
 
 Exhaustion re-raises the last error unchanged, so the callers' existing
 failure handling (``ExecutionEventPersistenceError`` -> runner abort ->
@@ -15,10 +22,12 @@ settlement) is the same with retries enabled, disabled, or used up.
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import sqlite3
+import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Iterator, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Iterator, TypeVar, cast
 
 from sqlalchemy import exc as sa_exc
 from sqlalchemy import text
@@ -32,6 +41,11 @@ from ...config import (
 from ...core.agent.interruption import is_database_unavailable
 from ...core.runtime_performance import increment_counter
 from .db_runtime import is_database_pool_timeout
+
+if TYPE_CHECKING:
+    from .task_execution_event_writer import FactWitness
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -228,5 +242,122 @@ async def retry_db_write_async(
                 raise
         else:
             if attempt > 1:
+                _count(site, "recovered")
+            return result
+
+
+@dataclass
+class CommitAttempt:
+    """What one attempt of a witnessed write leaves for its retry driver.
+
+    ``witness`` is the fact row this attempt's transaction inserted (from
+    ``stage_result_fact_no_commit``); it stands for every write in that
+    atomic transaction. ``confirm`` is what the attempt does after its
+    COMMIT: the driver calls it instead when a lost acknowledgement's COMMIT
+    is proven applied, so set it before committing.
+    """
+
+    number: int = 1
+    witness: FactWitness | None = None
+    confirm: Callable[[], Any] | None = None
+
+    @property
+    def rerun(self) -> bool:
+        """Whether an earlier attempt failed; its transaction must bound its
+        lock waits (:func:`bound_rerun_lock_wait_no_commit`)."""
+        return self.number > 1
+
+
+def run_with_commit_witness_sync(
+    operation: Callable[[CommitAttempt], T],
+    *,
+    site: str,
+    task_id: int,
+    run_id: str | None,
+    policy: DbWriteRetryPolicy | None = None,
+) -> T:
+    """Run a witnessed write, confirming or rerunning it after a lost COMMIT.
+
+    For writes that cannot simply be rerun because they make a fenced state
+    transition (a settlement): a rerun after an applied COMMIT would miss its
+    own fence and report the outcome as someone else's. So, after a
+    retryable error, an attempt that inserted a witness is read back first
+    (``fact_witness_committed``, which waits for the task row lock):
+
+    - found: the COMMIT applied. The attempt's ``confirm`` is returned, so
+      the caller reports its own committed outcome once.
+    - absent: nothing applied; the operation is rerun in a new attempt,
+      within the policy's bounds.
+    - the read fails: the outcome is undecided and the error is re-raised.
+
+    An error that is not retryable, or one from an attempt without a witness
+    (a legacy task, a replayed fact, or a failure before the fact was
+    staged), is re-raised unchanged, as without this driver. Every error
+    re-raised is the operation's own, cause chain intact. Runs in a worker
+    thread: the backoff sleeps it.
+
+    Operator signals: ``site`` labels the retry counter, as in
+    :func:`retry_db_write_async`. ``settlement_ack_reconciled`` (INFO) is
+    reported when a read-back proves a COMMIT applied, and
+    ``settlement_ack_unresolved`` when the read-back fails after a dropped
+    connection (``connection_was_lost``), the one error that can hide an
+    applied COMMIT.
+    """
+    from .execution_event_signals import report_unknown_outcome
+    from .task_execution_event_writer import fact_witness_committed
+
+    policy = policy or DbWriteRetryPolicy.from_config()
+    number = 0
+    while True:
+        number += 1
+        attempt = CommitAttempt(number=number)
+        try:
+            result = operation(attempt)
+        except Exception as exc:
+            witness = attempt.witness
+            if witness is None or not is_retryable_database_error(exc):
+                if number > 1:
+                    _count(site, "failed")
+                raise
+            committed: bool | None
+            try:
+                committed = fact_witness_committed(witness)
+            except Exception:
+                logger.warning(
+                    "Task %s %s commit read-back failed", task_id, site, exc_info=True
+                )
+                committed = None
+            if committed is None:
+                if connection_was_lost(exc):
+                    report_unknown_outcome(
+                        "settlement_ack_unresolved",
+                        task_id=task_id,
+                        run_id=run_id,
+                        storage="v2",
+                    )
+                if number > 1:
+                    _count(site, "failed")
+                raise
+            if committed and attempt.confirm is not None:
+                report_unknown_outcome(
+                    "settlement_ack_reconciled",
+                    task_id=task_id,
+                    run_id=run_id,
+                    storage="v2",
+                    level=logging.INFO,
+                )
+                if number > 1:
+                    _count(site, "recovered")
+                return cast(T, attempt.confirm())
+            if committed or number >= policy.attempts_for(exc):
+                # ``committed`` without ``confirm``: an attempt that committed
+                # outside its contract; never claim an outcome for it.
+                if number > 1:
+                    _count(site, "failed")
+                raise
+            _count(site, "retried")
+            time.sleep(policy.delay(number))
+        else:
+            if number > 1:
                 _count(site, "recovered")
             return result

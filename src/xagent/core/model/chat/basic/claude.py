@@ -226,6 +226,9 @@ def _fix_claude_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
     return schema
 
 
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5-5"
+
+
 class ClaudeLLM(BaseLLM):
     """
     Anthropic Claude LLM client using the official Anthropic SDK.
@@ -234,7 +237,7 @@ class ClaudeLLM(BaseLLM):
 
     def __init__(
         self,
-        model_name: str = "claude-3-5-sonnet-20241022",
+        model_name: str = DEFAULT_CLAUDE_MODEL,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         default_temperature: Optional[float] = None,

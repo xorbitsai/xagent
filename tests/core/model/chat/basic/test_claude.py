@@ -6,6 +6,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from xagent.core.model.chat.basic.claude import (
+    DEFAULT_CLAUDE_MODEL,
     ClaudeLLM,
     _anthropic_input_usage,
     _fix_pydantic_schema_for_claude,
@@ -34,6 +35,11 @@ class TestClaudeLLM:
     def llm(self, claude_llm_config):
         """Fixture providing Claude LLM instance."""
         return ClaudeLLM(**claude_llm_config)
+
+    def test_default_model_is_not_retired(self):
+        llm = ClaudeLLM(api_key="test-key")
+        assert llm.model_name == DEFAULT_CLAUDE_MODEL
+        assert "claude-3-5-sonnet" not in llm.model_name
 
     @pytest.mark.asyncio
     async def test_auto_only_model_normalizes_required_tool_choice(self, mocker):

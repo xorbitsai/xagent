@@ -78,6 +78,14 @@ export const hostnameFromUrl = (url?: string | null): string => {
   }
 };
 
+export function getModelSourceLabel(model: {
+  base_url?: string | null;
+  model_provider: string;
+}): string {
+  const host = hostnameFromUrl(model.base_url);
+  return host ? `${host} (${model.model_provider})` : model.model_provider;
+}
+
 export interface UserDefaultModel {
   id: number;
   user_id: number;

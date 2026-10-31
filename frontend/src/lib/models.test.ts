@@ -9,6 +9,7 @@ vi.mock("./api-wrapper", async (importOriginal) => ({
 import { apiRequest } from "./api-wrapper"
 import {
   getProviderModels,
+  getModelSourceLabel,
   getUserDefaultModels,
   getUserModels,
   hostnameFromUrl,
@@ -181,6 +182,26 @@ describe("batch ASR availability", () => {
     expect(models[0].abilities).toEqual(["asr"])
     expect(supportsBatchAsr({ ...batch, model_provider: "xinference" })).toBe(true)
   })
+})
+
+describe("getModelSourceLabel", () => {
+  it("distinguishes endpoints using the same provider, including their ports", () => {
+    expect(getModelSourceLabel({
+      model_provider: "openai-compatible",
+      base_url: "http://localhost:9997/v1",
+    })).toBe("localhost:9997 (openai-compatible)")
+    expect(getModelSourceLabel({
+      model_provider: "openai-compatible",
+      base_url: "https://models.example.com:8443/v1",
+    })).toBe("models.example.com:8443 (openai-compatible)")
+  })
+
+  it.each([undefined, null, "", "/v1", "not a url"])(
+    "uses only the provider when the endpoint is %s",
+    (base_url) => {
+      expect(getModelSourceLabel({ model_provider: "openai", base_url })).toBe("openai")
+    },
+  )
 })
 
 describe("model producer decoders", () => {

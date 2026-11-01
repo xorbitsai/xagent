@@ -8,7 +8,6 @@ import logging
 from collections.abc import AsyncIterator, Coroutine
 from contextlib import aclosing, suppress
 from dataclasses import asdict
-from inspect import isawaitable
 from types import SimpleNamespace
 from typing import Any, Literal
 
@@ -23,7 +22,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy.orm import Session
-from starlette.types import Receive, Scope, Send
+from starlette.types import Message, Receive, Scope, Send
 from starlette.websockets import WebSocketState
 
 from ...core.model.asr.adapter import get_asr_model_instance
@@ -59,6 +58,10 @@ _AUDIO_FRAME_BYTES = 64 * 1024
 _CONTROL_FRAME_BYTES = 4096
 _IO_TIMEOUT = 30.0
 _SESSION_SECONDS = 600.0
+
+
+class _ASRSessionTimeout(TimeoutError):
+    """A local transport deadline, rather than a provider failure."""
 
 
 def _load_speech_config(
@@ -100,12 +103,16 @@ async def _race(*operations: Coroutine[Any, Any, None]) -> None:
         for task in done:
             await task
     finally:
-        for task in tasks:
-            await cancel_and_drain_async_task(task)
+
+        async def cleanup() -> None:
+            for task in tasks:
+                await cancel_and_drain_async_task(task)
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(cleanup()))
 
 
 def _log_provider_error(model: BaseASR | BaseTTS, error: Exception) -> None:
-    detail = str(error)
+    detail = str(error) or type(error).__name__
     key = getattr(model, "api_key", None)
     if key:
         detail = detail.replace(key, "[REDACTED]")
@@ -116,11 +123,27 @@ async def _close_model(model: BaseASR | BaseTTS) -> None:
     async def close() -> None:
         method = getattr(model, "aclose", None)
         if callable(method):
-            result = method()
-            if isawaitable(result):
-                await result
+            await method()
 
     await drain_async_task_cancellation_safe(asyncio.create_task(close()))
+
+
+async def _receive_asr_message(websocket: WebSocket) -> Message:
+    try:
+        return await asyncio.wait_for(websocket.receive(), _IO_TIMEOUT)
+    except TimeoutError:
+        raise _ASRSessionTimeout from None
+
+
+async def _send_asr_error(
+    websocket: WebSocket, code: str, message: str, close_code: int
+) -> None:
+    if websocket.application_state is WebSocketState.CONNECTED:
+        with suppress(WebSocketDisconnect, RuntimeError, OSError):
+            await websocket.send_json(
+                {"type": "error", "code": code, "message": message}
+            )
+            await websocket.close(code=close_code, reason=message)
 
 
 async def _receive_asr_audio(
@@ -129,13 +152,15 @@ async def _receive_asr_audio(
     audio_bytes = 0
     width = 2 if start.format == "pcm" else 1
     while True:
-        message = await asyncio.wait_for(websocket.receive(), _IO_TIMEOUT)
+        message = await _receive_asr_message(websocket)
         if message["type"] == "websocket.disconnect":
             raise WebSocketDisconnect(message.get("code", 1000))
         audio = message.get("bytes")
         if audio is not None:
             if len(audio) > _AUDIO_FRAME_BYTES:
                 raise ValueError("Audio frame exceeds 64 KiB")
+            if len(audio) % width:
+                raise ValueError("PCM fragments must contain complete 16-bit samples")
             audio_bytes += len(audio)
             if audio_bytes > start.sample_rate * width * _SESSION_SECONDS:
                 raise ValueError("ASR audio duration limit reached")
@@ -164,7 +189,10 @@ async def _relay_asr_events(
     async with await model.open_stream(**options) as stream:
         ready.set_result(stream)
         async for event in stream:
-            await asyncio.wait_for(websocket.send_json(asdict(event)), _IO_TIMEOUT)
+            try:
+                await asyncio.wait_for(websocket.send_json(asdict(event)), _IO_TIMEOUT)
+            except TimeoutError:
+                raise _ASRSessionTimeout from None
 
 
 @speech_router.websocket("/asr/stream")
@@ -184,7 +212,7 @@ async def stream_asr(
     model: BaseASR | None = None
     model_closed = False
     try:
-        message = await asyncio.wait_for(websocket.receive(), _IO_TIMEOUT)
+        message = await _receive_asr_message(websocket)
         if message["type"] == "websocket.disconnect":
             return
         text = message.get("text") or ""
@@ -201,46 +229,41 @@ async def stream_asr(
             raise ValueError("Selected ASR model does not support live audio")
         async with usage_scope(user.id, usage_source="speech_transcribe"):
             try:
-                async with asyncio.timeout(_SESSION_SECONDS):
-                    ready: asyncio.Future[ASRStreamSession] = (
-                        asyncio.get_running_loop().create_future()
-                    )
-                    await _race(
-                        _receive_asr_audio(websocket, ready, start),
-                        _relay_asr_events(websocket, model, ready, start),
-                    )
+                deadline = asyncio.timeout(_SESSION_SECONDS)
+                try:
+                    async with deadline:
+                        ready: asyncio.Future[ASRStreamSession] = (
+                            asyncio.get_running_loop().create_future()
+                        )
+                        await _race(
+                            _receive_asr_audio(websocket, ready, start),
+                            _relay_asr_events(websocket, model, ready, start),
+                        )
+                except TimeoutError:
+                    if not deadline.expired():
+                        raise
+                    raise _ASRSessionTimeout from None
             finally:
                 # Close before the opening scope delivers ASR input duration.
                 model_closed = True
                 await _close_model(model)
     except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         return
-    except (ValidationError, ValueError) as exc:
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "invalid_request",
-                "message": "Invalid speech stream request",
-            }
+    except _ASRSessionTimeout:
+        await _send_asr_error(
+            websocket, "session_timeout", "Speech session timed out", 1000
         )
-        await websocket.close(code=1008, reason="Invalid speech stream request")
+    except (ValidationError, ValueError) as exc:
+        await _send_asr_error(
+            websocket, "invalid_request", "Invalid speech stream request", 1008
+        )
         logger.debug("Invalid ASR stream request: %s", type(exc).__name__)
     except HTTPException as exc:
-        await websocket.send_json(
-            {"type": "error", "code": "model_unavailable", "message": exc.detail}
-        )
-        await websocket.close(code=1008, reason="Speech model unavailable")
+        await _send_asr_error(websocket, "model_unavailable", exc.detail, 1008)
     except Exception as exc:
         if model is not None:
             _log_provider_error(model, exc)
-        await websocket.send_json(
-            {
-                "type": "error",
-                "code": "stream_failed",
-                "message": "Speech stream failed",
-            }
-        )
-        await websocket.close(code=1011, reason="Speech stream failed")
+        await _send_asr_error(websocket, "stream_failed", "Speech stream failed", 1011)
     finally:
         if model is not None and not model_closed:
             await _close_model(model)
@@ -310,10 +333,30 @@ class _TTSAudioResponse(StreamingResponse):
                 await _close_model(self.model)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async with asyncio.timeout(_SESSION_SECONDS):
-            await _race(
-                self._serve(scope, receive, send), self.listen_for_disconnect(receive)
-            )
+        started = False
+
+        async def send_response(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            async with asyncio.timeout(_SESSION_SECONDS):
+                await _race(
+                    self._serve(scope, receive, send_response),
+                    self.listen_for_disconnect(receive),
+                )
+        except Exception as exc:
+            _log_provider_error(self.model, exc)
+            if started:
+                # Preserve the truncated-response signal without exposing SDK details
+                # through an ASGI exception traceback.
+                raise RuntimeError("Speech synthesis stream interrupted") from None
+            await JSONResponse(
+                {"detail": "Speech synthesis failed"},
+                status_code=504 if isinstance(exc, TimeoutError) else 502,
+            )(scope, receive, send)
 
 
 @speech_router.post("/tts/stream", response_class=StreamingResponse)

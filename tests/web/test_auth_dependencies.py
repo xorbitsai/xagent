@@ -770,6 +770,7 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             (
                 "WebSocketDisconnect",
                 "_WebSocketAuthenticationTerminated",
+                "_ASRSessionTimeout",
                 "ValidationError",
                 "ValueError",
                 "HTTPException",

@@ -23,7 +23,7 @@ class TTSStreamRequest(BaseModel):
 
     model_id: str = Field(min_length=1, max_length=512)
     text: str = Field(min_length=1, max_length=5000)
-    voice: str | None = Field(default=None, min_length=1, max_length=256)
+    voice: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_-]{1,128}$")
     language: str | None = Field(default=None, min_length=1, max_length=32)
     format: str | None = Field(default=None, min_length=1, max_length=64)
     sample_rate: int | None = Field(default=None, ge=8000, le=48000)

@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+import traceback
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from tests.web.auth_token_cases import build_access_token
 from xagent.core.model.asr.base import ASRStreamEvent, ASRStreamSession
 from xagent.core.model.chat.token_context import MediaCallType
 from xagent.core.model.media_metering import record_provider_usage
 from xagent.core.model.tts.base import TTSChunk
+from xagent.core.model.tts.elevenlabs import ElevenLabsTTS
 from xagent.web.api import speech, websocket_auth
 from xagent.web.models import database
 from xagent.web.models.model import Model
@@ -111,6 +114,7 @@ class FakeTTS:
         self.close_count = 0
         self.stream_closed = False
         self.error = None
+        self.error_after_first = None
         self.gate = None
         self.block_first = False
 
@@ -123,6 +127,8 @@ class FakeTTS:
                 await self.gate.wait()
             record_provider_usage(self, MediaCallType.TTS, len(options["text"]))
             yield TTSChunk(audio=b"first", format="pcm", sample_rate=24000)
+            if self.error_after_first is not None:
+                raise self.error_after_first
             if self.gate is not None:
                 await self.gate.wait()
             yield TTSChunk(audio=b"second", format="pcm", sample_rate=24000)
@@ -373,6 +379,171 @@ def test_asr_send_failure_reports_a_safe_error_and_closes_both_halves(api, caplo
     assert api.asr.close_count == 1
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "not json",
+        {"type": "unknown"},
+        {"type": "start", "model_id": "live"},
+        {"type": "commit"},
+        "x" * 4097,
+        b"\x00",
+    ],
+)
+def test_asr_invalid_frames_close_with_1008_before_provider_input(api, message):
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        assert ws.receive_json()["type"] == "session_started"
+        if isinstance(message, bytes):
+            ws.send_bytes(message)
+        elif isinstance(message, str):
+            ws.send_text(message)
+        else:
+            ws.send_json(message)
+        assert ws.receive_json()["code"] == "invalid_request"
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1008
+    assert api.asr.sessions[0].closed
+    assert not api.asr.sessions[0].audio
+
+
+@pytest.mark.parametrize("deadline", ["initial", "idle", "session", "provider"])
+def test_asr_transport_timeouts_are_distinct_from_provider_failure(
+    api, monkeypatch, caplog, deadline
+):
+    if deadline in {"initial", "idle"}:
+        monkeypatch.setattr(speech, "_IO_TIMEOUT", 0.1)
+    elif deadline == "session":
+        monkeypatch.setattr(speech, "_SESSION_SECONDS", 0.1)
+    else:
+        api.asr.send_error = TimeoutError("synthetic-provider-secret")
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        if deadline != "initial":
+            ws.send_json({"type": "start", "model_id": "live"})
+            assert ws.receive_json()["type"] == "session_started"
+        if deadline == "provider":
+            ws.send_bytes(b"\x00\x00")
+        assert ws.receive_json()["code"] == (
+            "stream_failed" if deadline == "provider" else "session_timeout"
+        )
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == (1011 if deadline == "provider" else 1000)
+    if deadline == "initial":
+        api.asr_factory.assert_not_called()
+    else:
+        assert api.asr.sessions[0].closed and api.asr.close_count == 1
+    assert "synthetic-provider-secret" not in caplog.text
+    if deadline != "provider":
+        assert "Speech stream failed" not in caplog.text
+
+
+def test_close_aborts_a_committed_segment_whose_final_has_not_arrived(api):
+    committed = threading.Event()
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live", "vad": False})
+        ws.receive_json()
+
+        async def commit_without_final():
+            committed.set()
+
+        api.asr.sessions[0].commit = commit_without_final
+        ws.send_json({"type": "commit"})
+        assert committed.wait(2)
+        ws.send_json({"type": "close"})
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1000
+    assert api.asr.sessions[0].closed and api.asr.close_count == 1
+
+
+@pytest.mark.parametrize(
+    "branch,disconnected",
+    [
+        ("invalid", OSError()),
+        ("missing", RuntimeError()),
+        ("provider", WebSocketDisconnect()),
+    ],
+)
+async def test_asr_error_response_after_disconnect_does_not_escape(
+    api, monkeypatch, branch, disconnected
+):
+    incoming = asyncio.Queue()
+    incoming.put_nowait({"type": "websocket.connect"})
+    incoming.put_nowait(
+        {
+            "type": "websocket.receive",
+            "text": json.dumps(
+                {
+                    "type": "start",
+                    "model_id": "missing" if branch == "missing" else "live",
+                }
+            ),
+        }
+    )
+    incoming.put_nowait(
+        {"type": "websocket.receive", "text": "invalid"}
+        if branch == "invalid"
+        else {"type": "websocket.receive", "bytes": b"\x00\x00"}
+    )
+    api.asr.send_error = RuntimeError("provider failed")
+    attempted = []
+
+    async def send(message):
+        if (
+            message["type"] == "websocket.send"
+            and json.loads(message["text"])["type"] == "error"
+        ):
+            attempted.append(message)
+            raise disconnected
+
+    monkeypatch.setattr(
+        speech, "get_authenticated_user", AsyncMock(return_value=SimpleNamespace(id=1))
+    )
+    websocket = WebSocket(
+        {"type": "websocket", "headers": [], "subprotocols": []}, incoming.get, send
+    )
+    await asyncio.wait_for(speech.stream_asr.__wrapped__(websocket), 2)
+    assert len(attempted) == 1
+    assert api.asr.close_count == (0 if branch == "missing" else 1)
+
+
+async def test_repeated_cancellation_drains_both_stream_halves():
+    started = [asyncio.Event(), asyncio.Event()]
+    closed = [asyncio.Event(), asyncio.Event()]
+    closing, release = asyncio.Event(), asyncio.Event()
+    children = []
+
+    async def operation(index):
+        children.append(asyncio.current_task())
+        started[index].set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if index == 0:
+                closing.set()
+                await release.wait()
+            closed[index].set()
+
+    task = asyncio.create_task(speech._race(operation(0), operation(1)))
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 2)
+        task.cancel()
+        await asyncio.wait_for(closing.wait(), 2)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 2)
+        assert all(event.is_set() for event in closed)
+    finally:
+        release.set()
+        for child in children:
+            if not child.done():
+                child.cancel()
+        await asyncio.gather(*children, return_exceptions=True)
+
+
 def test_tts_stream_has_audio_metadata_and_exactly_one_usage_delivery(api):
     response = api.client.post(
         TTS_PATH,
@@ -450,6 +621,44 @@ def test_tts_requires_login_and_validates_text_before_provider_access(api):
         )
         assert response.status_code == 422
     api.tts_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "voice", ["../../v1/user?x=", "voice/other", "voice?x=", "%2e%2e", "x" * 129]
+)
+def test_shared_model_voice_cannot_redirect_owner_credentials(api, voice):
+    with api.db() as db:
+        link = db.query(UserModel).filter_by(model_id=2).one()
+        link.user_id, link.is_shared = 2, True
+        db.commit()
+    response = api.client.post(
+        TTS_PATH,
+        headers=api.headers,
+        json={"model_id": "voice", "text": "Hello", "voice": voice},
+    )
+    assert response.status_code == 422
+    api.tts_factory.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"format": "foo"},
+        {"format": "pcm_12345"},
+        {"format": "pcm", "sample_rate": 12345},
+    ],
+)
+def test_invalid_tts_output_options_are_local_400_errors(api, options):
+    model = ElevenLabsTTS(api_key="synthetic-provider-secret")
+    model._ensure_async_client = Mock()
+    api.tts_factory.return_value = model
+    response = api.client.post(
+        TTS_PATH,
+        headers=api.headers,
+        json={"model_id": "voice", "text": "Hello", **options},
+    )
+    assert response.status_code == 400
+    model._ensure_async_client.assert_not_called()
 
 
 def test_tts_first_audio_timeout_cancels_the_provider_and_closes_its_client(
@@ -531,3 +740,57 @@ async def test_disconnect_during_tts_client_close_waits_for_cleanup_before_meter
         await asyncio.wait_for(task, 2)
     assert closed.is_set()
     assert len(api.usage) == 1
+
+
+@pytest.mark.parametrize("failure", ["provider", "chunk_timeout", "session_timeout"])
+async def test_tts_late_failure_keeps_truncation_without_leaking_provider_details(
+    api, monkeypatch, caplog, failure
+):
+    if failure == "provider":
+        api.tts.error_after_first = RuntimeError(
+            "provider exposed synthetic-provider-secret"
+        )
+    else:
+        api.tts.gate = asyncio.Event()
+        monkeypatch.setattr(
+            speech,
+            "_IO_TIMEOUT" if failure == "chunk_timeout" else "_SESSION_SECONDS",
+            0.02,
+        )
+    response = speech._TTSAudioResponse(
+        api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
+    )
+    messages, incoming = [], asyncio.Queue()
+
+    async def send(message):
+        messages.append(message)
+
+    with pytest.raises(
+        RuntimeError, match="Speech synthesis stream interrupted"
+    ) as error:
+        await asyncio.wait_for(response({"type": "http"}, incoming.get, send), 2)
+    assert messages[0]["status"] == 200
+    assert any(message.get("body") == b"first" for message in messages)
+    assert not any(message.get("more_body") is False for message in messages)
+    formatted = "".join(traceback.format_exception(error.value))
+    assert "synthetic-provider-secret" not in formatted + caplog.text
+    assert api.tts.stream_closed and api.tts.close_count == 1
+    assert len(api.usage) == 1
+
+
+async def test_tts_session_timeout_before_audio_is_a_504(api, monkeypatch):
+    api.tts.gate = asyncio.Event()
+    api.tts.block_first = True
+    monkeypatch.setattr(speech, "_SESSION_SECONDS", 0.02)
+    response = speech._TTSAudioResponse(
+        api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
+    )
+    messages, incoming = [], asyncio.Queue()
+
+    async def send(message):
+        messages.append(message)
+
+    await asyncio.wait_for(response({"type": "http"}, incoming.get, send), 2)
+    assert messages[0]["status"] == 504
+    assert api.tts.stream_closed and api.tts.close_count == 1
+    assert not api.usage

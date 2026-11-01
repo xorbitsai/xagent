@@ -28,9 +28,11 @@ WebSocket URLs and navigation tickets; it cannot sanitize third-party logs or
 delete credentials already retained in historical logs.
 
 Existing user/purpose/signature/session-generation checks, task ownership,
-five-second idle revocation polling and per-message revalidation still apply.
+five-second idle revocation polling and chat-message revalidation still apply.
 Streaming speech revalidates before starting the provider session and uses the
-same revocation monitor; individual PCM fragments do not perform database reads.
+same revocation monitor. Individual PCM fragments and `commit`/`close` controls
+do not perform database reads; revocation during an active stream is detected
+by that monitor.
 Changing an explicit `token` prop changes the hook's in-memory login identity,
 so uploads and retries are not reused across explicit login identities.
 An auth-context refresh for the same user/session intentionally retains that

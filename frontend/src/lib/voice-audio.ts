@@ -4,6 +4,11 @@ import { websocketAuthProtocols } from "./websocket-auth"
 import { encodePcm16, VoiceResampler } from "./voice-conversation"
 import { createVoiceVad, type VoiceVad } from "./voice-vad"
 
+export type VoiceAudioFailure = "session_timeout" | "authentication_required" | "connection_failed"
+export class VoiceAudioError extends Error {
+  constructor(public code: VoiceAudioFailure) { super(code) }
+}
+
 /** One call owns its microphone, socket, playback sources and fetches. */
 export class VoiceAudio {
   private closed = false
@@ -35,7 +40,7 @@ export class VoiceAudio {
     sessionId: string | null
     activity: (active: boolean) => void
     transcript: (type: "partial" | "final", text: string, segmentId: number) => void
-    error: () => void
+    error: (reason?: VoiceAudioFailure) => void
     vadFallback?: () => void
   }) {}
 
@@ -52,8 +57,8 @@ export class VoiceAudio {
     this.microphone = media
     await context.audioWorklet.addModule("/voice-capture-worklet.js")
     if (this.closed) return
-    // Backend ASR/VAD owns the baseline protocol. Local VAD only reduces
-    // playback interruption latency and must not block a call or SDK parity.
+    // Backend ASR/VAD owns the baseline protocol. Local activity refines turn
+    // boundaries and must not block a call or SDK parity.
     void createVoiceVad({
       signal: this.vadLoading.signal,
       speech: speaking => { if (!this.closed && !this.muted) this.options.activity(speaking) },
@@ -67,7 +72,7 @@ export class VoiceAudio {
     this.socket = socket
     await new Promise<void>((resolve, reject) => {
       this.rejectReady = reject
-      this.readyTimeout = setTimeout(() => reject(new Error("Speech connection timed out")), 30000)
+      this.readyTimeout = setTimeout(() => this.fail("connection_failed"), 30000)
       socket.onopen = () => socket.send(JSON.stringify({
         type: "start", model_id: this.options.asr, format: "pcm", sample_rate: 16000,
         vad: true, vad_silence_threshold_secs: 0.5,
@@ -92,14 +97,11 @@ export class VoiceAudio {
                 this.options.activity(false)
               }
             }
-          } else if (event.type === "error") this.options.error()
-        } catch { this.options.error() }
+          } else if (event.type === "error") this.fail(event.code === "session_timeout" ? "session_timeout" : "connection_failed")
+        } catch { this.fail("connection_failed") }
       }
-      socket.onerror = socket.onclose = () => {
-        clearTimeout(this.readyTimeout)
-        reject(new Error("Speech connection closed"))
-        if (!this.closed) this.options.error()
-      }
+      socket.onerror = () => this.fail("connection_failed")
+      socket.onclose = event => this.fail(event.code === 4001 ? "authentication_required" : event.reason === "Speech session timed out" ? "session_timeout" : "connection_failed")
     })
     if (this.closed) return
     const resampler = new VoiceResampler(context.sampleRate)
@@ -109,7 +111,7 @@ export class VoiceAudio {
     this.sink.gain.value = 0
     this.capture.port.onmessage = ({ data }: MessageEvent<Float32Array>) => {
       if (this.closed || socket.readyState !== WebSocket.OPEN) return
-      if (socket.bufferedAmount > 256 * 1024) { this.options.error(); return }
+      if (socket.bufferedAmount > 256 * 1024) { this.fail("connection_failed"); return }
       const samples = this.muted ? new Float32Array(data.length) : data
       const frame = resampler.process(samples)
       this.vad?.process(frame)
@@ -117,6 +119,15 @@ export class VoiceAudio {
     }
     this.source.connect(this.capture)
     this.capture.connect(this.sink).connect(context.destination)
+  }
+
+  private fail(reason: VoiceAudioFailure) {
+    if (this.closed) return
+    const reject = this.rejectReady
+    this.rejectReady = null
+    reject?.(new VoiceAudioError(reason))
+    this.close()
+    this.options.error(reason)
   }
 
   private useServerVad() {
@@ -144,14 +155,18 @@ export class VoiceAudio {
     const signal = controller.signal
     const login = readAuthSessionSnapshot()
     const token = login.accessToken
-    if (!token || login.sessionId !== this.options.sessionId) throw new Error("Authentication required")
+    if (!token || login.sessionId !== this.options.sessionId) throw new VoiceAudioError("authentication_required")
     // A synthesis request is billable; never automatically replay a failed POST.
     const response = await fetch(`${getApiUrl()}/api/models/speech/tts/stream`, {
       method: "POST", signal,
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ model_id: this.options.tts, voice: this.options.voice, text, format: "pcm", sample_rate: 24000 }),
     })
-    if (!response.ok || !response.body) throw new Error("Speech synthesis failed")
+    if (!response.ok || !response.body) {
+      await response.body?.cancel()
+      if (response.status === 401 || response.status === 403) throw new VoiceAudioError("authentication_required")
+      throw new Error("Speech synthesis failed")
+    }
     const rate = Number(response.headers.get("X-Audio-Sample-Rate"))
     if (response.headers.get("X-Audio-Format") !== "pcm" || !Number.isFinite(rate) || rate < 8000 || rate > 48000) {
       await response.body.cancel()
@@ -194,6 +209,9 @@ export class VoiceAudio {
       }
       if (pending.length && !signal.aborted) throw new Error("Truncated PCM sample")
       while (!signal.aborted && !this.closed && this.playback.size) await wait()
+    } catch (error) {
+      if (this.synthesis === controller) this.stopAudio()
+      throw error
     } finally {
       await reader.cancel().catch(() => {})
       reader.releaseLock()

@@ -5,6 +5,7 @@ import { usePathname, useSearchParams } from "next/navigation"
 import { useApp } from "@/contexts/app-context-chat"
 import { useAuth } from "@/contexts/auth-context"
 import { VoiceConversation } from "@/components/chat/voice-conversation"
+import { isJsonRecord } from "@/lib/api-wrapper"
 
 type VoiceConfig = Record<string, unknown>
 const TaskVoiceContext = createContext<((config: VoiceConfig) => void) | undefined>(undefined)
@@ -28,16 +29,20 @@ export function TaskVoiceProvider({ children }: { children: React.ReactNode }) {
     const active = owner.current
     if (!active) return
     if (active.login !== login) { close(); return }
-    if (active.path === pathname && active.search === search) return
+    if (active.path === pathname && active.search === search) {
+      if (creating && isConnected && active.createdTaskId === state.taskId && pathname === `/task/${active.createdTaskId}`) setCreating(false)
+      return
+    }
     if (active.createdTaskId !== null && active.path === "/task" && state.taskId === active.createdTaskId && pathname === `/task/${active.createdTaskId}`) {
       active.path = pathname
       active.search = search
+      if (isConnected) setCreating(false)
       return
     }
     close()
     // Navigation to a different draft/task invalidates pending create ownership.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pathname, search, state.taskId, login])
+  }, [pathname, search, state.taskId, login, isConnected, creating])
 
   return <TaskVoiceContext.Provider value={config => {
     if (!voiceInputEnabled || !taskControlsEnabled) return
@@ -61,17 +66,19 @@ export function TaskVoiceProvider({ children }: { children: React.ReactNode }) {
         if (!active) return
         const startsTask = state.taskId === null
         setCreating(startsTask)
+        let delivered = false
         try {
           await sendMessage(text, {
             ...active.config, clientMessageId,
             ...(state.currentTask?.status === "waiting_for_user" && state.currentTask.waitingRequestId
-              ? { metadata: { request_id: state.currentTask.waitingRequestId } } : {}),
+              ? { metadata: { ...(isJsonRecord(active.config.metadata) ? active.config.metadata : {}), request_id: state.currentTask.waitingRequestId } } : {}),
           }, [], {
             canAdoptCreatedTask: () => owner.current === active,
             onCreatedTask: id => { if (owner.current === active) active.createdTaskId = id },
           })
+          delivered = true
         } finally {
-          if (owner.current === active) {
+          if (owner.current === active && (!delivered || !startsTask || active.createdTaskId === null)) {
             // The created task can attach before Next commits its route change.
             // Retain that one permitted route transition until the layout sees it.
             setCreating(false)

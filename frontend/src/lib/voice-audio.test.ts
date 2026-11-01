@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { VoiceAudio } from "./voice-audio"
+import { VoiceAudio, VoiceAudioError } from "./voice-audio"
 import { createVoiceVad } from "./voice-vad"
 
 const detectors = vi.hoisted(() => [] as Array<{ options: { speech: (active: boolean) => void; error: () => void }; process: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }>)
@@ -9,7 +9,8 @@ vi.mock("./voice-vad", () => ({ createVoiceVad: vi.fn(async options => {
   return vad
 }) }))
 
-vi.mock("./auth-cache", () => ({ readAuthSessionSnapshot: () => ({ accessToken: "current-login-token", sessionId: "login" }) }))
+const login = vi.hoisted(() => ({ accessToken: "current-login-token", sessionId: "login" }))
+vi.mock("./auth-cache", () => ({ readAuthSessionSnapshot: () => login }))
 vi.mock("./utils", () => ({ getWsUrl: () => "wss://example.com", getApiUrl: () => "https://example.com" }))
 
 class Socket {
@@ -19,7 +20,7 @@ class Socket {
   bufferedAmount = 0
   onopen: (() => void) | null = null
   onmessage: ((event: { data: string }) => void) | null = null
-  onclose: (() => void) | null = null
+  onclose: ((event: { code: number; reason: string }) => void) | null = null
   onerror: (() => void) | null = null
   send = vi.fn()
   close = vi.fn()
@@ -51,6 +52,7 @@ const options = () => ({ asr: "live", tts: "speaker", token: "login-token", sess
 beforeEach(() => {
   Socket.instances = []; captures.length = 0; playback.length = 0
   detectors.length = 0
+  login.sessionId = "login"
   vi.stubGlobal("WebSocket", Socket)
   vi.stubGlobal("AudioContext", Context)
   vi.stubGlobal("AudioWorkletNode", class {
@@ -63,7 +65,7 @@ beforeEach(() => {
     getUserMedia: vi.fn().mockResolvedValue({ getTracks: () => [{ stop: stopTrack }] }),
   } })
 })
-afterEach(() => { vi.unstubAllGlobals(); vi.clearAllMocks() })
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.clearAllMocks() })
 
 async function start(call: VoiceAudio) {
   const opening = call.start()
@@ -76,6 +78,82 @@ async function start(call: VoiceAudio) {
 }
 
 describe("browser voice resources", () => {
+  it.each(["error", "close", "timeout"])("cleans up a failed ASR handshake (%s)", async failure => {
+    if (failure === "timeout") vi.useFakeTimers()
+    const events = options()
+    const call = new VoiceAudio(events)
+    const opening = call.start().catch(error => error)
+    for (let step = 0; step < 20 && !Socket.instances.length; step++) await Promise.resolve()
+    const socket = Socket.instances[0]
+    if (failure === "error") socket.onerror!()
+    if (failure === "close") socket.onclose!({ code: 1006, reason: "" })
+    if (failure === "timeout") await vi.advanceTimersByTimeAsync(30000)
+    expect(await opening).toBeInstanceOf(VoiceAudioError)
+    expect(events.error).toHaveBeenCalledExactlyOnceWith("connection_failed")
+    expect(socket.close).toHaveBeenCalledOnce()
+    expect(stopTrack).toHaveBeenCalledOnce()
+    expect(closeContext).toHaveBeenCalledOnce()
+  })
+
+  it("reports a server session timeout distinctly and releases microphone resources", async () => {
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    socket.onmessage!({ data: JSON.stringify({ type: "error", code: "session_timeout" }) })
+    expect(events.error).toHaveBeenCalledExactlyOnceWith("session_timeout")
+    expect(stopTrack).toHaveBeenCalledOnce()
+    expect(socket.close).toHaveBeenCalledOnce()
+  })
+
+  it("reports session revocation distinctly", async () => {
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    socket.onclose!({ code: 4001, reason: "Session expired" })
+    expect(events.error).toHaveBeenCalledExactlyOnceWith("authentication_required")
+    expect(stopTrack).toHaveBeenCalledOnce()
+  })
+
+  it.each(["0", "NaN", "96000"])("rejects invalid sample-rate metadata (%s)", async rate => {
+    const call = new VoiceAudio(options())
+    await start(call)
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([0, 0]), { headers: { "X-Audio-Format": "pcm", "X-Audio-Sample-Rate": rate } })))
+    await expect(call.speak("Hello")).rejects.toThrow("Invalid speech audio format")
+    expect(playback).toHaveLength(0)
+    call.close()
+  })
+
+  it("does not synthesize with a replacement login's credentials", async () => {
+    const call = new VoiceAudio(options())
+    await start(call)
+    login.sessionId = "replacement-login"
+    const request = vi.fn()
+    vi.stubGlobal("fetch", request)
+    await expect(call.speak("Hello")).rejects.toMatchObject({ code: "authentication_required" })
+    expect(request).not.toHaveBeenCalled()
+    call.close()
+  })
+
+  it("classifies synthesis authentication errors without replaying the request", async () => {
+    const call = new VoiceAudio(options())
+    await start(call)
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 401 })))
+    await expect(call.speak("Hello")).rejects.toMatchObject({ code: "authentication_required" })
+    expect(fetch).toHaveBeenCalledOnce()
+    call.close()
+  })
+
+  it("relays quiet server transcripts while local VAD reports no activity", async () => {
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    socket.onmessage!({ data: JSON.stringify({ type: "partial", text: "Quiet words", segment_id: 1 }) })
+    socket.onmessage!({ data: JSON.stringify({ type: "final", text: "Quiet words", segment_id: 1 }) })
+    expect(events.transcript).toHaveBeenLastCalledWith("final", "Quiet words", 1)
+    expect(events.activity).not.toHaveBeenCalled()
+    call.close()
+  })
+
   it("uses the backend ASR/VAD protocol when the local detector cannot load", async () => {
     vi.mocked(createVoiceVad).mockRejectedValueOnce(new Error("WASM unavailable"))
     const events = options()

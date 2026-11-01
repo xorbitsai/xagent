@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const calls = vi.hoisted(() => [] as Array<{
-  options: { activity: (active: boolean) => void; transcript: (type: "partial" | "final", text: string, id: number) => void }
+  options: { activity: (active: boolean) => void; transcript: (type: "partial" | "final", text: string, id: number) => void; error: (reason?: "session_timeout" | "authentication_required") => void }
   close: ReturnType<typeof vi.fn>; stopAudio: ReturnType<typeof vi.fn>; speak: ReturnType<typeof vi.fn>
 }>)
 const auth = vi.hoisted(() => ({ token: "user-token", user: { id: 1 }, session: { sessionId: "login-1" } }))
@@ -11,7 +11,7 @@ const preferences = vi.hoisted(() => ({ asr_model_id: "live", tts_model_id: "spe
 vi.mock("@/hooks/use-voice-preferences", () => ({ useVoicePreferences: () => ({ preferences, loading: false, error: false }) }))
 vi.mock("@/contexts/auth-context", () => ({ useAuth: () => auth }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
-vi.mock("@/lib/voice-audio", () => ({ VoiceAudio: class {
+vi.mock("@/lib/voice-audio", async original => ({ ...await original<typeof import("@/lib/voice-audio")>(), VoiceAudio: class {
   close = vi.fn(); stopAudio = vi.fn(); speak = vi.fn().mockResolvedValue(undefined)
   constructor(public options: typeof calls[number]["options"]) { calls.push(this) }
   async start() {}
@@ -30,10 +30,43 @@ vi.mock("@/lib/api-wrapper", async importOriginal => ({
 }))
 
 import { VoiceConversation } from "./voice-conversation"
+import { VoiceAudioError } from "@/lib/voice-audio"
 
-afterEach(() => { cleanup(); calls.length = 0; vi.clearAllMocks() })
+afterEach(() => { cleanup(); calls.length = 0; preferences.asr_model_id = "live"; vi.clearAllMocks() })
 
 describe("voice conversation entry and call lifecycle", () => {
+  it("shows the ASR session deadline without blaming microphone configuration", async () => {
+    render(<VoiceConversation taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} open />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    act(() => { calls[0].options.error("session_timeout") })
+    expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.sessionTimeout")
+    expect(calls[0].close).toHaveBeenCalledOnce()
+  })
+
+  it.each([false, true])("keeps a TTS failure recoverable except for authentication loss (%s)", async authFailure => {
+    const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: vi.fn(), open: true }
+    const view = render(<VoiceConversation {...props} />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    calls[0].speak.mockRejectedValueOnce(authFailure ? new VoiceAudioError("authentication_required") : new Error("temporary synthesis failure"))
+    await act(async () => {
+      calls[0].options.transcript("final", "Hello", 0)
+      await new Promise(resolve => setTimeout(resolve, 320))
+    })
+    view.rerender(<VoiceConversation {...props} messages={[{ id: "answer", role: "assistant", isResult: true, status: "completed", content: "Hello back." }]} />)
+    if (authFailure) {
+      await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.authenticationRequired"))
+      expect(calls[0].close).toHaveBeenCalledOnce()
+    } else {
+      await screen.findByText("voiceConversation.playbackFailed")
+      expect(calls[0].close).not.toHaveBeenCalled()
+      expect(screen.getByRole("button", { name: "voiceConversation.mute" })).toBeEnabled()
+    }
+  })
+
   it("selects live models, sends a voice turn, speaks the reply and interrupts without a button", async () => {
     const onSend = vi.fn().mockResolvedValue(undefined)
     const onInterrupt = vi.fn()
@@ -61,8 +94,9 @@ describe("voice conversation entry and call lifecycle", () => {
     await waitFor(() => expect(call.speak).toHaveBeenCalledWith("Hello back. "))
     const stops = call.stopAudio.mock.calls.length
     act(() => { call.options.activity(true) })
-    expect(call.stopAudio).toHaveBeenCalledTimes(stops + 1)
+    expect(call.stopAudio).toHaveBeenCalledTimes(stops)
     act(() => { call.options.transcript("partial", "Change that", 1) })
+    expect(call.stopAudio).toHaveBeenCalledTimes(stops + 1)
     expect(onInterrupt).toHaveBeenCalledOnce()
     expect(screen.queryByRole("button", { name: /interrupt|打断/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.end" }))
@@ -75,7 +109,6 @@ describe("voice conversation entry and call lifecycle", () => {
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("settings.voice.selectionUnavailable"))
     expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeDisabled()
     expect(screen.getByRole("link", { name: "settings.voice.openSettings" })).toHaveAttribute("href", "?settings=voice")
-    preferences.asr_model_id = "live"
   })
 
   it("shows a rejected task's explanation instead of blaming the microphone", async () => {

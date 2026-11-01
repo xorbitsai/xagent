@@ -69,7 +69,7 @@ def page_security_headers(*, embeddable: bool = False) -> dict[str, str]:
         "base-uri 'none'",
         "object-src 'none'",
         "form-action 'self'",
-        "script-src 'self' 'unsafe-inline' https:",
+        "script-src 'self' 'unsafe-inline' https: 'wasm-unsafe-eval'",
         "style-src 'self' 'unsafe-inline' https:",
         "img-src 'self' data: blob: https:",
         "media-src 'self' data: blob: https:",

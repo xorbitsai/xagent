@@ -23,7 +23,7 @@ from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig
-from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.database import Base, get_db, get_engine, get_session_local
 from xagent.web.models.model import Model as DBModel
 from xagent.web.models.user import UserDefaultModel, UserModel
 from xagent.web.services.llm_utils import (
@@ -841,6 +841,66 @@ def test_speech_voice_listing_uses_accessible_model_and_closes_client(
         assert response.json() == [{"voice_id": "voice-one", "name": "Rachel"}]
     assert "synthetic-secret" not in response.text + caplog.text
     provider.aclose.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "case", ["inactive", "non_speech", "non_tts", "unsupported", "malformed_ids"]
+)
+def test_speech_voice_listing_capability_and_output_boundaries(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, case
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    if case in {"inactive", "non_speech", "non_tts"}:
+        with get_session_local()() as db:
+            saved = db.query(DBModel).filter_by(model_id=model_id).one()
+            if case == "inactive":
+                saved.is_active = False
+            if case == "non_speech":
+                saved.category = "llm"
+            if case == "non_tts":
+                saved.abilities = ["asr"]
+            db.commit()
+    provider = SimpleNamespace(
+        supports_voice_listing=case != "unsupported",
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "safe-voice", "name": "Rachel"},
+                {"voice_id": "../private"},
+                {"voice_id": 123},
+                {},
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (
+        200 if case == "malformed_ids" else 404 if case == "inactive" else 400
+    ), response.text
+    if case in {"inactive", "non_speech", "non_tts"}:
+        factory.assert_not_called()
+    else:
+        provider.aclose.assert_awaited_once()
+        if case == "unsupported":
+            provider.list_available_voices.assert_not_called()
+        else:
+            assert response.json() == [{"voice_id": "safe-voice", "name": "Rachel"}]
 
 
 class TestModelAPI:

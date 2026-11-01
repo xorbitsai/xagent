@@ -43,7 +43,8 @@ export function VoiceSettings() {
   const validModels = available(models.asr, draft.asr_model_id) && available(models.tts, draft.tts_model_id)
   const reason = voiceModelReason(models)
   const currentVoices = voices?.model === ttsId ? voices : null
-  const validVoice = !draft.voice || Boolean(currentVoices?.items.some(voice => voice.voice_id === draft.voice))
+  const savedVoice = draft.tts_model_id === saved.preferences.tts_model_id && draft.voice === saved.preferences.voice
+  const validVoice = !draft.voice || Boolean(currentVoices?.items.some(voice => voice.voice_id === draft.voice)) || Boolean(currentVoices?.error && savedVoice)
   const change = (patch: VoiceConversationPreferences) => { setDraft(previous => ({ ...previous, ...patch })); setStatus("") }
   const modelSelect = (kind: "asr" | "tts", label: string) => {
     const field = kind === "asr" ? "asr_model_id" : "tts_model_id"
@@ -78,7 +79,7 @@ export function VoiceSettings() {
       <span>{t("settings.voice.speaker")}</span>
       <select aria-label={t("settings.voice.speaker")} className="w-full rounded-md border bg-background p-2 font-normal" value={draft.voice || ""} disabled={!ready || saving || !availableTts} onChange={event => change({ voice: event.target.value || null, ...(event.target.value ? { tts_model_id: ttsId } : {}) })}>
         <option value="">{t("settings.voice.modelDefault")}</option>
-        {draft.voice && !validVoice && <option value={draft.voice} disabled>{t("settings.voice.selectionUnavailable")}</option>}
+        {draft.voice && !currentVoices?.items.some(voice => voice.voice_id === draft.voice) && <option value={draft.voice} disabled>{t(currentVoices?.error && savedVoice ? "settings.voice.savedVoice" : "settings.voice.selectionUnavailable")}</option>}
         {currentVoices?.items.map(voice => <option key={voice.voice_id} value={voice.voice_id}>{voice.name}</option>)}
       </select>
     </label>

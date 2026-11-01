@@ -3,7 +3,7 @@ export interface VoiceVad {
   destroy: () => Promise<void>
 }
 
-/** Run Silero on 32 ms mono frames; only confirmed speech can interrupt. */
+/** Report Silero speech activity on 32 ms mono frames. */
 export async function createVoiceVad(options: {
   speech: (speaking: boolean) => void
   error: () => void

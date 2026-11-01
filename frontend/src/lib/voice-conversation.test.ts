@@ -6,12 +6,102 @@ afterEach(() => vi.useRealTimers())
 function coordinator() {
   const actions = {
     send: vi.fn().mockResolvedValue(undefined), interrupt: vi.fn(), stopAudio: vi.fn(),
-    speak: vi.fn().mockResolvedValue(undefined), phase: vi.fn(), caption: vi.fn(), error: vi.fn(),
+    speak: vi.fn().mockResolvedValue(undefined), phase: vi.fn(), caption: vi.fn(), error: vi.fn(), playbackError: vi.fn(),
   }
   return { actions, turns: new VoiceTurns(actions) }
 }
 
 describe("voice turn ownership", () => {
+  it("keeps the answer audible through local VAD activity without a transcript", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.activity(true); turns.transcript("final", "Hello", 0); turns.activity(false)
+    await vi.advanceTimersByTimeAsync(300)
+    turns.updateBusy(true)
+    turns.reply({ id: "answer", text: "First sentence. More", complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    const stops = actions.stopAudio.mock.calls.length
+    turns.activity(true); turns.activity(false)
+    turns.reply({ id: "answer", text: "First sentence. More words. Tail", complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.stopAudio).toHaveBeenCalledTimes(stops)
+    expect(actions.interrupt).not.toHaveBeenCalled()
+    expect(actions.speak.mock.calls.map(([text]) => text)).toEqual(["First sentence. ", "More words. "])
+    turns.stop()
+  })
+
+  it("accepts server-confirmed speech even when local VAD misses it", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.transcript("partial", "Quiet speech", 0)
+    turns.transcript("final", "Quiet speech", 0)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(actions.send).toHaveBeenCalledExactlyOnceWith("Quiet speech")
+    turns.stop()
+  })
+
+  it("waits for an in-progress utterance before flushing a previously queued segment", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.updateBusy(true)
+    turns.activity(true); turns.transcript("final", "First", 0); turns.activity(false)
+    await vi.advanceTimersByTimeAsync(300)
+    turns.activity(true)
+    turns.updateBusy(false)
+    expect(actions.send).not.toHaveBeenCalled()
+    turns.transcript("partial", "Second", 1)
+    turns.activity(false)
+    turns.updateBusy(false)
+    expect(actions.send).not.toHaveBeenCalled()
+    turns.transcript("final", "Second", 1)
+    await vi.advanceTimersByTimeAsync(300)
+    expect(actions.send).toHaveBeenCalledExactlyOnceWith("First Second")
+    turns.stop()
+  })
+
+  it("holds incomplete ASCII sentence ends and streams CJK punctuation", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.activity(true); turns.transcript("final", "Hello", 0); turns.activity(false)
+    await vi.advanceTimersByTimeAsync(300)
+    turns.reply({ id: "answer", text: "3.", complete: false })
+    expect(actions.speak).not.toHaveBeenCalled()
+    turns.reply({ id: "answer", text: "3.14 is pi. More", complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak).toHaveBeenLastCalledWith("3.14 is pi. ")
+    turns.reply({ id: "cjk", text: "你好。还有", complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak).toHaveBeenLastCalledWith("你好。")
+    turns.stop()
+  })
+
+  it("continues after a consumed markdown prefix changes without replaying it", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.activity(true); turns.transcript("final", "Hello", 0); turns.activity(false)
+    await vi.advanceTimersByTimeAsync(300)
+    turns.reply({ id: "answer", text: "[Read this. More", complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    turns.reply({ id: "answer", text: "Read this. More words. Tail", complete: false })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak.mock.calls.map(([text]) => text)).toEqual(["Read this. ", "More words. "])
+    turns.stop()
+  })
+
+  it("reports one failed sentence and continues with the next without replay", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    actions.speak.mockRejectedValueOnce(new Error("temporary synthesis failure"))
+    turns.activity(true); turns.transcript("final", "Hello", 0); turns.activity(false)
+    await vi.advanceTimersByTimeAsync(300)
+    turns.reply({ id: "answer", text: "First. Second.", complete: true })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(actions.speak.mock.calls.map(([text]) => text)).toEqual(["First. ", "Second."])
+    expect(actions.playbackError).toHaveBeenCalledOnce()
+    expect(actions.error).not.toHaveBeenCalled()
+    turns.stop()
+  })
+
   it("coalesces VAD segments, never sends partials, and ignores repeated finals", async () => {
     vi.useFakeTimers()
     const { turns, actions } = coordinator()
@@ -47,9 +137,10 @@ describe("voice turn ownership", () => {
     expect(actions.speak).toHaveBeenCalledExactlyOnceWith("First sentence. ")
     const previousStops = actions.stopAudio.mock.calls.length
     turns.activity(true)
-    expect(actions.stopAudio).toHaveBeenCalledTimes(previousStops + 1)
+    expect(actions.stopAudio).toHaveBeenCalledTimes(previousStops)
     expect(actions.interrupt).not.toHaveBeenCalled()
     turns.transcript("partial", "Actually", 1)
+    expect(actions.stopAudio).toHaveBeenCalledTimes(previousStops + 1)
     turns.transcript("partial", "Actually change that", 1)
     expect(actions.interrupt).toHaveBeenCalledOnce()
     turns.reply({ id: "old", text: "First sentence. More old speech. Too late.", complete: true })
@@ -134,12 +225,12 @@ describe("audio format and activity", () => {
     expect(view.getInt16(31998, true)).toBe(16384)
   })
 
-  it("cannot interrupt or submit an ASR frame without VAD speech confirmation", async () => {
+  it("does not interrupt or submit empty server transcripts", async () => {
     vi.useFakeTimers()
     const { turns, actions } = coordinator()
     turns.updateBusy(true)
-    turns.transcript("partial", "Background noise", 0)
-    turns.transcript("final", "Background noise", 0)
+    turns.transcript("partial", "  ", 0)
+    turns.transcript("final", "", 0)
     await vi.advanceTimersByTimeAsync(500)
     expect(actions.interrupt).not.toHaveBeenCalled()
     expect(actions.stopAudio).not.toHaveBeenCalled()

@@ -104,7 +104,8 @@ def test_spa_html_has_enforced_baseline_csp(dist_dir, path):
     assert "base-uri 'none'" in policy
     assert "form-action 'self'" in policy
     assert "frame-ancestors 'none'" in policy
-    assert "unsafe-eval" not in policy
+    assert "'unsafe-eval'" not in policy.replace(";", " ").split()
+    assert "'wasm-unsafe-eval'" in policy.replace(";", " ").split()
     assert response.headers["x-frame-options"] == "DENY"
 
 
@@ -113,7 +114,8 @@ def test_spa_widget_keeps_embedding_but_not_unsafe_eval(dist_dir):
     policy = response.headers["content-security-policy"]
     assert "frame-ancestors" not in policy
     assert "x-frame-options" not in response.headers
-    assert "unsafe-eval" not in policy
+    assert "'unsafe-eval'" not in policy.replace(";", " ").split()
+    assert "'wasm-unsafe-eval'" in policy.replace(";", " ").split()
     assert "object-src 'none'" in policy
 
 

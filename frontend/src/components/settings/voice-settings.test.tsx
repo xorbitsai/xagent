@@ -65,3 +65,14 @@ it("shows failed saves and keeps the model default available if voice listing fa
   fireEvent.click(screen.getByRole("button", { name: "common.save" }))
   expect(await screen.findByText("settings.voice.saveFailed")).toBeInTheDocument()
 })
+
+it("preserves an unchanged saved voice when listing fails while changing the listening model", async () => {
+  request.mockReset().mockResolvedValue(new Response(null, { status: 502 }))
+  render(<VoiceSettings />)
+  await screen.findByText("settings.voice.voicesFailed")
+  expect(screen.getByLabelText("settings.voice.speaker")).toHaveValue("voice-one")
+  fireEvent.change(screen.getByLabelText("voiceConversation.transcriptionModel"), { target: { value: "" } })
+  expect(screen.getByRole("button", { name: "common.save" })).toBeEnabled()
+  fireEvent.click(screen.getByRole("button", { name: "common.save" }))
+  await waitFor(() => expect(save).toHaveBeenCalledWith({ voice_conversation: { asr_model_id: null, tts_model_id: "speaker", voice: "voice-one" } }))
+})

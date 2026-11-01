@@ -53,6 +53,7 @@ describe("voice model requirements", () => {
     request.mockImplementation(async () => new Response(null, { status: 503 }))
     act(() => { window.dispatchEvent(new Event("focus")) })
     await waitFor(() => expect(voiceModelReason(view.result.current)).toBe("modelsUnavailable"))
+    expect(view.result.current.asr.map(model => model.model_id)).toEqual(["live"])
     view.unmount()
   })
   it("never restores a previous login's models after a late response", async () => {
@@ -65,6 +66,19 @@ describe("voice model requirements", () => {
     await waitFor(() => expect(view.result.current.loading).toBe(false))
     await act(async () => { release(response([asr, tts])) })
     expect(voiceModelReason(view.result.current)).toBe("needsAsrAndTts")
+    view.unmount()
+  })
+  it("keeps the current owner's models during background revalidation", async () => {
+    request.mockResolvedValueOnce(response([asr, tts]))
+    const view = renderHook(() => useVoiceModels(true))
+    await waitFor(() => expect(view.result.current.tts).toHaveLength(1))
+    let release!: (response: Response) => void
+    request.mockImplementationOnce(() => new Promise<Response>(resolve => { release = resolve }))
+    act(() => { window.dispatchEvent(new Event("focus")) })
+    expect(view.result.current.loading).toBe(false)
+    expect(view.result.current.tts.map(model => model.model_id)).toEqual(["speaker"])
+    await act(async () => { release(response([asr])) })
+    await waitFor(() => expect(view.result.current.tts).toHaveLength(0))
     view.unmount()
   })
 })

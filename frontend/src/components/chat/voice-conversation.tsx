@@ -11,7 +11,7 @@ import { generateClientMessageId } from "@/lib/utils"
 import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models"
 import { useVoicePreferences } from "@/hooks/use-voice-preferences"
 import { VoiceModeButton } from "./voice-mode-button"
-import { VoiceAudio } from "@/lib/voice-audio"
+import { VoiceAudio, VoiceAudioError, type VoiceAudioFailure } from "@/lib/voice-audio"
 import { VoiceTurns, type VoicePhase } from "@/lib/voice-conversation"
 
 interface ReplyMessage {
@@ -48,6 +48,8 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   const [phase, setPhase] = useState<VoicePhase>("idle")
   const [caption, setCaption] = useState("")
   const [sendFailure, setSendFailure] = useState("")
+  const [audioFailure, setAudioFailure] = useState<VoiceAudioFailure>()
+  const [playbackFailed, setPlaybackFailed] = useState(false)
   const [muted, setMuted] = useState(false)
   const [serverVadOnly, setServerVadOnly] = useState(false)
   const audio = useRef<VoiceAudio | null>(null)
@@ -63,8 +65,8 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
     turns.current?.stop(); turns.current = null
     audio.current?.close(); audio.current = null
   }
-  const end = () => { release(); setPhase("idle"); setMuted(false); setCaption(""); setSendFailure(""); setServerVadOnly(false) }
-  const fail = () => { release(); setPhase("error") }
+  const end = () => { release(); setPhase("idle"); setMuted(false); setCaption(""); setSendFailure(""); setAudioFailure(undefined); setPlaybackFailed(false); setServerVadOnly(false) }
+  const fail = (reason?: VoiceAudioFailure) => { release(); setAudioFailure(reason); setPlaybackFailed(false); setPhase("error") }
 
   useEffect(() => {
     const previous = identity.current
@@ -116,13 +118,14 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
       asr: asrId, tts: ttsId, voice: saved.preferences.voice || undefined, token: auth.token, sessionId: auth.session?.sessionId ?? null,
       activity: speaking => { if (current()) turns.current?.activity(speaking) },
       transcript: (type, text, id) => { if (current()) turns.current?.transcript(type, text, id) },
-      error: () => { if (current()) fail() },
+      error: reason => { if (current()) fail(reason) },
       vadFallback: () => { if (current()) setServerVadOnly(true) },
     })
     audio.current = call
     turns.current = new VoiceTurns({
       send: async (text) => {
         baseline.current = new Set(live.current.messages.map(message => message.id))
+        if (current()) setPlaybackFailed(false)
         try {
           await live.current.onSend(text, generateClientMessageId())
         } catch (error) {
@@ -138,12 +141,17 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
       phase: next => { if (current()) setPhase(next) },
       caption: text => { if (current()) setCaption(text) },
       error: () => { if (current()) fail() },
+      playbackError: error => {
+        if (!current()) return
+        if (error instanceof VoiceAudioError) fail(error.code)
+        else setPlaybackFailed(true)
+      },
     })
     turns.current.updateBusy(live.current.busy)
     try {
       await call.start()
       if (current()) setPhase(turns.current?.muted ? "muted" : "listening")
-    } catch { if (current()) fail() }
+    } catch (error) { if (current()) fail(error instanceof VoiceAudioError ? error.code : undefined) }
   }
 
   if (!auth.token) return null
@@ -159,8 +167,9 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
           <div aria-hidden="true" className={`flex h-28 w-28 items-center justify-center rounded-full bg-primary/10 text-primary ${active && !muted ? "motion-safe:animate-pulse" : ""}`}>
             {muted ? <MicOff className="h-10 w-10" /> : <Headphones className="h-10 w-10" />}
           </div>
-          <p role="status" className="text-sm font-medium">{t(phase === "error" && sendFailure ? "voiceConversation.sendFailed" : `voiceConversation.states.${phase}`)}</p>
+          <p role="status" className="text-sm font-medium">{t(phase === "error" && sendFailure ? "voiceConversation.sendFailed" : phase === "error" && audioFailure === "session_timeout" ? "voiceConversation.sessionTimeout" : phase === "error" && audioFailure === "authentication_required" ? "voiceConversation.authenticationRequired" : `voiceConversation.states.${phase}`)}</p>
           {phase === "error" && sendFailure && <p role="alert" className="text-center text-sm text-muted-foreground">{sendFailure}</p>}
+          {playbackFailed && <p role="alert" className="text-center text-sm text-muted-foreground">{t("voiceConversation.playbackFailed")}</p>}
           {serverVadOnly && <p className="text-center text-xs text-muted-foreground">{t("voiceConversation.serverVadOnly")}</p>}
           <p aria-live="polite" className="min-h-12 max-h-40 overflow-auto text-center text-sm text-muted-foreground">{caption}</p>
         </div>

@@ -9,6 +9,7 @@ export function speechText(value: string): string {
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/[*_`#>|]/g, "")
+    .replace(/\[|\]/g, "")
     .replace(/\s+/g, " ").trim()
 }
 
@@ -69,6 +70,7 @@ export class VoiceTurns {
   private interruptWanted = false
   private userSpeaking = false
   private speechAccepted = false
+  private transcriptPending = false
   private stopped = false
   private queue: string[] = []
   private draining = false
@@ -83,15 +85,14 @@ export class VoiceTurns {
     phase: (phase: VoicePhase) => void
     caption: (text: string) => void
     error: (error: unknown) => void
+    playbackError: (error: unknown) => void
   }) {}
 
   activity(active: boolean) {
     if (this.stopped || this.muted) return
     this.userSpeaking = active
     if (active) {
-      this.speechAccepted = true
       clearTimeout(this.timer)
-      this.cutOff()
     } else this.schedule()
   }
 
@@ -105,7 +106,12 @@ export class VoiceTurns {
   }
 
   transcript(type: "partial" | "final", text: string, segmentId: number) {
-    if (this.stopped || this.muted || !this.speechAccepted || !text.trim() || this.segmentIds.has(segmentId)) return
+    if (this.stopped || this.muted || !text.trim() || this.segmentIds.has(segmentId)) return
+    if (!this.speechAccepted) {
+      this.speechAccepted = true
+      this.cutOff()
+    }
+    this.transcriptPending = type === "partial"
     // A transcript is speech confirmation: pause generation only after this,
     // rather than cancelling an agent because of a short microphone noise.
     if ((this.busy || this.sending) && !this.interrupted) {
@@ -125,7 +131,7 @@ export class VoiceTurns {
 
   private schedule() {
     clearTimeout(this.timer)
-    if (this.userSpeaking || !this.segments.length || this.muted || this.stopped) return
+    if (this.userSpeaking || (!this.segments.length && !this.pending) || this.muted || this.stopped) return
     this.timer = setTimeout(() => {
       this.pending = [this.pending, ...this.segments].filter(Boolean).join(" ")
       this.segments = []
@@ -142,7 +148,7 @@ export class VoiceTurns {
   }
 
   private async flush() {
-    if (!this.pending || this.busy || this.sending || this.stopped || this.muted) return
+    if (!this.pending || this.busy || this.sending || this.stopped || this.muted || this.userSpeaking || this.transcriptPending || this.segments.length) return
     const text = this.pending
     this.pending = ""
     this.speechAccepted = false
@@ -162,11 +168,13 @@ export class VoiceTurns {
     const text = speechText(reply.text)
     if (!text || text.startsWith("{")) return
     const previous = this.replyOffsets.get(reply.id) || ""
-    if (!text.startsWith(previous)) return
-    let rest = text.slice(previous.length)
-    let consumed = previous
+    if (text.length < previous.length) return
+    // Streaming markdown can revise an earlier prefix. Keep the spoken
+    // position without replaying it or blocking all subsequent sentences.
+    let consumed = text.slice(0, previous.length)
+    let rest = text.slice(consumed.length)
     while (rest) {
-      const sentence = rest.match(/^[\s\S]*?[.!?](?:\s|$)/)?.[0]
+      const sentence = rest.match(/^[\s\S]*?(?:[.!?]\s+|[。！？]\s*)/)?.[0]
       const chunk = sentence || (reply.complete ? rest : "")
       if (!chunk) break
       // Each synthesis request stays within the transport's text limit.
@@ -188,7 +196,9 @@ export class VoiceTurns {
         this.speaking = true
         this.actions.phase("speaking")
         try { await this.actions.speak(text) }
-        catch (error) { if (epoch === this.epoch && !this.stopped) this.actions.error(error) }
+        catch (error) {
+          if (epoch === this.epoch && !this.stopped && !(error instanceof Error && error.name === "AbortError")) this.actions.playbackError(error)
+        }
         if (epoch === this.epoch) this.speaking = false
       }
     } finally {
@@ -203,6 +213,7 @@ export class VoiceTurns {
     this.pending = ""
     this.userSpeaking = false
     this.speechAccepted = false
+    this.transcriptPending = false
     clearTimeout(this.timer)
     this.actions.phase(muted ? "muted" : this.busy ? "thinking" : "listening")
   }

@@ -6,7 +6,7 @@ const runtime = vi.hoisted(() => ({
   path: "/task", search: "", login: "login-1",
   state: { taskId: null as number | null, messages: [] as Array<{
     id: string; role: string; isResult: boolean; status: string; content: string
-  }>, isProcessing: false, currentTask: null },
+  }>, isProcessing: false, currentTask: null as { status: string; waitingRequestId?: string } | null },
   sendMessage: vi.fn(), pauseTask: vi.fn(), isConnected: false, isMessageDeliveryPending: false,
   isConversationResetPending: false, isSessionInteractionLocked: false,
   voiceInputEnabled: true, taskControlsEnabled: true,
@@ -40,7 +40,7 @@ import { TaskVoiceProvider, useTaskVoice } from "./task-voice-context"
 
 function Entry() {
   const open = useTaskVoice()
-  return <button onClick={() => open?.({ model: "chosen-model", agentId: 7 })}>home-voice</button>
+  return <button onClick={() => open?.({ model: "chosen-model", agentId: 7, metadata: { source: "composer" } })}>home-voice</button>
 }
 const tree = () => <TaskVoiceProvider><Entry /></TaskVoiceProvider>
 async function openCall() {
@@ -69,6 +69,30 @@ beforeEach(() => {
 afterEach(() => { cleanup(); calls.length = 0; vi.clearAllMocks() })
 
 describe("home voice task creation", () => {
+  it("retains creation ownership after send resolves but before task navigation and socket readiness", async () => {
+    runtime.sendMessage.mockImplementation(async (_text, _config, _files, options) => { options.onCreatedTask(42) })
+    const view = await openCall()
+    await speak()
+    runtime.state.taskId = 42
+    view.rerender(tree())
+    expect(calls[0].close).not.toHaveBeenCalled()
+    runtime.path = "/task/42"
+    view.rerender(tree())
+    expect(calls[0].close).not.toHaveBeenCalled()
+    runtime.isConnected = true
+    view.rerender(tree())
+    expect(calls[0].close).not.toHaveBeenCalled()
+  })
+
+  it("preserves composer metadata when answering a waiting request", async () => {
+    runtime.path = "/task/42"; runtime.state.taskId = 42; runtime.isConnected = true
+    runtime.state.currentTask = { status: "waiting_for_user", waitingRequestId: "request-1" }
+    runtime.sendMessage.mockResolvedValue(undefined)
+    await openCall()
+    await speak()
+    expect(runtime.sendMessage.mock.calls[0][1].metadata).toEqual({ source: "composer", request_id: "request-1" })
+  })
+
   it("creates on the first utterance and keeps microphone/replies across its own task navigation", async () => {
     let accepted!: () => void
     runtime.sendMessage.mockImplementation(() => new Promise<void>(resolve => { accepted = resolve }))

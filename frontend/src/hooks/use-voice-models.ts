@@ -35,7 +35,9 @@ export function useVoiceModels(enabled: boolean, refreshKey = false) {
     let request = 0
     const load = async () => {
       const current = ++request
-      setState({ owner, models: [], loading: true, error: false })
+      setState(previous => previous.owner === owner
+        ? { ...previous, loading: previous.loading || previous.error, error: false }
+        : { owner, models: [], loading: true, error: false })
       try {
         const response = await apiRequest(`${getApiUrl()}/api/models/?category=speech&limit=1000`)
         if (!response.ok) throw new Error("Models unavailable")
@@ -43,7 +45,7 @@ export function useVoiceModels(enabled: boolean, refreshKey = false) {
         if (!models) throw new Error("Invalid model list")
         if (active && request === current) setState({ owner, models, loading: false, error: false })
       } catch {
-        if (active && request === current) setState({ owner, models: [], loading: false, error: true })
+        if (active && request === current) setState(previous => ({ owner, models: previous.owner === owner ? previous.models : [], loading: false, error: true }))
       }
     }
     void load()

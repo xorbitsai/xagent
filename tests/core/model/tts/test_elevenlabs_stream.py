@@ -31,6 +31,71 @@ def provider(monkeypatch):
     return SimpleNamespace(model=model, usage=usage)
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "voice", ["../../v1/user?x=", "voice/other", "voice?x=", "%2e%2e", "x" * 129]
+)
+async def test_synthesis_rejects_path_control_before_opening_the_sdk(
+    monkeypatch, provider, streaming, voice
+):
+    client = Mock()
+    monkeypatch.setattr(provider.model, "_ensure_async_client", client)
+    with pytest.raises(ValueError, match="valid voice ID"):
+        if streaming:
+            await anext(provider.model.synthesize_stream("Hello", voice=voice))
+        else:
+            await provider.model.synthesize("Hello", voice=voice)
+    client.assert_not_called()
+    provider.usage.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"format": "foo"},
+        {"format": "pcm_12345"},
+        {"format": "pcm", "sample_rate": 12345},
+    ],
+)
+async def test_invalid_output_options_never_open_the_sdk(
+    monkeypatch, provider, options
+):
+    client = Mock()
+    monkeypatch.setattr(provider.model, "_ensure_async_client", client)
+    with pytest.raises(ValueError, match="Unsupported ElevenLabs output"):
+        await anext(provider.model.synthesize_stream("Hello", **options))
+    client.assert_not_called()
+    provider.usage.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"voice": " invalid voice "}, "valid voice ID"),
+        ({"format": "future_provider_format"}, "Unsupported ElevenLabs output"),
+    ],
+)
+async def test_legacy_configuration_stays_constructible_but_requests_validate(
+    monkeypatch, streaming, options, error
+):
+    model = ElevenLabsTTS(api_key="test-secret", **options)
+    client = Mock()
+    monkeypatch.setattr(model, "_ensure_async_client", client)
+    with pytest.raises(ValueError, match=error):
+        if streaming:
+            await anext(model.synthesize_stream("Hello"))
+        else:
+            await model.synthesize("Hello")
+    client.assert_not_called()
+    # Explicit valid overrides can still use the discoverable saved model.
+    request = model._synthesis_request(
+        "Hello", voice="safe-voice", format="pcm", sample_rate=16000
+    )
+    assert request["voice_id"] == "safe-voice"
+    assert request["output_format"] == "pcm_16000"
+
+
 def install_stream(monkeypatch, provider, audio, *, error=None):
     closed = asyncio.Event()
     requests = []

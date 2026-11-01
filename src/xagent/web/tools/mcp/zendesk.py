@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import re
@@ -29,6 +30,12 @@ logger = logging.getLogger("zendesk-mcp")
 
 
 mcp = FastMCP("zendesk-mcp")
+
+
+class _OutcomeUnknownError(RuntimeError):
+    """A request whose effect on Zendesk is unknown: the connection failed, or
+    Zendesk answered 5xx. A write may still have been applied."""
+
 
 # A shared Session (HTTP keep-alive / connection pooling) rather than a bare
 # requests.request() per call -- most benefit accrues to this module's own
@@ -483,7 +490,7 @@ def _request(
         # credentials, and urllib3's "Max retries exceeded with url:
         # /search.json?query=..." echoing the request's own query string
         # (which for the search tools can carry end-user PII).
-        raise RuntimeError(_sanitize_exception_text(exc)) from exc
+        raise _OutcomeUnknownError(_sanitize_exception_text(exc)) from exc
 
     if 300 <= response.status_code < 400:
         raise RuntimeError(
@@ -521,6 +528,8 @@ def _request(
                 "granted to this connection do not allow this request; "
                 "reconnecting Zendesk requests the scopes again."
             )
+        if response.status_code >= 500:
+            raise _OutcomeUnknownError(message) from exc
         raise RuntimeError(message) from exc
 
     if response.status_code == 204 or not response.content:
@@ -988,6 +997,116 @@ def _side_conversation_event_summary(event: dict[str, Any]) -> dict[str, Any]:
             else None
         ),
     }
+
+
+# Macro actions zendesk_apply_macro can turn into one ticket update under
+# the connector's tickets:write scope. Every other action (side
+# conversations, CCs, followers, custom fields, ...) is refused before
+# anything is saved: the apply preview silently leaves out actions it
+# can't express as ticket fields, so it can't be trusted to show them.
+# custom_status_id is deliberately absent: a macro that sets a custom ticket
+# status is refused, while one that sets a status category ("status")
+# applies, and Zendesk picks that category's default custom status.
+_MACRO_FIELD_ACTIONS = ("status", "priority", "assignee_id", "group_id")
+_MACRO_TAG_ACTIONS = frozenset({"current_tags", "remove_tags", "set_tags"})
+_MACRO_COMMENT_ACTIONS = frozenset({"comment_value", "comment_value_html"})
+_MACRO_COMMENT_MODE_ACTION = "comment_mode_is_public"
+_ALLOWED_MACRO_ACTIONS = (
+    frozenset(_MACRO_FIELD_ACTIONS)
+    | _MACRO_TAG_ACTIONS
+    | _MACRO_COMMENT_ACTIONS
+    | {_MACRO_COMMENT_MODE_ACTION}
+)
+
+
+def _macro_comment_is_public(actions: list[dict[str, Any]]) -> bool:
+    """The macro's comment visibility. Without a comment_mode_is_public
+    action the comment is public, the agent UI's default reply mode. An
+    unrecognized value, or more than one such action, is refused rather
+    than guessed: a wrong guess posts an internal note to the customer."""
+    modes = [
+        action.get("value")
+        for action in actions
+        if action.get("field") == _MACRO_COMMENT_MODE_ACTION
+    ]
+    if len(modes) > 1:
+        raise ValueError(
+            f"the macro sets {_MACRO_COMMENT_MODE_ACTION} more than once, so "
+            "whether the comment is public is ambiguous; nothing was saved"
+        )
+    if not modes:
+        return True
+    normalized = str(modes[0]).strip().lower()
+    if normalized in ("true", "false"):
+        return normalized == "true"
+    raise ValueError(
+        f"the macro sets {_MACRO_COMMENT_MODE_ACTION} to {modes[0]!r}, which "
+        "is not true or false; nothing was saved"
+    )
+
+
+def _build_apply_macro_response(payload: dict[str, Any]) -> str:
+    """Cap an apply-macro response, shrinking in order of what the caller
+    loses least: the reported comment body, then the saved ticket's summary
+    (down to its id), then the change details. Unless the cap is below the
+    smallest success envelope, it never turns a saved result into an
+    error: an error invites a retry, and a retry of a save posts the
+    comment again."""
+    max_output_length = get_tool_max_output_length()
+    response = _success(**payload)
+    comment = payload["changes"].get("comment")
+    body = comment.get("body") if isinstance(comment, dict) else None
+    while (
+        not payload["dry_run"]
+        and len(response) > max_output_length
+        and isinstance(body, str)
+        and body
+    ):
+        body = body[: len(body) // 2]
+        payload = {
+            **payload,
+            "truncated": True,
+            "changes": {
+                **payload["changes"],
+                "comment": {**comment, "body": body, "body_truncated": True},
+            },
+        }
+        response = _success(**payload)
+    if len(response) > max_output_length and isinstance(payload.get("ticket"), dict):
+        payload = {
+            **payload,
+            "truncated": True,
+            "ticket": {"id": payload["ticket"].get("id")},
+        }
+        response = _success(**payload)
+    if len(response) > max_output_length and payload["dry_run"]:
+        # Never hand out a preview_token for changes the caller can't see:
+        # it would let them be saved unreviewed.
+        return _error_capped(
+            "this macro's preview is too large to show within the output "
+            "limit, so it can't be approved here; nothing was saved. Raise "
+            "XAGENT_TOOL_MAX_OUTPUT_LENGTH or apply it in the Zendesk agent UI."
+        )
+    if len(response) > max_output_length:
+        payload = {**payload, "truncated": True, "changes": {"truncated": True}}
+        response = _success(**payload)
+    if len(response) > max_output_length:
+        # The save is committed: keep shrinking to the smallest success
+        # envelope rather than let the cap turn it into an error.
+        for fallback in (
+            {
+                "dry_run": False,
+                "ticket_id": payload.get("ticket_id"),
+                "truncated": True,
+            },
+            {"dry_run": False, "truncated": True},
+            {"dry_run": False},
+            {},
+        ):
+            response = _success(**fallback)
+            if len(response) <= max_output_length:
+                break
+    return _finalize_capped(response, max_output_length)
 
 
 def _resolve_path_id(
@@ -1715,6 +1834,242 @@ def zendesk_get_side_conversation(
         logger.error(
             f"Error fetching side conversation {side_conversation_id} on Zendesk "
             f"ticket {ticket_id}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_apply_macro(
+    ticket_id: int | str,
+    macro_id: int | str,
+    dry_run: bool = True,
+    preview_token: str | None = None,
+) -> str:
+    """
+    Apply a macro to a ticket the way the Zendesk agent UI does: set the
+    fields the macro sets and add its comment, with placeholders such as
+    {{ticket.requester.first_name}} filled in. Two steps: first preview
+    (the default, `dry_run: true`), which saves nothing and returns the
+    changes and a `preview_token`; then save with dry_run=false and that
+    same preview_token. The save is refused, with nothing saved, if the
+    ticket or the macro changed since that preview -- preview again and
+    re-confirm. A save is also refused if the macro renders differently
+    than in the preview (e.g. the requester's details changed).
+    Only macros whose actions set status, priority, assignee, group,
+    tags, or add a comment can be applied. A macro with any other action
+    (for example a side conversation, CCs, a custom field, or a custom
+    ticket status) is refused before anything is saved, listing the
+    actions it can't apply, and so is an inactive macro, one with
+    attached files, or one that sets the comment visibility more than once.
+    The comment is public unless the macro marks it internal. In the
+    reported changes, `body_is_html` marks a comment body that is HTML.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI.
+    macro_id: a bare numeric id (from zendesk_list_macros), or the macro's
+    Admin Center URL.
+    preview_token: required to save; the `preview_token` from a preview of
+    this macro on this ticket. It binds the exact write that preview showed
+    (ticket state, macro version, and the rendered changes); it is not a
+    record of a human approval, so show the preview to the user before
+    saving.
+    """
+    try:
+        if isinstance(preview_token, str):
+            preview_token = preview_token.strip()
+        if not dry_run and not preview_token:
+            raise ValueError(
+                "to save, pass the preview_token from a preview (dry_run=true) "
+                "of this macro on this ticket; nothing was saved"
+            )
+        ticket_path_id = _resolve_path_id(
+            ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id"
+        )
+        macro_path_id = _resolve_path_id(macro_id, _MACRO_URL_ID_PATTERN, "macro_id")
+        macro = _unwrap(_request("GET", f"/macros/{macro_path_id}.json"), "macro")
+        if macro.get("active") is False:
+            raise ValueError("this macro is inactive; nothing was saved")
+        actions = [a for a in macro.get("actions") or [] if isinstance(a, dict)]
+        fields = {str(action.get("field")) for action in actions}
+        unsupported = sorted(fields - _ALLOWED_MACRO_ACTIONS)
+        if unsupported:
+            raise ValueError(
+                "this macro has actions this connector can't apply: "
+                f"{', '.join(unsupported)}; nothing was saved. Apply it in "
+                "the Zendesk agent UI instead."
+            )
+        public = _macro_comment_is_public(actions)
+        if not fields - {_MACRO_COMMENT_MODE_ACTION}:
+            raise ValueError("this macro has no actions to apply")
+
+        # Attached files are a separate resource, not in `actions`; applying
+        # the macro without them would silently drop them.
+        attachments = _request("GET", f"/macros/{macro_path_id}/attachments.json")
+        macro_attachments = (
+            attachments.get("macro_attachments")
+            if isinstance(attachments, dict)
+            else None
+        )
+        if not isinstance(macro_attachments, list):
+            raise RuntimeError(
+                "Zendesk didn't say whether this macro has attached files; "
+                "nothing was saved"
+            )
+        if macro_attachments:
+            raise ValueError(
+                "this macro has attached files, which this connector can't add "
+                "to the ticket; nothing was saved. Apply it in the Zendesk "
+                "agent UI instead."
+            )
+
+        # The ticket-scoped preview, not GET /macros/{id}/apply: only this
+        # one renders placeholders, and it carries the final tag set and the
+        # updated_at the save is pinned to.
+        preview = _request(
+            "GET", f"/tickets/{ticket_path_id}/macros/{macro_path_id}/apply.json"
+        )
+        # The render can't be trusted to reflect the definition the allowlist
+        # checked: an action added since that read (e.g. cc) wouldn't show in
+        # the rendered output, so compare the definition itself.
+        reread = _unwrap(_request("GET", f"/macros/{macro_path_id}.json"), "macro")
+        if any(
+            reread.get(key) != macro.get(key)
+            for key in ("updated_at", "active", "actions")
+        ):
+            raise ValueError(
+                "the macro changed while it was being applied; nothing was "
+                "saved. Preview again."
+            )
+        preview_ticket = (
+            (preview.get("result") or {}).get("ticket")
+            if isinstance(preview, dict)
+            else None
+        )
+        if not isinstance(preview_ticket, dict):
+            raise RuntimeError("Zendesk returned no preview of this macro's result")
+
+        changes: dict[str, Any] = {}
+        update: dict[str, Any] = {}
+        for field in _MACRO_FIELD_ACTIONS:
+            if field in fields:
+                if field not in preview_ticket:
+                    raise RuntimeError(
+                        f"Zendesk's preview of this macro has no {field}; "
+                        "nothing was saved"
+                    )
+                changes[field] = update[field] = preview_ticket.get(field)
+        if fields & _MACRO_TAG_ACTIONS:
+            # The whole final set: a single-ticket update ignores
+            # additional_tags/remove_tags. safe_update below keeps this from
+            # overwriting tags someone changed after the preview.
+            tags = preview_ticket.get("tags")
+            if not isinstance(tags, list):
+                raise RuntimeError(
+                    "Zendesk's preview of this macro has no tag list; nothing was saved"
+                )
+            changes["tags"] = update["tags"] = tags
+        if fields & _MACRO_COMMENT_ACTIONS:
+            comment = preview_ticket.get("comment") or {}
+            html_body = comment.get("html_body")
+            body = comment.get("body")
+            key, text = ("html_body", html_body) if html_body else ("body", body)
+            if not text:
+                raise RuntimeError(
+                    "Zendesk's preview of this macro has an empty comment; "
+                    "nothing was saved"
+                )
+            update["comment"] = {key: text, "public": public}
+            changes["comment"] = {
+                "body": html_body or body,
+                "body_is_html": bool(html_body),
+                "public": public,
+            }
+
+        preview_stamp = preview_ticket.get("updated_at")
+        if not preview_stamp:
+            raise RuntimeError(
+                "Zendesk's preview has no updated_at to pin a save to; nothing "
+                "was saved"
+            )
+        # Binds a save to exactly what was previewed: the ticket and its
+        # state, and the macro and its version. The digest also binds the
+        # exact write (rendered comment, its visibility, fields and tags), so
+        # a macro edited mid-call or a placeholder rendering differently
+        # can't change what is saved.
+        write_digest = hashlib.sha256(
+            json.dumps(update, sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()[:32]
+        stamps = "|".join(
+            str(part)
+            for part in (
+                preview_ticket.get("id"),
+                preview_stamp,
+                macro.get("id"),
+                macro.get("updated_at"),
+            )
+        )
+        token = f"{stamps}|{write_digest}"
+        payload: dict[str, Any] = {
+            "dry_run": dry_run,
+            "ticket_id": preview_ticket.get("id"),
+            "macro": {"id": macro.get("id"), "title": macro.get("title")},
+            "changes": changes,
+        }
+        if dry_run:
+            payload["preview_token"] = token
+            return _build_apply_macro_response(payload)
+
+        if token != preview_token:
+            if preview_token and preview_token.rsplit("|", 1)[0] == stamps:
+                raise ValueError(
+                    "the macro renders differently than in the preview this "
+                    "preview_token came from (for example the requester's "
+                    "details changed, or a placeholder depends on the time); "
+                    "nothing was saved. Preview again and confirm the new "
+                    "changes; if it keeps rendering differently, apply it in "
+                    "the Zendesk agent UI."
+                )
+            raise ValueError(
+                "the ticket or the macro changed since the preview this "
+                "preview_token came from, or it is from another ticket or "
+                "macro; nothing was saved. Preview again and confirm the new "
+                "changes."
+            )
+        # The token check above already refuses a retry after a successful
+        # save, since the save moved updated_at. safe_update pinned to the
+        # approved preview covers the rest: Zendesk answers 409 and saves
+        # nothing if the ticket changes between that check and this save.
+        try:
+            result = _request(
+                "PUT",
+                f"/tickets/{ticket_path_id}.json",
+                json_data={
+                    "ticket": {
+                        **update,
+                        "safe_update": True,
+                        "updated_stamp": preview_stamp,
+                    }
+                },
+            )
+        except _OutcomeUnknownError as exc:
+            raise RuntimeError(
+                f"{exc}. The save may have been applied: check the ticket with "
+                "zendesk_get_ticket and zendesk_list_ticket_comments before "
+                "applying this macro again."
+            ) from exc
+        ticket = _unwrap(result, "ticket")
+        payload["ticket"] = (
+            _ticket_summary(ticket) if isinstance(ticket, dict) else ticket
+        )
+        if "comment" in update:
+            event = _find_comment_event(result, public)
+            # The body is already in changes.comment; don't report it twice.
+            payload["comment"] = (
+                {k: v for k, v in event.items() if k != "body"} if event else None
+            )
+        return _build_apply_macro_response(payload)
+    except Exception as e:
+        logger.error(
+            f"Error applying Zendesk macro {macro_id} to ticket {ticket_id}: {e}"
         )
         return _error_capped(str(e))
 

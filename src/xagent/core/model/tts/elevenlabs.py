@@ -69,6 +69,19 @@ _GENERIC_OUTPUT_FORMATS: dict[str, str] = {
     "alaw": "alaw_8000",
     "opus": "opus_48000_128",
 }
+_SUPPORTED_OUTPUT_FORMATS = {
+    *(
+        f"{codec}_{rate}"
+        for codec in ("pcm", "wav")
+        for rate in (8000, 16000, 22050, 24000, 32000, 44100, 48000)
+    ),
+    *(f"mp3_44100_{rate}" for rate in (32, 64, 96, 128, 192)),
+    *(f"opus_48000_{rate}" for rate in (32, 64, 96, 128, 192)),
+    "mp3_22050_32",
+    "mp3_24000_48",
+    "ulaw_8000",
+    "alaw_8000",
+}
 
 
 def _get_field(value: Any, *names: str) -> Any:
@@ -193,6 +206,11 @@ class ElevenLabsTTS(BaseTTS):
         return self._async_client
 
     @staticmethod
+    def _validate_voice_id(voice_id: str) -> None:
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", voice_id) is None:
+            raise ValueError("ElevenLabs voice must be a valid voice ID")
+
+    @staticmethod
     def _validate_sample_rate_request(
         requested_format: Optional[str],
         sample_rate: Optional[int],
@@ -220,10 +238,12 @@ class ElevenLabsTTS(BaseTTS):
         normalized = output_format.lower()
         codec = normalized.split("_", 1)[0]
         if codec == "pcm" and sample_rate:
-            return f"pcm_{sample_rate}"
-        if "_" in normalized:
-            return normalized
-        return _GENERIC_OUTPUT_FORMATS.get(normalized, output_format)
+            output_format = f"pcm_{sample_rate}"
+        elif "_" in normalized:
+            output_format = normalized
+        else:
+            output_format = _GENERIC_OUTPUT_FORMATS.get(normalized, output_format)
+        return output_format
 
     @staticmethod
     def _validate_provider_options(options: dict[str, Any]) -> None:
@@ -612,9 +632,19 @@ class ElevenLabsTTS(BaseTTS):
         sample_rate: Optional[int] = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        voice_id = voice or self.voice
+        self._validate_voice_id(voice_id)
         final_output_format = self._resolve_output_format(
             format or self.output_format, sample_rate or self.sample_rate
         )
+        # Keep saved models discoverable; validate the effective request before
+        # any provider client is opened, including agent-tool callers.
+        requested_format = (format or self.output_format).strip().lower()
+        if (
+            requested_format not in _GENERIC_OUTPUT_FORMATS
+            and requested_format not in _SUPPORTED_OUTPUT_FORMATS
+        ) or final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
+            raise ValueError("Unsupported ElevenLabs output format or sample rate")
         self._validate_sample_rate_request(
             format or self.output_format,
             sample_rate,
@@ -639,7 +669,7 @@ class ElevenLabsTTS(BaseTTS):
 
         return {
             "text": synthesis_text,
-            "voice_id": voice or self.voice,
+            "voice_id": voice_id,
             "model_id": self.model,
             "output_format": final_output_format,
             **request_kwargs,

@@ -742,6 +742,50 @@ async def test_disconnect_during_tts_client_close_waits_for_cleanup_before_meter
     assert len(api.usage) == 1
 
 
+async def test_disconnect_after_audio_waits_for_usage_delivery(api, monkeypatch):
+    entered, release, delivered = (
+        threading.Event(),
+        threading.Event(),
+        threading.Event(),
+    )
+
+    def delayed_usage(*row):
+        entered.set()
+        assert release.wait(5)
+        api.usage.append(row)
+        delivered.set()
+
+    monkeypatch.setattr(quota_hooks, "_standalone_usage_hook", delayed_usage)
+    response = speech._TTSAudioResponse(
+        api.tts, 1, TTSStreamRequest(model_id="voice", text="Hello")
+    )
+    incoming, messages = asyncio.Queue(), []
+
+    async def send(message):
+        messages.append(message)
+
+    task = asyncio.create_task(response({"type": "http"}, incoming.get, send))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert messages[-1] == {
+            "type": "http.response.body",
+            "body": b"",
+            "more_body": False,
+        }
+        assert api.tts.close_count == 1
+        await incoming.put({"type": "http.disconnect"})
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(task), 0.02)
+        assert not api.usage
+    finally:
+        release.set()
+        await asyncio.wait_for(task, 2)
+        assert await asyncio.to_thread(delivered.wait, 2)
+    assert len(api.usage) == 1
+    assert api.usage[0][0] == 1
+    assert api.usage[0][2] == "speech_synthesize"
+
+
 @pytest.mark.parametrize("failure", ["provider", "chunk_timeout", "session_timeout"])
 async def test_tts_late_failure_keeps_truncation_without_leaking_provider_details(
     api, monkeypatch, caplog, failure

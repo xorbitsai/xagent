@@ -293,46 +293,49 @@ class _TTSAudioResponse(StreamingResponse):
             yield chunk.audio
 
     async def _serve(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async with usage_scope(self.user_id, usage_source="speech_synthesize"):
-            try:
-                async with aclosing(
-                    self.model.synthesize_stream(**self.options)
-                ) as chunks:
-                    try:
-                        first = await asyncio.wait_for(anext(chunks), _IO_TIMEOUT)
-                    except Exception as exc:
-                        _log_provider_error(self.model, exc)
-                        status = (
-                            400
-                            if isinstance(exc, ValueError)
-                            else 504
-                            if isinstance(exc, TimeoutError)
-                            else 502
-                        )
-                        await JSONResponse(
-                            {"detail": "Speech synthesis failed"}, status_code=status
-                        )(scope, receive, send)
-                        return
-                    self.media_type = {
-                        "mp3": "audio/mpeg",
-                        "wav": "audio/wav",
-                        "pcm": "audio/pcm",
-                    }.get(first.format, "application/octet-stream")
-                    headers = {
-                        "Cache-Control": "no-store",
-                        "X-Accel-Buffering": "no",
-                        "X-Audio-Format": first.format,
-                        "Access-Control-Expose-Headers": "X-Audio-Format, X-Audio-Sample-Rate",
-                    }
-                    if first.sample_rate is not None:
-                        headers["X-Audio-Sample-Rate"] = str(first.sample_rate)
-                    self.init_headers(headers)
-                    self.body_iterator = self._audio(first, chunks)
-                    await self.stream_response(send)
-            finally:
-                await _close_model(self.model)
+        try:
+            async with aclosing(self.model.synthesize_stream(**self.options)) as chunks:
+                try:
+                    first = await asyncio.wait_for(anext(chunks), _IO_TIMEOUT)
+                except Exception as exc:
+                    _log_provider_error(self.model, exc)
+                    status = (
+                        400
+                        if isinstance(exc, ValueError)
+                        else 504
+                        if isinstance(exc, TimeoutError)
+                        else 502
+                    )
+                    await JSONResponse(
+                        {"detail": "Speech synthesis failed"}, status_code=status
+                    )(scope, receive, send)
+                    return
+                self.media_type = {
+                    "mp3": "audio/mpeg",
+                    "wav": "audio/wav",
+                    "pcm": "audio/pcm",
+                }.get(first.format, "application/octet-stream")
+                headers = {
+                    "Cache-Control": "no-store",
+                    "X-Accel-Buffering": "no",
+                    "X-Audio-Format": first.format,
+                    "Access-Control-Expose-Headers": "X-Audio-Format, X-Audio-Sample-Rate",
+                }
+                if first.sample_rate is not None:
+                    headers["X-Audio-Sample-Rate"] = str(first.sample_rate)
+                self.init_headers(headers)
+                self.body_iterator = self._audio(first, chunks)
+                await self.stream_response(send)
+        finally:
+            await _close_model(self.model)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        # Meter on the request owner, outside the cancellable stream/disconnect
+        # race. An EOF-triggered disconnect must not detach the quota hook.
+        async with usage_scope(self.user_id, usage_source="speech_synthesize"):
+            await self._respond(scope, receive, send)
+
+    async def _respond(self, scope: Scope, receive: Receive, send: Send) -> None:
         started = False
 
         async def send_response(message: Message) -> None:

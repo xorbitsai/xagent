@@ -5,6 +5,13 @@ for a continuous conversation in private task chat. Save an ElevenLabs
 `scribe_v2_realtime` model with the `asr` ability and an ElevenLabs speech model
 with the `tts` ability before starting.
 
+The entry remains visible but disabled while models are being checked or a
+required model is missing. Hover or focus the disabled entry to see whether it
+needs realtime ASR with server VAD, streaming TTS, or a selected chat model/agent.
+Inactive models and file-only ASR do not qualify. Returning to the app refreshes
+availability; a failed model-list request is reported separately from missing
+configuration. Public widget/share capabilities remain opt-in.
+
 Choose the headphone **Voice mode** button next to the microphone on the task
 home page, or **Voice mode** above an existing private task's composer.
 Select a listening model and a speaking model, then **Start conversation**.
@@ -27,10 +34,12 @@ the ordinary task message-delivery path, including waiting-question IDs and
 durable client message IDs. Attachments in the text composer are not sent by
 the voice call.
 
-The microphone remains active while the agent speaks. Browser echo
-cancellation and local Silero v5 VAD confirm human speech before stopping
-playback; an ASR partial confirms the words before requesting interruption of an
-active agent run through the existing pause path. The next utterance waits for
+The microphone remains active while the agent speaks. Backend realtime ASR
+provides server VAD and final transcript boundaries. Browser echo cancellation
+and optional local Silero v5 VAD reduce interruption latency; without local VAD,
+non-empty backend transcripts confirm speech before playback is stopped. An ASR
+partial confirms the words before requesting interruption of an active agent run
+through the existing pause path. The next utterance waits for
 that run to settle before delivery, then follows the normal continuation path.
 Interruption is automatic and speaking requires no extra action.
 Interrupted audio fetches and queued speech are discarded, and stale reply
@@ -42,8 +51,16 @@ Capture uses an AudioWorklet and resamples the actual device rate to mono
 PCM16 at 16 kHz. Playback consumes 24 kHz PCM incrementally, retaining split
 samples across HTTP chunks and bounding scheduled audio ahead of playback.
 Silero processes 32 ms frames with a 0.6 speech probability threshold and
-160 ms minimum speech. Only its confirmed speech event interrupts playback;
-audio levels, isolated candidate frames, and ASR events without VAD confirmation
-do not. The ONNX model and WASM runtime are served by the application itself,
+160 ms minimum speech. When available, only its confirmed speech event interrupts
+playback; audio levels and isolated candidate frames do not. Local VAD loads in
+the background and never blocks connection/capture. If loading or inference
+fails, the call continues using backend ASR/VAD and shows that mode. The ONNX
+model and WASM runtime are served by the application itself,
 prepared from pinned npm packages by `predev` and `prebuild`. They are loaded
-only when starting a call. No browser audio is sent to a VAD service.
+only when starting a call. Local detection sends no additional browser audio to
+a VAD service.
+
+API/SDK clients use the same backend protocol: open realtime ASR with `vad: true`,
+consume `partial`/`final` events, and stream TTS responses. They do not require
+browser Silero, ONNX or WASM. Server VAD is supplied by the ASR adapter here; it
+is not a separately configured VAD model.

@@ -2,7 +2,9 @@ import React, { useState, useRef, useEffect, useId, useMemo } from "react";
 import { renderFileMentionsHtml } from "./FileChip";
 import { escapeHtml } from "@/lib/html-escape";
 import { useRouter } from "next/navigation";
-import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square, Headphones } from "lucide-react";
+import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
+import { VoiceModeButton } from "./voice-mode-button";
+import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models";
 import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
@@ -193,6 +195,7 @@ export function ChatInput({
   const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
+  const voiceModels = useVoiceModels(Boolean(voiceInputEnabled && onVoiceConversation));
 
   useEffect(() => {
     mountedRef.current = true;
@@ -930,18 +933,12 @@ export function ChatInput({
     };
   };
   const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
-    <Button type="button" variant="ghost" size="sm"
-      aria-label={t("voiceConversation.open")} title={t("voiceConversation.open")}
-      className="h-8 w-8 p-0 rounded-full text-muted-foreground hover:text-foreground"
+    <VoiceModeButton iconOnly
+      reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
       disabled={isInputBusy || voiceInput.status !== "idle"}
-      onMouseDown={event => event.preventDefault()}
       onClick={() => {
-        if (!hideConfig && !readOnlyConfig && !selectedAgents.length && !agentConfig.model) {
-          setShowNoModelAlert(true);
-          return;
-        }
         onVoiceConversation(deliveryConfig());
-      }}><Headphones className="h-4 w-4" /></Button>
+      }} />
   ) : null;
 
   const handleSubmit = async (e: React.SyntheticEvent) => {

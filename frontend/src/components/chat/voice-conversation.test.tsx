@@ -37,6 +37,7 @@ describe("voice conversation entry and call lifecycle", () => {
     const onInterrupt = vi.fn()
     const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend, onInterrupt }
     const view = render(<VoiceConversation {...props} />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
     await waitFor(() => expect(screen.getByLabelText("voiceConversation.transcriptionModel")).toHaveValue("live"))
     expect(screen.queryByRole("option", { name: "batch" })).not.toBeInTheDocument()
@@ -67,6 +68,7 @@ describe("voice conversation entry and call lifecycle", () => {
   it("ends the old call on task navigation and ignores late speech callbacks", async () => {
     const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: vi.fn() }
     const view = render(<VoiceConversation {...props} />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))

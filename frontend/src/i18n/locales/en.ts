@@ -143,6 +143,13 @@ const en = {
     transcriptionModel: "Listening model",
     speechModel: "Speaking model",
     modelsRequired: "Add a live transcription model and a speech synthesis model in Models to use voice mode.",
+    checkingModels: "Checking voice models…",
+    modelsUnavailable: "Voice models could not be checked. Refresh the page and try again.",
+    needsAsrAndTts: "Add realtime ASR with server VAD (scribe_v2_realtime) and streaming TTS in Models.",
+    needsAsr: "Add realtime ASR with server VAD (scribe_v2_realtime) in Models.",
+    needsTts: "Add a streaming TTS model in Models.",
+    needsLlm: "Select a chat model or an agent before starting voice mode.",
+    serverVadOnly: "Using server voice detection. Interruption may take slightly longer.",
     states: {
       idle: "Ready when you are",
       connecting: "Connecting…",

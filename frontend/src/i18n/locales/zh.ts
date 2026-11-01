@@ -143,6 +143,13 @@ const zh = {
     transcriptionModel: "语音识别模型",
     speechModel: "语音合成模型",
     modelsRequired: "请先在模型设置中添加支持实时转写和语音合成的模型。",
+    checkingModels: "正在检查语音模型…",
+    modelsUnavailable: "无法检查语音模型，请刷新页面后重试。",
+    needsAsrAndTts: "请在模型设置中添加支持服务端 VAD 的实时 ASR（scribe_v2_realtime）和流式 TTS。",
+    needsAsr: "请在模型设置中添加支持服务端 VAD 的实时 ASR（scribe_v2_realtime）。",
+    needsTts: "请在模型设置中添加流式语音合成（TTS）模型。",
+    needsLlm: "请先选择聊天模型或 Agent，再开始语音模式。",
+    serverVadOnly: "正在使用服务端语音检测，打断响应可能稍慢。",
     states: {
       idle: "准备就绪",
       connecting: "正在连接…",

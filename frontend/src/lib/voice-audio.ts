@@ -16,6 +16,7 @@ export class VoiceAudio {
   private playback = new Set<AudioBufferSourceNode>()
   private synthesis: AbortController | null = null
   private vad: VoiceVad | null = null
+  private serverSpeaking = false
   private vadLoading = new AbortController()
   private rejectReady: ((error: Error) => void) | null = null
   private readyTimeout: ReturnType<typeof setTimeout> | undefined
@@ -34,6 +35,7 @@ export class VoiceAudio {
     activity: (active: boolean) => void
     transcript: (type: "partial" | "final", text: string, segmentId: number) => void
     error: () => void
+    vadFallback?: () => void
   }) {}
 
   async start(): Promise<void> {
@@ -49,13 +51,17 @@ export class VoiceAudio {
     this.microphone = media
     await context.audioWorklet.addModule("/voice-capture-worklet.js")
     if (this.closed) return
-    const vad = await createVoiceVad({
+    // Backend ASR/VAD owns the baseline protocol. Local VAD only reduces
+    // playback interruption latency and must not block a call or SDK parity.
+    void createVoiceVad({
       signal: this.vadLoading.signal,
       speech: speaking => { if (!this.closed && !this.muted) this.options.activity(speaking) },
-      error: () => { if (!this.closed) this.options.error() },
-    })
-    if (this.closed) { await vad.destroy(); return }
-    this.vad = vad
+      error: () => this.useServerVad(),
+    }).then(async vad => {
+      if (this.closed) { await vad.destroy(); return }
+      if (this.serverSpeaking) { this.serverSpeaking = false; this.options.activity(false) }
+      this.vad = vad
+    }).catch(() => this.useServerVad())
     const socket = new WebSocket(`${getWsUrl().replace(/\/$/, "")}/api/models/speech/asr/stream`, websocketAuthProtocols(this.options.token))
     this.socket = socket
     await new Promise<void>((resolve, reject) => {
@@ -74,7 +80,17 @@ export class VoiceAudio {
             this.rejectReady = null
             resolve()
           } else if ((event.type === "partial" || event.type === "final") && typeof event.text === "string") {
-            if (!this.muted) this.options.transcript(event.type, event.text, event.segment_id)
+            if (!this.muted) {
+              if (!this.vad && event.text.trim() && !this.serverSpeaking) {
+                this.serverSpeaking = true
+                this.options.activity(true)
+              }
+              this.options.transcript(event.type, event.text, event.segment_id)
+              if (!this.vad && event.type === "final") {
+                this.serverSpeaking = false
+                this.options.activity(false)
+              }
+            }
           } else if (event.type === "error") this.options.error()
         } catch { this.options.error() }
       }
@@ -95,11 +111,21 @@ export class VoiceAudio {
       if (socket.bufferedAmount > 256 * 1024) { this.options.error(); return }
       const samples = this.muted ? new Float32Array(data.length) : data
       const frame = resampler.process(samples)
-      vad.process(frame)
+      this.vad?.process(frame)
       socket.send(encodePcm16(frame))
     }
     this.source.connect(this.capture)
     this.capture.connect(this.sink).connect(context.destination)
+  }
+
+  private useServerVad() {
+    const vad = this.vad
+    this.vad = null
+    if (vad) {
+      void vad.destroy().catch(() => {})
+      if (!this.closed) this.options.activity(false)
+    }
+    if (!this.closed) this.options.vadFallback?.()
   }
 
   stopAudio() {

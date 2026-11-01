@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { VoiceAudio } from "./voice-audio"
+import { createVoiceVad } from "./voice-vad"
 
-const detectors = vi.hoisted(() => [] as Array<{ options: { speech: (active: boolean) => void }; process: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }>)
+const detectors = vi.hoisted(() => [] as Array<{ options: { speech: (active: boolean) => void; error: () => void }; process: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }>)
 vi.mock("./voice-vad", () => ({ createVoiceVad: vi.fn(async options => {
   const vad = { options, process: vi.fn(), destroy: vi.fn().mockResolvedValue(undefined) }
   detectors.push(vad)
@@ -45,7 +46,7 @@ class Context {
   }
 }
 
-const options = () => ({ asr: "live", tts: "speaker", token: "login-token", sessionId: "login", activity: vi.fn(), transcript: vi.fn(), error: vi.fn() })
+const options = () => ({ asr: "live", tts: "speaker", token: "login-token", sessionId: "login", activity: vi.fn(), transcript: vi.fn(), error: vi.fn(), vadFallback: vi.fn() })
 
 beforeEach(() => {
   Socket.instances = []; captures.length = 0; playback.length = 0
@@ -75,6 +76,65 @@ async function start(call: VoiceAudio) {
 }
 
 describe("browser voice resources", () => {
+  it("uses the backend ASR/VAD protocol when the local detector cannot load", async () => {
+    vi.mocked(createVoiceVad).mockRejectedValueOnce(new Error("WASM unavailable"))
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toMatchObject({ vad: true })
+    expect(events.vadFallback).toHaveBeenCalledOnce()
+    captures[0].port.onmessage!({ data: new Float32Array(1024).fill(0.9) })
+    expect(events.activity).not.toHaveBeenCalled()
+    socket.onmessage!({ data: JSON.stringify({ type: "partial", text: "Hello", segment_id: 1 }) })
+    socket.onmessage!({ data: JSON.stringify({ type: "final", text: "Hello there.", segment_id: 1 }) })
+    expect(events.activity.mock.calls).toEqual([[true], [false]])
+    expect(events.transcript).toHaveBeenLastCalledWith("final", "Hello there.", 1)
+    expect(events.error).not.toHaveBeenCalled()
+    call.close()
+  })
+
+  it("starts without waiting for local VAD and releases a detector arriving after close", async () => {
+    let release!: (vad: Awaited<ReturnType<typeof createVoiceVad>>) => void
+    vi.mocked(createVoiceVad).mockReturnValueOnce(new Promise(resolve => { release = resolve }))
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    socket.onmessage!({ data: JSON.stringify({ type: "final", text: "Server VAD works.", segment_id: 1 }) })
+    expect(events.activity.mock.calls).toEqual([[true], [false]])
+    call.close()
+    const detector = { process: vi.fn(), destroy: vi.fn().mockResolvedValue(undefined) }
+    release(detector)
+    await Promise.resolve()
+    expect(detector.destroy).toHaveBeenCalledOnce()
+  })
+
+  it("keeps streaming after a running local detector fails", async () => {
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    detectors[0].options.error()
+    expect(detectors[0].destroy).toHaveBeenCalledOnce()
+    socket.onmessage!({ data: JSON.stringify({ type: "final", text: "Continue.", segment_id: 1 }) })
+    expect(events.transcript).toHaveBeenCalledWith("final", "Continue.", 1)
+    expect(events.vadFallback).toHaveBeenCalledOnce()
+    expect(events.error).not.toHaveBeenCalled()
+    call.close()
+  })
+
+  it("finishes server speech activity when a local detector joins mid-utterance", async () => {
+    let release!: (vad: Awaited<ReturnType<typeof createVoiceVad>>) => void
+    vi.mocked(createVoiceVad).mockReturnValueOnce(new Promise(resolve => { release = resolve }))
+    const events = options()
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    socket.onmessage!({ data: JSON.stringify({ type: "partial", text: "Hello", segment_id: 1 }) })
+    release({ process: vi.fn(), destroy: vi.fn().mockResolvedValue(undefined) })
+    await Promise.resolve()
+    socket.onmessage!({ data: JSON.stringify({ type: "final", text: "Hello there.", segment_id: 1 }) })
+    expect(events.activity.mock.calls).toEqual([[true], [false]])
+    expect(events.transcript).toHaveBeenLastCalledWith("final", "Hello there.", 1)
+    call.close()
+  })
   it("uses header login, mono PCM capture, local activity, and releases every resource", async () => {
     const callbacks = options()
     const call = new VoiceAudio(callbacks)

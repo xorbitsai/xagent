@@ -516,7 +516,8 @@ jobs:
     name: Test PostgreSQL Migrations
     needs: detect-migration-changes
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # The serial migration and concurrency suites can exceed 40 minutes.
+    timeout-minutes: 60
 
     services:
       postgres:

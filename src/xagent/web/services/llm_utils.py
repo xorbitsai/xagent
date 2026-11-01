@@ -14,7 +14,7 @@ from ...core.model.chat.basic.adapter import (
     create_base_llm,
 )
 from ...core.model.chat.basic.base import BaseLLM
-from ...core.model.chat.basic.claude import ClaudeLLM
+from ...core.model.chat.basic.claude import DEFAULT_CLAUDE_MODEL, ClaudeLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.gemini import GeminiLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -1406,7 +1406,7 @@ def create_llm_from_env() -> Optional[BaseLLM]:
     claude_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
     if claude_key:
         try:
-            model_name = os.getenv("CLAUDE_MODEL_NAME", "claude-3-5-sonnet-20241022")
+            model_name = os.getenv("CLAUDE_MODEL_NAME", DEFAULT_CLAUDE_MODEL)
             base_url = os.getenv("CLAUDE_BASE_URL")
             return attach_chat_retry_wrapper(
                 ClaudeLLM(

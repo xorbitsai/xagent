@@ -583,6 +583,108 @@ async def test_asr_error_response_after_disconnect_does_not_escape(
     assert api.asr.close_count == (0 if branch == "missing" else 1)
 
 
+@pytest.mark.parametrize(
+    "blocked", ["transcript", "error", "error_close", "normal_close", "unauth_close"]
+)
+async def test_blocked_asr_terminal_writes_settle_handler_and_watcher(
+    api, monkeypatch, blocked
+):
+    release, blocked_send = asyncio.Event(), asyncio.Event()
+    messages = []
+    monkeypatch.setattr(speech, "_IO_TIMEOUT", 0.03)
+    monkeypatch.setattr(speech, "_TERMINAL_TIMEOUT", 0.03, raising=False)
+    monkeypatch.setattr(
+        speech,
+        "get_authenticated_user",
+        AsyncMock(
+            return_value=None if blocked == "unauth_close" else SimpleNamespace(id=1)
+        ),
+    )
+    incoming = asyncio.Queue()
+    incoming.put_nowait({"type": "websocket.connect"})
+    incoming.put_nowait(
+        {
+            "type": "websocket.receive",
+            "text": json.dumps({"type": "start", "model_id": "live"}),
+        }
+    )
+    incoming.put_nowait({"type": "websocket.receive", "bytes": b"\x00\x00"})
+    if blocked != "transcript":
+        incoming.put_nowait(
+            {
+                "type": "websocket.receive",
+                "text": json.dumps({"type": "close"})
+                if blocked == "normal_close"
+                else "invalid",
+            }
+        )
+
+    async def receive():
+        if release.is_set():
+            return {"type": "websocket.disconnect", "code": 1000}
+        if not incoming.empty():
+            return incoming.get_nowait()
+        # The slow reader is still sending microphone audio, so only the
+        # outbound transcript can hit its idle limit.
+        await asyncio.sleep(0.005)
+        return {"type": "websocket.receive", "bytes": b"\x00\x00"}
+
+    async def send(message):
+        messages.append(message)
+        event = (
+            json.loads(message["text"]) if message["type"] == "websocket.send" else {}
+        )
+        if (
+            message["type"] == "websocket.close"
+            or (blocked == "transcript" and event.get("type") in {"partial", "error"})
+            or (blocked == "error" and event.get("type") == "error")
+        ):
+            blocked_send.set()
+            await release.wait()
+
+    websocket = WebSocket(
+        {"type": "websocket", "headers": [], "query_string": b"", "subprotocols": []},
+        receive,
+        send,
+    )
+    task = asyncio.create_task(speech.stream_asr(websocket, token="test-token"))
+    try:
+        await asyncio.wait_for(blocked_send.wait(), 1)
+        watchers = [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "websocket-session-monitor"
+        ]
+        assert len(watchers) == 1
+        await asyncio.wait_for(asyncio.shield(task), 0.5)
+    finally:
+        # Let the unfixed handler finish even when the deadline assertion fails.
+        release.set()
+        await asyncio.wait_for(task, 2)
+    assert watchers[0].done()
+    closes = [message for message in messages if message["type"] == "websocket.close"]
+    assert len(closes) == 1
+    assert closes[0]["code"] == (
+        4001
+        if blocked == "unauth_close"
+        else 1000
+        if blocked in {"normal_close", "transcript"}
+        else 1008
+    )
+    errors = [
+        message
+        for message in messages
+        if message["type"] == "websocket.send"
+        and json.loads(message["text"])["type"] == "error"
+    ]
+    assert len(errors) == (blocked in {"error", "error_close"})
+    assert api.asr.close_count == (0 if blocked == "unauth_close" else 1)
+    assert len(api.usage) == (0 if blocked == "unauth_close" else 1)
+    if blocked != "unauth_close":
+        assert api.asr.sessions[0].closed
+        assert api.usage[0][0] == 1 and api.usage[0][2] == "speech_transcribe"
+
+
 async def test_repeated_cancellation_drains_both_stream_halves():
     started = [asyncio.Event(), asyncio.Event()]
     closed = [asyncio.Event(), asyncio.Event()]

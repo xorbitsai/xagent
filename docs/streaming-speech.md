@@ -83,6 +83,8 @@ event. Query-string credentials are refused before the upgrade, as
 described in [WebSocket authentication](websocket-header-auth.md).
 Connections and total submitted audio are limited to ten minutes; no inbound
 frame for 30 seconds also ends the session. Reconnect for a new session.
+Terminal error/close delivery is bounded and best effort. When an outbound
+transcript stalls, the server attempts to close without another error data frame.
 
 ## Streaming synthesis
 

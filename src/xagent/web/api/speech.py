@@ -58,10 +58,16 @@ _AUDIO_FRAME_BYTES = 64 * 1024
 _CONTROL_FRAME_BYTES = 4096
 _IO_TIMEOUT = 30.0
 _SESSION_SECONDS = 600.0
+# Terminal frames are best effort, including on a transport under backpressure.
+_TERMINAL_TIMEOUT = 1.0
 
 
 class _ASRSessionTimeout(TimeoutError):
     """A local transport deadline, rather than a provider failure."""
+
+
+class _ASRWriteTimeout(_ASRSessionTimeout):
+    """The outbound transport stalled; do not send another data frame."""
 
 
 def _load_speech_config(
@@ -137,15 +143,31 @@ async def _receive_asr_message(websocket: WebSocket) -> Message:
         raise _ASRSessionTimeout from None
 
 
+async def _close_asr_socket(
+    websocket: WebSocket, code: int = 1000, reason: str = ""
+) -> None:
+    if websocket.application_state in {
+        WebSocketState.CONNECTING,
+        WebSocketState.CONNECTED,
+    }:
+        with suppress(WebSocketDisconnect, RuntimeError, OSError, TimeoutError):
+            await asyncio.wait_for(
+                websocket.close(code=code, reason=reason), _TERMINAL_TIMEOUT
+            )
+
+
 async def _send_asr_error(
     websocket: WebSocket, code: str, message: str, close_code: int
 ) -> None:
     if websocket.application_state is WebSocketState.CONNECTED:
-        with suppress(WebSocketDisconnect, RuntimeError, OSError):
-            await websocket.send_json(
-                {"type": "error", "code": code, "message": message}
+        with suppress(WebSocketDisconnect, RuntimeError, OSError, TimeoutError):
+            await asyncio.wait_for(
+                websocket.send_json(
+                    {"type": "error", "code": code, "message": message}
+                ),
+                _TERMINAL_TIMEOUT,
             )
-            await websocket.close(code=close_code, reason=message)
+        await _close_asr_socket(websocket, close_code, message)
 
 
 async def _receive_asr_audio(
@@ -199,7 +221,7 @@ async def _relay_asr_events(
             try:
                 await asyncio.wait_for(websocket.send_json(asdict(event)), _IO_TIMEOUT)
             except TimeoutError:
-                raise _ASRSessionTimeout from None
+                raise _ASRWriteTimeout from None
 
 
 @speech_router.websocket("/asr/stream")
@@ -213,7 +235,7 @@ async def stream_asr(
     except _WebSocketAuthenticationTerminated:
         return
     if user is None:
-        await websocket.close(code=4001, reason="Authentication required")
+        await _close_asr_socket(websocket, 4001, "Authentication required")
         return
     await accept_authenticated_websocket(websocket)
     model: BaseASR | None = None
@@ -265,6 +287,8 @@ async def stream_asr(
                 await _close_model(model)
     except (WebSocketDisconnect, _WebSocketAuthenticationTerminated):
         return
+    except _ASRWriteTimeout:
+        await _close_asr_socket(websocket, 1000, "Speech session timed out")
     except _ASRSessionTimeout:
         await _send_asr_error(
             websocket, "session_timeout", "Speech session timed out", 1000
@@ -282,9 +306,7 @@ async def stream_asr(
     finally:
         if model is not None and not model_closed:
             await _close_model(model)
-        if websocket.application_state is WebSocketState.CONNECTED:
-            with suppress(WebSocketDisconnect, RuntimeError, OSError):
-                await websocket.close()
+        await _close_asr_socket(websocket)
 
 
 class _TTSAudioResponse(StreamingResponse):

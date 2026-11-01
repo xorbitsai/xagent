@@ -130,7 +130,6 @@ class ElevenLabsTTS(BaseTTS):
             base_url or os.getenv("ELEVENLABS_BASE_URL") or ELEVENLABS_DEFAULT_BASE_URL
         ).rstrip("/")
         self.voice = voice or ELEVENLABS_DEFAULT_VOICE_ID
-        self._validate_voice_id(self.voice)
         self.language = language
         self.output_format = self._resolve_output_format(format, sample_rate)
         self._validate_sample_rate_request(format, sample_rate, self.output_format)
@@ -237,11 +236,6 @@ class ElevenLabsTTS(BaseTTS):
     ) -> str:
         output_format = (requested_format or ELEVENLABS_DEFAULT_OUTPUT_FORMAT).strip()
         normalized = output_format.lower()
-        if (
-            normalized not in _GENERIC_OUTPUT_FORMATS
-            and normalized not in _SUPPORTED_OUTPUT_FORMATS
-        ):
-            raise ValueError("Unsupported ElevenLabs output format or sample rate")
         codec = normalized.split("_", 1)[0]
         if codec == "pcm" and sample_rate:
             output_format = f"pcm_{sample_rate}"
@@ -249,8 +243,6 @@ class ElevenLabsTTS(BaseTTS):
             output_format = normalized
         else:
             output_format = _GENERIC_OUTPUT_FORMATS.get(normalized, output_format)
-        if output_format not in _SUPPORTED_OUTPUT_FORMATS:
-            raise ValueError("Unsupported ElevenLabs output format or sample rate")
         return output_format
 
     @staticmethod
@@ -645,6 +637,14 @@ class ElevenLabsTTS(BaseTTS):
         final_output_format = self._resolve_output_format(
             format or self.output_format, sample_rate or self.sample_rate
         )
+        # Keep saved models discoverable; validate the effective request before
+        # any provider client is opened, including agent-tool callers.
+        requested_format = (format or self.output_format).strip().lower()
+        if (
+            requested_format not in _GENERIC_OUTPUT_FORMATS
+            and requested_format not in _SUPPORTED_OUTPUT_FORMATS
+        ) or final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
+            raise ValueError("Unsupported ElevenLabs output format or sample rate")
         self._validate_sample_rate_request(
             format or self.output_format,
             sample_rate,

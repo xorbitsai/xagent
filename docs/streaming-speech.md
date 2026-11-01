@@ -77,8 +77,9 @@ Errors have the shape
 | `session_timeout` | Local receive/send idle limit or session deadline | 1000 |
 | `stream_failed` | Provider failure, including an upstream timeout | 1011 |
 
-Authentication failure or session revocation closes with 4001 and may have no
-`error` event. Query-string credentials are refused before the upgrade, as
+Authentication failure during the handshake is rejected with HTTP 403.
+Session revocation after acceptance closes with 4001 and may have no `error`
+event. Query-string credentials are refused before the upgrade, as
 described in [WebSocket authentication](websocket-header-auth.md).
 Connections and total submitted audio are limited to ten minutes; no inbound
 frame for 30 seconds also ends the session. Reconnect for a new session.

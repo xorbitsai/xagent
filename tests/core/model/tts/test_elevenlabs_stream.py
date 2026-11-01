@@ -68,6 +68,34 @@ async def test_invalid_output_options_never_open_the_sdk(
     provider.usage.assert_not_called()
 
 
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "options,error",
+    [
+        ({"voice": " invalid voice "}, "valid voice ID"),
+        ({"format": "future_provider_format"}, "Unsupported ElevenLabs output"),
+    ],
+)
+async def test_legacy_configuration_stays_constructible_but_requests_validate(
+    monkeypatch, streaming, options, error
+):
+    model = ElevenLabsTTS(api_key="test-secret", **options)
+    client = Mock()
+    monkeypatch.setattr(model, "_ensure_async_client", client)
+    with pytest.raises(ValueError, match=error):
+        if streaming:
+            await anext(model.synthesize_stream("Hello"))
+        else:
+            await model.synthesize("Hello")
+    client.assert_not_called()
+    # Explicit valid overrides can still use the discoverable saved model.
+    request = model._synthesis_request(
+        "Hello", voice="safe-voice", format="pcm", sample_rate=16000
+    )
+    assert request["voice_id"] == "safe-voice"
+    assert request["output_format"] == "pcm_16000"
+
+
 def install_stream(monkeypatch, provider, audio, *, error=None):
     closed = asyncio.Event()
     requests = []

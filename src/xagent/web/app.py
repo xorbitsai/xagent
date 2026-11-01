@@ -1588,13 +1588,28 @@ def _security_header_values(path: str) -> dict[str, str]:
     return headers
 
 
-@app.middleware("http")
-async def security_headers(request: Request, call_next: Any) -> Any:
-    """Add browser hardening headers without breaking the SPA or previews."""
-    response = await call_next(request)
-    for name, value in _security_header_values(request.url.path).items():
-        response.headers.setdefault(name, value)
-    return response
+class SecurityHeadersMiddleware:
+    """Add browser headers without buffering or completing failed streams."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_response(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                for name, value in _security_header_values(scope["path"]).items():
+                    headers.setdefault(name, value)
+            await send(message)
+
+        await self.app(scope, receive, send_response)
+
+
+app.add_middleware(SecurityHeadersMiddleware)
 
 
 current_dir = os.path.dirname(os.path.abspath(__file__))

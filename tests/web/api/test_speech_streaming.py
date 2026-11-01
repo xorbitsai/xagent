@@ -350,6 +350,80 @@ def test_asr_validates_start_before_provider_access(api, message):
     api.asr_factory.assert_not_called()
 
 
+@pytest.mark.parametrize("stage", ["start", "control"])
+def test_asr_frame_size_checks_precede_json_parsing(api, monkeypatch, stage):
+    # Valid padded JSON ensures only the byte limit rejects this frame. The
+    # parse spy also makes the test fail if the size guard is removed.
+    if stage == "start":
+        parse = Mock(wraps=speech.ASRStreamStart.model_validate_json)
+        monkeypatch.setattr(speech.ASRStreamStart, "model_validate_json", parse)
+    else:
+        parse = Mock(wraps=speech.json.loads)
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        if stage == "control":
+            ws.send_json({"type": "start", "model_id": "live"})
+            assert ws.receive_json()["type"] == "session_started"
+            monkeypatch.setattr(speech.json, "loads", parse)
+        command = (
+            {"type": "start", "model_id": "live"}
+            if stage == "start"
+            else {"type": "commit"}
+        )
+        oversized = json.dumps(command) + " " * 5000
+        ws.send_text(oversized)
+        error = ws.receive_json()
+        assert error["code"] == "invalid_request"
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1008
+    # json.loads is shared with the test client, which decodes the error event.
+    if stage == "start":
+        parse.assert_not_called()
+        api.asr_factory.assert_not_called()
+    else:
+        assert not any(call.args[0] == oversized for call in parse.call_args_list)
+        assert not api.asr.sessions[0].commits
+        assert api.asr.sessions[0].closed
+
+
+@pytest.mark.parametrize("failure", ["factory", "open"])
+def test_asr_configuration_errors_are_model_unavailable(api, failure, caplog):
+    error = ValueError("api_key=synthetic-provider-secret")
+    if failure == "factory":
+        api.asr_factory.side_effect = error
+    else:
+        api.asr.open_stream = AsyncMock(side_effect=error)
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        assert ws.receive_json()["code"] == "model_unavailable"
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1008
+    assert "Speech stream failed" in caplog.text
+    assert "synthetic-provider-secret" not in caplog.text
+    assert api.asr.close_count == (failure == "open")
+
+
+@pytest.mark.parametrize("failure", ["config", "factory"])
+def test_asr_failure_before_model_creation_is_logged_safely(
+    api, monkeypatch, caplog, failure
+):
+    error = RuntimeError("storage failed api_key=synthetic-provider-secret")
+    if failure == "config":
+        monkeypatch.setattr(speech, "_load_speech_config", Mock(side_effect=error))
+    else:
+        api.asr_factory.side_effect = error
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        assert ws.receive_json()["code"] == "stream_failed"
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1011
+    assert "storage failed" in caplog.text
+    assert "synthetic-provider-secret" not in caplog.text
+    assert api.asr.close_count == 0
+
+
 @pytest.mark.parametrize("size", [64 * 1024 + 1, 32002])
 def test_asr_rejects_oversized_audio_and_closes_the_session(api, monkeypatch, size):
     if size == 32002:
@@ -386,7 +460,7 @@ def test_asr_send_failure_reports_a_safe_error_and_closes_both_halves(api, caplo
         {"type": "unknown"},
         {"type": "start", "model_id": "live"},
         {"type": "commit"},
-        "x" * 4097,
+        json.dumps({"type": "commit", "pad": "x" * 5000}),
         b"\x00",
     ],
 )
@@ -600,7 +674,7 @@ def test_nonstreaming_adapters_are_rejected_and_closed(api, kind):
     if kind == "asr":
         with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
             ws.send_json({"type": "start", "model_id": "live"})
-            assert ws.receive_json()["code"] == "invalid_request"
+            assert ws.receive_json()["code"] == "model_unavailable"
         assert not model.sessions
     else:
         response = api.client.post(
@@ -838,3 +912,62 @@ async def test_tts_session_timeout_before_audio_is_a_504(api, monkeypatch):
     assert messages[0]["status"] == 504
     assert api.tts.stream_closed and api.tts.close_count == 1
     assert not api.usage
+
+
+@pytest.mark.parametrize(
+    "failure", ["provider", "chunk_timeout", "session_timeout", None]
+)
+async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, failure):
+    from xagent.web.app import app
+
+    if failure == "provider":
+        api.tts.error_after_first = RuntimeError("synthetic-provider-secret")
+    elif failure:
+        api.tts.gate = asyncio.Event()
+        monkeypatch.setattr(
+            speech,
+            "_IO_TIMEOUT" if failure == "chunk_timeout" else "_SESSION_SECONDS",
+            0.05,
+        )
+    body = json.dumps({"model_id": "voice", "text": "Hello"}).encode()
+    incoming, messages = asyncio.Queue(), []
+    incoming.put_nowait({"type": "http.request", "body": body, "more_body": False})
+
+    async def send(message):
+        messages.append(message)
+
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": TTS_PATH,
+        "query_string": b"",
+        "headers": [
+            (b"authorization", api.headers["Authorization"].encode()),
+            (b"content-type", b"application/json"),
+        ],
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 1234),
+    }
+    if failure:
+        with pytest.raises(
+            RuntimeError, match="Speech synthesis stream interrupted"
+        ) as error:
+            await asyncio.wait_for(app(scope, incoming.get, send), 2)
+        assert (
+            "synthetic-provider-secret"
+            not in "".join(traceback.format_exception(error.value)) + caplog.text
+        )
+    else:
+        await asyncio.wait_for(app(scope, incoming.get, send), 2)
+    assert messages[0]["status"] == 200
+    headers = dict(messages[0]["headers"])
+    assert headers[b"x-content-type-options"] == b"nosniff"
+    assert headers[b"x-frame-options"] == b"DENY"
+    assert any(message.get("body") == b"first" for message in messages)
+    assert any(message.get("more_body") is False for message in messages) is (
+        failure is None
+    )
+    assert api.tts.stream_closed and api.tts.close_count == 1
+    assert len(api.usage) == 1

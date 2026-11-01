@@ -111,7 +111,9 @@ async def _race(*operations: Coroutine[Any, Any, None]) -> None:
         await drain_async_task_cancellation_safe(asyncio.create_task(cleanup()))
 
 
-def _log_provider_error(model: BaseASR | BaseTTS, error: Exception) -> None:
+def _log_provider_error(
+    model: BaseASR | BaseTTS | SimpleNamespace | None, error: Exception
+) -> None:
     detail = str(error) or type(error).__name__
     key = getattr(model, "api_key", None)
     if key:
@@ -186,7 +188,12 @@ async def _relay_asr_events(
     start: ASRStreamStart,
 ) -> None:
     options = start.model_dump(exclude={"type", "model_id"}, exclude_none=True)
-    async with await model.open_stream(**options) as stream:
+    try:
+        stream = await model.open_stream(**options)
+    except ValueError as exc:
+        _log_provider_error(model, exc)
+        raise HTTPException(status_code=400, detail="ASR model unavailable") from None
+    async with stream:
         ready.set_result(stream)
         async for event in stream:
             try:
@@ -210,6 +217,7 @@ async def stream_asr(
         return
     await accept_authenticated_websocket(websocket)
     model: BaseASR | None = None
+    config: SimpleNamespace | None = None
     model_closed = False
     try:
         message = await _receive_asr_message(websocket)
@@ -224,9 +232,17 @@ async def stream_asr(
         config = await run_db_io_cancellation_safe(
             lambda: _load_speech_config(user.id, start.model_id, "asr")
         )
-        model = get_asr_model_instance(config)
+        try:
+            model = get_asr_model_instance(config)
+        except ValueError as exc:
+            _log_provider_error(config, exc)
+            raise HTTPException(
+                status_code=400, detail="Invalid ASR model configuration"
+            ) from None
         if not model.supports_streaming:
-            raise ValueError("Selected ASR model does not support live audio")
+            raise HTTPException(
+                status_code=400, detail="Selected ASR model does not support live audio"
+            )
         async with usage_scope(user.id, usage_source="speech_transcribe"):
             try:
                 deadline = asyncio.timeout(_SESSION_SECONDS)
@@ -261,8 +277,7 @@ async def stream_asr(
     except HTTPException as exc:
         await _send_asr_error(websocket, "model_unavailable", exc.detail, 1008)
     except Exception as exc:
-        if model is not None:
-            _log_provider_error(model, exc)
+        _log_provider_error(model or config, exc)
         await _send_asr_error(websocket, "stream_failed", "Speech stream failed", 1011)
     finally:
         if model is not None and not model_closed:

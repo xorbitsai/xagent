@@ -2728,6 +2728,7 @@ interface SendMessageOptions {
   // before adopting a create response; normal navigation after adoption must
   // not cancel delivery of that task's first message.
   canAdoptCreatedTask?: () => boolean
+  onCreatedTask?: (taskId: number) => void
 }
 
 // Whether the current Session socket has finished attaching: its server has
@@ -7961,6 +7962,7 @@ export function AppProvider({
           if (!canAdoptCreatedTask()) return
           adopted = true
           const newTaskId = taskData.task_id
+          options?.onCreatedTask?.(newTaskId)
 
           console.log('✅ Task created successfully:', {
             taskId: newTaskId,

@@ -21,7 +21,7 @@ interface ReplyMessage {
   status?: string
 }
 
-export function VoiceConversation({ taskId, messages, busy, waiting, disabled, onSend, onInterrupt }: {
+export function VoiceConversation({ taskId, messages, busy, waiting, disabled, onSend, onInterrupt, open: controlledOpen, onOpenChange, hideTrigger = false, allowTaskAdoption = false }: {
   taskId: number | null
   messages: ReplyMessage[]
   busy: boolean
@@ -29,10 +29,16 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   disabled: boolean
   onSend: (text: string, clientMessageId: string) => Promise<void>
   onInterrupt: () => boolean | void
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  hideTrigger?: boolean
+  allowTaskAdoption?: boolean
 }) {
   const { t } = useI18n()
   const auth = useAuth()
-  const [open, setOpen] = useState(false)
+  const [internalOpen, setInternalOpen] = useState(false)
+  const open = controlledOpen ?? internalOpen
+  const setOpen = (value: boolean) => { setInternalOpen(value); onOpenChange?.(value) }
   const [models, setModels] = useState<ModelWithAccess[]>([])
   const [loading, setLoading] = useState(false)
   const [asr, setAsr] = useState("")
@@ -46,6 +52,7 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   const baseline = useRef(new Set<string>())
   const live = useRef({ messages, busy, waiting, onSend, onInterrupt })
   live.current = { messages, busy, waiting, onSend, onInterrupt }
+  const identity = useRef({ taskId, sessionId: auth.session?.sessionId, userId: auth.user?.id })
 
   const release = () => {
     generation.current += 1
@@ -56,12 +63,22 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   const fail = () => { release(); setPhase("error") }
 
   useEffect(() => {
+    const previous = identity.current
+    identity.current = { taskId, sessionId: auth.session?.sessionId, userId: auth.user?.id }
+    const sameLogin = previous.sessionId === auth.session?.sessionId && previous.userId === auth.user?.id
+    if (sameLogin && (previous.taskId === taskId || (allowTaskAdoption && previous.taskId === null && taskId !== null))) return
     end()
     setOpen(false)
-    return () => { release() }
     // A call belongs to one task and one login, including during late permission prompts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId, auth.session?.sessionId, auth.user?.id])
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => { release() }, [])
+  useEffect(() => {
+    if (!open && audio.current) end()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
 
   useEffect(() => {
     if (!open || !auth.token || audio.current) return
@@ -134,10 +151,10 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
 
   if (!auth.token) return null
   return <>
-    <Button type="button" variant="ghost" size="sm" aria-label={t("voiceConversation.open")} title={t("voiceConversation.open")} disabled={disabled} onClick={() => setOpen(true)}>
+    {!hideTrigger && <Button type="button" variant="ghost" size="sm" aria-label={t("voiceConversation.open")} title={t("voiceConversation.open")} disabled={disabled} onClick={() => setOpen(true)}>
       <Headphones className="h-4 w-4" />
       <span className="ml-2">{t("voiceConversation.open")}</span>
-    </Button>
+    </Button>}
     <Dialog open={open} onOpenChange={value => { if (!value) end(); setOpen(value) }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>

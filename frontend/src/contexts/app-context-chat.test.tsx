@@ -2667,6 +2667,7 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it.each(["response", "body", "failure", "upload"])("does not adopt or deliver a superseded draft after deferred %s", async (phase) => {
+    const onCreatedTask = vi.fn()
     let release!: (value: Response) => void
     const pending = new Promise<Response>((resolve) => { release = resolve })
     let releaseBody!: (value: unknown) => void
@@ -2684,7 +2685,7 @@ describe("AppProvider websocket message routing", () => {
       const { sendMessage } = useApp()
       send = () => sendMessage("draft A", undefined,
         phase === "upload" ? [new File(["data"], "a.txt")] : [],
-        { canAdoptCreatedTask: () => owned })
+        { canAdoptCreatedTask: () => owned, onCreatedTask })
       return null
     }
     render(<AppProvider token="token"><DraftProbe /><StateProbe /></AppProvider>)
@@ -2701,12 +2702,17 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-title")).toHaveTextContent(/^$/)
     expect(routerPushMock).not.toHaveBeenCalled()
     expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(onCreatedTask).not.toHaveBeenCalled()
     if (phase === "upload") {
       expect(apiRequestMock.mock.calls.some(([url]) => url.endsWith("/api/chat/task/create"))).toBe(false)
     }
   })
 
   it("sends selected task runtime extensions in the create request", async () => {
+    const onCreatedTask = vi.fn((id: number) => {
+      expect(id).toBe(8)
+      expect(routerPushMock).not.toHaveBeenCalled()
+    })
     let createBody: Record<string, unknown> | undefined
     apiRequestMock.mockImplementation(
       async (url: string, options?: RequestInit) => {
@@ -2737,7 +2743,7 @@ describe("AppProvider websocket message routing", () => {
       send = () => sendMessage("inspect browser", {
         clientMessageId: "turn-local-browser",
         runtimeExtensions: { local_browser: {} },
-      }, [], { canAdoptCreatedTask: () => ownsDraft })
+      }, [], { canAdoptCreatedTask: () => ownsDraft, onCreatedTask })
       return null
     }
 
@@ -2759,6 +2765,7 @@ describe("AppProvider websocket message routing", () => {
         runtime_extensions: { local_browser: {} },
       })
     )
+    expect(onCreatedTask).toHaveBeenCalledWith(8)
     expect(ownsDraft).toBe(false)
 
     await act(async () => {

@@ -5,13 +5,21 @@ for a continuous conversation in private task chat. Save an ElevenLabs
 `scribe_v2_realtime` model with the `asr` ability and an ElevenLabs speech model
 with the `tts` ability before starting.
 
-Open a private task conversation and choose **Voice mode** beside the composer.
+Choose the headphone **Voice mode** button next to the microphone on the task
+home page, or **Voice mode** above an existing private task's composer.
 Select a listening model and a speaking model, then **Start conversation**.
 Microphone permission is requested only when starting. The call shows live
 transcription and Listening, Thinking, or Speaking status; microphone mute and
 end-call are the only in-call controls. Closing the dialog, leaving the task,
 logging out, or losing the chat connection ends the call and releases resources.
 Public widget/share conversations do not enable this private voice entry.
+
+On the home page, the first utterance creates the task using the composer's
+selected model, mode, runtime and agent. Opening voice mode sends no message and
+does not clear the text draft or attach its files. The call remains active while
+the created task opens, so its first reply can be spoken without restarting the
+microphone. Navigating to another task/draft, leaving task pages or changing the
+login cancels the call and invalidates any pending creation response.
 
 Speech is submitted automatically after VAD finals and a short quiet interval;
 adjacent segments are combined and duplicate finals are ignored. Text enters

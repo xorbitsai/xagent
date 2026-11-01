@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useId, useMemo } from "react";
 import { renderFileMentionsHtml } from "./FileChip";
 import { escapeHtml } from "@/lib/html-escape";
 import { useRouter } from "next/navigation";
-import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
+import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square, Headphones } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
@@ -72,6 +72,7 @@ interface ChatInputProps {
   hideFileUpload?: boolean;
   filesDisabled?: boolean;
   voiceInputEnabled?: boolean;
+  onVoiceConversation?: (config: AgentConfig) => void;
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
@@ -154,6 +155,7 @@ export function ChatInput({
   hideFileUpload = false,
   filesDisabled = false,
   voiceInputEnabled = true,
+  onVoiceConversation,
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
@@ -897,6 +899,51 @@ export function ChatInput({
     appendFiles(droppedFiles);
   };
 
+  const executionMode = showExecutionModePicker ? pickedExecutionMode : taskConfig?.executionMode;
+  const normalizedExecutionMode = executionMode
+    ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+    : undefined;
+  const extraRuntimeExtensions = activeLocalBrowserTarget
+    ? { local_browser: { ...activeLocalBrowserTarget } }
+    : activeTaskRuntimeSelection?.runtimeExtensions;
+  const deliveryConfig = (clientMessageId?: string, requestId?: string) => {
+    const metadata = {
+      ...(agentConfig.metadata || {}),
+      ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      ...(requestId ? { request_id: requestId } : {}),
+    };
+    return {
+      ...agentConfig,
+      ...(configIsDrivenByTaskConfig ? {
+        model: displayModel,
+        smallFastModel: taskConfig?.smallFastModel,
+        visualModel: taskConfig?.visualModel,
+        compactModel: taskConfig?.compactModel,
+        executionMode: normalizedExecutionMode,
+      } : {}),
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      ...(extraRuntimeExtensions ? {
+        runtimeExtensions: { ...(agentConfig.runtimeExtensions || {}), ...extraRuntimeExtensions },
+      } : {}),
+      ...(!configIsDrivenByTaskConfig && normalizedExecutionMode ? { executionMode: normalizedExecutionMode } : {}),
+    };
+  };
+  const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
+    <Button type="button" variant="ghost" size="sm"
+      aria-label={t("voiceConversation.open")} title={t("voiceConversation.open")}
+      className="h-8 w-8 p-0 rounded-full text-muted-foreground hover:text-foreground"
+      disabled={isInputBusy || voiceInput.status !== "idle"}
+      onMouseDown={event => event.preventDefault()}
+      onClick={() => {
+        if (!hideConfig && !readOnlyConfig && !selectedAgents.length && !agentConfig.model) {
+          setShowNoModelAlert(true);
+          return;
+        }
+        onVoiceConversation(deliveryConfig());
+      }}><Headphones className="h-4 w-4" /></Button>
+  ) : null;
+
   const handleSubmit = async (e: React.SyntheticEvent) => {
     e.preventDefault();
 
@@ -913,15 +960,6 @@ export function ChatInput({
       isSubmittingRef.current = true;
       const trimmed = message.trim();
       const messageToSend = trimmed;
-      const executionMode = showExecutionModePicker
-        ? pickedExecutionMode
-        : taskConfig?.executionMode;
-      const normalizedExecutionMode = executionMode
-        ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
-        : undefined;
-      const extraRuntimeExtensions = activeLocalBrowserTarget
-        ? { local_browser: { ...activeLocalBrowserTarget } }
-        : activeTaskRuntimeSelection?.runtimeExtensions;
       const deliveryKey = JSON.stringify([
         messageToSend,
         extraRuntimeExtensions || null,
@@ -936,49 +974,8 @@ export function ChatInput({
         ? previousAttempt.clientMessageId
         : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
-      const existingMetadata = {
-        ...(agentConfig.metadata || {}),
-        ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
-      };
       const draftRequestId = draftRequestSnapshotRef.current?.requestId;
-      const metadataToSend = draftRequestId
-        ? { ...existingMetadata, request_id: draftRequestId }
-        : Object.keys(existingMetadata).length > 0
-          ? existingMetadata
-          : undefined;
-
-      const configToSend = {
-        ...agentConfig,
-        ...(configIsDrivenByTaskConfig
-          ? {
-              model: displayModel,
-              smallFastModel: taskConfig?.smallFastModel,
-              visualModel: taskConfig?.visualModel,
-              compactModel: taskConfig?.compactModel,
-              // Same live-vs-mirror reasoning as the model fields above,
-              // applied to executionMode: a falsy live value must still
-              // explicitly clear the key here rather than being skipped,
-              // or it would silently fall through to whatever stale
-              // executionMode `agentConfig` (spread below) still carries
-              // from the previous lead while its own mirroring effect
-              // hasn't caught up yet.
-              executionMode: normalizedExecutionMode,
-            }
-          : {}),
-        clientMessageId,
-        ...(metadataToSend ? { metadata: metadataToSend } : {}),
-        ...(extraRuntimeExtensions
-          ? {
-              runtimeExtensions: {
-                ...(agentConfig.runtimeExtensions || {}),
-                ...extraRuntimeExtensions,
-              },
-            }
-          : {}),
-        ...(!configIsDrivenByTaskConfig && normalizedExecutionMode
-          ? { executionMode: normalizedExecutionMode }
-          : {}),
-      };
+      const configToSend = deliveryConfig(clientMessageId, draftRequestId);
 
       const sentDraft = message;
       await onSend(messageToSend, configToSend);
@@ -1328,6 +1325,7 @@ export function ChatInput({
                   )}
                 </Button>
               )}
+              {voiceConversationButton}
               {showStopButton ? (
                 <Button
                   type="button"
@@ -1522,6 +1520,7 @@ export function ChatInput({
                     )}
                   </Button>
                 )}
+                {voiceConversationButton}
                 <Button
                   type="submit"
                   size="icon"

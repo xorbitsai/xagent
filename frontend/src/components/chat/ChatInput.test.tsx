@@ -138,6 +138,22 @@ describe("ChatInput", () => {
     vi.unstubAllGlobals()
   })
 
+  it("opens voice mode beside the composer without sending or clearing its draft", () => {
+    const openVoice = vi.fn()
+    const onSend = vi.fn()
+    const onInputChange = vi.fn()
+    const { container, rerender } = render(<ChatInput onSend={onSend}
+      onVoiceConversation={openVoice} inputValue="Keep my draft" onInputChange={onInputChange}
+      readOnlyConfig taskConfig={{ model: "selected-model", executionMode: "flash" }} />)
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    expect(openVoice).toHaveBeenCalledWith(expect.objectContaining({ model: "selected-model", executionMode: { mode: "flash" } }))
+    expect(container.querySelector("[contenteditable]")).toHaveTextContent("Keep my draft")
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onInputChange).not.toHaveBeenCalled()
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceInputEnabled={false} />)
+    expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
+  })
+
   it("requires a model when submitting generic chat", async () => {
     const onSend = vi.fn()
     const { container } = render(

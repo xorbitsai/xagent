@@ -85,6 +85,7 @@ type ChatStartScreenProps = {
   onRetryAttachment?: (file: File) => void;
   attachmentsBusy?: boolean;
   voiceInputEnabled?: boolean;
+  onVoiceConversation?: React.ComponentProps<typeof ChatInput>["onVoiceConversation"];
   taskConfig?: React.ComponentProps<typeof ChatInput>["taskConfig"];
   autoFocus?: boolean;
   inputMinHeightClass?: string;
@@ -120,6 +121,7 @@ export function ChatStartScreen({
   onRetryAttachment,
   attachmentsBusy = false,
   voiceInputEnabled = true,
+  onVoiceConversation,
   taskConfig,
   autoFocus = false,
   inputMinHeightClass,
@@ -204,6 +206,7 @@ export function ChatStartScreen({
             onRetryAttachment={onRetryAttachment}
             attachmentsBusy={attachmentsBusy}
             voiceInputEnabled={voiceInputEnabled}
+            onVoiceConversation={onVoiceConversation}
             hideFileUpload={filesBlocked}
             taskConfig={taskConfig}
             autoFocus={autoFocus}

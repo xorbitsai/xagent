@@ -221,6 +221,7 @@ export default defineConfig({
       "src/components/pages/oidc-callback.test.tsx",
       "src/components/task/task-conversation-panel.test.tsx",
       "src/components/chat/voice-conversation.test.tsx",
+      "src/contexts/task-voice-context.test.tsx",
       "src/lib/voice-conversation.test.ts",
       "src/lib/voice-audio.test.ts",
       "src/lib/voice-vad.test.ts",

@@ -1342,7 +1342,7 @@ def create_llm_from_env() -> Optional[BaseLLM]:
     openai_key = os.getenv("OPENAI_API_KEY")
     if openai_key and not is_placeholder_api_key(openai_key):
         try:
-            model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-4")
+            model_name = os.getenv("OPENAI_MODEL_NAME", "gpt-5.6-terra")
             base_url = os.getenv("OPENAI_BASE_URL")
             return attach_chat_retry_wrapper(
                 OpenAILLM(
@@ -1390,7 +1390,7 @@ def create_llm_from_env() -> Optional[BaseLLM]:
     gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if gemini_key:
         try:
-            model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.0-flash-exp")
+            model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-3.8-flash")
             base_url = os.getenv("GEMINI_BASE_URL")
             return attach_chat_retry_wrapper(
                 GeminiLLM(

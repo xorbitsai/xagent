@@ -30,6 +30,9 @@ from sqlalchemy.pool import QueuePool
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
 from tests.shared.execution_scope import register_scope_resolver
 from tests.web.services.active_interaction_read_shared import PRE_CHANGE_EQUIVALENT
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.task_lease_shared import (
     live_task_lease as live_task_lease_fixture,
 )
@@ -60,6 +63,7 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import ops_signals
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
 from xagent.web.services import task_orchestrator
@@ -2236,6 +2240,221 @@ async def test_live_resume_reads_the_interaction_row_before_injecting(
         ]
     else:
         assert unavailable_lines == []
+
+
+def _live_injection_doubles(
+    outcome: UserMessageInjectionOutcome,
+) -> tuple[MagicMock, MagicMock, MagicMock]:
+    """An agent whose live injection reports ``outcome``, plus the
+    WebSocket and background managers ``handle_task_message`` needs to
+    reach it."""
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=outcome)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+    bg_mgr.running_tasks.get.return_value = None
+    return agent, ws_manager, bg_mgr
+
+
+async def _send_live_message(
+    task_id: int,
+    owner: User,
+    *,
+    client_message_id: str,
+    agent: MagicMock,
+    ws_manager: MagicMock,
+    bg_mgr: MagicMock,
+) -> None:
+    """Drive ``handle_task_message`` with the real interaction reader and
+    the real close."""
+    with (
+        patch(
+            "xagent.web.services.agent_service_manager.get_agent_manager",
+            return_value=MagicMock(get_agent_for_task=AsyncMock(return_value=agent)),
+        ),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.services.task_execution.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.services.task_execution.execute_resume_background", AsyncMock()
+        ),
+    ):
+        await handle_task_message(
+            _make_command_reply(MagicMock()),
+            task_id,
+            {
+                "message": "Use staging",
+                "client_message_id": client_message_id,
+                "user": owner,
+                "files": [],
+            },
+        )
+
+
+def _sent_error_frames(ws_manager: MagicMock) -> list[dict]:
+    return [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "error"
+    ]
+
+
+def _interaction_and_marker(
+    db: Session, *, task_id: int, row_id: int
+) -> tuple[tuple[str, str | None, int | None], int | None]:
+    db.expire_all()
+    row = db.get(TaskInteractionRequest, row_id)
+    task = db.get(Task, task_id)
+    return (row.status, row.terminal_reason, row.active_slot), (
+        task.interaction_protocol_version
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_chat_message_with_an_active_row_is_injected_and_closes_it_under_native_shared_execution(
+    live_task_lease,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The online injection site reads and closes the active row the same
+    way in a process that can publish native rows: the message is injected
+    once, and the row it answered is closed as answered through a legacy
+    resume with the task's marker cleared. Neither the reader nor the close
+    is stubbed."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+    owner = _user(db_session, "native-close-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "native-close-runner"
+    task.run_id = "native-close-run"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+    live_task_lease(db_session, task)
+    task_id = int(task.id)
+    row_id = _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="native-close-run",
+        idempotency_key="native-close-q1",
+    )
+    agent, ws_manager, bg_mgr = _live_injection_doubles(
+        UserMessageInjectionOutcome.POSTED_FRESH
+    )
+
+    await _send_live_message(
+        task_id,
+        owner,
+        client_message_id="native-close-turn",
+        agent=agent,
+        ws_manager=ws_manager,
+        bg_mgr=bg_mgr,
+    )
+
+    assert _sent_error_frames(ws_manager) == []
+    agent.post_user_message.assert_awaited_once()
+    assert _interaction_and_marker(db_session, task_id=task_id, row_id=row_id) == (
+        ("terminated", "answered_via_legacy_resume", None),
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_row_left_by_an_unknown_injection_refuses_a_bare_resume_and_closes_on_the_next_fresh_message(
+    live_task_lease,
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    """An injection whose outcome is unknown leaves the active row and the
+    marker in place, because only a fresh post proves the message reached
+    the run. That row then refuses a resume carrying no receipt, and the
+    next message that is posted fresh closes it.
+
+    Between the refused resume and the last message the test itself writes
+    the task back to the running state the online injection site needs;
+    the task's paused state before the resume is written by the test too.
+    """
+    # The refused resume registers this process-global signal; /health's
+    # own tests assert its payload exactly, so it must not outlive the test.
+    request.addfinalizer(
+        lambda: ops_signals.clear_degradation(
+            ops_signals.INTERACTION_LEGACY_RESUME_SHIM
+        )
+    )
+    install_interaction_rollout_policy(
+        monkeypatch, mode="legacy", shared_task_execution=True
+    )
+    owner = _user(db_session, "unknown-close-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "unknown-close-runner"
+    task.run_id = "unknown-close-run"
+    task.interaction_protocol_version = 1
+    db_session.commit()
+    live_task_lease(db_session, task)
+    task_id = int(task.id)
+    row_id = _seed_active_interaction_row(
+        db_session,
+        task_id=task_id,
+        run_id="unknown-close-run",
+        idempotency_key="unknown-close-q1",
+    )
+
+    agent, ws_manager, bg_mgr = _live_injection_doubles(
+        UserMessageInjectionOutcome.OUTCOME_UNKNOWN
+    )
+    await _send_live_message(
+        task_id,
+        owner,
+        client_message_id="unknown-close-turn-1",
+        agent=agent,
+        ws_manager=ws_manager,
+        bg_mgr=bg_mgr,
+    )
+    agent.post_user_message.assert_awaited_once()
+    assert _interaction_and_marker(db_session, task_id=task_id, row_id=row_id) == (
+        ("active", None, 1),
+        1,
+    )
+
+    db_session.get(Task, task_id).status = TaskStatus.PAUSED
+    db_session.commit()
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        result = await command_execution_service.resume_task(
+            _make_command_reply(MagicMock()),
+            task_id,
+            {"user": SimpleNamespace(id=int(owner.id), is_admin=False)},
+        )
+    assert result.outcome is command_execution_service.ResumeCommandOutcome.REJECTED
+    assert result.reason_code == "interaction_pending"
+    assert _interaction_and_marker(db_session, task_id=task_id, row_id=row_id) == (
+        ("active", None, 1),
+        1,
+    )
+
+    db_session.get(Task, task_id).status = TaskStatus.RUNNING
+    db_session.commit()
+    agent, ws_manager, bg_mgr = _live_injection_doubles(
+        UserMessageInjectionOutcome.POSTED_FRESH
+    )
+    await _send_live_message(
+        task_id,
+        owner,
+        client_message_id="unknown-close-turn-2",
+        agent=agent,
+        ws_manager=ws_manager,
+        bg_mgr=bg_mgr,
+    )
+    agent.post_user_message.assert_awaited_once()
+    assert _interaction_and_marker(db_session, task_id=task_id, row_id=row_id) == (
+        ("terminated", "answered_via_legacy_resume", None),
+        None,
+    )
 
 
 @pytest.mark.asyncio

@@ -26,7 +26,7 @@ unconditional clear would erase a marker that is still correct for a
 question that is still active.
 
 A fourth WebSocket exit path does not clear the marker at all:
-``_settle_resumed_task_lease`` (``websocket.py``) settles a cancelled or
+``_settle_resumed_task_lease`` (``task_execution.py``) settles a cancelled or
 failed resume by way of ``settle_task_lease_isolated`` ->
 ``fail_and_release_task_lease_no_commit``, neither of which touches
 ``interaction_protocol_version`` or ``task_interaction_requests``. This is
@@ -38,7 +38,9 @@ readers filter on ``status`` before ever consulting it.
 
 The two WebSocket sites and the A2A and v1 reply sites do not give this
 close the same atomicity guarantee. At both WebSocket sites
-(``websocket.py``), ``close_legacy_resume_interaction_sync`` opens its own
+(``handle_task_message`` in ``task_command_execution.py`` and
+``execute_resume_background`` in ``task_execution.py``),
+``close_legacy_resume_interaction_sync`` opens its own
 short transaction only after the message write has already committed --
 the close is a best-effort step that follows the message write, not part
 of it. If that separate transaction fails, both call sites only log the
@@ -369,19 +371,16 @@ def active_interaction_id_sync(task_id: int) -> ActiveInteractionRead:
     retire-the-wrong-row bug this function exists to prevent, so an
     unreadable id must never widen what the close matches.
 
-    At the resume command seam's refusal gate (``websocket.py``), all three
-    states are handled on their own branch, and today
-    ``ActiveInteractionUnavailable`` takes the same action as
-    ``ActiveInteractionAbsent``: the resume proceeds. That is not the two
-    being interchangeable -- it is what the marker gate makes true right
-    now. Nothing in ``src/`` writes ``tasks.interaction_protocol_version``
-    to anything but ``NULL``, so a read that could not be made cannot be
-    hiding a live native interaction row, and refusing on it would cost a
-    refused resume on tasks that provably carry no question. The change
-    that first writes that marker to ``1`` is the one that turns this
-    gate's ``ActiveInteractionUnavailable`` branch into a refusal; the
-    branch is already separate so that change edits one branch's action
-    and touches neither of the other two.
+    At the resume command seam's refusal gate (``resume_task`` in
+    ``task_command_execution.py``), each of the three states has its own
+    branch. ``ActiveInteractionUnavailable`` is not treated as
+    ``ActiveInteractionAbsent`` there: a read that could not be made may be
+    hiding a live native row. The gate refuses the resume on it only when
+    this process's frozen rollout mode is ``native`` and it runs shared
+    task execution, the only configuration in which native rows can be
+    published; in every other configuration the resume proceeds, as it does
+    on ``ActiveInteractionAbsent``. Refusing in every configuration would
+    refuse resumes on deployments that never publish a native row.
 
     Two branches resolve to ``ActiveInteractionAbsent`` before the row
     lookup ever runs, and both mean the same thing as an empty lookup, not
@@ -404,8 +403,8 @@ def active_interaction_id_sync(task_id: int) -> ActiveInteractionRead:
     write ``NULL``, so the marker is NULL for every task and this branch
     returns ``ActiveInteractionAbsent()`` before anything below it runs.
 
-    This is also the resume command seam's reader (``websocket.py``'s
-    refusal gate for a resume whose payload cannot prove it answered the
+    This is also the resume command seam's reader (the refusal gate in
+    ``resume_task``, for a resume whose payload cannot prove it answered the
     active question). That seam used to carry a byte-identical copy of the
     query; one reader is what keeps the close, the refusal gate and the
     read surface from drifting into three notions of "the live row".

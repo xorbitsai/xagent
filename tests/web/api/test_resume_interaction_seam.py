@@ -1,13 +1,13 @@
-"""The compatibility seam routing ``_handle_resume_task_unserialized``
-through the interaction lifecycle service: a task that still has an active
-native interaction row must refuse a resume that does not carry the
-receipt ``respond()`` stages, on both of this handler's two resume paths
-(the ``supports_live_control`` branch and the bare ``resume_execution``
-fallback) -- see ``active_interaction_id_sync``'s own docstring in
+"""The compatibility seam routing ``resume_task`` through the interaction
+lifecycle service: a task that still has an active native interaction row
+must refuse a resume that does not carry the receipt ``respond()`` stages,
+on both of this handler's two resume paths (the ``supports_live_control``
+branch and the bare ``resume_execution`` fallback) -- see
+``active_interaction_id_sync``'s own docstring in
 ``task_interaction_close.py`` for the shared predicate this seam keys off
 (including the ``tasks.interaction_protocol_version`` marker gate ahead of
-it), and that function's call site in ``websocket.py`` for why the check
-runs before ``agent_service`` is built.
+it), and that function's call site in ``task_command_execution.py`` for why
+the check runs before ``agent_service`` is built.
 
 Mocking follows ``test_pause_resume_offturn_build_workspace.py``'s
 established shape: a real ``AgentServiceManager``/``TaskSetupSnapshot``
@@ -32,6 +32,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from tests.shared.async_waits import DB_PROGRESS_TIMEOUT
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
     make_task,
@@ -44,6 +47,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services import interaction_rollout as ir
 from xagent.web.services import ops_signals
 from xagent.web.services import task_command_execution as command_execution_service
 from xagent.web.services import task_execution as task_execution_service
@@ -60,6 +64,31 @@ from xagent.web.services.task_setup_snapshot import (
 
 OWNER_ID = 7
 RUN_ID = "run-a"
+
+# ``None`` is a process that never ran the startup validator; the tuples are
+# (mode, shared task execution) as validate_interaction_rollout_at_startup()
+# freezes them. A branch that reads the policy raises on ``None``.
+_EVERY_ROLLOUT_STATE = [
+    None,
+    ("legacy", True),
+    ("legacy", False),
+    ("read", True),
+    ("read", False),
+    ("native", True),
+    ("native", False),
+]
+
+
+def _install_rollout_state(
+    monkeypatch: pytest.MonkeyPatch, state: tuple[str, bool] | None
+) -> None:
+    if state is None:
+        monkeypatch.setattr(ir, "_policy", None)
+    else:
+        mode, shared_task_execution = state
+        install_interaction_rollout_policy(
+            monkeypatch, mode=mode, shared_task_execution=shared_task_execution
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -191,8 +220,12 @@ def _connection_manager() -> MagicMock:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rollout_state", _EVERY_ROLLOUT_STATE)
 async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
-    monkeypatch: pytest.MonkeyPatch, _session_factory, _seeded_task: int
+    monkeypatch: pytest.MonkeyPatch,
+    _session_factory,
+    _seeded_task: int,
+    rollout_state: tuple[str, bool] | None,
 ) -> None:
     """Neither resume path may run when an active native interaction row
     exists and the incoming command carries no receipt: this asserts zero
@@ -200,6 +233,7 @@ async def test_legacy_resume_without_a_receipt_is_refused_with_an_active_row(
     ``supports_live_control`` path (agent_service reports
     ``supports_live_control() -> True``)."""
 
+    _install_rollout_state(monkeypatch, rollout_state)
     import xagent.web.models.database as database_module
 
     monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
@@ -353,8 +387,12 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("rollout_state", _EVERY_ROLLOUT_STATE)
 async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
-    monkeypatch: pytest.MonkeyPatch, _session_factory, _seeded_task: int
+    monkeypatch: pytest.MonkeyPatch,
+    _session_factory,
+    _seeded_task: int,
+    rollout_state: tuple[str, bool] | None,
 ) -> None:
     """The refusal gate reads through active_interaction_id_sync, which
     stops at a NULL tasks.interaction_protocol_version before it queries
@@ -368,6 +406,7 @@ async def test_legacy_resume_is_not_refused_when_the_task_marker_is_null(
     change that wires the first writer has to write it -- see the marker's
     own ownership comment on Task.interaction_protocol_version."""
 
+    _install_rollout_state(monkeypatch, rollout_state)
     import xagent.web.models.database as database_module
 
     monkeypatch.setattr(database_module, "_SessionLocal", _session_factory)
@@ -830,49 +869,14 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
     assert resume_scheduled.is_set()
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("reason", sorted(ACTIVE_INTERACTION_UNAVAILABLE_REASONS))
-async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-    _seeded_task: int,
-    reason: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """``ActiveInteractionUnavailable`` takes its own branch at this gate,
-    distinct from ``ActiveInteractionAbsent``, but today's action on that
-    branch is the same as ``ActiveInteractionAbsent``'s: the resume
-    proceeds. Nothing in ``src/`` writes
-    ``tasks.interaction_protocol_version`` to anything but ``NULL``, so a
-    read that could not be made cannot be hiding a live native interaction
-    row -- refusing here would only cost a refused resume on tasks that
-    provably carry no question. Turning this branch into a refusal is the
-    job of the change that first writes that marker to ``1``; that change
-    edits this one branch's action, and this test is what will need to
-    flip when it does.
+_UNVERIFIABLE_REPLY = (
+    "We couldn't check this task's pending questions; please try again."
+)
 
-    Patches ``active_interaction_id_sync`` directly rather than seeding a
-    real row and breaking the database under it: the production code path
-    this exercises is entirely on the caller's side of that function (the
-    three-way branch and what each arm does), not inside the function
-    itself -- its own failure branches are pinned in
-    tests/web/services/test_task_interaction_close.py.
 
-    Parametrized over the whole reason vocabulary
-    (``ACTIVE_INTERACTION_UNAVAILABLE_REASONS``) rather than one word:
-    this gate must not start keying on which reason an unavailable read
-    carries, and a reason word added later gains its cell here without
-    anyone remembering to add one. The log line this branch emits is
-    asserted too -- it is the only trace this arm leaves, since the gate's
-    action here is to do nothing.
-    """
-
-    monkeypatch.setattr(
-        command_execution_service,
-        "active_interaction_id_sync",
-        lambda task_id: ActiveInteractionUnavailable(reason),
-    )
-
-    snapshot = _snapshot(task_id=_seeded_task)
+def _unavailable_read_doubles() -> SimpleNamespace:
+    """The doubles ``_resume_with_unavailable_read`` patches in, built
+    first so a test can still inspect them when ``resume_task`` raises."""
     connection_manager = _connection_manager()
     background_manager = MagicMock()
     background_manager.running_tasks = {}
@@ -885,11 +889,49 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
     )
     agent_service = MagicMock()
     agent_service.supports_live_control = MagicMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    return SimpleNamespace(
+        connection_manager=connection_manager,
+        background_manager=background_manager,
+        transition=transition,
+        agent_manager=agent_manager,
+        resume_scheduled=asyncio.Event(),
+    )
 
-    resume_scheduled = asyncio.Event()
+
+async def _resume_with_unavailable_read(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    doubles: SimpleNamespace,
+    *,
+    task_id: int,
+    reason: str,
+):
+    """Drive ``resume_task`` with ``active_interaction_id_sync`` reporting
+    ``ActiveInteractionUnavailable(reason)``, everything else around the
+    seam answering as it does for a resumable waiting task, and return its
+    result.
+
+    Patches ``active_interaction_id_sync`` directly rather than seeding a
+    real row and breaking the database under it: what is exercised here is
+    entirely on the caller's side of that function (the three-way branch
+    and what each arm does); its own failure branches are pinned in
+    tests/web/services/test_task_interaction_close.py.
+
+    A scheduled resume is waited on, before the patches are lifted, until
+    the stubbed background resume starts.
+    """
+
+    monkeypatch.setattr(
+        command_execution_service,
+        "active_interaction_id_sync",
+        lambda task_id: ActiveInteractionUnavailable(reason),
+    )
+    snapshot = _snapshot(task_id=task_id)
 
     async def _stub_execute_resume_background(**kwargs: object) -> None:
-        resume_scheduled.set()
+        doubles.resume_scheduled.set()
 
     from xagent.web.services import task_setup_snapshot as snapshot_module
 
@@ -899,15 +941,21 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
                 snapshot_module, "load_task_setup_snapshot_sync", return_value=snapshot
             )
         )
-        stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
+        stack.enter_context(
+            patch.object(websocket_api, "manager", doubles.connection_manager)
+        )
         stack.enter_context(
             patch.object(
-                websocket_api.task_execution_controller, "transition", new=transition
+                websocket_api.task_execution_controller,
+                "transition",
+                new=doubles.transition,
             )
         )
         stack.enter_context(
             patch.object(
-                task_execution_service, "background_task_manager", background_manager
+                task_execution_service,
+                "background_task_manager",
+                doubles.background_manager,
             )
         )
         # The handler asks the DB whether another process still holds a live
@@ -927,11 +975,11 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
                 side_effect=_stub_execute_resume_background,
             )
         )
-        agent_manager = MagicMock()
-        agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
         stack.enter_context(
             patch.object(
-                agent_runtime_service, "get_agent_manager", lambda: agent_manager
+                agent_runtime_service,
+                "get_agent_manager",
+                lambda: doubles.agent_manager,
             )
         )
         stack.enter_context(
@@ -940,25 +988,88 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
 
         result = await command_execution_service.resume_task(
             _make_command_reply(MagicMock()),
-            _seeded_task,
+            task_id,
             {"user": SimpleNamespace(id=OWNER_ID, is_admin=False)},
         )
+        if result.outcome is command_execution_service.ResumeCommandOutcome.SCHEDULED:
+            await asyncio.wait_for(
+                doubles.resume_scheduled.wait(), timeout=DB_PROGRESS_TIMEOUT
+            )
+    return result
 
-        agent_manager.get_agent_for_task.assert_awaited()
-        await asyncio.wait_for(resume_scheduled.wait(), timeout=DB_PROGRESS_TIMEOUT)
 
-    assert resume_scheduled.is_set()
-    transition.assert_awaited()
-    errors = [
+def _sent_errors(connection_manager: MagicMock) -> list[dict]:
+    return [
         call.args[0]
         for call in connection_manager.send_personal_message.await_args_list
         if isinstance(call.args[0], dict) and call.args[0].get("type") == "error"
     ]
-    assert errors == []
+
+
+def _seam_records(caplog: pytest.LogCaptureFixture, level: int) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == command_execution_service.__name__ and record.levelno == level
+    ]
+
+
+# Every combination of the frozen policy's two fields except the one that
+# can publish native rows: mode native together with shared task execution.
+_PROCEEDING_POLICIES = [
+    ("legacy", True),
+    ("legacy", False),
+    ("read", True),
+    ("read", False),
+    ("native", False),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted(ACTIVE_INTERACTION_UNAVAILABLE_REASONS))
+@pytest.mark.parametrize(("mode", "shared_task_execution"), _PROCEEDING_POLICIES)
+async def test_unavailable_read_lets_the_resume_proceed_outside_native_shared_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    _seeded_task: int,
+    mode: str,
+    shared_task_execution: bool,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An active interaction read that could not be made only refuses a
+    resume in a process that can publish native rows. Everywhere else the
+    resume proceeds exactly as it does when the read found no row, and the
+    one trace this arm leaves is its info line.
+
+    Parametrized over the whole reason vocabulary
+    (``ACTIVE_INTERACTION_UNAVAILABLE_REASONS``) rather than one word:
+    this gate must not start keying on which reason an unavailable read
+    carries, and a reason word added later gains its cell here without
+    anyone remembering to add one.
+    """
+
+    install_interaction_rollout_policy(
+        monkeypatch, mode=mode, shared_task_execution=shared_task_execution
+    )
+
+    seam = _unavailable_read_doubles()
+    result = await _resume_with_unavailable_read(
+        monkeypatch,
+        caplog,
+        seam,
+        task_id=_seeded_task,
+        reason=reason,
+    )
+
+    seam.agent_manager.get_agent_for_task.assert_awaited()
+    assert seam.resume_scheduled.is_set()
+    seam.transition.assert_awaited()
+    assert _sent_errors(seam.connection_manager) == []
     assert (
         ops_signals.INTERACTION_LEGACY_RESUME_SHIM
         not in ops_signals.active_degradations()
     )
+    assert ops_signals.active_degradations() == {}
     assert result.outcome is not command_execution_service.ResumeCommandOutcome.REJECTED
     assert [
         record.getMessage()
@@ -970,19 +1081,112 @@ async def test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", sorted(ACTIVE_INTERACTION_UNAVAILABLE_REASONS))
+async def test_unavailable_read_refuses_the_resume_under_native_shared_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    _seeded_task: int,
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """In a process that can publish native rows, a read that could not be
+    made may be hiding one, so a manual resume is refused before any agent
+    is built or any transition runs: one error reply, the
+    ``interaction_unverifiable`` reason code, one warning line, and no
+    degradation signal."""
+
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+
+    seam = _unavailable_read_doubles()
+    result = await _resume_with_unavailable_read(
+        monkeypatch,
+        caplog,
+        seam,
+        task_id=_seeded_task,
+        reason=reason,
+    )
+
+    assert result == command_execution_service.ResumeCommandResult(
+        command_execution_service.ResumeCommandOutcome.REJECTED,
+        _UNVERIFIABLE_REPLY,
+        reason_code="interaction_unverifiable",
+    )
+    assert _sent_errors(seam.connection_manager) == [
+        {
+            "type": "error",
+            "message": _UNVERIFIABLE_REPLY,
+            "task": {
+                "id": _seeded_task,
+                "run_id": RUN_ID,
+                "state_version": 1,
+                "control_state": "waiting_for_user",
+                "status": "waiting_for_user",
+            },
+        }
+    ]
+    seam.agent_manager.get_agent_for_task.assert_not_called()
+    seam.transition.assert_not_called()
+    seam.background_manager.try_reserve_resume.assert_not_called()
+    assert _seam_records(caplog, logging.WARNING) == [
+        f"resume refused for task_id={_seeded_task} run_id={RUN_ID}: the active "
+        f"interaction read was unavailable (reason={reason})"
+    ]
+    assert _seam_records(caplog, logging.INFO) == []
+    assert ops_signals.active_degradations() == {}
+
+
+@pytest.mark.asyncio
+async def test_unavailable_read_raises_when_the_rollout_policy_was_never_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+    _seeded_task: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The unavailable arm reads the frozen policy, and a process that
+    never ran the startup validator is a programming error: the
+    ``RuntimeError`` reaches the caller rather than being folded into
+    either a refusal or a proceed, and the client gets only the generic
+    processing-failed reply."""
+
+    monkeypatch.setattr(ir, "_policy", None)
+    seam = _unavailable_read_doubles()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _resume_with_unavailable_read(
+            monkeypatch,
+            caplog,
+            seam,
+            task_id=_seeded_task,
+            reason="lookup_failed",
+        )
+
+    assert str(exc_info.value) == (
+        "the interaction rollout policy singleton was read before "
+        "validate_interaction_rollout_at_startup() initialized it."
+    )
+    assert _sent_errors(seam.connection_manager) == [
+        {
+            "type": "error",
+            "error_code": "message_processing_failed",
+            "message": "The message could not be processed. Please try again.",
+        }
+    ]
+    seam.transition.assert_not_called()
+
+
 # active_interaction_id_sync's own four branches (no database configured
 # yet, a session that fails to open, the interaction table not existing
 # yet, the row lookup itself raising) used to be pinned here, against
 # websocket.py's own _active_native_interaction_id_sync, back when all
 # four were fail-open. That function is gone -- the seam now reads through
 # the same task_interaction_close.active_interaction_id_sync the four
-# legacy-resume injection sites use, and the fail-open behavior of all four
-# branches is unchanged: what changed is only that the reader now reports
-# them as one of three states instead of collapsing all of them into the
-# same None, and this gate handles each state on its own branch (see
-# test_legacy_resume_is_not_refused_when_the_active_interaction_read_is_
-# unavailable above for the ActiveInteractionUnavailable branch, and
-# test_legacy_resume_is_not_refused_when_the_task_marker_is_null above for
-# ActiveInteractionAbsent). All four branches of the read itself are pinned
+# legacy-resume injection sites use, and that reader's four branches are
+# unchanged: what changed is only that the reader now reports them as one
+# of three states instead of collapsing all of them into the same None,
+# and this gate handles each state on its own branch (see the three
+# test_unavailable_read_* tests above for the ActiveInteractionUnavailable
+# branch, and test_legacy_resume_is_not_refused_when_the_task_marker_is_null
+# above for ActiveInteractionAbsent). All four branches of the read itself are pinned
 # in tests/web/services/test_task_interaction_close.py, alongside the
 # marker gate that reader adds ahead of them.

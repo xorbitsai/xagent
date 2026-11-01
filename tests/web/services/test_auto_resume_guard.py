@@ -8,6 +8,7 @@ Runs on SQLite and, when ``XAGENT_TEST_POSTGRES_URL`` is set, PostgreSQL.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import timedelta
 from types import SimpleNamespace
@@ -18,6 +19,9 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
@@ -46,7 +50,10 @@ from xagent.web.services.task_command_execution import (
 )
 from xagent.web.services.task_command_transport import dispatch_one_task_command
 from xagent.web.services.task_execution import ResumeReservationOutcome
-from xagent.web.services.task_interaction_close import ActiveInteractionAbsent
+from xagent.web.services.task_interaction_close import (
+    ActiveInteractionAbsent,
+    ActiveInteractionUnavailable,
+)
 from xagent.web.services.task_lease_service import utc_now
 
 engine = engine_fixture
@@ -985,6 +992,57 @@ async def test_resume_task_skips_an_unanswered_question_without_an_error(
     assert result.reason_code == "interaction_pending"
     reply.assert_not_awaited()
     handler.manager.try_reserve_resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "shared_task_execution"),
+    [
+        ("legacy", True),
+        ("legacy", False),
+        ("read", True),
+        ("read", False),
+        ("native", True),
+        ("native", False),
+    ],
+)
+async def test_resume_task_skips_an_unverifiable_interaction_read_without_an_error(
+    factory, handler, monkeypatch, caplog, mode, shared_task_execution
+):
+    """An automatic resume whose active interaction read could not be made
+    is skipped, not refused, in a process that can publish native rows, so
+    housekeeping schedules it again; everywhere else it proceeds. Neither
+    outcome sends a reply."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode=mode, shared_task_execution=shared_task_execution
+    )
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+
+    with caplog.at_level(logging.INFO, logger=commands.__name__):
+        result, reply = await _resume(factory, task_id)
+
+    reply.assert_not_awaited()
+    skipped_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == commands.__name__
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("auto resume skipped")
+    ]
+    if (mode, shared_task_execution) == ("native", True):
+        assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+        assert result.reason_code == "interaction_unverifiable"
+        handler.manager.try_reserve_resume.assert_not_called()
+        assert skipped_lines == [
+            f"auto resume skipped task_id={task_id} run_id={RUN} "
+            "why=interaction_unverifiable component=auto-resume"
+        ]
+    else:
+        assert result.outcome is ResumeCommandOutcome.SCHEDULED
+        assert skipped_lines == []
 
 
 @pytest.mark.asyncio

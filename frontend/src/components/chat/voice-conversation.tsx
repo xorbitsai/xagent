@@ -47,6 +47,7 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   const modelReason = voiceModelReason(models)
   const [phase, setPhase] = useState<VoicePhase>("idle")
   const [caption, setCaption] = useState("")
+  const [sendFailure, setSendFailure] = useState("")
   const [muted, setMuted] = useState(false)
   const [serverVadOnly, setServerVadOnly] = useState(false)
   const audio = useRef<VoiceAudio | null>(null)
@@ -62,7 +63,7 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
     turns.current?.stop(); turns.current = null
     audio.current?.close(); audio.current = null
   }
-  const end = () => { release(); setPhase("idle"); setMuted(false); setCaption(""); setServerVadOnly(false) }
+  const end = () => { release(); setPhase("idle"); setMuted(false); setCaption(""); setSendFailure(""); setServerVadOnly(false) }
   const fail = () => { release(); setPhase("error") }
 
   useEffect(() => {
@@ -122,7 +123,14 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
     turns.current = new VoiceTurns({
       send: async (text) => {
         baseline.current = new Set(live.current.messages.map(message => message.id))
-        await live.current.onSend(text, generateClientMessageId())
+        try {
+          await live.current.onSend(text, generateClientMessageId())
+        } catch (error) {
+          // The normal task-delivery path supplies a client-safe API error.
+          // Keep its explanation separate from microphone/ASR failures.
+          if (current()) setSendFailure(error instanceof Error ? error.message : t("voiceConversation.sendFailed"))
+          throw error
+        }
       },
       interrupt: () => live.current.onInterrupt(),
       stopAudio: () => call.stopAudio(),
@@ -151,7 +159,8 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
           <div aria-hidden="true" className={`flex h-28 w-28 items-center justify-center rounded-full bg-primary/10 text-primary ${active && !muted ? "motion-safe:animate-pulse" : ""}`}>
             {muted ? <MicOff className="h-10 w-10" /> : <Headphones className="h-10 w-10" />}
           </div>
-          <p role="status" className="text-sm font-medium">{t(`voiceConversation.states.${phase}`)}</p>
+          <p role="status" className="text-sm font-medium">{t(phase === "error" && sendFailure ? "voiceConversation.sendFailed" : `voiceConversation.states.${phase}`)}</p>
+          {phase === "error" && sendFailure && <p role="alert" className="text-center text-sm text-muted-foreground">{sendFailure}</p>}
           {serverVadOnly && <p className="text-center text-xs text-muted-foreground">{t("voiceConversation.serverVadOnly")}</p>}
           <p aria-live="polite" className="min-h-12 max-h-40 overflow-auto text-center text-sm text-muted-foreground">{caption}</p>
         </div>

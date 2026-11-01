@@ -142,6 +142,7 @@ const en = {
     unmute: "Unmute microphone",
     transcriptionModel: "Listening model",
     speechModel: "Speaking model",
+    sendFailed: "Your message could not be sent. Check the selected chat model and try again.",
     modelsRequired: "Add a live transcription model and a speech synthesis model in Models to use voice mode.",
     checkingModels: "Checking voice models…",
     modelsUnavailable: "Voice models could not be checked. Refresh the page and try again.",

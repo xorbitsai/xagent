@@ -142,6 +142,7 @@ const zh = {
     unmute: "打开麦克风",
     transcriptionModel: "语音识别模型",
     speechModel: "语音合成模型",
+    sendFailed: "消息发送失败，请检查当前选择的聊天模型后重试。",
     modelsRequired: "请先在模型设置中添加支持实时转写和语音合成的模型。",
     checkingModels: "正在检查语音模型…",
     modelsUnavailable: "无法检查语音模型，请刷新页面后重试。",

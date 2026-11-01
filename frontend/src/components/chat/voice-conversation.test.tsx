@@ -78,6 +78,30 @@ describe("voice conversation entry and call lifecycle", () => {
     preferences.asr_model_id = "live"
   })
 
+  it("shows a rejected task's explanation instead of blaming the microphone", async () => {
+    const message = "Your Auto model configuration has no usable candidate models. Review your Auto model settings."
+    const onSend = vi.fn().mockRejectedValue(new Error(message))
+    render(<VoiceConversation taskId={null} messages={[]} busy={false} waiting={false} disabled={false} onSend={onSend} onInterrupt={vi.fn()} open />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    await act(async () => {
+      calls[0].options.activity(true)
+      calls[0].options.transcript("final", "Hello. Can you hear me?", 0)
+      calls[0].options.activity(false)
+      await new Promise(resolve => setTimeout(resolve, 320))
+    })
+    expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.sendFailed")
+    expect(screen.getByRole("alert")).toHaveTextContent(message)
+    expect(screen.queryByText("voiceConversation.states.error")).not.toBeInTheDocument()
+    expect(onSend).toHaveBeenCalledTimes(1)
+    expect(calls[0].close).toHaveBeenCalledOnce()
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.states.listening"))
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    expect(onSend).toHaveBeenCalledTimes(1)
+  })
+
   it("ends the old call on task navigation and ignores late speech callbacks", async () => {
     const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: vi.fn() }
     const view = render(<VoiceConversation {...props} />)

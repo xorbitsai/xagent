@@ -3734,6 +3734,8 @@ def test_apply_macro_reports_a_safe_update_conflict(monkeypatch):
     assert result["status"] == "error"
     assert "HTTP 409" in result["message"]
     assert "Safe update timestamp" in result["message"]
+    assert "nothing was saved" in result["message"]
+    assert "preview again" in result["message"]
 
 
 @pytest.mark.parametrize(

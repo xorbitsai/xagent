@@ -25,7 +25,8 @@ from ..public_elevenlabs import (
     close_public_elevenlabs_http_client,
     create_public_elevenlabs_client,
 )
-from .base import ASRResult, ASRSegment, BaseASR
+from .base import ASRResult, ASRSegment, ASRStreamSession, BaseASR
+from .elevenlabs_stream import REALTIME_ASR_MODEL, ElevenLabsASRStream
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,42 @@ class ElevenLabsASR(BaseASR):
         ).rstrip("/")
         self.language = language
         self._async_client: Any = None
+        self._streams: set[ElevenLabsASRStream] = set()
+        self._stream_generation = 0
+
+    @property
+    def supports_streaming(self) -> bool:
+        return self.model == REALTIME_ASR_MODEL
+
+    @property
+    def supports_vad(self) -> bool:
+        return self.supports_streaming
+
+    async def open_stream(
+        self,
+        *,
+        language: Optional[str] = None,
+        format: str = "pcm",
+        sample_rate: int = 16000,
+        vad: bool = True,
+        **kwargs: Any,
+    ) -> ASRStreamSession:
+        if not self.supports_streaming:
+            raise ValueError("Live ASR requires the scribe_v2_realtime model")
+        generation = self._stream_generation
+        stream = await ElevenLabsASRStream.connect(
+            self,
+            language=language or self.language,
+            format=format,
+            sample_rate=sample_rate,
+            vad=vad,
+            **kwargs,
+        )
+        if generation != self._stream_generation:
+            await stream.aclose()
+            raise RuntimeError("ASR model was closed while opening the stream")
+        self._streams.add(stream)
+        return stream
 
     @staticmethod
     def _create_async_client(
@@ -205,9 +242,16 @@ class ElevenLabsASR(BaseASR):
 
     async def aclose(self) -> None:
         """Close any cached ElevenLabs SDK clients."""
+        self._stream_generation += 1
         async_client = self._async_client
         self._async_client = None
-        await self._close_client(async_client)
+        try:
+            if self._streams:
+                await asyncio.gather(
+                    *(stream.aclose() for stream in tuple(self._streams))
+                )
+        finally:
+            await self._close_client(async_client)
 
     async def __aenter__(self) -> "ElevenLabsASR":
         return self
@@ -286,6 +330,11 @@ class ElevenLabsASR(BaseASR):
         **kwargs: Any,
     ) -> Union[str, ASRResult]:
         """Transcribe audio to text."""
+
+        if self.supports_streaming:
+            raise ValueError(
+                "scribe_v2_realtime accepts live audio through open_stream()"
+            )
 
         request_kwargs = self._build_request_kwargs(
             language=language,
@@ -449,6 +498,8 @@ class ElevenLabsASR(BaseASR):
 
     @property
     def abilities(self) -> list[str]:
+        if self.supports_streaming:
+            return ["asr"]
         return [
             "asr",
             "timestamps",

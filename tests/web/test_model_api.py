@@ -279,6 +279,59 @@ def _platform_config(model_id: str, category: str = "llm"):
     return ChatModelConfig(**common, model_name="gpt-4", abilities=["chat"])
 
 
+@pytest.mark.parametrize("provider", ["xinference", "elevenlabs"])
+def test_speech_defaults_survive_create_read_update_and_clear(
+    test_db, regular_headers, sample_speech_model_data, provider
+):
+    settings = {
+        "language": "en",
+        "voice": "configured-voice",
+        "format": "pcm",
+        "sample_rate": 16000,
+    }
+    payload = {**sample_speech_model_data, "model_provider": provider, **settings}
+    created = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert created.status_code == 200, created.text
+    saved = created.json()
+    assert {key: saved[key] for key in settings} == settings
+    model_id = saved["model_id"]
+    detail_url = f"/api/models/by-id/{model_id}"
+
+    detail = client.get(detail_url, headers=regular_headers)
+    assert detail.status_code == 200
+    assert {key: detail.json()[key] for key in settings} == settings
+    listed = client.get("/api/models/", headers=regular_headers)
+    assert listed.status_code == 200
+    listed_model = next(item for item in listed.json() if item["model_id"] == model_id)
+    assert {key: listed_model[key] for key in settings} == settings
+
+    db = next(get_db())
+    try:
+        config = CoreStorage(db, DBModel).load(model_id)
+        assert {key: getattr(config, key) for key in settings} == settings
+    finally:
+        db.close()
+
+    changed = {"voice": "updated-voice", "sample_rate": 24000}
+    updated = client.put(detail_url, json=changed, headers=regular_headers)
+    assert updated.status_code == 200, updated.text
+    expected = {**settings, **changed}
+    refreshed = client.get("/api/models/", headers=regular_headers)
+    refreshed_model = next(
+        item for item in refreshed.json() if item["model_id"] == model_id
+    )
+    assert {key: refreshed_model[key] for key in expected} == expected
+
+    cleared = client.put(
+        detail_url, json={key: None for key in settings}, headers=regular_headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    reread = client.get(detail_url, headers=regular_headers)
+    assert {key: reread.json()[key] for key in settings} == {
+        key: None for key in settings
+    }
+
+
 @pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
 def test_user_creation_rejects_platform_namespace(
     test_db, regular_headers, sample_model_data, path
@@ -293,6 +346,95 @@ def test_user_creation_rejects_platform_namespace(
         assert db.query(DBModel).filter_by(model_id="platform/forged").first() is None
     finally:
         db.close()
+
+
+@pytest.fixture
+def realtime_asr_record(regular_headers, sample_speech_model_data):
+    payload = {
+        **sample_speech_model_data,
+        "model_id": "live-only-asr",
+        "model_name": "scribe_v2_realtime",
+        "model_provider": "elevenlabs",
+        "abilities": ["asr"],
+    }
+    response = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_file_transcription_rejects_live_only_asr_before_provider_call(
+    realtime_asr_record, regular_headers, explicit
+):
+    with patch("xagent.core.model.asr.adapter.get_asr_model_instance") as factory:
+        response = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+            data={"model_id": realtime_asr_record["model_id"]} if explicit else {},
+        )
+    assert response.status_code == (400 if explicit else 404), response.text
+    factory.assert_not_called()
+
+
+def test_live_only_asr_cannot_become_file_asr_default(
+    realtime_asr_record, regular_headers
+):
+    response = client.post(
+        "/api/models/user-default",
+        headers=regular_headers,
+        json={"model_id": realtime_asr_record["id"], "config_type": "asr"},
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("legacy_default", [False, True])
+def test_file_asr_resolution_skips_realtime_candidates_and_legacy_defaults(
+    realtime_asr_record,
+    regular_user,
+    regular_headers,
+    sample_speech_model_data,
+    legacy_default,
+):
+    response = client.post(
+        "/api/models/",
+        headers=regular_headers,
+        json={
+            **sample_speech_model_data,
+            "model_id": "batch-asr",
+            "model_name": "scribe_v2",
+            "model_provider": "elevenlabs",
+            "abilities": ["asr"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    if legacy_default:
+        db = next(get_db())
+        try:
+            db.add(
+                UserDefaultModel(
+                    user_id=regular_user["id"],
+                    model_id=realtime_asr_record["id"],
+                    config_type="asr",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+    fake = SimpleNamespace(
+        transcribe=AsyncMock(return_value="recognized"), aclose=AsyncMock()
+    )
+    with patch(
+        "xagent.core.model.asr.adapter.get_asr_model_instance", return_value=fake
+    ) as factory:
+        transcribed = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+        )
+    assert transcribed.status_code == 200, transcribed.text
+    assert transcribed.json()["model_id"] == "batch-asr"
+    assert factory.call_args.args[0].model_name == "scribe_v2"
 
 
 @pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])

@@ -15,7 +15,7 @@ def get_tts_model_instance(db_model: Any) -> BaseTTS:
 
     Args:
         db_model: Database model instance with fields: model_name, model_provider,
-                  api_key, base_url, abilities, timeout, max_retries
+                  api_key, base_url, and optional speech defaults
 
     Returns:
         BaseTTS instance
@@ -27,6 +27,12 @@ def get_tts_model_instance(db_model: Any) -> BaseTTS:
     model_name = str(db_model.model_name)
     api_key = str(db_model.api_key) if db_model.api_key else None
     base_url = str(db_model.base_url) if db_model.base_url else None
+    # Omitted settings retain each provider's own defaults for existing rows.
+    options: dict[str, Any] = {}
+    for field in ("language", "voice", "format", "sample_rate"):
+        value = getattr(db_model, field, None)
+        if value is not None:
+            options[field] = value
 
     model: BaseTTS
     if provider == "xinference":
@@ -35,12 +41,14 @@ def get_tts_model_instance(db_model: Any) -> BaseTTS:
             model_uid=model_name,
             base_url=base_url,
             api_key=api_key,
+            **options,
         )
     elif provider == "elevenlabs":
         model = ElevenLabsTTS(
             model=model_name,
             base_url=base_url,
             api_key=api_key,
+            **options,
         )
     else:
         raise ValueError(

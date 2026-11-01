@@ -9,12 +9,14 @@ vi.mock("./api-wrapper", async (importOriginal) => ({
 import { apiRequest } from "./api-wrapper"
 import {
   getProviderModels,
+  getModelSourceLabel,
   getUserDefaultModels,
   getUserModels,
   hostnameFromUrl,
   parseModelList,
   parseUserDefaultModels,
   resolveTaskLlmSelection,
+  supportsBatchAsr,
 } from "./models"
 
 const mockedRequest = vi.mocked(apiRequest)
@@ -161,6 +163,45 @@ describe("hostnameFromUrl", () => {
     expect(hostnameFromUrl("/v1")).toBe("")
     expect(hostnameFromUrl("not a url")).toBe("")
   })
+})
+
+describe("batch ASR availability", () => {
+  it("filters custom realtime rows while retaining file ASR models and their metadata", () => {
+    const realtime = model({
+      model_id: "my-custom-live-model",
+      category: "speech",
+      model_provider: " ElevenLabs ",
+      model_name: "scribe_v2_realtime",
+      abilities: ["asr"],
+    })
+    const batch = { ...realtime, id: 2, model_id: "file-asr", model_name: "scribe_v2" }
+    const tts = { ...realtime, id: 3, model_id: "tts", abilities: ["tts"] }
+    const models = parseModelList([realtime, batch, tts])!
+
+    expect(models.filter(supportsBatchAsr).map(model => model.model_id)).toEqual(["file-asr"])
+    expect(models[0].abilities).toEqual(["asr"])
+    expect(supportsBatchAsr({ ...batch, model_provider: "xinference" })).toBe(true)
+  })
+})
+
+describe("getModelSourceLabel", () => {
+  it("distinguishes endpoints using the same provider, including their ports", () => {
+    expect(getModelSourceLabel({
+      model_provider: "openai-compatible",
+      base_url: "http://localhost:9997/v1",
+    })).toBe("localhost:9997 (openai-compatible)")
+    expect(getModelSourceLabel({
+      model_provider: "openai-compatible",
+      base_url: "https://models.example.com:8443/v1",
+    })).toBe("models.example.com:8443 (openai-compatible)")
+  })
+
+  it.each([undefined, null, "", "/v1", "not a url"])(
+    "uses only the provider when the endpoint is %s",
+    (base_url) => {
+      expect(getModelSourceLabel({ model_provider: "openai", base_url })).toBe("openai")
+    },
+  )
 })
 
 describe("model producer decoders", () => {

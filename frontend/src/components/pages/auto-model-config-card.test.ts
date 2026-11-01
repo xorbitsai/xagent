@@ -14,7 +14,6 @@ vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
 vi.mock("@/components/ui/sonner", () => ({
   toast: { error: toastErrorMock, success: vi.fn() },
 }))
-vi.mock("@/components/ui/multi-select", () => ({ MultiSelect: () => null }))
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: (key: string) => key }),
 }))
@@ -164,5 +163,59 @@ describe("AutoModelConfigCard", () => {
       ],
     })
     await waitFor(() => expect(onSuccess).toHaveBeenCalledOnce())
+  })
+
+  it("distinguishes same-name candidates by endpoint in options, tags, and ordered rows", async () => {
+    const firstModel = {
+      ...model,
+      model_provider: "openai-compatible",
+      base_url: "http://localhost:9997/v1",
+    }
+    const secondModel = {
+      ...firstModel,
+      id: 2,
+      model_id: "remote-gpt",
+      base_url: "https://models.example.com:8443/v1",
+    }
+    const providerOnlyModel = { ...model, id: 3, model_id: "official-gpt" }
+    apiRequestMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        configured: false,
+        mode: "sequential_failover",
+        candidates: [],
+      })))
+      .mockResolvedValueOnce(new Response(JSON.stringify([
+        { id: "openai/gpt-5.5", input_modalities: ["text"] },
+      ])))
+
+    render(createElement(AutoModelConfigCard, {
+      models: [firstModel, secondModel, providerOnlyModel],
+      onSuccess: vi.fn(),
+    }))
+
+    await waitFor(() => expect(screen.getByText("models.auto.configure")).toBeEnabled())
+    fireEvent.click(screen.getByText("models.auto.configure"))
+    fireEvent.click(screen.getByText("models.auto.selectModels"))
+
+    const firstOption = screen.getByRole("button", {
+      name: "gpt-5.5 localhost:9997 (openai-compatible)",
+    })
+    expect(screen.getByRole("button", {
+      name: "gpt-5.5 models.example.com:8443 (openai-compatible)",
+    })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "gpt-5.5 openai" })).toBeInTheDocument()
+
+    fireEvent.click(firstOption)
+    fireEvent.click(screen.getByRole("button", {
+      name: "gpt-5.5 models.example.com:8443 (openai-compatible)",
+    }))
+    fireEvent.click(screen.getByRole("button", { name: "gpt-5.5 openai" }))
+
+    expect(screen.getByText("gpt-5.5 · localhost:9997 (openai-compatible)")).toBeInTheDocument()
+    expect(screen.getByText("gpt-5.5 · models.example.com:8443 (openai-compatible)")).toBeInTheDocument()
+    expect(screen.getByText("gpt-5.5 · openai")).toBeInTheDocument()
+    expect(screen.getByText("1. gpt-5.5").parentElement).toHaveTextContent("localhost:9997 (openai-compatible)")
+    expect(screen.getByText("2. gpt-5.5").parentElement).toHaveTextContent("models.example.com:8443 (openai-compatible)")
+    expect(screen.getByText("3. gpt-5.5").parentElement).toHaveTextContent("openai")
   })
 })

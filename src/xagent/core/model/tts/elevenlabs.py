@@ -9,7 +9,9 @@ import mimetypes
 import os
 import re
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Iterable
+from contextlib import aclosing
+from contextvars import copy_context
 from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -19,6 +21,7 @@ from ..chat.token_context import MediaCallType
 from ..media_metering import (
     BilledStream,
     elevenlabs_billed_units,
+    iter_billed_stream,
     read_billed_stream,
     record_provider_usage,
 )
@@ -27,7 +30,7 @@ from ..public_elevenlabs import (
     close_public_elevenlabs_sync_http_client,
     create_public_elevenlabs_client,
 )
-from .base import BaseTTS, TTSResult
+from .base import BaseTTS, TTSChunk, TTSResult
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,19 @@ _GENERIC_OUTPUT_FORMATS: dict[str, str] = {
     "mulaw": "ulaw_8000",
     "alaw": "alaw_8000",
     "opus": "opus_48000_128",
+}
+_SUPPORTED_OUTPUT_FORMATS = {
+    *(
+        f"{codec}_{rate}"
+        for codec in ("pcm", "wav")
+        for rate in (8000, 16000, 22050, 24000, 32000, 44100, 48000)
+    ),
+    *(f"mp3_44100_{rate}" for rate in (32, 64, 96, 128, 192)),
+    *(f"opus_48000_{rate}" for rate in (32, 64, 96, 128, 192)),
+    "mp3_22050_32",
+    "mp3_24000_48",
+    "ulaw_8000",
+    "alaw_8000",
 }
 
 
@@ -190,6 +206,11 @@ class ElevenLabsTTS(BaseTTS):
         return self._async_client
 
     @staticmethod
+    def _validate_voice_id(voice_id: str) -> None:
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", voice_id) is None:
+            raise ValueError("ElevenLabs voice must be a valid voice ID")
+
+    @staticmethod
     def _validate_sample_rate_request(
         requested_format: Optional[str],
         sample_rate: Optional[int],
@@ -217,10 +238,12 @@ class ElevenLabsTTS(BaseTTS):
         normalized = output_format.lower()
         codec = normalized.split("_", 1)[0]
         if codec == "pcm" and sample_rate:
-            return f"pcm_{sample_rate}"
-        if "_" in normalized:
-            return normalized
-        return _GENERIC_OUTPUT_FORMATS.get(normalized, output_format)
+            output_format = f"pcm_{sample_rate}"
+        elif "_" in normalized:
+            output_format = normalized
+        else:
+            output_format = _GENERIC_OUTPUT_FORMATS.get(normalized, output_format)
+        return output_format
 
     @staticmethod
     def _validate_provider_options(options: dict[str, Any]) -> None:
@@ -600,27 +623,33 @@ class ElevenLabsTTS(BaseTTS):
                 f"ElevenLabs voice deletion failed: {redacted_error}"
             ) from exc
 
-    async def synthesize(
+    def _synthesis_request(
         self,
         text: str,
         voice: Optional[str] = None,
         language: Optional[str] = None,
         format: Optional[str] = None,
         sample_rate: Optional[int] = None,
-        verbose: bool = False,
         **kwargs: Any,
-    ) -> Union[bytes, TTSResult]:
-        reference_audio = kwargs.pop("reference_audio", None)
+    ) -> dict[str, Any]:
         voice_id = voice or self.voice
+        self._validate_voice_id(voice_id)
         final_output_format = self._resolve_output_format(
             format or self.output_format, sample_rate or self.sample_rate
         )
+        # Keep saved models discoverable; validate the effective request before
+        # any provider client is opened, including agent-tool callers.
+        requested_format = (format or self.output_format).strip().lower()
+        if (
+            requested_format not in _GENERIC_OUTPUT_FORMATS
+            and requested_format not in _SUPPORTED_OUTPUT_FORMATS
+        ) or final_output_format not in _SUPPORTED_OUTPUT_FORMATS:
+            raise ValueError("Unsupported ElevenLabs output format or sample rate")
         self._validate_sample_rate_request(
             format or self.output_format,
             sample_rate,
             final_output_format,
         )
-        final_sample_rate = _sample_rate_from_output_format(final_output_format)
         language_code = kwargs.pop("language_code", None) or language or self.language
         voice_settings = kwargs.pop("voice_settings", None)
         pronunciation_aliases = kwargs.pop("pronunciation_aliases", None)
@@ -638,44 +667,70 @@ class ElevenLabsTTS(BaseTTS):
                 voice_settings
             )
 
+        return {
+            "text": synthesis_text,
+            "voice_id": voice_id,
+            "model_id": self.model,
+            "output_format": final_output_format,
+            **request_kwargs,
+        }
+
+    def _synthesis_error(
+        self, exc: Exception, *, streaming: bool = False
+    ) -> RuntimeError:
+        error_text = str(exc)
+        if self.api_key:
+            error_text = error_text.replace(self.api_key, "[REDACTED]")
+        if "invalid_uid" in error_text or "invalid ID has been received" in error_text:
+            message = (
+                "ElevenLabs rejected the provided voice ID. ElevenLabs voice IDs "
+                "are account-specific opaque values: call list_tts_voices or "
+                "clone_tts_voice and use an exact returned voice_id, or omit voice "
+                "to use the configured default."
+            )
+        else:
+            prefix = (
+                "ElevenLabs TTS stream failed" if streaming else "ElevenLabs TTS failed"
+            )
+            message = f"{prefix}: {redact_sensitive_text(error_text)}"
+        logger.error("%s", message)
+        return RuntimeError(message)
+
+    async def synthesize(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        verbose: bool = False,
+        **kwargs: Any,
+    ) -> Union[bytes, TTSResult]:
+        reference_audio = kwargs.pop("reference_audio", None)
+        request = self._synthesis_request(
+            text, voice, language, format, sample_rate, **kwargs
+        )
+        final_output_format = request["output_format"]
+        final_sample_rate = _sample_rate_from_output_format(final_output_format)
+        language_code = request.get("language_code")
+        synthesis_text = request["text"]
+
         client = self._ensure_async_client()
         stream = BilledStream()
         try:
             if reference_audio:
-                voice_id = await self._get_or_create_cloned_voice(reference_audio)
+                request["voice_id"] = await self._get_or_create_cloned_voice(
+                    reference_audio
+                )
             audio = await read_billed_stream(
                 client.text_to_speech,
                 "convert",
-                {
-                    "text": synthesis_text,
-                    "voice_id": voice_id,
-                    "model_id": self.model,
-                    "output_format": final_output_format,
-                    **request_kwargs,
-                },
+                request,
                 self._coerce_audio_bytes,
                 stream,
             )
         except Exception as exc:
-            error_text = str(exc)
-            if (
-                "invalid_uid" in error_text
-                or "invalid ID has been received" in error_text
-            ):
-                message = (
-                    "ElevenLabs rejected the provided voice ID. ElevenLabs voice IDs "
-                    "are account-specific opaque values: call list_tts_voices or "
-                    "clone_tts_voice and use an exact returned voice_id, or omit voice "
-                    "to use the configured default."
-                )
-                logger.error("ElevenLabs TTS failed: %s", message)
-                raise RuntimeError(message) from exc
-            redacted_error = redact_sensitive_text(str(exc))
-            logger.error(
-                "ElevenLabs TTS failed: %s",
-                redacted_error,
-            )
-            raise RuntimeError(f"ElevenLabs TTS failed: {redacted_error}") from exc
+            raise self._synthesis_error(exc) from exc
         finally:
             # Once accepted, ElevenLabs charges for the text it was sent --
             # the aliased text, not the caller's -- whether or not the audio
@@ -701,10 +756,79 @@ class ElevenLabsTTS(BaseTTS):
             language=language_code,
             raw_response={
                 "model": self.model,
-                "voice_id": voice_id,
+                "voice_id": request["voice_id"],
                 "output_format": final_output_format,
             },
         )
+
+    @property
+    def supports_streaming(self) -> bool:
+        return True
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[TTSChunk, None]:
+        """Yield provider audio immediately; callers close the iterator on interruption."""
+        reference_audio = kwargs.pop("reference_audio", None)
+        request = self._synthesis_request(
+            text, voice, language, format, sample_rate, **kwargs
+        )
+        output_format = request["output_format"]
+        client = self._ensure_async_client()
+        state = BilledStream()
+        usage_context = copy_context()
+        recorded = False
+
+        def record_charge() -> None:
+            nonlocal recorded
+            if state.accepted and not recorded:
+                recorded = True
+                usage_context.run(
+                    record_provider_usage,
+                    self,
+                    MediaCallType.TTS,
+                    len(request["text"]),
+                    provider_billed_units=elevenlabs_billed_units(state.headers),
+                )
+
+        received_audio = False
+        try:
+            if reference_audio:
+                request["voice_id"] = await self._get_or_create_cloned_voice(
+                    reference_audio
+                )
+            async with aclosing(
+                iter_billed_stream(
+                    client.text_to_speech,
+                    "stream",
+                    request,
+                    self._coerce_audio_bytes,
+                    state,
+                )
+            ) as stream:
+                async for audio in stream:
+                    # Charge before yielding, including when the consumer never
+                    # resumes the iterator after its first audio fragment.
+                    record_charge()
+                    if audio:
+                        received_audio = True
+                        yield TTSChunk(
+                            audio=audio,
+                            format=_extension_from_output_format(output_format),
+                            sample_rate=_sample_rate_from_output_format(output_format),
+                        )
+            if not received_audio:
+                raise RuntimeError("ElevenLabs TTS returned no audio data")
+        except Exception as exc:
+            raise self._synthesis_error(exc, streaming=True) from None
+        finally:
+            record_charge()
 
     @property
     def abilities(self) -> list[str]:

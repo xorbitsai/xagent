@@ -34,6 +34,7 @@ import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/sonner";
 import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
+import { getModelSourceLabel } from "@/lib/models";
 import { cn, getApiUrl } from "@/lib/utils";
 
 import type { Model } from "./models";
@@ -64,6 +65,10 @@ interface Props {
   models: Model[];
   generalDefault?: Model;
   onSuccess: () => Promise<void>;
+}
+
+function modelLabel(model: Model): string {
+  return `${model.model_name} · ${getModelSourceLabel(model)}`;
 }
 
 function normalizedValues(model: Model): string[] {
@@ -440,7 +445,8 @@ export function AutoModelConfigCard({
                 options={availableModels.map((model) => ({
                   value: String(model.id),
                   label: model.model_name,
-                  description: model.model_provider,
+                  selectedLabel: modelLabel(model),
+                  description: getModelSourceLabel(model),
                 }))}
                 searchable
                 placeholder={t("models.auto.selectModels")}
@@ -494,8 +500,8 @@ export function AutoModelConfigCard({
                             {mode === "sequential_failover" && `${index + 1}. `}
                             {model.model_name}
                           </div>
-                          <div className="text-xs text-muted-foreground">
-                            {model.model_provider}
+                          <div className="break-all text-xs text-muted-foreground">
+                            {getModelSourceLabel(model)}
                           </div>
                         </div>
                       </div>
@@ -551,7 +557,7 @@ export function AutoModelConfigCard({
                   <SelectContent>
                     {selectedModels.map((model) => (
                       <SelectItem key={model.id} value={String(model.id)}>
-                        {model.model_name}
+                        {modelLabel(model)}
                       </SelectItem>
                     ))}
                   </SelectContent>

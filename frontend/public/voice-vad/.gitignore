@@ -1,0 +1,4 @@
+# Generated from pinned npm packages by predev/prebuild.
+*
+!.gitignore
+!LICENSE-*.txt

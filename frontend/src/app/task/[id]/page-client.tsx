@@ -270,7 +270,7 @@ function TaskDetailContent() {
           </div>
         ) : null}
         <div className="flex-1 min-h-0 relative">
-          <TaskConversationPanel mode="page" onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
+          <TaskConversationPanel mode="page" voiceConversationEnabled onAgentExecutionClick={state.currentTask?.conversationStorageVersion === 2 ? (selection) => {
             if (state.taskId) {
               closeFilePreview()
               setAgentExecution({ taskId: state.taskId, selection })

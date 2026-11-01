@@ -307,9 +307,13 @@ async def test_external_close_ends_a_pending_receive_normally(transport):
     t.client.close.assert_awaited_once()
 
 
-async def test_realtime_model_is_not_advertised_to_existing_batch_consumers():
+async def test_catalogue_includes_the_model_used_by_live_voice_conversations():
     models = await ElevenLabsASR.async_list_available_models()
-    assert {model["id"] for model in models} == {"scribe_v1", "scribe_v2"}
+    assert {model["id"] for model in models} == {
+        "scribe_v1",
+        "scribe_v2",
+        "scribe_v2_realtime",
+    }
 
 
 async def test_close_does_not_wait_for_the_default_ten_second_peer_timeout(monkeypatch):

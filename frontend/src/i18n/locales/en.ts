@@ -513,7 +513,21 @@ Build when you need.`,
   settings: {
     tabs: {
       general: "General",
+      voice: "Voice",
       computerAccess: "Computer use",
+    },
+    voice: {
+      description: "Choose the models and voice used for your voice conversations. Changes apply to your next conversation.",
+      automatic: "Automatic (first available compatible model)",
+      speaker: "Voice",
+      modelDefault: "Model default voice",
+      selectionUnavailable: "Saved selection is unavailable. Choose another option in Voice settings.",
+      loadingVoices: "Loading available voices…",
+      voicesFailed: "Could not load voices. You can keep the model default and try again later.",
+      loadFailed: "Could not load your voice settings. Reopen Settings and try again.",
+      saved: "Voice settings saved.",
+      saveFailed: "Could not save voice settings. Please try again.",
+      openSettings: "Voice settings",
     },
     budget: {
       title: "Execution token budget",

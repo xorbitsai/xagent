@@ -168,7 +168,7 @@ describe("browser voice resources", () => {
   })
 
   it("plays the first PCM chunk before completion and aborts the fetch and scheduled audio on interruption", async () => {
-    const call = new VoiceAudio(options())
+    const call = new VoiceAudio({ ...options(), voice: "selected-voice" })
     await start(call)
     let stream!: ReadableStreamDefaultController<Uint8Array>
     let signal!: AbortSignal
@@ -189,6 +189,7 @@ describe("browser voice resources", () => {
     expect(playback[0].stop).toHaveBeenCalledOnce()
     expect((await settled).name).toBe("AbortError")
     expect(vi.mocked(fetch)).toHaveBeenCalledOnce()
+    expect(JSON.parse(vi.mocked(fetch).mock.calls[0][1]!.body as string)).toMatchObject({ model_id: "speaker", voice: "selected-voice" })
     call.close()
   })
 })

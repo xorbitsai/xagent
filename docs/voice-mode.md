@@ -14,7 +14,13 @@ configuration. Public widget/share capabilities remain opt-in.
 
 Choose the headphone **Voice mode** button next to the microphone on the task
 home page, or **Voice mode** above an existing private task's composer.
-Select a listening model and a speaking model, then **Start conversation**.
+Choose your listening model, speaking model and voice in **Settings → Voice**.
+These preferences are saved to your account, separately from the agent's writing
+style. Automatic uses the first available compatible model; the model's default
+voice is used unless you select a named voice from its provider. Voice lists are
+fetched by the backend using the accessible model, never a browser API key.
+An unavailable saved model requires choosing a replacement in Settings.
+The conversation dialog uses these preferences; press **Start conversation**.
 Microphone permission is requested only when starting. The call shows live
 transcription and Listening, Thinking, or Speaking status; microphone mute and
 end-call are the only in-call controls. Closing the dialog, leaving the task,

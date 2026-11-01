@@ -777,6 +777,72 @@ def test_xinference_tts_models_route_is_removed():
     list_models.assert_not_called()
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_speech_voice_listing_uses_accessible_model_and_closes_client(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, caplog, failure
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    provider = SimpleNamespace(
+        api_key="synthetic-secret",
+        supports_voice_listing=True,
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "voice-one", "name": "Rachel", "extra": "private metadata"}
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    if failure:
+        provider.list_available_voices.side_effect = RuntimeError("synthetic-secret")
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    assert client.get(
+        "/api/models/speech/voices", params={"model_id": model_id}
+    ).status_code in {401, 403}
+    factory.assert_not_called()
+    assert (
+        client.get(
+            "/api/models/speech/voices",
+            params={"model_id": "missing"},
+            headers=regular_headers,
+        ).status_code
+        == 404
+    )
+    factory.assert_not_called()
+    with monkeypatch.context() as hidden:
+        hidden.setattr(model_module, "_passes_model_visibility_hook", lambda *_: False)
+        assert (
+            client.get(
+                "/api/models/speech/voices",
+                params={"model_id": model_id},
+                headers=regular_headers,
+            ).status_code
+            == 404
+        )
+    factory.assert_not_called()
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (502 if failure else 200), response.text
+    if not failure:
+        assert response.json() == [{"voice_id": "voice-one", "name": "Rachel"}]
+    assert "synthetic-secret" not in response.text + caplog.text
+    provider.aclose.assert_awaited_once()
+
+
 class TestModelAPI:
     """Test model management API endpoints"""
 

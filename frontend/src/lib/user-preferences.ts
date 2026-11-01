@@ -8,7 +8,14 @@ import type { OnboardingVoiceId } from "@/lib/onboarding-data";
  * department/industry/voice/goals, all optional so a caller can PATCH just
  * the fields it has. `voice` must be one of VALID_USER_VOICES or the
  * backend 422s. */
+export interface VoiceConversationPreferences {
+  asr_model_id?: string | null;
+  tts_model_id?: string | null;
+  voice?: string | null;
+}
+
 export interface UserPreferences {
+  voice_conversation?: VoiceConversationPreferences | null;
   execution_budget_tokens?: number | null;
   execution_budget_soft_percent?: number | null;
   onboarded?: boolean;

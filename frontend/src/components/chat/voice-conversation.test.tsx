@@ -7,6 +7,8 @@ const calls = vi.hoisted(() => [] as Array<{
   close: ReturnType<typeof vi.fn>; stopAudio: ReturnType<typeof vi.fn>; speak: ReturnType<typeof vi.fn>
 }>)
 const auth = vi.hoisted(() => ({ token: "user-token", user: { id: 1 }, session: { sessionId: "login-1" } }))
+const preferences = vi.hoisted(() => ({ asr_model_id: "live", tts_model_id: "speaker", voice: "saved-voice" }))
+vi.mock("@/hooks/use-voice-preferences", () => ({ useVoicePreferences: () => ({ preferences, loading: false, error: false }) }))
 vi.mock("@/contexts/auth-context", () => ({ useAuth: () => auth }))
 vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: (key: string) => key }) }))
 vi.mock("@/lib/voice-audio", () => ({ VoiceAudio: class {
@@ -39,11 +41,13 @@ describe("voice conversation entry and call lifecycle", () => {
     const view = render(<VoiceConversation {...props} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
-    await waitFor(() => expect(screen.getByLabelText("voiceConversation.transcriptionModel")).toHaveValue("live"))
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument()
     expect(screen.queryByRole("option", { name: "batch" })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.states.listening"))
     const call = calls[0]
+    expect(call.options).toMatchObject({ asr: "live", tts: "speaker", voice: "saved-voice" })
     await act(async () => {
       call.options.activity(true)
       call.options.transcript("final", "Hello there.", 0)
@@ -63,6 +67,15 @@ describe("voice conversation entry and call lifecycle", () => {
     expect(screen.queryByRole("button", { name: /interrupt|打断/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.end" }))
     expect(call.close).toHaveBeenCalledOnce()
+  })
+
+  it("requires correcting an unavailable saved model rather than silently changing it", async () => {
+    preferences.asr_model_id = "removed-model"
+    render(<VoiceConversation taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} open />)
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("settings.voice.selectionUnavailable"))
+    expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeDisabled()
+    expect(screen.getByRole("link", { name: "settings.voice.openSettings" })).toHaveAttribute("href", "?settings=voice")
+    preferences.asr_model_id = "live"
   })
 
   it("ends the old call on task navigation and ignores late speech callbacks", async () => {

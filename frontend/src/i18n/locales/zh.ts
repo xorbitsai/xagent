@@ -513,7 +513,21 @@ const zh = {
   settings: {
     tabs: {
       general: "通用",
+      voice: "语音",
       computerAccess: "操作电脑",
+    },
+    voice: {
+      description: "设置语音对话使用的模型和声音。更改将在下次对话时生效。",
+      automatic: "自动（首个可用的兼容模型）",
+      speaker: "说话声音",
+      modelDefault: "使用模型默认声音",
+      selectionUnavailable: "已保存的选项不可用，请在语音设置中重新选择。",
+      loadingVoices: "正在加载可用声音…",
+      voicesFailed: "无法加载声音列表，可以先使用模型默认声音，稍后重试。",
+      loadFailed: "无法加载语音设置，请重新打开设置后重试。",
+      saved: "语音设置已保存。",
+      saveFailed: "无法保存语音设置，请重试。",
+      openSettings: "语音设置",
     },
     budget: {
       title: "执行 token 预算",

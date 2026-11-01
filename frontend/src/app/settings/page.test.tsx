@@ -16,6 +16,11 @@ afterEach(() => {
 })
 
 describe("SettingsPage", () => {
+  it("opens the Voice settings dialog from a direct settings link", async () => {
+    window.history.replaceState({}, "", "/settings?tab=voice")
+    render(<SettingsPage />)
+    await waitFor(() => expect(navigationState.replace).toHaveBeenCalledWith("/task?settings=voice"))
+  })
   it("redirects the legacy settings route to the Computer use dialog", async () => {
     window.history.replaceState({}, "", "/settings?tab=computer#desktop-relay")
 

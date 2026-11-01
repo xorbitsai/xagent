@@ -1,15 +1,17 @@
 "use client"
 
 import React, { useEffect, useState } from "react"
-import { Monitor, Settings2 } from "lucide-react"
+import { Monitor, Settings2, Volume2 } from "lucide-react"
 
 import { SettingsContent } from "@/components/settings/settings-content"
+import { VoiceSettings } from "@/components/settings/voice-settings"
+import { useAuth } from "@/contexts/auth-context"
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn } from "@/lib/utils"
 import { TaskRuntimeSettingsExtension } from "@/lib/task-runtime-ui-extension"
 
-export type SettingsDialogTab = "general" | "computer"
+export type SettingsDialogTab = "general" | "computer" | "voice"
 
 export function SettingsDialog({
   open,
@@ -23,9 +25,11 @@ export function SettingsDialog({
   targetId?: string
 }) {
   const { t } = useI18n()
+  const { session } = useAuth()
   const [activeTab, setActiveTab] = useState<SettingsDialogTab>(initialTab)
   const tabs = [
     { id: "general" as const, label: t("settings.tabs.general"), icon: Settings2 },
+    { id: "voice" as const, label: t("settings.tabs.voice"), icon: Volume2 },
     { id: "computer" as const, label: t("settings.tabs.computerAccess"), icon: Monitor },
   ]
 
@@ -79,7 +83,9 @@ export function SettingsDialog({
               </h2>
             </header>
             <div className="min-h-0 flex-1 overflow-hidden">
-              {activeTab === "computer" ? (
+              {activeTab === "voice" ? (
+                <div className="h-full overflow-y-auto p-6"><VoiceSettings key={session?.sessionId} /></div>
+              ) : activeTab === "computer" ? (
                 <div className="h-full overflow-y-auto p-6">
                   <TaskRuntimeSettingsExtension />
                 </div>

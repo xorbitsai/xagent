@@ -30,6 +30,7 @@ export class VoiceAudio {
   constructor(private options: {
     asr: string
     tts: string
+    voice?: string
     token: string
     sessionId: string | null
     activity: (active: boolean) => void
@@ -148,7 +149,7 @@ export class VoiceAudio {
     const response = await fetch(`${getApiUrl()}/api/models/speech/tts/stream`, {
       method: "POST", signal,
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model_id: this.options.tts, text, format: "pcm", sample_rate: 24000 }),
+      body: JSON.stringify({ model_id: this.options.tts, voice: this.options.voice, text, format: "pcm", sample_rate: 24000 }),
     })
     if (!response.ok || !response.body) throw new Error("Speech synthesis failed")
     const rate = Number(response.headers.get("X-Audio-Sample-Rate"))

@@ -1,6 +1,7 @@
 "use client"
 
 import React, { useEffect, useRef, useState } from "react"
+import Link from "next/link"
 import { Headphones, Mic, MicOff, PhoneOff } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
@@ -8,6 +9,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { generateClientMessageId } from "@/lib/utils"
 import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models"
+import { useVoicePreferences } from "@/hooks/use-voice-preferences"
 import { VoiceModeButton } from "./voice-mode-button"
 import { VoiceAudio } from "@/lib/voice-audio"
 import { VoiceTurns, type VoicePhase } from "@/lib/voice-conversation"
@@ -40,10 +42,9 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   const open = controlledOpen ?? internalOpen
   const setOpen = (value: boolean) => { setInternalOpen(value); onOpenChange?.(value) }
   const models = useVoiceModels(!hideTrigger || open, open)
+  const saved = useVoicePreferences(open)
   const { asr: liveAsr, tts: liveTts, loading } = models
   const modelReason = voiceModelReason(models)
-  const [asr, setAsr] = useState("")
-  const [tts, setTts] = useState("")
   const [phase, setPhase] = useState<VoicePhase>("idle")
   const [caption, setCaption] = useState("")
   const [muted, setMuted] = useState(false)
@@ -82,8 +83,10 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open])
 
-  const asrId = liveAsr.some(model => model.model_id === asr) ? asr : liveAsr[0]?.model_id || ""
-  const ttsId = liveTts.some(model => model.model_id === tts) ? tts : liveTts[0]?.model_id || ""
+  const asrId = saved.preferences.asr_model_id || liveAsr[0]?.model_id || ""
+  const ttsId = saved.preferences.tts_model_id || liveTts[0]?.model_id || ""
+  const selectionUnavailable = !liveAsr.some(model => model.model_id === asrId) || !liveTts.some(model => model.model_id === ttsId)
+  const canStart = !modelReason && !loading && !saved.loading && !saved.error && !selectionUnavailable && !busy && !disabled
   const active = phase !== "idle" && phase !== "error"
 
   useEffect(() => {
@@ -103,13 +106,13 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   }, [messages, busy, waiting])
 
   const start = async () => {
-    if (audio.current || !auth.token || modelReason || !asrId || !ttsId || busy || disabled) return
+    if (audio.current || !auth.token || !canStart) return
     end()
     const epoch = generation.current
     const current = () => epoch === generation.current
     setPhase("connecting")
     const call = new VoiceAudio({
-      asr: asrId, tts: ttsId, token: auth.token, sessionId: auth.session?.sessionId ?? null,
+      asr: asrId, tts: ttsId, voice: saved.preferences.voice || undefined, token: auth.token, sessionId: auth.session?.sessionId ?? null,
       activity: speaking => { if (current()) turns.current?.activity(speaking) },
       transcript: (type, text, id) => { if (current()) turns.current?.transcript(type, text, id) },
       error: () => { if (current()) fail() },
@@ -154,17 +157,10 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
         </div>
         {!active ? <div className="space-y-4">
           {modelReason && <p className="text-sm text-muted-foreground">{t(`voiceConversation.${modelReason}`)}</p>}
-          <label className="block text-sm">{t("voiceConversation.transcriptionModel")}
-            <select aria-label={t("voiceConversation.transcriptionModel")} className="mt-1 w-full rounded-md border bg-background p-2" value={asrId} onChange={event => setAsr(event.target.value)}>
-              {liveAsr.map(model => <option key={model.id} value={model.model_id}>{model.model_id}</option>)}
-            </select>
-          </label>
-          <label className="block text-sm">{t("voiceConversation.speechModel")}
-            <select aria-label={t("voiceConversation.speechModel")} className="mt-1 w-full rounded-md border bg-background p-2" value={ttsId} onChange={event => setTts(event.target.value)}>
-              {liveTts.map(model => <option key={model.id} value={model.model_id}>{model.model_id}</option>)}
-            </select>
-          </label>
-          <Button className="w-full" disabled={Boolean(modelReason) || loading || !asrId || !ttsId || busy || disabled} onClick={() => void start()}>{t("voiceConversation.start")}</Button>
+          {saved.error && <p role="alert" className="text-sm text-muted-foreground">{t("settings.voice.loadFailed")}</p>}
+          {!modelReason && !saved.loading && selectionUnavailable && <p role="alert" className="text-sm text-muted-foreground">{t("settings.voice.selectionUnavailable")}</p>}
+          <Button className="w-full" disabled={!canStart} onClick={() => void start()}>{t("voiceConversation.start")}</Button>
+          <Link className="block text-center text-sm text-muted-foreground underline underline-offset-4" href="?settings=voice" onClick={() => { end(); setOpen(false) }}>{t("settings.voice.openSettings")}</Link>
         </div> : <div className="flex justify-center gap-4">
           <Button variant="outline" aria-label={muted ? t("voiceConversation.unmute") : t("voiceConversation.mute")} aria-pressed={muted} onClick={() => {
             const next = !muted; setMuted(next)

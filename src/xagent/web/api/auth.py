@@ -109,6 +109,7 @@ from ..oauth_provider_quirks import (
     requires_json_accept_header,
     requires_pkce,
 )
+from ..schemas.voice_preferences import VoiceConversationPreferences
 from ..services import gmail_provisioning
 from ..services.auth_attempts import (
     AttemptBucket,
@@ -1633,6 +1634,7 @@ class UpdatePreferencesRequest(BaseModel):
         default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
     )
     voice: Optional[str] = None
+    voice_conversation: VoiceConversationPreferences | None = None
     goals: Optional[
         List[Annotated[str, Field(max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH)]]
     ] = Field(default=None, max_length=PREFERENCES_GOALS_MAX_ITEMS)

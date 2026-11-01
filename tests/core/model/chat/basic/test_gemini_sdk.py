@@ -24,6 +24,10 @@ def gemini_llm_config() -> Dict[str, Any]:
 class TestGeminiLLMSDK:
     """Test cases for Gemini LLM implementation using official SDK."""
 
+    def test_default_model_is_not_retired(self) -> None:
+        llm = GeminiLLM(api_key="test-api-key")
+        assert "gemini-2.0" not in llm.model_name
+
     @pytest.fixture
     def llm(self, gemini_llm_config: Dict[str, str]) -> GeminiLLM:
         """Fixture providing Gemini LLM instance."""

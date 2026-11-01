@@ -75,6 +75,7 @@ interface ChatInputProps {
   filesDisabled?: boolean;
   voiceInputEnabled?: boolean;
   onVoiceConversation?: (config: AgentConfig) => void;
+  voiceConversationDisabled?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
@@ -158,6 +159,7 @@ export function ChatInput({
   filesDisabled = false,
   voiceInputEnabled = true,
   onVoiceConversation,
+  voiceConversationDisabled = false,
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
@@ -935,7 +937,7 @@ export function ChatInput({
   const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
     <VoiceModeButton iconOnly
       reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
-      disabled={isInputBusy || voiceInput.status !== "idle"}
+      disabled={voiceConversationDisabled || isInputBusy || voiceInput.status !== "idle"}
       onClick={() => {
         onVoiceConversation(deliveryConfig());
       }} />

@@ -326,6 +326,7 @@ export function TaskConversationPanel({
   const fileAccess = useFileAccess()
   const { t, locale } = useI18n()
   const [files, setFiles] = useState<File[]>([])
+  const [voiceOpen, setVoiceOpen] = useState(false)
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
   const [dagLayout, setDagLayout] = useState<"TB" | "LR">("TB")
   const [leftWidth, setLeftWidth] = useState(50)
@@ -1171,26 +1172,27 @@ export function TaskConversationPanel({
             )}
 
             {voiceConversationEnabled && voiceInputEnabled && taskControlsEnabled && (
-              <div className="mb-1 flex justify-end">
-                <VoiceConversation
-                  taskId={state.taskId}
-                  messages={state.messages}
-                  busy={state.isProcessing || isMessageDeliveryPending || ["running", "pending", "pause_requested", "resume_requested"].includes(state.currentTask?.status || "")}
-                  waiting={state.currentTask?.status === "waiting_for_user"}
-                  disabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
-                  onInterrupt={() => {
-                    if (state.isProcessing || state.currentTask?.status === "running") { pauseTask(); return true }
-                    return false
-                  }}
-                  onSend={async (text, clientMessageId) => {
-                    await sendMessage(text, {
-                      clientMessageId,
-                      metadata: state.currentTask?.status === "waiting_for_user" && state.currentTask.waitingRequestId
-                        ? { request_id: state.currentTask.waitingRequestId } : undefined,
-                    }, [])
-                  }}
-                />
-              </div>
+              <VoiceConversation
+                hideTrigger
+                open={voiceOpen}
+                onOpenChange={setVoiceOpen}
+                taskId={state.taskId}
+                messages={state.messages}
+                busy={state.isProcessing || isMessageDeliveryPending || ["running", "pending", "pause_requested", "resume_requested"].includes(state.currentTask?.status || "")}
+                waiting={state.currentTask?.status === "waiting_for_user"}
+                disabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
+                onInterrupt={() => {
+                  if (state.isProcessing || state.currentTask?.status === "running") { pauseTask(); return true }
+                  return false
+                }}
+                onSend={async (text, clientMessageId) => {
+                  await sendMessage(text, {
+                    clientMessageId,
+                    metadata: state.currentTask?.status === "waiting_for_user" && state.currentTask.waitingRequestId
+                      ? { request_id: state.currentTask.waitingRequestId } : undefined,
+                  }, [])
+                }}
+              />
             )}
             <ChatInput
               onSend={handleSend}
@@ -1230,6 +1232,8 @@ export function TaskConversationPanel({
               onRetryAttachment={onRetryAttachment}
               attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
+              onVoiceConversation={voiceConversationEnabled && taskControlsEnabled ? () => setVoiceOpen(true) : undefined}
+              voiceConversationDisabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
               hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}

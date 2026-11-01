@@ -13,7 +13,7 @@ availability; a failed model-list request is reported separately from missing
 configuration. Public widget/share capabilities remain opt-in.
 
 Choose the headphone **Voice mode** button next to the microphone on the task
-home page, or **Voice mode** above an existing private task's composer.
+home page or in an existing private task's composer.
 Choose your listening model, speaking model and voice in **Settings → Voice**.
 These preferences are saved to your account, separately from the agent's writing
 style. Automatic uses the first available compatible model; the model's default

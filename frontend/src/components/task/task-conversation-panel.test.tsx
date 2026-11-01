@@ -31,6 +31,7 @@ const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const voiceProps = vi.hoisted(() => ({ current: null as null | {
   disabled: boolean; busy: boolean; onSend: (text: string, id: string) => Promise<void>; onInterrupt: () => void
+  hideTrigger?: boolean; open?: boolean; onOpenChange?: (open: boolean) => void
 } }))
 const pauseTaskMock = vi.hoisted(() => vi.fn())
 const resumeTaskMock = vi.hoisted(() => vi.fn())
@@ -58,6 +59,8 @@ const chatInputProps = vi.hoisted(() => ({
     files?: File[]
     filesDisabled?: boolean
     voiceInputEnabled?: boolean
+    onVoiceConversation?: () => void
+    voiceConversationDisabled?: boolean
     hideFileUpload?: boolean
     isLoading?: boolean
     currentInteractionRequestId?: string
@@ -102,7 +105,10 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
 vi.mock("@/components/chat/voice-conversation", () => ({
   VoiceConversation: (props: NonNullable<typeof voiceProps.current>) => {
     voiceProps.current = props
-    return <button>Voice conversation entry</button>
+    return <>
+      {!props.hideTrigger && <button>Voice conversation entry</button>}
+      {props.open && <button onClick={() => props.onOpenChange?.(false)}>Close voice conversation</button>}
+    </>
   },
 }))
 
@@ -231,6 +237,10 @@ vi.mock("@/components/chat/ChatInput", () => ({
     chatInputProps.current = props
     return (
       <div data-testid="chat-input">
+        {props.voiceInputEnabled && props.onVoiceConversation && <button
+          disabled={props.voiceConversationDisabled}
+          onClick={props.onVoiceConversation}
+        >Composer voice mode</button>}
         <button
           type="button"
           disabled={props.isLoading}
@@ -315,6 +325,7 @@ describe("TaskConversationPanel", () => {
     getFileDownloadUrlMock.mockReset()
     fileAccessRequestMock.mockReset()
     chatInputProps.current = null
+    voiceProps.current = null
     appControls.isConversationResetPending = false
     appControls.isMessageDeliveryPending = false
     appControls.isSessionInteractionLocked = false
@@ -836,9 +847,14 @@ describe("TaskConversationPanel", () => {
 
   it("opens voice only for opted-in private chat and reuses message delivery and interruption", async () => {
     const view = render(<TaskConversationPanel mode="page" />)
+    expect(screen.queryByText("Composer voice mode")).not.toBeInTheDocument()
     expect(screen.queryByText("Voice conversation entry")).not.toBeInTheDocument()
     view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
-    expect(screen.getByText("Voice conversation entry")).toBeInTheDocument()
+    expect(screen.queryByText("Voice conversation entry")).not.toBeInTheDocument()
+    fireEvent.click(screen.getByText("Composer voice mode"))
+    expect(screen.getByText("Close voice conversation")).toBeInTheDocument()
+    fireEvent.click(screen.getByText("Close voice conversation"))
+    expect(screen.queryByText("Close voice conversation")).not.toBeInTheDocument()
     expect(voiceProps.current?.disabled).toBe(false)
     await voiceProps.current?.onSend("Spoken message", "voice-message-id")
     expect(sendMessageMock).toHaveBeenCalledWith("Spoken message", { clientMessageId: "voice-message-id", metadata: undefined }, [])
@@ -846,9 +862,18 @@ describe("TaskConversationPanel", () => {
     view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
     voiceProps.current?.onInterrupt()
     expect(pauseTaskMock).toHaveBeenCalledOnce()
+    appControls.isSessionInteractionLocked = true
+    view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
+    expect(screen.getByText("Composer voice mode")).toBeDisabled()
+    expect(voiceProps.current?.disabled).toBe(true)
     appControls.voiceInputEnabled = false
     view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
+    expect(screen.queryByText("Composer voice mode")).not.toBeInTheDocument()
     expect(screen.queryByText("Voice conversation entry")).not.toBeInTheDocument()
+    appControls.voiceInputEnabled = true
+    appControls.taskControlsEnabled = false
+    view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
+    expect(chatInputProps.current?.onVoiceConversation).toBeUndefined()
   })
 
   it("omits task controls from ChatInput when the transport disables them", () => {

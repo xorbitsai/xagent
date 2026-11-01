@@ -157,6 +157,11 @@ describe("ChatInput", () => {
     expect(container.querySelector("[contenteditable]")).toHaveTextContent("Keep my draft")
     expect(onSend).not.toHaveBeenCalled()
     expect(onInputChange).not.toHaveBeenCalled()
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceConversationDisabled
+      readOnlyConfig taskConfig={{ model: "selected-model" }} />)
+    expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    expect(openVoice).toHaveBeenCalledOnce()
     rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceInputEnabled={false} />)
     expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
   })

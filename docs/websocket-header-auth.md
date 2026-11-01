@@ -1,6 +1,7 @@
 # Private WebSocket login credentials
 
-Private chat, builder chat, builder preview and progress WebSockets no longer
+Private chat, builder chat, builder preview, progress and streaming speech
+WebSockets no longer
 accept `token` or `access_token` in the query string, including empty, repeated
 and percent-encoded names. There is no query-credential fallback.
 
@@ -28,6 +29,8 @@ delete credentials already retained in historical logs.
 
 Existing user/purpose/signature/session-generation checks, task ownership,
 five-second idle revocation polling and per-message revalidation still apply.
+Streaming speech revalidates before starting the provider session and uses the
+same revocation monitor; individual PCM fragments do not perform database reads.
 Changing an explicit `token` prop changes the hook's in-memory login identity,
 so uploads and retries are not reused across explicit login identities.
 An auth-context refresh for the same user/session intentionally retains that

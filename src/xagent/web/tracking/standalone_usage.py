@@ -52,6 +52,7 @@ UsageSource = Literal[
     "memory_api",
     "model_probe",
     "speech_transcribe",
+    "speech_synthesize",
     "telegram_voice",
 ]
 

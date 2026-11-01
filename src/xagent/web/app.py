@@ -89,6 +89,7 @@ from .api.progress_ws import progress_ws_router
 from .api.share import share_router
 from .api.skill_hub import router as skill_hub_router
 from .api.skills import router as skills_router
+from .api.speech import speech_router
 from .api.system import system_router
 from .api.templates import router as templates_router
 from .api.tools import tools_router
@@ -1673,6 +1674,7 @@ app.include_router(kb_router)
 app.include_router(me_router)
 app.include_router(personal_api_keys_router)
 app.include_router(model_router)
+app.include_router(speech_router)
 app.include_router(ws_router)
 app.include_router(monitor_router)
 app.include_router(progress_ws_router)

@@ -10,7 +10,6 @@ import { useI18n } from "@/contexts/i18n-context"
 import { generateClientMessageId } from "@/lib/utils"
 import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models"
 import { useVoicePreferences } from "@/hooks/use-voice-preferences"
-import { VoiceModeButton } from "./voice-mode-button"
 import { VoiceAudio, VoiceAudioError, type VoiceAudioFailure } from "@/lib/voice-audio"
 import { VoiceTurns, type VoicePhase } from "@/lib/voice-conversation"
 
@@ -23,7 +22,7 @@ interface ReplyMessage {
   status?: string
 }
 
-export function VoiceConversation({ taskId, messages, busy, waiting, disabled, onSend, onInterrupt, open: controlledOpen, onOpenChange, hideTrigger = false, allowTaskAdoption = false }: {
+export function VoiceConversation({ taskId, messages, busy, waiting, disabled, onSend, onInterrupt, open, onOpenChange, allowTaskAdoption = false }: {
   taskId: number | null
   messages: ReplyMessage[]
   busy: boolean
@@ -31,17 +30,13 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   disabled: boolean
   onSend: (text: string, clientMessageId: string) => Promise<void>
   onInterrupt: () => boolean | void
-  open?: boolean
-  onOpenChange?: (open: boolean) => void
-  hideTrigger?: boolean
+  open: boolean
+  onOpenChange: (open: boolean) => void
   allowTaskAdoption?: boolean
 }) {
   const { t } = useI18n()
   const auth = useAuth()
-  const [internalOpen, setInternalOpen] = useState(false)
-  const open = controlledOpen ?? internalOpen
-  const setOpen = (value: boolean) => { setInternalOpen(value); onOpenChange?.(value) }
-  const models = useVoiceModels(!hideTrigger || open, open)
+  const models = useVoiceModels(open)
   const saved = useVoicePreferences(open)
   const { asr: liveAsr, tts: liveTts, loading } = models
   const modelReason = voiceModelReason(models)
@@ -74,7 +69,7 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
     const sameLogin = previous.sessionId === auth.session?.sessionId && previous.userId === auth.user?.id
     if (sameLogin && (previous.taskId === taskId || (allowTaskAdoption && previous.taskId === null && taskId !== null))) return
     end()
-    setOpen(false)
+    onOpenChange(false)
     // A call belongs to one task and one login, including during late permission prompts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId, auth.session?.sessionId, auth.user?.id])
@@ -155,9 +150,8 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
   }
 
   if (!auth.token) return null
-  return <>
-    {!hideTrigger && <VoiceModeButton reason={modelReason} disabled={disabled} onClick={() => setOpen(true)} />}
-    <Dialog open={open} onOpenChange={value => { if (!value) end(); setOpen(value) }}>
+  return (
+    <Dialog open={open} onOpenChange={value => { if (!value) end(); onOpenChange(value) }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle>{t("voiceConversation.title")}</DialogTitle>
@@ -178,7 +172,7 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
           {saved.error && <p role="alert" className="text-sm text-muted-foreground">{t("settings.voice.loadFailed")}</p>}
           {!modelReason && !saved.loading && selectionUnavailable && <p role="alert" className="text-sm text-muted-foreground">{t("settings.voice.selectionUnavailable")}</p>}
           <Button className="w-full" disabled={!canStart} onClick={() => void start()}>{t("voiceConversation.start")}</Button>
-          <Link className="block text-center text-sm text-muted-foreground underline underline-offset-4" href="?settings=voice" onClick={() => { end(); setOpen(false) }}>{t("settings.voice.openSettings")}</Link>
+          <Link className="block text-center text-sm text-muted-foreground underline underline-offset-4" href="?settings=voice" onClick={() => { end(); onOpenChange(false) }}>{t("settings.voice.openSettings")}</Link>
         </div> : <div className="flex justify-center gap-4">
           <Button variant="outline" aria-label={muted ? t("voiceConversation.unmute") : t("voiceConversation.mute")} aria-pressed={muted} onClick={() => {
             const next = !muted; setMuted(next)
@@ -189,5 +183,5 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
         </div>}
       </DialogContent>
     </Dialog>
-  </>
+  )
 }

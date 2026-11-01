@@ -935,6 +935,40 @@ export function ChatInput({
       ...(!configIsDrivenByTaskConfig && normalizedExecutionMode ? { executionMode: normalizedExecutionMode } : {}),
     };
   };
+  const voiceInputButton = voiceInputEnabled && voiceInput.hasAsrModel ? (
+    <TooltipProvider><Tooltip delayDuration={200}>
+      <TooltipTrigger asChild>
+        <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
+          aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label={voiceInputLabel}
+            className={cn(
+              "h-8 w-8 p-0 rounded-full transition-colors",
+              voiceInput.status === "recording"
+                ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+              voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+            )}
+            disabled={voiceInputDisabled}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={handleVoiceInputClick}
+          >
+            {voiceInput.status === "recording" ? (
+              <Square className="h-3.5 w-3.5 fill-current" />
+            ) : voiceInput.status === "transcribing" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Mic className="h-4 w-4" />
+            )}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
+    </Tooltip></TooltipProvider>
+  ) : null;
   const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
     <VoiceModeButton iconOnly
       reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
@@ -1298,40 +1332,7 @@ export function ChatInput({
                   </Button>
                 </>
               )}
-              {voiceInputEnabled && voiceInput.hasAsrModel && (
-                <TooltipProvider><Tooltip delayDuration={200}>
-                  <TooltipTrigger asChild>
-                    <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
-                      aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        aria-label={voiceInputLabel}
-                        className={cn(
-                          "h-8 w-8 p-0 rounded-full transition-colors",
-                          voiceInput.status === "recording"
-                            ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                            : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
-                          voiceInput.status === "transcribing" && "cursor-wait opacity-80"
-                        )}
-                        disabled={voiceInputDisabled}
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={handleVoiceInputClick}
-                      >
-                        {voiceInput.status === "recording" ? (
-                          <Square className="h-3.5 w-3.5 fill-current" />
-                        ) : voiceInput.status === "transcribing" ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Mic className="h-4 w-4" />
-                        )}
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
-                </Tooltip></TooltipProvider>
-              )}
+              {voiceInputButton}
               {voiceConversationButton}
               {showStopButton ? (
                 <Button
@@ -1500,40 +1501,7 @@ export function ChatInput({
                 <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
-                {voiceInputEnabled && voiceInput.hasAsrModel && (
-                  <TooltipProvider><Tooltip delayDuration={200}>
-                    <TooltipTrigger asChild>
-                      <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
-                        aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          aria-label={voiceInputLabel}
-                          className={cn(
-                            "h-8 w-8 p-0 rounded-full transition-colors",
-                            voiceInput.status === "recording"
-                              ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                              : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
-                            voiceInput.status === "transcribing" && "cursor-wait opacity-80"
-                          )}
-                          disabled={voiceInputDisabled}
-                          onMouseDown={(event) => event.preventDefault()}
-                          onClick={handleVoiceInputClick}
-                        >
-                          {voiceInput.status === "recording" ? (
-                            <Square className="h-3.5 w-3.5 fill-current" />
-                          ) : voiceInput.status === "transcribing" ? (
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                          ) : (
-                            <Mic className="h-4 w-4" />
-                          )}
-                        </Button>
-                      </span>
-                    </TooltipTrigger>
-                    <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
-                  </Tooltip></TooltipProvider>
-                )}
+                {voiceInputButton}
                 {voiceConversationButton}
                 <Button
                   type="submit"

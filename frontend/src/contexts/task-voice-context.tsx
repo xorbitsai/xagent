@@ -51,7 +51,7 @@ export function TaskVoiceProvider({ children }: { children: React.ReactNode }) {
   }}>
     {children}
     <VoiceConversation
-      hideTrigger open={open} onOpenChange={value => { if (!value) close() }}
+      open={open} onOpenChange={value => { if (!value) close() }}
       allowTaskAdoption={creating && owner.current?.createdTaskId === state.taskId}
       taskId={state.taskId} messages={state.messages}
       busy={state.isProcessing || isMessageDeliveryPending || ["running", "pending", "pause_requested", "resume_requested"].includes(state.currentTask?.status || "")}

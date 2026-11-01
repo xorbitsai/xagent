@@ -1173,7 +1173,6 @@ export function TaskConversationPanel({
 
             {voiceConversationEnabled && voiceInputEnabled && taskControlsEnabled && (
               <VoiceConversation
-                hideTrigger
                 open={voiceOpen}
                 onOpenChange={setVoiceOpen}
                 taskId={state.taskId}

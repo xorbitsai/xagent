@@ -31,7 +31,7 @@ const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const voiceProps = vi.hoisted(() => ({ current: null as null | {
   disabled: boolean; busy: boolean; onSend: (text: string, id: string) => Promise<void>; onInterrupt: () => void
-  hideTrigger?: boolean; open?: boolean; onOpenChange?: (open: boolean) => void
+  open: boolean; onOpenChange: (open: boolean) => void
 } }))
 const pauseTaskMock = vi.hoisted(() => vi.fn())
 const resumeTaskMock = vi.hoisted(() => vi.fn())
@@ -105,10 +105,7 @@ vi.mock("@/contexts/app-context-chat", async (importOriginal) => ({
 vi.mock("@/components/chat/voice-conversation", () => ({
   VoiceConversation: (props: NonNullable<typeof voiceProps.current>) => {
     voiceProps.current = props
-    return <>
-      {!props.hideTrigger && <button>Voice conversation entry</button>}
-      {props.open && <button onClick={() => props.onOpenChange?.(false)}>Close voice conversation</button>}
-    </>
+    return props.open ? <button onClick={() => props.onOpenChange(false)}>Close voice conversation</button> : null
   },
 }))
 
@@ -848,9 +845,7 @@ describe("TaskConversationPanel", () => {
   it("opens voice only for opted-in private chat and reuses message delivery and interruption", async () => {
     const view = render(<TaskConversationPanel mode="page" />)
     expect(screen.queryByText("Composer voice mode")).not.toBeInTheDocument()
-    expect(screen.queryByText("Voice conversation entry")).not.toBeInTheDocument()
     view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
-    expect(screen.queryByText("Voice conversation entry")).not.toBeInTheDocument()
     fireEvent.click(screen.getByText("Composer voice mode"))
     expect(screen.getByText("Close voice conversation")).toBeInTheDocument()
     fireEvent.click(screen.getByText("Close voice conversation"))
@@ -869,7 +864,6 @@ describe("TaskConversationPanel", () => {
     appControls.voiceInputEnabled = false
     view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)
     expect(screen.queryByText("Composer voice mode")).not.toBeInTheDocument()
-    expect(screen.queryByText("Voice conversation entry")).not.toBeInTheDocument()
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = false
     view.rerender(<TaskConversationPanel mode="page" voiceConversationEnabled />)

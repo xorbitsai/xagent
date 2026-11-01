@@ -32,11 +32,16 @@ vi.mock("@/lib/api-wrapper", async importOriginal => ({
 import { VoiceConversation } from "./voice-conversation"
 import { VoiceAudioError } from "@/lib/voice-audio"
 
+function Call(props: Omit<React.ComponentProps<typeof VoiceConversation>, "open" | "onOpenChange">) {
+  const [open, setOpen] = React.useState(true)
+  return <VoiceConversation {...props} open={open} onOpenChange={setOpen} />
+}
+
 afterEach(() => { cleanup(); calls.length = 0; preferences.asr_model_id = "live"; vi.clearAllMocks() })
 
-describe("voice conversation entry and call lifecycle", () => {
+describe("voice conversation call lifecycle", () => {
   it("shows the ASR session deadline without blaming microphone configuration", async () => {
-    render(<VoiceConversation taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} open />)
+    render(<Call taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
     await waitFor(() => expect(calls).toHaveLength(1))
@@ -46,8 +51,8 @@ describe("voice conversation entry and call lifecycle", () => {
   })
 
   it.each([false, true])("keeps a TTS failure recoverable except for authentication loss (%s)", async authFailure => {
-    const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: vi.fn(), open: true }
-    const view = render(<VoiceConversation {...props} />)
+    const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: vi.fn() }
+    const view = render(<Call {...props} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
     await waitFor(() => expect(calls).toHaveLength(1))
@@ -56,7 +61,7 @@ describe("voice conversation entry and call lifecycle", () => {
       calls[0].options.transcript("final", "Hello", 0)
       await new Promise(resolve => setTimeout(resolve, 320))
     })
-    view.rerender(<VoiceConversation {...props} messages={[{ id: "answer", role: "assistant", isResult: true, status: "completed", content: "Hello back." }]} />)
+    view.rerender(<Call {...props} messages={[{ id: "answer", role: "assistant", isResult: true, status: "completed", content: "Hello back." }]} />)
     if (authFailure) {
       await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.authenticationRequired"))
       expect(calls[0].close).toHaveBeenCalledOnce()
@@ -71,9 +76,7 @@ describe("voice conversation entry and call lifecycle", () => {
     const onSend = vi.fn().mockResolvedValue(undefined)
     const onInterrupt = vi.fn()
     const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend, onInterrupt }
-    const view = render(<VoiceConversation {...props} />)
-    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
-    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    const view = render(<Call {...props} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
     expect(screen.queryByRole("combobox")).not.toBeInTheDocument()
     expect(screen.queryByRole("option", { name: "batch" })).not.toBeInTheDocument()
@@ -88,7 +91,7 @@ describe("voice conversation entry and call lifecycle", () => {
       await new Promise(resolve => setTimeout(resolve, 320))
     })
     expect(onSend).toHaveBeenCalledWith("Hello there.", expect.any(String))
-    view.rerender(<VoiceConversation {...props} busy messages={[
+    view.rerender(<Call {...props} busy messages={[
       { id: "answer", role: "assistant", isResult: true, status: "running", content: "Hello back. Still thinking" },
     ]} />)
     await waitFor(() => expect(call.speak).toHaveBeenCalledWith("Hello back. "))
@@ -105,7 +108,7 @@ describe("voice conversation entry and call lifecycle", () => {
 
   it("requires correcting an unavailable saved model rather than silently changing it", async () => {
     preferences.asr_model_id = "removed-model"
-    render(<VoiceConversation taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} open />)
+    render(<Call taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} />)
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("settings.voice.selectionUnavailable"))
     expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeDisabled()
     expect(screen.getByRole("link", { name: "settings.voice.openSettings" })).toHaveAttribute("href", "?settings=voice")
@@ -114,7 +117,7 @@ describe("voice conversation entry and call lifecycle", () => {
   it("shows a rejected task's explanation instead of blaming the microphone", async () => {
     const message = "Your Auto model configuration has no usable candidate models. Review your Auto model settings."
     const onSend = vi.fn().mockRejectedValue(new Error(message))
-    render(<VoiceConversation taskId={null} messages={[]} busy={false} waiting={false} disabled={false} onSend={onSend} onInterrupt={vi.fn()} open />)
+    render(<Call taskId={null} messages={[]} busy={false} waiting={false} disabled={false} onSend={onSend} onInterrupt={vi.fn()} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
     await waitFor(() => expect(calls).toHaveLength(1))
@@ -137,14 +140,12 @@ describe("voice conversation entry and call lifecycle", () => {
 
   it("ends the old call on task navigation and ignores late speech callbacks", async () => {
     const props = { taskId: 42, messages: [], busy: false, waiting: false, disabled: false, onSend: vi.fn().mockResolvedValue(undefined), onInterrupt: vi.fn() }
-    const view = render(<VoiceConversation {...props} />)
-    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
-    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    const view = render(<Call {...props} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
     fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
     await waitFor(() => expect(calls).toHaveLength(1))
     const old = calls[0]
-    view.rerender(<VoiceConversation {...props} taskId={43} />)
+    view.rerender(<Call {...props} taskId={43} />)
     expect(old.close).toHaveBeenCalledOnce()
     act(() => { old.options.transcript("final", "Too late", 0) })
     expect(props.onSend).not.toHaveBeenCalled()

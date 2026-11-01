@@ -6,6 +6,7 @@ import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp
 import { VoiceModeButton } from "./voice-mode-button";
 import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
@@ -1298,31 +1299,38 @@ export function ChatInput({
                 </>
               )}
               {voiceInputEnabled && voiceInput.hasAsrModel && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  aria-label={voiceInputLabel}
-                  title={voiceInputLabel}
-                  className={cn(
-                    "h-8 w-8 p-0 rounded-full transition-colors",
-                    voiceInput.status === "recording"
-                      ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                      : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
-                    voiceInput.status === "transcribing" && "cursor-wait opacity-80"
-                  )}
-                  disabled={voiceInputDisabled}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={handleVoiceInputClick}
-                >
-                  {voiceInput.status === "recording" ? (
-                    <Square className="h-3.5 w-3.5 fill-current" />
-                  ) : voiceInput.status === "transcribing" ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Mic className="h-4 w-4" />
-                  )}
-                </Button>
+                <TooltipProvider><Tooltip delayDuration={200}>
+                  <TooltipTrigger asChild>
+                    <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
+                      aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        aria-label={voiceInputLabel}
+                        className={cn(
+                          "h-8 w-8 p-0 rounded-full transition-colors",
+                          voiceInput.status === "recording"
+                            ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                            : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+                          voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+                        )}
+                        disabled={voiceInputDisabled}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={handleVoiceInputClick}
+                      >
+                        {voiceInput.status === "recording" ? (
+                          <Square className="h-3.5 w-3.5 fill-current" />
+                        ) : voiceInput.status === "transcribing" ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Mic className="h-4 w-4" />
+                        )}
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
+                </Tooltip></TooltipProvider>
               )}
               {voiceConversationButton}
               {showStopButton ? (
@@ -1493,31 +1501,38 @@ export function ChatInput({
                   ⏎ {t("common.send")}
                 </span>
                 {voiceInputEnabled && voiceInput.hasAsrModel && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    aria-label={voiceInputLabel}
-                    title={voiceInputLabel}
-                    className={cn(
-                      "h-8 w-8 p-0 rounded-full transition-colors",
-                      voiceInput.status === "recording"
-                        ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                        : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
-                      voiceInput.status === "transcribing" && "cursor-wait opacity-80"
-                    )}
-                    disabled={voiceInputDisabled}
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={handleVoiceInputClick}
-                  >
-                    {voiceInput.status === "recording" ? (
-                      <Square className="h-3.5 w-3.5 fill-current" />
-                    ) : voiceInput.status === "transcribing" ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Mic className="h-4 w-4" />
-                    )}
-                  </Button>
+                  <TooltipProvider><Tooltip delayDuration={200}>
+                    <TooltipTrigger asChild>
+                      <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
+                        aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          aria-label={voiceInputLabel}
+                          className={cn(
+                            "h-8 w-8 p-0 rounded-full transition-colors",
+                            voiceInput.status === "recording"
+                              ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                              : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+                            voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+                          )}
+                          disabled={voiceInputDisabled}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={handleVoiceInputClick}
+                        >
+                          {voiceInput.status === "recording" ? (
+                            <Square className="h-3.5 w-3.5 fill-current" />
+                          ) : voiceInput.status === "transcribing" ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Mic className="h-4 w-4" />
+                          )}
+                        </Button>
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
+                  </Tooltip></TooltipProvider>
                 )}
                 {voiceConversationButton}
                 <Button

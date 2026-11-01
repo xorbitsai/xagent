@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -49,6 +49,7 @@ from ....config import (
     get_llm_stream_no_payload_abort_models,
     get_llm_stream_no_payload_timeout_seconds,
 )
+from .types import ChunkType, StreamChunk
 
 # ``finish_reason`` value stamped on the chunk that ends an aborted stream, so
 # the runtime's #2786 markers record the abort instead of a clean finish.
@@ -345,6 +346,46 @@ class StreamProgressGuard:
 
 
 # ------------------------------------------------------------------ helpers
+
+
+def no_progress_tail_chunk(
+    abort: StreamAbort,
+    accumulated_tool_calls: MutableMapping[str, dict[str, Any]],
+    raw_payload: Any,
+) -> StreamChunk:
+    """Build the final chunk for a stream aborted by the progress guard.
+
+    Providers decorate ``raw_payload`` with any provider-specific state before
+    calling this helper.  If the triggering delta polluted a completed tool
+    call, trim that call back to the argument length observed immediately
+    before the delta.  The returned snapshot therefore equals or extends the
+    last one the runtime received, rather than looking like a new argument
+    delta.
+    """
+    if abort.tool_call_id is not None and abort.keep_length is not None:
+        call = accumulated_tool_calls.get(abort.tool_call_id)
+        function = call.get("function") if isinstance(call, dict) else None
+        arguments = function.get("arguments") if isinstance(function, dict) else None
+        if isinstance(arguments, str):
+            function["arguments"] = arguments[: abort.keep_length]
+
+    if hasattr(raw_payload, "model_dump"):
+        raw_payload = raw_payload.model_dump()
+    raw = dict(raw_payload) if isinstance(raw_payload, dict) else {}
+    raw[STREAM_ABORTED_KEY] = abort.reason
+
+    if accumulated_tool_calls:
+        return StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=list(accumulated_tool_calls.values()),
+            finish_reason=NO_PROGRESS_FINISH_REASON,
+            raw=raw,
+        )
+    return StreamChunk(
+        type=ChunkType.END,
+        finish_reason=NO_PROGRESS_FINISH_REASON,
+        raw=raw,
+    )
 
 
 _JSON_DECODER = json.JSONDecoder()

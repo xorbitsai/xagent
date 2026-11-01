@@ -14,10 +14,13 @@ import pytest
 from xagent.core.model.chat.stream_progress import (
     NO_PAYLOAD_STREAM_FALLBACK,
     NO_PROGRESS_FINISH_REASON,
+    STREAM_ABORTED_KEY,
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
+    no_progress_tail_chunk,
 )
+from xagent.core.model.chat.types import ChunkType
 
 
 def _config(**overrides: object) -> StreamProgressConfig:
@@ -522,6 +525,37 @@ class TestNoPayloadTimeout:
         )
         now[0] = 1000.0
         assert guard.observe(reasoning_texts=("more",)) is None
+
+
+class TestNoProgressTailChunk:
+    def test_end_chunk_stamps_abort_reason(self) -> None:
+        abort = StreamAbort(reason="empty_deltas", detail="empty")
+
+        chunk = no_progress_tail_chunk(abort, {}, {"provider": "value"})
+
+        assert chunk.type == ChunkType.END
+        assert chunk.finish_reason == NO_PROGRESS_FINISH_REASON
+        assert chunk.raw == {
+            "provider": "value",
+            STREAM_ABORTED_KEY: "empty_deltas",
+        }
+
+    def test_tool_chunk_repairs_the_rejected_delta(self) -> None:
+        calls = _tool_calls(("call_1", '{"q": "x"}garbage'))
+        keep_length = len('{"q": "x"}')
+        abort = StreamAbort(
+            reason="tool_call_trailing_bytes",
+            detail="trailing bytes",
+            tool_call_id="call_1",
+            keep_length=keep_length,
+        )
+
+        chunk = no_progress_tail_chunk(abort, calls, None)
+
+        assert chunk.type == ChunkType.TOOL_CALL
+        assert chunk.finish_reason == NO_PROGRESS_FINISH_REASON
+        assert chunk.tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert chunk.raw == {STREAM_ABORTED_KEY: "tool_call_trailing_bytes"}
 
 
 class TestConfigFromEnv:

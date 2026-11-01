@@ -1052,17 +1052,19 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
         "server": ("testserver", 80),
         "client": ("127.0.0.1", 1234),
     }
+    # This watchdog includes auth and DB thread-pool scheduling on loaded CI
+    # runners; the provider timeout cases above still use their short deadlines.
     if failure:
         with pytest.raises(
             RuntimeError, match="Speech synthesis stream interrupted"
         ) as error:
-            await asyncio.wait_for(app(scope, incoming.get, send), 2)
+            await asyncio.wait_for(app(scope, incoming.get, send), 10)
         assert (
             "synthetic-provider-secret"
             not in "".join(traceback.format_exception(error.value)) + caplog.text
         )
     else:
-        await asyncio.wait_for(app(scope, incoming.get, send), 2)
+        await asyncio.wait_for(app(scope, incoming.get, send), 10)
     assert messages[0]["status"] == 200
     headers = dict(messages[0]["headers"])
     assert headers[b"x-content-type-options"] == b"nosniff"

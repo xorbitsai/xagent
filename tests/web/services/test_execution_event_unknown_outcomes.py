@@ -79,6 +79,7 @@ from xagent.web.services import (
     task_lease_recovery,
 )
 from xagent.web.services import task_orchestrator as orchestrator
+from xagent.web.services.db_write_retry import DbWriteRetryPolicy
 from xagent.web.services.execution_event_signals import report_unknown_outcome
 from xagent.web.services.task_auto_recovery import InterruptionSettlementDeferred
 from xagent.web.services.task_execution import (
@@ -546,7 +547,14 @@ async def test_a_rolled_back_settlement_leaves_the_one_report_to_lease_recovery(
     with pytest.raises(OperationalError):
         _settle_unknown_tool_effect(path, factory, tid, lease)
 
-    assert settlement_commit["staged"] == [TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR]
+    # The settle paths read the refused COMMIT back, find it absent and rerun
+    # it, deciding the run again, until the retry attempts are used up.
+    attempts = (
+        DbWriteRetryPolicy.from_config().attempts if path.startswith("settle_") else 1
+    )
+    assert settlement_commit["staged"] == (
+        [TASK_UNKNOWN_TOOL_EFFECT_SETTLEMENT_ERROR] * attempts
+    )
     with factory() as db:
         assert db.get(Task, tid).status == TaskStatus.RUNNING
     assert_none(caplog, metric_reader)

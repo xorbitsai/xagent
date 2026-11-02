@@ -5915,6 +5915,257 @@ async def test_nested_enum_argument_is_rejected_before_mcp_execution(monkeypatch
     create_session_mock.assert_not_called()
 
 
+def _invalid_arguments(location, reason):
+    return {
+        "content": [
+            {
+                "text": (
+                    f"Invalid MCP tool arguments at {location}: {reason}. "
+                    "Check the tool schema and retry."
+                )
+            }
+        ],
+        "is_error": True,
+    }
+
+
+_TOP_LEVEL_PROPERTIES = {
+    "item_id": {"type": "integer"},
+    "description": {"type": "string"},
+    "reasoning": {"type": "string"},
+    "category": {"type": "string"},
+}
+_TOP_LEVEL_REQUIRED = ["item_id", "description", "reasoning"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "location", "reason"),
+    [
+        pytest.param(
+            {"item_id": 1, "description": "x"},
+            "reasoning",
+            "a required value is missing",
+            id="missing-required",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": 5, "reasoning": "y"},
+            "description",
+            'the value has the wrong type (expected "string")',
+            id="wrong-type-required",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": "x", "reasoning": "y", "category": 5},
+            "category",
+            'the value has the wrong type (expected "string")',
+            id="wrong-type-optional",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": None, "reasoning": "y"},
+            "description",
+            'the value has the wrong type (expected "string")',
+            id="null-for-required-non-nullable",
+        ),
+    ],
+)
+async def test_top_level_argument_error_is_returned_before_mcp_execution(
+    monkeypatch, args, location, reason
+):
+    adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(args)
+
+    assert result == _invalid_arguments(location, reason)
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_top_level_argument_error_does_not_echo_supplied_values(monkeypatch):
+    adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(
+        {"item_id": 1, "description": ["top-secret-value"], "reasoning": "y"}
+    )
+
+    assert result["is_error"] is True
+    assert "top-secret-value" not in repr(result)
+    assert "pydantic" not in repr(result).lower()
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "location", "reason"),
+    [
+        pytest.param(
+            {"item_id": 1, "description": "x"},
+            "reasoning",
+            "a required value is missing",
+            id="missing-required",
+        ),
+        pytest.param(
+            {"item_id": 1, "description": ["top-secret-value"], "reasoning": "y"},
+            "description",
+            "the schema constraint was not satisfied",
+            id="wrong-type",
+        ),
+    ],
+)
+async def test_top_level_argument_error_without_compiled_validator(
+    monkeypatch, args, location, reason
+):
+    """A schema that failed to compile still yields a correctable error."""
+    adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
+    adapter._args_validator = None
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async(args)
+
+    assert result == _invalid_arguments(location, reason)
+    assert "top-secret-value" not in repr(result)
+    create_session_mock.assert_not_called()
+
+
+def _runtime_bound_adapter():
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="list_clients",
+            description="List clients",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "account_id": {"type": "string"},
+                },
+                "required": ["account_id", "query"],
+            },
+        ),
+        connection={
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "tool_arguments", "key": "account_id"},
+                },
+            ],
+            "connector_runtime": {
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_bound_required_argument_is_not_reported_missing(monkeypatch):
+    adapter = _runtime_bound_adapter()
+    execute_mock = AsyncMock(return_value={"content": [], "is_error": False})
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute_mock)
+
+    result = await adapter.run_json_async({"query": "active"})
+
+    assert result["is_error"] is False
+    assert execute_mock.await_args.args[1] == {
+        "query": "active",
+        "account_id": "6185",
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_argument_error_skips_runtime_bound_required_argument(
+    monkeypatch,
+):
+    adapter = _runtime_bound_adapter()
+    execute_mock = AsyncMock()
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute_mock)
+
+    result = await adapter.run_json_async({})
+
+    assert result == _invalid_arguments("query", "a required value is missing")
+    execute_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("schema", "value", "reason"),
+    [
+        pytest.param(
+            {"type": "integer"},
+            "12",
+            'the value has the wrong type (expected "integer")',
+            id="numeric-string",
+        ),
+        pytest.param(
+            {"type": "integer"},
+            True,
+            'the value has the wrong type (expected "integer")',
+            id="boolean",
+        ),
+        pytest.param(
+            {"type": "integer"},
+            1.0,
+            'the value has the wrong type (expected "integer")',
+            id="integral-float",
+        ),
+        pytest.param(
+            {"type": "integer", "minimum": 1},
+            0,
+            "the minimum constraint (1) was not satisfied",
+            id="minimum",
+        ),
+        pytest.param(
+            {"type": "integer", "maximum": 10},
+            11,
+            "the maximum constraint (10) was not satisfied",
+            id="maximum",
+        ),
+        pytest.param(
+            {"type": "integer", "exclusiveMinimum": 1},
+            1,
+            "the exclusiveMinimum constraint (1) was not satisfied",
+            id="exclusive-minimum",
+        ),
+        pytest.param(
+            {"type": "integer", "exclusiveMaximum": 10},
+            10,
+            "the exclusiveMaximum constraint (10) was not satisfied",
+            id="exclusive-maximum",
+        ),
+    ],
+)
+async def test_strict_integer_error_is_returned_before_mcp_execution(
+    monkeypatch, schema, value, reason
+):
+    adapter = _schema_adapter({"scan_id": schema}, ["scan_id"])
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"scan_id": value})
+
+    assert result == _invalid_arguments("scan_id", reason)
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_value_the_args_model_coerces_still_reaches_the_server(monkeypatch):
+    """Pydantic still runs before the schema check, so its coercions keep working."""
+    adapter = _schema_adapter({"flag": {"type": "boolean"}}, ["flag"])
+    execute_mock = AsyncMock(return_value={"content": [], "is_error": False})
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute_mock)
+
+    result = await adapter.run_json_async({"flag": "true"})
+
+    assert result["is_error"] is False
+    assert execute_mock.await_args.args[1] == {"flag": True}
+
+
 def test_an_unusable_numeric_bound_costs_only_its_own_key():
     """A value no provider can carry drops that key and nothing else.
 

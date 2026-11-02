@@ -2806,6 +2806,36 @@ class MCPToolAdapter(AbstractBaseTool):
         return error
 
     @staticmethod
+    def _args_model_argument_error(exc: ValidationError) -> Any:
+        """Describe an args-model failure by field name and failure kind only.
+
+        Used when the compiled validator cannot name the problem, for example
+        because the schema did not compile. Pydantic's own message echoes the
+        supplied value and a documentation URL, so none of it is carried over.
+        """
+        first = exc.errors(
+            include_url=False, include_context=False, include_input=False
+        )[0]
+        field = [str(first["loc"][0])] if first["loc"] else []
+        if first["type"] == "missing":
+            return jsonschema_exceptions.ValidationError(
+                "missing", validator="required", validator_value=field, instance={}
+            )
+        return jsonschema_exceptions.ValidationError(
+            "invalid", validator=None, path=field
+        )
+
+    def _rejected_arguments_result(self, error: Any) -> dict[str, Any]:
+        """Log a locally rejected call and return its correctable error."""
+        result = self._invalid_arguments_result(error)
+        logger.warning(
+            "MCP tool %s rejected supplied arguments locally: %s",
+            self.mcp_tool.name,
+            result["content"][0]["text"],
+        )
+        return result
+
+    @staticmethod
     def _invalid_arguments_result(error: Any) -> dict[str, Any]:
         path = [str(part) for part in error.absolute_path]
         if error.validator == "required" and isinstance(error.instance, Mapping):
@@ -3015,21 +3045,23 @@ class MCPToolAdapter(AbstractBaseTool):
 
         return normalized_args
 
-    def _validate_strict_integer_args(self, args: Mapping[str, Any]) -> None:
-        """Validate declared integer inputs before Pydantic can coerce them.
+    def _strict_integer_argument_error(self, args: Mapping[str, Any]) -> Any | None:
+        """Find a declared integer input before Pydantic can coerce it.
 
         MCP arguments arrive as JSON values.  Pydantic's default ``int``
         parsing accepts booleans, numeric strings, and integral floats, which
         changes the caller's value before a strict downstream tool can inspect
         it.  Preserve the schema's integer contract at this shared boundary and
         enforce its numeric bounds without changing the emitted args model.
+        The failure is shaped like a JSON Schema error so it is reported the
+        same way as every other argument the model can correct.
         """
         schema = self.mcp_tool.inputSchema
         if not isinstance(schema, dict):
-            return
+            return None
         properties = schema.get("properties")
         if not isinstance(properties, dict):
-            return
+            return None
 
         for field_name, field_schema in properties.items():
             if field_name not in args or args[field_name] is None:
@@ -3039,17 +3071,27 @@ class MCPToolAdapter(AbstractBaseTool):
 
             value = args[field_name]
             if not isinstance(value, int) or isinstance(value, bool):
-                raise TypeError(f"{field_name} must be an integer")
+                return jsonschema_exceptions.ValidationError(
+                    f"{field_name} must be an integer",
+                    validator="type",
+                    validator_value="integer",
+                    path=[field_name],
+                )
 
             for constraint, bound in self._integer_schema_bounds(field_schema):
-                if constraint == "minimum" and value < bound:
-                    raise ValueError(f"{field_name} must be at least {bound}")
-                if constraint == "maximum" and value > bound:
-                    raise ValueError(f"{field_name} must be at most {bound}")
-                if constraint == "exclusiveMinimum" and value <= bound:
-                    raise ValueError(f"{field_name} must be greater than {bound}")
-                if constraint == "exclusiveMaximum" and value >= bound:
-                    raise ValueError(f"{field_name} must be less than {bound}")
+                if (
+                    (constraint == "minimum" and value < bound)
+                    or (constraint == "maximum" and value > bound)
+                    or (constraint == "exclusiveMinimum" and value <= bound)
+                    or (constraint == "exclusiveMaximum" and value >= bound)
+                ):
+                    return jsonschema_exceptions.ValidationError(
+                        f"{field_name} violates {constraint}",
+                        validator=constraint,
+                        validator_value=bound,
+                        path=[field_name],
+                    )
+        return None
 
     def _schema_is_integer_only(self, schema: Any) -> bool:
         """Return True when integer is the only accepted non-null JSON type."""
@@ -3444,8 +3486,18 @@ class MCPToolAdapter(AbstractBaseTool):
                         self.mcp_tool.name,
                     )
                     normalized_args.pop(field_name, None)
-            self._validate_strict_integer_args(normalized_args)
-            parsed_args = self._args_type(**normalized_args)
+            strict_integer_error = self._strict_integer_argument_error(normalized_args)
+            if strict_integer_error is not None:
+                return self._rejected_arguments_result(strict_integer_error)
+            try:
+                parsed_args = self._args_type(**normalized_args)
+            except ValidationError as exc:
+                # The args model excludes runtime-bound fields, and so does the
+                # validator compiled from it, so neither reports them missing.
+                return self._rejected_arguments_result(
+                    self._nested_argument_error(normalized_args)
+                    or self._args_model_argument_error(exc)
+                )
             supplied_argument_names = set(normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
             input_schema = self.mcp_tool.inputSchema
@@ -3512,13 +3564,7 @@ class MCPToolAdapter(AbstractBaseTool):
             argument_error = self._nested_argument_error(validation_args)
             if argument_error is not None:
                 await self._discard_external_upload_args(staged_uploads)
-                result = self._invalid_arguments_result(argument_error)
-                logger.warning(
-                    "MCP tool %s rejected supplied arguments locally: %s",
-                    self.mcp_tool.name,
-                    result["content"][0]["text"],
-                )
-                return result
+                return self._rejected_arguments_result(argument_error)
 
             logger.debug(
                 "Executing MCP tool %s with args keys: %s for user %s",

@@ -43,6 +43,10 @@ def test_create_rejects_internal_docker_management_fields() -> None:
         )
 
         assert response.status_code == 400, response.text
+        assert (
+            "Internal Docker management fields are not available"
+            in response.json()["detail"]
+        )
         assert field_name in response.json()["detail"]
 
         db = _direct_db_session()
@@ -93,7 +97,9 @@ def test_update_rejects_docker_management_fields_without_changing_server() -> No
         db.close()
 
 
-def test_update_accepts_editable_config_after_response_metadata_is_projected_out() -> None:
+def test_update_accepts_editable_config_after_response_metadata_is_projected_out() -> (
+    None
+):
     headers = _admin_headers()
     created = client.post(
         "/api/mcp/servers",
@@ -119,6 +125,57 @@ def test_update_accepts_editable_config_after_response_metadata_is_projected_out
         server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
         assert server.managed == "external"
         assert server.url == "https://rotated.example.test/sse"
+    finally:
+        db.close()
+
+
+def test_editing_legacy_internal_row_drops_trusted_docker_fields() -> None:
+    headers = _admin_headers()
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        server = MCPServer(
+            name="legacy-internal-edit",
+            managed="internal",
+            transport="sse",
+            url="http://127.0.0.1:9000/sse",
+            docker_url="unix:///var/run/docker.sock",
+            docker_image="legacy/image:latest",
+            restart_policy="no",
+            auto_start=False,
+        )
+        db.add(server)
+        db.flush()
+        db.add(
+            UserMCPServer(
+                user_id=user.id,
+                mcpserver_id=server.id,
+                is_owner=True,
+                can_edit=True,
+                can_delete=True,
+                is_active=True,
+            )
+        )
+        db.commit()
+        server_id = server.id
+    finally:
+        db.close()
+
+    response = client.put(
+        f"/api/mcp/servers/{server_id}",
+        headers=headers,
+        json={"config": {"url": "https://converted.example.test/sse"}},
+    )
+
+    assert response.status_code == 200, response.text
+    db = _direct_db_session()
+    try:
+        server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert server.managed == "external"
+        assert server.url == "https://converted.example.test/sse"
+        assert server.docker_url is None
+        assert server.docker_image is None
+        assert server.auto_start is False
     finally:
         db.close()
 

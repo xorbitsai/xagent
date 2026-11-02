@@ -367,6 +367,22 @@ describe("MCP edit contract", () => {
     })
   })
 
+  it("does not emit config for a description-only edit of a response-backed server", () => {
+    const detail = parseMcpServerDetail({
+      ...mcpDetailPayload,
+      config: {
+        ...mcpDetailPayload.config,
+        managed: "external",
+        docker_host: "tcp://docker:2375",
+      },
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(
+      buildMcpServerPayload({ ...formData, description: "Updated description" }, detail),
+    ).toEqual({ description: "Updated description" })
+  })
+
   it("sends the complete per-user env replacement when a key is added", () => {
     const detail = parseMcpServerDetail(mcpDetailPayload)
     const { formData } = mcpServerDetailToEditState(detail)

@@ -2154,10 +2154,10 @@ def _reject_user_mcp_docker_config(config: dict[str, Any]) -> None:
     new Docker option to ``MCPServerConfig`` does not silently expose it here.
     """
     forbidden = sorted(
-        str(field_name)
+        field_name
         for field_name in config
         if field_name in _USER_FORBIDDEN_MCP_CONFIG_FIELDS
-        or (isinstance(field_name, str) and field_name.startswith("docker_"))
+        or field_name.startswith("docker_")
     )
     if forbidden:
         raise ValueError(
@@ -2204,7 +2204,15 @@ def _build_server_config(
     if existing_server:
         existing_config = existing_server.to_config_dict()
         for key, value in existing_config.items():
-            if key not in config_dict and value is not None:
+            # Legacy internal rows may still contain Docker lifecycle fields.
+            # A user-facing edit converts the row to the external contract;
+            # never copy those trusted-deployment fields back into that edit.
+            if (
+                key not in _USER_FORBIDDEN_MCP_CONFIG_FIELDS
+                and not key.startswith("docker_")
+                and key not in config_dict
+                and value is not None
+            ):
                 config_dict[key] = value
 
     TransportFieldValidator.validate_transport_fields(

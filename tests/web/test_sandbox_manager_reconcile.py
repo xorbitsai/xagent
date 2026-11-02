@@ -783,6 +783,7 @@ class TestGateCallSiteStructuralPin:
         "_get_or_create_sandbox_locked": {
             "get_or_create_sandbox",
             "_create_lease_provider_locked",
+            "get_or_create_lease_provider",
         },
         "_create_lease_provider_locked": {
             "create_lease_provider",

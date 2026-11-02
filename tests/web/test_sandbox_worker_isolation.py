@@ -82,6 +82,7 @@ async def test_worker_lifecycle_preserves_other_workers_live_sandbox(
     init_db(db_url=f"sqlite:///{tmp_path / 'workers.db'}")
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "deployment")
+    monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "xagent-test-sandbox-egress")
     collection = _LabelFilteredCollection()
     client = _ClientWithCollection(collection)
     monkeypatch.setattr(docker_module, "_create_docker_client", lambda: client)

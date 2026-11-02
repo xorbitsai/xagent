@@ -637,8 +637,8 @@ def _list_offset_paginated(
     limit: int,
     extra_fields_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> str:
-    """Shared body for the offset-paginated tools (zendesk_search,
-    zendesk_search_users, zendesk_search_articles, and the two side
+    """Shared body for the offset-paginated tools (zendesk_search, the
+    zendesk_search_* tools, and the two side
     conversation tools) -- symmetric to _list_cursor_paginated below, so
     both pagination families in this file build their own truncation-aware
     flat envelope and cap it themselves, rather than routing through the
@@ -1707,7 +1707,8 @@ def zendesk_get_article(article_id: int | str) -> str:
 def zendesk_list_macros(limit: int = 25, after_cursor: str | None = None) -> str:
     """
     List the active macros the connected agent can use, with each macro's
-    title and description. Use zendesk_get_macro for what a macro does.
+    title and description. Use zendesk_search_macros to find a macro by
+    name, and zendesk_get_macro for what a macro does.
     limit: max macros to return (default 25, hard cap 100).
     after_cursor: pass the previous call's own after_cursor to fetch the
     next page; omit for the first page.
@@ -1722,12 +1723,49 @@ def zendesk_list_macros(limit: int = 25, after_cursor: str | None = None) -> str
 
 
 @mcp.tool()
+def zendesk_search_macros(query: str, limit: int = 25, page: int = 1) -> str:
+    """
+    Search active macros by title, e.g. "refund". Only titles are matched,
+    not descriptions or actions. Returns each macro's title and
+    description; use zendesk_get_macro for what a macro does.
+    limit: max macros to return (default 25, hard cap 100).
+    page: 1-based page number; pass the previous page + 1 to continue. If a
+    call is truncated for size (`truncated: true` in the response,
+    `has_more` forced true), re-run the search with a smaller `limit` from
+    `page=1` -- see zendesk_search's identical note for why.
+    """
+    try:
+        query = _require_non_blank(query, "query")
+        max_results = _clamp_limit(limit)
+        page = max(1, page)
+        # /macros/search only pages by offset: it answers page[size] with
+        # HTTP 400, so this cannot share zendesk_list_macros' cursor paging.
+        # active=true keeps the results to the macros zendesk_list_macros
+        # would list. No _past_search_window guard: unlike the other search
+        # tools, Zendesk documents no result-window ceiling for this one.
+        return _list_offset_paginated(
+            "/macros/search.json",
+            "macros",
+            _macro_summary,
+            {"query": query, "active": "true", "per_page": max_results, "page": page},
+            max_results,
+            extra_fields_fn=lambda result: {"count": result.get("count")},
+        )
+    except Exception as e:
+        # Logged length-bounded like zendesk_search.
+        logger.error(
+            f"Error searching Zendesk macros for query of length {len(query or '')}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
 def zendesk_get_macro(macro_id: int | str) -> str:
     """
     Get a macro by id, including its actions (the ticket fields it sets and
     the comment it adds) and which groups or users it is restricted to.
-    macro_id: a bare numeric id (from zendesk_list_macros), or the macro's
-    Admin Center URL.
+    macro_id: a bare numeric id (from zendesk_list_macros or
+    zendesk_search_macros), or the macro's Admin Center URL.
     """
     try:
         path_id = _resolve_path_id(macro_id, _MACRO_URL_ID_PATTERN, "macro_id")
@@ -1865,8 +1903,8 @@ def zendesk_apply_macro(
     reported changes, `body_is_html` marks a comment body that is HTML.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
     Zendesk agent UI.
-    macro_id: a bare numeric id (from zendesk_list_macros), or the macro's
-    Admin Center URL.
+    macro_id: a bare numeric id (from zendesk_list_macros or
+    zendesk_search_macros), or the macro's Admin Center URL.
     preview_token: required to save; the `preview_token` from a preview of
     this macro on this ticket. It binds the exact write that preview showed
     (ticket state, macro version, and the rendered changes); it is not a

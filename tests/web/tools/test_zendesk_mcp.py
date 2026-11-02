@@ -2518,6 +2518,7 @@ _ALL_TOOL_CALLS = [
     ("zendesk_search_articles", {"query": "password"}),
     ("zendesk_get_article", {"article_id": 1}),
     ("zendesk_list_macros", {}),
+    ("zendesk_search_macros", {"query": "close"}),
     ("zendesk_get_macro", {"macro_id": 1}),
     ("zendesk_list_side_conversations", {"ticket_id": 1}),
     (
@@ -2897,6 +2898,121 @@ def test_list_macros_surfaces_a_permission_error(monkeypatch):
 
     assert result["status"] == "error"
     assert "HTTP 403" in result["message"]
+
+
+def test_search_macros_searches_active_macros_by_page(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "macros": [
+                    {
+                        "id": 5,
+                        "title": "Close and redirect",
+                        "description": "Redirect to the Help Center",
+                        "active": True,
+                        "actions": [{"field": "status", "value": "solved"}],
+                        "updated_at": "2026-10-01T00:00:00Z",
+                    }
+                ],
+                "count": 1,
+                "next_page": None,
+                "previous_page": None,
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_search_macros(" close ", limit=10, page=2))
+
+    assert result == {
+        "status": "success",
+        "macros": [
+            {
+                "id": 5,
+                "title": "Close and redirect",
+                "description": "Redirect to the Help Center",
+                "updated_at": "2026-10-01T00:00:00Z",
+            }
+        ],
+        "count": 1,
+        "has_more": False,
+        "truncated": False,
+    }
+    assert mock_request.call_args.kwargs["method"] == "GET"
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/macros/search.json"
+    )
+    # Offset paging: /macros/search answers page[size] with HTTP 400 (checked
+    # on a live account, #3397).
+    assert mock_request.call_args.kwargs["params"] == {
+        "query": "close",
+        "active": "true",
+        "per_page": 10,
+        "page": 2,
+    }
+
+
+def test_search_macros_reports_more_pages_from_next_page(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "macros": [{"id": 5, "title": "Close and redirect"}],
+                    "count": 2,
+                    "next_page": "https://acme.zendesk.com/api/v2/macros/search.json?page=2",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_search_macros("close", limit=1))
+
+    assert result["has_more"] is True
+
+
+def test_search_macros_clamps_limit_and_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"macros": [], "count": 0}))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_search_macros("close", limit=500, page=0)
+
+    params = mock_request.call_args.kwargs["params"]
+    assert params["per_page"] == 100
+    assert params["page"] == 1
+
+
+@pytest.mark.parametrize("query", ["   ", None])
+def test_search_macros_requires_non_blank_query(monkeypatch, query):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_search_macros(query))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_macros_surfaces_a_zendesk_error(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "error": "InvalidPaginationParameter",
+                    "description": "page must be an integer",
+                },
+                status_code=400,
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_search_macros("close"))
+
+    assert result["status"] == "error"
+    assert "HTTP 400" in result["message"]
 
 
 def test_get_macro_returns_its_actions_and_restriction(monkeypatch):

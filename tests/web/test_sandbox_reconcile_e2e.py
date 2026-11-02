@@ -82,7 +82,25 @@ def event_loop():
 @pytest.fixture(scope="module")
 def docker_service():
     """Shared real Docker service/store for this module's tests."""
-    return DockerSandboxService(MemDockerStore(), namespace="test")
+    client = docker_sandbox_module._create_docker_client()
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+        options={"com.docker.network.bridge.enable_icc": "false"},
+    )
+    try:
+        yield DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            network=network_name,
+            client=client,
+        )
+    finally:
+        network.remove()
 
 
 @pytest.fixture
@@ -329,6 +347,7 @@ class TestLegacyContainerMigration:
                 t0_spec.image,
                 template,
                 config,
+                "bridge",
             )
             await asyncio.to_thread(container.start)
             await asyncio.to_thread(container.reload)
@@ -344,6 +363,10 @@ class TestLegacyContainerMigration:
             pre_inspection = await docker_service.inspect(sandbox_name)
             assert pre_inspection is not None
             assert pre_inspection.fingerprint_label is None
+            assert not pre_inspection.runtime_policy_matches, (
+                "a legacy container on Docker's default bridge must enter the "
+                "MISMATCH rebuild path"
+            )
             id_before = container.id
 
             sandbox = await manager.get_or_create_sandbox(
@@ -428,6 +451,7 @@ class TestLegacyMatchingStoreRowStaysUnverified:
                 desired_spec.image,
                 template,
                 config,
+                docker_service._network,
             )
             await asyncio.to_thread(container.start)
             await asyncio.to_thread(container.reload)

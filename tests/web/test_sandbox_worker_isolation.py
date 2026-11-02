@@ -11,6 +11,7 @@ from xagent.web.sandbox_store import DBDockerStore
 def test_worker_namespace_is_stable_and_required(monkeypatch):
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "deployment")
+    monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "xagent-test-sandbox-egress")
     monkeypatch.delenv("XAGENT_SANDBOX_WORKER_ID", raising=False)
     with pytest.raises(ValueError, match="XAGENT_SANDBOX_WORKER_ID"):
         config.get_sandbox_worker_namespace()
@@ -81,6 +82,7 @@ async def test_worker_lifecycle_preserves_other_workers_live_sandbox(
     init_db(db_url=f"sqlite:///{tmp_path / 'workers.db'}")
     monkeypatch.setenv("XAGENT_SHARED_TASK_EXECUTION_ENABLED", "true")
     monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "deployment")
+    monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "xagent-test-sandbox-egress")
     collection = _LabelFilteredCollection()
     client = _ClientWithCollection(collection)
     monkeypatch.setattr(docker_module, "_create_docker_client", lambda: client)

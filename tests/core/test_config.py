@@ -86,6 +86,7 @@ from xagent.config import (
     SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
     SANDBOX_NAMESPACE,
+    SANDBOX_NETWORK,
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
@@ -199,6 +200,7 @@ from xagent.config import (
     get_sandbox_max_containers,
     get_sandbox_memory,
     get_sandbox_namespace,
+    get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_slack_app_token,
@@ -234,6 +236,7 @@ from xagent.config import (
     get_xrouter_excluded_models,
     in_sandbox_tool_runner,
     validate_sandbox_namespace,
+    validate_sandbox_network,
 )
 
 
@@ -367,6 +370,9 @@ class TestEnvironmentVariableConstants:
 
     def test_sandbox_namespace_constant(self):
         assert SANDBOX_NAMESPACE == "XAGENT_SANDBOX_NAMESPACE"
+
+    def test_sandbox_network_constant(self):
+        assert SANDBOX_NETWORK == "XAGENT_SANDBOX_NETWORK"
 
     def test_sandbox_host_storage_root_constant(self):
         assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
@@ -2147,6 +2153,31 @@ class TestGetSandboxNamespace:
         """
         monkeypatch.setenv(SANDBOX_NAMESPACE, "a" * 100)
         assert get_sandbox_namespace() == "a" * 100
+
+
+class TestGetSandboxNetwork:
+    def test_missing_or_blank_returns_none(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_NETWORK, raising=False)
+        assert get_sandbox_network() is None
+        monkeypatch.setenv(SANDBOX_NETWORK, "  ")
+        assert get_sandbox_network() is None
+
+    def test_dedicated_network_name_is_accepted(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_NETWORK, "stage_sandbox-egress.v1")
+        assert get_sandbox_network() == "stage_sandbox-egress.v1"
+
+    @pytest.mark.parametrize(
+        "value",
+        ["bridge", "host", "none", "default", "has space", "/bad", "a" * 256],
+    )
+    def test_builtin_or_malformed_network_is_rejected(self, monkeypatch, value):
+        monkeypatch.setenv(SANDBOX_NETWORK, value)
+        with pytest.raises(ValueError, match="Invalid sandbox network"):
+            get_sandbox_network()
+
+    def test_direct_validation_is_fail_closed(self):
+        with pytest.raises(ValueError, match="Invalid sandbox network"):
+            validate_sandbox_network("")
 
 
 class TestGetBoxliteHomeDir:

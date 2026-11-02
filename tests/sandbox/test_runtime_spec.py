@@ -656,6 +656,14 @@ class TestSandboxServiceDefaults:
 
 
 class TestSpecMatchesInspection:
+    def test_backend_runtime_policy_failure_is_a_hard_mismatch(self):
+        desired = _make_spec()
+        inspection = _make_inspection(
+            fingerprint_label=None,
+            runtime_policy_matches=False,
+        )
+        assert spec_matches_inspection(desired, inspection) is SpecVerdict.MISMATCH
+
     def test_missing_fingerprint_label_is_unverified(self):
         desired = _make_spec()
         inspection = _make_inspection(fingerprint_label=None)

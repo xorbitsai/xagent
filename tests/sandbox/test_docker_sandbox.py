@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
+from docker import errors
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     SANDBOX_RUNTIME_GID,
@@ -148,6 +149,31 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def configured_module_sandbox_network():
+    """Provide a real dedicated bridge only to this Docker service module."""
+    key = "XAGENT_SANDBOX_NETWORK"
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = None
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(key, network_name)
+        try:
+            if is_docker_available():
+                client = docker_sandbox_module._create_docker_client()
+                network = client.networks.create(
+                    network_name,
+                    driver="bridge",
+                    labels={
+                        docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                    },
+                    options={"com.docker.network.bridge.enable_icc": "false"},
+                )
+            yield
+        finally:
+            if network is not None:
+                network.remove()
+
+
 requires_docker = pytest.mark.skipif(
     not is_docker_available(), reason="Requires reachable Docker daemon"
 )
@@ -156,7 +182,25 @@ requires_docker = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def docker_service():
     """Provide a shared Docker sandbox service for integration-style tests."""
-    return DockerSandboxService(MemDockerStore(), namespace="test")
+    client = docker_sandbox_module._create_docker_client()
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+        options={"com.docker.network.bridge.enable_icc": "false"},
+    )
+    try:
+        yield DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            network=network_name,
+            client=client,
+        )
+    finally:
+        network.remove()
 
 
 class _FakeContainerCollection:
@@ -174,6 +218,18 @@ class _FakeDockerClient:
 
     def __init__(self, containers=()):
         self.containers = _FakeContainerCollection(containers)
+        self.networks = SimpleNamespace(
+            get=lambda name: SimpleNamespace(
+                name=name,
+                attrs={
+                    "Driver": "bridge",
+                    "Labels": {
+                        docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                    },
+                    "Options": {"com.docker.network.bridge.enable_icc": "false"},
+                },
+            )
+        )
 
     def ping(self):
         return True
@@ -294,6 +350,110 @@ class TestDockerSandboxServiceFailures:
         monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 1000)
 
         with pytest.raises(SandboxRuntimeConflictError, match="run as root"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_configured_network(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+
+        def missing_network(_name):
+            raise errors.NotFound("not found")
+
+        client.networks.get = missing_network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="is not available"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_bridge_network(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.networks.get = lambda name: SimpleNamespace(
+            name=name,
+            attrs={
+                "Driver": "overlay",
+                "Labels": {
+                    docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                },
+            },
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="bridge driver"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_exact_network_name(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get("xagent-test-sandbox-egress")
+        network.name = "different-network"
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="exact name"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_dedicated_network_label(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get(os.environ["XAGENT_SANDBOX_NETWORK"])
+        network.attrs["Labels"] = {}
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="must carry the label"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_icc_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get(os.environ["XAGENT_SANDBOX_NETWORK"])
+        network.attrs["Options"] = {"com.docker.network.bridge.enable_icc": "true"}
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="inter-container"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_reports_socket_proxy_network_denial(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.networks.get = lambda _name: (_ for _ in ()).throw(
+            errors.APIError("forbidden")
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="NETWORKS=1"):
             service.validate_host_workspace_access()
 
     def test_host_workspace_readiness_rejects_rootless_daemon(
@@ -446,17 +606,28 @@ class TestNamespaceIsolation:
                 client=_FakeDockerClient(),
             )
 
+    def test_service_constructor_rejects_builtin_network(self):
+        with pytest.raises(ValueError, match="Invalid sandbox network"):
+            DockerSandboxService(
+                MemDockerStore(),
+                namespace="test",
+                network="bridge",
+                client=_FakeDockerClient(),
+            )
+
     def test_constructor_preserves_client_position_and_reads_namespace_env(
         self, monkeypatch
     ):
         """Existing direct callers keep the client argument while the required
         namespace comes from the documented environment variable."""
         monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "alpha")
+        monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "alpha-sandbox-egress")
 
         positional_client = _FakeDockerClient()
         positional = DockerSandboxService(MemDockerStore(), positional_client)
         assert positional._client is positional_client
         assert positional._namespace == "alpha"
+        assert positional._network == "alpha-sandbox-egress"
 
         keyword_client = _FakeDockerClient()
         keyword = DockerSandboxService(
@@ -465,11 +636,18 @@ class TestNamespaceIsolation:
         )
         assert keyword._client is keyword_client
         assert keyword._namespace == "alpha"
+        assert keyword._network == "alpha-sandbox-egress"
 
     def test_constructor_without_namespace_env_fails_closed(self, monkeypatch):
         """Compatibility must never fall back to daemon-global ownership."""
         monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
         with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE is required"):
+            DockerSandboxService(MemDockerStore(), _FakeDockerClient())
+
+    def test_constructor_without_network_env_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "alpha")
+        monkeypatch.delenv("XAGENT_SANDBOX_NETWORK", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NETWORK is required"):
             DockerSandboxService(MemDockerStore(), _FakeDockerClient())
 
     def test_count_legacy_containers_uses_exact_legacy_filter(self):
@@ -711,6 +889,7 @@ class TestNamespaceIsolation:
                 "img",
                 template,
                 SandboxConfig(),
+                "alpha-sandbox-egress",
             )
             assert captured["labels"]["xagent.managed"] == "v2"
             assert captured["labels"]["xagent.sandbox.namespace"] == "alpha"
@@ -724,6 +903,8 @@ class TestNamespaceIsolation:
             assert captured["environment"]["HOME"] == "/home/sandbox"
             assert captured["cap_drop"] == ["ALL"]
             assert captured["pids_limit"] == 1024
+            assert captured["network"] == "alpha-sandbox-egress"
+            assert "network_mode" not in captured
 
         client, captured = _capture_create_client()
         await docker_sandbox_module._create_container(
@@ -737,6 +918,7 @@ class TestNamespaceIsolation:
                 env={"HOME": "/tmp/custom-home"},
                 volumes=[("/host/workspace", "/root/.xagent/user_1", "rw")],
             ),
+            "alpha-sandbox-egress",
         )
         assert captured["pids_limit"] == 2048
         assert captured["environment"]["HOME"] == "/tmp/custom-home"
@@ -751,8 +933,22 @@ class TestNamespaceIsolation:
             "img",
             SandboxTemplate(type="image", image="img"),
             SandboxConfig(),
+            "alpha-sandbox-egress",
         )
         assert "pids_limit" not in captured
+
+        client, captured = _capture_create_client()
+        await docker_sandbox_module._create_container(
+            client,
+            "user::isolated",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(network_isolated=True),
+            "alpha-sandbox-egress",
+        )
+        assert captured["network_mode"] == "none"
+        assert "network" not in captured
 
     @pytest.mark.asyncio
     async def test_create_defaults_runtime_security_profile(self, monkeypatch):

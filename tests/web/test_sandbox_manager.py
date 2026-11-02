@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import threading
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -212,8 +213,9 @@ class TestCreateDockerService:
 
     @pytest.fixture(autouse=True)
     def _namespace_env(self, monkeypatch):
-        """A namespace is mandatory for the Docker sandbox implementation."""
+        """Ownership and a dedicated network are mandatory for Docker."""
         monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "test")
+        monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "test-sandbox-egress")
 
     def test_uses_db_store(self):
         """Test Docker sandbox service is created with persistent store."""
@@ -229,6 +231,7 @@ class TestCreateDockerService:
         mock_store_cls.assert_called_once_with(namespace=None)
         assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
         assert mock_service_cls.call_args[1]["namespace"] == "test"
+        assert mock_service_cls.call_args[1]["network"] == "test-sandbox-egress"
 
     def test_creation_failure_is_fatal(self):
         """An enabled Docker runtime must not degrade to local execution."""
@@ -246,6 +249,11 @@ class TestCreateDockerService:
         """Missing namespace must fail loudly, never degrade to unscoped mode."""
         monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
         with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE is required"):
+            _create_docker_service()
+
+    def test_missing_network_is_fatal(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_SANDBOX_NETWORK", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NETWORK is required"):
             _create_docker_service()
 
     def test_legacy_container_inventory_is_logged(self, caplog):
@@ -673,6 +681,65 @@ class TestSandboxLifecycleConfig:
         assert service.get_or_create.await_args_list[0].args[0] == "user::42"
         assert service.get_or_create.await_args_list[1].args[0] == "build_preview::42"
 
+    @pytest.mark.asyncio
+    async def test_cached_reconciled_sandbox_recovers_runtime_network_drift(
+        self, tmp_path
+    ):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_42"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            first = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+            inspection = await service.inspect("user::42")
+            assert inspection is not None
+            inspection.runtime_policy_matches = False
+            service.inspect.side_effect = [
+                inspection,
+                inspection,
+                replace(inspection, state="stopped"),
+            ]
+
+            second = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+
+        assert second is not first
+        service.delete.assert_awaited_once_with("user::42")
+
+    @pytest.mark.asyncio
+    async def test_cached_reconciled_sandbox_recovers_deleted_runtime(self, tmp_path):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_42"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            first = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+            service._containers.pop("user::42")
+            service.containers.discard("user::42")
+
+            second = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+
+        assert second is not first
+
 
 class TestSandboxLeaseProvider:
     """Test leasing primary and worker sandboxes for tool execution."""
@@ -988,6 +1055,27 @@ class TestSandboxManagerWarmup:
         assert config.cpus == 1
         assert config.memory == 512
 
+    @pytest.mark.asyncio
+    async def test_warmup_replaces_stale_network_policy_container_once(self):
+        mock_service = FakeSandboxService()
+        manager = SandboxManager(mock_service)
+        mock_sandbox = MagicMock()
+        mock_sandbox.__aenter__ = AsyncMock(return_value=mock_sandbox)
+        mock_sandbox.__aexit__ = AsyncMock(return_value=None)
+        mock_service.get_or_create = AsyncMock(
+            side_effect=[
+                SandboxRuntimeConflictError("network drift"),
+                mock_sandbox,
+            ]
+        )
+        mock_service.delete = AsyncMock()
+
+        await manager.warmup()
+
+        assert mock_service.get_or_create.await_count == 2
+        assert mock_service.delete.await_args_list[0].args == ("__warmup__",)
+        assert mock_service.delete.await_count == 2
+
 
 class TestSandboxActivityTracking:
     """Test attach/release ref-counting and last-activity tracking."""
@@ -1147,6 +1235,70 @@ class TestGetOrCreateLeaseProvider:
         assert first is provider
         assert second is provider
         manager._create_lease_provider_locked.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cached_provider_recovers_runtime_network_drift(self, tmp_path):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_7"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            first = await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=mount_intent
+            )
+            inspection = await service.inspect("user::7")
+            assert inspection is not None
+            inspection.runtime_policy_matches = False
+            service.inspect.side_effect = [
+                inspection,
+                inspection,
+                replace(inspection, state="stopped"),
+                replace(inspection, runtime_policy_matches=True),
+            ]
+
+            second = await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=mount_intent
+            )
+
+        assert second is not first
+        assert second.primary_sandbox is not first.primary_sandbox
+        service.delete.assert_awaited_once_with("user::7")
+
+    @pytest.mark.asyncio
+    async def test_active_provider_network_drift_keeps_failing_closed(self, tmp_path):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_7"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            provider = await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=mount_intent
+            )
+            assert await manager.attach_provider("user", "7", provider)
+            inspection = await service.inspect("user::7")
+            assert inspection is not None
+            inspection.runtime_policy_matches = False
+            service.inspect.side_effect = [inspection, inspection, inspection]
+
+            for _ in range(2):
+                with pytest.raises(SandboxRuntimeConflictError, match="became active"):
+                    await manager.get_or_create_lease_provider(
+                        "user", "7", mount_intent=mount_intent
+                    )
+
+        service.delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_concurrent_requests_create_single_provider(self):

@@ -11,7 +11,7 @@ export type VoiceCapabilities = Record<string, { asr?: boolean; tts?: boolean }>
 export function voiceModelOptions(models: ModelWithAccess[], capabilities: VoiceCapabilities = {}) {
   const speech = models.filter(model => model.is_active && model.category === "speech")
   return {
-    // This adapter provides streaming ASR and server-side VAD together.
+    // ASR requires ElevenLabs realtime or Xinference's probed streaming + server VAD.
     asr: speech.filter(model => model.abilities?.includes("asr") && ((model.model_provider.trim().toLowerCase() === "elevenlabs" && model.model_name === "scribe_v2_realtime") || capabilities[model.model_id]?.asr === true)),
     tts: speech.filter(model => model.abilities?.includes("tts") && (model.model_provider.trim().toLowerCase() === "elevenlabs" || capabilities[model.model_id]?.tts === true)),
   }
@@ -68,7 +68,9 @@ export function useVoiceModels(enabled: boolean, refreshKey = false) {
                 if (!response.ok) throw new Error("Capabilities unavailable")
                 const result = await response.json()
                 if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("Invalid capabilities")
-                const value = result.streaming === true && (ability !== "asr" || result.server_vad === true)
+                const value = result.streaming === true && (ability === "asr"
+                  ? result.server_vad === true
+                  : Array.isArray(result.formats) && result.formats.includes("pcm") && Array.isArray(result.sample_rates) && result.sample_rates.includes(24000))
                 if (!active) return
                 cache.set(key, { value, checked: Date.now() })
                 capabilities[model.model_id] = { ...capabilities[model.model_id], [ability]: value }

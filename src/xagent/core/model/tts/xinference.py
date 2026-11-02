@@ -128,8 +128,7 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
             "response_format": output_format,
             "stream": True,
         }
-        if final_language:
-            body["kwargs"] = json.dumps({"language": final_language})
+        body["kwargs"] = json.dumps({"language": final_language})
         if generation != self._stream_generation:
             raise RuntimeError("TTS model was closed while opening its stream")
         client = create_public_model_aiohttp_session(

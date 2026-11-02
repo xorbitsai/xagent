@@ -1158,18 +1158,23 @@ def test_capability_endpoint_only_returns_browser_contract(api):
 
 
 @pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (RuntimeError("synthetic-provider-secret"), 502),
+        (TimeoutError("synthetic-provider-secret"), 504),
+    ],
+)
 def test_capability_endpoint_maps_and_logs_upstream_failure(
-    api, caplog, ability, model_id
+    api, caplog, ability, model_id, error, status
 ):
     provider = getattr(api, ability)
-    provider.get_streaming_capabilities = AsyncMock(
-        side_effect=RuntimeError("synthetic-provider-secret")
-    )
+    provider.get_streaming_capabilities = AsyncMock(side_effect=error)
     response = api.client.get(
         f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
         headers=api.headers,
     )
-    assert response.status_code == 502
+    assert response.status_code == status
     assert "synthetic-provider-secret" not in response.text + caplog.text
     assert "Speech stream failed" in caplog.text
     assert provider.close_count == 1

@@ -469,7 +469,8 @@ async def speech_capabilities(
     except Exception as exc:
         _log_provider_error(model, exc)
         raise HTTPException(
-            status_code=502, detail="Speech capabilities unavailable"
+            status_code=504 if isinstance(exc, TimeoutError) else 502,
+            detail="Speech capabilities unavailable",
         ) from None
     finally:
         await _close_model(model)

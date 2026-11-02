@@ -105,13 +105,30 @@ it("enables Xinference ASR and TTS after positive capability probes", async () =
   const live = model({ model_id: "gpu-asr", model_provider: "xinference" })
   const speaker = model({ ...tts, model_id: "gpu-tts", model_provider: "xinference" })
   request.mockImplementation(async (url: string) => url.includes("/capabilities")
-    ? new Response(JSON.stringify({ streaming: true, server_vad: true }), { status: 200 })
+    ? new Response(JSON.stringify({ streaming: true, server_vad: true, formats: ["pcm"], sample_rates: [24000] }), { status: 200 })
     : response([live, speaker]))
   const view = renderHook(() => useVoiceModels(true))
   await waitFor(() => expect(view.result.current.loading).toBe(false))
   expect(view.result.current.asr).toMatchObject([live])
   expect(view.result.current.tts).toMatchObject([speaker])
   expect(voiceModelReason(view.result.current)).toBeUndefined()
+  view.unmount()
+})
+
+it.each([
+  { streaming: true },
+  { streaming: true, formats: ["mp3"], sample_rates: [24000] },
+  { streaming: true, formats: ["pcm"], sample_rates: [16000] },
+  { streaming: false, formats: ["pcm"], sample_rates: [24000] },
+])("rejects Xinference TTS capabilities incompatible with voice playback: %j", async capabilities => {
+  const speaker = model({ ...tts, model_id: "gpu-tts", model_provider: "xinference" })
+  request.mockImplementation(async (url: string) => url.includes("/capabilities")
+    ? new Response(JSON.stringify(capabilities), { status: 200 })
+    : response([asr, speaker]))
+  const view = renderHook(() => useVoiceModels(true))
+  await waitFor(() => expect(view.result.current.loading).toBe(false))
+  expect(view.result.current.tts).toEqual([])
+  expect(voiceModelReason(view.result.current)).toBe("needsTts")
   view.unmount()
 })
 

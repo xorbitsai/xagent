@@ -680,6 +680,34 @@ class TestSandboxLifecycleConfig:
         assert service.get_or_create.await_args_list[0].args[0] == "user::42"
         assert service.get_or_create.await_args_list[1].args[0] == "build_preview::42"
 
+    @pytest.mark.asyncio
+    async def test_cached_reconciled_sandbox_rechecks_runtime_network_policy(
+        self, tmp_path
+    ):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_42"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            await manager.get_or_create_sandbox("user", "42", mount_intent=mount_intent)
+            inspection = await service.inspect("user::42")
+            assert inspection is not None
+            inspection.runtime_policy_matches = False
+            service.inspect.return_value = inspection
+
+            with pytest.raises(
+                SandboxRuntimeConflictError, match="runtime network policy"
+            ):
+                await manager.get_or_create_sandbox(
+                    "user", "42", mount_intent=mount_intent
+                )
+
 
 class TestSandboxLeaseProvider:
     """Test leasing primary and worker sandboxes for tool execution."""

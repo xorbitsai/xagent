@@ -1964,7 +1964,7 @@ class DockerSandboxService(SandboxService):
             ) from exc
         try:
             sandbox_network = self._client.networks.get(self._network)
-        except (errors.NotFound, errors.ImageNotFound) as exc:
+        except errors.NotFound as exc:
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox Docker network {self._network!r} is not "
                 "available on the daemon"
@@ -1995,6 +1995,12 @@ class DockerSandboxService(SandboxService):
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox Docker network {self._network!r} must carry "
                 f"the label {SANDBOX_NETWORK_LABEL}={SANDBOX_NETWORK_LABEL_VALUE}"
+            )
+        options = cast(dict[str, str], network_attrs.get("Options") or {})
+        if options.get("com.docker.network.bridge.enable_icc") != "false":
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} must disable "
+                "inter-container communication"
             )
         security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(

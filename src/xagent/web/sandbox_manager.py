@@ -1365,7 +1365,21 @@ class SandboxManager:
         cached_spec = self._config_cache.get(sandbox_name)
         if cached_spec is not None:
             self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
-            return self._cache[sandbox_name]
+            if not await self._resolve_backend_probe():
+                return self._cache[sandbox_name]
+            inspection = await self._service.inspect(sandbox_name)
+            if inspection is None:
+                # The daemon object was removed out of band. Drop the stale
+                # process-local handle and continue through normal recovery.
+                self._cache.pop(sandbox_name, None)
+                self._config_cache.pop(sandbox_name, None)
+            elif inspection.runtime_policy_matches is False:
+                raise SandboxRuntimeConflictError(
+                    f"Sandbox {sandbox_name!r} no longer satisfies the runtime "
+                    "network policy"
+                )
+            else:
+                return self._cache[sandbox_name]
 
         probe = await self._resolve_backend_probe()
         if not probe:

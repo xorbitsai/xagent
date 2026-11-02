@@ -18,9 +18,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from docker import errors
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
+from docker import errors
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     SANDBOX_RUNTIME_GID,
@@ -153,28 +153,25 @@ def event_loop():
 def configured_module_sandbox_network():
     """Provide a real dedicated bridge only to this Docker service module."""
     key = "XAGENT_SANDBOX_NETWORK"
-    previous = os.environ.get(key)
     network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
     network = None
-    os.environ[key] = network_name
-    if is_docker_available():
-        client = docker_sandbox_module._create_docker_client()
-        network = client.networks.create(
-            network_name,
-            driver="bridge",
-            labels={
-                docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
-            },
-        )
-    try:
-        yield
-    finally:
-        if network is not None:
-            network.remove()
-        if previous is None:
-            os.environ.pop(key, None)
-        else:
-            os.environ[key] = previous
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv(key, network_name)
+        try:
+            if is_docker_available():
+                client = docker_sandbox_module._create_docker_client()
+                network = client.networks.create(
+                    network_name,
+                    driver="bridge",
+                    labels={
+                        docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                    },
+                    options={"com.docker.network.bridge.enable_icc": "false"},
+                )
+            yield
+        finally:
+            if network is not None:
+                network.remove()
 
 
 requires_docker = pytest.mark.skipif(
@@ -193,6 +190,7 @@ def docker_service():
         labels={
             docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
         },
+        options={"com.docker.network.bridge.enable_icc": "false"},
     )
     try:
         yield DockerSandboxService(
@@ -228,6 +226,7 @@ class _FakeDockerClient:
                     "Labels": {
                         docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
                     },
+                    "Options": {"com.docker.network.bridge.enable_icc": "false"},
                 },
             )
         )
@@ -423,6 +422,22 @@ class TestDockerSandboxServiceFailures:
         monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
 
         with pytest.raises(SandboxRuntimeConflictError, match="must carry the label"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_icc_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get(os.environ["XAGENT_SANDBOX_NETWORK"])
+        network.attrs["Options"] = {"com.docker.network.bridge.enable_icc": "true"}
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="inter-container"):
             service.validate_host_workspace_access()
 
     def test_host_workspace_readiness_reports_socket_proxy_network_denial(

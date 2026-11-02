@@ -55,6 +55,7 @@ def docker_service():
         labels={
             docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
         },
+        options={"com.docker.network.bridge.enable_icc": "false"},
     )
     try:
         yield DockerSandboxService(

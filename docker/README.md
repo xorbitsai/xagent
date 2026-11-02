@@ -297,9 +297,10 @@ a privileged deployment mode: Docker socket access is effectively host-level
 container control.
 
 When `DOCKER_HOST` points at a restricted Docker socket proxy instead, the
-proxy must permit daemon inspection through `GET /info`. For
-Tecnativa/docker-socket-proxy, set `INFO=1`; readiness fails closed if Xagent
-cannot verify the daemon's security mode.
+proxy must permit daemon inspection through both `GET /info` and
+`GET /networks/{name}`. For Tecnativa/docker-socket-proxy, set `INFO=1` and
+`NETWORKS=1`; readiness fails closed if Xagent cannot verify the daemon's
+security mode and the dedicated sandbox bridge configuration.
 
 The backend process itself must run as effective uid 0, and the Docker daemon
 must be rootful with user-namespace remapping disabled. Xagent uses that host

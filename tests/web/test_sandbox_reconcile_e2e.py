@@ -84,7 +84,14 @@ def docker_service():
     """Shared real Docker service/store for this module's tests."""
     client = docker_sandbox_module._create_docker_client()
     network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
-    network = client.networks.create(network_name, driver="bridge")
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+        options={"com.docker.network.bridge.enable_icc": "false"},
+    )
     try:
         yield DockerSandboxService(
             MemDockerStore(),

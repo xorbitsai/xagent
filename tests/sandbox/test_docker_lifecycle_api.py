@@ -88,6 +88,7 @@ def docker_service():
         labels={
             docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
         },
+        options={"com.docker.network.bridge.enable_icc": "false"},
     )
     try:
         yield DockerSandboxService(
@@ -312,6 +313,25 @@ class TestRuntimeNetworkPolicy:
     async def test_start_existing_rejects_network_policy_drift(self, drifted_service):
         with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
             await drifted_service.start_existing("box")
+
+    @pytest.mark.asyncio
+    async def test_configured_network_plus_extra_network_is_rejected(self, monkeypatch):
+        container = _FakeCreatedContainer()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeDockerClient([container]),
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module,
+            "_build_inspection",
+            lambda _container: _observed_inspection(
+                runtime_networks=(service._network, "bridge")
+            ),
+        )
+
+        with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
+            await service.start_existing("box")
 
 
 # --- create(): mock-layer tests for paths that are impractical against a
@@ -760,6 +780,15 @@ class TestFindPublishMismatchesEveryBranch:
             ("working_dir", {"working_dir": "/somewhere/else"}),
             ("network_isolated", {"network_isolated": True}),
             ("runtime_networks", {"runtime_networks": ("other-network",)}),
+            (
+                "runtime_networks",
+                {
+                    "runtime_networks": (
+                        "xagent-test-sandbox-egress",
+                        "bridge",
+                    )
+                },
+            ),
             ("cpus", {"raw_nano_cpus": 2_000_000_000}),
             ("memory", {"raw_memory_bytes": 1024 * 1024 * 1024}),
             ("pids_limit", {"raw_pids_limit": 2048}),

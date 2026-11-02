@@ -645,6 +645,75 @@ async def test_text_only_fallback_rejects_required_image(
         )
 
 
+def _unbuildable_service_router(
+    monkeypatch, *, configured: bool = False
+) -> tuple[RouterLLM, Exception]:
+    build_error = ValueError("unknown XROUTER_EMBEDDING_BACKEND 'carrier-pigeon'")
+
+    def get_service() -> Any:
+        raise build_error
+
+    monkeypatch.setenv("XAGENT_ROUTER_FALLBACK_MODEL", "fallback/model")
+    monkeypatch.setattr(
+        "xagent.core.model.chat.basic.router._get_service",
+        get_service,
+    )
+    downstream = _ScriptedChatLLM([])
+    router = RouterLLM(
+        downstream_resolver=lambda _model_id, **_kwargs: downstream,
+        candidate_models=("primary/model", "fallback/model") if configured else None,
+    )
+    return router, build_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [False, True], ids=["legacy", "configured"])
+async def test_unbuildable_service_is_reported_instead_of_a_fallback_mismatch(
+    monkeypatch,
+    configured: bool,
+) -> None:
+    router, build_error = _unbuildable_service_router(
+        monkeypatch, configured=configured
+    )
+
+    with pytest.raises(RouterModalityRoutingError) as excinfo:
+        await router.prepare_for_call(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "inspect"},
+                        {"type": "image_url", "image_url": {"url": "http://x/y.png"}},
+                    ],
+                }
+            ]
+        )
+
+    message = str(excinfo.value)
+    assert "fallback/model" in message
+    assert "could not be checked" in message
+    assert "carrier-pigeon" in message
+    assert "does not support" not in message
+    assert excinfo.value.__cause__ is build_error
+
+
+@pytest.mark.asyncio
+async def test_unbuildable_service_still_serves_text_calls_on_the_fallback(
+    monkeypatch,
+) -> None:
+    router, _build_error = _unbuildable_service_router(monkeypatch)
+
+    prepared = await router.prepare_for_call(
+        [{"role": "user", "content": "plain text only"}],
+        preferred_input_modalities=("image",),
+    )
+
+    # The advisory image preference cannot be checked against the fallback,
+    # so the call is served without claiming vision.
+    assert prepared.model_name == "fallback/model"
+    assert not prepared.has_ability("vision")
+
+
 class _LegacyModalityUnawareService:
     """An installed xrouter-llm whose route() predates modality preferences."""
 

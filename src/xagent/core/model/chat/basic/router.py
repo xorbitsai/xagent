@@ -136,6 +136,13 @@ class RouterModalityRoutingError(RuntimeError):
     """The installed router cannot enforce required input modalities."""
 
 
+class _ProfileLookupError(Exception):
+    """xrouter's model profiles could not be read, so nothing was checked.
+
+    Usually the routing service failed to build; ``__cause__`` carries why.
+    """
+
+
 # Downstream failures that say the selected model cannot serve requests right
 # now -- its provider is down, slow, out of capacity or quota, or no longer
 # accepts the credential or the model name -- rather than that this request
@@ -459,7 +466,7 @@ class RouterLLM(BaseLLM):
         configured = self._candidate_input_modalities.get(candidate_id)
         if configured is not None:
             return configured
-        return self._profile_input_modalities(self._profile_id(candidate_id))
+        return self._known_input_modalities(self._profile_id(candidate_id))
 
     async def chat(
         self,
@@ -607,7 +614,7 @@ class RouterLLM(BaseLLM):
             fallback_model = None
         context_window = await self._context_window_for(model_id, downstream)
         input_modalities = (
-            await asyncio.to_thread(self._profile_input_modalities, model_id)
+            await asyncio.to_thread(self._known_input_modalities, model_id)
             if route_input_modalities
             else ()
         )
@@ -889,16 +896,23 @@ class RouterLLM(BaseLLM):
 
     @staticmethod
     def _profile_input_modalities(model_id: str) -> tuple[str, ...]:
+        """The input modalities xrouter's model profile lists for ``model_id``.
+
+        ``()`` means the profile lists none, or there is no such profile.
+        Raises ``_ProfileLookupError`` when the profiles could not be read at
+        all, so a caller can tell an unchecked model from one that lacks a
+        modality.
+        """
         try:
             profile = _get_service().profiles.get(model_id)
             values = getattr(profile, "input_modalities", ())
-        except Exception as exc:  # noqa: BLE001 - metadata is best effort
+        except Exception as exc:  # noqa: BLE001 - reported as a lookup failure
             logger.warning(
                 "Could not resolve xrouter input modalities for %s: %s",
                 model_id,
                 exc,
             )
-            return ()
+            raise _ProfileLookupError(str(exc)) from exc
         if not isinstance(values, (list, tuple, set, frozenset)):
             return ()
         return tuple(
@@ -907,6 +921,18 @@ class RouterLLM(BaseLLM):
             )
         )
 
+    def _known_input_modalities(self, model_id: str) -> tuple[str, ...]:
+        """``_profile_input_modalities``, but an unchecked model accepts nothing.
+
+        For callers that only narrow candidates or advertise abilities: a
+        model whose profile could not be read is not offered content it might
+        reject. The lookup failure is already logged.
+        """
+        try:
+            return self._profile_input_modalities(model_id)
+        except _ProfileLookupError:
+            return ()
+
     def _compatible_fallback(
         self, required_input_modalities: tuple[str, ...]
     ) -> str | None:
@@ -914,7 +940,17 @@ class RouterLLM(BaseLLM):
             return None
         if not required_input_modalities:
             return self._fallback_model
-        supported = set(self._profile_input_modalities(self._fallback_model))
+        try:
+            supported = set(self._profile_input_modalities(self._fallback_model))
+        except _ProfileLookupError as exc:
+            # Still a refusal -- the content cannot go to a model nobody
+            # checked -- but one that names the lookup failure, not the model.
+            raise RouterModalityRoutingError(
+                f"Auto fallback model {self._fallback_model!r} could not be "
+                "checked for required input modalities "
+                f"({', '.join(required_input_modalities)}): xrouter model "
+                f"profiles are unavailable ({exc})"
+            ) from exc.__cause__
         missing = sorted(set(required_input_modalities) - supported)
         if missing:
             raise RouterModalityRoutingError(

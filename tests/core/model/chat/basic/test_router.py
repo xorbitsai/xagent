@@ -645,7 +645,9 @@ async def test_text_only_fallback_rejects_required_image(
         )
 
 
-def _unbuildable_service_router(monkeypatch) -> tuple[RouterLLM, Exception]:
+def _unbuildable_service_router(
+    monkeypatch, *, configured: bool = False
+) -> tuple[RouterLLM, Exception]:
     build_error = ValueError("unknown XROUTER_EMBEDDING_BACKEND 'carrier-pigeon'")
 
     def get_service() -> Any:
@@ -657,14 +659,22 @@ def _unbuildable_service_router(monkeypatch) -> tuple[RouterLLM, Exception]:
         get_service,
     )
     downstream = _ScriptedChatLLM([])
-    return RouterLLM(downstream_resolver=lambda _model_id: downstream), build_error
+    router = RouterLLM(
+        downstream_resolver=lambda _model_id, **_kwargs: downstream,
+        candidate_models=("primary/model", "fallback/model") if configured else None,
+    )
+    return router, build_error
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("configured", [False, True], ids=["legacy", "configured"])
 async def test_unbuildable_service_is_reported_instead_of_a_fallback_mismatch(
     monkeypatch,
+    configured: bool,
 ) -> None:
-    router, build_error = _unbuildable_service_router(monkeypatch)
+    router, build_error = _unbuildable_service_router(
+        monkeypatch, configured=configured
+    )
 
     with pytest.raises(RouterModalityRoutingError) as excinfo:
         await router.prepare_for_call(

@@ -23,6 +23,12 @@ from xagent.web.memory_lifecycle import (
     MemoryUnavailableError,
 )
 from xagent.web.services import agent_service_manager as agent_runtime_service
+from xagent.web.services.memory_binding import (
+    MemoryStoreBinding,
+    MemoryTaskBindingRequest,
+    MemoryToolAssemblyRequest,
+    set_trusted_memory_binding_resolver,
+)
 from xagent.web.services.memory_policy import (
     MEMORY_POLICY_BINDING_FAILURE_REASON,
     MEMORY_POLICY_RESOLVER_FAILURE_REASON,
@@ -37,8 +43,10 @@ from xagent.web.user_isolated_memory import UserIsolatedMemoryStore
 @pytest.fixture(autouse=True)
 def clear_memory_policy_resolver() -> Iterator[None]:
     set_trusted_memory_policy_resolver(None)
+    set_trusted_memory_binding_resolver(None)
     yield
     set_trusted_memory_policy_resolver(None)
+    set_trusted_memory_binding_resolver(None)
 
 
 def _task(*, agent_id: int | None = None, source: str | None = None) -> Any:
@@ -85,6 +93,201 @@ def test_default_memory_policy_is_unchanged_without_resolver(
     else:
         assert policy.memory is dynamic_store
         get_memory_store.assert_called_once_with()
+
+
+def test_binding_selects_store_once_and_fences_retrieval_by_route() -> None:
+    first_store = InMemoryMemoryStore()
+    second_store = InMemoryMemoryStore()
+    selected: dict[str, Any] = {
+        "store": first_store,
+        "backend": "backend-a",
+        "generation": "route-1",
+    }
+    requests: list[MemoryTaskBindingRequest] = []
+
+    def resolver(request: object) -> MemoryStoreBinding:
+        assert isinstance(request, MemoryTaskBindingRequest)
+        requests.append(request)
+        return MemoryStoreBinding(
+            store=selected["store"],
+            backend_identity=str(selected["backend"]),
+            route_generation=str(selected["generation"]),
+        )
+
+    set_trusted_memory_binding_resolver(resolver)
+
+    first = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+    first_fingerprint = first.execution_metadata(
+        ambient_owner_user_id=23,
+        ambient_execution_scope=None,
+    )[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY]
+    assert first.memory is first_store
+    assert len(requests) == 1
+
+    selected.update(store=second_store, generation="route-2")
+    second = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+    second_fingerprint = second.execution_metadata(
+        ambient_owner_user_id=23,
+        ambient_execution_scope=None,
+    )[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY]
+
+    assert second.memory is second_store
+    assert len(requests) == 2
+    assert first_fingerprint != second_fingerprint
+    assert requests == [
+        MemoryTaskBindingRequest(
+            task_id=17,
+            user_id=23,
+            agent_id=None,
+            source=None,
+            is_preview=False,
+        ),
+        MemoryTaskBindingRequest(
+            task_id=17,
+            user_id=23,
+            agent_id=None,
+            source=None,
+            is_preview=False,
+        ),
+    ]
+
+
+def test_disabled_preview_does_not_resolve_a_backend_binding() -> None:
+    resolver = Mock(side_effect=AssertionError("disabled preview must not bind"))
+    set_trusted_memory_binding_resolver(resolver)
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(
+        task=_task(),
+        agent_config={"is_preview": True},
+    )
+
+    assert policy.memory_enabled is False
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    resolver.assert_not_called()
+
+
+def test_binding_failure_is_inert_and_never_falls_back_to_global_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    global_store = Mock(side_effect=AssertionError("must not fall back"))
+    monkeypatch.setattr(agent_runtime_service, "get_memory_store", global_store)
+    set_trusted_memory_binding_resolver(
+        Mock(side_effect=RuntimeError("remote unavailable"))
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert (
+        policy.memory_availability_reason
+        == agent_runtime_service.MEMORY_BINDING_RESOLUTION_FAILURE_REASON
+    )
+    global_store.assert_not_called()
+
+
+def test_binding_tool_factory_is_scoped_to_the_selected_snapshot() -> None:
+    seen: list[MemoryToolAssemblyRequest] = []
+    tool = object()
+
+    def factory(request: MemoryToolAssemblyRequest) -> list[object]:
+        seen.append(request)
+        return [tool]
+
+    store = InMemoryMemoryStore()
+    set_trusted_memory_binding_resolver(
+        lambda _request: MemoryStoreBinding(
+            store=store,
+            backend_identity="backend-a",
+            route_generation="route-1",
+            memory_tools_factory=factory,
+        )
+    )
+
+    policy = agent_runtime_service.resolve_agent_service_memory_policy(task=_task())
+    assert policy.memory_tools_factory is not None
+    assert policy.memory_tools_factory(
+        memory_store=policy.memory,
+        task="remember",
+        runtime="runtime",
+        context="context",
+    ) == [tool]
+    [request] = seen
+    assert request.memory_store is store
+    assert request.task == "remember"
+    assert request.runtime == "runtime"
+    assert request.context == "context"
+
+
+@pytest.mark.asyncio
+async def test_cached_service_rebinds_store_and_actual_tool_factory() -> None:
+    first_store = InMemoryMemoryStore()
+    second_store = InMemoryMemoryStore()
+    first_tool = object()
+    second_tool = object()
+    selected: dict[str, Any] = {
+        "store": first_store,
+        "tool": first_tool,
+        "generation": "1",
+    }
+
+    def resolver(_request: object) -> MemoryStoreBinding:
+        selected_tool = selected["tool"]
+        return MemoryStoreBinding(
+            store=selected["store"],
+            backend_identity="backend-a",
+            route_generation=str(selected["generation"]),
+            memory_tools_factory=lambda _assembly: [selected_tool],
+        )
+
+    set_trusted_memory_binding_resolver(resolver)
+    service = AgentService(
+        name="cached",
+        id="web_task_17",
+        tools=[],
+        enable_workspace=False,
+        memory=InMemoryMemoryStore(),
+    )
+    service._execution_adapter = service._build_execution_adapter()
+    manager = agent_runtime_service.AgentServiceManager()
+    manager._agents[17] = service
+
+    await manager._reconcile_cached_agent_memory_policy(
+        17,
+        task=_task(),
+        agent_config={},
+        ambient_owner_user_id=23,
+        ambient_execution_scope=None,
+    )
+    assert service.memory is first_store
+    assert service._execution_adapter.config.memory_store is first_store
+    assert service.memory_tools_factory is not None
+    assert service.memory_tools_factory(
+        memory_store=first_store,
+        task="first",
+        runtime=None,
+        context=None,
+    ) == [first_tool]
+
+    selected.update(store=second_store, tool=second_tool, generation="2")
+    await manager._reconcile_cached_agent_memory_policy(
+        17,
+        task=_task(),
+        agent_config={},
+        ambient_owner_user_id=23,
+        ambient_execution_scope=None,
+    )
+
+    assert service.memory is second_store
+    assert service._execution_adapter.config.memory_store is second_store
+    assert service.memory_tools_factory is not None
+    assert service.memory_tools_factory(
+        memory_store=second_store,
+        task="second",
+        runtime=None,
+        context=None,
+    ) == [second_tool]
 
 
 def test_trusted_resolver_can_enable_preview_memory(

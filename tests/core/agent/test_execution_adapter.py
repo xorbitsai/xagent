@@ -119,6 +119,39 @@ class RecordingRegistry:
         return StartHandle()
 
 
+class BindingSnapshotRegistry:
+    def __init__(self) -> None:
+        self.handles: dict[str, SimpleNamespace] = {}
+        self.started_runners: list[Any] = []
+        self.resumed_binding: tuple[Any, Any] | None = None
+
+    def start(
+        self,
+        runner: Any,
+        *,
+        execution_id: str,
+        metadata: dict[str, Any],
+        **_kwargs: Any,
+    ) -> StartHandle:
+        self.started_runners.append(runner)
+        self.handles[execution_id] = SimpleNamespace(
+            runner=runner,
+            metadata=dict(metadata),
+        )
+        return StartHandle()
+
+    def get(self, execution_id: str) -> SimpleNamespace | None:
+        return self.handles.get(execution_id)
+
+    async def resume(self, execution_id: str, **_kwargs: Any) -> dict[str, Any]:
+        runner = self.handles[execution_id].runner
+        self.resumed_binding = (
+            runner.agent.memory_store,
+            runner.agent.memory_tools_factory,
+        )
+        return {"success": True, "output": "resumed"}
+
+
 class NoSkillManager:
     async def list_skills(self) -> list[dict[str, Any]]:
         return []
@@ -176,6 +209,47 @@ def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -
     assert metadata["builtin_agent_name"] == "internal_worker"
     assert normalized["metadata"]["agent_type"] == "builtin"
     assert normalized["metadata"]["builtin_agent_name"] == "internal_worker"
+
+
+@pytest.mark.asyncio
+async def test_execution_binding_is_snapshotted_until_next_start_or_resume() -> None:
+    old_store = InMemoryMemoryStore()
+    new_store = InMemoryMemoryStore()
+
+    def old_factory(_request: object) -> list[str]:
+        return ["old"]
+
+    def new_factory(_request: object) -> list[str]:
+        return ["new"]
+
+    registry = BindingSnapshotRegistry()
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="memory-binding-snapshot",
+            pattern="react",
+            llm=FakeLLM([]),
+            registry=cast(Any, registry),
+            memory_store=old_store,
+            memory_tools_factory=old_factory,
+        )
+    )
+
+    adapter.start(task="active turn", task_id="active")
+    active_runner = registry.started_runners[-1]
+
+    adapter.config.memory_store = new_store
+    adapter.config.memory_tools_factory = new_factory
+
+    assert active_runner.agent.memory_store is old_store
+    assert active_runner.agent.memory_tools_factory is old_factory
+
+    adapter.start(task="next turn", task_id="next")
+    next_runner = registry.started_runners[-1]
+    assert next_runner.agent.memory_store is new_store
+    assert next_runner.agent.memory_tools_factory is new_factory
+
+    await adapter.resume("active")
+    assert registry.resumed_binding == (new_store, new_factory)
 
 
 @pytest.mark.asyncio

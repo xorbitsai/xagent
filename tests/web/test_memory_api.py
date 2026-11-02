@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 from unittest.mock import Mock
@@ -18,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.storage_admission import (
     DormantLanceDBMemoryHandle,
@@ -32,6 +34,11 @@ from xagent.web.api.memory import MemoryManagementRouter
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
+from xagent.web.services.memory_binding import (
+    MemoryManagementBindingRequest,
+    MemoryStoreBinding,
+    set_trusted_memory_binding_resolver,
+)
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 # Fixture IDs in the minted str(uuid.uuid4()) form; the routes accept any opaque ID.
@@ -49,6 +56,13 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture(autouse=True)
+def clear_memory_binding_resolver() -> Iterator[None]:
+    set_trusted_memory_binding_resolver(None)
+    yield
+    set_trusted_memory_binding_resolver(None)
 
 
 def override_get_db():
@@ -158,6 +172,82 @@ def sample_memory_notes():
             mime_type="text/plain",
         ),
     ]
+
+
+def test_management_binding_resolves_once_per_request_after_authentication(
+    auth_headers: dict[str, str],
+    test_db: User,
+) -> None:
+    selected_store = InMemoryMemoryStore()
+    legacy_provider = Mock(side_effect=AssertionError("legacy store must not be used"))
+    requests: list[MemoryManagementBindingRequest] = []
+
+    def resolver(request: object) -> MemoryStoreBinding:
+        assert isinstance(request, MemoryManagementBindingRequest)
+        requests.append(request)
+        return MemoryStoreBinding(
+            store=selected_store,
+            backend_identity="backend-a",
+            route_generation="route-1",
+            public_diagnostics={"backend": "host-managed", "ready": True},
+        )
+
+    set_trusted_memory_binding_resolver(resolver)
+    app = FastAPI()
+    app.include_router(auth_router)
+    app.include_router(MemoryManagementRouter(legacy_provider).get_router())
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    created = client.post(
+        "/api/memory",
+        json={"content": "bound note"},
+        headers=auth_headers,
+    )
+    info = client.get("/api/memory/store-info", headers=auth_headers)
+
+    assert created.status_code == 200
+    assert info.status_code == 200
+    assert info.json() == {"backend": "host-managed", "ready": True}
+    assert requests == [
+        MemoryManagementBindingRequest(authenticated_user_id=int(test_db.id)),
+        MemoryManagementBindingRequest(authenticated_user_id=int(test_db.id)),
+    ]
+    legacy_provider.assert_not_called()
+    assert selected_store.get(created.json()["memory_id"]).success
+
+
+def test_management_binding_failure_returns_503_without_legacy_fallback(
+    auth_headers: dict[str, str],
+) -> None:
+    legacy_provider = Mock(side_effect=AssertionError("legacy store must not be used"))
+    set_trusted_memory_binding_resolver(
+        Mock(side_effect=RuntimeError("backend unavailable"))
+    )
+    app = FastAPI()
+    app.include_router(auth_router)
+    app.include_router(MemoryManagementRouter(legacy_provider).get_router())
+    app.dependency_overrides[get_db] = override_get_db
+
+    response = TestClient(app).get("/api/memory/list", headers=auth_headers)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Memory storage is temporarily unavailable."}
+    legacy_provider.assert_not_called()
+
+
+def test_management_binding_is_not_resolved_before_authentication() -> None:
+    resolver = Mock(side_effect=AssertionError("resolver must run after auth"))
+    set_trusted_memory_binding_resolver(resolver)
+    app = FastAPI()
+    app.include_router(auth_router)
+    app.include_router(MemoryManagementRouter().get_router())
+    app.dependency_overrides[get_db] = override_get_db
+
+    response = TestClient(app).get("/api/memory/list")
+
+    assert response.status_code == 401
+    resolver.assert_not_called()
 
 
 class TestMemoryListEndpoint:

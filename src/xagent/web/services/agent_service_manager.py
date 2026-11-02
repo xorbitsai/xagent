@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
@@ -115,7 +116,16 @@ from .memory_availability import (
 from .memory_availability import (
     public_memory_availability_reason,
 )
+from .memory_binding import (
+    MemoryBindingResolutionError,
+    MemoryStoreBinding,
+    MemoryTaskBindingRequest,
+    MemoryToolAssemblyRequest,
+    MemoryToolFactory,
+    resolve_trusted_memory_binding,
+)
 from .memory_policy import (
+    MEMORY_BINDING_RESOLUTION_FAILURE_REASON,
     MEMORY_POLICY_BINDING_FAILURE_REASON,
     MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON,
     MEMORY_POLICY_TASK_MISSING_REASON,
@@ -248,6 +258,9 @@ class AgentServiceMemoryPolicy:
     memory_available: bool = True
     memory_availability_reason: str | None = None
     memory_access_scope: MemoryAccessScope | None = None
+    backend_identity: str | None = None
+    route_generation: str | None = None
+    memory_tools_factory: Callable[..., list[Any]] | None = None
 
     @property
     def public_availability_reason(self) -> str | None:
@@ -287,6 +300,8 @@ class AgentServiceMemoryPolicy:
                         ExecutionScope | None,
                         ambient_execution_scope,
                     ),
+                    backend_identity=self.backend_identity,
+                    route_generation=self.route_generation,
                 )
             )
         if not self.memory_available:
@@ -304,6 +319,92 @@ class AgentServiceMemoryPolicy:
 def _optional_task_int(task: Any, field: str) -> int | None:
     value = getattr(task, field, None)
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _adapt_memory_tools_factory(
+    factory: MemoryToolFactory | None,
+) -> Callable[..., list[Any]] | None:
+    """Adapt the public frozen request contract to the core runtime callback."""
+
+    if factory is None:
+        return None
+
+    def build_tools(
+        *,
+        memory_store: MemoryStore,
+        task: str,
+        runtime: Any | None,
+        context: Any | None,
+    ) -> list[Any]:
+        tools = factory(
+            MemoryToolAssemblyRequest(
+                memory_store=memory_store,
+                task=task,
+                runtime=runtime,
+                context=context,
+            )
+        )
+        if isinstance(tools, (str, bytes)) or not isinstance(tools, Sequence):
+            raise TypeError("memory tools factory must return a sequence")
+        return list(tools)
+
+    return build_tools
+
+
+def _inert_memory_policy(reason: str) -> AgentServiceMemoryPolicy:
+    return AgentServiceMemoryPolicy(
+        memory=InMemoryMemoryStore(),
+        memory_enabled=False,
+        memory_available=False,
+        memory_availability_reason=reason,
+    )
+
+
+def _compose_memory_binding(
+    *,
+    binding: MemoryStoreBinding,
+    policy_scope: MemoryAccessScope | None,
+    enabled: bool,
+    availability_reason: str | None,
+) -> AgentServiceMemoryPolicy:
+    """Combine backend selection with the legacy eligibility authority.
+
+    A host may keep its existing policy resolver as the scope authority while
+    the new binding resolver selects only a backend. If both resolvers provide
+    scopes they must agree exactly; two different identity authorities are
+    rejected instead of being nested or silently preferred.
+    """
+
+    binding_scope = binding.access_scope
+    if binding_scope is not None and policy_scope is not None:
+        if binding_scope != policy_scope:
+            return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+        selected_scope = binding_scope
+        memory = binding.store
+    elif binding_scope is not None:
+        selected_scope = binding_scope
+        memory = binding.store
+    elif policy_scope is not None:
+        selected_scope = policy_scope
+        try:
+            memory = bind_memory_access_scope(binding.store, policy_scope)
+        except Exception:
+            logger.warning("Trusted memory access-scope binding failed")
+            return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+    else:
+        selected_scope = None
+        memory = binding.store
+
+    return AgentServiceMemoryPolicy(
+        memory=memory,
+        memory_enabled=enabled,
+        memory_available=True,
+        memory_availability_reason=availability_reason,
+        memory_access_scope=selected_scope,
+        backend_identity=binding.backend_identity,
+        route_generation=binding.route_generation,
+        memory_tools_factory=_adapt_memory_tools_factory(binding.memory_tools_factory),
+    )
 
 
 def resolve_agent_service_memory_policy(
@@ -348,6 +449,27 @@ def resolve_agent_service_memory_policy(
             memory_availability_reason=None if override is None else override.reason,
         )
 
+    binding_request = MemoryTaskBindingRequest(
+        task_id=_optional_task_int(task, "id"),
+        user_id=_optional_task_int(task, "user_id"),
+        agent_id=_optional_task_int(task, "agent_id"),
+        source=source if isinstance(source, str) else None,
+        is_preview=is_preview,
+    )
+    try:
+        binding = resolve_trusted_memory_binding(binding_request)
+    except MemoryBindingResolutionError:
+        return _inert_memory_policy(MEMORY_BINDING_RESOLUTION_FAILURE_REASON)
+
+    policy_scope = override.memory_access_scope if override is not None else None
+    if binding is not None:
+        return _compose_memory_binding(
+            binding=binding,
+            policy_scope=policy_scope,
+            enabled=enabled,
+            availability_reason=None if override is None else override.reason,
+        )
+
     try:
         memory: MemoryStore = get_memory_store()
     except MemoryUnavailableError as error:
@@ -366,7 +488,7 @@ def resolve_agent_service_memory_policy(
             memory_availability_reason=error.status.state.value,
         )
 
-    access_scope = override.memory_access_scope if override is not None else None
+    access_scope = policy_scope
     if access_scope is not None:
         try:
             memory = bind_memory_access_scope(memory, access_scope)
@@ -3116,6 +3238,7 @@ class AgentServiceManager:
                         memory_enabled=memory_policy.memory_enabled,
                         memory_available=memory_policy.memory_available,
                         memory_availability_reason=memory_policy.public_availability_reason,
+                        memory_tools_factory=memory_policy.memory_tools_factory,
                         execution_metadata=memory_policy.execution_metadata(
                             ambient_owner_user_id=runtime_user_id,
                             ambient_execution_scope=scope,
@@ -3348,6 +3471,7 @@ class AgentServiceManager:
                 enabled=policy.memory_enabled,
                 available=True,
                 availability_reason=policy.public_availability_reason,
+                memory_tools_factory=policy.memory_tools_factory,
                 execution_metadata=execution_metadata,
             )
         if not policy.memory_available:
@@ -4565,6 +4689,7 @@ class AgentServiceManager:
                     memory_enabled=memory_policy.memory_enabled,
                     memory_available=memory_policy.memory_available,
                     memory_availability_reason=memory_policy.public_availability_reason,
+                    memory_tools_factory=memory_policy.memory_tools_factory,
                     execution_metadata=memory_policy.execution_metadata(
                         ambient_owner_user_id=user_id,
                         ambient_execution_scope=scope,

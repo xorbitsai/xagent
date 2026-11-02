@@ -28,6 +28,7 @@ class Agent:
     system_prompt: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     memory_store: "MemoryStore | None" = None
+    memory_tools_factory: Any | None = None
     memory_similarity_threshold: float | None = None
     skill_manager: "SkillManager | None" = None
     allowed_skills: list[str] | None = None

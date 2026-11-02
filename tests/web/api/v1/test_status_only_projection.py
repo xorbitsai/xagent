@@ -324,6 +324,8 @@ EXCLUDE = {
     ("POST", "/v1/agents"),
     ("POST", "/v1/agents/from-template"),
     ("POST", "/v1/agents/{agent_id}/api-key"),
+    ("GET", "/v1/agents/{agent_id}/skills"),
+    ("PUT", "/v1/agents/{agent_id}/skills"),
     ("GET", "/v1/skills"),
     ("GET", "/v1/skills/{name}"),
     ("POST", "/v1/skills"),

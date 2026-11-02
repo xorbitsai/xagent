@@ -187,6 +187,8 @@ _ROUTES = [
     ("POST", "/v1/skills/upload"),
     ("PUT", "/v1/skills/{name}"),
     ("DELETE", "/v1/skills/{name}"),
+    ("GET", "/v1/agents/{agent_id}/skills"),
+    ("PUT", "/v1/agents/{agent_id}/skills"),
 ]
 _KEY_KINDS = ["no-key", "agent-key", "revoked-personal-key", "workspace-key"]
 
@@ -213,14 +215,16 @@ def test_skill_routes_accept_only_a_live_personal_key(method, path, kind):
     mounted = sorted(
         (verb.upper(), template)
         for template, operations in app_for_tests.openapi()["paths"].items()
-        if template == "/v1/skills" or template.startswith("/v1/skills/")
+        if template == "/v1/skills"
+        or template.startswith("/v1/skills/")
+        or (template.startswith("/v1/agents/") and template.endswith("/skills"))
         for verb in operations
     )
-    assert len(mounted) == 6
+    assert len(mounted) == 8
     assert mounted == sorted(_ROUTES)
 
     headers = _headers_for(kind)
-    url = path.replace("{name}", "alpha")
+    url = path.replace("{name}", "alpha").replace("{agent_id}", "1")
     if path.endswith("/upload"):
         resp = client.request(
             method, url, headers=headers, files={"file": ("a.md", b"x")}
@@ -268,15 +272,21 @@ def _v1_source(entry: dict) -> str:
 
 def _assert_listing_is_the_runtime_set(key: str) -> tuple[list[dict], list[str]]:
     """``GET /v1/skills`` lists exactly what a task run for the holder loads,
-    with the same ``source`` there and on ``GET /v1/skills/{name}``.
+    with the same ``source`` there and on ``GET /v1/skills/{name}``, and the
+    names an agent skill list update checks against are that same set.
 
     Returns the listing and the body of each listed skill's GET.
     """
+    from xagent.web.services.skill_management import SkillManagementRuntime
+
     listed = client.get("/v1/skills", headers=_bearer(key))
     assert listed.status_code == 200, listed.text
     assert isinstance(listed.json(), list)
     runtime = asyncio.run(_runtime_skills())
     assert {item["name"] for item in listed.json()} == set(runtime)
+    holder = client.get("/v1/me", headers=_bearer(key)).json()["user_id"]
+    visible = asyncio.run(SkillManagementRuntime().visible_names(user_id=holder))
+    assert visible == set(runtime)
     bodies = []
     for item in listed.json():
         expected = _v1_source(runtime[item["name"]])

@@ -25,9 +25,9 @@ Design notes:
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StringConstraints
 
 from ..api.skill_hub import _MAX_SKILL_MD_CHARS, _NAME_RE
 from .agent import PromptContextFieldDeclaration, PromptContextFieldList
@@ -367,6 +367,62 @@ class V1SkillUpdateRequest(BaseModel):
 
 class V1SkillDeleteResponse(BaseModel):
     name: str
+
+
+class V1AgentSkillsResponse(BaseModel):
+    """Response of ``GET /v1/agents/{agent_id}/skills``."""
+
+    agent_id: int
+    skills: list[str] = Field(..., description="The agent's skill names, in order.")
+
+
+class V1AgentSkillsUpdateRequest(BaseModel):
+    """Body for ``PUT /v1/agents/{agent_id}/skills``.
+
+    ``skills`` replaces the agent's whole skill list, so read the current list
+    with ``GET`` first and send it back with your change. There is no conflict
+    detection: of two concurrent replacements the later one wins. A list holds
+    at most 100 names, so an agent that already has more than 100 cannot be
+    sent back with an edit through this endpoint; it can only be given a
+    shorter list.
+
+    New tasks use the new list at once. An existing task keeps using the
+    previous list while its cached agent runtime is alive: the cache is
+    released after 120 seconds idle, or after 1800 seconds for a task that is
+    paused or waiting for the user, and each server process has its own cache.
+    If the agent is the manager or an enabled worker of a workforce and its
+    list now differs, other than in order, from the list it had when an
+    ongoing workforce conversation started, that conversation is rejected with
+    ``workforce_config_changed`` on its next turn.
+    """
+
+    skills: list[Annotated[str, StringConstraints(min_length=1, max_length=1000)]] = (
+        Field(
+            ...,
+            max_length=100,
+            description=(
+                "The complete new list; a repeated name is kept once, at its "
+                "first position. A name that is not on the agent yet must be "
+                "the name of a skill the key holder can see, or a valid "
+                "personal skill name (1-100 ASCII letters, digits, '_' or '-'). "
+                "Names already on the agent are kept as they are."
+            ),
+        )
+    )
+
+
+class V1AgentSkillsUpdateResponse(V1AgentSkillsResponse):
+    """Response of ``PUT /v1/agents/{agent_id}/skills``."""
+
+    unresolved_for_caller: list[str] = Field(
+        ...,
+        description=(
+            "Names this request added that are not among the skills the key "
+            "holder can see. They are stored anyway, because a task loads the "
+            "skills of the user who runs it, and that user may have a skill "
+            "with this name."
+        ),
+    )
 
 
 class CreateTaskResponse(BaseModel):

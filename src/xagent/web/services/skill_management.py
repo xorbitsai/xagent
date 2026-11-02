@@ -154,6 +154,11 @@ class SkillManagementRuntime:
             sorted(entries, key=lambda e: (e.source != "personal", e.name.lower()))
         )
 
+    async def visible_names(self, *, user_id: int) -> frozenset[str]:
+        """The names of the skills the holder's tasks run with."""
+        manager = await self._manager(user_id)
+        return frozenset(skill["name"] for skill in await manager.list_skills())
+
     async def get_entry(self, *, user_id: int, name: str) -> SkillDetailSnapshot | None:
         manager = await self._manager(user_id)
         entry = await manager.get_skill(name)

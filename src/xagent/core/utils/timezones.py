@@ -199,6 +199,27 @@ _CITY_AREAS = frozenset(
     }
 )
 
+# Legacy names under Australia/ that tzdata keeps as links to current zones
+# (Australia/Victoria -> Australia/Melbourne). Their last segment is a state,
+# territory, island, county or compass direction, not a city, so they are left
+# out of city matching like the country groupings above: "Victoria" would
+# otherwise answer for Victoria, BC with Melbourne time. Written in full, each
+# still resolves as an exact IANA name.
+_LEGACY_REGION_ZONES = frozenset(
+    {
+        "Australia/ACT",
+        "Australia/LHI",
+        "Australia/NSW",
+        "Australia/North",
+        "Australia/Queensland",
+        "Australia/South",
+        "Australia/Tasmania",
+        "Australia/Victoria",
+        "Australia/West",
+        "Australia/Yancowinna",
+    }
+)
+
 
 @lru_cache(maxsize=1)
 def _zone_by_lowercase() -> dict[str, str]:
@@ -207,20 +228,38 @@ def _zone_by_lowercase() -> dict[str, str]:
 
 @lru_cache(maxsize=1)
 def _zone_by_city() -> dict[str, str]:
-    # Keyed by the lowercased last segment. A city that ends more than one
-    # zone name (America/Indianapolis, America/Indiana/Indianapolis) is left
-    # out: picking one would be a guess.
+    # Keyed by the lowercased last segment of each name under a city area,
+    # legacy region names excluded. A city resolves only when exactly one of
+    # those names ends in it and that name has two segments (AREA/CITY).
+    #
+    # A city that ends more than one name stays unresolved
+    # (America/Indianapolis, America/Indiana/Indianapolis). Such a pair is
+    # usually an old and a current name for one zone rather than two different
+    # clocks, but zoneinfo does not expose which name links to which, so this
+    # table does not choose between them; the full name always resolves.
+    #
+    # A three-segment name (America/Argentina/San_Juan,
+    # America/North_Dakota/Center) ends in a town standing for a sub-region,
+    # while the bare name usually means somewhere better known (San Juan,
+    # Puerto Rico), so such a zone is reached only through its full name. It
+    # still counts towards its last segment above, so Indianapolis stays
+    # unresolved instead of matching America/Indianapolis alone.
     zones_by_city: defaultdict[str, list[str]] = defaultdict(list)
     for name in available_timezones():
         area, _, rest = name.partition("/")
-        if area in _CITY_AREAS and rest:
+        if area in _CITY_AREAS and rest and name not in _LEGACY_REGION_ZONES:
             zones_by_city[name.rsplit("/", 1)[1].lower()].append(name)
-    return {city: zones[0] for city, zones in zones_by_city.items() if len(zones) == 1}
+    return {
+        city: zones[0]
+        for city, zones in zones_by_city.items()
+        if len(zones) == 1 and zones[0].count("/") == 1
+    }
 
 
 def _canonical_zone_name(name: str) -> Optional[str]:
     # Tiers in order, each consulted only when the one before has no entry:
-    # an exact IANA name, a Rails zone name, then a city naming one zone.
+    # an exact IANA name, a Rails zone name, then a bare city as
+    # _zone_by_city matches it.
     by_lowercase = _zone_by_lowercase()
     lowered = name.strip().lower()
     canonical = by_lowercase.get(lowered)
@@ -237,8 +276,9 @@ def _canonical_zone_name(name: str) -> Optional[str]:
 def resolve_zone(name: Optional[str]) -> Optional[ZoneInfo]:
     """Return the zone a caller-supplied name refers to, or None.
 
-    None covers a missing, unknown or ambiguous name; what that means (fall
-    back to UTC, or refuse) is the caller's decision.
+    None covers a missing, unknown or ambiguous name, and a bare name the
+    city tier does not match (see _zone_by_city); what that means (fall back
+    to UTC, or refuse) is the caller's decision.
     """
     # Every tier ends in a name taken from available_timezones() rather than
     # ZoneInfo(name) directly: ZoneInfo.key echoes whatever string it was

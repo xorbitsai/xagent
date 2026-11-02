@@ -201,7 +201,13 @@ def validate_local_time(local_time: str, timezone_name: str) -> ValidateLocalTim
     """Resolve a wall-clock time in a zone to every UTC instant it names."""
     zone = resolve_zone(timezone_name)
     if zone is None:
-        raise ValueError(f"Unknown IANA timezone: {timezone_name!r}")
+        # The model reads this message to decide how to retry, so it says
+        # which form to pass instead.
+        raise ValueError(
+            f"Unknown IANA timezone: {timezone_name!r}. Pass the full Region/City "
+            "IANA name, for example 'Australia/Sydney'; a bare city name is not "
+            "always resolved."
+        )
     # Region/City only (plus UTC). These are all real tzdata entries that do
     # not mean what a caller naming them means: 'EST' is a fixed -05:00 that
     # never observes DST, 'Etc/GMT+10' inverts the sign to -10:00, 'Factory'

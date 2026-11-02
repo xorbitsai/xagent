@@ -142,7 +142,7 @@ def test_sub_minute_offset_keeps_its_seconds() -> None:
 def test_a_name_that_does_not_mean_a_place_is_rejected(zone: str) -> None:
     # These all resolve, so the offset would be returned with no signal that
     # it is not the zone the caller meant. Here the offset is the answer.
-    with pytest.raises(ValueError, match="Region/City"):
+    with pytest.raises(ValueError, match="^timezone must be a Region/City"):
         validate_local_time("2026-07-15 12:00", zone)
 
 
@@ -178,7 +178,7 @@ def test_a_common_alias_resolves_to_its_iana_zone(supplied: str, zone: str) -> N
 def test_an_alias_outside_region_city_is_still_rejected() -> None:
     # The Rails table maps this one to Etc/GMT+12, which the Region/City guard
     # refuses whatever name reached it.
-    with pytest.raises(ValueError, match="Region/City"):
+    with pytest.raises(ValueError, match="^timezone must be a Region/City"):
         validate_local_time("2026-07-15 12:00", "International Date Line West")
 
 
@@ -186,8 +186,14 @@ def test_an_alias_outside_region_city_is_still_rejected() -> None:
     "zone", ["Not/AZone", "", "   ", "/etc/passwd", "Indianapolis", "Gotham"]
 )
 def test_unknown_zone_is_rejected(zone: str) -> None:
-    with pytest.raises(ValueError, match="Unknown IANA timezone"):
+    # Still an error, with the form to retry with: the model reads this text.
+    with pytest.raises(ValueError) as excinfo:
         validate_local_time("2026-06-01 09:00", zone)
+
+    assert str(excinfo.value) == (
+        f"Unknown IANA timezone: {zone!r}. Pass the full Region/City IANA name, "
+        "for example 'Australia/Sydney'; a bare city name is not always resolved."
+    )
 
 
 @pytest.mark.parametrize(

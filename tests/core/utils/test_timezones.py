@@ -21,6 +21,9 @@ def _key(name: object) -> str | None:
         ("EST", "EST"),
         ("us/eastern", "US/Eastern"),
         ("Etc/GMT+10", "Etc/GMT+10"),
+        # Not matched as bare cities (see below), but exact names all the same.
+        ("Australia/Victoria", "Australia/Victoria"),
+        ("america/argentina/san_juan", "America/Argentina/San_Juan"),
     ],
 )
 def test_canonical_names_resolve_to_their_canonical_key(
@@ -61,7 +64,7 @@ def test_rails_zone_names_resolve_to_their_iana_zone(
         ("Port   of Spain", "America/Port_of_Spain"),
     ],
 )
-def test_a_city_naming_exactly_one_zone_resolves_to_it(
+def test_a_city_ending_only_a_two_segment_zone_resolves_to_it(
     supplied: str, expected: str
 ) -> None:
     assert _key(supplied) == expected
@@ -102,6 +105,43 @@ def test_an_ambiguous_city_stays_unresolved(supplied: str) -> None:
     ],
 )
 def test_a_legacy_country_zone_suffix_is_not_a_city(supplied: str) -> None:
+    assert _key(supplied) is None
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        "ACT",
+        "LHI",
+        "NSW",
+        "North",
+        "Queensland",
+        "South",
+        "Tasmania",
+        "Victoria",  # also Victoria, BC
+        "West",
+        "Yancowinna",
+    ],
+)
+def test_an_australian_legacy_region_name_is_not_a_city(supplied: str) -> None:
+    # Each is the last segment of exactly one zone under a city area
+    # (Australia/Victoria, ...), but names a state, territory, island, county
+    # or direction.
+    assert _key(supplied) is None
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        "San Juan",  # America/Argentina/San_Juan; also San Juan, Puerto Rico
+        "Petersburg",  # America/Indiana/Petersburg
+        "Center",  # America/North_Dakota/Center
+        "Salta",  # America/Argentina/Salta, its only zone
+    ],
+)
+def test_a_city_ending_only_a_three_segment_zone_stays_unresolved(
+    supplied: str,
+) -> None:
     assert _key(supplied) is None
 
 

@@ -68,19 +68,6 @@ else:
     print("Warning: Neither .env nor example.env file found")
 
 
-@pytest.fixture(scope="session", autouse=True)
-def dedicated_sandbox_network_for_tests():
-    """Give direct DockerSandboxService tests a non-built-in network name."""
-    key = "XAGENT_SANDBOX_NETWORK"
-    previous = os.environ.get(key)
-    os.environ[key] = "xagent-test-sandbox-egress"
-    yield
-    if previous is None:
-        os.environ.pop(key, None)
-    else:
-        os.environ[key] = previous
-
-
 @pytest.fixture(autouse=True)
 def local_execution_unless_selected(monkeypatch):
     """Existing suites select local execution; shared suites opt in explicitly."""

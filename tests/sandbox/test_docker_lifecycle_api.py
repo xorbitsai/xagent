@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect as std_inspect
+import os
 import threading
 import uuid
 from contextlib import asynccontextmanager
@@ -56,6 +57,21 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def configured_unit_network_name():
+    """Keep fake-client services explicit without changing the full suite."""
+    key = "XAGENT_SANDBOX_NETWORK"
+    previous = os.environ.get(key)
+    os.environ[key] = "xagent-test-sandbox-egress"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 requires_docker = pytest.mark.skipif(
     not is_docker_available(), reason="Requires reachable Docker daemon"
 )
@@ -66,7 +82,13 @@ def docker_service():
     """Provide a shared Docker sandbox service for integration-style tests."""
     client = docker_sandbox_module._create_docker_client()
     network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
-    network = client.networks.create(network_name, driver="bridge")
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+    )
     try:
         yield DockerSandboxService(
             MemDockerStore(),
@@ -254,6 +276,42 @@ class TestSupportsRuntimeSpec:
         # the probe itself needs no runtime access, so we bypass __init__.
         service = object.__new__(BoxliteSandboxService)
         assert await service.supports_runtime_spec() is False
+
+
+class TestRuntimeNetworkPolicy:
+    @pytest.fixture
+    def drifted_service(self, monkeypatch):
+        container = _FakeCreatedContainer()
+        service = DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            client=_FakeDockerClient([container]),
+        )
+        monkeypatch.setattr(
+            docker_sandbox_module,
+            "_build_inspection",
+            lambda _container: _observed_inspection(
+                runtime_networks=("unexpected-network",)
+            ),
+        )
+        return service
+
+    @pytest.mark.asyncio
+    async def test_inspect_reports_network_policy_drift(self, drifted_service):
+        inspection = await drifted_service.inspect("box")
+
+        assert inspection is not None
+        assert inspection.runtime_policy_matches is False
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_rejects_network_policy_drift(self, drifted_service):
+        with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
+            await drifted_service.get_or_create("box")
+
+    @pytest.mark.asyncio
+    async def test_start_existing_rejects_network_policy_drift(self, drifted_service):
+        with pytest.raises(SandboxRuntimeConflictError, match="attached exclusively"):
+            await drifted_service.start_existing("box")
 
 
 # --- create(): mock-layer tests for paths that are impractical against a
@@ -749,7 +807,7 @@ class TestFindPublishMismatchesEveryBranch:
         )
         inspection = _observed_inspection(
             network_isolated=True,
-            runtime_networks=(),
+            runtime_networks=("none",),
         )
         assert (
             docker_sandbox_module._find_publish_mismatches(
@@ -1672,6 +1730,19 @@ class TestBuildInspectionFacts:
             _FakeInspectableContainer(attrs)
         )
         assert inspection.facts.network_isolated is True
+
+    def test_network_isolated_comes_from_host_network_mode_none(self):
+        attrs = _attrs()
+        attrs["Config"]["NetworkDisabled"] = False
+        attrs["HostConfig"]["NetworkMode"] = "none"
+        attrs["NetworkSettings"]["Networks"] = {"none": {}}
+
+        inspection = docker_sandbox_module._build_inspection(
+            _FakeInspectableContainer(attrs)
+        )
+
+        assert inspection.facts.network_isolated is True
+        assert inspection.facts.runtime_networks == ("none",)
 
     def test_network_isolated_is_false_when_network_disabled_is_absent(self):
         attrs = _attrs()

@@ -18,6 +18,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from docker import errors
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
@@ -148,6 +149,34 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(scope="module", autouse=True)
+def configured_module_sandbox_network():
+    """Provide a real dedicated bridge only to this Docker service module."""
+    key = "XAGENT_SANDBOX_NETWORK"
+    previous = os.environ.get(key)
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = None
+    os.environ[key] = network_name
+    if is_docker_available():
+        client = docker_sandbox_module._create_docker_client()
+        network = client.networks.create(
+            network_name,
+            driver="bridge",
+            labels={
+                docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+            },
+        )
+    try:
+        yield
+    finally:
+        if network is not None:
+            network.remove()
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+
 requires_docker = pytest.mark.skipif(
     not is_docker_available(), reason="Requires reachable Docker daemon"
 )
@@ -158,7 +187,13 @@ def docker_service():
     """Provide a shared Docker sandbox service for integration-style tests."""
     client = docker_sandbox_module._create_docker_client()
     network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
-    network = client.networks.create(network_name, driver="bridge")
+    network = client.networks.create(
+        network_name,
+        driver="bridge",
+        labels={
+            docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+        },
+    )
     try:
         yield DockerSandboxService(
             MemDockerStore(),
@@ -186,7 +221,15 @@ class _FakeDockerClient:
     def __init__(self, containers=()):
         self.containers = _FakeContainerCollection(containers)
         self.networks = SimpleNamespace(
-            get=lambda _name: SimpleNamespace(attrs={"Driver": "bridge"})
+            get=lambda name: SimpleNamespace(
+                name=name,
+                attrs={
+                    "Driver": "bridge",
+                    "Labels": {
+                        docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                    },
+                },
+            )
         )
 
     def ping(self):
@@ -316,7 +359,7 @@ class TestDockerSandboxServiceFailures:
         client = _FakeDockerClient()
 
         def missing_network(_name):
-            raise RuntimeError("not found")
+            raise errors.NotFound("not found")
 
         client.networks.get = missing_network
         service = DockerSandboxService(
@@ -332,7 +375,15 @@ class TestDockerSandboxServiceFailures:
         self, tmp_path, monkeypatch
     ):
         client = _FakeDockerClient()
-        client.networks.get = lambda _name: SimpleNamespace(attrs={"Driver": "overlay"})
+        client.networks.get = lambda name: SimpleNamespace(
+            name=name,
+            attrs={
+                "Driver": "overlay",
+                "Labels": {
+                    docker_sandbox_module.SANDBOX_NETWORK_LABEL: docker_sandbox_module.SANDBOX_NETWORK_LABEL_VALUE
+                },
+            },
+        )
         service = DockerSandboxService(
             MemDockerStore(), namespace="test", client=client
         )
@@ -340,6 +391,54 @@ class TestDockerSandboxServiceFailures:
         monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
 
         with pytest.raises(SandboxRuntimeConflictError, match="bridge driver"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_exact_network_name(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get("xagent-test-sandbox-egress")
+        network.name = "different-network"
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="exact name"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_requires_dedicated_network_label(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        network = client.networks.get(os.environ["XAGENT_SANDBOX_NETWORK"])
+        network.attrs["Labels"] = {}
+        client.networks.get = lambda _name: network
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="must carry the label"):
+            service.validate_host_workspace_access()
+
+    def test_host_workspace_readiness_reports_socket_proxy_network_denial(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeDockerClient()
+        client.networks.get = lambda _name: (_ for _ in ()).throw(
+            errors.APIError("forbidden")
+        )
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=client
+        )
+        monkeypatch.setattr(docker_sandbox_module, "get_uploads_dir", lambda: tmp_path)
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 0)
+
+        with pytest.raises(SandboxRuntimeConflictError, match="NETWORKS=1"):
             service.validate_host_workspace_access()
 
     def test_host_workspace_readiness_rejects_rootless_daemon(

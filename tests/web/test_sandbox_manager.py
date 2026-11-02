@@ -995,6 +995,27 @@ class TestSandboxManagerWarmup:
         assert config.cpus == 1
         assert config.memory == 512
 
+    @pytest.mark.asyncio
+    async def test_warmup_replaces_stale_network_policy_container_once(self):
+        mock_service = FakeSandboxService()
+        manager = SandboxManager(mock_service)
+        mock_sandbox = MagicMock()
+        mock_sandbox.__aenter__ = AsyncMock(return_value=mock_sandbox)
+        mock_sandbox.__aexit__ = AsyncMock(return_value=None)
+        mock_service.get_or_create = AsyncMock(
+            side_effect=[
+                SandboxRuntimeConflictError("network drift"),
+                mock_sandbox,
+            ]
+        )
+        mock_service.delete = AsyncMock()
+
+        await manager.warmup()
+
+        assert mock_service.get_or_create.await_count == 2
+        assert mock_service.delete.await_args_list[0].args == ("__warmup__",)
+        assert mock_service.delete.await_count == 2
+
 
 class TestSandboxActivityTracking:
     """Test attach/release ref-counting and last-activity tracking."""

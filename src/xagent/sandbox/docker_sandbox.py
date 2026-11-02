@@ -93,6 +93,8 @@ CONTAINER_NAME_PREFIX = "xagent_sandbox_"
 SNAPSHOT_REPOSITORY = "xagent-sandbox-snapshot"
 _CPU_NANOS = 1_000_000_000
 _DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-dedicated-network-v2"
+SANDBOX_NETWORK_LABEL = "xagent.sandbox.network"
+SANDBOX_NETWORK_LABEL_VALUE = "v1"
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -108,6 +110,11 @@ def _ownership_label_filters(namespace: str) -> list[str]:
         f"{LABEL_MANAGED}={MANAGED_LABEL_VALUE}",
         f"{LABEL_NAMESPACE}={namespace}",
     ]
+
+
+def _expected_runtime_networks(network_isolated: bool, network: str) -> set[str]:
+    """Return Docker inspect's exact network keys for one sandbox mode."""
+    return {"none"} if network_isolated else {network}
 
 
 class DockerStore(abc.ABC):
@@ -623,7 +630,9 @@ def _find_publish_mismatches(
         mismatches.append("working_dir")
     if facts.network_isolated != desired.network_isolated:
         mismatches.append("network_isolated")
-    expected_networks = set() if desired.network_isolated else {expected_network}
+    expected_networks = _expected_runtime_networks(
+        desired.network_isolated, expected_network
+    )
     if set(facts.runtime_networks) != expected_networks:
         mismatches.append("runtime_networks")
     if (facts.raw_nano_cpus or 0) != int(desired.cpus * _CPU_NANOS):
@@ -1414,11 +1423,7 @@ class DockerSandboxService(SandboxService):
             if container is not None:
                 await asyncio.to_thread(container.reload)
                 inspection = _build_inspection(container)
-                if not self._runtime_network_policy_matches(inspection):
-                    raise SandboxRuntimeConflictError(
-                        f"Sandbox {name!r} is not attached exclusively to the "
-                        "configured sandbox network"
-                    )
+                self._require_network_policy(name, inspection)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
                     await asyncio.to_thread(container.start)
@@ -1502,10 +1507,18 @@ class DockerSandboxService(SandboxService):
         return True
 
     def _runtime_network_policy_matches(self, inspection: SandboxInspection) -> bool:
-        expected_networks = (
-            set() if inspection.facts.network_isolated else {self._network}
+        expected_networks = _expected_runtime_networks(
+            inspection.facts.network_isolated, self._network
         )
         return set(inspection.facts.runtime_networks) == expected_networks
+
+    def _require_network_policy(self, name: str, inspection: SandboxInspection) -> None:
+        """Reject adoption when the live container escaped its network mode."""
+        if not self._runtime_network_policy_matches(inspection):
+            raise SandboxRuntimeConflictError(
+                f"Sandbox {name!r} is not attached exclusively to the "
+                "configured sandbox network"
+            )
 
     async def inspect(self, name: str) -> Optional[SandboxInspection]:
         """Observe a sandbox's current state and runtime facts.
@@ -1758,11 +1771,7 @@ class DockerSandboxService(SandboxService):
             async with control.exclusive_access(mark_deleted=False):
                 await asyncio.to_thread(container.reload)
                 inspection = _build_inspection(container)
-                if not self._runtime_network_policy_matches(inspection):
-                    raise SandboxRuntimeConflictError(
-                        f"Sandbox {name!r} is not attached exclusively to the "
-                        "configured sandbox network"
-                    )
+                self._require_network_policy(name, inspection)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
                     await asyncio.to_thread(container.start)
@@ -1939,7 +1948,7 @@ class DockerSandboxService(SandboxService):
         return SANDBOX_RUNTIME_GID
 
     def validate_host_workspace_access(self) -> None:
-        """Exercise the ownership operations required by writable bind mounts."""
+        """Validate Docker network policy and writable-bind ownership support."""
         if os.geteuid() != 0:
             raise SandboxRuntimeConflictError(
                 "Docker sandbox workspace preparation requires the Xagent "
@@ -1955,16 +1964,37 @@ class DockerSandboxService(SandboxService):
             ) from exc
         try:
             sandbox_network = self._client.networks.get(self._network)
-        except Exception as exc:
+        except (errors.NotFound, errors.ImageNotFound) as exc:
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox Docker network {self._network!r} is not "
                 "available on the daemon"
             ) from exc
+        except errors.APIError as exc:
+            raise SandboxRuntimeConflictError(
+                "Cannot inspect the configured sandbox Docker network. If a "
+                "docker-socket-proxy is in use, allow the /networks endpoint "
+                "(for Tecnativa/docker-socket-proxy, set NETWORKS=1)."
+            ) from exc
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                f"Failed to inspect configured sandbox Docker network {self._network!r}"
+            ) from exc
         network_attrs = cast(dict[str, Any], sandbox_network.attrs or {})
+        if sandbox_network.name != self._network:
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network must be addressed by its "
+                f"exact name {self._network!r}, not by an ID or prefix"
+            )
         if network_attrs.get("Driver") != "bridge":
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox Docker network {self._network!r} must use "
                 "the bridge driver"
+            )
+        labels = cast(dict[str, str], network_attrs.get("Labels") or {})
+        if labels.get(SANDBOX_NETWORK_LABEL) != SANDBOX_NETWORK_LABEL_VALUE:
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} must carry "
+                f"the label {SANDBOX_NETWORK_LABEL}={SANDBOX_NETWORK_LABEL_VALUE}"
             )
         security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(

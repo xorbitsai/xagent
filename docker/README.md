@@ -394,10 +394,22 @@ deliverables are repaired individually.
 > environment; pip/systemd deployments must set both values explicitly (see
 > `example.env`). The backend must also run with
 > effective uid 0 against a rootful Docker daemon with user-namespace
-> remapping disabled; a Docker socket proxy must permit `GET /info`
-> (`INFO=1` for Tecnativa/docker-socket-proxy). Missing or incompatible
+> remapping disabled; a Docker socket proxy must permit `GET /info` and
+> `GET /networks/*` (`INFO=1` and `NETWORKS=1` for
+> Tecnativa/docker-socket-proxy). Missing or incompatible
 > settings stop backend startup rather than falling back to unsafe ownership
 > or an unverifiable daemon mode.
+
+Create the network before starting Xagent. The label is a readiness contract
+that prevents accidentally reusing the application bridge, and ICC is disabled
+so sandboxes on the same bridge cannot address one another directly:
+
+```bash
+docker network create --driver bridge \
+  --label xagent.sandbox.network=v1 \
+  -o com.docker.network.bridge.enable_icc=false \
+  "$XAGENT_SANDBOX_NETWORK"
+```
 
 The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
 `scheduler` from the resolved `${COMPOSE_PROJECT_NAME}` and requires an exact
@@ -413,6 +425,12 @@ network-isolated sandboxes use Docker's `none` network mode. Xagent verifies
 the live attachment before publishing or reusing a container and rejects the
 built-in `bridge`, `host`, `none`, and `default` network names. Creating the
 bridge and applying/persisting its firewall rules remain deployment duties.
+
+The dedicated-network runtime security profile changes the sandbox
+attestation version. Existing v2 containers created with the previous profile
+will not be adopted; drain and remove them during the coordinated maintenance
+window below so first use recreates them under the new network policy. Bind
+mounted workspace data is preserved.
 
 `XAGENT_SANDBOX_MAX_CONTAINERS` applies independently to each deployment
 namespace, not globally to the shared daemon. Size the daemon for up to the

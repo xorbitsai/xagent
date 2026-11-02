@@ -2451,9 +2451,20 @@ class SandboxManager:
             template = SandboxTemplate(type="image", image=image)
             # Use empty config for warmup - no need for volumes/env
             warmup_config = SandboxConfig()
-            async with await self._service.get_or_create(
-                warmup_name, template=template, config=warmup_config
-            ):
+            try:
+                sandbox = await self._service.get_or_create(
+                    warmup_name, template=template, config=warmup_config
+                )
+            except SandboxRuntimeConflictError:
+                logger.warning(
+                    "Deleting stale sandbox warmup container after runtime "
+                    "policy mismatch"
+                )
+                await self._service.delete(warmup_name)
+                sandbox = await self._service.get_or_create(
+                    warmup_name, template=template, config=warmup_config
+                )
+            async with sandbox:
                 pass
             await self._service.delete(warmup_name)
             logger.info(f"Sandbox image warmup completed: {image}")

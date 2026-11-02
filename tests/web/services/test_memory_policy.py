@@ -152,6 +152,118 @@ def test_binding_selects_store_once_and_fences_retrieval_by_route() -> None:
     ]
 
 
+def test_binding_fingerprint_fences_backend_and_generation_independently() -> None:
+    def fingerprint(
+        *, backend: str, generation: str, store: InMemoryMemoryStore
+    ) -> str | None:
+        policy = agent_runtime_service.AgentServiceMemoryPolicy(
+            memory=store,
+            memory_enabled=True,
+            backend_identity=backend,
+            route_generation=generation,
+        )
+        return policy.execution_metadata(
+            ambient_owner_user_id=23,
+            ambient_execution_scope=None,
+        )[MEMORY_RETRIEVAL_SCOPE_FINGERPRINT_METADATA_KEY]
+
+    baseline = fingerprint(
+        backend="backend-a",
+        generation="route-1",
+        store=InMemoryMemoryStore(),
+    )
+
+    assert baseline == fingerprint(
+        backend="backend-a",
+        generation="route-1",
+        store=InMemoryMemoryStore(),
+    )
+    assert baseline != fingerprint(
+        backend="backend-b",
+        generation="route-1",
+        store=InMemoryMemoryStore(),
+    )
+    assert baseline != fingerprint(
+        backend="backend-a",
+        generation="route-2",
+        store=InMemoryMemoryStore(),
+    )
+
+
+def test_compose_memory_binding_preserves_matching_scope_authority() -> None:
+    scope = MemoryAccessScope(
+        owner_user_id=700,
+        memory_dimensions={},
+        strict_owner_only=True,
+    )
+    binding = MemoryStoreBinding(
+        store=UserIsolatedMemoryStore(InMemoryMemoryStore()),
+        backend_identity="backend-a",
+        route_generation="route-1",
+        access_scope=scope,
+    )
+
+    policy = agent_runtime_service._compose_memory_binding(
+        binding=binding,
+        policy_scope=scope,
+        enabled=True,
+        availability_reason=None,
+    )
+
+    assert policy.memory is binding.store
+    assert policy.memory_access_scope is scope
+    assert policy.memory_available is True
+
+
+def test_compose_memory_binding_binds_policy_scope_when_binding_has_none() -> None:
+    scope = MemoryAccessScope(
+        owner_user_id=700,
+        memory_dimensions={"principal": "person-1"},
+    )
+    binding = MemoryStoreBinding(
+        store=UserIsolatedMemoryStore(InMemoryMemoryStore()),
+        backend_identity="backend-a",
+        route_generation="route-1",
+    )
+
+    policy = agent_runtime_service._compose_memory_binding(
+        binding=binding,
+        policy_scope=scope,
+        enabled=True,
+        availability_reason=None,
+    )
+
+    assert policy.memory is not binding.store
+    assert policy.memory_access_scope is scope
+    assert policy.memory_available is True
+
+
+def test_compose_memory_binding_rejects_conflicting_scope_authorities() -> None:
+    binding = MemoryStoreBinding(
+        store=UserIsolatedMemoryStore(InMemoryMemoryStore()),
+        backend_identity="backend-a",
+        route_generation="route-1",
+        access_scope=MemoryAccessScope(
+            owner_user_id=700,
+            memory_dimensions={"principal": "person-1"},
+        ),
+    )
+
+    policy = agent_runtime_service._compose_memory_binding(
+        binding=binding,
+        policy_scope=MemoryAccessScope(
+            owner_user_id=700,
+            memory_dimensions={"principal": "person-2"},
+        ),
+        enabled=True,
+        availability_reason=None,
+    )
+
+    assert policy.memory_enabled is False
+    assert policy.memory_available is False
+    assert policy.memory_availability_reason == MEMORY_POLICY_BINDING_FAILURE_REASON
+
+
 def test_disabled_preview_does_not_resolve_a_backend_binding() -> None:
     resolver = Mock(side_effect=AssertionError("disabled preview must not bind"))
     set_trusted_memory_binding_resolver(resolver)
@@ -262,6 +374,9 @@ async def test_cached_service_rebinds_store_and_actual_tool_factory() -> None:
     )
     assert service.memory is first_store
     assert service._execution_adapter.config.memory_store is first_store
+    assert service._execution_adapter.config.memory_tools_factory is (
+        service.memory_tools_factory
+    )
     assert service.memory_tools_factory is not None
     assert service.memory_tools_factory(
         memory_store=first_store,
@@ -281,6 +396,9 @@ async def test_cached_service_rebinds_store_and_actual_tool_factory() -> None:
 
     assert service.memory is second_store
     assert service._execution_adapter.config.memory_store is second_store
+    assert service._execution_adapter.config.memory_tools_factory is (
+        service.memory_tools_factory
+    )
     assert service.memory_tools_factory is not None
     assert service.memory_tools_factory(
         memory_store=second_store,

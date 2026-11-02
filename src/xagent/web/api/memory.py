@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import Annotated, Any, Callable, Iterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette import convertors as starlette_url  # codespell:ignore
 
 from xagent.core.memory.base import MemoryStore
@@ -122,6 +122,13 @@ class MemoryUpdateRequest(BaseModel):
         None, description="Updated memory metadata"
     )
 
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, content: Optional[str]) -> Optional[str]:
+        if content is not None and not content.strip():
+            raise ValueError("content must not be blank")
+        return content
+
 
 class MemoryListResponse(BaseModel):
     memories: list[dict[str, Any]]
@@ -179,9 +186,7 @@ class MemoryManagementRouter:
             raise HTTPException(status_code=503, detail=error.status.detail) from None
 
     def _setup_routes(self) -> None:
-        async def resolve_request_binding(
-            user: User = Depends(get_current_user),
-        ) -> _ManagementMemoryBinding:
+        async def bind_authenticated_user(user: User) -> _ManagementMemoryBinding:
             user_id = int(user.id)
             try:
                 binding = await resolve_trusted_memory_binding_async(
@@ -195,6 +200,11 @@ class MemoryManagementRouter:
                     detail=MEMORY_READ_UNAVAILABLE_DETAIL,
                 ) from None
             return _ManagementMemoryBinding(user_id=user_id, binding=binding)
+
+        async def resolve_request_binding(
+            user: User = Depends(get_current_user),
+        ) -> _ManagementMemoryBinding:
+            return await bind_authenticated_user(user)
 
         def request_store(request_binding: _ManagementMemoryBinding) -> MemoryStore:
             if request_binding.binding is not None:
@@ -340,10 +350,12 @@ class MemoryManagementRouter:
         async def update_memory(
             memory_id: MemoryIdPath,
             update_request: MemoryUpdateRequest,
-            request_binding: _ManagementMemoryBinding = Depends(
-                resolve_request_binding
-            ),
+            user: User = Depends(get_current_user),
         ) -> dict[str, Any]:
+            # Body validation completes before a remote binding is selected.
+            # Authentication remains a dependency, so unauthenticated callers
+            # cannot use validation responses to probe this endpoint.
+            request_binding = await bind_authenticated_user(user)
             store = request_store(request_binding)
             try:
                 # Set user context for memory operations
@@ -429,13 +441,16 @@ class MemoryManagementRouter:
         @self.router.post("")
         async def create_memory(
             memory_request: dict[str, Any],
-            request_binding: _ManagementMemoryBinding = Depends(
-                resolve_request_binding
-            ),
+            user: User = Depends(get_current_user),
         ) -> dict[str, Any]:
             # Validate required fields
-            if "content" not in memory_request:
-                raise HTTPException(status_code=422, detail="Content field is required")
+            content = memory_request.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise HTTPException(
+                    status_code=422,
+                    detail="Content field must be a non-blank string",
+                )
+            request_binding = await bind_authenticated_user(user)
             # Resolved before the try block on purpose: the lifecycle 503 must
             # reach the caller as itself, while the handler below keeps
             # wrapping store failures the way it always has.
@@ -445,7 +460,7 @@ class MemoryManagementRouter:
                 with UserContext(request_binding.user_id), memory_operation():
                     # Create new memory note
                     memory_note = MemoryNote(
-                        content=memory_request.get("content", ""),
+                        content=content,
                         keywords=memory_request.get("keywords", []),
                         tags=memory_request.get("tags", []),
                         category=memory_request.get("category", "general"),
@@ -488,11 +503,11 @@ class MemoryManagementRouter:
                 resolve_request_binding
             ),
         ) -> dict:
-            """Report the memory lifecycle state.
+            """Report public diagnostics for the active memory backend.
 
-            This stays available in every lifecycle state, including
-            BLOCKED_REPAIR, so an operator can see why memory is fenced off
-            while the rest of the deployment keeps serving.
+            The legacy backend reports its lifecycle state, including
+            BLOCKED_REPAIR. A trusted host binding reports only its declared
+            public diagnostics, and binding resolution failures return 503.
             """
             if request_binding.binding is not None:
                 return dict(request_binding.binding.public_diagnostics)

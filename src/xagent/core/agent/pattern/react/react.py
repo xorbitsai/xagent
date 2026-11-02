@@ -119,7 +119,7 @@ from ...context.execution import (
     snapshot_container,
     tool_evidence_state,
 )
-from ...context.memory_tool import build_memory_tools
+from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import evidence_facts, grounding_rule
 from ...language import effective_output_language, final_answer_language_rule
@@ -972,12 +972,19 @@ class ReActPattern(AgentPattern):
                 context=context,
             )
         else:
-            extra_tools = self._memory_tools_factory(
-                memory_store=self._memory_store,
-                task=task_text,
-                runtime=runtime,
-                context=context,
+            # Host factories are synchronous setup hooks and must not perform
+            # blocking I/O. Copy their result so adding run-local tools never
+            # mutates a list retained by the host.
+            extra_tools = list(
+                self._memory_tools_factory(
+                    memory_store=self._memory_store,
+                    task=task_text,
+                    runtime=runtime,
+                    context=context,
+                )
             )
+            if extra_tools and hasattr(context, "metadata"):
+                context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
         skill_tool = await build_load_skill_tool(
             skill_manager=skill_manager,
             context=context,

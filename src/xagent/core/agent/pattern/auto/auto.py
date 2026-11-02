@@ -490,6 +490,7 @@ class AutoPattern(AgentPattern):
                 skill_manager=kwargs.get("skill_manager"),
                 allowed_skills=kwargs.get("allowed_skills"),
                 memory_store=kwargs.get("memory_store"),
+                memory_tools_factory=kwargs.get("memory_tools_factory"),
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
                 compact_llm=kwargs.get("compact_llm"),
             )
@@ -519,6 +520,7 @@ class AutoPattern(AgentPattern):
         llm: Any,
         runtime: PatternRuntime,
         memory_store: Any | None = None,
+        memory_tools_factory: Any | None = None,
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
@@ -638,6 +640,7 @@ class AutoPattern(AgentPattern):
             llm=llm,
             runtime=child_runtime,
             memory_store=memory_store,
+            memory_tools_factory=memory_tools_factory,
             memory_similarity_threshold=memory_similarity_threshold,
             skill_manager=skill_manager,
             allowed_skills=allowed_skills,

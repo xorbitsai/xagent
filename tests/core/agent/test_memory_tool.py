@@ -645,14 +645,23 @@ def test_build_memory_tools_stamps_guidance_flag_on_context() -> None:
 
 @pytest.mark.asyncio
 async def test_react_uses_selected_custom_memory_tool_factory() -> None:
+    class SkillManager:
+        async def list_skills(self) -> list[dict[str, str]]:
+            return [{"name": "memory-skill", "description": "Use memory"}]
+
+        async def get_skill(self, _name: str) -> None:
+            return None
+
     pattern = ReActPattern()
     store = InMemoryMemoryStore()
     custom_tool = object()
     calls: list[dict[str, Any]] = []
 
+    factory_tools = [custom_tool]
+
     def factory(**kwargs: Any) -> list[Any]:
         calls.append(kwargs)
-        return [custom_tool]
+        return factory_tools
 
     pattern._memory_store = store
     pattern._memory_tools_factory = factory
@@ -664,11 +673,14 @@ async def test_react_uses_selected_custom_memory_tool_factory() -> None:
         context=context,
         task_text="remember this",
         runtime=cast(Any, runtime),
-        skill_manager=None,
+        skill_manager=SkillManager(),
         allowed_skills=None,
     )
 
-    assert tools == [custom_tool]
+    assert tools[0] is custom_tool
+    assert tools[1].name == "load_skill"
+    assert factory_tools == [custom_tool]
+    assert context.metadata["memory_tools_enabled"] is True
     assert calls == [
         {
             "memory_store": store,

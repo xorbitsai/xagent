@@ -376,12 +376,13 @@ def _compose_memory_binding(
     """
 
     binding_scope = binding.access_scope
-    if binding_scope is not None and policy_scope is not None:
-        if binding_scope != policy_scope:
-            return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
-        selected_scope = binding_scope
-        memory = binding.store
-    elif binding_scope is not None:
+    if (
+        binding_scope is not None
+        and policy_scope is not None
+        and binding_scope != policy_scope
+    ):
+        return _inert_memory_policy(MEMORY_POLICY_BINDING_FAILURE_REASON)
+    if binding_scope is not None:
         selected_scope = binding_scope
         memory = binding.store
     elif policy_scope is not None:

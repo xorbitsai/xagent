@@ -29,6 +29,7 @@ from xagent.core.agent.language import (
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -664,6 +665,88 @@ async def test_auto_loaded_skill_guidance_reaches_dag_before_planning() -> None:
     child_system = child_context.get_messages_for_llm()[0]["content"]
     assert "Selected skill guidance" in child_system
     assert "Use the Auto skill instructions." in child_system
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["react", "plan_execute"])
+async def test_auto_public_run_forwards_custom_memory_tool_factory(
+    action: str,
+) -> None:
+    child = CapturingChildPattern()
+    pattern = AutoPattern(
+        react_pattern=child,  # type: ignore[arg-type]
+        dag_pattern=child,  # type: ignore[arg-type]
+    )
+    context = ExecutionContext(execution_id=f"auto-memory-factory-{action}")
+    context.add_user_message("Use the selected memory tools")
+
+    def factory(**_kwargs: Any) -> list[Any]:
+        return []
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([decision_tool_response(action, "Needs memory tools.")]),
+        runtime=RecordingRuntime(),
+        memory_store=FakeMemoryStore(),
+        memory_tools_factory=factory,
+    )
+
+    assert result["success"] is True
+    assert child.kwargs is not None
+    assert child.kwargs["memory_tools_factory"] is factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["react", "plan_execute"])
+async def test_auto_default_children_execute_custom_memory_tools(action: str) -> None:
+    responses: list[Any] = [decision_tool_response(action, "Needs memory tools.")]
+    if action == "plan_execute":
+        responses.append(plan_tool_response([{"id": "search", "task": "Search"}]))
+    responses.extend(
+        [
+            {
+                "content": "searching",
+                "tool_calls": [
+                    {
+                        "id": "call",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": '{"query":"xagent"}',
+                        },
+                    }
+                ],
+            },
+            "done",
+        ]
+    )
+    tool = FakeSearchTool()
+    factory_result = [tool]
+    factory_contexts: list[ExecutionContext] = []
+
+    def factory(**kwargs: Any) -> list[Any]:
+        factory_contexts.append(kwargs["context"])
+        return factory_result
+
+    context = ExecutionContext(execution_id=f"auto-default-memory-{action}")
+    context.add_user_message("Search memory for xagent")
+    result = await AutoPattern(dag_pattern=DAGPattern(LLMPlanGenerator())).run(
+        context=context,
+        tools=[],
+        llm=FakeLLM(responses),
+        runtime=PatternRuntime(),
+        memory_store=InMemoryMemoryStore(),
+        memory_tools_factory=factory,
+    )
+
+    assert result["success"] is True
+    assert len(tool.calls) == 1
+    assert factory_result == [tool]
+    assert factory_contexts
+    assert all(
+        factory_context.metadata["memory_tools_enabled"] is True
+        for factory_context in factory_contexts
+    )
 
 
 def plan_tool_response(

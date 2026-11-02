@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -47,7 +47,7 @@ vi.mock("lucide-react", () => {
   }
 })
 
-import { VoiceInputController } from "./voice-input-controller"
+import { VoiceInputController, useVoiceInputControls } from "./voice-input-controller"
 
 function jsonResponse(data: unknown): Response {
   return new Response(JSON.stringify(data), {
@@ -137,6 +137,29 @@ describe("VoiceInputController", () => {
 
   afterEach(() => {
     cleanup()
+  })
+
+  it("requires a file ASR model even when a custom realtime row advertises ASR", async () => {
+    const realtime = {
+      model_id: "custom-live-model",
+      model_provider: "elevenlabs",
+      model_name: "scribe_v2_realtime",
+      abilities: ["asr"],
+    }
+    const batch = { ...realtime, model_id: "file-asr", model_name: "scribe_v2" }
+    const { result } = renderHook(() => useVoiceInputControls({ autoRefresh: false }))
+
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([realtime]))
+    await act(() => result.current.refreshAvailability())
+    expect(result.current.hasAsrModel).toBe(false)
+
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([realtime, batch]))
+    await act(() => result.current.refreshAvailability())
+    expect(result.current.hasAsrModel).toBe(true)
+
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([realtime]))
+    await act(() => result.current.refreshAvailability())
+    expect(result.current.hasAsrModel).toBe(false)
   })
 
   it("inserts transcription into the field active when recording started", async () => {

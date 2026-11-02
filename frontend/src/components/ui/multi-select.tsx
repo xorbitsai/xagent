@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import React, { useState, useRef, useEffect } from "react"
 import { cn } from "@/lib/utils"
 import { ChevronDown, X } from "lucide-react"
 import { MarkdownDescription } from "./markdown-description"
@@ -9,6 +9,7 @@ import { useI18n } from "@/contexts/i18n-context"
 interface MultiSelectOption {
   value: string
   label: string
+  selectedLabel?: string
   description?: string
   count?: number
 }
@@ -76,7 +77,8 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
 
   const filteredOptions = options.filter(opt =>
     opt.label.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    opt.value.toLowerCase().includes(searchQuery.toLowerCase())
+    opt.value.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    opt.description?.toLowerCase().includes(searchQuery.toLowerCase())
   )
 
   const toggleOpen = () => {
@@ -120,11 +122,11 @@ export function MultiSelect({ values, onValuesChange, options, placeholder, clas
         )}
         onClick={toggleOpen}
       >
-        <div className="flex items-center gap-2 flex-wrap">
+        <div className="flex min-w-0 items-center gap-2 flex-wrap">
           {selectedOptions.length > 0 ? (
             selectedOptions.map((option) => (
-              <div key={option.value} className="flex items-center gap-1 bg-secondary text-secondary-foreground px-2 py-1 rounded-md text-xs">
-                {option.label}
+              <div key={option.value} className="flex max-w-full items-center gap-1 bg-secondary text-secondary-foreground px-2 py-1 rounded-md text-xs">
+                <span className="break-all">{option.selectedLabel || option.label}</span>
                 <button
                   type="button"
                   onClick={(e) => handleRemove(option.value, e)}

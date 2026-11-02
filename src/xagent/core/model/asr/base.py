@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 
 @dataclass
@@ -52,6 +53,45 @@ class ASRSegment:
         return self.text
 
 
+@dataclass(frozen=True)
+class ASRStreamEvent:
+    """A live transcript update; a final result commits one segment, not a turn."""
+
+    type: Literal["session_started", "partial", "final"]
+    text: str = ""
+    segment_id: int = 0
+    session_id: Optional[str] = None
+
+
+class ASRStreamSession(ABC):
+    """Own one live, mono audio connection and its transcript iterator.
+
+    Closing or cancelling discards pending audio; it does not commit a turn.
+    Consumers should use the async context manager to release the connection
+    when stopping iteration early. Close the session before the opening
+    ``usage_scope`` or ``TokenContextManager`` exits: usage is flushed to that
+    scope on close and cannot be delivered after the scope has already exited.
+    """
+
+    @abstractmethod
+    async def send_audio(self, audio: bytes) -> None: ...
+
+    @abstractmethod
+    async def commit(self) -> None: ...
+
+    @abstractmethod
+    def __aiter__(self) -> AsyncIterator[ASRStreamEvent]: ...
+
+    @abstractmethod
+    async def aclose(self) -> None: ...
+
+    async def __aenter__(self) -> ASRStreamSession:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
+
+
 class BaseASR(ABC):
     """Abstract base class for Automatic Speech Recognition (ASR) models."""
 
@@ -89,6 +129,28 @@ class BaseASR(ABC):
     def abilities(self) -> list[str]:
         """Get the list of abilities supported by this model."""
         pass
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Whether this configured model accepts live audio input."""
+        return False
+
+    @property
+    def supports_vad(self) -> bool:
+        """Whether the live ASR service can commit segments using its own VAD."""
+        return False
+
+    async def open_stream(
+        self,
+        *,
+        language: Optional[str] = None,
+        format: str = "pcm",
+        sample_rate: int = 16000,
+        vad: bool = True,
+        **kwargs: Any,
+    ) -> ASRStreamSession:
+        """Open a live audio session; PCM means signed 16-bit little-endian mono."""
+        raise NotImplementedError("This ASR model does not support live audio")
 
     @property
     def supports_speaker_diarization(self) -> bool:

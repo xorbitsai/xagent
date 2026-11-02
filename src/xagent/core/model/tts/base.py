@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
@@ -25,6 +26,15 @@ class TTSResult:
 
     raw_response: Optional[dict[str, Any]] = None
     """Raw response from the API for debugging or advanced usage"""
+
+
+@dataclass(frozen=True)
+class TTSChunk:
+    """An audio fragment in the stream's format, not a standalone audio file."""
+
+    audio: bytes
+    format: str
+    sample_rate: Optional[int] = None
 
 
 class BaseTTS(ABC):
@@ -68,6 +78,23 @@ class BaseTTS(ABC):
     def abilities(self) -> list[str]:
         """Get the list of abilities supported by this model."""
         pass
+
+    @property
+    def supports_streaming(self) -> bool:
+        """Whether the adapter returns audio before synthesis completes."""
+        return False
+
+    def synthesize_stream(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[TTSChunk, None]:
+        """Stream audio for one text segment; close the iterator on interruption."""
+        raise NotImplementedError("This TTS model does not support audio streaming")
 
     @property
     def supports_multiple_voices(self) -> bool:

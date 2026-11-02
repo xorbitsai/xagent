@@ -65,7 +65,8 @@ describe("standalone browser security policy", () => {
     for (const directive of ["base-uri 'none'", "object-src 'none'", "form-action 'self'", "frame-ancestors 'none'"]) {
       expect(policy).toContain(directive)
     }
-    expect(policy).not.toContain("unsafe-eval")
+    expect(policy.split(/[;\s]+/)).not.toContain("'unsafe-eval'")
+    expect(policy.split(/[;\s]+/)).toContain("'wasm-unsafe-eval'")
     expect(headers["X-Frame-Options"]).toBe("DENY")
     expect(policy).toContain("script-src 'self' 'unsafe-inline' https:")
     expect(policy).toContain("frame-src 'self' blob: https://docs.google.com")
@@ -78,7 +79,7 @@ describe("standalone browser security policy", () => {
         const value = policy.split("; ").find((part) => part.startsWith(directive))!
         expect(value.split(" ").includes("http:")).toBe(development)
       }
-      expect(policy.includes("unsafe-eval")).toBe(development)
+      expect(policy.split(/[;\s]+/).includes("'unsafe-eval'")).toBe(development)
     }
   })
 

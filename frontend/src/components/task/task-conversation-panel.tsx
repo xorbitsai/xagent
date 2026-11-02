@@ -5,6 +5,7 @@ import { CheckCircle2, AlertCircle, FolderOpen, Loader2 } from "lucide-react"
 import dagre from "dagre"
 import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput"
 import { ChatMessage } from "@/components/chat/ChatMessage"
+import { VoiceConversation } from "@/components/chat/voice-conversation"
 import type { AgentExecutionSummary } from "@/components/chat/TraceEventRenderer"
 import { CompactionNotice } from "@/components/chat/CompactionNotice"
 import { ContextUsageRing } from "@/components/chat/ContextUsageRing"
@@ -35,6 +36,7 @@ import { cn } from "@/lib/utils"
 export type TaskConversationPanelMode = "page" | "embedded-preview"
 
 interface TaskConversationPanelProps {
+  voiceConversationEnabled?: boolean
   mode: TaskConversationPanelMode
   className?: string
   showTaskActions?: boolean
@@ -297,6 +299,7 @@ export function TaskConversationPanel({
   attachmentFiles,
   onAttachmentFilesChange,
   onAgentExecutionClick,
+  voiceConversationEnabled = false,
 }: TaskConversationPanelProps) {
   const {
     state,
@@ -318,10 +321,12 @@ export function TaskConversationPanel({
     isMessageDeliveryPending,
     isSessionInteractionLocked,
     connectionNotice,
+    isConnected,
   } = useApp()
   const fileAccess = useFileAccess()
   const { t, locale } = useI18n()
   const [files, setFiles] = useState<File[]>([])
+  const [voiceOpen, setVoiceOpen] = useState(false)
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
   const [dagLayout, setDagLayout] = useState<"TB" | "LR">("TB")
   const [leftWidth, setLeftWidth] = useState(50)
@@ -1166,6 +1171,28 @@ export function TaskConversationPanel({
               </div>
             )}
 
+            {voiceConversationEnabled && voiceInputEnabled && taskControlsEnabled && (
+              <VoiceConversation
+                open={voiceOpen}
+                onOpenChange={setVoiceOpen}
+                taskId={state.taskId}
+                messages={state.messages}
+                busy={state.isProcessing || isMessageDeliveryPending || ["running", "pending", "pause_requested", "resume_requested"].includes(state.currentTask?.status || "")}
+                waiting={state.currentTask?.status === "waiting_for_user"}
+                disabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
+                onInterrupt={() => {
+                  if (state.isProcessing || state.currentTask?.status === "running") { pauseTask(); return true }
+                  return false
+                }}
+                onSend={async (text, clientMessageId) => {
+                  await sendMessage(text, {
+                    clientMessageId,
+                    metadata: state.currentTask?.status === "waiting_for_user" && state.currentTask.waitingRequestId
+                      ? { request_id: state.currentTask.waitingRequestId } : undefined,
+                  }, [])
+                }}
+              />
+            )}
             <ChatInput
               onSend={handleSend}
               currentInteractionRequestId={
@@ -1204,6 +1231,8 @@ export function TaskConversationPanel({
               onRetryAttachment={onRetryAttachment}
               attachmentsBusy={attachmentsBusy}
               voiceInputEnabled={voiceInputEnabled}
+              onVoiceConversation={voiceConversationEnabled && taskControlsEnabled ? () => setVoiceOpen(true) : undefined}
+              voiceConversationDisabled={!isConnected || isConversationResetPending || isSessionInteractionLocked}
               hideFileUpload={hideFileUpload || filesBlocked}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}

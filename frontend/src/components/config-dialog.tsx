@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge"
 import { Settings, X, Loader2, ArrowRight } from "lucide-react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
-import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
+import { isBuiltinModel, getModelSourceLabel } from "@/lib/models"
 import { useAuth } from "@/contexts/auth-context"
 import { Select } from "@/components/ui/select"
 import { Slider } from "@/components/ui/slider"
@@ -62,13 +62,6 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
     memorySimilarityThreshold: currentConfig?.memorySimilarityThreshold ?? 1.5
   })
   const { t } = useI18n()
-
-  // Provider host line shown under the model name: "hostname (provider)",
-  // falling back to just the provider when there's no base_url.
-  const modelHost = (m: Model): string => {
-    const host = hostnameFromUrl(m.base_url)
-    return host ? `${host} (${m.model_provider})` : m.model_provider
-  }
 
   // Fetch models when dialog opens
   useEffect(() => {
@@ -224,7 +217,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                     options={models.map(m => ({
                       value: m.model_id,
                       label: m.model_name,
-                      host: modelHost(m),
+                      host: getModelSourceLabel(m),
                       description: m.model_id,
                       isBuiltin: isBuiltinModel(m),
                       isDefault: m.is_default,
@@ -251,7 +244,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        host: modelHost(m),
+                        host: getModelSourceLabel(m),
                         description: m.model_id,
                         isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
@@ -279,7 +272,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        host: modelHost(m),
+                        host: getModelSourceLabel(m),
                         description: m.model_id,
                         isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,
@@ -307,7 +300,7 @@ export function ConfigDialog({ onConfigChange, currentConfig, trigger }: ConfigD
                       ...models.map(m => ({
                         value: m.model_id,
                         label: m.model_name,
-                        host: modelHost(m),
+                        host: getModelSourceLabel(m),
                         description: m.model_id,
                         isBuiltin: isBuiltinModel(m),
                         isDefault: m.is_default,

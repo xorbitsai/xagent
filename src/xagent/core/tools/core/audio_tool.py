@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from ....config import get_remote_json_download_max_bytes
 from ...file_ref import build_workspace_file_ref
+from ...model.asr.adapter import supports_batch_asr
 from ...model.asr.base import ASRResult, BaseASR
 from ...model.tts.base import BaseTTS, TTSResult
 from ...utils.public_download import download_public_input
@@ -221,7 +222,23 @@ class AudioToolCore:
 
     def _get_asr_model(self, model_id: Optional[str] = None) -> Optional[BaseASR]:
         """Get ASR model by ID or default model."""
-        return self._get_model(self._asr_models, self._default_asr_model, model_id)
+        if (
+            model_id is not None
+            and model_id in self._asr_models
+            and not supports_batch_asr(self._asr_models[model_id])
+        ):
+            raise ValueError("Selected ASR model only supports live audio")
+        models = {
+            key: model
+            for key, model in self._asr_models.items()
+            if supports_batch_asr(model)
+        }
+        default = (
+            self._default_asr_model
+            if supports_batch_asr(self._default_asr_model)
+            else None
+        )
+        return self._get_model(models, default, model_id)
 
     @staticmethod
     def _is_cjk_character(value: str) -> bool:

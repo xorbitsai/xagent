@@ -218,6 +218,10 @@ class ModelResponse(BaseModel):
     base_url: Optional[str]
     bedrock_region: Optional[str] = None
     bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
+    language: Optional[str] = None
+    voice: Optional[str] = None
+    format: Optional[str] = None
+    sample_rate: Optional[int] = None
     temperature: Optional[float]
     context_window: Optional[int] = None
     dimension: Optional[int]
@@ -376,6 +380,10 @@ class ModelWithAccessInfo(BaseModel):
     base_url: Optional[str]
     bedrock_region: Optional[str] = None
     bedrock_auth_mode: Optional[Literal["api_key", "credentials_chain"]] = None
+    language: Optional[str] = None
+    voice: Optional[str] = None
+    format: Optional[str] = None
+    sample_rate: Optional[int] = None
     temperature: Optional[float]
     context_window: Optional[int] = None
     dimension: Optional[int]

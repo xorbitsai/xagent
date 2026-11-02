@@ -27,6 +27,7 @@ import {
   getUserDefaultModels,
   setUserDefaultModel,
   removeUserDefaultModel,
+  supportsBatchAsr,
   DefaultModelType,
   ModelWithAccess,
   UserDefaultModelMap,
@@ -106,7 +107,7 @@ const getCompatibleModels = (models: ModelWithAccess[], configType: SettingsDefa
     return models.filter((model) => model.category === 'video' && (model.abilities || []).includes('generate'))
   }
   if (configType === 'asr') {
-    return models.filter((model) => model.category === 'speech' && (model.abilities || []).includes('asr'))
+    return models.filter((model) => model.category === 'speech' && supportsBatchAsr(model))
   }
   if (configType === 'tts') {
     return models.filter((model) => model.category === 'speech' && (model.abilities || []).includes('tts'))
@@ -114,7 +115,7 @@ const getCompatibleModels = (models: ModelWithAccess[], configType: SettingsDefa
   if (configType === 'speech') {
     return models.filter((model) => {
       const abilities = model.abilities || []
-      return model.category === 'speech' && abilities.includes('asr') && abilities.includes('tts')
+      return model.category === 'speech' && supportsBatchAsr(model) && abilities.includes('tts')
     })
   }
   if (configType === 'sound_effect') {

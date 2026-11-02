@@ -37,6 +37,8 @@ import shutil
 import struct
 import subprocess
 import tempfile
+from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import Any, Awaitable, Callable, Mapping, Optional
@@ -177,14 +179,14 @@ class BilledStream:
         return b"".join(self.chunks)
 
 
-async def read_billed_stream(
+async def iter_billed_stream(
     section: Any,
     method: str,
     kwargs: dict[str, Any],
     coerce: Callable[[Any], bytes],
     state: BilledStream,
-) -> bytes:
-    """Stream an ElevenLabs audio endpoint into ``state``.
+) -> AsyncGenerator[bytes, None]:
+    """Yield audio without buffering, retaining acceptance and billing headers.
 
     Uses the SDK's ``with_raw_response`` client when present: it enters only on
     a 2xx response, which marks the request accepted before the first byte is
@@ -199,17 +201,37 @@ async def read_billed_stream(
             state.accepted = True
             state.headers = response.headers
             async for chunk in response.data:
-                state.chunks.append(coerce(chunk))
-        return state.audio
+                yield coerce(chunk)
+        return
 
     response = getattr(section, method)(**kwargs)
     # ElevenLabs SDK 2.56+ exposes streaming methods as async generators;
     # older releases returned a coroutine resolving to an async iterator.
     if isawaitable(response):
         response = await response
-    async for chunk in response:
-        state.accepted = True
-        state.chunks.append(coerce(chunk))
+    try:
+        async for chunk in response:
+            state.accepted = True
+            yield coerce(chunk)
+    finally:
+        close = getattr(response, "aclose", None)
+        if callable(close):
+            await close()
+
+
+async def read_billed_stream(
+    section: Any,
+    method: str,
+    kwargs: dict[str, Any],
+    coerce: Callable[[Any], bytes],
+    state: BilledStream,
+) -> bytes:
+    """Collect the audio for callers of the existing, non-streaming API."""
+    async with aclosing(
+        iter_billed_stream(section, method, kwargs, coerce, state)
+    ) as stream:
+        async for chunk in stream:
+            state.chunks.append(chunk)
     return state.audio
 
 

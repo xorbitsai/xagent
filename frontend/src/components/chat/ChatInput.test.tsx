@@ -43,7 +43,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({ user: authUserMock.current }),
+  useAuth: () => ({ user: authUserMock.current, token: "test-token" }),
 }))
 
 vi.mock("@/components/config-dialog", () => ({
@@ -136,6 +136,34 @@ describe("ChatInput", () => {
     cleanup()
     Reflect.deleteProperty(document, "execCommand")
     vi.unstubAllGlobals()
+  })
+
+  it("opens voice mode beside the composer without sending or clearing its draft", async () => {
+    apiRequestMock.mockImplementation(async () => new Response(JSON.stringify([
+      { id: 1, model_id: "live", model_name: "scribe_v2_realtime", abilities: ["asr"] },
+      { id: 2, model_id: "tts", model_name: "eleven_v3", abilities: ["tts"] },
+    ].map(model => ({ category: "speech", model_provider: "elevenlabs", base_url: null, temperature: null,
+      context_window: null, dimension: null, description: null, created_at: null, updated_at: null,
+      is_active: true, is_owner: true, can_edit: true, can_delete: true, is_shared: false, ...model }))), { status: 200 }))
+    const openVoice = vi.fn()
+    const onSend = vi.fn()
+    const onInputChange = vi.fn()
+    const { container, rerender } = render(<ChatInput onSend={onSend}
+      onVoiceConversation={openVoice} inputValue="Keep my draft" onInputChange={onInputChange}
+      readOnlyConfig taskConfig={{ model: "selected-model", executionMode: "flash" }} />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeEnabled())
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    expect(openVoice).toHaveBeenCalledWith(expect.objectContaining({ model: "selected-model", executionMode: { mode: "flash" } }))
+    expect(container.querySelector("[contenteditable]")).toHaveTextContent("Keep my draft")
+    expect(onSend).not.toHaveBeenCalled()
+    expect(onInputChange).not.toHaveBeenCalled()
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceConversationDisabled
+      readOnlyConfig taskConfig={{ model: "selected-model" }} />)
+    expect(screen.getByRole("button", { name: "voiceConversation.open" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.open" }))
+    expect(openVoice).toHaveBeenCalledOnce()
+    rerender(<ChatInput onSend={onSend} onVoiceConversation={openVoice} voiceInputEnabled={false} />)
+    expect(screen.queryByRole("button", { name: "voiceConversation.open" })).not.toBeInTheDocument()
   })
 
   it("requires a model when submitting generic chat", async () => {

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from typing import Any, Optional, Union
+from unittest.mock import AsyncMock
 
 import pytest
 
 from xagent.core.model.asr.base import ASRResult, ASRSegment, BaseASR
+from xagent.core.model.asr.elevenlabs import ElevenLabsASR
 from xagent.core.model.tts.base import BaseTTS, TTSResult
 from xagent.core.tools.adapters.vibe.audio_tool import AudioTool
 from xagent.core.tools.core.audio_tool import AudioToolCore
@@ -173,6 +175,29 @@ def test_audio_path_resolution_does_not_fall_back_to_process_cwd(
 
     with pytest.raises(FileNotFoundError, match="not found in workspace"):
         tool._resolve_audio_path("output/voice.mp3")
+
+
+async def test_file_audio_tool_skips_live_only_asr_and_rejects_explicit_selection(
+    tmp_path, monkeypatch
+):
+    workspace = TaskWorkspace("batch_asr_boundary", base_dir=str(tmp_path))
+    audio_path = workspace.output_dir / "voice.wav"
+    audio_path.write_bytes(b"audio")
+    file_id = workspace.register_file(str(audio_path))
+    live = ElevenLabsASR(model="scribe_v2_realtime", api_key="test-key")
+    transcribe = AsyncMock(side_effect=AssertionError("live model selected for a file"))
+    monkeypatch.setattr(live, "transcribe", transcribe)
+    tool = AudioToolCore(
+        asr_models={"live": live, "batch": FakeASR()},
+        default_asr_model=live,
+        workspace=workspace,
+    )
+    result = await tool.transcribe_audio(file_id)
+    assert result["success"] is True
+    result = await tool.transcribe_audio(file_id, model_id="live")
+    assert result["success"] is False
+    assert "only supports live audio" in result["error"]
+    transcribe.assert_not_awaited()
 
 
 async def test_transcribe_audio_verbose_preserves_provider_timestamps(

@@ -46,6 +46,10 @@ def create_model_table(Base: Type[Any]) -> Type[Any]:
         )  # Total context window in tokens
         bedrock_region = Column(String(64), nullable=True)
         bedrock_auth_mode = Column(String(32), nullable=True)
+        language = Column(String(64), nullable=True)
+        voice = Column(String(255), nullable=True)
+        format = Column(String(64), nullable=True)
+        sample_rate = Column(Integer, nullable=True)
         dimension = Column(
             Integer, nullable=True
         )  # Vector dimension for embedding models

@@ -198,6 +198,10 @@ class CoreStorage:
             return SpeechModelConfig(
                 **common,
                 model_provider=db_model.model_provider,
+                language=db_model.language,
+                voice=db_model.voice,
+                format=db_model.format,
+                sample_rate=db_model.sample_rate,
             )
         elif db_model.category == "sound_effect":
             return SoundEffectModelConfig(
@@ -320,6 +324,10 @@ class CoreStorage:
                     {
                         "model_provider": model.model_provider,
                         "category": "speech",
+                        "language": model.language,
+                        "voice": model.voice,
+                        "format": model.format,
+                        "sample_rate": model.sample_rate,
                     }
                 )
             elif isinstance(model, SoundEffectModelConfig):

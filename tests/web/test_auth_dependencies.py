@@ -701,6 +701,12 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             terminated,
         ),
         (
+            "web/api/speech.py",
+            "stream_asr",
+            "get_authenticated_user",
+            terminated,
+        ),
+        (
             "web/api/files.py",
             "_user_from_bearer_or_stream_ticket",
             "get_current_user",
@@ -756,6 +762,21 @@ def test_auth_consumer_topology_is_closed_across_source_tree() -> None:
             "progress_websocket_endpoint",
             "get_authenticated_user",
             ("WebSocketDisconnect", "_WebSocketAuthenticationTerminated", "Exception"),
+        ),
+        (
+            "web/api/speech.py",
+            "stream_asr",
+            "get_authenticated_user",
+            (
+                "WebSocketDisconnect",
+                "_WebSocketAuthenticationTerminated",
+                "_ASRWriteTimeout",
+                "_ASRSessionTimeout",
+                "ValidationError",
+                "ValueError",
+                "HTTPException",
+                "Exception",
+            ),
         ),
     )
     modules = {"xagent.web.auth_dependencies", "xagent.web.api.websocket_auth"}

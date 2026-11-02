@@ -15,7 +15,7 @@ import {
   waitForBackgroundJob,
 } from "@/lib/background-jobs"
 import { getApiUrl } from "@/lib/utils"
-import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
+import { isBuiltinModel, getModelSourceLabel } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog, type AppIntegration } from "@/components/mcp/official-mcp-settings-dialog"
@@ -1037,17 +1037,12 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     description: skill.description || skill.when_to_use || undefined,
   }))
 
-  const modelHost = (model: Model): string => {
-    const host = hostnameFromUrl(model.base_url)
-    return host ? `${host} (${model.model_provider})` : model.model_provider
-  }
-
   const modelOptions = [
     { value: "", label: "--" },
     ...(Array.isArray(models) ? models : []).map((model) => ({
       value: model.id.toString(),
       label: model.model_name,
-      host: modelHost(model),
+      host: getModelSourceLabel(model),
       description: model.model_id,
       isBuiltin: isBuiltinModel(model),
       isDefault: model.is_default,

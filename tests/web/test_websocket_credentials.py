@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from xagent.web.api import progress_ws
+from xagent.web.api import progress_ws, speech
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api import websocket_auth
 from xagent.web.api.websocket_auth import revalidate_websocket_session
@@ -25,16 +25,25 @@ def _scope(headers):
 
 
 @pytest.mark.parametrize(
-    "path", ["/ws/chat/1", "/ws/build/chat", "/ws/build/preview", "/ws/progress/1"]
+    "path",
+    [
+        "/ws/chat/1",
+        "/ws/build/chat",
+        "/ws/build/preview",
+        "/ws/progress/1",
+        "/api/models/speech/asr/stream",
+    ],
 )
 @pytest.mark.parametrize("legacy", [False, True])
 def test_every_private_route_uses_the_shared_header_guard(monkeypatch, path, legacy):
     authenticate = AsyncMock(return_value=None)
     monkeypatch.setattr(websocket_api, "get_authenticated_user", authenticate)
     monkeypatch.setattr(progress_ws, "get_authenticated_user", authenticate)
+    monkeypatch.setattr(speech, "get_authenticated_user", authenticate)
     app = FastAPI()
     app.include_router(websocket_api.ws_router)
     app.include_router(progress_ws.progress_ws_router)
+    app.include_router(speech.speech_router)
     with TestClient(app) as client:
         with pytest.raises(WebSocketDisconnect):
             with client.websocket_connect(

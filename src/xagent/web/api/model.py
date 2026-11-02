@@ -47,9 +47,11 @@ from xagent.core.model.providers import (
 )
 from xagent.core.utils.security import redact_sensitive_text
 
+from ...core.model.asr.adapter import supports_batch_asr
+from ...core.model.tts.adapter import get_tts_model_instance
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..models.auto_model import AutoModelCandidate, AutoModelConfig
-from ..models.database import get_db
+from ..models.database import get_db, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.user import User, UserDefaultModel, UserModel
 from ..schemas.model import (
@@ -72,11 +74,13 @@ from ..services.auto_model_service import (
     is_reserved_auto_router_model_id,
     list_router_profiles,
 )
+from ..services.db_runtime import drain_async_task_cancellation_safe
 from ..services.llm_utils import (
     PLATFORM_MODEL_MANAGER,
     CoreStorage,
     is_platform_model_id,
 )
+from ..services.model_service import _passes_model_visibility_hook
 from ..services.model_store import ModelSharingConflictError, ModelStore
 from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
 
@@ -323,7 +327,11 @@ def _iter_accessible_asr_models(db: Session, user: User) -> list[DBModel]:
     seen_model_ids: set[int] = set()
     for db_model, _user_model in rows:
         model_pk = int(db_model.id)
-        if model_pk in seen_model_ids or not _model_has_ability(db_model, "asr"):
+        if (
+            model_pk in seen_model_ids
+            or not _model_has_ability(db_model, "asr")
+            or not supports_batch_asr(db_model)
+        ):
             continue
         seen_model_ids.add(model_pk)
         models.append(db_model)
@@ -339,7 +347,11 @@ def _resolve_asr_model_for_transcription(
         _, db_model, _user_model = _resolve_accessible_model(
             db, user, requested_model_id
         )
-        if db_model.category != "speech" or not _model_has_ability(db_model, "asr"):
+        if (
+            db_model.category != "speech"
+            or not _model_has_ability(db_model, "asr")
+            or not supports_batch_asr(db_model)
+        ):
             raise HTTPException(
                 status_code=400,
                 detail="Selected model does not support ASR transcription",
@@ -360,7 +372,9 @@ def _resolve_asr_model_for_transcription(
     default_model: Optional[DBModel] = None
     if asr_default and asr_default.model:
         default_model = cast(DBModel, asr_default.model)
-        if not _model_has_ability(default_model, "asr"):
+        if not _model_has_ability(default_model, "asr") or not supports_batch_asr(
+            default_model
+        ):
             default_model = None
 
     if default_model:
@@ -494,6 +508,8 @@ def _is_default_config_type_compatible(model: Any, config_type: str) -> bool:
         return False
     current_category = str(getattr(model, "category", ""))
     if current_category != expected_category:
+        return False
+    if config_type in {"asr", "speech"} and not supports_batch_asr(model):
         return False
 
     abilities = getattr(model, "abilities", None) or []
@@ -736,6 +752,10 @@ async def create_model(
         "base_url": db_model.base_url,
         "bedrock_region": db_model.bedrock_region,
         "bedrock_auth_mode": db_model.bedrock_auth_mode,
+        "language": db_model.language,
+        "voice": db_model.voice,
+        "format": db_model.format,
+        "sample_rate": db_model.sample_rate,
         "temperature": db_model.temperature,
         "context_window": db_model.context_window,
         "dimension": db_model.dimension,
@@ -1205,6 +1225,63 @@ async def test_model_connection(
             message="Connection failed",
             error=safe_error,
         )
+
+
+@model_router.get("/speech/voices")
+async def list_speech_voices(
+    model_id: str = Query(min_length=1, max_length=512),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, str]]:
+    """List selectable voices through an accessible configured TTS model."""
+    _, config, _ = _resolve_accessible_model(db, user, model_id)
+    if not config.is_active or not _passes_model_visibility_hook(
+        db, int(user.id), config
+    ):
+        raise HTTPException(status_code=404, detail="Model not found")
+    if config.category != "speech" or "tts" not in (config.abilities or []):
+        raise HTTPException(status_code=400, detail="Select a speech synthesis model")
+    try:
+        model = get_tts_model_instance(config)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="Invalid TTS model configuration"
+        ) from None
+    try:
+        release_db_connection_if_clean(db)
+        if not model.supports_voice_listing:
+            raise HTTPException(
+                status_code=400, detail="Voice listing is not supported"
+            )
+        voices = await asyncio.wait_for(model.list_available_voices(), timeout=30)
+        return [
+            {
+                "voice_id": voice["voice_id"],
+                "name": str(voice.get("name") or voice["voice_id"]),
+            }
+            for voice in voices
+            if isinstance(voice.get("voice_id"), str)
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", voice["voice_id"])
+        ]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        key = getattr(model, "api_key", None)
+        detail = str(exc).replace(key, "[REDACTED]") if key else str(exc)
+        logger.warning("Speech voice listing failed: %s", redact_sensitive_text(detail))
+        raise HTTPException(
+            status_code=502, detail="Could not load available voices"
+        ) from None
+    finally:
+
+        async def close() -> None:
+            method = getattr(model, "aclose", None)
+            if callable(method):
+                result = method()
+                if isawaitable(result):
+                    await result
+
+        await drain_async_task_cancellation_safe(asyncio.create_task(close()))
 
 
 @model_router.post("/speech/transcribe")

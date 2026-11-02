@@ -3,7 +3,10 @@ import { renderFileMentionsHtml } from "./FileChip";
 import { escapeHtml } from "@/lib/html-escape";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
+import { VoiceModeButton } from "./voice-mode-button";
+import { useVoiceModels, voiceModelReason } from "@/hooks/use-voice-models";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
@@ -72,6 +75,8 @@ interface ChatInputProps {
   hideFileUpload?: boolean;
   filesDisabled?: boolean;
   voiceInputEnabled?: boolean;
+  onVoiceConversation?: (config: AgentConfig) => void;
+  voiceConversationDisabled?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
@@ -154,6 +159,8 @@ export function ChatInput({
   hideFileUpload = false,
   filesDisabled = false,
   voiceInputEnabled = true,
+  onVoiceConversation,
+  voiceConversationDisabled = false,
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
@@ -191,6 +198,7 @@ export function ChatInput({
   const { user } = useAuth();
   const { openFilePreview } = useApp();
   const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
+  const voiceModels = useVoiceModels(Boolean(voiceInputEnabled && onVoiceConversation));
 
   useEffect(() => {
     mountedRef.current = true;
@@ -897,6 +905,79 @@ export function ChatInput({
     appendFiles(droppedFiles);
   };
 
+  const executionMode = showExecutionModePicker ? pickedExecutionMode : taskConfig?.executionMode;
+  const normalizedExecutionMode = executionMode
+    ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+    : undefined;
+  const extraRuntimeExtensions = activeLocalBrowserTarget
+    ? { local_browser: { ...activeLocalBrowserTarget } }
+    : activeTaskRuntimeSelection?.runtimeExtensions;
+  const deliveryConfig = (clientMessageId?: string, requestId?: string) => {
+    const metadata = {
+      ...(agentConfig.metadata || {}),
+      ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      ...(requestId ? { request_id: requestId } : {}),
+    };
+    return {
+      ...agentConfig,
+      ...(configIsDrivenByTaskConfig ? {
+        model: displayModel,
+        smallFastModel: taskConfig?.smallFastModel,
+        visualModel: taskConfig?.visualModel,
+        compactModel: taskConfig?.compactModel,
+        executionMode: normalizedExecutionMode,
+      } : {}),
+      ...(clientMessageId ? { clientMessageId } : {}),
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      ...(extraRuntimeExtensions ? {
+        runtimeExtensions: { ...(agentConfig.runtimeExtensions || {}), ...extraRuntimeExtensions },
+      } : {}),
+      ...(!configIsDrivenByTaskConfig && normalizedExecutionMode ? { executionMode: normalizedExecutionMode } : {}),
+    };
+  };
+  const voiceInputButton = voiceInputEnabled && voiceInput.hasAsrModel ? (
+    <TooltipProvider><Tooltip delayDuration={200}>
+      <TooltipTrigger asChild>
+        <span className="inline-flex" tabIndex={voiceInputDisabled ? 0 : undefined}
+          aria-label={voiceInputDisabled ? voiceInputLabel : undefined}>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            aria-label={voiceInputLabel}
+            className={cn(
+              "h-8 w-8 p-0 rounded-full transition-colors",
+              voiceInput.status === "recording"
+                ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
+                : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
+              voiceInput.status === "transcribing" && "cursor-wait opacity-80"
+            )}
+            disabled={voiceInputDisabled}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={handleVoiceInputClick}
+          >
+            {voiceInput.status === "recording" ? (
+              <Square className="h-3.5 w-3.5 fill-current" />
+            ) : voiceInput.status === "transcribing" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Mic className="h-4 w-4" />
+            )}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent><p>{voiceInputLabel}</p></TooltipContent>
+    </Tooltip></TooltipProvider>
+  ) : null;
+  const voiceConversationButton = voiceInputEnabled && onVoiceConversation ? (
+    <VoiceModeButton iconOnly
+      reason={voiceModelReason(voiceModels, Boolean(selectedAgents.length || displayModel))}
+      disabled={voiceConversationDisabled || isInputBusy || voiceInput.status !== "idle"}
+      onClick={() => {
+        onVoiceConversation(deliveryConfig());
+      }} />
+  ) : null;
+
   const handleSubmit = async (e: React.SyntheticEvent) => {
     e.preventDefault();
 
@@ -913,15 +994,6 @@ export function ChatInput({
       isSubmittingRef.current = true;
       const trimmed = message.trim();
       const messageToSend = trimmed;
-      const executionMode = showExecutionModePicker
-        ? pickedExecutionMode
-        : taskConfig?.executionMode;
-      const normalizedExecutionMode = executionMode
-        ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
-        : undefined;
-      const extraRuntimeExtensions = activeLocalBrowserTarget
-        ? { local_browser: { ...activeLocalBrowserTarget } }
-        : activeTaskRuntimeSelection?.runtimeExtensions;
       const deliveryKey = JSON.stringify([
         messageToSend,
         extraRuntimeExtensions || null,
@@ -936,49 +1008,8 @@ export function ChatInput({
         ? previousAttempt.clientMessageId
         : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
-      const existingMetadata = {
-        ...(agentConfig.metadata || {}),
-        ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
-      };
       const draftRequestId = draftRequestSnapshotRef.current?.requestId;
-      const metadataToSend = draftRequestId
-        ? { ...existingMetadata, request_id: draftRequestId }
-        : Object.keys(existingMetadata).length > 0
-          ? existingMetadata
-          : undefined;
-
-      const configToSend = {
-        ...agentConfig,
-        ...(configIsDrivenByTaskConfig
-          ? {
-              model: displayModel,
-              smallFastModel: taskConfig?.smallFastModel,
-              visualModel: taskConfig?.visualModel,
-              compactModel: taskConfig?.compactModel,
-              // Same live-vs-mirror reasoning as the model fields above,
-              // applied to executionMode: a falsy live value must still
-              // explicitly clear the key here rather than being skipped,
-              // or it would silently fall through to whatever stale
-              // executionMode `agentConfig` (spread below) still carries
-              // from the previous lead while its own mirroring effect
-              // hasn't caught up yet.
-              executionMode: normalizedExecutionMode,
-            }
-          : {}),
-        clientMessageId,
-        ...(metadataToSend ? { metadata: metadataToSend } : {}),
-        ...(extraRuntimeExtensions
-          ? {
-              runtimeExtensions: {
-                ...(agentConfig.runtimeExtensions || {}),
-                ...extraRuntimeExtensions,
-              },
-            }
-          : {}),
-        ...(!configIsDrivenByTaskConfig && normalizedExecutionMode
-          ? { executionMode: normalizedExecutionMode }
-          : {}),
-      };
+      const configToSend = deliveryConfig(clientMessageId, draftRequestId);
 
       const sentDraft = message;
       await onSend(messageToSend, configToSend);
@@ -1301,33 +1332,8 @@ export function ChatInput({
                   </Button>
                 </>
               )}
-              {voiceInputEnabled && voiceInput.hasAsrModel && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  aria-label={voiceInputLabel}
-                  title={voiceInputLabel}
-                  className={cn(
-                    "h-8 w-8 p-0 rounded-full transition-colors",
-                    voiceInput.status === "recording"
-                      ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                      : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
-                    voiceInput.status === "transcribing" && "cursor-wait opacity-80"
-                  )}
-                  disabled={voiceInputDisabled}
-                  onMouseDown={(event) => event.preventDefault()}
-                  onClick={handleVoiceInputClick}
-                >
-                  {voiceInput.status === "recording" ? (
-                    <Square className="h-3.5 w-3.5 fill-current" />
-                  ) : voiceInput.status === "transcribing" ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Mic className="h-4 w-4" />
-                  )}
-                </Button>
-              )}
+              {voiceInputButton}
+              {voiceConversationButton}
               {showStopButton ? (
                 <Button
                   type="button"
@@ -1495,33 +1501,8 @@ export function ChatInput({
                 <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
-                {voiceInputEnabled && voiceInput.hasAsrModel && (
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="sm"
-                    aria-label={voiceInputLabel}
-                    title={voiceInputLabel}
-                    className={cn(
-                      "h-8 w-8 p-0 rounded-full transition-colors",
-                      voiceInput.status === "recording"
-                        ? "bg-red-500 text-white hover:bg-red-600 hover:text-white"
-                        : "text-muted-foreground hover:text-foreground hover:bg-secondary/80",
-                      voiceInput.status === "transcribing" && "cursor-wait opacity-80"
-                    )}
-                    disabled={voiceInputDisabled}
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={handleVoiceInputClick}
-                  >
-                    {voiceInput.status === "recording" ? (
-                      <Square className="h-3.5 w-3.5 fill-current" />
-                    ) : voiceInput.status === "transcribing" ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Mic className="h-4 w-4" />
-                    )}
-                  </Button>
-                )}
+                {voiceInputButton}
+                {voiceConversationButton}
                 <Button
                   type="submit"
                   size="icon"

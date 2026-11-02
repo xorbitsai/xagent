@@ -397,6 +397,64 @@ class TestAuthAPI:
         assert data["user"]["email"] == test_user_data["email"]
         assert data["user"]["preferences"] == {}
 
+    def test_voice_conversation_preferences_round_trip_without_changing_writing_style(
+        self, test_db
+    ):
+        setup_first_admin()
+        token = login_and_get_token("administrator", "admin123")
+        headers = {"Authorization": f"Bearer {token}"}
+        assert (
+            client.patch(
+                "/api/auth/me/preferences",
+                json={"voice": "warm", "department": "Sales"},
+                headers=headers,
+            ).status_code
+            == 200
+        )
+        preferences = {
+            "asr_model_id": "live",
+            "tts_model_id": "speaker",
+            "voice": "selected-voice",
+        }
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice_conversation": preferences},
+            headers=headers,
+        )
+        assert response.status_code == 200
+        stored = client.get("/api/auth/me", headers=headers).json()["user"][
+            "preferences"
+        ]
+        assert stored == {
+            "voice": "warm",
+            "department": "Sales",
+            "voice_conversation": preferences,
+        }
+        for invalid in (
+            {"voice": "../../v1/user"},
+            {"tts_model_id": "x" * 513},
+            {"unknown": True},
+        ):
+            assert (
+                client.patch(
+                    "/api/auth/me/preferences",
+                    json={"voice_conversation": invalid},
+                    headers=headers,
+                ).status_code
+                == 422
+            )
+        assert (
+            client.patch(
+                "/api/auth/me/preferences",
+                json={"voice_conversation": None},
+                headers=headers,
+            ).status_code
+            == 200
+        )
+        assert client.get("/api/auth/me", headers=headers).json()["user"][
+            "preferences"
+        ] == {"voice": "warm", "department": "Sales"}
+
     def test_update_current_user_preferences_merges_across_calls(
         self, test_db, test_user_data
     ):

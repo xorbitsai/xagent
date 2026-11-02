@@ -23,7 +23,7 @@ from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
 from xagent.web.models.auth_database import get_auth_db
 from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig
-from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.database import Base, get_db, get_engine, get_session_local
 from xagent.web.models.model import Model as DBModel
 from xagent.web.models.user import UserDefaultModel, UserModel
 from xagent.web.services.llm_utils import (
@@ -279,6 +279,59 @@ def _platform_config(model_id: str, category: str = "llm"):
     return ChatModelConfig(**common, model_name="gpt-4", abilities=["chat"])
 
 
+@pytest.mark.parametrize("provider", ["xinference", "elevenlabs"])
+def test_speech_defaults_survive_create_read_update_and_clear(
+    test_db, regular_headers, sample_speech_model_data, provider
+):
+    settings = {
+        "language": "en",
+        "voice": "configured-voice",
+        "format": "pcm",
+        "sample_rate": 16000,
+    }
+    payload = {**sample_speech_model_data, "model_provider": provider, **settings}
+    created = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert created.status_code == 200, created.text
+    saved = created.json()
+    assert {key: saved[key] for key in settings} == settings
+    model_id = saved["model_id"]
+    detail_url = f"/api/models/by-id/{model_id}"
+
+    detail = client.get(detail_url, headers=regular_headers)
+    assert detail.status_code == 200
+    assert {key: detail.json()[key] for key in settings} == settings
+    listed = client.get("/api/models/", headers=regular_headers)
+    assert listed.status_code == 200
+    listed_model = next(item for item in listed.json() if item["model_id"] == model_id)
+    assert {key: listed_model[key] for key in settings} == settings
+
+    db = next(get_db())
+    try:
+        config = CoreStorage(db, DBModel).load(model_id)
+        assert {key: getattr(config, key) for key in settings} == settings
+    finally:
+        db.close()
+
+    changed = {"voice": "updated-voice", "sample_rate": 24000}
+    updated = client.put(detail_url, json=changed, headers=regular_headers)
+    assert updated.status_code == 200, updated.text
+    expected = {**settings, **changed}
+    refreshed = client.get("/api/models/", headers=regular_headers)
+    refreshed_model = next(
+        item for item in refreshed.json() if item["model_id"] == model_id
+    )
+    assert {key: refreshed_model[key] for key in expected} == expected
+
+    cleared = client.put(
+        detail_url, json={key: None for key in settings}, headers=regular_headers
+    )
+    assert cleared.status_code == 200, cleared.text
+    reread = client.get(detail_url, headers=regular_headers)
+    assert {key: reread.json()[key] for key in settings} == {
+        key: None for key in settings
+    }
+
+
 @pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
 def test_user_creation_rejects_platform_namespace(
     test_db, regular_headers, sample_model_data, path
@@ -293,6 +346,95 @@ def test_user_creation_rejects_platform_namespace(
         assert db.query(DBModel).filter_by(model_id="platform/forged").first() is None
     finally:
         db.close()
+
+
+@pytest.fixture
+def realtime_asr_record(regular_headers, sample_speech_model_data):
+    payload = {
+        **sample_speech_model_data,
+        "model_id": "live-only-asr",
+        "model_name": "scribe_v2_realtime",
+        "model_provider": "elevenlabs",
+        "abilities": ["asr"],
+    }
+    response = client.post("/api/models/", json=payload, headers=regular_headers)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_file_transcription_rejects_live_only_asr_before_provider_call(
+    realtime_asr_record, regular_headers, explicit
+):
+    with patch("xagent.core.model.asr.adapter.get_asr_model_instance") as factory:
+        response = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+            data={"model_id": realtime_asr_record["model_id"]} if explicit else {},
+        )
+    assert response.status_code == (400 if explicit else 404), response.text
+    factory.assert_not_called()
+
+
+def test_live_only_asr_cannot_become_file_asr_default(
+    realtime_asr_record, regular_headers
+):
+    response = client.post(
+        "/api/models/user-default",
+        headers=regular_headers,
+        json={"model_id": realtime_asr_record["id"], "config_type": "asr"},
+    )
+    assert response.status_code == 400, response.text
+
+
+@pytest.mark.parametrize("legacy_default", [False, True])
+def test_file_asr_resolution_skips_realtime_candidates_and_legacy_defaults(
+    realtime_asr_record,
+    regular_user,
+    regular_headers,
+    sample_speech_model_data,
+    legacy_default,
+):
+    response = client.post(
+        "/api/models/",
+        headers=regular_headers,
+        json={
+            **sample_speech_model_data,
+            "model_id": "batch-asr",
+            "model_name": "scribe_v2",
+            "model_provider": "elevenlabs",
+            "abilities": ["asr"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    if legacy_default:
+        db = next(get_db())
+        try:
+            db.add(
+                UserDefaultModel(
+                    user_id=regular_user["id"],
+                    model_id=realtime_asr_record["id"],
+                    config_type="asr",
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+    fake = SimpleNamespace(
+        transcribe=AsyncMock(return_value="recognized"), aclose=AsyncMock()
+    )
+    with patch(
+        "xagent.core.model.asr.adapter.get_asr_model_instance", return_value=fake
+    ) as factory:
+        transcribed = client.post(
+            "/api/models/speech/transcribe",
+            headers=regular_headers,
+            files={"file": ("voice.wav", b"audio", "audio/wav")},
+        )
+    assert transcribed.status_code == 200, transcribed.text
+    assert transcribed.json()["model_id"] == "batch-asr"
+    assert factory.call_args.args[0].model_name == "scribe_v2"
 
 
 @pytest.mark.parametrize("path", ["/api/models/", "/api/models/register"])
@@ -633,6 +775,132 @@ def test_xinference_tts_models_route_is_removed():
 
     assert response.status_code == 404
     list_models.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_speech_voice_listing_uses_accessible_model_and_closes_client(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, caplog, failure
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    provider = SimpleNamespace(
+        api_key="synthetic-secret",
+        supports_voice_listing=True,
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "voice-one", "name": "Rachel", "extra": "private metadata"}
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    if failure:
+        provider.list_available_voices.side_effect = RuntimeError("synthetic-secret")
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    assert client.get(
+        "/api/models/speech/voices", params={"model_id": model_id}
+    ).status_code in {401, 403}
+    factory.assert_not_called()
+    assert (
+        client.get(
+            "/api/models/speech/voices",
+            params={"model_id": "missing"},
+            headers=regular_headers,
+        ).status_code
+        == 404
+    )
+    factory.assert_not_called()
+    with monkeypatch.context() as hidden:
+        hidden.setattr(model_module, "_passes_model_visibility_hook", lambda *_: False)
+        assert (
+            client.get(
+                "/api/models/speech/voices",
+                params={"model_id": model_id},
+                headers=regular_headers,
+            ).status_code
+            == 404
+        )
+    factory.assert_not_called()
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (502 if failure else 200), response.text
+    if not failure:
+        assert response.json() == [{"voice_id": "voice-one", "name": "Rachel"}]
+    assert "synthetic-secret" not in response.text + caplog.text
+    provider.aclose.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "case", ["inactive", "non_speech", "non_tts", "unsupported", "malformed_ids"]
+)
+def test_speech_voice_listing_capability_and_output_boundaries(
+    test_db, regular_headers, sample_speech_model_data, monkeypatch, case
+):
+    created = client.post(
+        "/api/models/",
+        json={
+            **sample_speech_model_data,
+            "model_provider": "elevenlabs",
+            "model_name": "eleven_v3",
+            "abilities": ["tts"],
+        },
+        headers=regular_headers,
+    )
+    assert created.status_code == 200, created.text
+    model_id = created.json()["model_id"]
+    if case in {"inactive", "non_speech", "non_tts"}:
+        with get_session_local()() as db:
+            saved = db.query(DBModel).filter_by(model_id=model_id).one()
+            if case == "inactive":
+                saved.is_active = False
+            if case == "non_speech":
+                saved.category = "llm"
+            if case == "non_tts":
+                saved.abilities = ["asr"]
+            db.commit()
+    provider = SimpleNamespace(
+        supports_voice_listing=case != "unsupported",
+        list_available_voices=AsyncMock(
+            return_value=[
+                {"voice_id": "safe-voice", "name": "Rachel"},
+                {"voice_id": "../private"},
+                {"voice_id": 123},
+                {},
+            ]
+        ),
+        aclose=AsyncMock(),
+    )
+    factory = Mock(return_value=provider)
+    monkeypatch.setattr(model_module, "get_tts_model_instance", factory)
+    response = client.get(
+        "/api/models/speech/voices",
+        params={"model_id": model_id},
+        headers=regular_headers,
+    )
+    assert response.status_code == (
+        200 if case == "malformed_ids" else 404 if case == "inactive" else 400
+    ), response.text
+    if case in {"inactive", "non_speech", "non_tts"}:
+        factory.assert_not_called()
+    else:
+        provider.aclose.assert_awaited_once()
+        if case == "unsupported":
+            provider.list_available_voices.assert_not_called()
+        else:
+            assert response.json() == [{"voice_id": "safe-voice", "name": "Rachel"}]
 
 
 class TestModelAPI:

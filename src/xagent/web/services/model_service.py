@@ -19,6 +19,7 @@ from xagent.core.model.image.base import (
     retry_image_call,
 )
 
+from ...core.model.asr.adapter import supports_batch_asr
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.image.dashscope import DashScopeImageModel
 from ...core.model.image.gemini import GeminiImageModel
@@ -1345,6 +1346,8 @@ def _get_models_by_category(
                 or ability not in abilities
             ):
                 continue
+            if ability == "asr" and not supports_batch_asr(db_model):
+                continue
 
             model_provider = str(db_model.model_provider).strip().lower()
             # api_key may be empty for self-hosted Xinference (no auth);
@@ -1539,7 +1542,11 @@ def get_default_asr_model(
                         .first()
                     )
 
-                    if asr_default and asr_default.model:
+                    if (
+                        asr_default
+                        and asr_default.model
+                        and supports_batch_asr(asr_default.model)
+                    ):
                         if _is_model_visible_to_user(
                             model_db, asr_default.model.id, user_id
                         ):
@@ -1563,15 +1570,17 @@ def get_default_asr_model(
                             _get_visible_user_ids(model_db, user_id)
                         ),
                     )
-                    .limit(1)
                     .all()
                 )
 
-                if admin_asr_defaults:
+                for asr_default in admin_asr_defaults:
+                    if not supports_batch_asr(asr_default.model):
+                        continue
                     try:
-                        return get_asr_model_instance(admin_asr_defaults[0].model)
+                        return get_asr_model_instance(asr_default.model)
                     except Exception as e:
                         logger.warning(f"Failed to create ASR model instance: {e}")
+                        break
 
         except Exception as e:
             logger.warning(f"Database query failed for ASR model: {e}")

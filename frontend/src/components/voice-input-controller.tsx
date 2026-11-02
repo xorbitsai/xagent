@@ -12,6 +12,7 @@ import {
   parseApiResponse,
 } from "@/lib/api-wrapper"
 import { cn, getApiUrl, getUploadApiUrl } from "@/lib/utils"
+import { supportsBatchAsr } from "@/lib/models"
 
 export type VoiceTarget = HTMLInputElement | HTMLTextAreaElement | HTMLElement
 export type VoiceStatus = "idle" | "recording" | "transcribing"
@@ -343,10 +344,7 @@ export function useVoiceInputControls(
       }
       const available =
         Array.isArray(models) &&
-        models.some((model) => {
-          const abilities = Array.isArray(model?.abilities) ? model.abilities : []
-          return abilities.map(String).includes("asr")
-        })
+        models.some(supportsBatchAsr)
       setHasAsrModel(available)
     } catch {
       if (

@@ -12,7 +12,7 @@ export function browserSecurityHeaders({
     "base-uri 'none'",
     "object-src 'none'",
     "form-action 'self'",
-    `script-src 'self' 'unsafe-inline' https:${development ? " 'unsafe-eval'" : ""}`,
+    `script-src 'self' 'unsafe-inline' https: 'wasm-unsafe-eval'${development ? " 'unsafe-eval'" : ""}`,
     "style-src 'self' 'unsafe-inline' https:",
     `img-src 'self' data: blob: https:${development ? " http:" : ""}`,
     `media-src 'self' data: blob: https:${development ? " http:" : ""}`,

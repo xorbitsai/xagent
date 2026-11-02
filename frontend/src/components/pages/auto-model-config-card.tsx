@@ -34,6 +34,7 @@ import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/sonner";
 import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
+import { getModelSourceLabel } from "@/lib/models";
 import { cn, getApiUrl } from "@/lib/utils";
 
 import type { Model } from "./models";
@@ -66,6 +67,10 @@ interface Props {
   onSuccess: () => Promise<void>;
 }
 
+function modelLabel(model: Model): string {
+  return `${model.model_name} · ${getModelSourceLabel(model)}`;
+}
+
 function normalizedValues(model: Model): string[] {
   const raw = model.model_name.trim().toLowerCase();
   const provider = model.model_provider.trim().toLowerCase();
@@ -84,6 +89,24 @@ function normalizedValues(model: Model): string[] {
   return [...values];
 }
 
+// Same mapping as validate_candidate_modalities on the backend, which rejects a
+// routing candidate whose profile image, audio or video inputs differ from the
+// model abilities.
+const MODALITY_ABILITIES: Record<string, string> = {
+  image: "vision",
+  audio: "audio",
+  video: "video",
+};
+
+function modalitiesMatch(model: Model, profile: RouterProfile): boolean {
+  const abilities = model.abilities || [];
+  return Object.entries(MODALITY_ABILITIES).every(
+    ([modality, ability]) =>
+      profile.input_modalities.includes(modality) ===
+      abilities.includes(ability),
+  );
+}
+
 export function guessProfile(
   model: Model,
   profiles: RouterProfile[],
@@ -93,7 +116,10 @@ export function guessProfile(
     const profileValues = [profile.id, ...(profile.aliases || [])].map((value) =>
       value.trim().toLowerCase(),
     );
-    return profileValues.some((value) => modelValues.has(value));
+    return (
+      profileValues.some((value) => modelValues.has(value)) &&
+      modalitiesMatch(model, profile)
+    );
   })?.id;
 }
 
@@ -450,7 +476,8 @@ export function AutoModelConfigCard({
                 options={availableModels.map((model) => ({
                   value: String(model.id),
                   label: model.model_name,
-                  description: model.model_provider,
+                  selectedLabel: modelLabel(model),
+                  description: getModelSourceLabel(model),
                 }))}
                 searchable
                 placeholder={t("models.auto.selectModels")}
@@ -506,8 +533,8 @@ export function AutoModelConfigCard({
                             {mode === "sequential_failover" && `${index + 1}. `}
                             {model.model_name}
                           </div>
-                          <div className="text-xs text-muted-foreground">
-                            {model.model_provider}
+                          <div className="break-all text-xs text-muted-foreground">
+                            {getModelSourceLabel(model)}
                           </div>
                         </div>
                       </div>
@@ -571,7 +598,7 @@ export function AutoModelConfigCard({
                   <SelectContent>
                     {selectedModels.map((model) => (
                       <SelectItem key={model.id} value={String(model.id)}>
-                        {model.model_name}
+                        {modelLabel(model)}
                       </SelectItem>
                     ))}
                   </SelectContent>

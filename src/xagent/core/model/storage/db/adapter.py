@@ -2,7 +2,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from xagent.core.model.model import (
+from ...model import (
     ChatModelConfig,
     EmbeddingModelConfig,
     ImageModelConfig,
@@ -10,11 +10,12 @@ from xagent.core.model.model import (
     MusicModelConfig,
     RerankModelConfig,
     SoundEffectModelConfig,
+    SpeechModelConfig,
     VectorDBConfig,
     VectorDBType,
     VideoModelConfig,
 )
-from xagent.core.model.storage.error import (
+from ..error import (
     ModelNotFoundError,
     UnsupportedModelCategoryError,
 )
@@ -131,6 +132,17 @@ class SQLAlchemyModelHub:
                     "category": "rerank",
                 }
             )
+        elif isinstance(model, SpeechModelConfig):
+            db_data.update(
+                {
+                    "model_provider": model.model_provider,
+                    "category": "speech",
+                    "language": model.language,
+                    "voice": model.voice,
+                    "format": model.format,
+                    "sample_rate": model.sample_rate,
+                }
+            )
         elif isinstance(model, SoundEffectModelConfig):
             db_data.update(
                 {
@@ -224,6 +236,15 @@ class SQLAlchemyModelHub:
                 **common,
                 model_provider=db_model.model_provider,
             )
+        elif db_model.category == "speech":
+            return SpeechModelConfig(
+                **common,
+                model_provider=db_model.model_provider,
+                language=db_model.language,
+                voice=db_model.voice,
+                format=db_model.format,
+                sample_rate=db_model.sample_rate,
+            )
         elif db_model.category == "sound_effect":
             return SoundEffectModelConfig(
                 **common,
@@ -289,6 +310,15 @@ class SQLAlchemyModelHub:
                 config = RerankModelConfig(
                     **common_fields,
                     model_provider=db_model.model_provider,
+                )
+            elif db_model.category == "speech":
+                config = SpeechModelConfig(
+                    **common_fields,
+                    model_provider=db_model.model_provider,
+                    language=db_model.language,
+                    voice=db_model.voice,
+                    format=db_model.format,
+                    sample_rate=db_model.sample_rate,
                 )
             elif db_model.category == "sound_effect":
                 config = SoundEffectModelConfig(

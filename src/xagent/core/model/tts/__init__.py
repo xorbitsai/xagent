@@ -1,12 +1,13 @@
 """Text-to-Speech (TTS) model implementations."""
 
 from .adapter import ElevenLabsTTS, XinferenceTTS, get_tts_model
-from .base import BaseTTS, TTSResult
+from .base import BaseTTS, TTSChunk, TTSResult
 
 __all__ = [
     "get_tts_model",
     "BaseTTS",
     "TTSResult",
+    "TTSChunk",
     "XinferenceTTS",
     "ElevenLabsTTS",
 ]

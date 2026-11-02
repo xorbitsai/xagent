@@ -338,25 +338,61 @@ def _error(message: str, *, details: Any = None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _resource_locked_error(operation: str) -> str:
+def _resource_locked_error(operation: str, *, allow_save_as_copy: bool = True) -> str:
     """Return a stable, caller-actionable contract for a Graph 423."""
+    message = f"The OneDrive item is locked, so it could not be {operation}. "
+    actions = ["close_document_and_retry"]
+    if allow_save_as_copy:
+        message += (
+            "Close the document in Word or Teams and retry later, or use a "
+            "different destination path to save a copy."
+        )
+        actions.append("save_as_copy")
+    else:
+        message += (
+            "Ask the user to close it in Word, Excel, PowerPoint or Teams, or "
+            "check it in. The lock can take a few minutes to clear. "
+            "Do not retry until the user confirms."
+        )
     return json.dumps(
         {
             "status": "error",
-            "message": (
-                f"The OneDrive item is locked, so it could not be {operation}. "
-                "Close the document in Word or Teams and retry later, or use a "
-                "different destination path to save a copy."
-            ),
+            "message": message,
             "code": "resource_locked",
             "retryable": True,
             # Graph commonly omits the owner for driveItem 423 responses. Keep
             # a stable field without exposing or guessing an identity.
             "lock_owner": None,
-            "suggested_actions": ["close_document_and_retry", "save_as_copy"],
+            "suggested_actions": actions,
         },
         ensure_ascii=False,
     )
+
+
+def _item_write_error(
+    exc: Exception, operation: str, *, new_name: str | None = None
+) -> str:
+    """Explain known item-write failures without exposing Graph response bodies."""
+    if isinstance(exc, _GraphRequestError):
+        if exc.status_code == 423:
+            return _resource_locked_error(operation, allow_save_as_copy=False)
+        if exc.status_code == 403:
+            return _error(
+                "The connected account has no permission for this OneDrive "
+                f"item to be {operation}"
+            )
+        if exc.status_code == 404:
+            return _error("The OneDrive item or its parent folder no longer exists")
+        if (
+            exc.status_code == 409
+            and exc.code == "nameAlreadyExists"
+            and new_name is not None
+        ):
+            return _error(
+                f"The folder already contains an item named {new_name!r}; "
+                "retry with a different new_name"
+            )
+    return _error(str(exc))
 
 
 def _graph_headers(extra_headers: dict[str, str] | None = None) -> dict[str, str]:
@@ -1537,7 +1573,7 @@ def onedrive_upload_text_file(
         return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
-        return _error(str(e))
+        return _item_write_error(e, "overwritten")
 
 
 @mcp.tool()
@@ -1720,7 +1756,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
         return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error renaming OneDrive item %s: %s", item_id, e)
-        return _error(str(e))
+        return _item_write_error(e, "renamed", new_name=new_name)
 
 
 _CROSS_DRIVE_MOVE_MESSAGE = (
@@ -1929,7 +1965,7 @@ def onedrive_delete_item(item_id: str) -> str:
         return _success(message="Item deleted successfully")
     except Exception as e:
         logger.error("Error deleting OneDrive item %s: %s", item_id, e)
-        return _error(str(e))
+        return _item_write_error(e, "deleted")
 
 
 if __name__ == "__main__":

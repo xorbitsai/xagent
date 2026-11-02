@@ -1,15 +1,18 @@
 """Public SDK ``/v1/*`` namespace.
 
 This subpackage holds endpoints exposed to external SDK clients
-(Python / TypeScript / JavaScript) that authenticate with an
-``xag_<prefix>_<secret>`` API key rather than a JWT session.
+(Python / TypeScript / JavaScript) that authenticate with an API key
+rather than a JWT session: an ``xag_<prefix>_<secret>`` runtime key bound
+to one agent or workforce, or an ``xag_personal_<prefix>_<secret>``
+personal key that acts as its holder.
 
 The split from ``/api/*`` is deliberate (see SDK design doc §3):
 
   - ``/api/*`` is JWT-gated, for agent owners managing their own
     resources through the web UI.
   - ``/v1/*`` is API-key-gated, for SaaS callers running an agent
-    on behalf of an end user. Errors follow a separate stable schema
+    on behalf of an end user, and for users scripting their own agents
+    with a personal key. Errors follow a separate stable schema
     (``{"error": {"code": ..., "message": ...}}``) and the surface
     will version independently of internal admin endpoints.
 

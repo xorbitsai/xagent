@@ -144,6 +144,7 @@ async def create(host):
         file_ids=(),
         connector_runtime_context=(),
         timezone=None,
+        credential_kind="runtime",
     )
 
 

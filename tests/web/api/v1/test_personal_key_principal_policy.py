@@ -8,7 +8,11 @@ from fastapi.routing import APIRoute, iter_route_contexts
 
 from xagent.templates.manager import TemplateManager
 from xagent.web.api.v1 import deps
-from xagent.web.api.v1.deps import UserPrincipalSnapshot, get_user_from_personal_key
+from xagent.web.api.v1.deps import (
+    UserPrincipalSnapshot,
+    get_principal_from_api_key,
+    get_user_from_personal_key,
+)
 from xagent.web.services.personal_key_scope import set_personal_key_principal_policy
 
 from ..conftest import app_for_tests, client
@@ -18,6 +22,8 @@ pytestmark = pytest.mark.usefixtures("_test_db")
 
 POLICY_LOGGER = "xagent.web.services.personal_key_scope"
 POLICY_FAILURE_TEXT = "policy backend exploded"
+#: Every dependency that admits a personal key.
+PERSONAL_KEY_DEPENDENCIES = {get_user_from_personal_key, get_principal_from_api_key}
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +56,7 @@ def _personal_key_routes() -> list[tuple[str, str]]:
         if not isinstance(route.original_route, APIRoute):
             continue
         tree = route.dependant  # codespell:ignore dependant
-        if get_user_from_personal_key in _dependency_calls(tree):
+        if PERSONAL_KEY_DEPENDENCIES.intersection(_dependency_calls(tree)):
             routes.extend((method, route.path) for method in route.methods)
     return sorted(routes)
 
@@ -123,7 +129,9 @@ def test_personal_key_policy_runs_only_after_the_key_verifies() -> None:
 @pytest.mark.usefixtures("_template_manager")
 def test_personal_key_policy_applies_to_every_personal_key_route() -> None:
     routes = _personal_key_routes()
-    assert len(routes) == 15, routes
+    # The 15 management routes (me, agents, templates, skills) and the 11
+    # /v1/chat task routes.
+    assert len(routes) == 26, routes
     headers = _bearer(_create_personal_key()[0])
 
     for method, template in routes:

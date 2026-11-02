@@ -509,8 +509,9 @@ class TaskTurnOrchestrator:
 
         ``task_owner_user_id`` is the task OWNER's id — the runtime identity
         the turn executes as. Callers derive it from the already-authorized
-        task row (``task.user_id``) or the SDK agent's owner
-        (``agent.user_id``), NOT from the acting principal. They differ when
+        task row (``task.user_id``), the owner of an SDK agent key's agent
+        (``agent.user_id``), or the holder of an SDK personal key -- NOT from
+        the acting principal. They differ when
         an admin operates on another user's task: authorization happens at
         the entry (e.g. the WS admin bypass), and the turn must still run as
         the owner, not the admin. The claim predicate keeps ``Task.user_id ==

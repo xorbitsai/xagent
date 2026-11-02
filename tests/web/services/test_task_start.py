@@ -106,6 +106,7 @@ def test_task_starts_execute_without_api_routes() -> None:
                         created = await task_start.create_sdk_task(
                             agent_id=agent_id, task_owner_user_id=owner, actor_user_id=owner,
                             message="first", file_ids=(), connector_runtime_context=(), timezone="Asia/Taipei",
+                            credential_kind="runtime",
                         )
                         assert created.status == TaskStatus.RUNNING
                         assert not hasattr(created, "background_task")
@@ -199,6 +200,7 @@ async def test_sdk_start_cancellation_after_claim_still_schedules(monkeypatch, k
                 file_ids=(),
                 connector_runtime_context=(),
                 timezone=None,
+                credential_kind="runtime",
             )
         )
     else:

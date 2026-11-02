@@ -22,12 +22,16 @@ class MemoryAccessScope:
 
     ``owner_user_id`` is a real platform ``users.id``.  It therefore uses the
     persisted memory owner's positive signed-int64 domain; booleans and lossy
-    numeric spellings are not accepted.  At least one dimension is required so
-    opting in can never widen access to every memory owned by that user.
+    numeric spellings are not accepted.  At least one dimension is required by
+    default so opting in can never widen access to every memory owned by that
+    user.  A caller that deliberately needs the owner's dimension-less
+    namespace must say so with ``strict_owner_only=True``; that explicit form
+    excludes every dimension-stamped note instead of becoming ambient access.
     """
 
     owner_user_id: int
     memory_dimensions: Mapping[str, str]
+    strict_owner_only: bool = False
 
     def __post_init__(self) -> None:
         if type(self.owner_user_id) is not int:
@@ -38,9 +42,13 @@ class MemoryAccessScope:
 
         if not isinstance(self.memory_dimensions, Mapping):
             raise TypeError("memory_dimensions must be a mapping")
+        if type(self.strict_owner_only) is not bool:
+            raise TypeError("strict_owner_only must be a bool")
         dimensions = dict(self.memory_dimensions)
-        if not dimensions:
+        if not dimensions and not self.strict_owner_only:
             raise ValueError("memory access scope requires memory_dimensions")
+        if dimensions and self.strict_owner_only:
+            raise ValueError("strict owner-only scope cannot include memory_dimensions")
         validated = ExecutionScope(memory_dimensions=dimensions).memory_dimensions
 
         object.__setattr__(self, "owner_user_id", owner_user_id)

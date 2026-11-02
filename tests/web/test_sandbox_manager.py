@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import threading
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -681,7 +682,7 @@ class TestSandboxLifecycleConfig:
         assert service.get_or_create.await_args_list[1].args[0] == "build_preview::42"
 
     @pytest.mark.asyncio
-    async def test_cached_reconciled_sandbox_rechecks_runtime_network_policy(
+    async def test_cached_reconciled_sandbox_recovers_runtime_network_drift(
         self, tmp_path
     ):
         service = FakeSandboxService(runtime_spec_supported=True)
@@ -695,18 +696,49 @@ class TestSandboxLifecycleConfig:
                 return_value=[("/repo/src", "/app/src", "ro")],
             ),
         ):
-            await manager.get_or_create_sandbox("user", "42", mount_intent=mount_intent)
+            first = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
             inspection = await service.inspect("user::42")
             assert inspection is not None
             inspection.runtime_policy_matches = False
-            service.inspect.return_value = inspection
+            service.inspect.side_effect = [
+                inspection,
+                inspection,
+                replace(inspection, state="stopped"),
+            ]
 
-            with pytest.raises(
-                SandboxRuntimeConflictError, match="runtime network policy"
-            ):
-                await manager.get_or_create_sandbox(
-                    "user", "42", mount_intent=mount_intent
-                )
+            second = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+
+        assert second is not first
+        service.delete.assert_awaited_once_with("user::42")
+
+    @pytest.mark.asyncio
+    async def test_cached_reconciled_sandbox_recovers_deleted_runtime(self, tmp_path):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_42"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            first = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+            service._containers.pop("user::42")
+            service.containers.discard("user::42")
+
+            second = await manager.get_or_create_sandbox(
+                "user", "42", mount_intent=mount_intent
+            )
+
+        assert second is not first
 
 
 class TestSandboxLeaseProvider:
@@ -1203,6 +1235,70 @@ class TestGetOrCreateLeaseProvider:
         assert first is provider
         assert second is provider
         manager._create_lease_provider_locked.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cached_provider_recovers_runtime_network_drift(self, tmp_path):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_7"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            first = await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=mount_intent
+            )
+            inspection = await service.inspect("user::7")
+            assert inspection is not None
+            inspection.runtime_policy_matches = False
+            service.inspect.side_effect = [
+                inspection,
+                inspection,
+                replace(inspection, state="stopped"),
+                replace(inspection, runtime_policy_matches=True),
+            ]
+
+            second = await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=mount_intent
+            )
+
+        assert second is not first
+        assert second.primary_sandbox is not first.primary_sandbox
+        service.delete.assert_awaited_once_with("user::7")
+
+    @pytest.mark.asyncio
+    async def test_active_provider_network_drift_keeps_failing_closed(self, tmp_path):
+        service = FakeSandboxService(runtime_spec_supported=True)
+        manager = SandboxManager(service)
+        mount_intent = SandboxMountIntent(mount_root=str(tmp_path / "user_7"))
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            provider = await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=mount_intent
+            )
+            assert await manager.attach_provider("user", "7", provider)
+            inspection = await service.inspect("user::7")
+            assert inspection is not None
+            inspection.runtime_policy_matches = False
+            service.inspect.side_effect = [inspection, inspection, inspection]
+
+            for _ in range(2):
+                with pytest.raises(SandboxRuntimeConflictError, match="became active"):
+                    await manager.get_or_create_lease_provider(
+                        "user", "7", mount_intent=mount_intent
+                    )
+
+        service.delete.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_concurrent_requests_create_single_provider(self):

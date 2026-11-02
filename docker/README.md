@@ -285,6 +285,14 @@ KVM access.
 Docker sibling sandbox:
 
 ```bash
+export COMPOSE_PROJECT_NAME=xagent
+export XAGENT_SANDBOX_NETWORK="${COMPOSE_PROJECT_NAME}_sandbox-egress"
+docker network inspect "$XAGENT_SANDBOX_NETWORK" >/dev/null 2>&1 || \
+  docker network create --driver bridge \
+    --label xagent.sandbox.network=v1 \
+    -o com.docker.network.bridge.enable_icc=false \
+    "$XAGENT_SANDBOX_NETWORK"
+
 docker compose \
   -f docker-compose.yml \
   -f docker/docker-compose.sandbox.docker.yml \

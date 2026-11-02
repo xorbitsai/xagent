@@ -1484,8 +1484,10 @@ class DockerSandboxService(SandboxService):
     # create_snapshot() code paths above, aside from sharing
     # `_create_container` (which owns the spec-attestation label keys for
     # every container either path creates, blanking them when there is no
-    # attestation to make -- see its docstring) and the
-    # `_named_lock`/`_get_live_control` infrastructure.
+    # attestation to make -- see its docstring), the
+    # `_named_lock`/`_get_live_control` infrastructure, and
+    # `_require_network_policy`, which guards every reused container before
+    # publication. Fingerprint/spec verdicts remain the manager's concern.
     #
     # All of it assumes a single process is the sole owner of the containers
     # it manages. `_named_lock` and `_get_live_control` are in-process
@@ -1746,10 +1748,11 @@ class DockerSandboxService(SandboxService):
         """Start a previously-created sandbox, idempotent if already running.
 
         Adopts whatever container currently answers to ``name``: this method
-        performs no spec verification of any kind, and neither reads nor
-        writes the fingerprint attestation. A caller that cares whether the
-        running container still matches a desired spec must call ``inspect()``
-        and ``spec_matches_inspection()`` itself before adopting the result.
+        does not verify the desired spec or fingerprint attestation, but it
+        requires the live Docker network attachment to satisfy the shared
+        runtime policy before publishing the handle. A caller that cares
+        whether the remaining runtime facts match a desired spec must call
+        ``inspect()`` and ``spec_matches_inspection()`` itself first.
 
         Like every method on this service, this is also reference-count-blind
         (see ``create()``).

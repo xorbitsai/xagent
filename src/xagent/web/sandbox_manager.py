@@ -1373,11 +1373,13 @@ class SandboxManager:
                 # process-local handle and continue through normal recovery.
                 self._cache.pop(sandbox_name, None)
                 self._config_cache.pop(sandbox_name, None)
-            elif inspection.runtime_policy_matches is False:
-                raise SandboxRuntimeConflictError(
-                    f"Sandbox {sandbox_name!r} no longer satisfies the runtime "
-                    "network policy"
-                )
+            elif not inspection.runtime_policy_matches:
+                # Do not leave a poisoned cache entry behind. Falling
+                # through to reconciliation lets an idle sandbox converge
+                # immediately, while _reconcile_mismatch still rejects the
+                # destructive rebuild if an existing task is attached.
+                self._cache.pop(sandbox_name, None)
+                self._config_cache.pop(sandbox_name, None)
             else:
                 return self._cache[sandbox_name]
 
@@ -2112,23 +2114,53 @@ class SandboxManager:
         degrades to "no cached spec, allow".
 
         ``prepare_root`` is used while initially creating or reconciling the
-        sandbox. Cached providers do not repeat mount preparation.
+        sandbox. A matching cached provider does not repeat mount preparation;
+        recovery from a missing or drifted runtime may do so before rebuild.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
             async with self._activity_guard:
                 provider = self._lease_providers.get(base_name)
-                if provider is not None:
-                    self._ensure_config_equivalent(
-                        sandbox_name,
-                        self._config_cache.get(sandbox_name),
-                        self._build_runtime_spec(
-                            lifecycle_type, lifecycle_id, mount_intent=mount_intent
-                        ),
+
+            if provider is not None:
+                cached_spec = self._config_cache.get(sandbox_name)
+                self._ensure_config_equivalent(
+                    sandbox_name,
+                    cached_spec,
+                    self._build_runtime_spec(
+                        lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                    ),
+                )
+
+                # Re-enter the common cached-sandbox path on reconciliation
+                # backends so the hottest provider reuse path also
+                # re-inspects the live network attachment. Legacy backends
+                # have no inspection contract and keep their cache-only path.
+                # This intentionally does not depend on cached_spec being
+                # present: after an active mismatch rejects a rebuild the
+                # instance caches are empty, but every later acquire must
+                # continue to fail closed until the drift is repaired.
+                if await self._resolve_backend_probe():
+                    primary = await self._get_or_create_sandbox_locked(
+                        lifecycle_type,
+                        lifecycle_id,
+                        mount_intent=mount_intent,
+                        prepare_root=prepare_root,
                     )
+                    if primary is not provider.primary_sandbox:
+                        provider = await self._create_lease_provider_locked(
+                            lifecycle_type,
+                            lifecycle_id,
+                            mount_intent=mount_intent,
+                            prepare_root=prepare_root,
+                        )
+                        async with self._activity_guard:
+                            self._lease_providers[base_name] = provider
+
+                async with self._activity_guard:
                     self._touch_locked(base_name)
-                    return provider
+                return provider
 
             provider = await self._create_lease_provider_locked(
                 lifecycle_type,

@@ -347,7 +347,7 @@ class TestLegacyContainerMigration:
                 t0_spec.image,
                 template,
                 config,
-                docker_service._network,
+                "bridge",
             )
             await asyncio.to_thread(container.start)
             await asyncio.to_thread(container.reload)
@@ -363,6 +363,10 @@ class TestLegacyContainerMigration:
             pre_inspection = await docker_service.inspect(sandbox_name)
             assert pre_inspection is not None
             assert pre_inspection.fingerprint_label is None
+            assert not pre_inspection.runtime_policy_matches, (
+                "a legacy container on Docker's default bridge must enter the "
+                "MISMATCH rebuild path"
+            )
             id_before = container.id
 
             sandbox = await manager.get_or_create_sandbox(

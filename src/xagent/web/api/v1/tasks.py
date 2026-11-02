@@ -100,7 +100,11 @@ from ...services.uploaded_file_store import (
 from ...utils.db_timezone import normalize_datetime_from_db
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
-from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
+from .deps import (
+    ApiKeyPrincipal,
+    get_principal_from_api_key,
+    record_principal_usage,
+)
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
 
 logger = logging.getLogger(__name__)
@@ -469,7 +473,12 @@ async def create_chat_task(
     except DurableStorageOperationError as exc:
         _raise_v1_storage_unavailable(exc)
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal,
+        route="create_task",
+        task_id=started.task_id,
+        agent_id=started.agent_id,
+    )
 
     return CreateTaskResponse(
         task_id=started.task_id,
@@ -1144,7 +1153,12 @@ async def append_message_to_task(
     except DurableStorageOperationError as exc:
         _raise_v1_storage_unavailable(exc)
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal,
+        route="append_message",
+        task_id=started.task_id,
+        agent_id=started.agent_id,
+    )
 
     return AppendMessageResponse(
         task_id=started.task_id,
@@ -1269,7 +1283,9 @@ async def delete_chat_task(
 
     await asyncio.shield(asyncio.create_task(_cleanup_runtime_state()))
     outcome = await finish_task_deletion(committed)
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal, route="delete_task", task_id=task_id, agent_id=None
+    )
     return DeleteTaskResponse(
         task_id=task_id,
         workspace_cleanup_pending=outcome.workspace_cleanup_pending,
@@ -1335,7 +1351,9 @@ async def cancel_waiting_task_question(
     except TaskTurnError as exc:
         raise_for_turn_rejection(exc.reason)
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal, route="cancel_question", task_id=result.task_id, agent_id=None
+    )
     return CancelQuestionResponse(
         task_id=result.task_id,
         status=result.status,
@@ -1736,7 +1754,8 @@ async def stream_chat_task_events(
       - The stream force-closes with ``task.input_required`` if the task
         is found waiting on user input (same steps-then-close shape:
         ``task.status``, the task's steps, then ``task.input_required``);
-        with ``stream.error`` if the API key is revoked/paused, the task
+        with ``stream.error`` if the API key is revoked/paused (a personal
+        key: revoked or expired), the task
         row disappears (within one watchdog cycle, 30s in production, of
         the delete: ``task_expired`` when the retention policy expired
         it, ``task_deleted`` for any other removal), the client can't

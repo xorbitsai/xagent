@@ -6,13 +6,16 @@ by personal keys of that holder; runtime keys never reach them, and a
 personal key never reaches a task a runtime key or another surface created.
 """
 
-from datetime import UTC, datetime
+import logging
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.security import HTTPAuthorizationCredentials
 
+from xagent.web.api.v1 import _events_stream as es
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.deps import (
     AgentPrincipalSnapshot,
@@ -24,11 +27,13 @@ from xagent.web.api.v1.deps import (
 )
 from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.expired_task import ExpiredTaskTombstone
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.user import User
+from xagent.web.models.user_api_key import UserApiKey
 from xagent.web.models.workforce import WorkforceRun
 from xagent.web.services import task_start
 from xagent.web.services.agent_team_scope import (
@@ -563,3 +568,135 @@ def test_sdk_task_scope_without_owner_fails_closed(world) -> None:
     with pytest.raises(V1ApiError) as raised:
         v1_tasks._sdk_task_scope(ownerless)
     assert raised.value.http_status == 404
+
+
+# ===== Usage records and event streams under a personal key =====
+
+
+def _set_key(model, prefix: str, **values) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(model).filter(model.key_prefix == prefix).update(values)
+        db.commit()
+    finally:
+        db.close()
+
+
+def _agent_key_usage(prefix: str) -> tuple:
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).one()
+        return row.last_used_at, row.usage_month, row.usage_month_calls
+    finally:
+        db.close()
+
+
+def test_personal_key_usage_never_touches_agent_key_counters(world, caplog) -> None:
+    agent_id = world.agents["own"]
+    agent_key = _agent_key(world.headers["admin"], agent_id)
+    # Prefixes are unique within each key table, not across the two.
+    _set_key(AgentApiKey, agent_key.split("_")[1], key_prefix=world.prefix)
+    before = _agent_key_usage(world.prefix)
+
+    with caplog.at_level(logging.INFO, logger="xagent.web.api.v1.deps"):
+        task_id = _personal_task(world, "own")
+        _finish(task_id)
+        assert _call("append", task_id, world.key, {}).status_code == 202
+        _finish(task_id)
+        assert _call("delete", task_id, world.key, {}).status_code == 200
+
+    assert _agent_key_usage(world.prefix) == before
+    assert [
+        record.args
+        for record in caplog.records
+        if record.getMessage().startswith("personal key sdk call:")
+    ] == [
+        (world.prefix, world.holder_id, "create_task", task_id, agent_id),
+        (world.prefix, world.holder_id, "append_message", task_id, agent_id),
+        (world.prefix, world.holder_id, "delete_task", task_id, None),
+    ]
+
+
+async def test_stream_slots_and_watchdog_are_namespaced_by_key_kind(world) -> None:
+    agent_id = world.agents["own"]
+    agent_key = _agent_key(world.headers["admin"], agent_id)
+    agent_task = _create(agent_key, agent_id)
+    assert agent_task.status_code == 202, agent_task.text
+    tasks = {
+        "agent": agent_task.json()["task_id"],
+        "personal": _personal_task(world, "own"),
+    }
+    # Give the agent key and the personal key the same prefix.
+    shared = "Shared"
+    principals: dict[str, ApiKeyPrincipal] = {}
+    for kind, full_key, model in (
+        ("agent", agent_key, AgentApiKey),
+        ("personal", world.key, UserApiKey),
+    ):
+        principal = _resolve_principal_from_credentials(
+            HTTPAuthorizationCredentials(scheme="Bearer", credentials=full_key)
+        )
+        _set_key(model, principal.key.key_prefix, key_prefix=shared)
+        principals[kind] = replace(
+            principal, key=replace(principal.key, key_prefix=shared)
+        )
+
+    async def attach(kind: str):
+        return await es.build_event_stream_response(
+            task_id=tasks[kind],
+            principal=principals[kind],
+            initial_snapshot=v1_tasks._load_task_info_snapshot(
+                tasks[kind], principals[kind]
+            ),
+            read_task_snapshot=v1_tasks._load_task_info_snapshot,
+            read_task_steps_response=v1_tasks._get_chat_task_steps_sync,
+            read_task_steps_version=v1_tasks._load_task_steps_version_snapshot,
+            watchdog_interval_seconds=3600,
+            stream_max_duration_seconds=3600,
+            heartbeat_interval_seconds=3600,
+        )
+
+    es.reset_principal_stream_counts_for_testing()
+    try:
+        for full, other in (("personal", "agent"), ("agent", "personal")):
+            for _ in range(es.PER_PRINCIPAL_STREAM_CAP):
+                assert es.try_reserve_principal_slot(
+                    principals[full].stream_principal_id
+                )
+            with pytest.raises(V1ApiError) as limited:
+                await attach(full)
+            assert limited.value.http_status == 429
+            opened = await attach(other)
+            assert "event: task.status" in await opened.body_iterator.__anext__()
+            await opened.body_iterator.aclose()
+            es.reset_principal_stream_counts_for_testing()
+    finally:
+        es.reset_principal_stream_counts_for_testing()
+
+    async def watchdog_closes(kind: str) -> bool:
+        sink = es.V1EventStreamSink(
+            task_id=tasks[kind],
+            principal_key_prefix=principals[kind].stream_principal_id,
+            initial_status="running",
+        )
+        closed = await es.watchdog_check_once(
+            sink,
+            tasks[kind],
+            principals[kind],
+            read_task_snapshot=v1_tasks._load_task_info_snapshot,
+        )
+        if closed:
+            assert sink.queue.get_nowait() == (es.error_frame("unauthorized"), True)
+        return closed
+
+    assert not await watchdog_closes("personal")
+    assert not await watchdog_closes("agent")
+
+    _set_key(UserApiKey, shared, revoked_at=datetime.now(UTC))
+    assert await watchdog_closes("personal")
+    assert not await watchdog_closes("agent")
+
+    # Expired while open, stored naive the way SQLite reads it back.
+    expired = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=1)
+    _set_key(UserApiKey, shared, revoked_at=None, expires_at=expired)
+    assert await watchdog_closes("personal")

@@ -22,7 +22,7 @@ from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ...services.llm_utils import AutoModelUnavailableError
-from .deps import ApiKeyPrincipal, record_key_usage
+from .deps import ApiKeyPrincipal, record_principal_usage
 from .errors import V1ApiError, V1ErrorCode
 from .tasks import _ensure_agent_reachable, _resolve_task_or_404, _validate_owner_scope
 
@@ -174,7 +174,9 @@ async def reply_to_task(
     except AutoModelUnavailableError as exc:
         raise V1ApiError(V1ErrorCode.AUTO_MODEL_UNAVAILABLE, 409) from exc
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal, route="reply", task_id=ctx.task_id, agent_id=ctx.agent_id
+    )
 
     return ReplyResponse(
         command_id=result.command_id,

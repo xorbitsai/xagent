@@ -173,6 +173,7 @@ class _PersonalKeyRecord:
 
     key: PersonalApiKeySnapshot
     key_hash: str
+    revoked_at: datetime | None
     expires_at: datetime | None
     user: UserPrincipalSnapshot | None
 
@@ -544,8 +545,13 @@ def _record_key_usage_sync(key_prefix: str) -> None:
 async def record_key_usage(key_prefix: str) -> None:
     """Best-effort, non-blocking usage tracking for API-key stat cards.
 
-    Deliberately NOT called from :func:`get_agent_from_api_key` itself --
-    that dependency backs every ``/v1/chat/tasks/*`` route including the
+    Updates the runtime key (``agent_api_keys``) with this prefix. The
+    ``/v1/chat/tasks/*`` routes reach it through
+    :func:`record_principal_usage`, which never passes a personal key's
+    prefix here.
+
+    Deliberately NOT called from :func:`get_principal_from_api_key` itself
+    -- that dependency backs every ``/v1/chat/tasks/*`` route including the
     read-only status/steps polling endpoints SDK clients hit repeatedly,
     and recording a write there would (a) put a DB write+commit on the
     busiest possible request path and (b) conflate polling with real
@@ -559,6 +565,53 @@ async def record_key_usage(key_prefix: str) -> None:
     remains best-effort: the synchronous owner logs and swallows failures.
     """
     await run_db_io_cancellation_safe(lambda: _record_key_usage_sync(key_prefix))
+
+
+async def record_principal_usage(
+    principal: ApiKeyPrincipal,
+    *,
+    route: str,
+    task_id: int | None,
+    agent_id: int | None,
+) -> None:
+    """Record one SDK-visible call made with ``principal``'s key.
+
+    A runtime key goes to :func:`record_key_usage`. A personal key has no
+    usage columns: the call is one structured log line and nothing is
+    written, so it can never count against a runtime key that shares its
+    prefix.
+    """
+    if isinstance(principal.key, PersonalApiKeySnapshot):
+        logging.getLogger(__name__).info(
+            "personal key sdk call: key_prefix=%s user_id=%d route=%s "
+            "task_id=%s agent_id=%s",
+            principal.key.key_prefix,
+            principal.owner_user_id,
+            route,
+            task_id,
+            agent_id,
+        )
+        return
+    await record_key_usage(principal.key.key_prefix)
+
+
+def personal_key_usable(
+    revoked_at: datetime | None, expires_at: datetime | None, now: datetime
+) -> bool:
+    """Shared "is this personal key still usable" predicate.
+
+    A personal key is usable iff it has not been revoked and has not
+    expired. Used both by request-time authentication (below) and by the
+    v1 SSE watchdog's out-of-band key-validity check
+    (``web/api/v1/_events_stream.py``), so the two paths can't drift on
+    what "usable" means. ``DateTime(timezone=True)`` reads back naive on
+    SQLite, so the expiry is normalized to aware UTC before comparing: an
+    expired key is refused rather than failing on a naive vs aware
+    comparison.
+    """
+    if revoked_at is not None:
+        return False
+    return expires_at is None or normalize_datetime_from_db(expires_at) > now
 
 
 def _load_personal_key_record(prefix: str) -> _PersonalKeyRecord | None:
@@ -591,6 +644,7 @@ def _load_personal_key_record(prefix: str) -> _PersonalKeyRecord | None:
         return _PersonalKeyRecord(
             key=PersonalApiKeySnapshot(key_prefix=str(key_row.key_prefix)),
             key_hash=str(key_row.key_hash),
+            revoked_at=cast(datetime | None, key_row.revoked_at),
             expires_at=cast(datetime | None, key_row.expires_at),
             user=user_snapshot,
         )
@@ -616,12 +670,9 @@ def _resolve_user_from_personal_credentials(
         verify_dummy()
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
-    now = datetime.now(timezone.utc)
-    expires_at = record.expires_at
-    # ``DateTime(timezone=True)`` reads back naive on SQLite; normalize
-    # to aware UTC before comparing so an expired key yields 401, not a
-    # 500 from comparing naive vs aware datetimes.
-    if expires_at is not None and normalize_datetime_from_db(expires_at) <= now:
+    if not personal_key_usable(
+        record.revoked_at, record.expires_at, datetime.now(timezone.utc)
+    ):
         verify_dummy()
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 

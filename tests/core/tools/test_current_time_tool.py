@@ -100,6 +100,39 @@ def test_resolves_a_differently_cased_zone_name() -> None:
     assert result.utc_offset == "+10:00"
 
 
+@pytest.mark.parametrize(
+    ("supplied", "zone", "local", "offset"),
+    [
+        ("Melbourne", "Australia/Melbourne", "2026-08-25 08:03:37", "+10:00"),
+        ("Sydney", "Australia/Sydney", "2026-08-25 08:03:37", "+10:00"),
+        ("Wellington", "Pacific/Auckland", "2026-08-25 10:03:37", "+12:00"),
+        (
+            "Pacific Time (US & Canada)",
+            "America/Los_Angeles",
+            "2026-08-24 15:03:37",
+            "-07:00",
+        ),
+        ("toronto", "America/Toronto", "2026-08-24 18:03:37", "-04:00"),
+    ],
+)
+def test_resolves_a_common_alias_and_reports_the_iana_zone(
+    supplied: str, zone: str, local: str, offset: str
+) -> None:
+    result = current_time(supplied)
+
+    assert result.timezone == zone
+    assert result.local == local
+    assert result.utc_offset == offset
+
+
+def test_an_ambiguous_city_still_degrades_to_utc() -> None:
+    # America/Indianapolis and America/Indiana/Indianapolis both end in it.
+    result = current_time("Indianapolis")
+
+    assert result.timezone == "UTC"
+    assert result.local == result.utc
+
+
 def test_tool_runs_through_the_json_surface() -> None:
     tool = CurrentTimeTool()
 
@@ -119,7 +152,7 @@ def test_tool_runs_through_the_json_surface() -> None:
 
 def test_json_surface_rejects_a_non_string_timezone() -> None:
     # A non-string timezone fails pydantic validation at the JSON boundary,
-    # before _resolve_zone runs. The tool must not raise; the caller catches
+    # before resolve_zone runs. The tool must not raise; the caller catches
     # the validation error and reports a normal failed tool call.
     tool = CurrentTimeTool()
 

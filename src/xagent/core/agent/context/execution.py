@@ -14,7 +14,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any, Literal, cast
 from uuid import uuid4
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 import tiktoken
 
@@ -47,6 +47,7 @@ from ...tools.tool_result_spill import (
     spill_dir_for_workspace,
     spill_record_shape_is_valid,
 )
+from ...utils.timezones import resolve_zone
 from ..grounding import VALUE_KINDS, step_intent_not_fact_rule
 from ..language import (
     effective_output_language,
@@ -1238,16 +1239,10 @@ class ExecutionContext:
     def clock_zone(self) -> ZoneInfo | None:
         """The end user's timezone, or None when none was supplied or the name
         is unusable. The value is caller-controlled, so an unparsable name
-        degrades to the UTC wording instead of failing the run."""
-        name = self.metadata.get(CLOCK_TIMEZONE_METADATA_KEY)
-        if not isinstance(name, str) or not name.strip():
-            return None
-        try:
-            return ZoneInfo(name.strip())
-        except (ZoneInfoNotFoundError, ValueError, OSError, TypeError, KeyError):
-            # OSError is an over-long name, ValueError a path-shaped one; both
-            # are reachable because the name comes from the client.
-            return None
+        degrades to the UTC wording instead of failing the run. Resolved the
+        same way as the time tools, so the zone named in the prompt is a
+        canonical IANA name those tools accept back."""
+        return resolve_zone(self.metadata.get(CLOCK_TIMEZONE_METADATA_KEY))
 
     def _current_clock_text(self) -> str:
         utc_stamp = self.created_at.astimezone(timezone.utc).strftime(

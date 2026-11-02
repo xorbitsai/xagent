@@ -2278,6 +2278,27 @@ def test_clock_line_renders_a_negative_offset() -> None:
 
 
 @pytest.mark.parametrize(
+    ("supplied", "zone"),
+    [
+        ("Melbourne", "Australia/Melbourne"),
+        ("australia/melbourne", "Australia/Melbourne"),
+        ("Wellington", "Pacific/Auckland"),
+        ("Pacific Time (US & Canada)", "America/Los_Angeles"),
+    ],
+)
+def test_clock_line_names_the_iana_zone_for_a_common_alias(
+    supplied: str, zone: str
+) -> None:
+    # Same resolver as the time tools, so the zone the prompt names is one
+    # those tools accept back verbatim.
+    context = _clock_context(supplied)
+
+    assert context.clock_zone() is not None
+    assert context.clock_zone().key == zone
+    assert f"({zone}, UTC" in context._current_time_context()
+
+
+@pytest.mark.parametrize(
     "supplied",
     [
         "Not/AZone",

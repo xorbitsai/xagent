@@ -26,7 +26,12 @@ from xagent.web.models.auto_model import AutoModelCandidate, AutoModelConfig
 from xagent.web.models.model import Model
 from xagent.web.models.user import User, UserDefaultModel, UserModel
 from xagent.web.schemas.model import AutoModelConfigUpdate, ModelUpdate
-from xagent.web.services import auto_model_service, builder_chat_runtime, model_service
+from xagent.web.services import (
+    auto_model_service,
+    builder_chat_runtime,
+    llm_utils,
+    model_service,
+)
 from xagent.web.services.auto_model_service import (
     AutoModelConfigurationError,
     AutoModelService,
@@ -118,6 +123,31 @@ def configure(env, user, bindings, *, default=False):
     )
 
 
+@pytest.fixture
+def llm_utils_warnings(monkeypatch):
+    """Record the warnings llm_utils logs, bypassing logging configuration.
+
+    Replacing the module's ``logger`` binding keeps the assertion independent
+    of whichever logging setup ran first in the test process.
+    """
+    real = llm_utils.logger
+    warnings: list[str] = []
+
+    class RecordingLogger:
+        def warning(self, msg, *args, **kwargs):
+            warnings.append(msg % args if args else msg)
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    monkeypatch.setattr(llm_utils, "logger", RecordingLogger())
+    return warnings
+
+
+def skipped_candidates(warnings):
+    return [w for w in warnings if w.startswith("Skipping Auto candidate ")]
+
+
 def test_candidate_relationship_reads_persisted_position_order(env):
     first = target(env, env.consumer, name="first")
     second = target(env, env.consumer, name="second")
@@ -194,15 +224,176 @@ def test_rejects_profile_capability_mismatch_without_saving(env, profile, abilit
     assert env.db.query(AutoModelConfig).count() == 0
 
 
-def test_legacy_mismatched_binding_fails_before_provider_call(env):
+def test_legacy_mismatched_binding_fails_before_provider_call(env, llm_utils_warnings):
     t = target(env, env.consumer)
     cfg = configure(env, env.consumer, [("text-a", t)])
     cfg.candidates[0].routing_model_id = "image-a"
     env.db.commit()
-    with pytest.raises(AutoModelUnavailableError, match="input modalities"):
+    with pytest.raises(AutoModelUnavailableError, match="no active configured"):
         UserAwareModelStorage(env.db).get_llm_by_id(
             cfg.router_model.model_id, env.consumer.id
         )
+    skipped = skipped_candidates(llm_utils_warnings)
+    assert len(skipped) == 1
+    assert "'image-a'" in skipped[0] and "input modalities" in skipped[0]
+
+
+@pytest.mark.parametrize("removed_index", [0, 1])
+def test_routing_skips_candidate_whose_profile_left_the_catalog(
+    env, llm_utils_warnings, removed_index
+):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(
+        env, env.consumer, [("text-a", first), ("text-b", second)], default=True
+    )
+    cfg.candidates[removed_index].routing_model_id = "removed-profile"
+    env.db.commit()
+    remaining = ("text-a", "text-b")[1 - removed_index]
+
+    llm = UserAwareModelStorage(env.db).get_llm_by_id(
+        cfg.router_model.model_id, env.consumer.id
+    )
+
+    assert isinstance(llm, RouterLLM)
+    assert llm._candidate_models == (remaining,)
+    # The first candidate is the saved fallback; skipping it clears the fallback.
+    assert llm._fallback_model == (None if removed_index == 0 else remaining)
+    assert (
+        llm._downstream_resolver(remaining).model_id
+        == (("first", "second")[1 - removed_index])
+    )
+    skipped = skipped_candidates(llm_utils_warnings)
+    assert len(skipped) == 1
+    assert "'removed-profile'" in skipped[0] and "xrouter-llm catalog" in skipped[0]
+    default = model_service.get_default_model(env.consumer.id)
+    assert isinstance(default, RouterLLM)
+    assert default._candidate_models == (remaining,)
+
+
+@pytest.mark.parametrize("mismatched_index", [0, 1])
+def test_routing_skips_candidate_whose_profile_no_longer_matches_its_target(
+    env, llm_utils_warnings, mismatched_index
+):
+    # Saving rejects this binding, but it can still exist, for example after
+    # an xrouter-llm release changes a profile's input modalities.
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(
+        env, env.consumer, [("text-a", first), ("text-b", second)], default=True
+    )
+    cfg.candidates[mismatched_index].routing_model_id = "image-a"
+    env.db.commit()
+    remaining = ("text-a", "text-b")[1 - mismatched_index]
+
+    llm = UserAwareModelStorage(env.db).get_llm_by_id(
+        cfg.router_model.model_id, env.consumer.id
+    )
+
+    assert isinstance(llm, RouterLLM)
+    assert llm._candidate_models == (remaining,)
+    # The first candidate is the saved fallback; skipping it clears the fallback.
+    assert llm._fallback_model == (None if mismatched_index == 0 else remaining)
+    assert (
+        llm._downstream_resolver(remaining).model_id
+        == ("first", "second")[1 - mismatched_index]
+    )
+    skipped = skipped_candidates(llm_utils_warnings)
+    assert len(skipped) == 1
+    assert "'image-a'" in skipped[0] and "input modalities" in skipped[0]
+    default = model_service.get_default_model(env.consumer.id)
+    assert isinstance(default, RouterLLM)
+    assert default._candidate_models == (remaining,)
+
+
+@pytest.mark.parametrize(
+    "stale_profiles",
+    [
+        ("removed-profile", "another-removed-profile"),
+        ("image-a", "image-a"),
+        ("removed-profile", "image-a"),
+    ],
+    ids=["unknown", "mismatched", "mixed"],
+)
+def test_routing_with_only_stale_bindings_stays_unavailable(
+    env, llm_utils_warnings, stale_profiles
+):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(
+        env, env.consumer, [("text-a", first), ("text-b", second)], default=True
+    )
+    cfg.candidates[0].routing_model_id = stale_profiles[0]
+    cfg.candidates[1].routing_model_id = stale_profiles[1]
+    env.db.commit()
+
+    with pytest.raises(AutoModelUnavailableError, match="no active configured"):
+        UserAwareModelStorage(env.db).get_llm_by_id(
+            cfg.router_model.model_id, env.consumer.id
+        )
+    assert len(skipped_candidates(llm_utils_warnings)) == 2
+    with pytest.raises(AutoModelUnavailableError):
+        model_service.get_default_model(env.consumer.id)
+
+
+def test_routing_maps_missing_router_dependency_to_unavailable(env, monkeypatch):
+    t = target(env, env.consumer)
+    cfg = configure(env, env.consumer, [("text-a", t)], default=True)
+
+    def missing_dependency():
+        raise auto_model_service.AutoModelDependencyError(
+            "Auto model configuration needs xrouter-llm>=0.3.6"
+        )
+
+    monkeypatch.setattr(
+        auto_model_service, "load_router_profile_catalog", missing_dependency
+    )
+    with pytest.raises(AutoModelUnavailableError, match="xrouter-llm"):
+        UserAwareModelStorage(env.db).get_llm_by_id(
+            cfg.router_model.model_id, env.consumer.id
+        )
+    with pytest.raises(AutoModelUnavailableError):
+        model_service.get_default_model(env.consumer.id)
+
+
+def test_unknown_profile_has_its_own_configuration_error_type():
+    profiles = {"image-a": SimpleNamespace(input_modalities=("text", "image"))}
+    catalog = SimpleNamespace(
+        known_model_ids=lambda: tuple(profiles), get=profiles.__getitem__
+    )
+    unknown_error = auto_model_service.UnknownAutoProfileError
+
+    with pytest.raises(unknown_error, match="xrouter-llm catalog") as unknown:
+        auto_model_service.validate_candidate_modalities(
+            catalog, "removed-profile", ["chat"]
+        )
+    assert isinstance(unknown.value, AutoModelConfigurationError)
+
+    # A mismatch must stay the parent type, or ability edits would skip it.
+    with pytest.raises(
+        AutoModelConfigurationError, match="input modalities"
+    ) as mismatch:
+        auto_model_service.validate_candidate_modalities(catalog, "image-a", ["chat"])
+    assert not isinstance(mismatch.value, unknown_error)
+
+
+def test_sequential_keeps_candidate_whose_profile_left_the_catalog(env):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(env, env.consumer, [("text-a", first), ("text-b", second)])
+    cfg.mode = "sequential_failover"
+    cfg.fallback_model_id = None
+    cfg.candidates[0].routing_model_id = "removed-profile"
+    env.db.commit()
+
+    llm = UserAwareModelStorage(env.db).get_llm_by_id(
+        cfg.router_model.model_id, env.consumer.id
+    )
+
+    assert isinstance(llm, RouterLLM)
+    assert llm._candidate_models == tuple(
+        f"candidate:{candidate.id}" for candidate in cfg.candidates
+    )
 
 
 def test_configured_wrapper_never_adds_profile_only_abilities():
@@ -385,25 +576,68 @@ def test_pruning_candidate_recalculates_remaining_abilities(env):
     assert env.db.get(Model, cfg.router_model_id).abilities == ["chat", "tool_calling"]
 
 
-def test_editing_legacy_unknown_profile_returns_conflict(env):
+def test_editing_model_bound_to_unknown_profile_is_not_blocked(env):
     t = target(env, env.consumer)
     cfg = configure(env, env.consumer, [("text-a", t)])
     cfg.candidates[0].routing_model_id = "removed-profile"
     env.db.commit()
+    # Routing skips this binding while its profile is not in the installed
+    # catalog, so the edit is not checked against it.
+    asyncio.run(
+        model_api.update_model(
+            t.model_id,
+            ModelUpdate(abilities=["chat", "vision"]),
+            db=env.db,
+            user=env.consumer,
+        )
+    )
+    env.db.expire_all()
+    assert env.db.get(Model, t.id).abilities == ["chat", "vision"]
+    with pytest.raises(AutoModelUnavailableError, match="no active configured"):
+        UserAwareModelStorage(env.db).get_llm_by_id(
+            cfg.router_model.model_id, env.consumer.id
+        )
+
+
+@pytest.mark.parametrize("unknown_first", [True, False])
+def test_ability_edit_skips_only_the_unknown_profile_binding(env, unknown_first):
+    # Two users bind the same model. A shared model's abilities cannot change
+    # at all, so the consumer reaches the owner's model through a direct,
+    # unshared grant row instead.
+    t = target(env, env.owner)
+    env.db.add(UserModel(user_id=env.consumer.id, model_id=t.id, is_owner=True))
+    env.db.commit()
+    users = [env.consumer, env.owner] if unknown_first else [env.owner, env.consumer]
+    configs = {user.id: configure(env, user, [("text-a", t)]) for user in users}
+    configs[env.consumer.id].candidates[0].routing_model_id = "removed-profile"
+    env.db.commit()
+    # update_model walks the bindings in this query's order; pin it so each
+    # case really puts the unknown binding where its name says.
+    order = [
+        candidate.routing_model_id
+        for candidate in env.db.query(AutoModelCandidate)
+        .filter(AutoModelCandidate.target_model_id == t.id)
+        .all()
+    ]
+    assert order == (
+        ["removed-profile", "text-a"]
+        if unknown_first
+        else ["text-a", "removed-profile"]
+    )
+
     with pytest.raises(HTTPException) as error:
         asyncio.run(
             model_api.update_model(
                 t.model_id,
-                ModelUpdate(abilities=["chat", "tool_calling"]),
+                ModelUpdate(abilities=["chat", "vision"]),
                 db=env.db,
-                user=env.consumer,
+                user=env.owner,
             )
         )
     assert error.value.status_code == 409
-    with pytest.raises(AutoModelUnavailableError, match="Unknown Auto profile"):
-        UserAwareModelStorage(env.db).get_llm_by_id(
-            cfg.router_model.model_id, env.consumer.id
-        )
+    assert "input modalities" in str(error.value.detail)
+    env.db.rollback()
+    assert t.abilities == ["chat"]
 
 
 def _bundled_auto_router_models() -> tuple[str, ...]:

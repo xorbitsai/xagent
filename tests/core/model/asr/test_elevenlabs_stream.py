@@ -171,9 +171,17 @@ async def test_batch_and_realtime_models_use_their_own_endpoints(
     assert transport.model.supports_vad
     assert transport.model.abilities == ["asr"]
     local = XinferenceASR()
+    capabilities = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        "xagent.core.model.asr.xinference.fetch_audio_capabilities", capabilities
+    )
     assert not local.supports_streaming
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ValueError, match="does not support live ASR with VAD"):
         await local.open_stream()
+    capabilities.assert_awaited_once_with(local)
+    assert not local.supports_streaming
+    assert not local.supports_vad
+    await local.aclose()
 
 
 @pytest.mark.parametrize(

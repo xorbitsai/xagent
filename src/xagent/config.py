@@ -207,6 +207,7 @@ SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
 SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
 SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
 SANDBOX_NAMESPACE = "XAGENT_SANDBOX_NAMESPACE"
+SANDBOX_NETWORK = "XAGENT_SANDBOX_NETWORK"
 SANDBOX_WORKER_ID = "XAGENT_SANDBOX_WORKER_ID"
 TASK_RUNTIME_SECRETS_TTL_SECONDS = "XAGENT_TASK_RUNTIME_SECRETS_TTL_SECONDS"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
@@ -4106,6 +4107,8 @@ def get_sandbox_host_storage_root() -> Path | None:
 
 
 _SANDBOX_NAMESPACE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+_SANDBOX_NETWORK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_BUILTIN_DOCKER_NETWORKS = frozenset({"bridge", "host", "none", "default"})
 
 
 def validate_sandbox_namespace(namespace: str) -> None:
@@ -4152,6 +4155,34 @@ def get_sandbox_namespace() -> str | None:
     if not raw:
         return None
     validate_sandbox_namespace(raw)
+    return raw
+
+
+def validate_sandbox_network(network: str) -> None:
+    """Validate the dedicated Docker network used by untrusted sandboxes."""
+    if (
+        len(network) > 255
+        or not _SANDBOX_NETWORK_RE.fullmatch(network)
+        or network.lower() in _BUILTIN_DOCKER_NETWORKS
+    ):
+        raise ValueError(
+            f"Invalid sandbox network {network!r}: use a dedicated Docker "
+            "network name containing only letters, digits, dots, dashes, or "
+            "underscores; built-in Docker networks are not allowed"
+        )
+
+
+def get_sandbox_network() -> str | None:
+    """Return the dedicated Docker network for sandbox containers.
+
+    The deployment owns creation and firewall policy for this network. XAgent
+    only attaches containers to the exact configured name and verifies the
+    attachment before publishing or reusing them.
+    """
+    raw = os.getenv(SANDBOX_NETWORK, "").strip()
+    if not raw:
+        return None
+    validate_sandbox_network(raw)
     return raw
 
 

@@ -64,7 +64,18 @@ requires_docker = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def docker_service():
     """Provide a shared Docker sandbox service for integration-style tests."""
-    return DockerSandboxService(MemDockerStore(), namespace="test")
+    client = docker_sandbox_module._create_docker_client()
+    network_name = f"xagent-test-{uuid.uuid4().hex[:10]}"
+    network = client.networks.create(network_name, driver="bridge")
+    try:
+        yield DockerSandboxService(
+            MemDockerStore(),
+            namespace="test",
+            network=network_name,
+            client=client,
+        )
+    finally:
+        network.remove()
 
 
 def _unique_name(prefix: str) -> str:
@@ -501,10 +512,18 @@ class TestCreatePersistsCanonicalDesiredState:
         captured: dict = {}
 
         async def fake_create_container(
-            client, name, namespace, image, template, config, extra_labels=None
+            client,
+            name,
+            namespace,
+            image,
+            template,
+            config,
+            network,
+            extra_labels=None,
         ):
             captured["template"] = template
             captured["config"] = config
+            captured["network"] = network
             captured["extra_labels"] = dict(extra_labels or {})
             return created
 
@@ -550,6 +569,7 @@ class TestCreatePersistsCanonicalDesiredState:
         # Same objects the container itself was built from.
         assert row.template == captured["template"]
         assert row.config == captured["config"]
+        assert captured["network"] == "xagent-test-sandbox-egress"
 
         # And the row reproduces the fingerprint that was stamped on the
         # container, so a reader comparing the row against the label needs no
@@ -625,7 +645,7 @@ def _observed_facts(**overrides):
         volumes=(),
         ports=(),
         network_isolated=False,
-        runtime_networks=("bridge",),
+        runtime_networks=("xagent-test-sandbox-egress",),
         labels={},
         created_at="2026-01-01T00:00:00Z",
         working_dir="/home",
@@ -665,7 +685,10 @@ class TestFindPublishMismatchesEveryBranch:
     def test_agreeing_observation_reports_no_mismatch(self):
         assert (
             docker_sandbox_module._find_publish_mismatches(
-                self._desired(), DEFAULT_SANDBOX_IMAGE, _observed_inspection()
+                self._desired(),
+                DEFAULT_SANDBOX_IMAGE,
+                _observed_inspection(),
+                "xagent-test-sandbox-egress",
             )
             == []
         )
@@ -678,6 +701,7 @@ class TestFindPublishMismatchesEveryBranch:
             ("ports", {"ports": ((18080, 80),)}),
             ("working_dir", {"working_dir": "/somewhere/else"}),
             ("network_isolated", {"network_isolated": True}),
+            ("runtime_networks", {"runtime_networks": ("other-network",)}),
             ("cpus", {"raw_nano_cpus": 2_000_000_000}),
             ("memory", {"raw_memory_bytes": 1024 * 1024 * 1024}),
             ("pids_limit", {"raw_pids_limit": 2048}),
@@ -685,7 +709,10 @@ class TestFindPublishMismatchesEveryBranch:
     )
     def test_each_field_is_reported_when_it_disagrees(self, field, overrides):
         mismatches = docker_sandbox_module._find_publish_mismatches(
-            self._desired(), DEFAULT_SANDBOX_IMAGE, _observed_inspection(**overrides)
+            self._desired(),
+            DEFAULT_SANDBOX_IMAGE,
+            _observed_inspection(**overrides),
+            "xagent-test-sandbox-egress",
         )
         assert mismatches == [field]
 
@@ -698,6 +725,7 @@ class TestFindPublishMismatchesEveryBranch:
                 network_isolated=True,
                 raw_memory_bytes=1024 * 1024 * 1024,
             ),
+            "xagent-test-sandbox-egress",
         )
         assert mismatches == ["image", "working_dir", "network_isolated", "memory"]
 
@@ -707,8 +735,40 @@ class TestFindPublishMismatchesEveryBranch:
             self._desired(),
             DEFAULT_SANDBOX_IMAGE,
             _observed_inspection(raw_nano_cpus=None, raw_memory_bytes=None),
+            "xagent-test-sandbox-egress",
         )
         assert mismatches == ["cpus", "memory"]
+
+    def test_isolated_sandbox_requires_no_network_attachments(self):
+        desired = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image",
+            image=DEFAULT_SANDBOX_IMAGE,
+            working_dir="/home",
+            network_isolated=True,
+            pids_limit=1024,
+        )
+        inspection = _observed_inspection(
+            network_isolated=True,
+            runtime_networks=(),
+        )
+        assert (
+            docker_sandbox_module._find_publish_mismatches(
+                desired,
+                DEFAULT_SANDBOX_IMAGE,
+                inspection,
+                "xagent-test-sandbox-egress",
+            )
+            == []
+        )
+
+    def test_network_enabled_sandbox_cannot_be_detached(self):
+        mismatches = docker_sandbox_module._find_publish_mismatches(
+            self._desired(),
+            DEFAULT_SANDBOX_IMAGE,
+            _observed_inspection(runtime_networks=()),
+            "xagent-test-sandbox-egress",
+        )
+        assert mismatches == ["runtime_networks"]
 
     @pytest.mark.parametrize("raw_value", [None, 0, -1])
     def test_unlimited_backend_pids_values_are_normalized(self, raw_value):
@@ -725,7 +785,10 @@ class TestFindPublishMismatchesEveryBranch:
         )
         assert (
             docker_sandbox_module._find_publish_mismatches(
-                desired, DEFAULT_SANDBOX_IMAGE, inspection
+                desired,
+                DEFAULT_SANDBOX_IMAGE,
+                inspection,
+                "xagent-test-sandbox-egress",
             )
             == []
         )
@@ -745,7 +808,10 @@ class TestFindPublishMismatchesEveryBranch:
         )
         assert (
             docker_sandbox_module._find_publish_mismatches(
-                desired, DEFAULT_SANDBOX_IMAGE, inspection
+                desired,
+                DEFAULT_SANDBOX_IMAGE,
+                inspection,
+                "xagent-test-sandbox-egress",
             )
             == []
         )
@@ -1761,6 +1827,7 @@ class TestCreateContainerOwnsAttestationLabels:
             "img:tag",
             SandboxTemplate(type="image", image="img:tag"),
             SandboxConfig(),
+            "xagent-test-sandbox-egress",
             extra_labels=extra_labels,
         )
         return captured["labels"]

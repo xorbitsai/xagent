@@ -26,6 +26,7 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
@@ -3075,6 +3076,13 @@ def _create_docker_service() -> Optional[SandboxService]:
             "(pip/systemd) must pick their own stable value (see "
             "docker/README.md 'Sandbox Runtime Overlays' and example.env)"
         )
+    network = get_sandbox_network()
+    if network is None:
+        raise RuntimeError(
+            "XAGENT_SANDBOX_NETWORK is required when the Docker sandbox "
+            "implementation is enabled; set it to the dedicated, firewalled "
+            "Docker network created for untrusted sandboxes"
+        )
     try:
         from ..sandbox import DockerSandboxService
     except ImportError as exc:
@@ -3087,11 +3095,17 @@ def _create_docker_service() -> Optional[SandboxService]:
     store = DBDockerStore(namespace=namespace if get_sandbox_worker_id() else None)
 
     try:
-        service = DockerSandboxService(store=store, namespace=namespace)
+        service = DockerSandboxService(
+            store=store, namespace=namespace, network=network
+        )
     except Exception as exc:
         raise RuntimeError("Failed to initialize the Docker sandbox runtime") from exc
 
-    logger.info("Created Docker sandbox service (namespace=%s)", namespace)
+    logger.info(
+        "Created Docker sandbox service (namespace=%s, network=%s)",
+        namespace,
+        network,
+    )
     try:
         running_legacy_count, inactive_legacy_count = service.count_legacy_containers()
     except Exception as exc:

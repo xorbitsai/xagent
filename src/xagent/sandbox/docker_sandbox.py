@@ -35,9 +35,11 @@ from docker import errors, from_env
 
 from ..config import (
     get_sandbox_image,
+    get_sandbox_network,
     get_sandbox_namespace,
     get_sandbox_pids_limit,
     get_uploads_dir,
+    validate_sandbox_network,
     validate_sandbox_namespace,
 )
 from .base import (
@@ -90,7 +92,7 @@ MANAGED_LABEL_VALUE = "v2"
 CONTAINER_NAME_PREFIX = "xagent_sandbox_"
 SNAPSHOT_REPOSITORY = "xagent-sandbox-snapshot"
 _CPU_NANOS = 1_000_000_000
-_DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-egress-unfiltered-v1"
+_DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-dedicated-network-v2"
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -425,7 +427,10 @@ def _build_inspection(container: Container) -> SandboxInspection:
         env=env_map,
         volumes=tuple(volumes),
         ports=tuple(ports),
-        network_isolated=bool(config_data.get("NetworkDisabled")),
+        network_isolated=bool(
+            config_data.get("NetworkDisabled")
+            or host_config.get("NetworkMode") == "none"
+        ),
         runtime_networks=runtime_networks,
         labels=labels,
         created_at=cast(Optional[str], attrs.get("Created")),
@@ -561,6 +566,7 @@ def _find_publish_mismatches(
     desired: ResolvedSandboxRuntimeSpec,
     resolved_image: str,
     inspection: SandboxInspection,
+    expected_network: str,
 ) -> list[str]:
     """Return the field names whose observed value disagrees with ``desired``.
 
@@ -617,6 +623,9 @@ def _find_publish_mismatches(
         mismatches.append("working_dir")
     if facts.network_isolated != desired.network_isolated:
         mismatches.append("network_isolated")
+    expected_networks = set() if desired.network_isolated else {expected_network}
+    if set(facts.runtime_networks) != expected_networks:
+        mismatches.append("runtime_networks")
     if (facts.raw_nano_cpus or 0) != int(desired.cpus * _CPU_NANOS):
         mismatches.append("cpus")
     if (facts.raw_memory_bytes or 0) != int(desired.memory * 1024 * 1024):
@@ -1100,6 +1109,7 @@ async def _create_container(
     image: str,
     template: SandboxTemplate,
     config: SandboxConfig,
+    network: str,
     extra_labels: Optional[dict[str, str]] = None,
 ) -> Container:
     """Create a managed Docker container from sandbox template and config.
@@ -1180,12 +1190,19 @@ async def _create_container(
         "ports": ports,
         "nano_cpus": int((config.cpus or 1) * _CPU_NANOS),
         "mem_limit": (config.memory or 512) * 1024 * 1024,
-        "network_disabled": bool(config.network_isolated),
         # Security config
         "security_opt": ["no-new-privileges:true"],
         "cap_drop": ["ALL"],
         "labels": labels,
     }
+    if config.network_isolated:
+        # Explicitly use Docker's disconnected network namespace. Do not rely
+        # on NetworkDisabled alone, which does not attest the runtime mode.
+        kwargs["network_mode"] = "none"
+    else:
+        # The deployment creates this dedicated bridge and owns its firewall
+        # policy. Never fall back to Docker's daemon-global default bridge.
+        kwargs["network"] = network
     if effective_pids_limit is not None:
         kwargs["pids_limit"] = effective_pids_limit
     guest_paths = [guest for _, guest, _ in (config.volumes or [])]
@@ -1213,6 +1230,7 @@ class DockerSandboxService(SandboxService):
         client: Optional[Any] = None,
         *,
         namespace: Optional[str] = None,
+        network: Optional[str] = None,
     ) -> None:
         """Initialize the Docker sandbox service and validate daemon access.
 
@@ -1227,6 +1245,10 @@ class DockerSandboxService(SandboxService):
                 is restricted to it, so multiple deployments sharing one
                 Docker daemon can never discover or mutate each other's
                 sandboxes.
+            network: Dedicated deployment-created bridge for network-enabled
+                sandboxes. When omitted, resolve it from
+                ``XAGENT_SANDBOX_NETWORK``. Built-in Docker networks are
+                rejected and live attachments are verified before reuse.
         """
         resolved_namespace = (
             namespace if namespace is not None else get_sandbox_namespace()
@@ -1237,7 +1259,15 @@ class DockerSandboxService(SandboxService):
                 "DockerSandboxService without an explicit namespace"
             )
         validate_sandbox_namespace(resolved_namespace)
+        resolved_network = network if network is not None else get_sandbox_network()
+        if resolved_network is None:
+            raise RuntimeError(
+                "XAGENT_SANDBOX_NETWORK is required when constructing "
+                "DockerSandboxService without an explicit network"
+            )
+        validate_sandbox_network(resolved_network)
         self._namespace = resolved_namespace
+        self._network = resolved_network
         self._client = client or _create_docker_client()
         self._client.ping()
         self._store = store
@@ -1383,6 +1413,12 @@ class DockerSandboxService(SandboxService):
             container = await self._find_container(name)
             if container is not None:
                 await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                if not self._runtime_network_policy_matches(inspection):
+                    raise SandboxRuntimeConflictError(
+                        f"Sandbox {name!r} is not attached exclusively to the "
+                        "configured sandbox network"
+                    )
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
                     await asyncio.to_thread(container.start)
@@ -1414,6 +1450,7 @@ class DockerSandboxService(SandboxService):
                 image,
                 template,
                 cfg,
+                self._network,
             )
             try:
                 await asyncio.to_thread(container.start)
@@ -1464,6 +1501,12 @@ class DockerSandboxService(SandboxService):
         """Docker backs the explicit spec-reconciliation lifecycle."""
         return True
 
+    def _runtime_network_policy_matches(self, inspection: SandboxInspection) -> bool:
+        expected_networks = (
+            set() if inspection.facts.network_isolated else {self._network}
+        )
+        return set(inspection.facts.runtime_networks) == expected_networks
+
     async def inspect(self, name: str) -> Optional[SandboxInspection]:
         """Observe a sandbox's current state and runtime facts.
 
@@ -1482,7 +1525,11 @@ class DockerSandboxService(SandboxService):
         if container is None:
             return None
         await asyncio.to_thread(container.reload)
-        return _build_inspection(container)
+        inspection = _build_inspection(container)
+        inspection.runtime_policy_matches = self._runtime_network_policy_matches(
+            inspection
+        )
+        return inspection
 
     async def create(
         self, name: str, template: SandboxTemplate, config: SandboxConfig
@@ -1565,6 +1612,7 @@ class DockerSandboxService(SandboxService):
                     resolved_image,
                     backend_template,
                     backend_config,
+                    self._network,
                     extra_labels=extra_labels,
                 )
             except errors.APIError as exc:
@@ -1600,7 +1648,9 @@ class DockerSandboxService(SandboxService):
 
             await asyncio.to_thread(container.reload)
             inspection = _build_inspection(container)
-            mismatches = _find_publish_mismatches(desired, resolved_image, inspection)
+            mismatches = _find_publish_mismatches(
+                desired, resolved_image, inspection, self._network
+            )
             if mismatches:
                 # A container whose observed facts disagree with what we
                 # asked for must never be published: remove it directly
@@ -1707,6 +1757,12 @@ class DockerSandboxService(SandboxService):
             control = self._get_live_control(name)
             async with control.exclusive_access(mark_deleted=False):
                 await asyncio.to_thread(container.reload)
+                inspection = _build_inspection(container)
+                if not self._runtime_network_policy_matches(inspection):
+                    raise SandboxRuntimeConflictError(
+                        f"Sandbox {name!r} is not attached exclusively to the "
+                        "configured sandbox network"
+                    )
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
                     await asyncio.to_thread(container.start)
@@ -1897,6 +1953,19 @@ class DockerSandboxService(SandboxService):
                 "docker-socket-proxy is in use, allow the /info endpoint "
                 "(for Tecnativa/docker-socket-proxy, set INFO=1)."
             ) from exc
+        try:
+            sandbox_network = self._client.networks.get(self._network)
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} is not "
+                "available on the daemon"
+            ) from exc
+        network_attrs = cast(dict[str, Any], sandbox_network.attrs or {})
+        if network_attrs.get("Driver") != "bridge":
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox Docker network {self._network!r} must use "
+                "the bridge driver"
+            )
         security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(
             (

@@ -212,8 +212,9 @@ class TestCreateDockerService:
 
     @pytest.fixture(autouse=True)
     def _namespace_env(self, monkeypatch):
-        """A namespace is mandatory for the Docker sandbox implementation."""
+        """Ownership and a dedicated network are mandatory for Docker."""
         monkeypatch.setenv("XAGENT_SANDBOX_NAMESPACE", "test")
+        monkeypatch.setenv("XAGENT_SANDBOX_NETWORK", "test-sandbox-egress")
 
     def test_uses_db_store(self):
         """Test Docker sandbox service is created with persistent store."""
@@ -229,6 +230,7 @@ class TestCreateDockerService:
         mock_store_cls.assert_called_once_with(namespace=None)
         assert mock_service_cls.call_args[1]["store"] is mock_store_cls.return_value
         assert mock_service_cls.call_args[1]["namespace"] == "test"
+        assert mock_service_cls.call_args[1]["network"] == "test-sandbox-egress"
 
     def test_creation_failure_is_fatal(self):
         """An enabled Docker runtime must not degrade to local execution."""
@@ -246,6 +248,11 @@ class TestCreateDockerService:
         """Missing namespace must fail loudly, never degrade to unscoped mode."""
         monkeypatch.delenv("XAGENT_SANDBOX_NAMESPACE", raising=False)
         with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NAMESPACE is required"):
+            _create_docker_service()
+
+    def test_missing_network_is_fatal(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_SANDBOX_NETWORK", raising=False)
+        with pytest.raises(RuntimeError, match="XAGENT_SANDBOX_NETWORK is required"):
             _create_docker_service()
 
     def test_legacy_container_inventory_is_logged(self, caplog):

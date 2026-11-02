@@ -387,9 +387,12 @@ deliverables are repaired individually.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
-> `XAGENT_SANDBOX_NAMESPACE` before upgrading. The Compose overlay below sets
-> it automatically; pip/systemd deployments must set their own stable, unique
-> deployment identifier (see `example.env`). The backend must also run with
+> `XAGENT_SANDBOX_NAMESPACE` and `XAGENT_SANDBOX_NETWORK` before upgrading.
+> The network must already exist, use the bridge driver, and have the
+> deployment's egress firewall policy applied. The Compose overlay below sets
+> the namespace automatically and requires the network name from the deployment
+> environment; pip/systemd deployments must set both values explicitly (see
+> `example.env`). The backend must also run with
 > effective uid 0 against a rootful Docker daemon with user-namespace
 > remapping disabled; a Docker socket proxy must permit `GET /info`
 > (`INFO=1` for Tecnativa/docker-socket-proxy). Missing or incompatible
@@ -397,13 +400,19 @@ deliverables are repaired individually.
 > or an unverifiable daemon mode.
 
 The overlay sets `XAGENT_SANDBOX_NAMESPACE` on `backend`, `worker`, and
-`scheduler` from the resolved `${COMPOSE_PROJECT_NAME}`. Docker sibling mode
+`scheduler` from the resolved `${COMPOSE_PROJECT_NAME}` and requires an exact
+`XAGENT_SANDBOX_NETWORK` name. Docker sibling mode
 treats that Compose project name as authoritative and overrides any namespace
 from `example.env`; a missing value fails during Compose interpolation. Every
 sandbox container a deployment creates is scoped to that namespace (physical
 name and owner labels), so multiple deployments sharing one Docker daemon
 never discover or manage each other's sandboxes. Co-located stacks must use
 distinct Compose project names and distinct `XAGENT_HOST_STORAGE_ROOT` paths.
+Every network-enabled sandbox is attached only to the configured network;
+network-isolated sandboxes use Docker's `none` network mode. Xagent verifies
+the live attachment before publishing or reusing a container and rejects the
+built-in `bridge`, `host`, `none`, and `default` network names. Creating the
+bridge and applying/persisting its firewall rules remain deployment duties.
 
 `XAGENT_SANDBOX_MAX_CONTAINERS` applies independently to each deployment
 namespace, not globally to the shared daemon. Size the daemon for up to the

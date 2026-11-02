@@ -3,8 +3,11 @@
 ``get_agent_from_api_key`` resolves the ``Authorization: Bearer
 xag_<prefix>_<secret>`` header to detached agent/key snapshots.
 ``get_workforce_from_api_key`` is the workforce-bound counterpart, and
-``get_principal_from_api_key`` accepts either owner type for endpoints
-shared by both (the ``/v1/chat/tasks/*`` family). All database work runs
+``get_principal_from_api_key`` accepts either runtime owner type, or a
+personal ``xag_personal_<prefix>_<secret>`` key resolved to its holder, for
+the endpoints all three share (the ``/v1/chat/tasks/*`` family).
+``get_user_from_personal_key`` accepts only personal keys, for the
+management endpoints. All database work runs
 inside a worker-owned short session. Current keys use fast SHA-256
 verification; a legacy bcrypt check starts only after its loading session
 has closed and then upgrades that row to SHA-256 after one successful use.
@@ -108,23 +111,48 @@ class PersonalApiKeySnapshot:
 class ApiKeyPrincipal:
     """Detached owner of a presented SDK API key.
 
-    Exactly one of ``agent`` / ``workforce`` is set, mirroring the
-    exactly-one-FK invariant on :class:`AgentApiKey`. No Session or
-    attached ORM row crosses the authentication worker boundary.
+    Exactly one of ``agent`` / ``workforce`` / ``user`` is set. ``agent``
+    and ``workforce`` come from a runtime key, mirroring the exactly-one-FK
+    invariant on :class:`AgentApiKey`; ``user`` comes from a personal key
+    and is set exactly when ``key`` is a :class:`PersonalApiKeySnapshot`.
+    No Session or attached ORM row crosses the authentication worker
+    boundary.
     """
 
-    key: RuntimeApiKeySnapshot
+    key: RuntimeApiKeySnapshot | PersonalApiKeySnapshot
     agent: AgentPrincipalSnapshot | None = None
     workforce: WorkforcePrincipalSnapshot | None = None
+    user: UserPrincipalSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if (self.user is not None) != isinstance(self.key, PersonalApiKeySnapshot):
+            raise ValueError("a principal has a user exactly when its key is personal")
 
     @property
     def owner_user_id(self) -> int:
         """The user identity SDK calls act as: the owner of the bound
-        agent or workforce."""
+        agent or workforce, or the holder of a personal key."""
         if self.agent is not None:
             return int(self.agent.user_id)
-        assert self.workforce is not None
-        return int(self.workforce.owner_user_id)
+        if self.workforce is not None:
+            return int(self.workforce.owner_user_id)
+        if self.user is not None:
+            return int(self.user.id)
+        raise RuntimeError("API key principal has no owner")
+
+    @property
+    def stream_principal_id(self) -> str:
+        """The key's event-stream slot identity.
+
+        A runtime key counts under its bare prefix; a personal key under
+        ``personal:<prefix>``. Prefixes are unique within each key table,
+        not across the two, and a runtime prefix never contains ``:``, so a
+        runtime key and a personal key never share an identity. Used only to
+        count event-stream slots.
+        """
+        if isinstance(self.key, PersonalApiKeySnapshot):
+            return f"personal:{self.key.key_prefix}"
+        return self.key.key_prefix
 
 
 @dataclass(frozen=True)
@@ -335,11 +363,14 @@ def _load_runtime_key_record(prefix: str) -> _RuntimeKeyRecord | None:
 def _resolve_principal_from_credentials(
     credentials: HTTPAuthorizationCredentials | None,
 ) -> ApiKeyPrincipal:
-    """Resolve one runtime key entirely inside a synchronous DB worker.
+    """Resolve one runtime or personal key inside a synchronous DB worker.
 
-    All failure paths retain the legacy bcrypt timing floor and return the same
-    ``invalid_api_key`` code, so an attacker cannot enumerate live
-    prefixes by either error code or response timing. The DB Session is
+    A personal key is resolved by :func:`_resolve_user_from_personal_credentials`,
+    the same check (application principal policy included) the personal-key
+    management endpoints use, and yields a principal whose ``user`` is the
+    key holder. All failure paths retain the legacy bcrypt timing floor and
+    return the same ``invalid_api_key`` code, so an attacker cannot enumerate
+    live prefixes by either error code or response timing. The DB Session is
     closed before bcrypt runs, so the expensive hash check never pins a
     connection-pool slot.
     """
@@ -351,13 +382,18 @@ def _resolve_principal_from_credentials(
 
     raw = credentials.credentials
 
-    # Format check. parse_api_key returns None for anything not shaped
-    # like ``xag_<6 alnum>_<32 alnum>``. Workforce keys share the AGENT
-    # wire format -- the owner type is a DB fact, not a key-shape fact.
+    # Format check. parse_api_key accepts ``xag_<6 alnum>_<32 alnum>``
+    # (AGENT) and ``xag_personal_<6 alnum>_<32 alnum>`` (PERSONAL) and
+    # returns None for anything else. Workforce keys share the AGENT wire
+    # format -- the owner type is a DB fact, not a key-shape fact.
     parsed = parse_api_key(raw)
     if parsed is None:
         verify_dummy()
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    if parsed.kind == ApiKeyKind.PERSONAL:
+        user, personal_key = _resolve_user_from_personal_credentials(credentials)
+        return ApiKeyPrincipal(key=personal_key, user=user)
 
     if parsed.kind != ApiKeyKind.AGENT:
         verify_dummy()
@@ -416,11 +452,13 @@ def _resolve_principal_from_credentials(
 async def get_principal_from_api_key(
     credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ) -> ApiKeyPrincipal:
-    """Resolve an SDK API key to its owner, agent- or workforce-bound.
+    """Resolve an SDK API key to its owner: agent-bound, workforce-bound,
+    or the holder of a personal key.
 
-    Used by endpoints shared by both owner types (the
-    ``/v1/chat/tasks/*`` family); owner-specific endpoints use
-    :func:`get_agent_from_api_key` / :func:`get_workforce_from_api_key`.
+    Used by the endpoints all three share (the ``/v1/chat/tasks/*``
+    family), each of which scopes its work by the principal's kind;
+    owner-specific endpoints use :func:`get_agent_from_api_key` /
+    :func:`get_workforce_from_api_key`, which reject the other kinds.
     """
     return await run_db_io_cancellation_safe(
         lambda: _resolve_principal_from_credentials(credentials)
@@ -432,8 +470,8 @@ async def get_agent_from_api_key(
 ) -> tuple[AgentPrincipalSnapshot, RuntimeApiKeySnapshot]:
     """Resolve an SDK API key to detached agent/key snapshots.
 
-    Workforce-bound keys are rejected with the same opaque 401 --
-    endpoints using this dependency are agent-only surfaces.
+    Workforce-bound and personal keys are rejected with the same opaque
+    401 -- endpoints using this dependency are agent-only surfaces.
 
     Returns:
         Detached snapshots carrying only the fields downstream routes need.
@@ -444,7 +482,7 @@ async def get_agent_from_api_key(
             failed.
     """
     principal = await get_principal_from_api_key(credentials)
-    if principal.agent is None:
+    if principal.agent is None or not isinstance(principal.key, RuntimeApiKeySnapshot):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
     return principal.agent, principal.key
 
@@ -454,11 +492,13 @@ async def get_workforce_from_api_key(
 ) -> tuple[WorkforcePrincipalSnapshot, RuntimeApiKeySnapshot]:
     """Resolve an SDK API key to detached workforce/key snapshots.
 
-    Agent-bound keys are rejected with the same opaque 401 --
-    endpoints using this dependency are workforce-only surfaces.
+    Agent-bound and personal keys are rejected with the same opaque 401
+    -- endpoints using this dependency are workforce-only surfaces.
     """
     principal = await get_principal_from_api_key(credentials)
-    if principal.workforce is None:
+    if principal.workforce is None or not isinstance(
+        principal.key, RuntimeApiKeySnapshot
+    ):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
     return principal.workforce, principal.key
 

@@ -401,18 +401,20 @@ def test_runtime_key_cannot_call_management_endpoint():
     assert resp.json()["error"]["code"] == "invalid_api_key"
 
 
-def test_personal_key_cannot_call_runtime_endpoint():
+def test_personal_key_authenticates_on_runtime_endpoint():
+    """The task routes accept a personal key as its holder. An agent the
+    holder cannot reach is a scope miss (404), not an authentication failure."""
     personal = _personal_key()
     resp = client.post(
         "/v1/chat/tasks",
         headers=_bearer(personal),
         json={
-            "agent_id": 1,
+            "agent_id": 999_999,
             "message": {"role": "user", "content": "hello"},
         },
     )
-    assert resp.status_code == 401
-    assert resp.json()["error"]["code"] == "invalid_api_key"
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "agent_not_found"
 
 
 def test_from_template_creates_agent(template_manager):

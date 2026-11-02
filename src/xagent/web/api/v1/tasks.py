@@ -212,12 +212,20 @@ async def upload_task_files(
 
 
 def _sdk_task_scope(principal: ApiKeyPrincipal) -> task_start_service.SdkTaskScope:
-    return task_start_service.SdkTaskScope(
-        agent_id=int(principal.agent.id) if principal.agent is not None else None,
-        workforce_id=int(principal.workforce.id)
-        if principal.workforce is not None
-        else None,
-    )
+    """The task scope of ``principal``: its bound agent or workforce.
+
+    Any other principal has no task scope and gets the same 404 a task
+    outside its scope gets.
+    """
+    if principal.agent is not None:
+        return task_start_service.SdkTaskScope(
+            agent_id=int(principal.agent.id), workforce_id=None
+        )
+    if principal.workforce is not None:
+        return task_start_service.SdkTaskScope(
+            agent_id=None, workforce_id=int(principal.workforce.id)
+        )
+    raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
 
 
 def _raise_start_rejection(exc: task_start_service.TaskStartRejected) -> NoReturn:

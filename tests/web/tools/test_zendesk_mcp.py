@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import pytest
 import requests
+from mcp.server.fastmcp.exceptions import ToolError
 
 from xagent.web.tools.mcp import zendesk
 
@@ -2438,6 +2439,23 @@ async def test_optional_params_accept_explicit_none_through_tool_schema(
             "zendesk_get_side_conversation",
             {"ticket_id": 1, "side_conversation_id": "5c62"},
         ),
+        (
+            "zendesk_create_side_conversation",
+            {"ticket_id": 1, "subject": "s", "body": "b", "to": [{"user_id": 8}]},
+        ),
+        (
+            "zendesk_reply_to_side_conversation",
+            {
+                "ticket_id": 1,
+                "side_conversation_id": "5c62",
+                "body": "b",
+                "to": [{"user_id": 8}],
+            },
+        ),
+        (
+            "zendesk_update_side_conversation",
+            {"ticket_id": 1, "side_conversation_id": "5c62", "state": "closed"},
+        ),
         ("zendesk_apply_macro", {"ticket_id": 1, "macro_id": 1}),
         (
             "zendesk_update_ticket",
@@ -2523,6 +2541,23 @@ _ALL_TOOL_CALLS = [
     (
         "zendesk_get_side_conversation",
         {"ticket_id": 1, "side_conversation_id": "5c62"},
+    ),
+    (
+        "zendesk_create_side_conversation",
+        {"ticket_id": 1, "subject": "s", "body": "b", "to": [{"user_id": 8}]},
+    ),
+    (
+        "zendesk_reply_to_side_conversation",
+        {
+            "ticket_id": 1,
+            "side_conversation_id": "5c62",
+            "body": "b",
+            "to": [{"user_id": 8}],
+        },
+    ),
+    (
+        "zendesk_update_side_conversation",
+        {"ticket_id": 1, "side_conversation_id": "5c62", "state": "closed"},
     ),
     ("zendesk_apply_macro", {"ticket_id": 1, "macro_id": 1}),
 ]
@@ -3403,6 +3438,409 @@ def test_get_side_conversation_surfaces_an_events_error(monkeypatch):
     assert result["status"] == "error"
     assert "HTTP 403" in result["message"]
     assert mock_request.call_count == 2
+
+
+def _side_conversation_write_response(body="Can you confirm the new ship date?"):
+    return MockResponse(
+        json_data={
+            "side_conversation": _SIDE_CONVERSATION,
+            "event": _side_conversation_event("e1", body),
+        },
+        status_code=201,
+    )
+
+
+def test_create_side_conversation_posts_the_message(monkeypatch):
+    mock_request = Mock(return_value=_side_conversation_write_response())
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_create_side_conversation(
+            1,
+            " Shipping delay ",
+            "Can you confirm the new ship date?",
+            [
+                {"user_id": 8},
+                {"email": " vendor@example.com ", "name": " Vendor "},
+                {"email": "ops@example.com", "name": "  "},
+            ],
+        )
+    )
+
+    call = mock_request.call_args
+    assert call.kwargs["method"] == "POST"
+    assert call.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/tickets/1/side_conversations.json"
+    )
+    assert call.kwargs["json"] == {
+        "message": {
+            "subject": "Shipping delay",
+            "body": "Can you confirm the new ship date?",
+            "to": [
+                {"user_id": 8},
+                {"email": "vendor@example.com", "name": "Vendor"},
+                {"email": "ops@example.com"},
+            ],
+        }
+    }
+    assert result["status"] == "success"
+    assert result["side_conversation"] == _SIDE_CONVERSATION_SUMMARY
+    assert result["event"]["message"]["body"] == "Can you confirm the new ship date?"
+    assert result["truncated"] is False
+
+
+def test_create_side_conversation_accepts_a_numeric_string_user_id(monkeypatch):
+    mock_request = Mock(return_value=_side_conversation_write_response())
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    zendesk.zendesk_create_side_conversation(1, "s", "b", [{"user_id": "8"}])
+
+    assert mock_request.call_args.kwargs["json"]["message"]["to"] == [{"user_id": 8}]
+
+
+@pytest.mark.parametrize(
+    "subject, body, to, expected",
+    [
+        ("  ", "b", [{"user_id": 8}], "subject must not be blank"),
+        ("s", "", [{"user_id": 8}], "body must not be blank"),
+        ("s", "b", [], "to must list at least one participant"),
+        ("s", "b", None, "to must list at least one participant"),
+        ("s", "b", ["vendor@example.com"], "to[0] must be an object"),
+        (
+            "s",
+            "b",
+            [{"email": "vendor@example.com"}, {"slack_channel_id": "C1"}],
+            "to[1] has unsupported fields ['slack_channel_id']",
+        ),
+        ("s", "b", [{"support_group_id": 3}], "child-ticket"),
+        (
+            "s",
+            "b",
+            [{"user_id": 8, "email": "vendor@example.com"}],
+            "to[0] must set user_id or email, not both",
+        ),
+        ("s", "b", [{"name": "Vendor"}], "to[0] must set user_id or email"),
+        (
+            "s",
+            "b",
+            [{"user_id": 8, "name": "Vendor"}],
+            "to[0].name applies only to an email participant",
+        ),
+        ("s", "b", [{"email": "vendor"}], "to[0].email must be an email address"),
+        ("s", "b", [{"email": 5}], "to[0].email must be an email address"),
+        ("s", "b", [{"user_id": True}], "to[0].user_id must be a positive integer"),
+        ("s", "b", [{"user_id": 0}], "to[0].user_id must be a positive integer"),
+        ("s", "b", [{"user_id": "8a"}], "to[0].user_id must be a positive integer"),
+        ("s", "b", [{"user_id": "²"}], "to[0].user_id must be a positive integer"),
+    ],
+)
+def test_create_side_conversation_refuses_bad_input_without_calling_zendesk(
+    monkeypatch, subject, body, to, expected
+):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_create_side_conversation(1, subject, body, to))
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        requests.exceptions.ReadTimeout("read timed out"),
+        MockResponse(json_data={"error": "BadGateway"}, status_code=502),
+    ],
+    ids=["transport-error", "5xx"],
+)
+def test_create_side_conversation_warns_it_may_have_been_sent(monkeypatch, outcome):
+    mock_request = Mock(side_effect=[outcome])
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_create_side_conversation(1, "s", "b", [{"user_id": 8}])
+    )
+
+    assert result["status"] == "error"
+    assert "may have been created" in result["message"]
+    assert "zendesk_list_side_conversations" in result["message"]
+    assert mock_request.call_count == 1
+
+
+def test_create_side_conversation_does_not_warn_for_a_refused_request(monkeypatch):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "RecordInvalid", "description": "Invalid"},
+                status_code=422,
+            )
+        ),
+    )
+
+    result = json.loads(
+        zendesk.zendesk_create_side_conversation(1, "s", "b", [{"user_id": 8}])
+    )
+
+    assert result["status"] == "error"
+    assert "HTTP 422" in result["message"]
+    assert "may have been" not in result["message"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: zendesk.zendesk_create_side_conversation(1, "s", "b", [{"user_id": 8}]),
+        lambda: zendesk.zendesk_reply_to_side_conversation(
+            1, "5c62", "b", [{"user_id": 8}]
+        ),
+        lambda: zendesk.zendesk_update_side_conversation(1, "5c62", "closed"),
+    ],
+    ids=["create", "reply", "update"],
+)
+def test_side_conversation_writes_tell_a_grant_without_the_scope_to_reconnect(
+    monkeypatch, call
+):
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"error": "Forbidden", "description": "Forbidden"},
+                status_code=403,
+            )
+        ),
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert "HTTP 403" in result["message"]
+    assert "reconnecting Zendesk requests the scopes again" in result["message"]
+
+
+def test_create_side_conversation_trims_the_echoed_body_to_fit(monkeypatch):
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(return_value=_side_conversation_write_response("x" * 5000)),
+    )
+
+    response = zendesk.zendesk_create_side_conversation(
+        1, "s", "x" * 5000, [{"user_id": 8}]
+    )
+    result = json.loads(response)
+
+    assert len(response) <= 2000
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["event"]["message"]["body_truncated"] is True
+    assert result["side_conversation"]["id"] == _SIDE_CONVERSATION["id"]
+
+
+def test_create_side_conversation_collapses_the_conversation_after_the_body(
+    monkeypatch,
+):
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: 700)
+    long_conversation = {**_SIDE_CONVERSATION, "preview_text": "p" * 2000}
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "side_conversation": long_conversation,
+                    "event": _side_conversation_event("e1", "short"),
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        zendesk.zendesk_create_side_conversation(1, "s", "short", [{"user_id": 8}])
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["side_conversation"] == {
+        "id": _SIDE_CONVERSATION["id"],
+        "state": "open",
+    }
+
+
+@pytest.mark.parametrize(
+    "cap, expected",
+    [
+        (
+            400,
+            {
+                "status": "success",
+                "side_conversation": {
+                    "id": _SIDE_CONVERSATION["id"],
+                    "state": "open",
+                },
+                "event": {"id": "e1", "type": "create"},
+                "truncated": True,
+            },
+        ),
+        (
+            120,
+            {
+                "status": "success",
+                "side_conversation": {"id": _SIDE_CONVERSATION["id"]},
+                "truncated": True,
+            },
+        ),
+        (25, {"status": "success"}),
+    ],
+)
+def test_create_side_conversation_never_reports_a_sent_message_as_an_error(
+    monkeypatch, cap, expected
+):
+    """An error after the email went out invites a retry, which sends it
+    again; the response shrinks to the smallest success envelope instead."""
+    monkeypatch.setattr(zendesk, "get_tool_max_output_length", lambda: cap)
+    monkeypatch.setattr(
+        zendesk._session,
+        "request",
+        Mock(return_value=_side_conversation_write_response()),
+    )
+
+    response = zendesk.zendesk_create_side_conversation(1, "s", "b", [{"user_id": 8}])
+
+    assert len(response) <= cap
+    assert json.loads(response) == expected
+
+
+def test_reply_to_side_conversation_posts_the_body_and_recipients(monkeypatch):
+    mock_request = Mock(return_value=_side_conversation_write_response("Thanks"))
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_reply_to_side_conversation(
+            "https://acme.zendesk.com/agent/tickets/1",
+            "5c62",
+            "Thanks",
+            [{"email": "vendor@example.com"}],
+        )
+    )
+
+    call = mock_request.call_args
+    assert call.kwargs["method"] == "POST"
+    assert call.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/tickets/1/side_conversations/5c62/reply.json"
+    )
+    assert call.kwargs["json"] == {
+        "message": {"body": "Thanks", "to": [{"email": "vendor@example.com"}]}
+    }
+    assert result["status"] == "success"
+    assert result["event"]["message"]["body"] == "Thanks"
+
+
+@pytest.mark.parametrize(
+    "side_conversation_id, body, to, expected",
+    [
+        ("5c62", " ", [{"user_id": 8}], "body must not be blank"),
+        ("", "b", [{"user_id": 8}], "side_conversation_id"),
+        ("..", "b", [{"user_id": 8}], "side_conversation_id"),
+        ("5c62", "b", [{"msteams_channel_id": "T1"}], "unsupported fields"),
+        ("5c62", "b", [], "to must list at least one participant"),
+        ("5c62", "b", None, "to must list at least one participant"),
+    ],
+)
+def test_reply_to_side_conversation_refuses_bad_input_without_calling_zendesk(
+    monkeypatch, side_conversation_id, body, to, expected
+):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_reply_to_side_conversation(1, side_conversation_id, body, to)
+    )
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        requests.exceptions.ConnectionError("connection reset"),
+        MockResponse(json_data={"error": "Oops"}, status_code=500),
+    ],
+    ids=["transport-error", "5xx"],
+)
+def test_reply_to_side_conversation_warns_it_may_have_been_sent(monkeypatch, outcome):
+    monkeypatch.setattr(zendesk._session, "request", Mock(side_effect=[outcome]))
+
+    result = json.loads(
+        zendesk.zendesk_reply_to_side_conversation(1, "5c62", "b", [{"user_id": 8}])
+    )
+
+    assert result["status"] == "error"
+    assert "may have been sent" in result["message"]
+    assert "zendesk_get_side_conversation" in result["message"]
+
+
+async def test_reply_to_side_conversation_schema_requires_recipients(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    with pytest.raises(ToolError, match="Field required"):
+        await zendesk.mcp.call_tool(
+            "zendesk_reply_to_side_conversation",
+            {"ticket_id": 1, "side_conversation_id": "5c62", "body": "b"},
+        )
+
+    mock_request.assert_not_called()
+
+
+def test_update_side_conversation_sets_the_state(monkeypatch):
+    closed = {**_SIDE_CONVERSATION, "state": "closed"}
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"side_conversation": closed})
+    )
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_update_side_conversation(1, "5c62", " Closed "))
+
+    call = mock_request.call_args
+    assert call.kwargs["method"] == "PUT"
+    assert call.kwargs["url"] == (
+        "https://acme.zendesk.com/api/v2/tickets/1/side_conversations/5c62.json"
+    )
+    assert call.kwargs["json"] == {"side_conversation": {"state": "closed"}}
+    assert result["status"] == "success"
+    assert result["side_conversation"]["state"] == "closed"
+    assert result["event"] is None
+
+
+@pytest.mark.parametrize(
+    "side_conversation_id, state, expected",
+    [
+        ("5c62", "pending", "state must be one of ['closed', 'open']"),
+        ("5c62", " ", "state must not be blank"),
+        (None, "closed", "side_conversation_id"),
+    ],
+)
+def test_update_side_conversation_refuses_bad_input_without_calling_zendesk(
+    monkeypatch, side_conversation_id, state, expected
+):
+    mock_request = Mock()
+    monkeypatch.setattr(zendesk._session, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_update_side_conversation(1, side_conversation_id, state)
+    )
+
+    assert result["status"] == "error"
+    assert expected in result["message"]
+    mock_request.assert_not_called()
 
 
 def _macro(

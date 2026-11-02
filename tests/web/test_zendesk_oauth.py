@@ -259,7 +259,11 @@ def test_login_sends_the_user_to_the_accounts_consent_page(zendesk_db):
         "acme.zendesk.com",
         "/oauth/authorizations/new",
     )
-    assert parse_qs(location.query)["scope"] == ["read tickets:write"]
+    assert parse_qs(location.query)["scope"] == [
+        "read side_conversations:write tickets:write"
+    ]
+    # Zendesk has no optional_scope parameter; every scope is required.
+    assert "optional_scope" not in parse_qs(location.query)
 
 
 def test_blank_provider_credentials_come_from_env_at_request_time(

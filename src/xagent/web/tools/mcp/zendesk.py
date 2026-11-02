@@ -999,6 +999,141 @@ def _side_conversation_event_summary(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_SIDE_CONVERSATION_STATES = frozenset({"open", "closed"})
+# Shape only (one "@", no whitespace): Zendesk does the real address check.
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+$")
+_EMAIL_PARTICIPANT_FIELDS = frozenset({"user_id", "email", "name"})
+
+
+def _participant_user_id(value: Any, label: str) -> int:
+    if not isinstance(value, bool):
+        if isinstance(value, int) and value > 0:
+            return value
+        # isascii(): isdigit() also accepts digits int() can't parse ("²").
+        if (
+            isinstance(value, str)
+            and value.strip().isascii()
+            and value.strip().isdigit()
+        ):
+            user_id = int(value.strip())
+            if user_id > 0:
+                return user_id
+    raise ValueError(f"{label}.user_id must be a positive integer")
+
+
+def _validated_participants(to: Any) -> list[dict[str, Any]]:
+    """Validate `to` against an allowlist of email participants: a Zendesk
+    user by `user_id`, or an address by `email` with an optional `name`.
+
+    Slack, Microsoft Teams and child-ticket participants each need their own
+    identifiers and account setup, so any other field is refused. Zendesk
+    also refuses a message mixing participant types; the allowlist rules
+    that out before the request."""
+    if not isinstance(to, list) or not to:
+        raise ValueError("to must list at least one participant")
+    participants: list[dict[str, Any]] = []
+    for index, entry in enumerate(to):
+        label = f"to[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{label} must be an object with user_id, or email and an optional name"
+            )
+        unsupported = set(entry) - _EMAIL_PARTICIPANT_FIELDS
+        if unsupported:
+            raise ValueError(
+                f"{label} has unsupported fields {sorted(unsupported)}: only "
+                "email participants (user_id, or email with an optional name) "
+                "are supported, not Slack, Microsoft Teams or child-ticket "
+                "participants"
+            )
+        user_id = entry.get("user_id")
+        email = entry.get("email")
+        name = entry.get("name")
+        if user_id is not None and email is not None:
+            raise ValueError(f"{label} must set user_id or email, not both")
+        if user_id is not None:
+            if name is not None:
+                raise ValueError(f"{label}.name applies only to an email participant")
+            participants.append({"user_id": _participant_user_id(user_id, label)})
+            continue
+        if email is None:
+            raise ValueError(f"{label} must set user_id or email")
+        if not isinstance(email, str) or not _EMAIL_PATTERN.match(email.strip()):
+            raise ValueError(f"{label}.email must be an email address")
+        if name is not None and not isinstance(name, str):
+            raise ValueError(f"{label}.name must be a string")
+        participant: dict[str, Any] = {"email": email.strip()}
+        name = _blank_to_none(name)
+        if name:
+            participant["name"] = name
+        participants.append(participant)
+    return participants
+
+
+def _build_side_conversation_write_response(result: Any) -> str:
+    """The side conversation after a write, plus the message event the write
+    created (null for a state change).
+
+    Shrinks in order of what the caller loses least: the event's message
+    body, then the side conversation (down to its id and state), then the
+    event (down to its id and type); a top-level `truncated` flag reports
+    any cut. Unless the cap is below the smallest success envelope, it
+    never turns a written result into an error: an error invites a retry,
+    and a retry of a create or reply emails the message again."""
+    payload = result if isinstance(result, dict) else {}
+    conversation = payload.get("side_conversation")
+    summary: Any = (
+        _side_conversation_summary(conversation)
+        if isinstance(conversation, dict)
+        else conversation
+    )
+    event = payload.get("event")
+    event_summary = (
+        _side_conversation_event_summary(event) if isinstance(event, dict) else None
+    )
+
+    def _build(truncated: bool) -> str:
+        return _success(
+            side_conversation=summary, event=event_summary, truncated=truncated
+        )
+
+    response = _build(False)
+    max_output_length = get_tool_max_output_length()
+    if event_summary is not None:
+        message = event_summary.get("message")
+        body = message.get("body") if isinstance(message, dict) else None
+        while (
+            len(response) > max_output_length
+            and isinstance(message, dict)
+            and isinstance(body, str)
+            and body
+        ):
+            body = body[: len(body) // 2]
+            message = {**message, "body": body, "body_truncated": True}
+            event_summary = {**event_summary, "message": message}
+            response = _build(True)
+    if len(response) > max_output_length and isinstance(summary, dict):
+        summary = {"id": summary.get("id"), "state": summary.get("state")}
+        response = _build(True)
+    if len(response) > max_output_length and event_summary is not None:
+        event_summary = {
+            "id": event_summary.get("id"),
+            "type": event_summary.get("type"),
+        }
+        response = _build(True)
+    if len(response) > max_output_length:
+        conversation_id = summary.get("id") if isinstance(summary, dict) else None
+        for fallback in (
+            {"side_conversation": {"id": conversation_id}, "truncated": True},
+            {"truncated": True},
+            {},
+        ):
+            response = _success(**fallback)
+            if len(response) <= max_output_length:
+                break
+    return _finalize_capped(response, max_output_length)
+
+
 # Macro actions zendesk_apply_macro can turn into one ticket update under
 # the connector's tickets:write scope. Every other action (side
 # conversations, CCs, followers, custom fields, ...) is refused before
@@ -1833,6 +1968,146 @@ def zendesk_get_side_conversation(
     except Exception as e:
         logger.error(
             f"Error fetching side conversation {side_conversation_id} on Zendesk "
+            f"ticket {ticket_id}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_create_side_conversation(
+    ticket_id: int | str,
+    subject: str,
+    body: str,
+    to: list[dict[str, Any]],
+) -> str:
+    """
+    Start a side conversation on a ticket: Zendesk emails the message to the
+    recipients at once, and it can't be recalled. Confirm the recipients,
+    subject and body with the user before calling. Returns the new side
+    conversation and the message as sent.
+    Needs a Zendesk connection made with side conversation access (reconnect
+    one made earlier), an agent role allowed to contribute to side
+    conversations, and email side conversations turned on for the account.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI.
+    subject: the side conversation's subject line.
+    body: the plain-text message.
+    to: one or more email participants, each either {"user_id": <Zendesk
+    user id>} or {"email": "...", "name": "..."} (name optional). Slack,
+    Microsoft Teams and child-ticket participants are not supported.
+    """
+    try:
+        ticket_path_id = _resolve_path_id(
+            ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id"
+        )
+        message = {
+            "subject": _require_non_blank(subject, "subject"),
+            "body": _require_non_blank(body, "body"),
+            "to": _validated_participants(to),
+        }
+        try:
+            result = _request(
+                "POST",
+                f"/tickets/{ticket_path_id}/side_conversations.json",
+                json_data={"message": message},
+            )
+        except _OutcomeUnknownError as exc:
+            raise RuntimeError(
+                f"{exc}. The side conversation may have been created and its "
+                "message sent: check with zendesk_list_side_conversations "
+                "before creating it again."
+            ) from exc
+        return _build_side_conversation_write_response(result)
+    except Exception as e:
+        logger.error(
+            f"Error creating a side conversation on Zendesk ticket {ticket_id}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_reply_to_side_conversation(
+    ticket_id: int | str,
+    side_conversation_id: str,
+    body: str,
+    to: list[dict[str, Any]],
+) -> str:
+    """
+    Reply to a side conversation: Zendesk emails the reply at once, and it
+    can't be recalled. Confirm the body and the recipients with the user
+    before calling. Returns the side conversation and the reply as sent.
+    Needs the same access as zendesk_create_side_conversation.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI.
+    side_conversation_id: the `id` from zendesk_list_side_conversations (a
+    UUID string, not a number).
+    body: the plain-text reply.
+    to: required. The recipients, in zendesk_create_side_conversation's `to`
+    format. Usually the other participants listed by
+    zendesk_get_side_conversation; confirm them with the user.
+    """
+    try:
+        ticket_path_id = _resolve_path_id(
+            ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id"
+        )
+        conversation_path_id = url_path_id(side_conversation_id, "side_conversation_id")
+        message = {
+            "body": _require_non_blank(body, "body"),
+            "to": _validated_participants(to),
+        }
+        try:
+            result = _request(
+                "POST",
+                f"/tickets/{ticket_path_id}/side_conversations/"
+                f"{conversation_path_id}/reply.json",
+                json_data={"message": message},
+            )
+        except _OutcomeUnknownError as exc:
+            raise RuntimeError(
+                f"{exc}. The reply may have been sent: check with "
+                "zendesk_get_side_conversation before replying again."
+            ) from exc
+        return _build_side_conversation_write_response(result)
+    except Exception as e:
+        logger.error(
+            f"Error replying to side conversation {side_conversation_id} on "
+            f"Zendesk ticket {ticket_id}: {e}"
+        )
+        return _error_capped(str(e))
+
+
+@mcp.tool()
+def zendesk_update_side_conversation(
+    ticket_id: int | str, side_conversation_id: str, state: str
+) -> str:
+    """
+    Close or reopen a side conversation. Returns the updated side
+    conversation.
+    ticket_id: a bare numeric id, or a full ticket URL copied from the
+    Zendesk agent UI.
+    side_conversation_id: the `id` from zendesk_list_side_conversations (a
+    UUID string, not a number).
+    state: "open" or "closed" (case-insensitive).
+    """
+    try:
+        ticket_path_id = _resolve_path_id(
+            ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id"
+        )
+        conversation_path_id = url_path_id(side_conversation_id, "side_conversation_id")
+        new_state = _require_one_of(
+            _require_non_blank(state, "state"), _SIDE_CONVERSATION_STATES, "state"
+        )
+        # Setting a state is idempotent, so a retry after an unknown outcome
+        # is safe and needs no warning.
+        result = _request(
+            "PUT",
+            f"/tickets/{ticket_path_id}/side_conversations/{conversation_path_id}.json",
+            json_data={"side_conversation": {"state": new_state}},
+        )
+        return _build_side_conversation_write_response(result)
+    except Exception as e:
+        logger.error(
+            f"Error updating side conversation {side_conversation_id} on Zendesk "
             f"ticket {ticket_id}: {e}"
         )
         return _error_capped(str(e))

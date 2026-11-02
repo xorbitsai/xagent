@@ -1574,11 +1574,17 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "category": "Support",
             # "read" covers every read tool, including /search.json, which
             # has no resource-scoped variant; "tickets:write" covers create,
-            # update, delete, reply, and internal notes.
-            "oauth_scopes": ["read", "tickets:write"],
+            # update, delete, reply, and internal notes;
+            # "side_conversations:write" covers starting, replying to, and
+            # closing side conversations. A required scope, not an
+            # optional_oauth_scopes entry: Zendesk's authorize request has
+            # no optional_scope parameter. Grants made before it was added
+            # lack it until the user reconnects (20261102_zendesk_side_conv).
+            "oauth_scopes": ["read", "tickets:write", "side_conversations:write"],
             # Hidden until manually verified against a live account, same
             # precedent as the intercom row above: it ships customer-facing
-            # *write* tools (reply/internal note/create/update/delete)
+            # *write* tools (reply/internal note/create/update/delete, and
+            # side conversations that email outside recipients)
             # discoverable by every user the moment it's visible, and that
             # verification hasn't happened yet. Flip to True via a
             # follow-up once done --

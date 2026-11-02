@@ -11,6 +11,11 @@ from typing import Any, Callable, cast
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 from ...config import COMPACT_THRESHOLD_DEFAULT
+from ..agent.prompt_composition import (
+    PROMPT_COMPOSITION_KEY,
+    build_prompt_composition,
+    call_kind_from_metadata,
+)
 from ..agent.trace import (
     TraceAction,
     TraceCategory,
@@ -1589,6 +1594,19 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
+        if PROMPT_COMPOSITION_KEY not in event_metadata:
+            # Call sites without tool-origin knowledge (compaction) still get
+            # sizes. Written into the caller's dict so the matching
+            # llm_call_end carries it too.
+            fallback = build_prompt_composition(
+                messages,
+                tools,
+                call_kind=call_kind_from_metadata(event_metadata),
+                iteration=event_metadata.get("iteration"),
+            )
+            if metadata is not None:
+                metadata[PROMPT_COMPOSITION_KEY] = fallback
+            event_metadata = {**event_metadata, PROMPT_COMPOSITION_KEY: fallback}
         context_data: dict[str, Any] = {
             "context_messages_count": len(messages),
             "tools_count": len(tools or []),
@@ -1607,6 +1625,13 @@ class PatternRuntime:
         threshold = getattr(compact_config, "threshold", None)
         if isinstance(threshold, int) and threshold > 0:
             context_data["context_threshold"] = threshold
+        composition = event_metadata.get(PROMPT_COMPOSITION_KEY)
+        if isinstance(composition, dict):
+            logger.info(
+                "LLM call prompt composition. execution_id=%s composition=%s",
+                getattr(context, "execution_id", None),
+                json.dumps(composition, sort_keys=True, separators=(",", ":")),
+            )
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),

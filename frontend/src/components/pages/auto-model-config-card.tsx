@@ -271,6 +271,14 @@ export function AutoModelConfigCard({
     );
   }, [bindings, mode]);
 
+  // A saved binding can name a profile that a newer xrouter-llm release
+  // dropped. The select cannot show it, so mark the row and block saving
+  // until it is rebound instead of letting the server reject the whole form.
+  const knownProfileIds = useMemo(
+    () => new Set(profiles.map((profile) => profile.id)),
+    [profiles],
+  );
+
   const moveCandidate = (index: number, offset: -1 | 1) => {
     setSelectedIds((current) => {
       const target = index + offset;
@@ -283,7 +291,9 @@ export function AutoModelConfigCard({
 
   const canSave =
     selectedModels.length > 0 &&
-    selectedModels.every((model) => Boolean(bindings[String(model.id)])) &&
+    selectedModels.every((model) =>
+      knownProfileIds.has(bindings[String(model.id)]),
+    ) &&
     duplicateProfiles.size === 0 &&
     (mode === "sequential_failover" || Boolean(fallbackId));
 
@@ -457,6 +467,8 @@ export function AutoModelConfigCard({
                 <Label>{t("models.auto.profileBindings")}</Label>
                 {selectedModels.map((model, index) => {
                   const binding = bindings[String(model.id)] || "";
+                  const unknownProfile =
+                    Boolean(binding) && !knownProfileIds.has(binding);
                   return (
                     <div
                       key={model.id}
@@ -510,7 +522,8 @@ export function AutoModelConfigCard({
                       >
                         <SelectTrigger
                           className={cn(
-                            duplicateProfiles.has(binding) &&
+                            (duplicateProfiles.has(binding) ||
+                              unknownProfile) &&
                               "border-destructive",
                           )}
                         >
@@ -526,6 +539,13 @@ export function AutoModelConfigCard({
                           ))}
                         </SelectContent>
                       </Select>
+                      {unknownProfile && (
+                        <p className="text-xs text-destructive md:col-start-2">
+                          {t("models.auto.unknownProfile", {
+                            profile: binding,
+                          })}
+                        </p>
+                      )}
                     </div>
                   );
                 })}

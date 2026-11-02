@@ -803,6 +803,17 @@ class UserAwareModelStorage:
             raise AutoModelUnavailableError("Auto model has no configured candidates")
 
         mode = str(config.mode or "routing")
+        # Routing picks among catalog profiles, so it needs the installed
+        # catalog. Sequential candidates carry their target's own modalities,
+        # so only routing needs each profile to describe its bound endpoint.
+        catalog: Any = None
+        known_profile_ids: set[str] = set()
+        if mode == "routing":
+            try:
+                catalog = load_router_profile_catalog()
+            except AutoModelDependencyError as exc:
+                raise AutoModelUnavailableError(str(exc)) from exc
+            known_profile_ids = set(catalog.known_model_ids())
         targets_by_candidate: dict[str, ChatModelConfig] = {}
         profiles_by_candidate: dict[str, str] = {}
         modalities_by_candidate: dict[str, list[str]] = {}
@@ -820,6 +831,19 @@ class UserAwareModelStorage:
             ):
                 logger.warning(
                     "Skipping unavailable Auto candidate %r",
+                    candidate.routing_model_id,
+                )
+                continue
+            # A profile can leave the catalog when xrouter-llm is upgraded.
+            # Saving rejects unknown profiles, so this only skips bindings
+            # saved against an older catalog until they are rebound.
+            if (
+                catalog is not None
+                and candidate.routing_model_id not in known_profile_ids
+            ):
+                logger.warning(
+                    "Skipping Auto candidate %r: profile is not in the installed "
+                    "xrouter-llm catalog",
                     candidate.routing_model_id,
                 )
                 continue
@@ -857,18 +881,15 @@ class UserAwareModelStorage:
                 "Auto model has no active configured candidates"
             )
 
-        # Sequential candidates carry their target's own modalities, so only
-        # routing needs each profile to describe its bound endpoint.
-        if mode == "routing":
+        if catalog is not None:
             try:
-                catalog = load_router_profile_catalog()
                 for candidate_id, target_cfg in targets_by_candidate.items():
                     validate_candidate_modalities(
                         catalog,
                         profiles_by_candidate[candidate_id],
                         target_cfg.abilities or [],
                     )
-            except (AutoModelConfigurationError, AutoModelDependencyError) as exc:
+            except AutoModelConfigurationError as exc:
                 raise AutoModelUnavailableError(str(exc)) from exc
 
         candidate_ids = list(targets_by_candidate)

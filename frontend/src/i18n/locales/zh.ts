@@ -2198,6 +2198,7 @@ const zh = {
       profileBindings: "路由模型映射",
       selectProfile: "选择对应的模型画像",
       duplicateProfile: "每个路由模型画像只能映射一次。",
+      unknownProfile: "模型画像 {profile} 已不可用，请先重新选择画像再保存。",
       moveUp: "上移候选",
       moveDown: "下移候选",
       fallback: "兜底模型",

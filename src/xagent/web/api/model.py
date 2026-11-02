@@ -2109,7 +2109,12 @@ async def update_model(
 
         try:
             catalog = load_router_profile_catalog()
+            known_profile_ids = set(catalog.known_model_ids())
             for candidate in routing_candidates:
+                # Routing skips a binding whose profile left the catalog, and
+                # rebinding it validates against the abilities saved by then.
+                if candidate.routing_model_id not in known_profile_ids:
+                    continue
                 validate_candidate_modalities(
                     catalog,
                     str(candidate.routing_model_id),

@@ -205,6 +205,71 @@ def test_legacy_mismatched_binding_fails_before_provider_call(env):
         )
 
 
+@pytest.mark.parametrize("removed_index", [0, 1])
+def test_routing_skips_candidate_whose_profile_left_the_catalog(env, removed_index):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(
+        env, env.consumer, [("text-a", first), ("text-b", second)], default=True
+    )
+    cfg.candidates[removed_index].routing_model_id = "removed-profile"
+    env.db.commit()
+    remaining = ("text-a", "text-b")[1 - removed_index]
+
+    llm = UserAwareModelStorage(env.db).get_llm_by_id(
+        cfg.router_model.model_id, env.consumer.id
+    )
+
+    assert isinstance(llm, RouterLLM)
+    assert llm._candidate_models == (remaining,)
+    # The first candidate is the saved fallback; skipping it clears the fallback.
+    assert llm._fallback_model == (None if removed_index == 0 else remaining)
+    assert (
+        llm._downstream_resolver(remaining).model_id
+        == (("first", "second")[1 - removed_index])
+    )
+    default = model_service.get_default_model(env.consumer.id)
+    assert isinstance(default, RouterLLM)
+    assert default._candidate_models == (remaining,)
+
+
+def test_routing_with_only_unknown_profiles_stays_unavailable(env):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(
+        env, env.consumer, [("text-a", first), ("text-b", second)], default=True
+    )
+    cfg.candidates[0].routing_model_id = "removed-profile"
+    cfg.candidates[1].routing_model_id = "another-removed-profile"
+    env.db.commit()
+
+    with pytest.raises(AutoModelUnavailableError, match="no active configured"):
+        UserAwareModelStorage(env.db).get_llm_by_id(
+            cfg.router_model.model_id, env.consumer.id
+        )
+    with pytest.raises(AutoModelUnavailableError):
+        model_service.get_default_model(env.consumer.id)
+
+
+def test_sequential_keeps_candidate_whose_profile_left_the_catalog(env):
+    first = target(env, env.consumer, name="first")
+    second = target(env, env.consumer, name="second")
+    cfg = configure(env, env.consumer, [("text-a", first), ("text-b", second)])
+    cfg.mode = "sequential_failover"
+    cfg.fallback_model_id = None
+    cfg.candidates[0].routing_model_id = "removed-profile"
+    env.db.commit()
+
+    llm = UserAwareModelStorage(env.db).get_llm_by_id(
+        cfg.router_model.model_id, env.consumer.id
+    )
+
+    assert isinstance(llm, RouterLLM)
+    assert llm._candidate_models == tuple(
+        f"candidate:{candidate.id}" for candidate in cfg.candidates
+    )
+
+
 def test_configured_wrapper_never_adds_profile_only_abilities():
     downstream = SimpleNamespace(abilities=["chat"])
     router = RouterLLM(
@@ -385,22 +450,24 @@ def test_pruning_candidate_recalculates_remaining_abilities(env):
     assert env.db.get(Model, cfg.router_model_id).abilities == ["chat", "tool_calling"]
 
 
-def test_editing_legacy_unknown_profile_returns_conflict(env):
+def test_editing_model_bound_to_unknown_profile_is_not_blocked(env):
     t = target(env, env.consumer)
     cfg = configure(env, env.consumer, [("text-a", t)])
     cfg.candidates[0].routing_model_id = "removed-profile"
     env.db.commit()
-    with pytest.raises(HTTPException) as error:
-        asyncio.run(
-            model_api.update_model(
-                t.model_id,
-                ModelUpdate(abilities=["chat", "tool_calling"]),
-                db=env.db,
-                user=env.consumer,
-            )
+    # Routing skips this binding, so even abilities its old profile would not
+    # have matched can change; rebinding validates them again.
+    asyncio.run(
+        model_api.update_model(
+            t.model_id,
+            ModelUpdate(abilities=["chat", "vision"]),
+            db=env.db,
+            user=env.consumer,
         )
-    assert error.value.status_code == 409
-    with pytest.raises(AutoModelUnavailableError, match="Unknown Auto profile"):
+    )
+    env.db.expire_all()
+    assert env.db.get(Model, t.id).abilities == ["chat", "vision"]
+    with pytest.raises(AutoModelUnavailableError, match="no active configured"):
         UserAwareModelStorage(env.db).get_llm_by_id(
             cfg.router_model.model_id, env.consumer.id
         )

@@ -8,6 +8,8 @@ export function speechText(value: string): string {
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/https?:\/\/\S+/g, " ")
+    // Remove list numbering before whitespace flattening and sentence splitting.
+    .replace(/^[ \t]*\d+[.)][ \t]+/gm, "")
     .replace(/[*_`#>|]/g, "")
     .replace(/\[|\]/g, "")
     .replace(/\s+/g, " ").trim()

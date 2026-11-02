@@ -88,6 +88,31 @@ describe("voice turn ownership", () => {
     turns.stop()
   })
 
+  it("speaks streamed list items without synthesizing their numbers as separate sentences", async () => {
+    vi.useFakeTimers()
+    const { turns, actions } = coordinator()
+    turns.transcript("final", "How do I add a vehicle?", 0)
+    await vi.advanceTimersByTimeAsync(300)
+    const prefixes = [
+      "To add a vehicle in Detrack:\n\n1. ",
+      "In your admin dashboard, open the **Vehicles** tab.\n2. ",
+      "Choose the option to add a vehicle and fill in the vehicle details.\n3. ",
+      "Click **Save** to add it to your account.",
+    ]
+    let text = ""
+    for (const [index, prefix] of prefixes.entries()) {
+      text += prefix
+      turns.reply({ id: "answer", text, complete: index === prefixes.length - 1 })
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    expect(actions.speak.mock.calls.map(([value]) => value.trim())).toEqual([
+      "To add a vehicle in Detrack: In your admin dashboard, open the Vehicles tab.",
+      "Choose the option to add a vehicle and fill in the vehicle details.",
+      "Click Save to add it to your account.",
+    ])
+    turns.stop()
+  })
+
   it("reports one failed sentence and continues with the next without replay", async () => {
     vi.useFakeTimers()
     const { turns, actions } = coordinator()

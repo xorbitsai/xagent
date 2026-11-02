@@ -40,7 +40,12 @@ from ..services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ..services.model_service import _passes_model_visibility_hook
-from ..tracking.standalone_usage import usage_scope
+from ..tracking.standalone_usage import (
+    STANDALONE_USAGE_REFUSED,
+    StandaloneUsageRefused,
+    check_standalone_gate_async,
+    usage_scope,
+)
 from .model import _resolve_accessible_model
 from .websocket_auth import (
     _WebSocketAuthenticationTerminated,
@@ -157,7 +162,11 @@ async def _close_asr_socket(
 
 
 async def _send_asr_error(
-    websocket: WebSocket, code: str, message: str, close_code: int
+    websocket: WebSocket,
+    code: str,
+    message: str,
+    close_code: int,
+    close_reason: str | None = None,
 ) -> None:
     if websocket.application_state is WebSocketState.CONNECTED:
         with suppress(WebSocketDisconnect, RuntimeError, OSError, TimeoutError):
@@ -167,7 +176,9 @@ async def _send_asr_error(
                 ),
                 _TERMINAL_TIMEOUT,
             )
-        await _close_asr_socket(websocket, close_code, message)
+        await _close_asr_socket(
+            websocket, close_code, message if close_reason is None else close_reason
+        )
 
 
 async def _receive_asr_audio(
@@ -298,6 +309,15 @@ async def stream_asr(
             websocket, "invalid_request", "Invalid speech stream request", 1008
         )
         logger.debug("Invalid ASR stream request: %s", type(exc).__name__)
+    except StandaloneUsageRefused as exc:
+        # The gate's message can outgrow a close frame's 123-byte reason.
+        await _send_asr_error(
+            websocket,
+            STANDALONE_USAGE_REFUSED,
+            exc.message,
+            1008,
+            close_reason="Usage limit reached",
+        )
     except HTTPException as exc:
         await _send_asr_error(websocket, "model_unavailable", exc.detail, 1008)
     except Exception as exc:
@@ -369,8 +389,16 @@ class _TTSAudioResponse(StreamingResponse):
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Meter on the request owner, outside the cancellable stream/disconnect
         # race. An EOF-triggered disconnect must not detach the quota hook.
-        async with usage_scope(self.user_id, usage_source="speech_synthesize"):
-            await self._respond(scope, receive, send)
+        try:
+            async with usage_scope(self.user_id, usage_source="speech_synthesize"):
+                await self._respond(scope, receive, send)
+        except StandaloneUsageRefused as exc:
+            # Only entering the scope raises this: _respond turns every failure
+            # into a response of its own. Nothing was sent or opened yet.
+            await _close_model(self.model)
+            await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(
+                scope, receive, send
+            )
 
     async def _respond(self, scope: Scope, receive: Receive, send: Send) -> None:
         started = False
@@ -407,6 +435,10 @@ async def stream_tts(
 ) -> StreamingResponse:
     user_id = int(user.id)
     release_db_connection_if_clean(db)
+    # The metering scope opens once the response is being sent, too late for a
+    # status code; refuse here. The scope checks again, for a gate that turns
+    # in between.
+    await check_standalone_gate_async(user_id, "speech_synthesize")
     config = await run_db_io_cancellation_safe(
         lambda: _load_speech_config(user_id, request.model_id, "tts")
     )

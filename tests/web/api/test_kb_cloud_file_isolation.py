@@ -333,3 +333,37 @@ def test_a_new_collection_whose_only_file_raises_is_cleaned_up(
         is_admin=False,
         delete_orphaned_metadata=True,
     )
+
+
+def test_a_cloud_ingest_refused_by_the_gate_downloads_nothing(
+    test_env, temp_uploads, monkeypatch
+) -> None:
+    from xagent.web.services import quota_hooks
+
+    app, headers, user, _ = test_env
+    _connect_drive(test_env, monkeypatch)
+    gate_calls: list = []
+
+    def gate(user_id: int, source: str) -> str:
+        gate_calls.append((user_id, source))
+        return "Out of AI credits"
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    try:
+        with (
+            patch("xagent.web.api.kb.build") as build,
+            patch("xagent.web.api.kb.run_document_ingestion") as ingest,
+        ):
+            response = TestClient(app).post(
+                "/api/kb/ingest-cloud",
+                json={"collection": "cloud_coll", "files": _drive_files(2)},
+                headers=headers,
+            )
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+
+    assert response.status_code == 402
+    assert response.json()["detail"]["source"] == "kb_ingest_cloud"
+    assert gate_calls == [(int(user.id), "kb_ingest_cloud")]
+    build.assert_not_called()
+    ingest.assert_not_called()

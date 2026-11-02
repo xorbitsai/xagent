@@ -36,7 +36,7 @@ from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
 from ..services.kb_reference_protection import coordinate_ingest_job
-from ..tracking.standalone_usage import usage_scope
+from ..tracking.standalone_usage import StandaloneUsageRefused, usage_scope
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
@@ -248,7 +248,9 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
         )
         return _superseded_staged_document_result(payload)
     except Exception as exc:
-        if int(job.attempts or 0) >= int(job.max_attempts or 1):
+        # A refused job is not retried: the gate would refuse the retry too.
+        refused = isinstance(exc, StandaloneUsageRefused)
+        if refused or int(job.attempts or 0) >= int(job.max_attempts or 1):
             # Last attempt only: a retry re-registers the same doc_id and reuses
             # its parse, chunk and embedding rows.
             _rollback_raised_staged_document_ingestion(db, payload, exc)
@@ -257,6 +259,8 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             payload,
             context="background staged document ingest exception",
         )
+        if refused:
+            raise BackgroundJobHandlerError(str(exc), retryable=False) from exc
         raise
 
     result_payload = result.model_dump(mode="json")
@@ -415,8 +419,10 @@ def handle_kb_ingest_web(db: Session, job: BackgroundJob) -> dict[str, Any]:
                 )
             )
             result = api_result.result
-    except Exception:
+    except Exception as exc:
         _cleanup_failed_web_collection_metadata_if_new(db, payload)
+        if isinstance(exc, StandaloneUsageRefused):
+            raise BackgroundJobHandlerError(str(exc), retryable=False) from exc
         raise
 
     from ..api.kb import _demote_empty_crawl_to_error

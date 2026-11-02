@@ -82,7 +82,11 @@ from ..services.llm_utils import (
 )
 from ..services.model_service import _passes_model_visibility_hook
 from ..services.model_store import ModelSharingConflictError, ModelStore
-from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
+from ..tracking.standalone_usage import (
+    StandaloneUsageRefused,
+    run_in_usage_scope,
+    usage_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1317,6 +1321,8 @@ async def transcribe_speech_input(
                 ),
                 timeout=180.0,
             )
+    except StandaloneUsageRefused:
+        raise
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc
     except Exception as exc:

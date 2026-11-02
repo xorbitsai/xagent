@@ -191,7 +191,11 @@ from ..services.uploaded_file_store import (
     cleanup_superseded_uploaded_file_objects,
     snapshot_uploaded_file_version,
 )
-from ..tracking.standalone_usage import run_in_usage_scope, usage_scope
+from ..tracking.standalone_usage import (
+    check_standalone_gate_async,
+    run_in_usage_scope,
+    usage_scope,
+)
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -3447,6 +3451,9 @@ async def ingest(
         collection_existed_before = False
 
     _enforce_storage_gate(db, actor_user)
+    # Before the upload is written: the scope around the ingestion checks
+    # too, but refusing there means rolling the upload back.
+    await check_standalone_gate_async(int(actor_user.id), "kb_ingest")
 
     existing_file_record = (
         db.query(UploadedFile)
@@ -3793,6 +3800,8 @@ async def create_ingest_job(
 
     await _ensure_collection_access(safe_collection, _user, allow_create=True)
     await _ensure_background_job_queue_available_async()
+    # Before the upload is staged; the job checks again when it runs.
+    await check_standalone_gate_async(int(actor_user.id), "kb_ingest_job")
 
     try:
         get_collection_sync(safe_collection)
@@ -3962,6 +3971,7 @@ async def ingest_cloud(
 ) -> Union[List[IngestionResult], JSONResponse]:
     """Ingest files from cloud storage."""
     _enforce_storage_gate(db, _user)
+    await check_standalone_gate_async(int(_user.id), "kb_ingest_cloud")
 
     try:
         safe_collection = sanitize_path_component(request.collection, "collection")
@@ -5602,6 +5612,8 @@ async def create_ingest_web_job(
             detail = detail.removeprefix("Value error, ")
         raise HTTPException(status_code=422, detail=detail) from exc
     await _ensure_background_job_queue_available_async()
+    # Before the job is queued; the job checks again when it runs.
+    await check_standalone_gate_async(int(actor_user.id), "kb_ingest_web_job")
 
     try:
         get_collection_sync(safe_collection)

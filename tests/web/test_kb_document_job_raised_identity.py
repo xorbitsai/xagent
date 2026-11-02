@@ -563,3 +563,79 @@ def test_web_job_bills_its_submitter_not_the_storage_tenant():
 
     [(user_id, [row], source)] = calls
     assert (user_id, source, row["quantity"]) == (101, "kb_ingest_web_job", 2.0)
+
+
+def test_document_job_refused_by_the_gate_rolls_back_and_is_not_retried(
+    test_env, temp_uploads
+):
+    from xagent.web.jobs import kb_tasks
+    from xagent.web.services import quota_hooks
+
+    job_id = _submit(test_env, b"refused")
+    db = test_env[3]()
+    quota_hooks.set_standalone_gate_hook(lambda _user_id, _source: "Out of AI credits")
+    try:
+        job = db.query(BackgroundJob).filter(BackgroundJob.id == job_id).one()
+        # A first attempt of three: the refusal must not wait for the last one
+        # to clean up, because it is not retried.
+        job.attempts, job.max_attempts = 1, 3
+        db.commit()
+        rollback = kb_tasks._rollback_raised_staged_document_ingestion
+        with (
+            patch(_INGEST) as ingest,
+            patch.object(
+                kb_tasks,
+                "_rollback_raised_staged_document_ingestion",
+                wraps=rollback,
+            ) as rolled_back,
+            pytest.raises(BackgroundJobHandlerError) as failed,
+        ):
+            handle_kb_ingest_document(db, job)
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+        db.close()
+
+    assert str(failed.value) == "Out of AI credits"
+    assert failed.value.retryable is False
+    ingest.assert_not_called()
+    rolled_back.assert_called_once()
+
+
+def test_web_job_refused_by_the_gate_fails_without_a_retry():
+    from xagent.web.jobs import kb_tasks
+    from xagent.web.services import quota_hooks
+
+    job = BackgroundJob(
+        user_id=101,
+        payload={
+            "user_id": 999,
+            "collection": "web_coll",
+            "crawl_config": {"start_url": "https://example.com"},
+            "ingestion_config": {},
+        },
+    )
+    gate_calls: list = []
+
+    def gate(user_id: int, source: str) -> str:
+        gate_calls.append((user_id, source))
+        return "Out of AI credits"
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    try:
+        with (
+            patch.object(kb_tasks, "update_job_progress"),
+            patch.object(
+                kb_tasks, "_cleanup_failed_web_collection_metadata_if_new"
+            ) as cleanup,
+            patch.object(kb_tasks, "run_web_ingestion") as crawl,
+            pytest.raises(BackgroundJobHandlerError) as failed,
+        ):
+            kb_tasks.handle_kb_ingest_web(MagicMock(), job)
+    finally:
+        quota_hooks.set_standalone_gate_hook(None)
+
+    assert gate_calls == [(101, "kb_ingest_web_job")]
+    assert str(failed.value) == "Out of AI credits"
+    assert failed.value.retryable is False
+    crawl.assert_not_called()
+    cleanup.assert_called_once()

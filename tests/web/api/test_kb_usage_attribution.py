@@ -145,3 +145,92 @@ def test_web_ingest_carries_the_scope_into_the_executor_loop(client, hook):
 
     assert threads, "the crawl never ran"
     _assert_billed_to_actor(hook, "kb_ingest_web")
+
+
+@pytest.fixture
+def refusing_gate():
+    calls: list = []
+
+    def gate(user_id: int, source: str) -> str:
+        calls.append((user_id, source))
+        return "Out of AI credits"
+
+    quota_hooks.set_standalone_gate_hook(gate)
+    yield calls
+    quota_hooks.set_standalone_gate_hook(None)
+
+
+def _assert_refused(response: Any, gate_calls: list, source: str) -> None:
+    assert response.status_code == 402
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["source"]) == ("standalone_usage_refused", source)
+    # The member is checked, as the member is billed.
+    assert gate_calls[0] == (ACTOR_ID, source)
+
+
+def test_search_refused_by_the_gate_never_searches(client, hook, refusing_gate):
+    with patch.object(kb_module, "run_document_search") as search:
+        response = client.post(
+            "/api/kb/search",
+            data={"collection": "team-kb", "query_text": "q"},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_search")
+    search.assert_not_called()
+    assert hook == []
+
+
+def test_upload_ingest_refused_by_the_gate_writes_nothing(
+    client, hook, refusing_gate, tmp_path
+):
+    target = tmp_path / "f.txt"
+    with (
+        patch.object(kb_module, "run_document_ingestion_with_outcome") as ingest,
+        patch.object(kb_module, "get_upload_path", return_value=str(target)),
+        patch.object(kb_module, "_upsert_uploaded_file_record") as upsert,
+    ):
+        response = client.post(
+            "/api/kb/ingest",
+            data={"collection": "team-kb"},
+            files={"file": ("notes.txt", b"abc", "text/plain")},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_ingest")
+    assert refusing_gate == [(ACTOR_ID, "kb_ingest")]
+    ingest.assert_not_called()
+    upsert.assert_not_called()
+    assert not target.exists()
+
+
+def test_ingest_job_refused_by_the_gate_is_never_queued(
+    client, refusing_gate, tmp_path
+):
+    with (
+        patch.object(
+            kb_module, "get_upload_path", return_value=str(tmp_path / "f.txt")
+        ),
+        patch.object(
+            kb_module, "_ensure_background_job_queue_available_async", new=AsyncMock()
+        ),
+        patch.object(kb_module, "_enqueue_background_job_or_503_async") as enqueue,
+    ):
+        response = client.post(
+            "/api/kb/ingest/jobs",
+            data={"collection": "team-kb"},
+            files={"file": ("notes.txt", b"abc", "text/plain")},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_ingest_job")
+    enqueue.assert_not_called()
+
+
+def test_web_ingest_refused_by_the_gate_never_crawls(client, hook, refusing_gate):
+    with patch.object(kb_module, "run_web_ingestion_with_outcome") as crawl:
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={"collection": "team-kb", "start_url": "https://example.com"},
+        )
+
+    _assert_refused(response, refusing_gate, "kb_ingest_web")
+    crawl.assert_not_called()
+    assert hook == []

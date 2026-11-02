@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from contextvars import copy_context
 from typing import Any
 
@@ -15,6 +16,9 @@ from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
 from ..xinference_speech import audio_headers, audio_model_url
 from .base import ASRStreamEvent, ASRStreamSession
+
+_IO_TIMEOUT = 10.0
+_CLOSE_TIMEOUT = 1.0
 
 
 class XinferenceASRStream(ASRStreamSession):
@@ -32,7 +36,10 @@ class XinferenceASRStream(ASRStreamSession):
     def _data(message: aiohttp.WSMessage) -> dict[str, Any]:
         if message.type != aiohttp.WSMsgType.TEXT:
             raise RuntimeError("Xinference transcription connection ended")
-        data = json.loads(message.data)
+        try:
+            data = json.loads(message.data)
+        except ValueError as exc:
+            raise RuntimeError("Invalid Xinference transcription event") from exc
         if not isinstance(data, dict) or data.get("event") == "error":
             raise RuntimeError("Xinference transcription failed")
         return data
@@ -44,29 +51,35 @@ class XinferenceASRStream(ASRStreamSession):
         )
         socket = None
         try:
-            socket = await client.ws_connect(
-                audio_model_url(provider, "realtime"),
-                headers=audio_headers(provider),
-                heartbeat=20,
-                timeout=aiohttp.ClientWSTimeout(ws_close=1),
-                max_msg_size=2 * 1024**2,
+            socket = await asyncio.wait_for(
+                client.ws_connect(
+                    audio_model_url(provider, "realtime"),
+                    headers=audio_headers(provider),
+                    heartbeat=20,
+                    timeout=aiohttp.ClientWSTimeout(ws_close=1),
+                    max_msg_size=2 * 1024**2,
+                ),
+                _IO_TIMEOUT,
             )
-            await socket.send_json(
-                {
-                    "event": "session.start",
-                    "protocol_version": 1,
-                    "task": "audio.transcription",
-                    "input": {
-                        "audio": {
-                            "encoding": "pcm_s16le",
-                            "sample_rate": 16000,
-                            "channels": 1,
-                        }
-                    },
-                    "parameters": {"language": language or "en"},
-                }
+            await asyncio.wait_for(
+                socket.send_json(
+                    {
+                        "event": "session.start",
+                        "protocol_version": 1,
+                        "task": "audio.transcription",
+                        "input": {
+                            "audio": {
+                                "encoding": "pcm_s16le",
+                                "sample_rate": 16000,
+                                "channels": 1,
+                            }
+                        },
+                        "parameters": {"language": language or "en"},
+                    }
+                ),
+                _IO_TIMEOUT,
             )
-            data = cls._data(await asyncio.wait_for(socket.receive(), 10))
+            data = cls._data(await asyncio.wait_for(socket.receive(), _IO_TIMEOUT))
             session_id = data.get("session_id")
             if data.get("event") != "session.started" or not isinstance(
                 session_id, str
@@ -76,7 +89,8 @@ class XinferenceASRStream(ASRStreamSession):
         except BaseException:
             try:
                 if socket is not None:
-                    await socket.close()
+                    with suppress(Exception):
+                        await asyncio.wait_for(socket.close(), _CLOSE_TIMEOUT)
             finally:
                 await client.close()
             raise
@@ -84,11 +98,15 @@ class XinferenceASRStream(ASRStreamSession):
     async def send_audio(self, audio: bytes) -> None:
         if not isinstance(audio, bytes) or len(audio) % 2 or len(audio) > 65536:
             raise ValueError("Expected at most 64 KiB of aligned mono PCM16 audio")
-        async with self._send_lock:
-            if self._closed:
-                raise RuntimeError("ASR stream is closed")
-            await self._socket.send_bytes(audio)
-            self._audio_bytes += len(audio)
+        try:
+            async with self._send_lock:
+                if self._closed:
+                    raise RuntimeError("ASR stream is closed")
+                await asyncio.wait_for(self._socket.send_bytes(audio), _IO_TIMEOUT)
+                self._audio_bytes += len(audio)
+        except BaseException:
+            await self.aclose()
+            raise
 
     async def commit(self) -> None:
         raise ValueError("Xinference server VAD owns segment commits")
@@ -120,6 +138,8 @@ class XinferenceASRStream(ASRStreamSession):
                     raise RuntimeError("Invalid Xinference transcript sequence")
                 seq = current
                 data = event.get("data", {})
+                if not isinstance(data, dict):
+                    raise RuntimeError("Invalid Xinference transcript snapshot")
                 committed = data.get("sentences")
                 next_partial = data.get("partial")
                 if not isinstance(committed, list) or not isinstance(next_partial, str):
@@ -167,9 +187,14 @@ class XinferenceASRStream(ASRStreamSession):
         try:
             try:
                 if not self._socket.closed:
-                    await self._socket.send_json({"event": "session.cancel"})
+                    with suppress(Exception):
+                        await asyncio.wait_for(
+                            self._socket.send_json({"event": "session.cancel"}),
+                            _CLOSE_TIMEOUT,
+                        )
             finally:
-                await self._socket.close()
+                with suppress(Exception):
+                    await asyncio.wait_for(self._socket.close(), _CLOSE_TIMEOUT)
         finally:
             try:
                 await self._client.close()

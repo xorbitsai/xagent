@@ -63,17 +63,18 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
         self.language = language
         self.format = format
         self.sample_rate = sample_rate
-        self._stream_capabilities: dict[str, Any] = {}
+        self._stream_capabilities: dict[str, Any] | None = None
         self._stream_clients: set[Any] = set()
         self._stream_generation = 0
 
     @property
     def supports_streaming(self) -> bool:
-        return self._stream_capabilities.get("streaming") is True
+        return (self._stream_capabilities or {}).get("streaming") is True
 
     async def get_streaming_capabilities(self) -> dict[str, Any]:
-        info = await fetch_audio_capabilities(self)
-        self._stream_capabilities = info.get("tts", {})
+        if self._stream_capabilities is None:
+            info = await fetch_audio_capabilities(self)
+            self._stream_capabilities = info.get("tts", {})
         return self._stream_capabilities
 
     async def list_available_voices(self) -> list[dict[str, Any]]:
@@ -119,9 +120,24 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
             raise ValueError("Speech text must contain 1..5000 characters")
         if kwargs:
             raise ValueError("Unsupported Xinference streaming speech options")
-        final_language = language or self.language
-        if final_language == "en":
-            final_language = "English"
+        languages = {
+            "en": "English",
+            "zh": "Chinese",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "de": "German",
+            "fr": "French",
+            "ru": "Russian",
+            "pt": "Portuguese",
+            "es": "Spanish",
+            "it": "Italian",
+        }
+        configured_language = (language or self.language or "").strip().lower()
+        final_language = languages.get(
+            configured_language.replace("_", "-").split("-")[0]
+        )
+        if configured_language in {name.lower() for name in languages.values()}:
+            final_language = configured_language.capitalize()
         body: dict[str, Any] = {
             "model": self._model_uid,
             "input": text,
@@ -301,13 +317,14 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
     def abilities(self) -> list[str]:
         """Get the list of abilities supported by this model."""
         abilities = [
-            "voice_listing",
             "tts",
             "text_to_speech",
             "audio",
             "audio_generation",
             "real_time",  # Supports real-time synthesis
         ]
+        if (self._stream_capabilities or {}).get("voices"):
+            abilities.append("voice_listing")
 
         # Add multilingual support
         # Most Xinference TTS models support multiple languages

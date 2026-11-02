@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 from urllib.parse import quote
@@ -31,12 +32,18 @@ async def fetch_audio_capabilities(provider: Any) -> dict[str, Any]:
             if response.status in {404, 405}:
                 return {}
             response.raise_for_status()
-            data = await response.content.read(65537)
+            try:
+                data = await response.content.readexactly(65537)
+            except asyncio.IncompleteReadError as exc:
+                data = exc.partial
             if len(data) > 65536:
                 raise RuntimeError(
                     "Xinference audio capabilities exceeded the size limit"
                 )
-            result = json.loads(data)
+            try:
+                result = json.loads(data)
+            except (ValueError, UnicodeError) as exc:
+                raise RuntimeError("Invalid Xinference audio capabilities") from exc
             if not isinstance(result, dict):
                 raise RuntimeError("Invalid Xinference audio capabilities")
             if any(

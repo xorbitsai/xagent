@@ -156,8 +156,8 @@ partial/final segments in Xagent. Manual commits are unsupported because
 Xinference's `input.end` terminates a session. Closing the Xagent connection
 cancels the upstream session.
 
-Streaming CustomVoice synthesis uses mono PCM16 at 24 kHz. Set the saved TTS
-format to `pcm` and sample rate to `24000`; voice settings list the actual preset
+Streaming CustomVoice synthesis uses mono PCM16 at 24 kHz, requested by voice
+mode per sentence. Voice settings list the actual preset
 voice IDs returned by the loaded model. Audio is forwarded as it arrives, and
 interrupting playback closes the upstream response. Private or SSH-forwarded
 model endpoints must be listed in `XAGENT_MODEL_PRIVATE_ENDPOINTS` with matching

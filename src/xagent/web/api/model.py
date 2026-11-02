@@ -1249,6 +1249,7 @@ async def list_speech_voices(
         ) from None
     try:
         release_db_connection_if_clean(db)
+        await model.get_streaming_capabilities()
         if not model.supports_voice_listing:
             raise HTTPException(
                 status_code=400, detail="Voice listing is not supported"

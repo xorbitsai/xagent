@@ -18,7 +18,7 @@ const asr = model()
 const tts = model({ id: 2, model_id: "speaker", model_name: "eleven_v3", abilities: ["tts"] })
 const response = (models: ModelWithAccess[]) => new Response(JSON.stringify(models), { status: 200 })
 beforeEach(() => { request.mockReset(); auth.token = "token-a"; auth.session.sessionId = "login-a" })
-afterEach(() => { vi.clearAllMocks() })
+afterEach(() => { vi.clearAllMocks(); vi.restoreAllMocks() })
 
 describe("voice model requirements", () => {
   it("requires active streaming ASR/server VAD and TTS, including accessible shared models", () => {
@@ -98,5 +98,79 @@ it("requires both streaming and server VAD from Xinference", async () => {
   const view = renderHook(() => useVoiceModels(true))
   await waitFor(() => expect(view.result.current.loading).toBe(false))
   expect(view.result.current.asr).toEqual([])
+  view.unmount()
+})
+
+it("enables Xinference ASR and TTS after positive capability probes", async () => {
+  const live = model({ model_id: "gpu-asr", model_provider: "xinference" })
+  const speaker = model({ ...tts, model_id: "gpu-tts", model_provider: "xinference" })
+  request.mockImplementation(async (url: string) => url.includes("/capabilities")
+    ? new Response(JSON.stringify({ streaming: true, server_vad: true }), { status: 200 })
+    : response([live, speaker]))
+  const view = renderHook(() => useVoiceModels(true))
+  await waitFor(() => expect(view.result.current.loading).toBe(false))
+  expect(view.result.current.asr).toMatchObject([live])
+  expect(view.result.current.tts).toMatchObject([speaker])
+  expect(voiceModelReason(view.result.current)).toBeUndefined()
+  view.unmount()
+})
+
+it("publishes available models during a slow probe and deduplicates tab return events", async () => {
+  const live = model({ model_id: "gpu-asr", model_provider: "xinference" })
+  let release!: (value: Response) => void
+  request.mockImplementation((url: string) => url.includes("/capabilities")
+    ? new Promise<Response>(resolve => { release = resolve })
+    : Promise.resolve(response([asr, tts, live])))
+  const view = renderHook(() => useVoiceModels(true))
+  await waitFor(() => expect(view.result.current.tts).toMatchObject([tts]))
+  expect(view.result.current.loading).toBe(false)
+  expect(view.result.current.asr).toMatchObject([asr])
+  act(() => {
+    window.dispatchEvent(new Event("focus"))
+    document.dispatchEvent(new Event("visibilitychange"))
+  })
+  expect(request).toHaveBeenCalledTimes(2)
+  await act(async () => { release(new Response(JSON.stringify({ streaming: true, server_vad: true }))) })
+  await waitFor(() => expect(view.result.current.asr).toMatchObject([asr, live]))
+  expect(request).toHaveBeenCalledTimes(2)
+  view.unmount()
+})
+
+it("caches probes briefly, retains prior capability on failure, and accepts a later negative result", async () => {
+  let now = 1000
+  vi.spyOn(Date, "now").mockImplementation(() => now)
+  const live = model({ model_id: "gpu-asr", model_provider: "xinference" })
+  let status = 200
+  let streaming = true
+  request.mockImplementation(async (url: string) => url.includes("/capabilities")
+    ? new Response(JSON.stringify({ streaming, server_vad: true }), { status })
+    : response([live, tts]))
+  const view = renderHook(() => useVoiceModels(true))
+  await waitFor(() => expect(view.result.current.asr).toMatchObject([live]))
+  act(() => { window.dispatchEvent(new Event("focus")) })
+  await waitFor(() => expect(request).toHaveBeenCalledTimes(3))
+  now += 31000; status = 503
+  await act(async () => { window.dispatchEvent(new Event("focus")) })
+  await waitFor(() => expect(request).toHaveBeenCalledTimes(5))
+  expect(view.result.current.asr).toMatchObject([live])
+  expect(view.result.current.error).toBe(false)
+  status = 200; streaming = false
+  await act(async () => { window.dispatchEvent(new Event("focus")) })
+  await waitFor(() => expect(view.result.current.asr).toEqual([]))
+  expect(voiceModelReason(view.result.current)).toBe("needsAsr")
+  view.unmount()
+})
+
+it("invalidates cached capabilities when the model endpoint changes", async () => {
+  let live = model({ model_id: "gpu-asr", model_provider: "xinference" })
+  request.mockImplementation(async (url: string) => url.includes("/capabilities")
+    ? new Response(JSON.stringify({ streaming: !live.base_url, server_vad: true }))
+    : response([live, tts]))
+  const view = renderHook(() => useVoiceModels(true))
+  await waitFor(() => expect(view.result.current.asr).toMatchObject([live]))
+  live = { ...live, base_url: "https://other.example" }
+  await act(async () => { window.dispatchEvent(new Event("focus")) })
+  await waitFor(() => expect(view.result.current.asr).toEqual([]))
+  expect(request.mock.calls.filter(([url]) => url.includes("/capabilities"))).toHaveLength(2)
   view.unmount()
 })

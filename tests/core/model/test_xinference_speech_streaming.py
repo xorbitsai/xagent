@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import aiohttp
 import pytest
 from aiohttp import web
 
@@ -19,6 +21,11 @@ async def service(monkeypatch):
         audio=[],
         speech=[],
         cancelled=0,
+        probes=0,
+        caps_status=200,
+        caps_body=None,
+        outputs=None,
+        expected_language="English",
         release=asyncio.Event(),
         caps={
             "asr": {"streaming": True, "server_vad": True},
@@ -32,6 +39,9 @@ async def service(monkeypatch):
     )
 
     async def capabilities(request):
+        state.probes += 1
+        if state.caps_status != 200 or state.caps_body is not None:
+            return web.Response(status=state.caps_status, body=state.caps_body)
         return web.json_response(state.caps)
 
     async def realtime(request):
@@ -44,6 +54,10 @@ async def service(monkeypatch):
         async for message in ws:
             if message.type == web.WSMsgType.BINARY:
                 state.audio.append(message.data)
+                if state.outputs is not None:
+                    for output in state.outputs:
+                        await ws.send_json(output)
+                    continue
                 for seq, data in enumerate(
                     [
                         {"sentences": [], "partial": "Hello"},
@@ -73,7 +87,10 @@ async def service(monkeypatch):
     async def speech(request):
         body = await request.json()
         state.speech.append(body)
-        assert json.loads(body["kwargs"]) == {"language": "English"}
+        expected = (
+            {"language": state.expected_language} if state.expected_language else {}
+        )
+        assert json.loads(body.get("kwargs", "{}")) == expected
         response = web.StreamResponse(
             headers={"Content-Type": "application/octet-stream"}
         )
@@ -179,3 +196,164 @@ async def test_tts_rejects_mislabeled_formats_before_request(service):
             await anext(stream)
     assert not service.speech
     await provider.aclose()
+
+
+@pytest.mark.parametrize(
+    "language,expected",
+    [
+        ("en", "English"),
+        ("en-US", "English"),
+        ("zh", "Chinese"),
+        ("zh_CN", "Chinese"),
+        ("ja", "Japanese"),
+        ("ko", "Korean"),
+        ("de", "German"),
+        ("fr", "French"),
+        ("ru", "Russian"),
+        ("pt", "Portuguese"),
+        ("es", "Spanish"),
+        ("it", "Italian"),
+        ("Chinese", "Chinese"),
+        ("auto", None),
+        ("unknown", None),
+    ],
+)
+async def test_tts_normalizes_saved_languages(service, language, expected):
+    service.expected_language = expected
+    service.release.set()
+    provider = XinferenceTTS(base_url=service.url, format="pcm", language=language)
+    assert [chunk async for chunk in provider.synthesize_stream("Hello")]
+    await provider.aclose()
+
+
+async def test_capability_probe_reused_within_each_provider_instance(service):
+    provider = XinferenceASR(base_url=service.url)
+    await provider.get_streaming_capabilities()
+    stream = await provider.open_stream()
+    assert service.probes == 1
+    await stream.aclose()
+    await provider.aclose()
+    speaker = XinferenceTTS(base_url=service.url, language="en", format="pcm")
+    assert not speaker.supports_voice_listing
+    await speaker.get_streaming_capabilities()
+    assert await speaker.list_available_voices()
+    assert speaker.supports_voice_listing
+    service.release.set()
+    assert [chunk async for chunk in speaker.synthesize_stream("Hello")]
+    assert service.probes == 2
+    await speaker.aclose()
+
+
+@pytest.mark.parametrize("status", [404, 405])
+async def test_missing_capabilities_disable_streaming_and_voice_listing(
+    service, status
+):
+    service.caps_status = status
+    provider = XinferenceTTS(base_url=service.url)
+    assert await provider.get_streaming_capabilities() == {}
+    assert await provider.list_available_voices() == []
+    assert not provider.supports_streaming and not provider.supports_voice_listing
+    assert service.probes == 1
+    await provider.aclose()
+
+
+@pytest.mark.parametrize("body", [b"{", b"\xff", b"[]", b'{"asr":[]}', b" " * 65537])
+async def test_malformed_or_oversized_capabilities_are_upstream_errors(service, body):
+    service.caps_body = body
+    provider = XinferenceTTS(base_url=service.url)
+    with pytest.raises(RuntimeError, match="capabilities"):
+        await provider.get_streaming_capabilities()
+    assert provider._stream_capabilities is None
+    await provider.aclose()
+
+
+async def test_failed_capability_probe_is_not_cached(service):
+    provider = XinferenceASR(base_url=service.url)
+    service.caps_status = 503
+    with pytest.raises(aiohttp.ClientResponseError):
+        await provider.get_streaming_capabilities()
+    service.caps_status = 200
+    assert (await provider.get_streaming_capabilities())["streaming"]
+    assert service.probes == 2
+    await provider.aclose()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"event": "error", "message": "provider-secret"},
+        {"event": "output", "seq": 0, "session_id": "session-1"},
+        {"event": "output", "seq": True, "session_id": "session-1"},
+        {"event": "output", "seq": 2, "session_id": "other"},
+        {"event": "output", "seq": 1, "session_id": "session-1"},
+    ],
+)
+async def test_asr_rejects_upstream_error_or_invalid_sequence_and_session(
+    service, invalid
+):
+    data = {"sentences": [], "partial": "Hello"}
+    service.outputs = [
+        {"event": "output", "seq": 1, "session_id": "session-1", "data": data},
+        {**invalid, "data": data},
+    ]
+    provider = XinferenceASR(base_url=service.url)
+    stream = await provider.open_stream()
+    await stream.send_audio(b"\x00\x00")
+    with pytest.raises(RuntimeError) as exc:
+        async for _ in stream:
+            pass
+    assert "provider-secret" not in str(exc.value)
+    assert not provider._streams and service.cancelled == 1
+    await provider.aclose()
+
+
+@pytest.mark.parametrize("phase", ["connect", "start", "send", "cancel"])
+async def test_asr_transport_deadlines_close_owned_resources(monkeypatch, phase):
+    from xagent.core.model.asr import xinference_stream as module
+
+    async def blocked(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    socket = SimpleNamespace(
+        closed=False,
+        close=AsyncMock(),
+        send_json=AsyncMock(),
+        send_bytes=AsyncMock(),
+        receive=AsyncMock(
+            return_value=aiohttp.WSMessage(
+                aiohttp.WSMsgType.TEXT,
+                json.dumps({"event": "session.started", "session_id": "session-1"}),
+                "",
+            )
+        ),
+    )
+    client = SimpleNamespace(
+        close=AsyncMock(), ws_connect=AsyncMock(return_value=socket)
+    )
+    monkeypatch.setattr(
+        module, "create_public_model_aiohttp_session", lambda **_: client
+    )
+    monkeypatch.setattr(module, "_IO_TIMEOUT", 0.01)
+    monkeypatch.setattr(module, "_CLOSE_TIMEOUT", 0.01)
+    provider = XinferenceASR()
+    if phase == "connect":
+        client.ws_connect.side_effect = blocked
+    if phase == "start":
+        socket.send_json.side_effect = blocked
+    if phase in {"connect", "start"}:
+        with pytest.raises(TimeoutError):
+            await module.XinferenceASRStream.connect(provider, "en")
+    else:
+        stream = await module.XinferenceASRStream.connect(provider, "en")
+        provider._streams.add(stream)
+        if phase == "send":
+            socket.send_bytes.side_effect = blocked
+            with pytest.raises(TimeoutError):
+                await stream.send_audio(b"\x00\x00")
+        else:
+            socket.send_json.side_effect = blocked
+            await asyncio.wait_for(stream.aclose(), 0.5)
+        assert not provider._streams
+    client.close.assert_awaited_once()
+    if phase != "connect":
+        socket.close.assert_awaited_once()

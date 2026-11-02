@@ -55,20 +55,21 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
         BaseXinferenceModel.__init__(self, model, model_uid, base_url, api_key)
         self.language = language
         self._streams: set[XinferenceASRStream] = set()
-        self._stream_capabilities: dict[str, Any] = {}
+        self._stream_capabilities: dict[str, Any] | None = None
         self._stream_generation = 0
 
     @property
     def supports_streaming(self) -> bool:
-        return self._stream_capabilities.get("streaming") is True
+        return (self._stream_capabilities or {}).get("streaming") is True
 
     @property
     def supports_vad(self) -> bool:
-        return self._stream_capabilities.get("server_vad") is True
+        return (self._stream_capabilities or {}).get("server_vad") is True
 
     async def get_streaming_capabilities(self) -> dict[str, Any]:
-        info = await fetch_audio_capabilities(self)
-        self._stream_capabilities = info.get("asr", {})
+        if self._stream_capabilities is None:
+            info = await fetch_audio_capabilities(self)
+            self._stream_capabilities = info.get("asr", {})
         return self._stream_capabilities
 
     async def open_stream(

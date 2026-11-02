@@ -2245,6 +2245,7 @@ const zh = {
       selectProfile: "选择对应的模型画像",
       duplicateProfile: "每个路由模型画像只能映射一次。",
       unknownProfile: "模型画像 {profile} 已不可用，请先重新选择画像再保存。",
+      profileModalityMismatch: "模型画像 {profile} 的图片、音频或视频输入与该模型的能力不一致。请选择匹配的画像，或先修改模型能力，再保存。",
       moveUp: "上移候选",
       moveDown: "下移候选",
       fallback: "兜底模型",

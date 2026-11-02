@@ -34,6 +34,10 @@ class AutoModelConfigurationError(ValueError):
     """Raised when an Auto model configuration is invalid."""
 
 
+class UnknownAutoProfileError(AutoModelConfigurationError):
+    """Raised when a profile id is not in the installed xrouter-llm catalog."""
+
+
 class AutoModelDependencyError(RuntimeError):
     """Raised when the installed xrouter package cannot provide profiles."""
 
@@ -67,9 +71,16 @@ def list_router_profiles() -> list[dict[str, Any]]:
 def validate_candidate_modalities(
     catalog: Any, profile_id: str, abilities: Iterable[str]
 ) -> None:
-    """A profile must describe the saved endpoint's declared input capabilities."""
+    """A profile must describe the saved endpoint's declared input capabilities.
+
+    A profile missing from ``catalog`` raises ``UnknownAutoProfileError``, so a
+    caller can treat a binding left behind by a catalog change differently from
+    one whose profile and abilities disagree.
+    """
     if profile_id not in catalog.known_model_ids():
-        raise AutoModelConfigurationError(f"Unknown Auto profile {profile_id!r}")
+        raise UnknownAutoProfileError(
+            f"Auto profile {profile_id!r} is not in the installed xrouter-llm catalog"
+        )
     profile = catalog.get(profile_id)
     modality_abilities = {"image": "vision", "audio": "audio", "video": "video"}
     profile_modalities = set(profile.input_modalities) & modality_abilities.keys()
@@ -106,6 +117,9 @@ class AutoModelService:
         self, *, user_id: int, request: AutoModelConfigUpdate
     ) -> AutoModelConfig:
         catalog = load_router_profile_catalog()
+        # Sequential failover never calls validate_candidate_modalities, yet
+        # saving rejects unknown profiles in both modes; checking them here
+        # also names every unknown profile in one error.
         known_profile_ids = set(catalog.known_model_ids())
         requested_profile_ids = {
             candidate.routing_model_id for candidate in request.candidates

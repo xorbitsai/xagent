@@ -298,12 +298,28 @@ export function AutoModelConfigCard({
   }, [bindings, mode]);
 
   // A saved binding can name a profile that a newer xrouter-llm release
-  // dropped. The select cannot show it, so mark the row and block saving
-  // until it is rebound instead of letting the server reject the whole form.
-  const knownProfileIds = useMemo(
-    () => new Set(profiles.map((profile) => profile.id)),
+  // dropped, or, in routing mode, one whose image, audio or video inputs no
+  // longer match the model's abilities. Mark the row and block saving until
+  // it is fixed instead of letting the server reject the whole form.
+  const profilesById = useMemo(
+    () => new Map(profiles.map((profile) => [profile.id, profile])),
     [profiles],
   );
+
+  // Saving rejects an unknown profile in both modes but compares modalities
+  // only in routing mode, so only routing marks a mismatch.
+  const bindingIssue = (
+    model: Model,
+  ): "unknownProfile" | "modalityMismatch" | null => {
+    const binding = bindings[String(model.id)];
+    if (!binding) return null;
+    const profile = profilesById.get(binding);
+    if (!profile) return "unknownProfile";
+    if (mode === "routing" && !modalitiesMatch(model, profile)) {
+      return "modalityMismatch";
+    }
+    return null;
+  };
 
   const moveCandidate = (index: number, offset: -1 | 1) => {
     setSelectedIds((current) => {
@@ -317,8 +333,9 @@ export function AutoModelConfigCard({
 
   const canSave =
     selectedModels.length > 0 &&
-    selectedModels.every((model) =>
-      knownProfileIds.has(bindings[String(model.id)]),
+    selectedModels.every(
+      (model) =>
+        Boolean(bindings[String(model.id)]) && bindingIssue(model) === null,
     ) &&
     duplicateProfiles.size === 0 &&
     (mode === "sequential_failover" || Boolean(fallbackId));
@@ -494,8 +511,7 @@ export function AutoModelConfigCard({
                 <Label>{t("models.auto.profileBindings")}</Label>
                 {selectedModels.map((model, index) => {
                   const binding = bindings[String(model.id)] || "";
-                  const unknownProfile =
-                    Boolean(binding) && !knownProfileIds.has(binding);
+                  const issue = bindingIssue(model);
                   return (
                     <div
                       key={model.id}
@@ -550,7 +566,7 @@ export function AutoModelConfigCard({
                         <SelectTrigger
                           className={cn(
                             (duplicateProfiles.has(binding) ||
-                              unknownProfile) &&
+                              issue !== null) &&
                               "border-destructive",
                           )}
                         >
@@ -566,9 +582,16 @@ export function AutoModelConfigCard({
                           ))}
                         </SelectContent>
                       </Select>
-                      {unknownProfile && (
+                      {issue === "unknownProfile" && (
                         <p className="text-xs text-destructive md:col-start-2">
                           {t("models.auto.unknownProfile", {
+                            profile: binding,
+                          })}
+                        </p>
+                      )}
+                      {issue === "modalityMismatch" && (
+                        <p className="text-xs text-destructive md:col-start-2">
+                          {t("models.auto.profileModalityMismatch", {
                             profile: binding,
                           })}
                         </p>

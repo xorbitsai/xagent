@@ -815,13 +815,11 @@ class UserAwareModelStorage:
         # catalog. Sequential candidates carry their target's own modalities,
         # so only routing needs each profile to describe its bound endpoint.
         catalog: Any = None
-        known_profile_ids: set[str] = set()
         if mode == "routing":
             try:
                 catalog = load_router_profile_catalog()
             except AutoModelDependencyError as exc:
                 raise AutoModelUnavailableError(str(exc)) from exc
-            known_profile_ids = set(catalog.known_model_ids())
         targets_by_candidate: dict[str, ChatModelConfig] = {}
         profiles_by_candidate: dict[str, str] = {}
         modalities_by_candidate: dict[str, list[str]] = {}
@@ -842,19 +840,6 @@ class UserAwareModelStorage:
                     candidate.routing_model_id,
                 )
                 continue
-            # A profile can leave the catalog when xrouter-llm is upgraded.
-            # Saving rejects unknown profiles, so this only skips bindings
-            # saved against an older catalog until they are rebound.
-            if (
-                catalog is not None
-                and candidate.routing_model_id not in known_profile_ids
-            ):
-                logger.warning(
-                    "Skipping Auto candidate %r: profile is not in the installed "
-                    "xrouter-llm catalog",
-                    candidate.routing_model_id,
-                )
-                continue
             target_cfg = self.core_storage._db_model_to_config(target)
             if not isinstance(target_cfg, ChatModelConfig):
                 logger.warning(
@@ -862,6 +847,26 @@ class UserAwareModelStorage:
                     candidate.routing_model_id,
                 )
                 continue
+            if catalog is not None:
+                # The installed catalog need not be the one this binding was
+                # saved against: an xrouter-llm upgrade or downgrade can drop
+                # its profile or change the profile's input modalities, and
+                # the target's abilities can change while the profile is
+                # missing. Saving rejects such a binding; here it only takes
+                # this candidate out of routing so the others stay usable.
+                try:
+                    validate_candidate_modalities(
+                        catalog,
+                        str(candidate.routing_model_id),
+                        target_cfg.abilities or [],
+                    )
+                except AutoModelConfigurationError as exc:
+                    logger.warning(
+                        "Skipping Auto candidate %r: %s",
+                        candidate.routing_model_id,
+                        exc,
+                    )
+                    continue
             candidate_id = (
                 f"candidate:{candidate.id}"
                 if mode == "sequential_failover"
@@ -888,17 +893,6 @@ class UserAwareModelStorage:
             raise AutoModelUnavailableError(
                 "Auto model has no active configured candidates"
             )
-
-        if catalog is not None:
-            try:
-                for candidate_id, target_cfg in targets_by_candidate.items():
-                    validate_candidate_modalities(
-                        catalog,
-                        profiles_by_candidate[candidate_id],
-                        target_cfg.abilities or [],
-                    )
-            except AutoModelConfigurationError as exc:
-                raise AutoModelUnavailableError(str(exc)) from exc
 
         candidate_ids = list(targets_by_candidate)
         configured = router_cfg.model_copy(

@@ -93,6 +93,36 @@ def test_update_rejects_docker_management_fields_without_changing_server() -> No
         db.close()
 
 
+def test_update_accepts_editable_config_after_response_metadata_is_projected_out() -> None:
+    headers = _admin_headers()
+    created = client.post(
+        "/api/mcp/servers",
+        headers=headers,
+        json={
+            "name": "editable-remote",
+            "transport": "sse",
+            "config": {"url": "https://mcp.example.test/sse"},
+        },
+    )
+    assert created.status_code == 201, created.text
+    server_id = created.json()["id"]
+
+    response = client.put(
+        f"/api/mcp/servers/{server_id}",
+        headers=headers,
+        json={"config": {"url": "https://rotated.example.test/sse"}},
+    )
+
+    assert response.status_code == 200, response.text
+    db = _direct_db_session()
+    try:
+        server = db.query(MCPServer).filter(MCPServer.id == server_id).one()
+        assert server.managed == "external"
+        assert server.url == "https://rotated.example.test/sse"
+    finally:
+        db.close()
+
+
 def test_internal_logs_never_initialize_docker_manager(monkeypatch) -> None:
     headers = _admin_headers()
 

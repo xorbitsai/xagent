@@ -175,7 +175,7 @@ def test_editing_legacy_internal_row_drops_trusted_docker_fields() -> None:
         assert server.url == "https://converted.example.test/sse"
         assert server.docker_url is None
         assert server.docker_image is None
-        assert server.auto_start is False
+        assert server.auto_start is None
     finally:
         db.close()
 

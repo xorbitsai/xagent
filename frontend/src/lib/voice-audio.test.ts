@@ -271,3 +271,12 @@ describe("browser voice resources", () => {
     call.close()
   })
 })
+
+it.each([undefined, 0.5])("only submits an explicitly supported VAD timing override (%s)", async threshold => {
+  const call = new VoiceAudio({ ...options(), vadSilenceThreshold: threshold })
+  const socket = await start(call)
+  const payload = JSON.parse(socket.send.mock.calls[0][0])
+  expect(payload.vad_silence_threshold_secs).toBe(threshold)
+  if (threshold === undefined) expect(payload).not.toHaveProperty("vad_silence_threshold_secs")
+  call.close()
+})

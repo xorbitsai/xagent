@@ -796,6 +796,7 @@ def test_speech_voice_listing_uses_accessible_model_and_closes_client(
     provider = SimpleNamespace(
         api_key="synthetic-secret",
         supports_voice_listing=True,
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
         list_available_voices=AsyncMock(
             return_value=[
                 {"voice_id": "voice-one", "name": "Rachel", "extra": "private metadata"}
@@ -873,6 +874,7 @@ def test_speech_voice_listing_capability_and_output_boundaries(
             db.commit()
     provider = SimpleNamespace(
         supports_voice_listing=case != "unsupported",
+        get_streaming_capabilities=AsyncMock(return_value={"streaming": True}),
         list_available_voices=AsyncMock(
             return_value=[
                 {"voice_id": "safe-voice", "name": "Rachel"},

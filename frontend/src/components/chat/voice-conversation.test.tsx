@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const calls = vi.hoisted(() => [] as Array<{
-  options: { activity: (active: boolean) => void; transcript: (type: "partial" | "final", text: string, id: number) => void; error: (reason?: "session_timeout" | "authentication_required") => void }
+  options: { vadSilenceThreshold?: number; activity: (active: boolean) => void; transcript: (type: "partial" | "final", text: string, id: number) => void; error: (reason?: "session_timeout" | "authentication_required") => void }
   close: ReturnType<typeof vi.fn>; stopAudio: ReturnType<typeof vi.fn>; speak: ReturnType<typeof vi.fn>
 }>)
 const auth = vi.hoisted(() => ({ token: "user-token", user: { id: 1 }, session: { sessionId: "login-1" } }))
@@ -31,6 +31,7 @@ vi.mock("@/lib/api-wrapper", async importOriginal => ({
 
 import { VoiceConversation } from "./voice-conversation"
 import { VoiceAudioError } from "@/lib/voice-audio"
+import { apiRequest } from "@/lib/api-wrapper"
 
 function Call(props: Omit<React.ComponentProps<typeof VoiceConversation>, "open" | "onOpenChange">) {
   const [open, setOpen] = React.useState(true)
@@ -40,6 +41,18 @@ function Call(props: Omit<React.ComponentProps<typeof VoiceConversation>, "open"
 afterEach(() => { cleanup(); calls.length = 0; preferences.asr_model_id = "live"; vi.clearAllMocks() })
 
 describe("voice conversation call lifecycle", () => {
+  it("omits ElevenLabs VAD timing for a selected Xinference ASR", async () => {
+    vi.mocked(apiRequest).mockResolvedValueOnce(new Response(JSON.stringify([
+      { id: 1, model_id: "live", model_name: "gpu-asr", model_provider: "xinference", abilities: ["asr"] },
+      { id: 3, model_id: "speaker", model_name: "eleven_flash_v2_5", model_provider: "elevenlabs", abilities: ["tts"] },
+    ].map(model => ({ category: "speech", base_url: null, temperature: null, context_window: null, dimension: null, description: null, created_at: null, updated_at: null, is_active: true, is_owner: true, can_edit: true, can_delete: true, is_shared: false, ...model })))))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ streaming: true, server_vad: true })))
+    render(<Call taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
+    fireEvent.click(screen.getByRole("button", { name: "voiceConversation.start" }))
+    await waitFor(() => expect(calls).toHaveLength(1))
+    expect(calls[0].options.vadSilenceThreshold).toBeUndefined()
+  })
   it("shows the ASR session deadline without blaming microphone configuration", async () => {
     render(<Call taskId={42} messages={[]} busy={false} waiting={false} disabled={false} onSend={vi.fn()} onInterrupt={vi.fn()} />)
     await waitFor(() => expect(screen.getByRole("button", { name: "voiceConversation.start" })).toBeEnabled())
@@ -84,6 +97,7 @@ describe("voice conversation call lifecycle", () => {
     await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("voiceConversation.states.listening"))
     const call = calls[0]
     expect(call.options).toMatchObject({ asr: "live", tts: "speaker", voice: "saved-voice" })
+    expect(call.options.vadSilenceThreshold).toBe(0.5)
     await act(async () => {
       call.options.activity(true)
       call.options.transcript("final", "Hello there.", 0)

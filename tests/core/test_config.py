@@ -85,8 +85,8 @@ from xagent.config import (
     SANDBOX_IMAGE,
     SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
-    SANDBOX_NETWORK,
     SANDBOX_NAMESPACE,
+    SANDBOX_NETWORK,
     SANDBOX_SWEEP_INTERVAL,
     SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
@@ -199,8 +199,8 @@ from xagent.config import (
     get_sandbox_image,
     get_sandbox_max_containers,
     get_sandbox_memory,
-    get_sandbox_network,
     get_sandbox_namespace,
+    get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_slack_app_token,
@@ -235,8 +235,8 @@ from xagent.config import (
     get_web_search_provider,
     get_xrouter_excluded_models,
     in_sandbox_tool_runner,
-    validate_sandbox_network,
     validate_sandbox_namespace,
+    validate_sandbox_network,
 )
 
 

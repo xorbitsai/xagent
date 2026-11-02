@@ -35,12 +35,12 @@ from docker import errors, from_env
 
 from ..config import (
     get_sandbox_image,
-    get_sandbox_network,
     get_sandbox_namespace,
+    get_sandbox_network,
     get_sandbox_pids_limit,
     get_uploads_dir,
-    validate_sandbox_network,
     validate_sandbox_namespace,
+    validate_sandbox_network,
 )
 from .base import (
     SANDBOX_RUNTIME_GID,

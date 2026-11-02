@@ -2030,11 +2030,11 @@ def zendesk_reply_to_side_conversation(
     ticket_id: int | str,
     side_conversation_id: str,
     body: str,
-    to: list[dict[str, Any]] | None = None,
+    to: list[dict[str, Any]],
 ) -> str:
     """
     Reply to a side conversation: Zendesk emails the reply at once, and it
-    can't be recalled. Confirm the body (and any recipients) with the user
+    can't be recalled. Confirm the body and the recipients with the user
     before calling. Returns the side conversation and the reply as sent.
     Needs the same access as zendesk_create_side_conversation.
     ticket_id: a bare numeric id, or a full ticket URL copied from the
@@ -2042,18 +2042,19 @@ def zendesk_reply_to_side_conversation(
     side_conversation_id: the `id` from zendesk_list_side_conversations (a
     UUID string, not a number).
     body: the plain-text reply.
-    to: optional recipients, in zendesk_create_side_conversation's `to`
-    format. Zendesk may require it; if a reply without `to` is refused,
-    pass the recipients.
+    to: required. The recipients, in zendesk_create_side_conversation's `to`
+    format. Usually the other participants listed by
+    zendesk_get_side_conversation; confirm them with the user.
     """
     try:
         ticket_path_id = _resolve_path_id(
             ticket_id, _TICKET_URL_ID_PATTERN, "ticket_id"
         )
         conversation_path_id = url_path_id(side_conversation_id, "side_conversation_id")
-        message: dict[str, Any] = {"body": _require_non_blank(body, "body")}
-        if to is not None:
-            message["to"] = _validated_participants(to)
+        message = {
+            "body": _require_non_blank(body, "body"),
+            "to": _validated_participants(to),
+        }
         try:
             result = _request(
                 "POST",

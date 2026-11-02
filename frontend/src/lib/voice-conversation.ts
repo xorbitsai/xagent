@@ -8,9 +8,9 @@ export function speechText(value: string): string {
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/https?:\/\/\S+/g, " ")
-    // Remove list numbering before whitespace flattening and sentence splitting.
-    .replace(/^[ \t]*\d+[.)][ \t]+/gm, "")
     .replace(/[*_`#>|]/g, "")
+    // Strip markdown before list markers, keeping the original line boundaries.
+    .replace(/^[ \t]*\d+[.)][ \t]+/gm, "")
     .replace(/\[|\]/g, "")
     .replace(/\s+/g, " ").trim()
 }

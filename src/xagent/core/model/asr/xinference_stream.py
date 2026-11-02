@@ -14,7 +14,7 @@ import aiohttp
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
-from ..xinference_speech import audio_headers, audio_model_url
+from ..xinference_speech import audio_headers, audio_language, audio_model_url
 from .base import ASRStreamEvent, ASRStreamSession
 
 _IO_TIMEOUT = 10.0
@@ -74,7 +74,7 @@ class XinferenceASRStream(ASRStreamSession):
                                 "channels": 1,
                             }
                         },
-                        "parameters": {"language": language or "en"},
+                        "parameters": {"language": audio_language(language, "asr")},
                     }
                 ),
                 _IO_TIMEOUT,

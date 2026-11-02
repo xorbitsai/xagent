@@ -88,15 +88,16 @@ describe("voice turn ownership", () => {
     turns.stop()
   })
 
-  it("speaks streamed list items without synthesizing their numbers as separate sentences", async () => {
+  it.each(["plain", "bold", "quote"])("speaks streamed %s list items without synthesizing their numbers separately", async style => {
     vi.useFakeTimers()
     const { turns, actions } = coordinator()
     turns.transcript("final", "How do I add a vehicle?", 0)
     await vi.advanceTimersByTimeAsync(300)
+    const marker = (number: number) => style === "bold" ? `**${number}.** ` : style === "quote" ? `> ${number}. ` : `${number}. `
     const prefixes = [
-      "To add a vehicle in Detrack:\n\n1. ",
-      "In your admin dashboard, open the **Vehicles** tab.\n2. ",
-      "Choose the option to add a vehicle and fill in the vehicle details.\n3. ",
+      `To add a vehicle in Detrack:\n\n${marker(1)}`,
+      `In your admin dashboard, open the **Vehicles** tab.\n${marker(2)}`,
+      `Choose the option to add a vehicle and fill in the vehicle details.\n${marker(3)}`,
       "Click **Save** to add it to your account.",
     ]
     let text = ""

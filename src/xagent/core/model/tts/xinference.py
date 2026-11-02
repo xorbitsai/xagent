@@ -11,7 +11,7 @@ from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
 from ..public_http import create_public_model_aiohttp_session
 from ..xinference_base import BaseXinferenceModel
-from ..xinference_speech import audio_headers, fetch_audio_capabilities
+from ..xinference_speech import audio_headers, audio_language, fetch_audio_capabilities
 from .base import BaseTTS, TTSChunk, TTSResult
 
 logger = logging.getLogger(__name__)
@@ -120,24 +120,7 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
             raise ValueError("Speech text must contain 1..5000 characters")
         if kwargs:
             raise ValueError("Unsupported Xinference streaming speech options")
-        languages = {
-            "en": "English",
-            "zh": "Chinese",
-            "ja": "Japanese",
-            "ko": "Korean",
-            "de": "German",
-            "fr": "French",
-            "ru": "Russian",
-            "pt": "Portuguese",
-            "es": "Spanish",
-            "it": "Italian",
-        }
-        configured_language = (language or self.language or "").strip().lower()
-        final_language = languages.get(
-            configured_language.replace("_", "-").split("-")[0]
-        )
-        if configured_language in {name.lower() for name in languages.values()}:
-            final_language = configured_language.capitalize()
+        final_language = audio_language(language or self.language, "tts")
         body: dict[str, Any] = {
             "model": self._model_uid,
             "input": text,

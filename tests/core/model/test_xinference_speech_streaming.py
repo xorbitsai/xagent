@@ -26,6 +26,7 @@ async def service(monkeypatch):
         caps_body=None,
         outputs=None,
         expected_language="English",
+        expected_asr_language="auto",
         release=asyncio.Event(),
         caps={
             "asr": {"streaming": True, "server_vad": True},
@@ -49,7 +50,7 @@ async def service(monkeypatch):
         await ws.prepare(request)
         start = await ws.receive_json()
         assert start["task"] == "audio.transcription"
-        assert start["parameters"]["language"] == "en"
+        assert start["parameters"]["language"] == state.expected_asr_language
         await ws.send_json({"event": "session.started", "session_id": "session-1"})
         async for message in ws:
             if message.type == web.WSMsgType.BINARY:
@@ -214,8 +215,9 @@ async def test_tts_rejects_mislabeled_formats_before_request(service):
         ("es", "Spanish"),
         ("it", "Italian"),
         ("Chinese", "Chinese"),
-        ("auto", None),
-        ("unknown", None),
+        ("auto", "auto"),
+        (None, "auto"),
+        ("unknown", "auto"),
     ],
 )
 async def test_tts_normalizes_saved_languages(service, language, expected):
@@ -223,6 +225,26 @@ async def test_tts_normalizes_saved_languages(service, language, expected):
     service.release.set()
     provider = XinferenceTTS(base_url=service.url, format="pcm", language=language)
     assert [chunk async for chunk in provider.synthesize_stream("Hello")]
+    await provider.aclose()
+
+
+@pytest.mark.parametrize(
+    "language,expected",
+    [
+        (None, "auto"),
+        ("auto", "auto"),
+        ("zh-CN", "zh"),
+        ("zh_CN", "zh"),
+        ("en-US", "en"),
+        ("yue-HK", "yue"),
+        ("fil", "fil"),
+    ],
+)
+async def test_asr_start_normalizes_saved_language(service, language, expected):
+    service.expected_asr_language = expected
+    provider = XinferenceASR(base_url=service.url, language=language)
+    async with await provider.open_stream():
+        pass
     await provider.aclose()
 
 

@@ -1127,6 +1127,36 @@ def test_tts_capability_probe_failures_are_gateway_errors(api, caplog, error, st
     assert api.tts.close_count == 1 and not api.tts.calls
 
 
+def test_asr_capability_probe_failure_closes_and_redacts(api, caplog):
+    api.asr.get_streaming_capabilities = AsyncMock(
+        side_effect=RuntimeError("synthetic-provider-secret")
+    )
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        result = ws.receive_json()
+        assert result["type"] == "error" and result["code"] == "stream_failed"
+    assert "synthetic-provider-secret" not in json.dumps(result) + caplog.text
+    assert api.asr.close_count == 1 and not api.asr.sessions
+
+
+def test_capability_endpoint_only_returns_browser_contract(api):
+    expected = {
+        "streaming": True,
+        "server_vad": True,
+        "formats": ["pcm"],
+        "sample_rates": [24000],
+        "voices": [{"voice_id": "voice", "name": "Voice"}],
+    }
+    api.tts.get_streaming_capabilities = AsyncMock(
+        return_value={**expected, "internal_config": {"private": "provider-detail"}}
+    )
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == expected
+
+
 @pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
 def test_capability_endpoint_maps_and_logs_upstream_failure(
     api, caplog, ability, model_id

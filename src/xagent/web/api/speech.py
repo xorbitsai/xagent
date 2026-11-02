@@ -460,7 +460,12 @@ async def speech_capabilities(
             status_code=400, detail="Invalid speech model configuration"
         ) from None
     try:
-        return await model.get_streaming_capabilities()
+        capabilities = await model.get_streaming_capabilities()
+        return {
+            key: capabilities[key]
+            for key in ("streaming", "server_vad", "formats", "sample_rates", "voices")
+            if key in capabilities
+        }
     except Exception as exc:
         _log_provider_error(model, exc)
         raise HTTPException(

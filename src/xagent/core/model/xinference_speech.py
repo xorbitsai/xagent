@@ -11,6 +11,56 @@ import aiohttp
 
 from .public_http import create_public_model_aiohttp_session
 
+_TTS_LANGUAGES = {
+    "en": "English",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "de": "German",
+    "fr": "French",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "it": "Italian",
+}
+_ASR_LANGUAGES = {
+    **_TTS_LANGUAGES,
+    "yue": "Cantonese",
+    "ar": "Arabic",
+    "id": "Indonesian",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "tr": "Turkish",
+    "hi": "Hindi",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "sv": "Swedish",
+    "da": "Danish",
+    "fi": "Finnish",
+    "pl": "Polish",
+    "cs": "Czech",
+    "fil": "Filipino",
+    "tl": "Filipino",
+    "fa": "Persian",
+    "el": "Greek",
+    "ro": "Romanian",
+    "hu": "Hungarian",
+    "mk": "Macedonian",
+}
+_LANGUAGE_NAMES = {
+    role: {**values, **{name.lower(): name for name in values.values()}}
+    for role, values in (("asr", _ASR_LANGUAGES), ("tts", _TTS_LANGUAGES))
+}
+_ASR_CODES = {name: code for code, name in _ASR_LANGUAGES.items() if code != "tl"}
+
+
+def audio_language(language: str | None, role: str) -> str:
+    value = (language or "auto").strip().lower().replace("_", "-")
+    names = _LANGUAGE_NAMES[role]
+    normalized = names.get(value, names.get(value.split("-")[0], "auto"))
+    # ASR backends normalize ISO codes themselves; keep FunASR/Qwen compatible.
+    return _ASR_CODES.get(normalized, normalized) if role == "asr" else normalized
+
 
 def audio_model_url(provider: Any, suffix: str) -> str:
     uid = quote(provider._model_uid, safe="")

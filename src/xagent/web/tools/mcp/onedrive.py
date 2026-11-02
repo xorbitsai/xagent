@@ -340,20 +340,18 @@ def _error(message: str, *, details: Any = None) -> str:
 
 def _resource_locked_error(operation: str, *, allow_save_as_copy: bool = True) -> str:
     """Return a stable, caller-actionable contract for a Graph 423."""
-    message = f"The OneDrive item is locked, so it could not be {operation}. "
+    message = (
+        f"The OneDrive item is locked, so it could not be {operation}. "
+        "Ask the user to close it in Word, Excel, PowerPoint or Teams, or "
+        "check it in. The lock can take a few minutes to clear. "
+        "Do not retry until the user confirms."
+    )
     actions = ["close_document_and_retry"]
     if allow_save_as_copy:
         message += (
-            "Close the document in Word or Teams and retry later, or use a "
-            "different destination path to save a copy."
+            " Ask the user before choosing a different destination path to save a copy."
         )
         actions.append("save_as_copy")
-    else:
-        message += (
-            "Ask the user to close it in Word, Excel, PowerPoint or Teams, or "
-            "check it in. The lock can take a few minutes to clear. "
-            "Do not retry until the user confirms."
-        )
     return json.dumps(
         {
             "status": "error",
@@ -375,7 +373,9 @@ def _item_write_error(
     """Explain known item-write failures without exposing Graph response bodies."""
     if isinstance(exc, _GraphRequestError):
         if exc.status_code == 423:
-            return _resource_locked_error(operation, allow_save_as_copy=False)
+            return _resource_locked_error(
+                operation, allow_save_as_copy=operation == "overwritten"
+            )
         if exc.status_code == 403:
             return _error(
                 "The connected account has no permission for this OneDrive "
@@ -1608,8 +1608,9 @@ def onedrive_upload_file(
     name at the OneDrive root. Prefer the format-specific connector when one
     supports editing the existing Office document. If an existing item is
     locked, this tool returns code="resource_locked"; do not retry the
-    same destination immediately. Close the document and retry later, or ask
-    the user before choosing a different remote_path to save a copy.
+    same destination until the user confirms that the document has been
+    closed or checked in. Ask the user before choosing a different remote_path
+    to save a copy.
     mime_type: defaults to a guess from the remote filename, then the local
     filename, falling back to "application/octet-stream". It is sent on both
     simple uploads and upload-session chunks.

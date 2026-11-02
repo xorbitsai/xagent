@@ -940,6 +940,22 @@ def excel_update_range(
         return _error_from_exception(e)
 
 
+def _delete_worksheet_range(
+    file_path: str,
+    worksheet: str,
+    address: str,
+    shift: str,
+    message: str,
+    site_id: str | None,
+    drive_id: str | None,
+) -> str:
+    base = _workbook_base(file_path, site_id, drive_id)
+    segment = _odata_key_segment("worksheets", worksheet)
+    path = f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
+    _graph_mutation_request("POST", path, body={"shift": shift})
+    return _success(message=message, worksheet=worksheet, deleted_range=address)
+
+
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False))
 def excel_delete_columns(
     file_path: str,
@@ -959,16 +975,14 @@ def excel_delete_columns(
     """
     try:
         address = _normalize_column_range(start_column, end_column)
-        base = _workbook_base(file_path, site_id, drive_id)
-        segment = _odata_key_segment("worksheets", worksheet)
-        path = (
-            f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
-        )
-        _graph_mutation_request("POST", path, body={"shift": "Left"})
-        return _success(
+        return _delete_worksheet_range(
+            file_path,
+            worksheet,
+            address,
+            shift="Left",
             message="Columns deleted successfully",
-            worksheet=worksheet,
-            deleted_range=address,
+            site_id=site_id,
+            drive_id=drive_id,
         )
     except _GraphMutationIndeterminateError as e:
         logger.error(
@@ -1016,16 +1030,14 @@ def excel_delete_rows(
     """
     try:
         address = _normalize_row_range(start_row, end_row)
-        base = _workbook_base(file_path, site_id, drive_id)
-        segment = _odata_key_segment("worksheets", worksheet)
-        path = (
-            f"{base}/{segment}/range(address='{_odata_string_literal(address)}')/delete"
-        )
-        _graph_mutation_request("POST", path, body={"shift": "Up"})
-        return _success(
+        return _delete_worksheet_range(
+            file_path,
+            worksheet,
+            address,
+            shift="Up",
             message="Rows deleted successfully",
-            worksheet=worksheet,
-            deleted_range=address,
+            site_id=site_id,
+            drive_id=drive_id,
         )
     except _GraphMutationIndeterminateError as e:
         logger.error(

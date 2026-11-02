@@ -40,6 +40,7 @@ from xagent.web.services.agent_team_scope import (
     AgentTeamScope,
     set_agent_team_scope_hook,
 )
+from xagent.web.services.file_turn import build_prompt_context_block
 from xagent.web.services.task_command_transport import COMMAND_COMPLETED
 from xagent.web.services.task_runtime import PROMPT_CONTEXT_AGENT_CONFIG_KEY
 
@@ -113,7 +114,8 @@ def test_personal_key_rejected_on_runtime_only_routes() -> None:
 # ===== Task routes under a personal key =====
 
 UNUSED_TASK_ID = 9_000_002
-PERSONAL_PROMPT_CONTEXT_MESSAGE = "prompt_context is not supported for personal keys."
+# A field no agent in these tests declares.
+UNDECLARED_PROMPT_CONTEXT = {"prompt_context": {"undeclared_field": "x"}}
 # Whether the holder (a plain member of team 1) can run each agent.
 VISIBLE = {
     "own": True,
@@ -137,6 +139,7 @@ BAD_INPUTS = {
             }
         ]
     },
+    "undeclared_prompt_context": UNDECLARED_PROMPT_CONTEXT,
 }
 
 
@@ -404,6 +407,10 @@ def test_personal_key_write_routes_recheck_agent_visibility(
     if route in ("append", "reply") and not reachable:
         assert resp.status_code == 404, resp.text
         assert _error_code(resp) == "agent_not_found"
+        if route == "append":
+            resp = _call(route, task_id, world.key, UNDECLARED_PROMPT_CONTEXT)
+            assert resp.status_code == 404, resp.text
+            assert _error_code(resp) == "agent_not_found"
     else:
         assert resp.status_code == ALLOWED[route], resp.text
 
@@ -499,20 +506,53 @@ def test_runtime_keys_never_see_personal_key_tasks(world, route) -> None:
     assert _task(task_id).id == task_id
 
 
-@pytest.mark.parametrize("prompt_context", [{}, {"shift": "night"}])
-def test_personal_key_prompt_context_rejected(world, prompt_context) -> None:
-    before = _row_counts()
-    created = _create(world.key, world.agents["own"], prompt_context=prompt_context)
-    assert created.status_code == 422, created.text
-    assert created.json()["error"]["message"] == PERSONAL_PROMPT_CONTEXT_MESSAGE
-    assert _row_counts() == before
+SHIFT_DECLARED = [{"name": "shift", "max_length": 10}]
+STORED_PROMPT_CONTEXT = {"data": {"shift": "day"}, "signed": False}
 
+
+# An outcome is the stored value (None: nothing stored), the field names a
+# personal key is refused for, or "malformed".
+@pytest.mark.parametrize(
+    ("declarations", "prompt_context", "outcome"),
+    [
+        pytest.param(
+            SHIFT_DECLARED,
+            {"shift": "night"},
+            {"data": {"shift": "night"}, "signed": False},
+            id="declared",
+        ),
+        pytest.param(SHIFT_DECLARED, {}, None, id="empty"),
+        pytest.param(SHIFT_DECLARED, {"note": "x"}, ("note",), id="undeclared"),
+        pytest.param(SHIFT_DECLARED, {"shift": "x" * 11}, ("shift",), id="too_long"),
+        pytest.param(
+            SHIFT_DECLARED, {"shift": "night", "note": "x"}, ("note",), id="mixed"
+        ),
+        pytest.param(
+            None,
+            {"shift": "night", "note": "x"},
+            ("shift", "note"),
+            id="nothing_declared",
+        ),
+        pytest.param(SHIFT_DECLARED, {"bad name": "x"}, "malformed", id="malformed"),
+    ],
+)
+def test_personal_key_prompt_context_declared_fields_only(
+    world, declarations, prompt_context, outcome
+) -> None:
+    agent_id = world.agents["own"]
+    _update(Agent, agent_id, prompt_context_fields=declarations)
     task_id = _personal_task(world, "own")
     _finish(task_id)
-    stored = {PROMPT_CONTEXT_AGENT_CONFIG_KEY: {"data": {"shift": "day"}}}
+    stored = {PROMPT_CONTEXT_AGENT_CONFIG_KEY: STORED_PROMPT_CONTEXT}
     _update(Task, task_id, agent_config=stored)
+    agent_key = _create(
+        _agent_key(world.headers["admin"], agent_id),
+        agent_id,
+        prompt_context=prompt_context,
+    )
     before = _row_counts()
 
+    created = _create(world.key, agent_id, prompt_context=prompt_context)
     appended = client.post(
         f"/v1/chat/tasks/{task_id}/messages",
         headers=_bearer(world.key),
@@ -522,10 +562,34 @@ def test_personal_key_prompt_context_rejected(world, prompt_context) -> None:
         },
     )
 
-    assert appended.status_code == 422, appended.text
-    assert appended.json()["error"]["message"] == PERSONAL_PROMPT_CONTEXT_MESSAGE
-    assert _task(task_id).agent_config == stored
+    if isinstance(outcome, dict) or outcome is None:
+        for resp in (created, appended):
+            assert resp.status_code == 202, resp.text
+            config = _task(resp.json()["task_id"]).agent_config or {}
+            assert config.get(PROMPT_CONTEXT_AGENT_CONFIG_KEY) == outcome
+        if outcome is not None:
+            block = build_prompt_context_block(outcome)
+            assert block is not None
+            assert any(line.startswith("Unsigned:") for line in block.splitlines())
+        return
+    if outcome == "malformed":
+        # The same shape error an agent key gets.
+        assert agent_key.status_code == 422, agent_key.text
+        message = agent_key.json()["error"]["message"]
+    else:
+        # An agent key still passes the same fields through, signed.
+        assert agent_key.status_code == 202, agent_key.text
+        assert _task(agent_key.json()["task_id"]).agent_config == {
+            PROMPT_CONTEXT_AGENT_CONFIG_KEY: {"data": prompt_context, "signed": True}
+        }
+        message = "prompt_context fields this agent does not accept: " + ", ".join(
+            outcome
+        )
+    for resp in (created, appended):
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["error"]["message"] == message
     assert _row_counts() == before
+    assert _task(task_id).agent_config == stored
 
 
 def test_sdk_task_scope_without_owner_fails_closed(world) -> None:

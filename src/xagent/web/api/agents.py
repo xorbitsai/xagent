@@ -108,7 +108,10 @@ class AgentCreateRequest(BaseModel):
     )
     prompt_context_fields: PromptContextFieldList = Field(
         default_factory=list,
-        description="Fields the unsigned widget entry may pass to prompt context",
+        description=(
+            "Fields unsigned callers (the widget entry and personal keys) "
+            "may pass to prompt context"
+        ),
     )
     logo_base64: Optional[str] = Field(
         None, description="Logo image as base64 data URL"

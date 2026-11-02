@@ -52,7 +52,7 @@ PromptContextFieldDescription = Annotated[
 
 
 class PromptContextFieldDeclaration(BaseModel):
-    """One field the unsigned widget entry may pass to prompt context."""
+    """One field unsigned callers (widget entry, personal keys) may pass."""
 
     name: str = Field(..., pattern=PROMPT_CONTEXT_FIELD_NAME_PATTERN)
     max_length: StrictInt = Field(

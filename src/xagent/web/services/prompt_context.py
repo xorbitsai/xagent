@@ -25,10 +25,12 @@ _FIELD_NAME_RE = re.compile(PROMPT_CONTEXT_FIELD_NAME_PATTERN)
 
 
 def validate_signed_prompt_context(values: Any) -> None:
-    """Reject signed values the filter would otherwise drop instead of store.
+    """Reject a ``/v1`` prompt_context whose shape the filter would not store.
 
-    Trusted callers do not get a declarations whitelist, but the shared
-    serialized-size cap still applies and must surface as a 4xx.
+    Runs for every key. Signed (runtime key) values get no declarations
+    whitelist, so this is what turns a value the filter would drop into a
+    4xx. Unsigned (personal key) values are then also checked against the
+    agent's declarations.
     """
     if not isinstance(values, Mapping):
         raise ValueError("prompt_context must be an object.")
@@ -62,12 +64,16 @@ def _validated_declarations(declarations: Any) -> list[Any] | None:
         return None
 
 
-def build_prompt_context_value(
+def filter_prompt_context(
     values: Any, declarations: Any, *, signed: bool
-) -> dict[str, Any] | None:
-    """Filter raw values into a prompt_context value, or None if none survive."""
+) -> tuple[dict[str, Any] | None, tuple[str, ...]]:
+    """Filter raw values into a prompt_context value and name what it dropped.
+
+    Returns the value (None if no field survives) and, in input order, every
+    input field name the value does not carry, whatever the reason.
+    """
     if not isinstance(values, Mapping):
-        return None
+        return None, ()
     validated = _validated_declarations(declarations) or []
     limits = None if signed else {item.name: item.max_length for item in validated}
     descriptions = {
@@ -95,11 +101,21 @@ def build_prompt_context_value(
         except (ValueError, UnicodeEncodeError):
             continue
         kept[name] = value
-    if not kept:
-        return None
-    result: dict[str, Any] = {"data": kept, "signed": signed}
-    # Signed values stay unrestricted; declarations only supply meanings.
-    meanings = {name: descriptions[name] for name in kept if name in descriptions}
-    if meanings:
-        result["descriptions"] = meanings
-    return result if build_prompt_context_block(result) is not None else None
+    result: dict[str, Any] | None = None
+    if kept:
+        result = {"data": kept, "signed": signed}
+        # Signed values stay unrestricted; declarations only supply meanings.
+        meanings = {name: descriptions[name] for name in kept if name in descriptions}
+        if meanings:
+            result["descriptions"] = meanings
+        if build_prompt_context_block(result) is None:
+            result = None
+    carried = result["data"] if result is not None else {}
+    return result, tuple(str(name) for name in values if name not in carried)
+
+
+def build_prompt_context_value(
+    values: Any, declarations: Any, *, signed: bool
+) -> dict[str, Any] | None:
+    """Filter raw values into a prompt_context value, or None if none survive."""
+    return filter_prompt_context(values, declarations, signed=signed)[0]

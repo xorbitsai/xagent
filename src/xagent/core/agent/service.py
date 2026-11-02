@@ -81,6 +81,7 @@ class AgentService:
         memory_enabled: bool = True,
         memory_available: bool = True,
         memory_availability_reason: str | None = None,
+        memory_tools_factory: Callable[..., list[Any]] | None = None,
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
@@ -118,6 +119,7 @@ class AgentService:
         # to publish (see the web layer's memory availability policy).
         self.memory_available = memory_available
         self.memory_availability_reason = memory_availability_reason
+        self.memory_tools_factory = memory_tools_factory
         self.react_max_iterations = max(1, int(react_max_iterations))
         self.enable_default_tools = enable_default_tools
         self.skills_enabled = skills_enabled
@@ -242,6 +244,7 @@ class AgentService:
             patterns=self.patterns,
             llm=self.llm,
             memory_store=self.memory,
+            memory_tools_factory=self.memory_tools_factory,
         )
 
         logger.info(
@@ -455,6 +458,7 @@ class AgentService:
         enabled: bool,
         available: bool,
         availability_reason: str | None,
+        memory_tools_factory: Callable[..., list[Any]] | None = None,
         execution_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Atomically publish the current trusted memory policy to the runtime."""
@@ -464,6 +468,8 @@ class AgentService:
         self.memory_enabled = enabled
         self.memory_available = available
         self.memory_availability_reason = availability_reason
+        self.memory_tools_factory = memory_tools_factory
+        self.agent.memory_tools_factory = memory_tools_factory
         for key in (
             "memory_available",
             "memory_availability_reason",
@@ -474,6 +480,9 @@ class AgentService:
             self.execution_metadata.update(execution_metadata)
         if self._execution_adapter is not None:
             self._execution_adapter.config.memory_store = memory if enabled else None
+            self._execution_adapter.config.memory_tools_factory = (
+                memory_tools_factory if enabled else None
+            )
             self._execution_adapter.config.execution_metadata = dict(
                 self.execution_metadata
             )
@@ -701,6 +710,9 @@ class AgentService:
                 execution_context_messages=self._execution_context_messages,
                 recovered_skill_context=self._recovered_skill_context,
                 memory_store=self.memory if self.memory_enabled else None,
+                memory_tools_factory=(
+                    self.memory_tools_factory if self.memory_enabled else None
+                ),
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,

@@ -59,6 +59,7 @@ class AgentExecutionConfig:
     execution_context_messages: list[dict[str, Any]] = field(default_factory=list)
     recovered_skill_context: str | None = None
     memory_store: Any | None = None
+    memory_tools_factory: Any | None = None
     memory_similarity_threshold: float | None = None
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
@@ -199,6 +200,7 @@ class AgentExecutionAdapter:
             # or policy change. A paused runner still holds the previous list.
             handle.runner.agent.tools = self.config.tools
             handle.runner.agent.memory_store = self.config.memory_store
+            handle.runner.agent.memory_tools_factory = self.config.memory_tools_factory
             handle.runner.budget_policy_provider = self.config.budget_policy_provider
             execution_type = str(
                 handle.metadata.get("execution_type") or self._execution_type()
@@ -305,6 +307,7 @@ class AgentExecutionAdapter:
                 "pattern": self.config.pattern,
             },
             memory_store=self.config.memory_store,
+            memory_tools_factory=self.config.memory_tools_factory,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
             allowed_skills=(

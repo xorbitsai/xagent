@@ -119,7 +119,7 @@ from ...context.execution import (
     snapshot_container,
     tool_evidence_state,
 )
-from ...context.memory_tool import build_memory_tools
+from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import evidence_facts, grounding_rule
 from ...language import effective_output_language, final_answer_language_rule
@@ -820,6 +820,7 @@ class ReActPattern(AgentPattern):
         self.task_text: str | None = None
         self.memory_input_text: str | None = None
         self._memory_store: Any | None = None
+        self._memory_tools_factory: Any | None = None
         self._tool_decision_groups_by_name: dict[str, str] = {}
         self._connector_tool_sources: dict[str, str] = {}
 
@@ -891,6 +892,7 @@ class ReActPattern(AgentPattern):
             task_text = self._task_text(context)
             memory_text = self._memory_text(context, execution_text=task_text)
             self._memory_store = kwargs.get("memory_store")
+            self._memory_tools_factory = kwargs.get("memory_tools_factory")
             # DAG steps skip the automatic retrieval: the root run already
             # retrieved for the whole task, and steps can search_memory on
             # demand.
@@ -962,12 +964,27 @@ class ReActPattern(AgentPattern):
         """
         if self.finalize_after_tool_result:
             return tools
-        extra_tools: list[Any] = build_memory_tools(
-            memory_store=self._memory_store,
-            task=task_text,
-            runtime=runtime,
-            context=context,
-        )
+        if self._memory_tools_factory is None:
+            extra_tools: list[Any] = build_memory_tools(
+                memory_store=self._memory_store,
+                task=task_text,
+                runtime=runtime,
+                context=context,
+            )
+        else:
+            # Host factories are synchronous setup hooks and must not perform
+            # blocking I/O. Copy their result so adding run-local tools never
+            # mutates a list retained by the host.
+            extra_tools = list(
+                self._memory_tools_factory(
+                    memory_store=self._memory_store,
+                    task=task_text,
+                    runtime=runtime,
+                    context=context,
+                )
+            )
+            if extra_tools and hasattr(context, "metadata"):
+                context.metadata[MEMORY_TOOLS_METADATA_KEY] = True
         skill_tool = await build_load_skill_tool(
             skill_manager=skill_manager,
             context=context,

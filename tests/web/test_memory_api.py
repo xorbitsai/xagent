@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+from collections.abc import Iterator
 from datetime import datetime
 from typing import Any
 from unittest.mock import Mock
@@ -18,6 +19,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.memory.base import MemoryStore
 from xagent.core.memory.core import MemoryNote
+from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.core.memory.lancedb import LanceDBMemoryStore
 from xagent.core.memory.storage_admission import (
     DormantLanceDBMemoryHandle,
@@ -32,6 +34,11 @@ from xagent.web.api.memory import MemoryManagementRouter
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
+from xagent.web.services.memory_binding import (
+    MemoryManagementBindingRequest,
+    MemoryStoreBinding,
+    set_trusted_memory_binding_resolver,
+)
 from xagent.web.user_isolated_memory import UserContext, UserIsolatedMemoryStore
 
 # Fixture IDs in the minted str(uuid.uuid4()) form; the routes accept any opaque ID.
@@ -49,6 +56,13 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
 )
 TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@pytest.fixture(autouse=True)
+def clear_memory_binding_resolver() -> Iterator[None]:
+    set_trusted_memory_binding_resolver(None)
+    yield
+    set_trusted_memory_binding_resolver(None)
 
 
 def override_get_db():
@@ -158,6 +172,163 @@ def sample_memory_notes():
             mime_type="text/plain",
         ),
     ]
+
+
+def test_management_binding_resolves_once_per_request_after_authentication(
+    auth_headers: dict[str, str],
+    test_db: User,
+) -> None:
+    selected_store = InMemoryMemoryStore()
+    legacy_provider = Mock(side_effect=AssertionError("legacy store must not be used"))
+    requests: list[MemoryManagementBindingRequest] = []
+
+    def resolver(request: object) -> MemoryStoreBinding:
+        assert isinstance(request, MemoryManagementBindingRequest)
+        requests.append(request)
+        return MemoryStoreBinding(
+            store=selected_store,
+            backend_identity="backend-a",
+            route_generation="route-1",
+            public_diagnostics={"backend": "host-managed", "ready": True},
+        )
+
+    set_trusted_memory_binding_resolver(resolver)
+    app = FastAPI()
+    app.include_router(auth_router)
+    app.include_router(MemoryManagementRouter(legacy_provider).get_router())
+    app.dependency_overrides[get_db] = override_get_db
+    client = TestClient(app)
+
+    created = client.post(
+        "/api/memory",
+        json={"content": "bound note"},
+        headers=auth_headers,
+    )
+    info = client.get("/api/memory/store-info", headers=auth_headers)
+
+    assert created.status_code == 200
+    assert info.status_code == 200
+    assert info.json() == {"backend": "host-managed", "ready": True}
+    assert requests == [
+        MemoryManagementBindingRequest(authenticated_user_id=int(test_db.id)),
+        MemoryManagementBindingRequest(authenticated_user_id=int(test_db.id)),
+    ]
+    legacy_provider.assert_not_called()
+    assert selected_store.get(created.json()["memory_id"]).success
+
+
+def test_management_binding_failure_returns_503_without_legacy_fallback(
+    auth_headers: dict[str, str],
+) -> None:
+    legacy_provider = Mock(side_effect=AssertionError("legacy store must not be used"))
+    set_trusted_memory_binding_resolver(
+        Mock(side_effect=RuntimeError("backend unavailable"))
+    )
+    app = FastAPI()
+    app.include_router(auth_router)
+    app.include_router(MemoryManagementRouter(legacy_provider).get_router())
+    app.dependency_overrides[get_db] = override_get_db
+
+    response = TestClient(app).get("/api/memory/list", headers=auth_headers)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Memory storage is temporarily unavailable."}
+    legacy_provider.assert_not_called()
+
+
+def test_management_binding_is_not_resolved_before_authentication() -> None:
+    resolver = Mock(side_effect=AssertionError("resolver must run after auth"))
+    set_trusted_memory_binding_resolver(resolver)
+    app = FastAPI()
+    app.include_router(auth_router)
+    app.include_router(MemoryManagementRouter().get_router())
+    app.dependency_overrides[get_db] = override_get_db
+
+    response = TestClient(app).get("/api/memory/list")
+
+    assert response.status_code == 401
+    resolver.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "request_kwargs"),
+    [
+        ("post", "/api/memory", {"json": {}}),
+        ("post", "/api/memory", {"json": {"content": " \t\n"}}),
+        (
+            "post",
+            "/api/memory",
+            {"content": b"", "headers": {"content-type": "application/json"}},
+        ),
+        ("put", f"/api/memory/{MEMORY_ID_1}", {"json": {"content": ""}}),
+        (
+            "put",
+            f"/api/memory/{MEMORY_ID_1}",
+            {"content": b"", "headers": {"content-type": "application/json"}},
+        ),
+    ],
+)
+def test_invalid_body_is_rejected_before_remote_binding_resolution(
+    client: TestClient,
+    mock_memory_store: Mock,
+    auth_headers: dict[str, str],
+    method: str,
+    path: str,
+    request_kwargs: dict[str, Any],
+) -> None:
+    resolver = Mock(side_effect=AssertionError("invalid body must not bind"))
+    set_trusted_memory_binding_resolver(resolver)
+    kwargs = dict(request_kwargs)
+    headers = {**auth_headers, **kwargs.pop("headers", {})}
+
+    response = client.request(method, path, headers=headers, **kwargs)
+
+    assert response.status_code == 422
+    resolver.assert_not_called()
+    mock_memory_store.add.assert_not_called()
+    mock_memory_store.get.assert_not_called()
+    mock_memory_store.update.assert_not_called()
+
+
+def test_update_empty_object_keeps_existing_noop_contract(
+    client: TestClient,
+    mock_memory_store: Mock,
+    sample_memory_notes: list[MemoryNote],
+    auth_headers: dict[str, str],
+) -> None:
+    mock_memory_store.get.return_value = Mock(
+        success=True, content=sample_memory_notes[0]
+    )
+    mock_memory_store.update.return_value = Mock(success=True)
+
+    response = client.put(f"/api/memory/{MEMORY_ID_1}", json={}, headers=auth_headers)
+
+    assert response.status_code == 200
+    updated = mock_memory_store.update.call_args.args[0]
+    assert updated.content == sample_memory_notes[0].content
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [("post", "/api/memory"), ("put", f"/api/memory/{MEMORY_ID_1}")],
+)
+def test_authentication_precedes_body_validation_without_resolving_binding(
+    client: TestClient,
+    method: str,
+    path: str,
+) -> None:
+    resolver = Mock(side_effect=AssertionError("unauthenticated request must not bind"))
+    set_trusted_memory_binding_resolver(resolver)
+
+    response = client.request(
+        method,
+        path,
+        content=b"",
+        headers={"content-type": "application/json"},
+    )
+
+    assert response.status_code == 401
+    resolver.assert_not_called()
 
 
 class TestMemoryListEndpoint:
@@ -430,6 +601,17 @@ class TestMemoryCreateEndpoint:
         assert call_args.tags == []  # Default empty list
         assert call_args.metadata == {}  # Default empty dict
 
+    @pytest.mark.parametrize("content", [None, "", " \t\n", 7])
+    def test_create_rejects_non_string_or_blank_content_without_store_call(
+        self, client, mock_memory_store, auth_headers, content
+    ):
+        response = client.post(
+            "/api/memory/", json={"content": content}, headers=auth_headers
+        )
+
+        assert response.status_code == 422
+        mock_memory_store.add.assert_not_called()
+
     def test_create_memory_error_handling(
         self, client, mock_memory_store, auth_headers
     ):
@@ -539,6 +721,38 @@ class TestMemoryUpdateEndpoint:
         assert call_args.content == "Only content updated"
         assert call_args.keywords == ["test", "sample"]  # Original values preserved
         assert call_args.tags == ["important"]  # Original values preserved
+
+    @pytest.mark.parametrize("content", ["", " \t\n"])
+    def test_update_rejects_blank_content_without_store_call(
+        self, client, mock_memory_store, auth_headers, content
+    ):
+        response = client.put(
+            f"/api/memory/{MEMORY_ID_1}",
+            json={"content": content},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 422
+        mock_memory_store.get.assert_not_called()
+        mock_memory_store.update.assert_not_called()
+
+    def test_update_preserves_nonblank_content_exactly(
+        self, client, mock_memory_store, sample_memory_notes, auth_headers
+    ):
+        mock_memory_store.get.return_value = Mock(
+            success=True, content=sample_memory_notes[0]
+        )
+        mock_memory_store.update.return_value = Mock(success=True)
+
+        response = client.put(
+            f"/api/memory/{MEMORY_ID_1}",
+            json={"content": "  Mixed Case  "},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        updated = mock_memory_store.update.call_args.args[0]
+        assert updated.content == "  Mixed Case  "
 
     def test_update_memory_error_handling(
         self, client, mock_memory_store, auth_headers

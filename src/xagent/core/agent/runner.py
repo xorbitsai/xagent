@@ -2011,6 +2011,7 @@ class AgentRunner:
             callbacks=self.callbacks,
             streaming_handler=streaming_handler,
             memory_store=getattr(self.agent, "memory_store", None),
+            memory_tools_factory=getattr(self.agent, "memory_tools_factory", None),
             memory_similarity_threshold=getattr(
                 self.agent, "memory_similarity_threshold", None
             ),

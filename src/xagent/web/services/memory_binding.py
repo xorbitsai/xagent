@@ -9,18 +9,19 @@ legacy memory manager, policy, lifecycle, and tool behavior unchanged.
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import logging
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
 from ...core.memory.access_scope import MemoryAccessScope, bind_memory_access_scope
 from ...core.memory.base import MemoryStore
 from ...core.memory.scope_columns import strict_user_id
+from .db_runtime import run_db_io_cancellation_safe
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,12 @@ MemoryBindingRequest: TypeAlias = (
 
 @dataclass(frozen=True)
 class MemoryToolAssemblyRequest:
-    """Turn-local inputs for an opt-in host memory-tool factory."""
+    """Turn-local inputs for an opt-in host memory-tool factory.
+
+    The factory is called synchronously during pattern setup and must not
+    perform blocking I/O. Core copies the returned sequence before adding
+    run-local tools and marks the context for memory-usage guidance.
+    """
 
     memory_store: MemoryStore = field(repr=False)
     task: str
@@ -225,9 +231,22 @@ def resolve_trusted_memory_binding(
             raise TypeError("memory binding resolver returned an invalid binding")
         return binding
     except Exception as exc:
+        traceback_frame = exc.__traceback__
+        while traceback_frame is not None and traceback_frame.tb_next is not None:
+            traceback_frame = traceback_frame.tb_next
+        location = (
+            "unknown"
+            if traceback_frame is None
+            else (
+                f"{Path(traceback_frame.tb_frame.f_code.co_filename).name}:"
+                f"{traceback_frame.tb_frame.f_code.co_name}:"
+                f"{traceback_frame.tb_lineno}"
+            )
+        )
         logger.warning(
-            "Trusted memory binding resolver failed (%s)",
+            "Trusted memory binding resolver failed (%s at %s)",
             type(exc).__name__,
+            location,
         )
         raise MemoryBindingResolutionError(
             "trusted memory binding resolution failed"
@@ -239,7 +258,9 @@ async def resolve_trusted_memory_binding_async(
 ) -> MemoryStoreBinding | None:
     """Resolve a synchronous host callback without blocking the event loop."""
 
-    return await asyncio.to_thread(resolve_trusted_memory_binding, request)
+    return await run_db_io_cancellation_safe(
+        lambda: resolve_trusted_memory_binding(request)
+    )
 
 
 __all__ = [

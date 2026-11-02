@@ -8215,6 +8215,48 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     assert step_intent_not_fact_rule() in instruction
 
 
+@pytest.mark.asyncio
+async def test_dag_step_receives_selected_memory_tool_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = PlanStep(id="remember", task="Remember the result")
+    pattern = DAGPattern(lambda **_: build_plan(step))
+    pattern.plan = build_plan(step)
+    store = object()
+    captured: dict[str, Any] = {}
+
+    def factory(_request: object) -> list[object]:
+        return []
+
+    class CapturingReActPattern:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def seed_memory_input(self, memory_text: str) -> None:
+            del memory_text
+
+        async def run(self, **kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            return {"success": True, "status": "completed", "output": "done"}
+
+    monkeypatch.setattr(dag_module, "ReActPattern", CapturingReActPattern)
+    root_context = ExecutionContext(execution_id="dag-memory-binding")
+    root_context.add_user_message("Remember this result.")
+
+    await pattern._execute_step_impl(
+        step=step,
+        root_context=root_context,
+        tools=[],
+        llm=object(),
+        runtime=PatternRuntime(execution_id="dag-memory-binding"),
+        memory_store=store,
+        memory_tools_factory=factory,
+    )
+
+    assert captured["memory_store"] is store
+    assert captured["memory_tools_factory"] is factory
+
+
 _FILE_REFERENCE_BLOCK = (
     "\n\nAttached file(s):\n- quarterly.pdf\nInspect every attached file with "
     "the provided tools before answering, and reference each one by the exact "

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any, Optional, Protocol, Union
 
 from ..chat.token_context import MediaCallType
 from ..media_metering import record_provider_usage
+from ..public_http import create_public_model_aiohttp_session
 from ..xinference_base import BaseXinferenceModel
-from .base import BaseTTS, TTSResult
+from ..xinference_speech import audio_headers, fetch_audio_capabilities
+from .base import BaseTTS, TTSChunk, TTSResult
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +63,100 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
         self.language = language
         self.format = format
         self.sample_rate = sample_rate
+        self._stream_capabilities: dict[str, Any] = {}
+        self._stream_clients: set[Any] = set()
+        self._stream_generation = 0
+
+    @property
+    def supports_streaming(self) -> bool:
+        return self._stream_capabilities.get("streaming") is True
+
+    async def get_streaming_capabilities(self) -> dict[str, Any]:
+        info = await fetch_audio_capabilities(self)
+        self._stream_capabilities = info.get("tts", {})
+        return self._stream_capabilities
+
+    async def list_available_voices(self) -> list[dict[str, Any]]:
+        capabilities = await self.get_streaming_capabilities()
+        voices = capabilities.get("voices", [])
+        if not isinstance(voices, list) or any(
+            not isinstance(item, dict) for item in voices
+        ):
+            raise RuntimeError("Invalid Xinference voices")
+        return voices
+
+    def _start_closes(self) -> list[Any]:
+        self._stream_generation += 1
+        return [
+            client.close() for client in tuple(self._stream_clients)
+        ] + super()._start_closes()
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        voice: Optional[str] = None,
+        language: Optional[str] = None,
+        format: Optional[str] = None,
+        sample_rate: Optional[int] = None,
+        **kwargs: Any,
+    ) -> AsyncGenerator[TTSChunk, None]:
+        import aiohttp
+
+        generation = self._stream_generation
+        capabilities = await self.get_streaming_capabilities()
+        if not capabilities.get("streaming"):
+            raise ValueError(
+                "The running Xinference model does not support streaming speech"
+            )
+        output_format, rate = format or self.format, sample_rate or self.sample_rate
+        if output_format not in capabilities.get(
+            "formats", []
+        ) or rate not in capabilities.get("sample_rates", []):
+            raise ValueError(
+                "Xinference streaming speech requires the model's native format and sample rate"
+            )
+        if not isinstance(text, str) or not text.strip() or len(text) > 5000:
+            raise ValueError("Speech text must contain 1..5000 characters")
+        if kwargs:
+            raise ValueError("Unsupported Xinference streaming speech options")
+        final_language = language or self.language
+        if final_language == "en":
+            final_language = "English"
+        body: dict[str, Any] = {
+            "model": self._model_uid,
+            "input": text,
+            "voice": voice or self.voice or "",
+            "response_format": output_format,
+            "stream": True,
+        }
+        if final_language:
+            body["kwargs"] = json.dumps({"language": final_language})
+        if generation != self._stream_generation:
+            raise RuntimeError("TTS model was closed while opening its stream")
+        client = create_public_model_aiohttp_session(
+            timeout=aiohttp.ClientTimeout(total=600, sock_connect=10, sock_read=30)
+        )
+        self._stream_clients.add(client)
+        try:
+            async with client:
+                async with client.post(
+                    f"{self.base_url}/v1/audio/speech",
+                    json=body,
+                    headers=audio_headers(self),
+                ) as response:
+                    response.raise_for_status()
+                    record_provider_usage(self, MediaCallType.TTS, len(text))
+                    received = False
+                    async for audio in response.content.iter_any():
+                        if audio:
+                            received = True
+                            yield TTSChunk(
+                                audio=audio, format=output_format, sample_rate=rate
+                            )
+                    if not received:
+                        raise RuntimeError("Xinference returned no speech audio")
+        finally:
+            self._stream_clients.discard(client)
 
     async def synthesize(
         self,
@@ -203,6 +301,7 @@ class XinferenceTTS(BaseTTS, BaseXinferenceModel):
     def abilities(self) -> list[str]:
         """Get the list of abilities supported by this model."""
         abilities = [
+            "voice_listing",
             "tts",
             "text_to_speech",
             "audio",

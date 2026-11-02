@@ -82,3 +82,21 @@ describe("voice model requirements", () => {
     view.unmount()
   })
 })
+
+it("uses running Xinference capabilities for arbitrary model UIDs", () => {
+  const live = model({ model_id: "gpu-asr", model_provider: "xinference", model_name: "arbitrary-asr" })
+  const speaker = model({ ...tts, model_id: "gpu-tts", model_provider: "xinference", model_name: "arbitrary-tts" })
+  expect(voiceModelOptions([live, speaker])).toEqual({ asr: [], tts: [] })
+  expect(voiceModelOptions([live, speaker], { "gpu-asr": { asr: true }, "gpu-tts": { tts: true } })).toEqual({ asr: [live], tts: [speaker] })
+})
+
+it("requires both streaming and server VAD from Xinference", async () => {
+  const live = model({ model_id: "gpu-asr", model_provider: "xinference", model_name: "arbitrary-asr" })
+  request.mockImplementation(async (url: string) => url.includes("/capabilities")
+    ? new Response(JSON.stringify({ streaming: true, server_vad: false }), { status: 200 })
+    : response([live]))
+  const view = renderHook(() => useVoiceModels(true))
+  await waitFor(() => expect(view.result.current.loading).toBe(false))
+  expect(view.result.current.asr).toEqual([])
+  view.unmount()
+})

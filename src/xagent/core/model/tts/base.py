@@ -84,6 +84,9 @@ class BaseTTS(ABC):
         """Whether the adapter returns audio before synthesis completes."""
         return False
 
+    async def get_streaming_capabilities(self) -> dict[str, Any]:
+        return {"streaming": self.supports_streaming}
+
     def synthesize_stream(
         self,
         text: str,

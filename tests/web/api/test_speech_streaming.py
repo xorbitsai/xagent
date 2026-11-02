@@ -1075,3 +1075,19 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
     )
     assert api.tts.stream_closed and api.tts.close_count == 1
     assert len(api.usage) == 1
+
+
+def test_speech_capabilities_require_model_access_and_close_provider(api):
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == {"streaming": True}
+    assert api.tts.close_count == 1
+    other = build_access_token(sub="other", user_id=2)
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers={"Authorization": f"Bearer {other}"},
+    )
+    assert result.status_code == 404
+    assert api.tts_factory.call_count == 1

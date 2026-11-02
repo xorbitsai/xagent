@@ -12,7 +12,9 @@ from ..media_metering import (
     record_measured_usage,
 )
 from ..xinference_base import BaseXinferenceModel
-from .base import ASRResult, ASRSegment, BaseASR
+from ..xinference_speech import fetch_audio_capabilities
+from .base import ASRResult, ASRSegment, ASRStreamSession, BaseASR
+from .xinference_stream import XinferenceASRStream
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,8 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
     Xinference Automatic Speech Recognition (ASR) model client using the xinference-client SDK.
     Supports speech recognition using Xinference's audio models.
     """
+
+    provider_name = "xinference"
 
     def __init__(
         self,
@@ -50,6 +54,59 @@ class XinferenceASR(BaseASR, BaseXinferenceModel):
         """
         BaseXinferenceModel.__init__(self, model, model_uid, base_url, api_key)
         self.language = language
+        self._streams: set[XinferenceASRStream] = set()
+        self._stream_capabilities: dict[str, Any] = {}
+        self._stream_generation = 0
+
+    @property
+    def supports_streaming(self) -> bool:
+        return self._stream_capabilities.get("streaming") is True
+
+    @property
+    def supports_vad(self) -> bool:
+        return self._stream_capabilities.get("server_vad") is True
+
+    async def get_streaming_capabilities(self) -> dict[str, Any]:
+        info = await fetch_audio_capabilities(self)
+        self._stream_capabilities = info.get("asr", {})
+        return self._stream_capabilities
+
+    async def open_stream(
+        self,
+        *,
+        language: Optional[str] = None,
+        format: str = "pcm",
+        sample_rate: int = 16000,
+        vad: bool = True,
+        **kwargs: Any,
+    ) -> ASRStreamSession:
+        if (
+            format != "pcm"
+            or sample_rate != 16000
+            or not vad
+            or any(value is not None for value in kwargs.values())
+        ):
+            raise ValueError(
+                "Xinference live ASR requires 16 kHz mono PCM and server VAD; configure VAD at model launch"
+            )
+        generation = self._stream_generation
+        await self.get_streaming_capabilities()
+        if not self.supports_streaming or not self.supports_vad:
+            raise ValueError(
+                "The running Xinference model does not support live ASR with VAD"
+            )
+        stream = await XinferenceASRStream.connect(self, language or self.language)
+        if generation != self._stream_generation:
+            await stream.aclose()
+            raise RuntimeError("ASR model was closed while opening its stream")
+        self._streams.add(stream)
+        return stream
+
+    def _start_closes(self) -> list[Any]:
+        self._stream_generation += 1
+        return [
+            stream.aclose() for stream in tuple(self._streams)
+        ] + super()._start_closes()
 
     async def _record_usage(
         self, result: Any, audio_data: bytes, format: Optional[str]

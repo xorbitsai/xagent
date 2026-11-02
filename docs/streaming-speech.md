@@ -138,3 +138,28 @@ per-user or per-model concurrency cap: parallel streams, including those using
 a shared model's provider credential, are permitted. Usage accounting does not
 provide concurrency admission. Deployments that require such caps must enforce
 them across API replicas at their admission layer.
+
+## Xinference deployments
+
+Xinference models can use the same voice conversation controls when the running
+server exposes `GET /v1/models/{model_uid}/audio/capabilities`. Configure each
+speech model with the Xinference server root URL and the launched model UID.
+Capabilities are queried from the loaded adapter rather than inferred from that
+UID: ordinary file-only ASR and nonstreaming TTS remain unavailable to voice mode.
+The authenticated Xagent capability endpoint is
+`GET /api/models/speech/capabilities?model_id=<saved-id>&ability=asr` (or `tts`).
+
+For Qwen3-ASR 0.6B/1.7B and Qwen3-TTS CustomVoice 0.6B/1.7B, use Xinference's
+`vLLM` engine. Live ASR requires mono PCM16 at 16 kHz and server VAD; VAD timing
+is configured at model launch. Cumulative Xinference snapshots become individual
+partial/final segments in Xagent. Manual commits are unsupported because
+Xinference's `input.end` terminates a session. Closing the Xagent connection
+cancels the upstream session.
+
+Streaming CustomVoice synthesis uses mono PCM16 at 24 kHz. Set the saved TTS
+format to `pcm` and sample rate to `24000`; voice settings list the actual preset
+voice IDs returned by the loaded model. Audio is forwarded as it arrives, and
+interrupting playback closes the upstream response. Private or SSH-forwarded
+model endpoints must be listed in `XAGENT_MODEL_PRIVATE_ENDPOINTS` with matching
+`XAGENT_MODEL_PRIVATE_CIDRS`, using the deployment configuration described in
+`example.env`.

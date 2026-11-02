@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import difflib
 import hashlib
 import inspect
 import itertools
@@ -210,6 +211,12 @@ PAGINATION_ARGUMENT_NAMES = frozenset(
         "startAt",
     }
 )
+# Hints in the error for an unknown tool name. Close names are preferred; the
+# listing is the fallback for a name nothing resembles and stays short because
+# the model already has the full set in its tool schemas.
+TOOL_NOT_FOUND_CLOSE_CUTOFF = 0.8
+TOOL_NOT_FOUND_MAX_CLOSE_NAMES = 3
+TOOL_NOT_FOUND_MAX_LISTED_NAMES = 20
 # Bounds for the final_answer-strip warning's tool-name list. Tool names come
 # straight from the model, so the log line is shaped like the rest of this
 # module's untrusted-input logging: bounded length, escaped, never raw.
@@ -6828,7 +6835,40 @@ class ReActPattern(AgentPattern):
             matches_name = getattr(tool, "matches_name", None)
             if callable(matches_name) and matches_name(name):
                 return tool
-        raise ValueError(f"Tool not found: {name}")
+        raise ValueError(self._tool_not_found_message(name, tools))
+
+    def _tool_not_found_message(self, name: Any, tools: list[Any]) -> str:
+        """Name what the model emitted and what it could have called instead.
+
+        ``repr`` keeps an invalid name visibly different from a real tool whose
+        name it resembles, including when the replayed call shows that spelling.
+        """
+        available = list(
+            dict.fromkeys(
+                [
+                    # Not offered in the schema until a result has been spilled.
+                    *(
+                        tool_name
+                        for tool_name in map(self._tool_name, tools)
+                        if tool_name != SPILL_READ_TOOL_NAME
+                    ),
+                    *self._schema_tool_names(self._builtin_tool_schemas()),
+                ]
+            )
+        )
+        message = f"Tool not found: {name!r}."
+        close = difflib.get_close_matches(
+            str(name),
+            available,
+            n=TOOL_NOT_FOUND_MAX_CLOSE_NAMES,
+            cutoff=TOOL_NOT_FOUND_CLOSE_CUTOFF,
+        )
+        if close:
+            return f"{message} Did you mean: {', '.join(close)}?"
+        listed = ", ".join(available[:TOOL_NOT_FOUND_MAX_LISTED_NAMES])
+        hidden = len(available) - TOOL_NOT_FOUND_MAX_LISTED_NAMES
+        more = f" (and {hidden} more)" if hidden > 0 else ""
+        return f"{message} Available tools: {listed}{more}."
 
     async def _invoke_callable(self, fn: Any, **kwargs: Any) -> Any:
         if inspect.iscoroutinefunction(fn):

@@ -18,6 +18,7 @@ from .jira_attachment import (
     confirmed_attachment,
     read_allowed_file,
 )
+from .jira_delete import delete_error_hint
 from .utils import (
     clamp_limit,
     clamp_offset,
@@ -2407,6 +2408,57 @@ def jira_add_attachment(issue_key: str, file_path: str, cloud_id: str = "") -> s
         return _success(attachment=confirmed_attachment(result, len(data)))
     except Exception as e:
         return _attachment_error(issue_key, e, hint=attachment_error_hint(e))
+
+
+def _delete_error(issue_key: str, exc: Exception, hint: str | None = None) -> str:
+    safe_message = _safe_text(exc)
+    logger.error(f"Error deleting Jira issue {issue_key}: {safe_message}")
+    return _error(f"{hint}: {safe_message}" if hint else safe_message)
+
+
+@mcp.tool()
+def jira_delete_issue(
+    issue_key: str, delete_subtasks: bool = False, cloud_id: str = ""
+) -> str:
+    """
+    Permanently delete an issue. Jira Cloud has no trash or undo for this:
+    the issue, its comments, attachments and history are gone for good.
+    Before calling, confirm the exact issue key with the user (e.g. show them
+    its summary from jira_get_issue). If the user only wants the issue out of
+    the way, suggest jira_transition_issue to a status such as "Won't Do" or
+    "Closed" instead, which keeps the record.
+    issue_key: an issue key (e.g. "ENG-123") or its numeric id.
+    delete_subtasks: Jira refuses to delete an issue that has subtasks unless
+    this is true, and then deletes the subtasks too. Set it only after the
+    user has agreed to lose the subtasks.
+    """
+    try:
+        # Checked before any request, so a bad key never costs a call to Jira.
+        path = _issue_path(issue_key)
+    except ValueError as e:
+        return _error(_safe_text(e))
+    try:
+        resolved_cloud_id = _resolve_cloud_id(cloud_id)
+    except Exception as e:
+        # Not the DELETE yet: a failure here says nothing about the issue,
+        # so it gets no delete hint.
+        return _delete_error(issue_key, e)
+    try:
+        _request(
+            "DELETE",
+            resolved_cloud_id,
+            path,
+            # Jira reads the literal "true"/"false"; requests would send a
+            # Python bool as "True"/"False".
+            params={"deleteSubtasks": "true" if delete_subtasks else "false"},
+        )
+        return _success(issue_key=issue_key, deleted=True)
+    except Exception as e:
+        return _delete_error(
+            issue_key,
+            e,
+            hint=delete_error_hint(e, delete_subtasks=delete_subtasks),
+        )
 
 
 @mcp.tool()

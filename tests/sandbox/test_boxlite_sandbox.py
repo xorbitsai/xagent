@@ -19,7 +19,7 @@ except ImportError:
     )
 
 from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
-from xagent.sandbox.base import SandboxConfig, SandboxTemplate
+from xagent.sandbox.base import SandboxConfig, SandboxContractError, SandboxTemplate
 from xagent.sandbox.boxlite_sandbox import (
     BoxliteSandbox,
     BoxliteSandboxService,
@@ -72,6 +72,43 @@ class TestBoxliteSandboxRunCodeValidation:
 
         with pytest.raises(ValueError, match="Unsupported code type: ruby"):
             await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_bounded_download_rejects_guest_snapshot_before_host_copy(
+    tmp_path,
+) -> None:
+    class _FakeBox:
+        copy_out_called = False
+
+        async def exec(self, command, *args, **kwargs):
+            del kwargs
+            stdout = (
+                "/var/tmp/.xagent-bounded-download.test\n"
+                if command == "mktemp"
+                else "6\n"
+                if command == "stat"
+                else ""
+            )
+            return SimpleNamespace(
+                exit_code=0,
+                stdout=stdout,
+                stderr="",
+                error_message=None,
+            )
+
+        async def copy_out(self, *_args, **_kwargs):
+            self.copy_out_called = True
+
+    sandbox = object.__new__(BoxliteSandbox)
+    sandbox._box = _FakeBox()
+    destination = tmp_path / "download.bin"
+
+    with pytest.raises(SandboxContractError, match="byte limit"):
+        await sandbox.download_file("/guest/growing.bin", str(destination), max_bytes=5)
+
+    assert not sandbox._box.copy_out_called
+    assert not destination.exists()
 
 
 class _FakeStream:

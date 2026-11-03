@@ -930,6 +930,21 @@ class Sandbox(abc.ABC):
             ExecResult: Execution result with exit code, stdout, and stderr.
         """
 
+    async def prepare_workspace_roots(self, paths: Sequence[str]) -> None:
+        """Provision sandbox-local workspace roots before transfer.
+
+        Backends whose runtime identity cannot create arbitrary absolute roots
+        may override this narrow internal hook. The default keeps the normal
+        sandbox identity and is sufficient for already writable locations.
+        """
+        for path in paths:
+            result = await self.exec("mkdir", "-p", path)
+            if result.exit_code != 0:
+                raise SandboxContractError(
+                    f"Failed to prepare sandbox workspace root {path}: "
+                    f"{result.stderr or result.stdout}"
+                )
+
     # --- File Operations ---
 
     @abc.abstractmethod
@@ -950,7 +965,12 @@ class Sandbox(abc.ABC):
 
     @abc.abstractmethod
     async def download_file(
-        self, remote_path: str, local_path: str, overwrite: bool = False
+        self,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool = False,
+        *,
+        max_bytes: int | None = None,
     ) -> None:
         """Download a file from the sandbox.
 
@@ -958,10 +978,12 @@ class Sandbox(abc.ABC):
             remote_path: Source path in sandbox.
             local_path: Local target path (including filename).
             overwrite: Whether to overwrite if local file exists. Default False.
+            max_bytes: Optional hard limit while consuming the remote file.
 
         Raises:
             FileNotFoundError: Source file not found in sandbox.
             FileExistsError: Local file exists and overwrite=False.
+            SandboxContractError: Remote content exceeds max_bytes.
         """
 
     @abc.abstractmethod

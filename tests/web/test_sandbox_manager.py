@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.web.sandbox_fakes import FakeSandboxService
+from xagent.core.workspace import TaskWorkspace
 from xagent.sandbox.base import (
     SandboxConfig,
     SandboxInfo,
@@ -18,6 +19,7 @@ from xagent.sandbox.base import (
     SandboxTemplate,
 )
 from xagent.web.sandbox_manager import (
+    SandboxLeaseProvider,
     SandboxManager,
     _create_boxlite_service,
     _create_docker_service,
@@ -45,6 +47,148 @@ def reset_global_state():
     yield
     mod._sandbox_manager = None
     mod._sandbox_manager_initialized = False
+
+
+@pytest.mark.asyncio
+async def test_transfer_lease_checks_out_and_in_under_exclusive_lock():
+    transfer = MagicMock()
+    transfer.lock = asyncio.Lock()
+    transfer.checkout = AsyncMock()
+    transfer.check_in = AsyncMock()
+    sandbox = MagicMock()
+    provider = SandboxLeaseProvider(
+        manager=MagicMock(),
+        lifecycle_type="user",
+        lifecycle_id="7",
+        primary_sandbox=sandbox,
+        mount_intent=None,
+        prepare_root=None,
+        max_concurrency=3,
+        workspace_transfer=transfer,
+    )
+
+    async with provider.lease(concurrency_safe=False) as leased:
+        assert leased is sandbox
+        assert transfer.lock.locked()
+        transfer.checkout.assert_awaited_once_with(sandbox)
+
+    transfer.check_in.assert_awaited_once_with(sandbox)
+    assert not transfer.lock.locked()
+
+
+def test_transfer_mode_omits_writable_workspace_bind(tmp_path):
+    service = FakeSandboxService()
+    manager = SandboxManager(service)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    intent = SandboxMountIntent(mount_root=str(workspace))
+
+    with (
+        patch.dict(
+            "os.environ", {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"}, clear=False
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[("/project/src", "/app/src", "ro")],
+        ),
+    ):
+        volumes = manager._make_default_volumes("user", "7", mount_intent=intent)
+
+    assert volumes == [("/project/src", "/app/src", "ro")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lifecycle_type", ["ssh", "mcp"])
+async def test_transfer_mode_keeps_workspace_free_provider_without_transfer(
+    lifecycle_type,
+):
+    manager = SandboxManager(FakeSandboxService())
+
+    with (
+        patch.dict(
+            "os.environ", {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"}, clear=False
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[("/repo/src", "/app/src", "ro")],
+        ),
+    ):
+        provider = await manager.get_or_create_lease_provider(
+            lifecycle_type, "connector-list"
+        )
+
+    assert provider.workspace_transfer is None
+
+
+def test_transfer_mode_preserves_folded_ancestor_as_readonly_input(tmp_path):
+    manager = SandboxManager(FakeSandboxService())
+    ancestor = tmp_path / "user"
+    writable = ancestor / "project"
+    writable.mkdir(parents=True)
+    intent = SandboxMountIntent(mount_root=str(ancestor))
+
+    with patch.dict(
+        "os.environ", {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"}, clear=False
+    ):
+        transfer = manager._workspace_transfer(
+            "user", "7", intent, prepare_root=str(writable)
+        )
+
+    assert transfer is not None
+    assert [(root.path, root.writable) for root in transfer.roots] == [
+        (ancestor, False),
+        (writable, True),
+    ]
+
+
+def test_transfer_mode_uses_task_workspace_physical_symlink_projection(tmp_path):
+    real = tmp_path / "real-uploads"
+    real.mkdir()
+    alias = tmp_path / "uploads-alias"
+    alias.symlink_to(real, target_is_directory=True)
+    workspace = TaskWorkspace(
+        "task_9", base_dir=str(alias), migrate_sandbox_permissions=False
+    )
+    manager = SandboxManager(FakeSandboxService())
+    intent = SandboxMountIntent(mount_root=str(alias / "task_9"))
+
+    with patch.dict(
+        "os.environ", {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"}, clear=False
+    ):
+        transfer = manager._workspace_transfer(
+            "user", "7", intent, prepare_root=str(alias / "task_9")
+        )
+
+    assert transfer is not None
+    assert transfer.roots[0].path == workspace.workspace_dir
+
+
+@pytest.mark.asyncio
+async def test_transfer_provider_recovers_backup_before_workspace_preparation(tmp_path):
+    manager = SandboxManager(FakeSandboxService())
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "kept.txt").write_text("kept")
+    backup = workspace.parent / ".workspace.sandbox-transfer-backup"
+    workspace.rename(backup)
+    intent = SandboxMountIntent(mount_root=str(workspace))
+
+    with (
+        patch.dict(
+            "os.environ", {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"}, clear=False
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[("/repo/src", "/app/src", "ro")],
+        ),
+    ):
+        provider = await manager.get_or_create_lease_provider(
+            "user", "7", mount_intent=intent
+        )
+
+    assert provider.workspace_transfer is not None
+    assert not backup.exists()
+    assert (workspace / "kept.txt").read_text() == "kept"
 
 
 class TestCreateSandboxService:
@@ -1235,6 +1379,38 @@ class TestGetOrCreateLeaseProvider:
         assert first is provider
         assert second is provider
         manager._create_lease_provider_locked.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_transfer_cache_rejects_different_prepare_root(self, tmp_path):
+        manager = self._make_manager()
+        ancestor = tmp_path / "user"
+        first_root = ancestor / "project-a"
+        second_root = ancestor / "project-b"
+        first_root.mkdir(parents=True)
+        second_root.mkdir()
+        intent = SandboxMountIntent(mount_root=str(ancestor))
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"},
+                clear=False,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            await manager.get_or_create_lease_provider(
+                "user", "7", mount_intent=intent, prepare_root=str(first_root)
+            )
+
+            with pytest.raises(
+                SandboxRuntimeConflictError, match="different workspace transfer roots"
+            ):
+                await manager.get_or_create_lease_provider(
+                    "user", "7", mount_intent=intent, prepare_root=str(second_root)
+                )
 
     @pytest.mark.asyncio
     async def test_cached_provider_recovers_runtime_network_drift(self, tmp_path):

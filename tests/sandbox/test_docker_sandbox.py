@@ -16,6 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -27,6 +28,7 @@ from xagent.sandbox.base import (
     SANDBOX_RUNTIME_UID,
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
+    SandboxContractError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
     SpecVerdict,
@@ -42,6 +44,7 @@ from xagent.sandbox.docker_sandbox import (
     _write_tar_from_local_path,
     is_docker_available,
 )
+from xagent.sandbox.workspace_transfer import WorkspaceTransfer, WorkspaceTransferRoot
 
 
 def _raw_tar_records(archive: io.BytesIO) -> list[tuple[bytes, bytes, bytes]]:
@@ -360,6 +363,76 @@ def _get_free_host_port() -> int:
         sock.bind(("127.0.0.1", 0))
         sock.listen(1)
         return int(sock.getsockname()[1])
+
+
+def test_bounded_download_stops_archive_spooling_before_disk_growth() -> None:
+    with tempfile.TemporaryFile() as archive:
+        with pytest.raises(SandboxContractError, match="archive exceeds"):
+            docker_sandbox_module._write_stream_to_file(
+                [b"small", b"unexpected-growth"], archive, max_bytes=5
+            )
+        assert archive.tell() == 5
+
+
+@pytest.mark.asyncio
+async def test_cancelled_docker_exec_is_killed_and_drained_before_return() -> None:
+    started = threading.Event()
+    killed = threading.Event()
+    drained = threading.Event()
+    killer_users: list[str | None] = []
+
+    class _ExecAPI:
+        def exec_create(self, _container_id, cmd, **kwargs):
+            if "xagent-kill" in cmd:
+                killer_users.append(kwargs.get("user"))
+                return {"Id": "killer"}
+            return {"Id": "running"}
+
+        def exec_start(self, exec_id, **_kwargs):
+            if exec_id == "killer":
+                killed.set()
+                return b""
+
+            def stream():
+                started.set()
+                assert killed.wait(timeout=2)
+                drained.set()
+                if False:
+                    yield None
+
+            return stream()
+
+        def exec_inspect(self, exec_id):
+            if exec_id == "running":
+                return {"Running": not killed.is_set(), "Pid": 123, "ExitCode": 137}
+            return {"Running": False, "Pid": 0, "ExitCode": 0}
+
+    container = SimpleNamespace(
+        id="container",
+        client=SimpleNamespace(api=_ExecAPI()),
+        kill=lambda: killed.set(),
+    )
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._control = _SandboxControl("test")
+
+    async def require_container():
+        return container
+
+    sandbox._require_container = require_container
+    execution = asyncio.create_task(sandbox.exec("sleep", "600"))
+    assert await asyncio.to_thread(started.wait, 2)
+    execution.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+    assert killed.is_set()
+    assert drained.is_set()
+    assert killer_users == [
+        f"{docker_sandbox_module.SANDBOX_RUNTIME_UID}:"
+        f"{docker_sandbox_module.SANDBOX_RUNTIME_GID}"
+    ]
+    assert sandbox._control.active_ops == 0
 
 
 class TestDockerSandboxServiceFailures:
@@ -1081,6 +1154,30 @@ class TestNamespaceIsolation:
         )
         assert captured["network_mode"] == "none"
         assert "network" not in captured
+
+    @pytest.mark.asyncio
+    async def test_transfer_workspace_mode_provides_private_root_tmpfs(
+        self, monkeypatch
+    ):
+        async def _noop_ensure_image(_client, _image):
+            return None
+
+        monkeypatch.setattr(docker_sandbox_module, "_ensure_image", _noop_ensure_image)
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", "transfer")
+        client, captured = _capture_create_client()
+
+        await docker_sandbox_module._create_container(
+            client,
+            "user::1",
+            "alpha",
+            "img",
+            SandboxTemplate(type="image", image="img"),
+            SandboxConfig(volumes=[("/project/src", "/app/src", "ro")]),
+            "alpha-sandbox-egress",
+        )
+
+        assert captured["tmpfs"]["/root"].endswith("mode=0711,uid=1100,gid=1010")
+        assert "size=256m" in captured["tmpfs"]["/root"]
 
     @pytest.mark.asyncio
     async def test_create_defaults_runtime_security_profile(self, monkeypatch):
@@ -1868,6 +1965,101 @@ class TestDockerSandbox:
         finally:
             try:
                 await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_transfer_workspace_accepts_file_larger_than_64k(
+        self, docker_service, tmp_path
+    ):
+        name = f"test_transfer_large_{uuid.uuid4().hex[:8]}"
+        local = tmp_path / "accepted.bin"
+        local.write_bytes(b"x" * (128 * 1024))
+        remote = "/root/.xagent/uploads/user_1/accepted.bin"
+
+        with patch.dict(
+            os.environ, {"XAGENT_SANDBOX_WORKSPACE_MODE": "transfer"}, clear=False
+        ):
+            try:
+                sandbox = await docker_service.create(
+                    name,
+                    SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                    SandboxConfig(cpus=1, memory=512),
+                )
+                await sandbox.prepare_workspace_roots(
+                    [
+                        "/root/.xagent/uploads/user_1",
+                        "/srv/xagent/uploads/user_1",
+                    ]
+                )
+                await sandbox.upload_file(str(local), remote)
+                size = await sandbox.exec("stat", "-c", "%s", remote)
+                assert size.exit_code == 0, size.stderr
+                assert int(size.stdout.strip()) == 128 * 1024
+                external = "/srv/xagent/uploads/user_1/accepted.bin"
+                await sandbox.upload_file(str(local), external)
+                external_size = await sandbox.exec("stat", "-c", "%s", external)
+                assert external_size.exit_code == 0, external_size.stderr
+                assert int(external_size.stdout.strip()) == 128 * 1024
+            finally:
+                try:
+                    await docker_service.delete(name)
+                except Exception:
+                    pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_cancelled_exec_is_drained_before_next_operation(
+        self, docker_service
+    ):
+        name = f"test_cancel_exec_{uuid.uuid4().hex[:8]}"
+        try:
+            sandbox = await docker_service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(cpus=1, memory=512),
+            )
+            running = asyncio.create_task(sandbox.exec("sleep", "600"))
+            await asyncio.sleep(0.5)
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(running, timeout=10)
+
+            probe = await sandbox.exec("true")
+            assert probe.exit_code == 0, probe.stderr
+        finally:
+            try:
+                await docker_service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_transfer_helpers_ignore_guest_python_shadowing(
+        self, docker_service, tmp_path
+    ):
+        name = f"test_transfer_helper_{uuid.uuid4().hex[:8]}"
+        host_workspace = tmp_path / "workspace"
+        host_workspace.mkdir()
+        (host_workspace / "input.txt").write_text("input")
+        transfer = WorkspaceTransfer(
+            [WorkspaceTransferRoot(host_workspace, writable=True)]
+        )
+        try:
+            sandbox = await docker_service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(cpus=1, memory=512),
+            )
+            await transfer.checkout(sandbox)
+            await sandbox.write_file(
+                "import time\ntime.sleep(600)\n", "/home/sandbox/json.py"
+            )
+            await sandbox.write_file("output", str(host_workspace / "output.txt"))
+
+            await asyncio.wait_for(transfer.check_in(sandbox), timeout=10)
+            assert (host_workspace / "output.txt").read_text() == "output"
+        finally:
+            try:
+                await docker_service.delete(name)
             except Exception:
                 pass
 

@@ -8,6 +8,7 @@ import abc
 import asyncio
 import errno
 import io
+import json
 import logging
 import os
 import posixpath
@@ -17,6 +18,8 @@ import stat
 import tarfile
 import tempfile
 import textwrap
+import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -28,6 +31,7 @@ from typing import (
     AsyncIterator,
     Coroutine,
     Optional,
+    Sequence,
     cast,
 )
 
@@ -38,6 +42,7 @@ from ..config import (
     get_sandbox_namespace,
     get_sandbox_network,
     get_sandbox_pids_limit,
+    get_sandbox_workspace_mode,
     get_uploads_dir,
     validate_sandbox_namespace,
     validate_sandbox_network,
@@ -53,6 +58,7 @@ from .base import (
     Sandbox,
     SandboxAlreadyExistsError,
     SandboxConfig,
+    SandboxContractError,
     SandboxInfo,
     SandboxInspection,
     SandboxNotFoundError,
@@ -69,6 +75,36 @@ if TYPE_CHECKING:
     from docker.models.containers import Container
 
 logger = logging.getLogger(__name__)
+
+_MAX_TAR_ARCHIVE_OVERHEAD = 1024 * 1024
+_TRANSFER_ROOT_TMPFS_SIZE = "256m"
+_PREPARE_WORKSPACE_ROOTS_SCRIPT = r"""
+import json, os, stat, sys
+flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+uid, gid = int(sys.argv[2]), int(sys.argv[3])
+for raw in json.loads(sys.argv[1]):
+    if not isinstance(raw, str) or not raw.startswith("/") or raw == "/" or os.path.normpath(raw) != raw:
+        raise SystemExit("invalid workspace root")
+    descriptor = os.open("/", flags)
+    try:
+        for component in raw.split("/")[1:]:
+            created = False
+            try:
+                os.mkdir(component, mode=0o750, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+            if created:
+                os.fchown(descriptor, uid, gid)
+                os.fchmod(descriptor, 0o750)
+        os.fchown(descriptor, uid, gid)
+        os.fchmod(descriptor, 0o750)
+    finally:
+        os.close(descriptor)
+"""
 
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
 
@@ -754,8 +790,19 @@ def _write_tar_from_content(
     file_obj.seek(0)
 
 
+@dataclass
+class _DockerExecState:
+    created: threading.Event = field(default_factory=threading.Event)
+    exec_id: str | None = None
+
+
 def _exec_capped(
-    container: Any, cmd: list[str], env: Optional[dict[str, str]], cap: int
+    container: Any,
+    cmd: list[str],
+    env: Optional[dict[str, str]],
+    cap: int | None,
+    state: _DockerExecState,
+    user: str | None = None,
 ) -> ExecResult:
     """Exec ``cmd`` streaming stdout/stderr and keeping at most ``cap`` bytes of
     each, so the host docker client never buffers an unbounded remote flood
@@ -764,26 +811,41 @@ def _exec_capped(
     drop everything past the cap while still draining to EOF (the caller's
     ``timeout`` bounds how long that can take). Blocking — run in a thread."""
     api = container.client.api
-    exec_id = api.exec_create(
-        container.id, cmd, environment=env, stdout=True, stderr=True
-    )["Id"]
+    try:
+        create_kwargs: dict[str, Any] = {
+            "environment": env,
+            "stdout": True,
+            "stderr": True,
+        }
+        if user is not None:
+            create_kwargs["user"] = user
+        exec_id = api.exec_create(container.id, cmd, **create_kwargs)["Id"]
+        state.exec_id = exec_id
+    finally:
+        state.created.set()
     out = bytearray()
     err = bytearray()
     out_truncated = False
     err_truncated = False
     for stdout_chunk, stderr_chunk in api.exec_start(exec_id, stream=True, demux=True):
         if stdout_chunk:
-            room = cap - len(out)
-            if room > 0:
-                out.extend(stdout_chunk[:room])
-            if len(stdout_chunk) > max(room, 0):
-                out_truncated = True
+            if cap is None:
+                out.extend(stdout_chunk)
+            else:
+                room = cap - len(out)
+                if room > 0:
+                    out.extend(stdout_chunk[:room])
+                if len(stdout_chunk) > max(room, 0):
+                    out_truncated = True
         if stderr_chunk:
-            room = cap - len(err)
-            if room > 0:
-                err.extend(stderr_chunk[:room])
-            if len(stderr_chunk) > max(room, 0):
-                err_truncated = True
+            if cap is None:
+                err.extend(stderr_chunk)
+            else:
+                room = cap - len(err)
+                if room > 0:
+                    err.extend(stderr_chunk[:room])
+                if len(stderr_chunk) > max(room, 0):
+                    err_truncated = True
     exit_code = api.exec_inspect(exec_id).get("ExitCode")
     return ExecResult(
         exit_code=exit_code if exit_code is not None else -1,
@@ -794,11 +856,54 @@ def _exec_capped(
     )
 
 
+def _kill_docker_exec(container: Any, state: _DockerExecState) -> None:
+    """Terminate one Docker exec without waiting on its blocked stream."""
+    if not state.created.wait(timeout=5) or state.exec_id is None:
+        raise RuntimeError("Docker exec was not created before cancellation")
+    api = container.client.api
+    inspection = api.exec_inspect(state.exec_id)
+    pid = inspection.get("Pid")
+    if not isinstance(pid, int) or pid <= 0:
+        if not inspection.get("Running"):
+            return
+        raise RuntimeError("Docker exec has no killable guest pid")
+    kill_tree = (
+        'kill_tree() { for child in $(ps -o pid= --ppid "$1"); do '
+        'kill_tree "$child"; done; kill -KILL "$1" 2>/dev/null || true; }; '
+        'kill_tree "$1"'
+    )
+    killer = api.exec_create(
+        container.id,
+        ["sh", "-c", kill_tree, "xagent-kill", str(pid)],
+        # The container drops every capability, including CAP_KILL. Execute
+        # the terminator as the same uid as untrusted commands so ordinary
+        # same-uid signal permission remains sufficient.
+        user=f"{SANDBOX_RUNTIME_UID}:{SANDBOX_RUNTIME_GID}",
+        stdout=False,
+        stderr=False,
+    )["Id"]
+    api.exec_start(killer)
+    deadline = time.monotonic() + 4.0
+    while api.exec_inspect(state.exec_id).get("Running"):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("Cancelled Docker exec is still running")
+        time.sleep(0.05)
+
+
 def _write_stream_to_file(
-    stream: Any, file_obj: io.BufferedRandom | io.BufferedWriter
+    stream: Any,
+    file_obj: io.BufferedRandom | io.BufferedWriter,
+    *,
+    max_bytes: int | None = None,
 ) -> None:
     """Copy a streamed Docker archive into a local file object."""
+    total = 0
     for chunk in stream:
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise SandboxContractError(
+                "Sandbox download archive exceeds its byte limit"
+            )
         file_obj.write(chunk)
     file_obj.flush()
     file_obj.seek(0)
@@ -807,6 +912,8 @@ def _write_stream_to_file(
 def _extract_single_file_from_tar(
     tar_file_obj: io.BufferedRandom | io.BufferedReader,
     output_file_obj: io.BufferedWriter | io.BytesIO,
+    *,
+    max_bytes: int | None = None,
 ) -> None:
     """Extract the first regular file from a Docker get_archive tar stream."""
     with tarfile.open(fileobj=tar_file_obj, mode="r:*") as tar:
@@ -816,7 +923,12 @@ def _extract_single_file_from_tar(
         fileobj = tar.extractfile(member)
         if fileobj is None:
             raise FileNotFoundError(f"Could not read file from archive: {member.name}")
-        shutil.copyfileobj(fileobj, output_file_obj)
+        total = 0
+        while chunk := fileobj.read(1024 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise SandboxContractError("Sandbox download exceeds its byte limit")
+            output_file_obj.write(chunk)
         output_file_obj.flush()
 
 
@@ -940,23 +1052,52 @@ class DockerSandbox(Sandbox):
         *args: str,
         env: Optional[dict[str, str]] = None,
         max_output_bytes: Optional[int] = None,
+        user: str | None = None,
     ) -> ExecResult:
         """Execute a command directly against the current container instance."""
         container = await self._require_container()
         cmd: list[str] = [command, *args]
-        try:
-            if max_output_bytes is not None:
-                return await asyncio.to_thread(
-                    _exec_capped, container, cmd, env, max_output_bytes
-                )
-            result = await asyncio.to_thread(
-                container.exec_run,
+        state = _DockerExecState()
+        execution = asyncio.create_task(
+            asyncio.to_thread(
+                _exec_capped,
+                container,
                 cmd,
-                environment=env,
-                demux=True,
-                stdout=True,
-                stderr=True,
+                env,
+                max_output_bytes,
+                state,
+                user,
             )
+        )
+        try:
+            return await asyncio.shield(execution)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_kill_docker_exec, container, state), timeout=5
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to terminate cancelled Docker exec %s", state.exec_id
+                )
+                # A whole-container kill is the fail-closed fallback: a stale
+                # guest process must never outlive its lease and write into the
+                # next workspace snapshot.
+                await asyncio.wait_for(asyncio.to_thread(container.kill), timeout=5)
+            try:
+                await asyncio.wait_for(asyncio.shield(execution), timeout=10)
+            except Exception:
+                logger.exception(
+                    "Cancelled Docker exec %s did not drain after termination",
+                    state.exec_id,
+                )
+                # The targeted same-uid process-tree kill did not settle the
+                # Docker stream. Stop the whole sandbox before its operation
+                # guard can be released; reusing a container with an unknown
+                # live process would cross the next workspace lease boundary.
+                await asyncio.wait_for(asyncio.to_thread(container.kill), timeout=5)
+                await asyncio.wait_for(asyncio.shield(execution), timeout=10)
+            raise
         except Exception as exc:
             return ExecResult(
                 exit_code=1,
@@ -965,14 +1106,26 @@ class DockerSandbox(Sandbox):
                 error_message=str(exc),
             )
 
-        output = cast(tuple[bytes | None, bytes | None] | None, result.output)
-        stdout_bytes, stderr_bytes = output if output is not None else (b"", b"")
-        return ExecResult(
-            exit_code=cast(int, result.exit_code),
-            stdout=(stdout_bytes or b"").decode("utf-8", errors="replace"),
-            stderr=(stderr_bytes or b"").decode("utf-8", errors="replace"),
-            error_message=None,
-        )
+    async def prepare_workspace_roots(self, paths: Sequence[str]) -> None:
+        """Create authorized container-local roots as root, then drop ownership."""
+        async with self._control.operation():
+            async with self._control.exec_lock:
+                result = await self._exec_in_container(
+                    "python",
+                    "-I",
+                    "-S",
+                    "-c",
+                    _PREPARE_WORKSPACE_ROOTS_SCRIPT,
+                    json.dumps(list(paths)),
+                    str(SANDBOX_RUNTIME_UID),
+                    str(SANDBOX_RUNTIME_GID),
+                    user="0",
+                )
+                if result.exit_code != 0:
+                    raise SandboxContractError(
+                        "Failed to prepare sandbox workspace roots: "
+                        f"{result.stderr or result.stdout}"
+                    )
 
     async def stop(self) -> None:
         """Stop the sandbox container while preserving filesystem state.
@@ -1081,7 +1234,12 @@ class DockerSandbox(Sandbox):
                         raise RuntimeError(f"Failed to upload file to {remote_path}")
 
     async def download_file(
-        self, remote_path: str, local_path: str, overwrite: bool = False
+        self,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool = False,
+        *,
+        max_bytes: int | None = None,
     ) -> None:
         """Download a file from the sandbox to the local filesystem."""
         if not overwrite and os.path.exists(local_path):
@@ -1102,10 +1260,32 @@ class DockerSandbox(Sandbox):
                 local_dir = os.path.dirname(local_path)
                 if local_dir:
                     os.makedirs(local_dir, exist_ok=True)
-                with tempfile.TemporaryFile() as archive_file:
-                    await asyncio.to_thread(_write_stream_to_file, stream, archive_file)
-                    with open(local_path, "wb") as file_obj:
-                        _extract_single_file_from_tar(archive_file, file_obj)
+                destination_opened = False
+                try:
+                    with tempfile.TemporaryFile() as archive_file:
+                        archive_limit = (
+                            None
+                            if max_bytes is None
+                            else max_bytes + _MAX_TAR_ARCHIVE_OVERHEAD
+                        )
+                        await asyncio.to_thread(
+                            _write_stream_to_file,
+                            stream,
+                            archive_file,
+                            max_bytes=archive_limit,
+                        )
+                        with open(local_path, "wb") as file_obj:
+                            destination_opened = True
+                            _extract_single_file_from_tar(
+                                archive_file, file_obj, max_bytes=max_bytes
+                            )
+                except BaseException:
+                    if destination_opened:
+                        try:
+                            os.unlink(local_path)
+                        except FileNotFoundError:
+                            pass
+                    raise
 
     async def write_file(
         self, content: str, remote_path: str, overwrite: bool = False
@@ -1273,13 +1453,21 @@ async def _create_container(
     if effective_pids_limit is not None:
         kwargs["pids_limit"] = effective_pids_limit
     guest_paths = [guest for _, guest, _ in (config.volumes or [])]
-    if any(path.startswith("/root/") for path in guest_paths):
-        # The stock image keeps /root at 0700. A private tmpfs supplies only
-        # traversable parents for nested workspace bind mounts; it exposes no
-        # host files and is discarded with the container.
+    if get_sandbox_workspace_mode() == "transfer" or any(
+        path.startswith("/root/") for path in guest_paths
+    ):
+        # The stock image keeps /root at 0700. In bind mode this supplies only
+        # traversable parents. Transfer mode also needs sandbox-local storage
+        # for accepted 100 MiB inputs and generated output; tmpfs is logical
+        # capacity and is discarded with the container, never a host bind.
+        size = (
+            _TRANSFER_ROOT_TMPFS_SIZE
+            if get_sandbox_workspace_mode() == "transfer"
+            else "64k"
+        )
         kwargs["tmpfs"] = {
             "/root": (
-                "rw,nosuid,nodev,noexec,size=64k,mode=0711,"
+                f"rw,nosuid,nodev,noexec,size={size},mode=0711,"
                 f"uid={SANDBOX_RUNTIME_UID},gid={SANDBOX_RUNTIME_GID}"
             )
         }

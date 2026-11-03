@@ -202,6 +202,7 @@ SANDBOX_TOOL_RUNNER = "XAGENT_SANDBOX_TOOL_RUNNER"
 PYTHON_EXECUTOR_TIMEOUT_SECONDS = "XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS"
 SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
 SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
+SANDBOX_WORKSPACE_MODE = "XAGENT_SANDBOX_WORKSPACE_MODE"
 SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
 SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
 SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
@@ -3291,6 +3292,22 @@ def get_sandbox_max_concurrency() -> int:
         The per-lifecycle sandbox worker cap (>= 1).
     """
     return _get_positive_int_env(SANDBOX_MAX_CONCURRENCY, 3)
+
+
+def get_sandbox_workspace_mode() -> str:
+    """Return how task workspaces are exposed to sandbox containers.
+
+    ``bind`` preserves the historical host bind-mount behavior. ``transfer``
+    keeps workspace paths out of the container spec and copies regular files
+    at the serialized sandbox-lease boundary instead. The latter is opt-in:
+    deployments must finish the broker/storage rollout before enabling it.
+    """
+    value = os.getenv(SANDBOX_WORKSPACE_MODE, "bind").strip().lower()
+    if value not in {"bind", "transfer"}:
+        raise ValueError(
+            f"{SANDBOX_WORKSPACE_MODE} must be 'bind' or 'transfer', got {value!r}"
+        )
+    return value
 
 
 def _get_positive_float_env(env_var: str, default: float | None) -> float | None:

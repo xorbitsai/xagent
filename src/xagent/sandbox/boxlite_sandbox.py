@@ -22,10 +22,13 @@ from boxlite import SimpleBox
 
 from ..config import get_sandbox_image
 from .base import (
+    SANDBOX_RUNTIME_GID,
+    SANDBOX_RUNTIME_UID,
     CodeType,
     ExecResult,
     Sandbox,
     SandboxConfig,
+    SandboxContractError,
     SandboxInfo,
     SandboxNotFoundError,
     SandboxService,
@@ -38,6 +41,36 @@ logger = logging.getLogger(__name__)
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
 _EXECUTION_TIMEOUT_SECONDS = 60 * 60
 _EXECUTION_KILL_TIMEOUT_SECONDS = 5.0
+_BOUNDED_SNAPSHOT_TIMEOUT_SECONDS = 60.0
+_BOUNDED_SNAPSHOT_SCRIPT = r"""
+import os, stat, sys
+source, target = sys.argv[1], sys.argv[2]
+limit, uid, gid = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+output = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+try:
+    os.chmod(os.path.dirname(target), 0o555)
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    source_fd = os.open(source, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+            raise SystemExit("download source is not a regular file")
+        remaining = limit + 1
+        while remaining:
+            chunk = os.read(source_fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            pending = memoryview(chunk)
+            while pending:
+                pending = pending[os.write(output, pending):]
+            remaining -= len(chunk)
+    finally:
+        os.close(source_fd)
+finally:
+    os.close(output)
+"""
 
 # BoxLite's allow_net is enforced against the resolved connection destination.
 # Build an allowlist that is the IPv4 Internet minus IANA special-use ranges.
@@ -462,7 +495,12 @@ class BoxliteSandbox(Sandbox):
             raise RuntimeError(f"Failed to move file to {remote_path}: {result.stderr}")
 
     async def download_file(
-        self, remote_path: str, local_path: str, overwrite: bool = False
+        self,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool = False,
+        *,
+        max_bytes: int | None = None,
     ) -> None:
         check = await self.exec("test", "-e", remote_path)
         if check.exit_code != 0:
@@ -471,32 +509,75 @@ class BoxliteSandbox(Sandbox):
         if not overwrite and os.path.exists(local_path):
             raise FileExistsError(f"Local file already exists: {local_path}")
 
-        # First copy to temp directory (avoid volume mount issues)
+        if max_bytes is None:
+            temp_remote = f"/var/tmp/_download_{uuid.uuid4().hex}"
+            result = await self.exec("cp", remote_path, temp_remote)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to copy file to temporary location: {result.stderr}"
+                )
+            local_dir = os.path.dirname(local_path)
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
+            try:
+                await self._box.copy_out(temp_remote, local_path, overwrite=overwrite)
+            finally:
+                await self.exec("rm", "-f", temp_remote)
+            return
 
-        temp_filename = f"_download_{uuid.uuid4().hex}"
-        temp_remote = f"/var/tmp/{temp_filename}"
-
-        # Ensure /var/tmp exists
-        await self.exec("mkdir", "-p", "/var/tmp")
-
-        # Use cp command to copy to temporary location (supports volume mounts)
-        result = await self.exec("cp", remote_path, temp_remote)
-        if result.exit_code != 0:
+        # Root creates a private destination, then the helper irreversibly
+        # drops to the sandbox uid/gid before opening the guest source with
+        # O_NOFOLLOW. It copies at most max_bytes + 1, so the stable snapshot
+        # cannot expand backend staging or grant access to root-only files.
+        prepare = await self._box.exec(
+            "mktemp",
+            "-d",
+            "/var/tmp/.xagent-bounded-download.XXXXXXXX",
+            user="root",
+        )
+        if prepare.exit_code != 0:
             raise RuntimeError(
-                f"Failed to copy file to temporary location: {result.stderr}"
+                f"Failed to prepare bounded download directory: {prepare.stderr}"
             )
-
-        # Create local directory
-        local_dir = os.path.dirname(local_path)
-        if local_dir:
-            os.makedirs(local_dir, exist_ok=True)
-
-        # copy_out from temporary location to local
+        temp_dir = prepare.stdout.strip()
+        if not temp_dir.startswith("/var/tmp/.xagent-bounded-download."):
+            raise RuntimeError("BoxLite returned an unsafe download directory")
+        temp_remote = f"{temp_dir}/snapshot"
         try:
+            result = await self._box.exec(
+                "python",
+                "-I",
+                "-S",
+                "-c",
+                _BOUNDED_SNAPSHOT_SCRIPT,
+                remote_path,
+                temp_remote,
+                str(max_bytes),
+                str(SANDBOX_RUNTIME_UID),
+                str(SANDBOX_RUNTIME_GID),
+                user="root",
+                timeout=_BOUNDED_SNAPSHOT_TIMEOUT_SECONDS,
+            )
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to copy file to temporary location: {result.stderr}"
+                )
+            size = await self._box.exec(
+                "stat", "-c", "%s", "--", temp_remote, user="root"
+            )
+            if size.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to inspect download snapshot: {size.stderr}"
+                )
+            if int(size.stdout.strip()) > max_bytes:
+                raise SandboxContractError("Sandbox download exceeds its byte limit")
+
+            local_dir = os.path.dirname(local_path)
+            if local_dir:
+                os.makedirs(local_dir, exist_ok=True)
             await self._box.copy_out(temp_remote, local_path, overwrite=overwrite)
         finally:
-            # Clean up temporary file
-            await self.exec("rm", "-f", temp_remote)
+            await self._box.exec("rm", "-rf", "--", temp_dir, user="root")
 
     async def write_file(
         self, content: str, remote_path: str, overwrite: bool = False

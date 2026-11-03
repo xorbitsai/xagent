@@ -2429,6 +2429,27 @@ class TestSandboxConcurrencyConfig:
         assert get_sandbox_max_concurrency() == 3
 
 
+class TestSandboxWorkspaceModeConfig:
+    def test_default_is_bind(self, monkeypatch):
+        from xagent.config import get_sandbox_workspace_mode
+
+        monkeypatch.delenv("XAGENT_SANDBOX_WORKSPACE_MODE", raising=False)
+        assert get_sandbox_workspace_mode() == "bind"
+
+    def test_accepts_transfer_case_insensitively(self, monkeypatch):
+        from xagent.config import get_sandbox_workspace_mode
+
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", " Transfer ")
+        assert get_sandbox_workspace_mode() == "transfer"
+
+    def test_rejects_unknown_mode(self, monkeypatch):
+        from xagent.config import get_sandbox_workspace_mode
+
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", "shared")
+        with pytest.raises(ValueError, match="must be 'bind' or 'transfer'"):
+            get_sandbox_workspace_mode()
+
+
 class TestTriggerRateLimitConfig:
     """Config for trigger callback and CRUD rate limits."""
 

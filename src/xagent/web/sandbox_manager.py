@@ -31,6 +31,7 @@ from ..config import (
     get_sandbox_volumes,
     get_sandbox_worker_id,
     get_sandbox_worker_namespace,
+    get_sandbox_workspace_mode,
     get_storage_root,
     get_uploads_dir,
 )
@@ -58,6 +59,12 @@ from ..sandbox.base import (
     canonical_sandbox_path,
     grant_sandbox_runtime_access,
     spec_matches_inspection,
+)
+from ..sandbox.workspace_transfer import (
+    WorkspaceTransfer,
+    WorkspaceTransferRoot,
+    finish_workspace_transfer,
+    recover_workspace_root,
 )
 from .sandbox_keys import (
     DURABLE_CHROME_LIFECYCLE_TYPE,
@@ -124,17 +131,27 @@ class SandboxLease:
         self._sandbox: Sandbox | None = None
 
     async def __aenter__(self) -> Sandbox:
-        if not self._concurrency_safe:
-            self._sandbox = self._provider.primary_sandbox
-            return self._sandbox
-
-        self._slot = await self._provider.acquire_worker_slot()
+        transfer = self._provider.workspace_transfer
+        if transfer is not None:
+            await transfer.lock.acquire()
         try:
-            self._sandbox = await self._provider.get_worker_sandbox(self._slot)
+            if not self._concurrency_safe:
+                self._sandbox = self._provider.primary_sandbox
+            else:
+                self._slot = await self._provider.acquire_worker_slot()
+                self._sandbox = await self._provider.get_worker_sandbox(self._slot)
+            if transfer is not None:
+                await finish_workspace_transfer(transfer.checkout(self._sandbox))
             return self._sandbox
-        except Exception:
-            await self._provider.release_worker_slot(self._slot)
-            self._slot = None
+        except BaseException:
+            try:
+                if self._slot is not None:
+                    await self._provider.release_worker_slot(self._slot)
+                    self._slot = None
+            finally:
+                if transfer is not None and transfer.lock.locked():
+                    transfer.lock.release()
+                self._sandbox = None
             raise
 
     async def __aexit__(
@@ -143,10 +160,19 @@ class SandboxLease:
         exc_val: BaseException | None,
         exc_tb: object,
     ) -> None:
-        if self._slot is not None:
-            await self._provider.release_worker_slot(self._slot)
-            self._slot = None
-        self._sandbox = None
+        transfer = self._provider.workspace_transfer
+        try:
+            if transfer is not None and self._sandbox is not None:
+                await finish_workspace_transfer(transfer.check_in(self._sandbox))
+        finally:
+            try:
+                if self._slot is not None:
+                    await self._provider.release_worker_slot(self._slot)
+                    self._slot = None
+            finally:
+                self._sandbox = None
+                if transfer is not None and transfer.lock.locked():
+                    transfer.lock.release()
 
 
 class SandboxLeaseProvider:
@@ -162,12 +188,14 @@ class SandboxLeaseProvider:
         mount_intent: SandboxMountIntent | None,
         prepare_root: str | None,
         max_concurrency: int,
+        workspace_transfer: WorkspaceTransfer | None,
     ) -> None:
         self._manager = manager
         self._lifecycle_type = lifecycle_type
         self._lifecycle_id = lifecycle_id
         self._mount_intent = mount_intent
         self._prepare_root = prepare_root
+        self.workspace_transfer = workspace_transfer
         self._available_slots: asyncio.Queue[int] = asyncio.Queue()
         self._worker_locks: dict[int, asyncio.Lock] = {}
         self._workers: dict[int, Sandbox] = {}
@@ -202,6 +230,8 @@ class SandboxLeaseProvider:
         deployment must keep its backend/host storage mapping and symlink
         topology consistent.
         """
+        if self.workspace_transfer is not None:
+            return False
         return self._manager.workspace_dirs_are_host_mounted(
             self._lifecycle_type,
             self._lifecycle_id,
@@ -659,7 +689,10 @@ class SandboxManager:
 
     def requires_host_workspace_access(self) -> bool:
         """Whether this backend needs privileged host bind preparation."""
-        return self._service.host_workspace_gid() is not None
+        return (
+            get_sandbox_workspace_mode() == "bind"
+            and self._service.host_workspace_gid() is not None
+        )
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -906,7 +939,14 @@ class SandboxManager:
             host_side_sources=path_mapper.uses_host_storage_root
         )
         if volumes:
-            if self.requires_host_workspace_access():
+            if get_sandbox_workspace_mode() == "transfer":
+                writable = [source for source, _target, mode in volumes if mode == "rw"]
+                if writable:
+                    raise SandboxContractError(
+                        "Writable SANDBOX_VOLUMES are not allowed when "
+                        "XAGENT_SANDBOX_WORKSPACE_MODE=transfer"
+                    )
+            elif self.requires_host_workspace_access():
                 _validate_custom_volumes_for_uploads(
                     volumes,
                     path_mapper,
@@ -953,6 +993,41 @@ class SandboxManager:
 
         return paths
 
+    def _workspace_transfer(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None,
+    ) -> WorkspaceTransfer | None:
+        """Build the opt-in transfer boundary for one lifecycle provider."""
+        if get_sandbox_workspace_mode() != "transfer":
+            return None
+        roots: list[WorkspaceTransferRoot] = []
+        for backend_path, writable in self._workspace_mount_paths(
+            lifecycle_type, lifecycle_id, mount_intent
+        ):
+            # Workspace tools reconstruct paths from TaskWorkspace's resolved
+            # physical base. Transfer must use that same guest projection;
+            # retaining a lexical symlink alias would copy files to a path the
+            # reconstructed tool never reads or publishes.
+            path = backend_mount_path_views(backend_path).physical
+            if writable and prepare_root is not None and mount_intent is not None:
+                writable_path = backend_mount_path_views(prepare_root).physical
+                if writable_path != path and path.is_dir():
+                    roots.append(WorkspaceTransferRoot(path=path, writable=False))
+                path = writable_path
+            if not writable and not path.is_dir():
+                continue
+            roots.append(WorkspaceTransferRoot(path=path, writable=writable))
+        if not roots:
+            # SSH and connector-discovery providers intentionally have no
+            # user workspace. Transfer mode changes workspace transport; it
+            # must not disable otherwise supported sandbox consumers.
+            return None
+        return WorkspaceTransfer(roots)
+
     def workspace_dirs_are_host_mounted(
         self,
         lifecycle_type: str,
@@ -980,6 +1055,8 @@ class SandboxManager:
         """
         if not directories:
             return True
+        if get_sandbox_workspace_mode() != "bind":
+            return False
         if self._backend_probe is not True:
             return False
 
@@ -1140,6 +1217,9 @@ class SandboxManager:
                     trusted_root=trusted_root,
                     preserve_through=preserve_through,
                 )
+            elif should_create and get_sandbox_workspace_mode() == "transfer":
+                recover_workspace_root(target)
+                target.mkdir(parents=True, exist_ok=True)
             else:
                 try:
                     if should_create or target.exists():
@@ -1259,6 +1339,8 @@ class SandboxManager:
         """
         # Code mounts are always present (at least src/)
         volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
+        if get_sandbox_workspace_mode() == "transfer":
+            return volumes
         path_mapper = SandboxPathMapper.from_env()
 
         for backend_path, _should_create in self._workspace_mount_paths(
@@ -1916,6 +1998,12 @@ class SandboxManager:
             mount_intent=mount_intent,
             prepare_root=prepare_root,
             max_concurrency=get_sandbox_max_concurrency(),
+            workspace_transfer=self._workspace_transfer(
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent,
+                prepare_root=prepare_root,
+            ),
         )
 
     async def _list_managed_sandbox_names(self) -> set[str]:
@@ -2124,6 +2212,27 @@ class SandboxManager:
                 provider = self._lease_providers.get(base_name)
 
             if provider is not None:
+                if get_sandbox_workspace_mode() == "transfer":
+                    requested_transfer = self._workspace_transfer(
+                        lifecycle_type,
+                        lifecycle_id,
+                        mount_intent,
+                        prepare_root=prepare_root,
+                    )
+                    cached_roots = (
+                        None
+                        if provider.workspace_transfer is None
+                        else provider.workspace_transfer.roots
+                    )
+                    requested_roots = (
+                        None if requested_transfer is None else requested_transfer.roots
+                    )
+                    if cached_roots != requested_roots:
+                        raise SandboxRuntimeConflictError(
+                            f"Sandbox {sandbox_name!r} already exists with different "
+                            "workspace transfer roots. Use a distinct lifecycle id "
+                            "for different workspaces."
+                        )
                 cached_spec = self._config_cache.get(sandbox_name)
                 self._ensure_config_equivalent(
                     sandbox_name,

@@ -47,6 +47,50 @@ restricted Docker broker maintained in
 [`xagent-saas`](https://github.com/xorbitsai/xagent-saas/blob/main/docs/sandbox-broker.md).
 Change it only together with that parser and its real-Docker upload smoke test.
 
+### Workspace exposure modes
+
+`XAGENT_SANDBOX_WORKSPACE_MODE=bind` is the default and preserves the
+historical writable host bind mounts. Restricted-broker deployments can opt
+into `transfer` after their broker supports the archive contract above. In
+that mode Xagent removes writable workspace paths from the container spec,
+serializes sandbox tool calls for a lifecycle, copies regular files into the
+sandbox before a call, and publishes its writable workspace from a same-disk
+staging directory after the call. Publication uses the host's atomic directory
+exchange primitive, so there is no missing-destination window in which another
+backend process can recreate the path. A deployment whose filesystem cannot
+provide atomic exchange fails closed. Backups left by the older two-rename
+implementation are restored on checkout; ambiguous legacy backup state fails
+closed for manual recovery. External allowed directories are input snapshots
+and are not copied back. Symlinks, special files, unsafe relative paths, and
+transfers over the built-in file/byte limits fail closed. The current transfer
+contract permits at most 20,000 regular files and 200 MiB in aggregate for one
+lease. Docker supplies a 256 MiB sandbox-local `/root` tmpfs so the documented
+100 MiB upload limit and generated output fit without restoring a writable host
+bind. The tmpfs is logical capacity, consumes memory only as written, and is
+discarded with the sandbox.
+
+Check-in is compare-and-publish: if an authenticated upload or another backend
+writer changes a writable tree after checkout, publication is rejected and the
+live backend tree is retained. Publication also refuses to detach a tree that
+still has an open backend writer. A folded ancestor is copied as read-only
+input; only the task's effective writable subtree is eligible for publication.
+Symlink-backed configured roots use the same resolved physical path as
+`TaskWorkspace`. The published root retains the original owner, group, and
+traversal mode required by configured X-Accel delivery.
+
+Docker provisions authorized container-local absolute roots through a narrow
+no-follow root helper, so deployments using paths such as `/srv/xagent/uploads`
+do not need writable host binds. Transfer manifest/reset helpers use isolated
+Python imports and a bounded execution deadline. Cancelling a Docker exec kills
+and drains its guest process tree before the lease can publish or release the
+workspace lock.
+
+Transfer mode is intentionally a deployment cutover, not an automatic
+fallback. A failed transfer fails the tool call; Xagent never reintroduces a
+writable bind mount. Validate archive upload, cancellation, output
+registration, large-workspace latency, and rollback on Stage before enabling
+it in production.
+
 ## Tags
 
 - `latest` — the most recently published build

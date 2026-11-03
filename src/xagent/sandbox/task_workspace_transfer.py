@@ -17,10 +17,13 @@ import shlex
 import shutil
 import stat
 import tempfile
+import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypeVar
 
+from ..core.workspace import workspace_path_mutation_lock
 from .base import ExecResult, Sandbox, SandboxContractError
 
 MAX_TASK_FILES = 20_000
@@ -105,6 +108,10 @@ class TreeState:
     @property
     def files_by_path(self) -> dict[Path, FileState]:
         return {item.relative: item for item in self.files}
+
+    @property
+    def directories_by_path(self) -> dict[Path, int]:
+        return dict(self.directories)
 
 
 @dataclass(frozen=True)
@@ -250,9 +257,16 @@ def _open_host_parent(
             except FileExistsError:
                 pass
             next_fd = os.open(component, flags, dir_fd=current_fd)
-            identity = os.fstat(next_fd)
-            if (identity.st_uid, identity.st_gid) != (trusted_uid, trusted_gid):
-                os.fchown(next_fd, trusted_uid, trusted_gid)
+            try:
+                identity = os.fstat(next_fd)
+                if (identity.st_uid, identity.st_gid) != (
+                    trusted_uid,
+                    trusted_gid,
+                ):
+                    os.fchown(next_fd, trusted_uid, trusted_gid)
+            except BaseException:
+                os.close(next_fd)
+                raise
             os.close(current_fd)
             current_fd = next_fd
         return current_fd
@@ -283,6 +297,91 @@ def _file_state_at(parent_fd: int, name: str, relative: Path) -> FileState | Non
         )
     finally:
         os.close(file_fd)
+
+
+def _tree_entries(
+    tree: TreeState, *, normalized_modes: bool = False
+) -> dict[Path, tuple[str, int, int | None, str | None]]:
+    """Project a manifest into comparable file/directory entries."""
+
+    entries: dict[Path, tuple[str, int, int | None, str | None]] = {
+        relative: (
+            "dir",
+            mode & 0o755 if normalized_modes else mode,
+            None,
+            None,
+        )
+        for relative, mode in tree.directories
+    }
+    entries.update(
+        {
+            item.relative: (
+                "file",
+                item.mode & 0o755 if normalized_modes else item.mode,
+                item.size,
+                item.sha256,
+            )
+            for item in tree.files
+        }
+    )
+    return entries
+
+
+def _entry_kind(
+    entries: dict[Path, tuple[str, int, int | None, str | None]],
+    relative: Path,
+) -> str | None:
+    entry = entries.get(relative)
+    return entry[0] if entry is not None else None
+
+
+def _host_entry(
+    root: Path, relative: Path
+) -> tuple[str, int, int | None, str | None] | None:
+    """Read one host entry without following any path component."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    current_fd = os.open(root, flags)
+    try:
+        for component in relative.parent.parts:
+            try:
+                next_fd = os.open(component, flags, dir_fd=current_fd)
+            except (FileNotFoundError, NotADirectoryError):
+                return None
+            os.close(current_fd)
+            current_fd = next_fd
+        try:
+            info = os.stat(relative.name, dir_fd=current_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISDIR(info.st_mode):
+            return ("dir", mode, None, None)
+        if not stat.S_ISREG(info.st_mode):
+            raise SandboxContractError(f"Host publication target is unsafe: {relative}")
+        state = _file_state_at(current_fd, relative.name, relative)
+        if state is None:
+            return None
+        return ("file", state.mode, state.size, state.sha256)
+    finally:
+        os.close(current_fd)
+
+
+def _published_mode(
+    old_entry: tuple[str, int, int | None, str | None] | None,
+    expected_entry: tuple[str, int, int | None, str | None] | None,
+    new_entry: tuple[str, int, int | None, str | None],
+) -> int:
+    """Preserve host policy unless the guest deliberately changed mode."""
+
+    if (
+        old_entry is not None
+        and expected_entry is not None
+        and old_entry[0] == new_entry[0]
+        and new_entry[1] == expected_entry[1]
+    ):
+        return old_entry[1]
+    return new_entry[1] & 0o755
 
 
 def parse_guest_manifest(raw: str) -> TreeState:
@@ -337,6 +436,179 @@ def parse_guest_manifest(raw: str) -> TreeState:
     return TreeState(tuple(directories), tuple(files), total)
 
 
+def _publish_tree(
+    host_root: Path,
+    staging: Path,
+    baseline: TreeState,
+    guest: TreeState,
+) -> None:
+    """Publish changed entries while fencing supported host-side writers."""
+
+    root_identity = host_root.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(root_identity.st_mode):
+        raise SandboxContractError("Task workspace root is no longer a directory")
+    trusted_uid = root_identity.st_uid
+    trusted_gid = root_identity.st_gid
+    old = _tree_entries(baseline)
+    expected = _tree_entries(baseline, normalized_modes=True)
+    new = _tree_entries(guest)
+    affected = sorted(
+        (
+            path
+            for path in old.keys() | new.keys()
+            if expected.get(path) != new.get(path)
+        ),
+        key=lambda path: (len(path.parts), str(path)),
+    )
+    if not affected:
+        return
+
+    with ExitStack() as locks:
+        # Every supported host writer takes the same per-path lock before it
+        # opens the file and holds it through close. Holding all affected-path
+        # locks across this final comparison and publication prevents the
+        # old-inode append race while allowing unrelated files to progress.
+        for relative in affected:
+            locks.enter_context(workspace_path_mutation_lock(host_root / relative))
+        for relative in affected:
+            if _host_entry(host_root, relative) != old.get(relative):
+                raise SandboxContractError(
+                    f"Host changed an entry being published: {relative}"
+                )
+
+        # Remove files before directories, then directories deepest-first.
+        for relative in affected:
+            if (
+                _entry_kind(old, relative) != "file"
+                or _entry_kind(new, relative) == "file"
+            ):
+                continue
+            parent_fd = _open_host_parent(
+                host_root,
+                relative,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            try:
+                os.unlink(relative.name, dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+
+        for relative in reversed(affected):
+            if (
+                _entry_kind(old, relative) != "dir"
+                or _entry_kind(new, relative) == "dir"
+            ):
+                continue
+            parent_fd = _open_host_parent(
+                host_root,
+                relative,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            try:
+                os.rmdir(relative.name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise SandboxContractError(
+                    f"Host changed a directory being published: {relative}"
+                ) from exc
+            finally:
+                os.close(parent_fd)
+
+        # Materialize directory transitions shallow-first with a writable
+        # staging mode. Final guest-requested modes are applied after files.
+        for relative in affected:
+            if (
+                _entry_kind(new, relative) != "dir"
+                or _entry_kind(old, relative) == "dir"
+            ):
+                continue
+            parent_fd = _open_host_parent(
+                host_root,
+                relative,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            try:
+                os.mkdir(relative.name, mode=0o750, dir_fd=parent_fd)
+            except FileExistsError as exc:
+                raise SandboxContractError(
+                    f"Host created an entry being published: {relative}"
+                ) from exc
+            finally:
+                os.close(parent_fd)
+
+        for relative in affected:
+            entry = new.get(relative)
+            if entry is None or entry[0] != "file":
+                continue
+            staged = staging / relative
+            staged_identity = staged.stat(follow_symlinks=False)
+            if (staged_identity.st_uid, staged_identity.st_gid) != (
+                trusted_uid,
+                trusted_gid,
+            ):
+                os.chown(
+                    staged,
+                    trusted_uid,
+                    trusted_gid,
+                    follow_symlinks=False,
+                )
+            staged.chmod(
+                _published_mode(old.get(relative), expected.get(relative), entry)
+            )
+            parent_fd = _open_host_parent(
+                host_root,
+                relative,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            try:
+                if _entry_kind(old, relative) == "file":
+                    os.replace(staged, relative.name, dst_dir_fd=parent_fd)
+                else:
+                    try:
+                        os.link(
+                            staged,
+                            relative.name,
+                            dst_dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError as exc:
+                        raise SandboxContractError(
+                            f"Host created a file being published: {relative}"
+                        ) from exc
+                    staged.unlink()
+            finally:
+                os.close(parent_fd)
+
+        for relative in reversed(affected):
+            entry = new.get(relative)
+            if entry is None or entry[0] != "dir":
+                continue
+            flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = _open_host_parent(
+                host_root,
+                relative,
+                trusted_uid=trusted_uid,
+                trusted_gid=trusted_gid,
+            )
+            directory_fd = -1
+            try:
+                directory_fd = os.open(relative.name, flags, dir_fd=parent_fd)
+                identity = os.fstat(directory_fd)
+                if (identity.st_uid, identity.st_gid) != (trusted_uid, trusted_gid):
+                    os.fchown(directory_fd, trusted_uid, trusted_gid)
+                os.fchmod(
+                    directory_fd,
+                    _published_mode(old.get(relative), expected.get(relative), entry),
+                )
+            finally:
+                if directory_fd >= 0:
+                    os.close(directory_fd)
+                os.close(parent_fd)
+
+
 async def _helper(
     sandbox: Sandbox, script: str, root: Path, *, cap: int | None = None
 ) -> ExecResult:
@@ -387,7 +659,9 @@ class TaskWorkspaceTransfer:
                 raise SandboxContractError("Failed to set task workspace permissions")
         for explicit_input in inputs:
             before = await asyncio.to_thread(
-                _capture_explicit_input, explicit_input.host_path
+                _capture_explicit_input,
+                explicit_input.host_path,
+                guest_parent=explicit_input.guest_path.parents[1],
             )
             if before != explicit_input:
                 raise SandboxContractError(
@@ -399,7 +673,9 @@ class TaskWorkspaceTransfer:
                 overwrite=True,
             )
             after = await asyncio.to_thread(
-                _capture_explicit_input, explicit_input.host_path
+                _capture_explicit_input,
+                explicit_input.host_path,
+                guest_parent=explicit_input.guest_path.parents[1],
             )
             if after != explicit_input:
                 raise SandboxContractError(
@@ -421,16 +697,18 @@ class TaskWorkspaceTransfer:
                 f"Failed to inspect task workspace: {result.stderr or result.stdout}"
             )
         guest = parse_guest_manifest(result.stdout)
-        root_identity = self.host_root.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(root_identity.st_mode):
-            raise SandboxContractError("Task workspace root is no longer a directory")
-        trusted_uid = root_identity.st_uid
-        trusted_gid = root_identity.st_gid
-        old = baseline.files_by_path
-        new = guest.files_by_path
-        changed = [path for path, state in new.items() if old.get(path) != state]
-        removed = [path for path in old if path not in new]
-        if not changed and not removed:
+        old_entries = _tree_entries(baseline)
+        expected_entries = _tree_entries(baseline, normalized_modes=True)
+        new_entries = _tree_entries(guest)
+        changed_files = [
+            path
+            for path, entry in new_entries.items()
+            if entry[0] == "file" and expected_entries.get(path) != entry
+        ]
+        if not any(
+            expected_entries.get(path) != new_entries.get(path)
+            for path in old_entries.keys() | new_entries.keys()
+        ):
             return
 
         staging = Path(
@@ -440,8 +718,9 @@ class TaskWorkspaceTransfer:
             )
         )
         try:
-            for relative in changed:
-                item = new[relative]
+            guest_files = guest.files_by_path
+            for relative in changed_files:
+                item = guest_files[relative]
                 target = staging / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 await sandbox.download_file_bounded(
@@ -454,115 +733,35 @@ class TaskWorkspaceTransfer:
                         "Task workspace file changed while it was downloaded"
                     )
 
-            for relative in (*changed, *removed):
-                parent_fd = await asyncio.to_thread(
-                    _open_host_parent,
-                    self.host_root,
-                    relative,
-                    trusted_uid=trusted_uid,
-                    trusted_gid=trusted_gid,
-                )
-                try:
-                    current = await asyncio.to_thread(
-                        _file_state_at, parent_fd, relative.name, relative
-                    )
-                    if current != old.get(relative):
-                        raise SandboxContractError(
-                            f"Host changed a file being published: {relative}"
-                        )
-                finally:
-                    os.close(parent_fd)
-
-            for relative in changed:
-                staged = staging / relative
-                staged_identity = staged.stat(follow_symlinks=False)
-                if (staged_identity.st_uid, staged_identity.st_gid) != (
-                    trusted_uid,
-                    trusted_gid,
-                ):
-                    os.chown(
-                        staged,
-                        trusted_uid,
-                        trusted_gid,
-                        follow_symlinks=False,
-                    )
-                staged.chmod(new[relative].mode & 0o755)
-                parent_fd = await asyncio.to_thread(
-                    _open_host_parent,
-                    self.host_root,
-                    relative,
-                    trusted_uid=trusted_uid,
-                    trusted_gid=trusted_gid,
-                )
-                try:
-                    current = await asyncio.to_thread(
-                        _file_state_at, parent_fd, relative.name, relative
-                    )
-                    if current != old.get(relative):
-                        raise SandboxContractError(
-                            f"Host changed a file being published: {relative}"
-                        )
-                    if current is None:
-                        try:
-                            os.link(
-                                staged,
-                                relative.name,
-                                dst_dir_fd=parent_fd,
-                                follow_symlinks=False,
-                            )
-                        except FileExistsError:
-                            raise SandboxContractError(
-                                f"Host created a file being published: {relative}"
-                            ) from None
-                        staged.unlink()
-                    else:
-                        os.replace(staged, relative.name, dst_dir_fd=parent_fd)
-                finally:
-                    os.close(parent_fd)
-            for relative in removed:
-                parent_fd = await asyncio.to_thread(
-                    _open_host_parent,
-                    self.host_root,
-                    relative,
-                    trusted_uid=trusted_uid,
-                    trusted_gid=trusted_gid,
-                )
-                try:
-                    current = await asyncio.to_thread(
-                        _file_state_at, parent_fd, relative.name, relative
-                    )
-                    if current != old[relative]:
-                        raise SandboxContractError(
-                            f"Host changed a file being removed: {relative}"
-                        )
-                    try:
-                        os.unlink(relative.name, dir_fd=parent_fd)
-                    except FileNotFoundError:
-                        raise SandboxContractError(
-                            f"Host changed a file being removed: {relative}"
-                        ) from None
-                finally:
-                    os.close(parent_fd)
+            await asyncio.to_thread(
+                _publish_tree,
+                self.host_root,
+                staging,
+                baseline,
+                guest,
+            )
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
     async def cleanup(self, sandbox: Sandbox, inputs: Sequence[ExplicitInput]) -> None:
         await _helper(sandbox, _RESET_SCRIPT, self.guest_root)
-        for directory in sorted({item.guest_path.parent for item in inputs}):
+        for directory in sorted({item.guest_path.parents[1] for item in inputs}):
             result = await sandbox.exec("rm", "-rf", str(directory))
             if result.exit_code != 0:
                 raise SandboxContractError("Failed to clean sandbox input staging")
         self._baseline = None
 
 
-def _capture_explicit_input(path: Path) -> ExplicitInput:
+def _capture_explicit_input(
+    path: Path, *, guest_parent: Path | None = None
+) -> ExplicitInput:
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise SandboxContractError(
             "External sandbox inputs must be explicit regular files"
         )
     token = hashlib.sha256(str(path).encode()).hexdigest()[:24]
-    guest = Path("/home/sandbox/.xagent-inputs") / token / path.name
+    guest = (guest_parent or Path("/home/sandbox/.xagent-inputs")) / token / path.name
     return ExplicitInput(path, guest, info.st_size, _digest(path))
 
 
@@ -588,7 +787,7 @@ def _rewrite_value(value: Any, replacements: Sequence[tuple[str, str]]) -> Any:
 
 
 def _candidate_paths(value: str) -> set[str]:
-    """Extract complete absolute path arguments without interpreting code."""
+    """Extract absolute arguments and direct quoted code literals."""
     candidates = {value} if os.path.isabs(value) else set()
     try:
         tokens = shlex.split(value)
@@ -598,6 +797,11 @@ def _candidate_paths(value: str) -> set[str]:
         candidate = token.strip("()[]{}<>,;:")
         if os.path.isabs(candidate):
             candidates.add(candidate)
+    # execute_python_code receives the source as one string. Recognize only a
+    # direct, single-line quoted absolute literal (for example open('/x/a'));
+    # authorization and canonicalization still happen in collect_path.
+    for match in re.finditer(r"(['\"])(/[^'\"\r\n]+)\1", value):
+        candidates.add(match.group(2))
     return candidates
 
 
@@ -611,8 +815,9 @@ def build_call_plan(
     """Map task paths and exact, authorized external file arguments."""
     replacements: list[tuple[str, str]] = []
     inputs: list[ExplicitInput] = []
-    seen: set[Path] = set()
+    inputs_by_path: dict[Path, ExplicitInput] = {}
     total_input_bytes = 0
+    input_parent = Path("/home/sandbox/.xagent-inputs") / uuid.uuid4().hex
 
     def collect_path(raw_path: str) -> None:
         nonlocal total_input_bytes
@@ -634,14 +839,18 @@ def build_call_plan(
             guest_path = guest_root / resolved.relative_to(host_root)
             replacements.append((raw_path, str(guest_path)))
             return
-        if resolved in seen:
-            return
-        item = _capture_explicit_input(resolved)
-        seen.add(resolved)
-        total_input_bytes += item.size
-        _enforce_limits(len(seen), total_input_bytes)
-        inputs.append(item)
-        replacements.append((str(resolved), str(item.guest_path)))
+        item = inputs_by_path.get(resolved)
+        if item is None:
+            item = _capture_explicit_input(resolved, guest_parent=input_parent)
+            inputs_by_path[resolved] = item
+            total_input_bytes += item.size
+            _enforce_limits(len(inputs_by_path), total_input_bytes)
+            inputs.append(item)
+        # Upload once per canonical file, but preserve every separately
+        # authorized operand spelling so aliases are rewritten too.
+        replacements.append((raw_path, str(item.guest_path)))
+        if raw_path != str(resolved):
+            replacements.append((str(resolved), str(item.guest_path)))
 
     def collect(value: Any) -> None:
         if isinstance(value, dict):

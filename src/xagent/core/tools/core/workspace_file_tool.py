@@ -24,6 +24,7 @@ from ...file_ref import (
 from ...workspace import (
     DEFAULT_USER_FILE_LIST_LIMIT,
     TaskWorkspace,
+    workspace_path_mutation_lock,
 )
 from ..tool_result_spill import (
     SPILL_READ_MAX_CHARS,
@@ -381,10 +382,11 @@ class WorkspaceFileOperations:
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Use auto_register context to automatically register files
-        with self.workspace.auto_register_files():
-            logger.debug("Writing %d bytes to: %s", len(content), resolved_path)
-            with open(resolved_path, "w", encoding=encoding) as f:
-                f.write(content)
+        with workspace_path_mutation_lock(resolved_path):
+            with self.workspace.auto_register_files():
+                logger.debug("Writing %d bytes to: %s", len(content), resolved_path)
+                with open(resolved_path, "w", encoding=encoding) as f:
+                    f.write(content)
 
         file_ref = build_workspace_file_ref(
             workspace=self.workspace,
@@ -523,8 +525,9 @@ class WorkspaceFileOperations:
         if create_dirs:
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(resolved_path, "a", encoding=encoding) as f:
-            f.write(content)
+        with workspace_path_mutation_lock(resolved_path):
+            with open(resolved_path, "a", encoding=encoding) as f:
+                f.write(content)
         self.workspace.grant_sandbox_access(resolved_path)
         return True
 
@@ -535,7 +538,8 @@ class WorkspaceFileOperations:
         if not resolved_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        resolved_path.unlink()
+        with workspace_path_mutation_lock(resolved_path):
+            resolved_path.unlink()
         return True
 
     def file_exists(self, file_path: str) -> bool:

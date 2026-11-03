@@ -407,6 +407,16 @@ class TestDockerSandboxServiceFailures:
 
         assert not list(tmp_path.glob(".xagent-sandbox-ready-*"))
 
+    def test_runtime_policy_validation_does_not_require_bind_mount_privileges(
+        self, monkeypatch
+    ):
+        service = DockerSandboxService(
+            MemDockerStore(), namespace="test", client=_FakeDockerClient()
+        )
+        monkeypatch.setattr(docker_sandbox_module.os, "geteuid", lambda: 1000)
+
+        service.validate_runtime_policy()
+
     def test_host_workspace_readiness_probe_fails_closed(self, tmp_path, monkeypatch):
         service = DockerSandboxService(
             MemDockerStore(), namespace="test", client=_FakeDockerClient()

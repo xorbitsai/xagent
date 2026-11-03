@@ -24,12 +24,16 @@ class _ProbeStub:
 
     def __init__(self, supports_runtime_spec: bool) -> None:
         self._supports = supports_runtime_spec
+        self.runtime_policy_calls = 0
 
     async def _resolve_backend_probe(self) -> bool:
         return self._supports
 
     def validate_host_workspace_access(self) -> None:
         raise AssertionError("non-Docker backends must not run the host access probe")
+
+    def validate_runtime_policy(self) -> None:
+        self.runtime_policy_calls += 1
 
     def requires_host_workspace_access(self) -> bool:
         return False
@@ -55,10 +59,8 @@ async def test_readiness_skipped_when_backend_does_not_support_reconciliation():
 
 @pytest.mark.asyncio
 async def test_readiness_skipped_when_no_relevant_env_configured():
-    """Code mounts alone are never checked when neither SANDBOX_VOLUMES nor
-    XAGENT_EXTERNAL_UPLOAD_DIRS is configured -- the self-conflicting code
-    mounts below would raise if the empty-env skip did not short-circuit
-    before the triple set is ever built."""
+    """The network policy is validated even when mount checks are skipped."""
+    probe = _ProbeStub(True)
     with (
         patch.dict("os.environ", {}, clear=True),
         patch(
@@ -66,7 +68,9 @@ async def test_readiness_skipped_when_no_relevant_env_configured():
             return_value=[("/foo", "/guest1", "ro"), ("/foo", "/guest2", "ro")],
         ),
     ):
-        await check_sandbox_static_readiness(_ProbeStub(True))
+        await check_sandbox_static_readiness(probe)
+
+    assert probe.runtime_policy_calls == 1
 
 
 @pytest.mark.asyncio

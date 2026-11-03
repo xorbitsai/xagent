@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 from pydantic import BaseModel
 
+from ...workspace import workspace_path_mutation_lock
+
 try:
     from PIL import Image
 
@@ -186,8 +188,9 @@ def write_file(
             os.makedirs(dir_path, exist_ok=True)
         # If dir_path is empty (e.g., 'hello_world.html'), file is in current directory, no need to create directory
 
-    with open(file_path, "w", encoding=encoding) as f:
-        f.write(content)
+    with workspace_path_mutation_lock(file_path):
+        with open(file_path, "w", encoding=encoding) as f:
+            f.write(content)
     return True
 
 
@@ -216,8 +219,9 @@ def append_file(
             os.makedirs(dir_path, exist_ok=True)
         # If dir_path is empty (e.g., 'hello_world.html'), file is in current directory, no need to create directory
 
-    with open(file_path, "a", encoding=encoding) as f:
-        f.write(content)
+    with workspace_path_mutation_lock(file_path):
+        with open(file_path, "a", encoding=encoding) as f:
+            f.write(content)
     return True
 
 
@@ -235,7 +239,8 @@ def delete_file(file_path: str) -> bool:
         FileNotFoundError: File doesn't exist
         OSError: Deletion failed
     """
-    os.remove(file_path)
+    with workspace_path_mutation_lock(file_path):
+        os.remove(file_path)
     return True
 
 

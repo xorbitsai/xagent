@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import pickle
 import shutil
+import stat
+import threading
 from pathlib import Path
 
 import pytest
 
+from xagent.core.workspace import workspace_path_mutation_lock
 from xagent.sandbox.base import ExecResult, SandboxContractError
 from xagent.sandbox.task_workspace_transfer import (
     _MANIFEST_SCRIPT,
@@ -31,7 +35,12 @@ class _LocalSandbox:
         remote_path = Path(remote)
         if remote_path.is_relative_to(self.logical_root):
             return self.local_root / remote_path.relative_to(self.logical_root)
-        return self.local_root.parent / "inputs" / remote_path.name
+        input_root = Path("/home/sandbox/.xagent-inputs")
+        if remote_path.is_relative_to(input_root):
+            return (
+                self.local_root.parent / "inputs" / remote_path.relative_to(input_root)
+            )
+        raise AssertionError(f"unexpected sandbox path: {remote_path}")
 
     async def exec(self, command: str, *args: str, **kwargs) -> ExecResult:
         del kwargs
@@ -175,6 +184,84 @@ async def test_task_round_trip_publishes_only_changed_files(tmp_path: Path) -> N
 
     assert (host / "output" / "result.txt").read_text() == "result"
     assert (tmp_path / "owner" / "unrelated.txt").read_text() == "independent"
+
+
+@pytest.mark.asyncio
+async def test_empty_directory_changes_survive_across_leases(tmp_path: Path) -> None:
+    host = tmp_path / "web_task_empty_dir"
+    host.mkdir()
+    guest_path = Path("/home/sandbox/.xagent-workspaces/empty-dir")
+    guest = tmp_path / "guest"
+    sandbox = _LocalSandbox(guest_path, guest)
+    transfer = TaskWorkspaceTransfer(host, guest_path)
+
+    await transfer.checkout(sandbox)  # type: ignore[arg-type]
+    (guest / "build").mkdir()
+    (guest / "build").chmod(0o750)
+    await transfer.check_in(sandbox)  # type: ignore[arg-type]
+    await transfer.cleanup(sandbox, ())  # type: ignore[arg-type]
+
+    assert (host / "build").is_dir()
+    await transfer.checkout(sandbox)  # type: ignore[arg-type]
+    assert (guest / "build").is_dir()
+    assert stat.S_IMODE((guest / "build").stat().st_mode) == 0o750
+
+
+@pytest.mark.asyncio
+async def test_directory_removal_modes_and_type_transitions(tmp_path: Path) -> None:
+    host = tmp_path / "web_task_directory_transitions"
+    host.mkdir()
+    (host / "removed").mkdir()
+    (host / "file_to_directory").write_text("old file")
+    (host / "directory_to_file").mkdir()
+    mode_only = host / "mode_only"
+    mode_only.mkdir()
+    mode_only.chmod(0o750)
+    guest_path = Path("/home/sandbox/.xagent-workspaces/directory-transitions")
+    guest = tmp_path / "guest"
+    sandbox = _LocalSandbox(guest_path, guest)
+    transfer = TaskWorkspaceTransfer(host, guest_path)
+
+    await transfer.checkout(sandbox)  # type: ignore[arg-type]
+    (guest / "removed").rmdir()
+    (guest / "file_to_directory").unlink()
+    (guest / "file_to_directory").mkdir()
+    (guest / "file_to_directory" / "child.txt").write_text("new child")
+    (guest / "directory_to_file").rmdir()
+    (guest / "directory_to_file").write_text("new file")
+    (guest / "mode_only").chmod(0o700)
+
+    await transfer.check_in(sandbox)  # type: ignore[arg-type]
+
+    assert not (host / "removed").exists()
+    assert (host / "file_to_directory" / "child.txt").read_text() == "new child"
+    assert (host / "directory_to_file").read_text() == "new file"
+    assert stat.S_IMODE(mode_only.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_normalized_checkout_mode_does_not_publish_untouched_file(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "web_task_modes"
+    host.mkdir()
+    target = host / "shared.txt"
+    target.write_text("before")
+    target.chmod(0o660)
+    guest_path = Path("/home/sandbox/.xagent-workspaces/modes")
+    guest = tmp_path / "guest"
+    sandbox = _LocalSandbox(guest_path, guest)
+    transfer = TaskWorkspaceTransfer(host, guest_path)
+
+    await transfer.checkout(sandbox)  # type: ignore[arg-type]
+    (guest / "shared.txt").chmod(0o640)
+    await transfer.check_in(sandbox)  # type: ignore[arg-type]
+    assert stat.S_IMODE(target.stat().st_mode) == 0o660
+
+    (guest / "shared.txt").write_text("after")
+    await transfer.check_in(sandbox)  # type: ignore[arg-type]
+    assert target.read_text() == "after"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o660
 
 
 @pytest.mark.asyncio
@@ -342,6 +429,118 @@ def test_call_plan_handles_command_strings_and_maps_results(tmp_path: Path) -> N
             host_root=workspace.workspace_dir,
             guest_root=guest_root,
         )
+
+
+def test_call_plan_rewrites_python_literals_and_every_authorized_alias(
+    tmp_path: Path,
+) -> None:
+    from xagent.core.workspace import TaskWorkspace
+
+    external = tmp_path / "external"
+    subdir = external / "sub"
+    subdir.mkdir(parents=True)
+    chosen = external / "chosen.txt"
+    chosen.write_text("chosen")
+    alias = subdir / ".." / "chosen.txt"
+    workspace = TaskWorkspace(
+        "web_task_aliases",
+        str(tmp_path / "owner"),
+        allowed_external_dirs=[str(external)],
+        migrate_sandbox_permissions=False,
+    )
+    guest_root = Path("/home/sandbox/.xagent-workspaces/aliases")
+    plan = build_call_plan(
+        workspace,
+        {
+            "code": f"print(open('{alias}').read())",
+            "source": str(chosen),
+        },
+        host_root=workspace.workspace_dir,
+        guest_root=guest_root,
+    )
+
+    assert len(plan.inputs) == 1
+    assert str(alias) not in str(plan.args["code"])
+    assert str(chosen) not in str(plan.args["source"])
+    assert str(plan.inputs[0].guest_path) in str(plan.args["code"])
+
+
+@pytest.mark.asyncio
+async def test_input_cleanup_is_namespaced_per_call(tmp_path: Path) -> None:
+    from xagent.core.workspace import TaskWorkspace
+
+    host = tmp_path / "web_task_inputs"
+    host.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    chosen = external / "chosen.txt"
+    chosen.write_text("chosen")
+    workspace = TaskWorkspace(
+        "web_task_inputs",
+        str(tmp_path),
+        allowed_external_dirs=[str(external)],
+        migrate_sandbox_permissions=False,
+    )
+    guest_root = Path("/home/sandbox/.xagent-workspaces/inputs")
+    sandbox = _LocalSandbox(guest_root, tmp_path / "guest")
+    first = build_call_plan(
+        workspace,
+        {"source": str(chosen)},
+        host_root=workspace.workspace_dir,
+        guest_root=guest_root,
+    )
+    second = build_call_plan(
+        workspace,
+        {"source": str(chosen)},
+        host_root=workspace.workspace_dir,
+        guest_root=guest_root,
+    )
+    transfer = TaskWorkspaceTransfer(host, guest_root)
+
+    assert first.inputs[0].guest_path != second.inputs[0].guest_path
+    await transfer.checkout(sandbox, first.inputs)  # type: ignore[arg-type]
+    await transfer.checkout(sandbox, second.inputs)  # type: ignore[arg-type]
+    await transfer.cleanup(sandbox, first.inputs)  # type: ignore[arg-type]
+    assert sandbox._local(second.inputs[0].guest_path).read_text() == "chosen"
+
+
+@pytest.mark.asyncio
+async def test_publication_waits_for_host_writer_open_through_close(
+    tmp_path: Path,
+) -> None:
+    host = tmp_path / "web_task_writer"
+    host.mkdir()
+    target = host / "output.txt"
+    target.write_text("before")
+    guest_path = Path("/home/sandbox/.xagent-workspaces/writer")
+    guest = tmp_path / "guest"
+    sandbox = _LocalSandbox(guest_path, guest)
+    transfer = TaskWorkspaceTransfer(host, guest_path)
+    await transfer.checkout(sandbox)  # type: ignore[arg-type]
+    (guest / "output.txt").write_text("guest")
+    writer_opened = threading.Event()
+    allow_writer = threading.Event()
+
+    def append_on_host() -> None:
+        with workspace_path_mutation_lock(target):
+            with target.open("a") as stream:
+                writer_opened.set()
+                assert allow_writer.wait(5)
+                stream.write("+host")
+
+    writer = threading.Thread(target=append_on_host)
+    writer.start()
+    assert writer_opened.wait(2)
+    publication = asyncio.create_task(transfer.check_in(sandbox))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    assert not publication.done()
+    allow_writer.set()
+    writer.join(timeout=2)
+    assert not writer.is_alive()
+
+    with pytest.raises(SandboxContractError, match="Host changed"):
+        await publication
+    assert target.read_text() == "before+host"
 
 
 def test_pickled_workspace_projects_only_inside_tool_runner(

@@ -817,6 +817,10 @@ class SandboxManager:
         """Validate backend-specific host mount prerequisites."""
         self._service.validate_host_workspace_access()
 
+    def validate_runtime_policy(self) -> None:
+        """Validate backend isolation independently of workspace transport."""
+        self._service.validate_runtime_policy()
+
     def requires_host_workspace_access(self) -> bool:
         """Whether this backend needs privileged host bind preparation."""
         return (
@@ -3211,6 +3215,8 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
 
     if sandbox_mgr.requires_host_workspace_access():
         sandbox_mgr.validate_host_workspace_access()
+    else:
+        sandbox_mgr.validate_runtime_policy()
 
     external_dirs = get_external_upload_dirs()
     if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:

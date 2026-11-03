@@ -1144,6 +1144,9 @@ class SandboxService(abc.ABC):
     def validate_host_workspace_access(self) -> None:
         """Fail readiness if required host bind ownership cannot be prepared."""
 
+    def validate_runtime_policy(self) -> None:
+        """Fail readiness if backend isolation policy is misconfigured."""
+
     def runtime_security_profile(self) -> str | None:
         """Backend-specific hardening profile included in desired state."""
         return None

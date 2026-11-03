@@ -68,6 +68,15 @@ _auto_register = contextvars.ContextVar("_auto_register", default=False)
 _internal_file_registry: Dict[Tuple[str, str], Path] = {}
 _internal_path_registry: Dict[Tuple[str, str], str] = {}
 _internal_file_registry_lock = RLock()
+# File-scoped host mutations and sandbox transfer publication share these
+# locks. A writer must hold the lock from before opening the path until after
+# closing it; publication holds the same lock across its final comparison and
+# inode replacement, so an acknowledged append can never land on an inode
+# that publication subsequently unlinks.
+_workspace_path_mutation_locks: weakref.WeakValueDictionary[str, RLock] = (
+    weakref.WeakValueDictionary()
+)
+_workspace_path_mutation_locks_guard = Lock()
 _INTERNAL_TEMP_DIR_NAME = ".xagent-internal"
 _SANDBOX_PERMISSION_MIGRATION_MARKER = ".xagent-permissions-v2"
 _SANDBOX_RUNTIME_GID = 1010
@@ -77,6 +86,17 @@ _SANDBOX_RUNTIME_GID = 1010
 _sandbox_permission_migrations_attempted: set[str] = set()
 _sandbox_permission_migrations_lock = Lock()
 _SANDBOX_EXTERNAL_UPLOAD_STAGING_PARTS = (_INTERNAL_TEMP_DIR_NAME, "mcp-upload")
+
+
+@contextmanager
+def workspace_path_mutation_lock(path: str | Path) -> Iterator[None]:
+    """Serialize one host path's open-through-close mutation interval."""
+
+    key = os.path.realpath(os.path.abspath(path))
+    with _workspace_path_mutation_locks_guard:
+        lock = _workspace_path_mutation_locks.setdefault(key, RLock())
+    with lock:
+        yield
 
 
 class ExternalUploadStagingError(ValueError):

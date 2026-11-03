@@ -2071,21 +2071,8 @@ class DockerSandboxService(SandboxService):
         """Docker provides the bounded put/get archive contract transfer uses."""
         return True
 
-    def validate_host_workspace_access(self) -> None:
-        """Validate Docker network policy and writable-bind ownership support."""
-        if os.geteuid() != 0:
-            raise SandboxRuntimeConflictError(
-                "Docker sandbox workspace preparation requires the Xagent "
-                "backend process to run as root."
-            )
-        try:
-            daemon_info = self._client.info()
-        except Exception as exc:
-            raise SandboxRuntimeConflictError(
-                "Cannot inspect the Docker daemon security mode. If a "
-                "docker-socket-proxy is in use, allow the /info endpoint "
-                "(for Tecnativa/docker-socket-proxy, set INFO=1)."
-            ) from exc
+    def validate_runtime_policy(self) -> None:
+        """Validate the dedicated Docker bridge in every workspace mode."""
         try:
             sandbox_network = self._client.networks.get(self._network)
         except errors.NotFound as exc:
@@ -2126,6 +2113,23 @@ class DockerSandboxService(SandboxService):
                 f"Configured sandbox Docker network {self._network!r} must disable "
                 "inter-container communication"
             )
+
+    def validate_host_workspace_access(self) -> None:
+        """Validate prerequisites used only by writable host bind mounts."""
+        self.validate_runtime_policy()
+        if os.geteuid() != 0:
+            raise SandboxRuntimeConflictError(
+                "Docker sandbox workspace preparation requires the Xagent "
+                "backend process to run as root."
+            )
+        try:
+            daemon_info = self._client.info()
+        except Exception as exc:
+            raise SandboxRuntimeConflictError(
+                "Cannot inspect the Docker daemon security mode. If a "
+                "docker-socket-proxy is in use, allow the /info endpoint "
+                "(for Tecnativa/docker-socket-proxy, set INFO=1)."
+            ) from exc
         security_options = daemon_info.get("SecurityOptions") or ()
         unsupported_daemon_mode = next(
             (

@@ -60,7 +60,9 @@ lowers the compaction threshold once to exercise the existing compactor; this
 is a functional stress case, not a proposed production threshold.
 
 Resume exercises checkpoint serialization and reconstruction of the runtime,
-pattern, context, and local tool state. It is not a web-service process-crash or
+pattern, context, and local tool state. The resume point is retained separately
+as `resume-checkpoint.json` while `checkpoint.json` tracks subsequent progress.
+It is not a web-service process-crash or
 exactly-once external-write test. The checkpoint contains the synthetic ledger;
 ordinary event/call reports omit prompt text and credentials.
 
@@ -104,7 +106,7 @@ the same execution, step, model and call kind. It reports `initial`,
 `scope_changed`, `append_only`, `identical`, `messages_changed`,
 `messages_removed`, or `tools_changed`, along with the unchanged whole-message
 count and first changed message index. Compaction/decision/retry calls have
-separate baselines. Only hashes are retained in memory; neither hashes nor text
+separate baselines. Only content digests and scope identifiers are retained in memory; neither hashes nor text
 are emitted. A fresh runtime starts with `initial`, including after resume.
 
 These observations precede provider templating and context-reference

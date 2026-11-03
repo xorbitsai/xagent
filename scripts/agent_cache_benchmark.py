@@ -489,7 +489,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             checkpoint = runtime.last_checkpoint
             if checkpoint is None:
                 raise RuntimeError("Interrupted without checkpoint")
-            write_json(args.output / "checkpoint.json", checkpoint)
+            write_json(args.output / "resume-checkpoint.json", checkpoint)
             write_json(
                 args.output / "audit-state.json",
                 {
@@ -499,7 +499,9 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                     "saved": workload.saved,
                 },
             )
-            checkpoint = json.loads((args.output / "checkpoint.json").read_text())
+            checkpoint = json.loads(
+                (args.output / "resume-checkpoint.json").read_text()
+            )
             saved_state = json.loads((args.output / "audit-state.json").read_text())
             workload = AuditWorkload(
                 targets=targets, output=args.output, fail_at=args.fail_at, **saved_state

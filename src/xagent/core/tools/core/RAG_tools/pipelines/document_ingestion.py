@@ -57,7 +57,7 @@ from ..utils.embedding_utils import (
 )
 from ..utils.model_resolver import resolve_embedding_adapter
 from ..utils.token_utils import get_token_counter
-from ..utils.user_scope import resolve_user_scope
+from ..utils.user_scope import resolve_user_scope, user_scope_context
 from ..vector_storage.vector_manager import (
     commit_vectors_to_db,
     read_chunks_for_embedding,
@@ -711,7 +711,11 @@ def _process_document_impl(
             selected_model_id = requested_model_id
 
         effective_cfg = cfg.model_copy(update={"embedding_model_id": selected_model_id})
-        embedding_config, embedding_adapter = _resolve_embedding_adapter(effective_cfg)
+        # A bare model name resolves only among models this user may use.
+        with user_scope_context(user_id, is_admin):
+            embedding_config, embedding_adapter = _resolve_embedding_adapter(
+                effective_cfg
+            )
         selected_model_id = (embedding_config.id or selected_model_id or "").strip()
         cfg = effective_cfg.model_copy(update={"embedding_model_id": selected_model_id})
 

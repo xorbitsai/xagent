@@ -50,6 +50,7 @@ from xagent.core.model.storage.error import ModelNotFoundError
 from xagent.core.storage.manager import get_default_db_url
 
 from ..core.exceptions import EmbeddingAdapterError, RagCoreException
+from .user_scope import get_user_scope
 
 logger = logging.getLogger(__name__)
 
@@ -260,6 +261,26 @@ def _close_model_hub(hub: Any) -> None:
         db_close()
 
 
+def _visible_name_matches(db: Any, candidates: list[Any]) -> list[Any]:
+    """Scope the hub's ``model_name`` fallback to the request's user.
+
+    ``model_name`` is shared across users, so a bare name such as
+    ``"text-embedding-v4"`` may only resolve to a row the caller can use:
+    their own, or one shared with them. Without a request-scoped user only
+    admin-shared rows count.
+    """
+    try:
+        from xagent.web.services.model_service import rank_name_matched_models
+    except ImportError:
+        logger.warning(
+            "Model visibility rules are unavailable; not resolving models by "
+            "model_name.",
+            exc_info=True,
+        )
+        return []
+    return rank_name_matched_models(db, candidates, get_user_scope().user_id)
+
+
 @contextmanager
 def _managed_model_hub(model_type_name: str) -> Any:
     """Yield a model hub and always close its DB session after use."""
@@ -335,7 +356,7 @@ def _load_model_from_hub(
 
         # Load model configuration first
         try:
-            cfg = hub.load(model_id)
+            cfg = hub.load(model_id, name_match_scope=_visible_name_matches)
         except ModelNotFoundError as exc:
             raise exception_cls(
                 f"Failed to load {config_type.__name__} from model hub",
@@ -557,7 +578,7 @@ def _resolve_adapter_generic(
         hub_unavailable_error = unavailable_error
         if hub is not None:
             try:
-                cfg = hub.load(lookup_id)
+                cfg = hub.load(lookup_id, name_match_scope=_visible_name_matches)
             except ModelNotFoundError as hub_error:
                 hub_missing_model = True
                 logger.warning(

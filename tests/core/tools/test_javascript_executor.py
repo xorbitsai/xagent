@@ -5,7 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.javascript_executor import JavaScriptExecutorTool
+from xagent.core.tools.adapters.vibe.javascript_executor import (
+    JavaScriptExecutorTool,
+    JavaScriptExecutorToolForBasic,
+)
+from xagent.core.tools.adapters.vibe.javascript_executor import (
+    get_javascript_executor_tool as get_workspace_javascript_executor_tool,
+)
 from xagent.core.tools.artifacts import GENERATED_ARTIFACT_EXTENSIONS
 from xagent.core.tools.core.javascript_executor import (
     GENERATED_FILE_PATTERNS,
@@ -398,6 +404,52 @@ class TestJavaScriptExecutorTool:
         assert tool.description is not None
         assert len(tool.description) > 0
         assert "JavaScript" in tool.description
+
+
+def _javascript_function_tool(workspace):
+    return get_workspace_javascript_executor_tool({"workspace": workspace})
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [JavaScriptExecutorTool, JavaScriptExecutorToolForBasic, _javascript_function_tool],
+    ids=["adapter", "basic", "function"],
+)
+class TestJavaScriptWorkingDirectoryDescription:
+    def test_description_includes_resolved_working_directory(self, tmp_path, factory):
+        workspace = TaskWorkspace("test_js_description", str(tmp_path))
+        tool = factory(workspace)
+        working_directory = str(workspace.resolve_path(""))
+
+        assert working_directory == str(workspace.output_dir.resolve())
+        assert f"current working directory: {working_directory}." in tool.description
+        assert working_directory in tool.metadata.description
+
+    def test_without_workspace_describes_temporary_directory(self, factory):
+        tool = factory(None)
+
+        assert "temporary directory" in tool.description
+        assert "current process working directory" not in tool.description
+
+    def test_description_matches_actual_node_working_directory(self, tmp_path, factory):
+        workspace = TaskWorkspace("test_js_actual_directory", str(tmp_path))
+        tool = factory(workspace)
+
+        result = tool.run_json_sync(
+            {
+                "code": (
+                    "console.log(process.cwd()); "
+                    "require('fs').writeFileSync('cwd-check.txt', 'OK');"
+                )
+            }
+        )
+
+        assert result["success"] is True, result
+        working_directory = str(workspace.output_dir.resolve())
+        assert working_directory in result["output"]
+        assert working_directory in tool.description
+        assert (workspace.output_dir / "cwd-check.txt").read_text() == "OK"
+        assert not (workspace.output_dir / "output" / "cwd-check.txt").exists()
 
 
 class TestJavaScriptIntegrationScenarios:

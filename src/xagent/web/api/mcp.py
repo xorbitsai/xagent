@@ -2131,10 +2131,47 @@ class TransportFieldValidator:
                 raise ValueError(f"Transport '{transport}' requires field '{field}'")
 
 
+_USER_FORBIDDEN_MCP_CONFIG_FIELDS = frozenset(
+    {
+        "managed",
+        "volumes",
+        "bind_ports",
+        "restart_policy",
+        "auto_start",
+    }
+)
+
+
+def _reject_user_mcp_docker_config(config: dict[str, Any]) -> None:
+    """Keep API-created MCP servers outside XAgent's Docker control plane.
+
+    Internal MCP lifecycle fields are reserved for trusted deployment
+    configuration. Accepting them from the generic create/update API lets a
+    user select a Docker daemon, image, mounts and ports, and can turn later
+    status/log operations into host-Docker access or SSRF.
+
+    Match the ``docker_`` prefix as well as today's explicit fields so adding a
+    new Docker option to ``MCPServerConfig`` does not silently expose it here.
+    """
+    forbidden = sorted(
+        field_name
+        for field_name in config
+        if field_name in _USER_FORBIDDEN_MCP_CONFIG_FIELDS
+        or field_name.startswith("docker_")
+    )
+    if forbidden:
+        raise ValueError(
+            "Internal Docker management fields are not available to "
+            f"API-created MCP servers: {', '.join(forbidden)}"
+        )
+
+
 def _build_server_config(
     server_data: MCPServerCreate, existing_server: Optional[MCPServer] = None
 ) -> MCPServerConfig:
     """Build MCPServerConfig from API request data using modular parsing."""
+    _reject_user_mcp_docker_config(server_data.config or {})
+
     # Start with base config
     config_dict = {
         "name": server_data.name,
@@ -2167,7 +2204,15 @@ def _build_server_config(
     if existing_server:
         existing_config = existing_server.to_config_dict()
         for key, value in existing_config.items():
-            if key not in config_dict and value is not None:
+            # Legacy internal rows may still contain Docker lifecycle fields.
+            # A user-facing edit converts the row to the external contract;
+            # never copy those trusted-deployment fields back into that edit.
+            if (
+                key not in _USER_FORBIDDEN_MCP_CONFIG_FIELDS
+                and not key.startswith("docker_")
+                and key not in config_dict
+                and value is not None
+            ):
                 config_dict[key] = value
 
     TransportFieldValidator.validate_transport_fields(
@@ -5960,9 +6005,8 @@ async def get_mcp_server_logs(
     db: Session = Depends(get_db),
     lines: int = 100,
 ) -> Dict[str, Any]:
-    """Get logs for an internal MCP server."""
+    """Reject host-Docker log access from the user-facing MCP API."""
     try:
-        manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
         if not (1 <= lines <= 1000):
@@ -5992,8 +6036,14 @@ async def get_mcp_server_logs(
                 detail="Logs only available for internal servers",
             )
 
-        log_lines = manager.get_logs(server.name, lines)
-        return {"server_name": server.name, "logs": log_lines or []}
+        # Internal server lifecycle and diagnostics are deployment concerns.
+        # Never pass user-reachable database fields (notably name/docker_url)
+        # to DockerManager, including for rows created before the API input
+        # validation above was deployed.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Internal MCP server logs are disabled",
+        )
 
     except HTTPException:
         raise

@@ -334,6 +334,55 @@ describe("MCP edit contract", () => {
     ).toEqual({ description: "Updated description" })
   })
 
+  it("omits response-only deployment metadata from a nested config edit", () => {
+    const detail = parseMcpServerDetail({
+      ...mcpDetailPayload,
+      can_edit_global: true,
+      config: {
+        ...mcpDetailPayload.config,
+        managed: "external",
+        volumes: ["/host:/guest"],
+        bind_ports: { "8080": 8080 },
+        restart_policy: "always",
+        auto_start: true,
+        docker_host: "tcp://docker:2375",
+      },
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(formData.config).toEqual(mcpDetailPayload.config)
+    expect(
+      buildMcpServerPayload(
+        {
+          ...formData,
+          config: { ...formData.config, url: "https://rotated.example.com/mcp" },
+        },
+        detail,
+      ),
+    ).toEqual({
+      config: {
+        ...mcpDetailPayload.config,
+        url: "https://rotated.example.com/mcp",
+      },
+    })
+  })
+
+  it("does not emit config for a description-only edit of a response-backed server", () => {
+    const detail = parseMcpServerDetail({
+      ...mcpDetailPayload,
+      config: {
+        ...mcpDetailPayload.config,
+        managed: "external",
+        docker_host: "tcp://docker:2375",
+      },
+    })
+    const { formData } = mcpServerDetailToEditState(detail)
+
+    expect(
+      buildMcpServerPayload({ ...formData, description: "Updated description" }, detail),
+    ).toEqual({ description: "Updated description" })
+  })
+
   it("sends the complete per-user env replacement when a key is added", () => {
     const detail = parseMcpServerDetail(mcpDetailPayload)
     const { formData } = mcpServerDetailToEditState(detail)

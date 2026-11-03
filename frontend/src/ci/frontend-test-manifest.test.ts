@@ -260,10 +260,15 @@ function assertBashCompatibleDefaultShell(value: Record<string, unknown>, owner:
 function assertWorkflowTriggerContract(workflow: Record<string, unknown>) {
   requireRecord(workflow.on, "workflow triggers")
   const triggers = workflow.on
-  for (const trigger of ["workflow_dispatch", "pull_request", "push", "merge_group"]) {
+  for (const trigger of ["workflow_dispatch", "workflow_call", "pull_request", "merge_group"]) {
     if (!Object.hasOwn(triggers, trigger)) {
       throw new Error(`workflow triggers must include ${trigger}`)
     }
+  }
+  // main-push-check.yml calls this workflow for pushes the merge queue did not
+  // test; a push trigger here would re-run the suite on every merge.
+  if (Object.hasOwn(triggers, "push")) {
+    throw new Error("workflow triggers must not include push")
   }
 
   requireRecord(triggers.pull_request, "workflow pull_request")
@@ -657,6 +662,19 @@ describe("frontend CI test manifest", () => {
 
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
       `workflow triggers must include ${_}`,
+    )
+  })
+
+  it("rejects a push trigger", () => {
+    const source = replaceExactlyOnce(
+      realWorkflowSource,
+      "  merge_group:\n",
+      "  merge_group:\n  push:\n    branches: [main]\n",
+      "merge_group trigger",
+    )
+
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow(
+      "workflow triggers must not include push",
     )
   })
 

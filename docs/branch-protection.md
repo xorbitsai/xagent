@@ -43,7 +43,7 @@ the merge is clean. Only the graph check sees the problem.
 | `alembic-check` pre-commit hook | multiple heads, duplicate revision IDs, unresolvable `down_revision` | locally on commit, and on every PR via the `pre-commit` job |
 | Merge queue | the same defects, evaluated against the tree that will actually land | at merge time |
 | `Test SQLite/PostgreSQL Migrations` | a real `alembic upgrade head` on both backends | reported via the required `Migrations Summary` context |
-| `ci.yml` on `push: main` | post-merge detection if something slipped through | red build on `main`, emailed to the pusher |
+| `main-push-check.yml` on `push: main` | a commit that reached `main` without the merge queue (an administrator's direct push) | runs `ci.yml` on it; red build on `main`, emailed to the pusher |
 
 `scripts/check_alembic_heads.sh` is the single implementation of the graph
 check. It became the single implementation when
@@ -225,9 +225,17 @@ that output. On a docs-only pull request those five jobs still start and still
 report `success`, their own steps finishing in about twenty seconds.
 `prepare-deepdoc-cache` is not gated, so on a cache miss `pytest-fast-deepdoc`
 and `pytest-slow` wait on it first. Non-`pull_request` events --
-`merge_group`, `push` to `main`, `workflow_dispatch` -- never filter at all, so
+`merge_group`, `workflow_dispatch` -- never filter at all, so
 the queue re-runs the full suite against the tree that will actually land and
 stays the backstop for anything the filters get wrong.
+
+`ci.yml` does not run on `push` to `main`. The queue fast-forwards `main` to the
+commit it just tested, so a push run would repeat a passing result while
+holding runners that queued pull requests are waiting for.
+`main-push-check.yml` looks for a successful `merge_group` run of the pushed
+commit and, when there is none -- which is what an administrator's direct push
+produces -- calls `ci.yml` through `workflow_call`, so the run still belongs to
+the push and its pusher. A failed lookup runs it too.
 
 Step-level gating has a failure mode of its own that job-level gating does not: if the `changes` outputs come back empty, every guarded work step skips, only the `Skip` sentinel runs, and the job reports `success` having tested nothing. A skipped job at least shows up grey in the UI; this one is green, and `check_job` cannot tell the difference. `CI Summary` therefore also asserts that each output is a literal `true` or `false` and fails on an empty one -- that is the only way this summary could otherwise pass vacuously, so it is checked explicitly rather than trusted to the expression that produces it.
 

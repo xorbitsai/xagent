@@ -1425,6 +1425,49 @@ describe("SessionAgentChatPage file attachments", () => {
       surfaces.real = false
     })
 
+    it("types a clicked suggested prompt into the focused composer, then sends it as one chat message", async () => {
+      const socket = await mountActive({
+        agent: { id: 42, name: "Support Agent", suggested_prompts: ["Show my schedule"] },
+      })
+      await waitFor(() => expect(editor()).toBeInTheDocument())
+      // Focus may stay in the composer when the card is tapped on a phone.
+      act(() => { editor().focus() })
+
+      fireEvent.click(screen.getByText("Show my schedule"))
+
+      await waitFor(() => {
+        const typed = editor().textContent ?? ""
+        expect(typed.length).toBeGreaterThan(0)
+        expect(typed.length).toBeLessThan("Show my schedule".length)
+      })
+      expect(chatFrames(socket)).toHaveLength(0)
+      await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+      expect(chatFrames(socket)[0].message).toBe("Show my schedule")
+      expect(editor()).toHaveTextContent(/^Show my schedule$/)
+      acceptLast(socket)
+      await waitFor(() => expect(editor().textContent).toBe(""))
+      expect(chatFrames(socket)).toHaveLength(1)
+    })
+
+    it("sends the files picked on the start page with a clicked suggested prompt", async () => {
+      const socket = await mountActive({
+        capabilities,
+        agent: { id: 42, name: "Support Agent", suggested_prompts: ["Show my schedule"] },
+      })
+      await waitFor(() => expect(editor()).toBeInTheDocument())
+      fetchMock.mockResolvedValueOnce(created(FILE_A))
+      pick(pdf("a.pdf"))
+
+      fireEvent.click(screen.getByText("Show my schedule"))
+
+      await waitFor(() => expect(chatFrames(socket)).toHaveLength(1))
+      expect(uploadCalls()).toHaveLength(1)
+      expect(chatFrames(socket)[0]).toEqual(expect.objectContaining({
+        message: "Show my schedule",
+        file_ids: [FILE_A],
+      }))
+    })
+
     it.each(["running", "completed"])(
       "keeps a panel file added while a send with files is in flight (task %s)",
       async (status) => {

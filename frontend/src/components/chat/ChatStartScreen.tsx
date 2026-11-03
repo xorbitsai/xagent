@@ -1,6 +1,10 @@
-import React from "react";
+import React, { useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
-import { ChatInput, type ComposerAttachmentStatus } from "@/components/chat/ChatInput";
+import {
+  ChatInput,
+  type ComposerAttachmentStatus,
+  type ComposerAutoSendRequest,
+} from "@/components/chat/ChatInput";
 import type { SessionAttachmentsConfig } from "@/contexts/app-context-chat";
 import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
@@ -69,6 +73,10 @@ type ChatStartScreenProps = {
   onInputChange?: (value: string) => void;
   onFocusChange?: (focused: boolean) => void;
   onPromptSelect?: (prompt: string, promptHighlights?: string[]) => void;
+  // A clicked prompt is typed into the composer and sent from it, as if the
+  // visitor had typed it (see ChatInput's autoSendRequest). `onPromptSelect`
+  // still takes precedence when both are passed.
+  sendPromptOnClick?: boolean;
   promptHighlightTerms?: string[];
   files?: File[];
   onFilesChange?: (files: File[]) => void;
@@ -107,6 +115,7 @@ export function ChatStartScreen({
   onInputChange,
   onFocusChange,
   onPromptSelect,
+  sendPromptOnClick = false,
   promptHighlightTerms = [],
   files = [],
   onFilesChange,
@@ -130,9 +139,18 @@ export function ChatStartScreen({
   const filesBlocked = filesDisabled && !attachments;
   const enabledFiles = filesBlocked ? [] : files;
 
+  const [autoSendRequest, setAutoSendRequest] =
+    useState<ComposerAutoSendRequest | null>(null);
+  const nextAutoSendIdRef = useRef(0);
+
   const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
     if (onPromptSelect) {
       onPromptSelect(prompt, promptHighlights);
+      return;
+    }
+    if (sendPromptOnClick) {
+      nextAutoSendIdRef.current += 1;
+      setAutoSendRequest({ id: nextAutoSendIdRef.current, text: prompt });
       return;
     }
     if (onInputChange) {
@@ -212,6 +230,7 @@ export function ChatStartScreen({
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}
             selectedAgents={selectedAgents}
+            autoSendRequest={autoSendRequest}
           />
         </div>
 

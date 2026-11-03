@@ -649,6 +649,28 @@ def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
     return should_load_mcp_server_configs(tool_selection_spec)
 
 
+def _task_model_override_excluded_categories(
+    snapshot: Optional[TaskSetupSnapshot],
+) -> frozenset[str]:
+    """Tool categories this run's task model override explicitly excluded.
+
+    The one reader of the requested exclusion set, shared by both tool-build
+    readers. It comes from the snapshot's ``model_override`` because
+    ``tool_categories`` alone cannot tell "an agent created before it had an
+    ``mcp`` category" (an actor-marked task re-adds it) from "this run
+    explicitly excluded ``mcp``" (it must not). A snapshot without an
+    override means "nothing excluded", so the legacy behaviour is unchanged.
+
+    An exclusion only ever *removes* tools: it turns off the actor-marked
+    plain-``mcp`` add-back and the forced MCP config load. It is not a scoped
+    selection -- an explicit ``mcp:<server>`` entry is left alone and still
+    loads that server (see ``TaskModelOverride.excluded_tool_categories``).
+    """
+    if snapshot is None or snapshot.model_override is None:
+        return frozenset()
+    return snapshot.model_override.excluded_tool_categories
+
+
 def _build_tool_selection_spec_for_task(
     agent_config: Optional[dict],
     workforce_runtime: Optional[WorkforceTaskRuntime],
@@ -656,6 +678,7 @@ def _build_tool_selection_spec_for_task(
     task_id: int,
     omit_published_agent_tools: bool = False,
     include_mcp_tools: bool = False,
+    excluded_tool_categories: frozenset[str] = frozenset(),
 ) -> Any:
     """Single SSOT normalizer for chat reconstruct + snapshot paths.
 
@@ -665,6 +688,10 @@ def _build_tool_selection_spec_for_task(
     tool names) into a :class:`ToolSelectionSpec`. Centralising the
     call here keeps the two paths in lockstep and avoids the 30-line
     copy / paste that used to live in each.
+
+    ``excluded_tool_categories`` is the task model override's requested
+    exclusion set (see ``_task_model_override_excluded_categories``); a plain
+    ``mcp`` entry in it suppresses the actor-marked MCP add-back below.
     """
     from ...core.tools.adapters.vibe.selection_spec import (
         ToolSelectionSpec,
@@ -688,7 +715,10 @@ def _build_tool_selection_spec_for_task(
         ),
         extras_only_when_unconfigured=workforce_runtime is not None,
     )
-    if include_mcp_tools:
+    if include_mcp_tools and "mcp" not in excluded_tool_categories:
+        # An explicit "mcp" exclusion from the task model override wins over
+        # the actor-marked add-back (see
+        # ``_task_model_override_excluded_categories``).
         spec = with_mcp_tools(spec)
     if omit_published_agent_tools:
         spec = without_published_agent_tools(spec)
@@ -2167,6 +2197,9 @@ class AgentServiceManager:
         mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
+        excluded_tool_categories = _task_model_override_excluded_categories(
+            task_setup_snapshot
+        )
         if task_setup_snapshot is not None:
             workforce_runtime = task_setup_snapshot.workforce_runtime
             excluded_agent_id = task_setup_snapshot.excluded_agent_id
@@ -2240,6 +2273,7 @@ class AgentServiceManager:
             task_id=task_id,
             omit_published_agent_tools=actor_execution,
             include_mcp_tools=actor_execution,
+            excluded_tool_categories=excluded_tool_categories,
         )
         workspace_owner_id = int(task.user_id)
         # Actor-logical access policy + CA mount intent, built by
@@ -2305,7 +2339,10 @@ class AgentServiceManager:
             connector_runtime_turn_id=connector_runtime_turn_id,
             mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
             mcp_actor_execution_identity=mcp_actor_execution_identity,
-            force_mcp_tools=actor_execution,
+            # Same override exclusion as the selection-spec add-back above;
+            # only removes tools (see
+            # ``_task_model_override_excluded_categories``).
+            force_mcp_tools=actor_execution and "mcp" not in excluded_tool_categories,
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
@@ -3069,12 +3106,16 @@ class AgentServiceManager:
                     prepare_root=workspace_binding.prepare_root,
                 )
 
+                excluded_tool_categories = _task_model_override_excluded_categories(
+                    snapshot
+                )
                 tool_selection_spec = _build_tool_selection_spec_for_task(
                     agent_config,
                     workforce_runtime,
                     task_id=task_id,
                     omit_published_agent_tools=actor_marked,
                     include_mcp_tools=actor_marked,
+                    excluded_tool_categories=excluded_tool_categories,
                 )
 
                 tools = await create_default_tools(
@@ -3134,7 +3175,11 @@ class AgentServiceManager:
                     connector_runtime_turn_id=connector_runtime_turn_id,
                     mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                     mcp_actor_execution_identity=mcp_actor_execution_identity,
-                    force_mcp_tools=actor_marked,
+                    # Same override exclusion as the selection-spec add-back
+                    # above; only removes tools (see
+                    # ``_task_model_override_excluded_categories``).
+                    force_mcp_tools=actor_marked
+                    and "mcp" not in excluded_tool_categories,
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(
                         task.source if task is not None else None
                     ),

@@ -487,6 +487,7 @@ async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
             workforce_runtime=None,
             excluded_agent_id=None,
             agent=None,
+            model_override=None,
         ),
     )
 

@@ -200,7 +200,13 @@ class TaskModelOverride:
     are built on the stand-in and refuse.) ``excluded_tool_categories``
     removes tool categories from this run's selection; it requires an
     explicit category list, since an unrestricted selection has no list to
-    remove from.
+    remove from. Exclusions match *exact category names* only: excluding the
+    plain ``mcp`` category does not remove ``mcp:<server>`` entries from the
+    selection, and such an entry still loads that server. A caller that wants
+    no MCP tools at all must therefore list every ``mcp:<server>`` it selects,
+    not just ``mcp``. The applied override remains on the snapshot
+    (``model_override``), where the tool build reads this set to decide
+    whether an actor-marked task may re-add ``mcp``.
 
     Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
     applied to rebuilds a cached service for the task unless that service
@@ -240,6 +246,15 @@ def apply_task_model_override(
 
     Raises :class:`TaskModelOverrideError` when categories are to be excluded
     from a selection that is not an explicit list.
+
+    The returned snapshot also carries ``override`` as ``model_override``: the
+    requested exclusion set stays reachable there for the tool build, which
+    needs the intent (an old agent's list may never have listed ``mcp``, yet
+    this run still excludes it) to decide whether an actor-marked task may
+    re-add ``mcp``. See :class:`TaskModelOverride` for the exact-name /
+    scoped-``mcp:<server>`` semantics. The vision-category removal is
+    deliberately not part of that set: it already has its own stand-in
+    mechanism.
     """
     from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
 

@@ -3,6 +3,13 @@
 Operational helper scripts for local development, upgrades, and release checks.
 Run commands from the repository root unless a script says otherwise.
 
+## `fxmacrodata_example.py`
+
+Runs an opt-in release calendar and latest-releases lookup through Xagent's MCP
+configuration model and agent tool loader. USD works without a key. See
+[FXMacroData MCP](../docs/fxmacrodata.md) for the runnable configuration and
+setup instructions.
+
 ## `parallel_search_example.py`
 
 Runs opt-in, keyless web search and optional page fetching through Xagent's

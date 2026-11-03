@@ -98,6 +98,7 @@ SANDBOX_NETWORK_LABEL_VALUE = "v1"
 _SANDBOX_ARCHIVE_PAX_VERSION_KEY = "Xagent.archive.version"
 _SANDBOX_ARCHIVE_PAX_VERSION = "1"
 _MAX_SANDBOX_ARCHIVE_NAME_BYTES = 255
+_MAX_SANDBOX_ARCHIVE_FILE_SIZE = 8**11
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -648,14 +649,8 @@ def _find_publish_mismatches(
     return mismatches
 
 
-def _sandbox_archive_info(
-    arcname: str,
-    *,
-    size: int,
-    mode: int,
-    mtime: int = 0,
-) -> tarfile.TarInfo:
-    """Build the one regular member allowed by the sandbox upload protocol."""
+def _validate_sandbox_archive_name(arcname: str) -> None:
+    """Reject names that cannot be represented by the broker wire contract."""
     try:
         encoded_name = arcname.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:
@@ -669,9 +664,26 @@ def _sandbox_archive_info(
     ):
         raise ValueError("Sandbox uploads require a single valid file name")
 
+
+def _sandbox_archive_info(
+    arcname: str,
+    *,
+    size: int,
+    mode: int,
+) -> tarfile.TarInfo:
+    """Build the one regular member allowed by the sandbox upload protocol."""
+    _validate_sandbox_archive_name(arcname)
+    # A POSIX tar size field has eleven octal digits. Larger values make
+    # tarfile add a PAX ``size`` record, widening the broker wire contract.
+    if size < 0 or size >= _MAX_SANDBOX_ARCHIVE_FILE_SIZE:
+        raise ValueError("Sandbox upload file size is outside the archive contract")
+
     info = tarfile.TarInfo(name=arcname)
     info.size = size
-    info.mtime = mtime
+    # Never inherit a local timestamp: negative or very large mtimes cause
+    # tarfile to emit a PAX ``mtime`` key, and ordinary mtimes make the wire
+    # bytes depend on host filesystem state.
+    info.mtime = 0
     info.uid = SANDBOX_RUNTIME_UID
     info.gid = SANDBOX_RUNTIME_GID
     info.mode = mode
@@ -693,7 +705,6 @@ def _open_sandbox_upload_archive(
         format=tarfile.PAX_FORMAT,
         encoding="utf-8",
         errors="strict",
-        pax_headers={},
     )
 
 
@@ -718,7 +729,6 @@ def _write_tar_from_local_path(
         info = _sandbox_archive_info(
             arcname,
             size=source_stat.st_size,
-            mtime=int(source_stat.st_mtime),
             mode=stat.S_IMODE(source_stat.st_mode) & 0o755,
         )
         with os.fdopen(source_fd, "rb", closefd=True) as source:
@@ -1038,6 +1048,8 @@ class DockerSandbox(Sandbox):
         self, local_path: str, remote_path: str, overwrite: bool = False
     ) -> None:
         """Upload a local file into the sandbox filesystem."""
+        arcname = posixpath.basename(remote_path)
+        _validate_sandbox_archive_name(arcname)
         if not os.path.isfile(local_path):
             raise FileNotFoundError(f"Local file not found: {local_path}")
 
@@ -1061,9 +1073,7 @@ class DockerSandbox(Sandbox):
 
                 container = await self._require_container()
                 with tempfile.TemporaryFile() as archive_file:
-                    _write_tar_from_local_path(
-                        local_path, posixpath.basename(remote_path), archive_file
-                    )
+                    _write_tar_from_local_path(local_path, arcname, archive_file)
                     ok = await asyncio.to_thread(
                         container.put_archive, remote_dir, archive_file
                     )
@@ -1101,6 +1111,8 @@ class DockerSandbox(Sandbox):
         self, content: str, remote_path: str, overwrite: bool = False
     ) -> None:
         """Write text content directly to a file inside the sandbox."""
+        arcname = posixpath.basename(remote_path)
+        _validate_sandbox_archive_name(arcname)
         async with self._control.operation():
             async with self._control.file_lock:
                 if not overwrite:
@@ -1120,9 +1132,7 @@ class DockerSandbox(Sandbox):
 
                 container = await self._require_container()
                 with tempfile.TemporaryFile() as archive_file:
-                    _write_tar_from_content(
-                        content, posixpath.basename(remote_path), archive_file
-                    )
+                    _write_tar_from_content(content, arcname, archive_file)
                     ok = await asyncio.to_thread(
                         container.put_archive, remote_dir, archive_file
                     )

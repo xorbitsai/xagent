@@ -25,6 +25,7 @@ from xagent.sandbox import DEFAULT_SANDBOX_IMAGE
 from xagent.sandbox.base import (
     SANDBOX_RUNTIME_GID,
     SANDBOX_RUNTIME_UID,
+    ExecResult,
     ResolvedSandboxRuntimeSpec,
     SandboxConfig,
     SandboxRuntimeConflictError,
@@ -233,6 +234,348 @@ def test_write_tar_local_path_rejects_symlink_consistently(tmp_path) -> None:
     with tempfile.TemporaryFile() as archive:
         with pytest.raises(ValueError, match="regular local file"):
             _write_tar_from_local_path(str(source), "source.txt", archive)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_exec_cycles_container_and_drains_stream() -> None:
+    started = threading.Event()
+    stopped = threading.Event()
+    started_again = threading.Event()
+    drained = threading.Event()
+
+    class _ExecAPI:
+        calls = 0
+
+        def exec_create(self, _container_id, _cmd, **_kwargs):
+            self.calls += 1
+            return {"Id": f"exec-{self.calls}"}
+
+        def exec_start(self, exec_id, **_kwargs):
+            if exec_id == "exec-1":
+
+                def blocked_stream():
+                    started.set()
+                    assert started_again.wait(timeout=5)
+                    drained.set()
+                    if False:
+                        yield None
+
+                return blocked_stream()
+            return iter([(b"ready\n", None)])
+
+        @staticmethod
+        def exec_inspect(exec_id):
+            return {"ExitCode": 137 if exec_id == "exec-1" else 0}
+
+    class _Container:
+        id = "container"
+        client = SimpleNamespace(api=_ExecAPI())
+
+        @staticmethod
+        def reload():
+            return None
+
+        @staticmethod
+        def stop(*, timeout):
+            assert timeout == 1
+            stopped.set()
+
+        @staticmethod
+        def start():
+            assert stopped.is_set()
+            started_again.set()
+
+        @staticmethod
+        def remove(*, force):
+            raise AssertionError(f"healthy recovery removed container: {force}")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._container = _Container()
+    sandbox._name = "cancel-safe"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("cancel-safe")
+
+    running = asyncio.create_task(sandbox.exec("sleep", "600"))
+    assert await asyncio.to_thread(started.wait, 2)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=5)
+
+    assert stopped.is_set()
+    assert started_again.is_set()
+    assert drained.is_set()
+    assert sandbox._control.active_ops == 0
+    probe = await sandbox.exec("true")
+    assert probe.exit_code == 0
+    assert probe.stdout == "ready\n"
+
+
+def test_exec_streaming_caps_each_stream_and_handles_unknown_exit() -> None:
+    class _API:
+        @staticmethod
+        def exec_create(*_args, **_kwargs):
+            return {"Id": "exec"}
+
+        @staticmethod
+        def exec_start(*_args, **_kwargs):
+            return iter([(b"abcdef", b"uvwxyz")])
+
+        @staticmethod
+        def exec_inspect(_exec_id):
+            return {"ExitCode": None}
+
+    container = SimpleNamespace(id="container", client=SimpleNamespace(api=_API()))
+
+    capped = docker_sandbox_module._exec_streaming(container, ["true"], None, 3)
+
+    assert capped.exit_code == -1
+    assert capped.stdout == "abc"
+    assert capped.stderr == "uvw"
+    assert capped.truncated is True
+
+    uncapped = docker_sandbox_module._exec_streaming(container, ["true"], None, None)
+    assert uncapped.stdout == "abcdef"
+    assert uncapped.stderr == "uvwxyz"
+    assert uncapped.truncated is False
+
+
+def test_abandoned_exec_gate_never_creates_an_exec() -> None:
+    gate = docker_sandbox_module._ExecStartGate()
+    with gate._lock:
+        gate._abandoned = True
+
+    class _API:
+        @staticmethod
+        def exec_create(*_args, **_kwargs):
+            raise AssertionError("abandoned exec reached Docker")
+
+    container = SimpleNamespace(id="container", client=SimpleNamespace(api=_API()))
+
+    result = docker_sandbox_module._exec_streaming(
+        container, ["true"], None, None, gate
+    )
+
+    assert result.exit_code == -1
+
+
+@pytest.mark.asyncio
+async def test_recovery_store_failure_keeps_healthy_container() -> None:
+    released = asyncio.Event()
+
+    class _Store(MemDockerStore):
+        def update_info_state(self, name, state):
+            raise RuntimeError("store unavailable")
+
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            assert timeout == 1
+
+        @staticmethod
+        def start():
+            released.set()
+
+        @staticmethod
+        def remove(*, force):
+            raise AssertionError(f"healthy container removed: {force}")
+
+    async def execution_body():
+        await released.wait()
+        return ExecResult(exit_code=137, stdout="", stderr="")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "store-failure"
+    sandbox._store = _Store()
+    sandbox._control = _SandboxControl("store-failure")
+    gate = docker_sandbox_module._ExecStartGate()
+    assert gate.before_create() is True
+    assert gate.before_start() is True
+    execution = asyncio.create_task(execution_body())
+
+    await sandbox._recover_after_cancel(_Container(), execution, gate)
+
+    assert sandbox._control.deleted is False
+
+
+@pytest.mark.asyncio
+async def test_recovery_failure_preserves_caller_cancellation() -> None:
+    exec_started = threading.Event()
+
+    class _API:
+        @staticmethod
+        def exec_create(*_args, **_kwargs):
+            return {"Id": "exec"}
+
+        @staticmethod
+        def exec_start(*_args, **_kwargs):
+            def stream():
+                exec_started.set()
+                threading.Event().wait(1)
+                if False:
+                    yield None
+
+            return stream()
+
+        @staticmethod
+        def exec_inspect(_exec_id):
+            return {"ExitCode": 137}
+
+    class _Container:
+        id = "container"
+        client = SimpleNamespace(api=_API())
+
+        @staticmethod
+        def reload():
+            return None
+
+        @staticmethod
+        def stop(*, timeout):
+            raise RuntimeError(f"stop denied: {timeout}")
+
+        @staticmethod
+        def remove(*, force):
+            assert force is True
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._container = _Container()
+    sandbox._name = "failed-recovery"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("failed-recovery")
+
+    running = asyncio.create_task(sandbox.exec("sleep", "600"))
+    assert await asyncio.to_thread(exec_started.wait, 2)
+    running.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=5)
+    assert sandbox._control.deleted is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_bounds_file_lock_wait(monkeypatch) -> None:
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "locked-recovery"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("locked-recovery")
+    await sandbox._control.file_lock.acquire()
+    gate = docker_sandbox_module._ExecStartGate()
+    assert gate.before_create() is True
+    assert gate.before_start() is True
+    execution = asyncio.create_task(asyncio.Event().wait())
+    monkeypatch.setattr(docker_sandbox_module, "_EXEC_FILE_LOCK_TIMEOUT_SECONDS", 0.01)
+
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            raise AssertionError(f"stop called while file lock is held: {timeout}")
+
+    try:
+        with pytest.raises(RuntimeError, match="file operations"):
+            await sandbox._recover_after_cancel(_Container(), execution, gate)
+        assert sandbox._control.deleted is True
+    finally:
+        sandbox._control.file_lock.release()
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+
+
+@pytest.mark.asyncio
+async def test_recovery_drain_timeout_is_bounded(monkeypatch, caplog) -> None:
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "drain-timeout"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("drain-timeout")
+    gate = docker_sandbox_module._ExecStartGate()
+    assert gate.before_create() is True
+    assert gate.before_start() is True
+    execution = asyncio.create_task(asyncio.Event().wait())
+    monkeypatch.setattr(docker_sandbox_module, "_EXEC_DRAIN_TIMEOUT_SECONDS", 0.01)
+
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            assert timeout == 1
+
+        @staticmethod
+        def start():
+            return None
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            await sandbox._recover_after_cancel(_Container(), execution, gate)
+        assert "did not drain" in caplog.text
+    finally:
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+
+
+@pytest.mark.asyncio
+async def test_second_cancellation_does_not_release_recovery_guards() -> None:
+    exec_started = threading.Event()
+    recovery_started = threading.Event()
+    allow_recovery = threading.Event()
+    cycled = threading.Event()
+
+    class _API:
+        @staticmethod
+        def exec_create(*_args, **_kwargs):
+            return {"Id": "exec"}
+
+        @staticmethod
+        def exec_start(*_args, **_kwargs):
+            def stream():
+                exec_started.set()
+                assert cycled.wait(5)
+                if False:
+                    yield None
+
+            return stream()
+
+        @staticmethod
+        def exec_inspect(_exec_id):
+            return {"ExitCode": 137}
+
+    class _Container:
+        id = "container"
+        client = SimpleNamespace(api=_API())
+
+        @staticmethod
+        def reload():
+            return None
+
+        @staticmethod
+        def stop(*, timeout):
+            assert timeout == 1
+            recovery_started.set()
+            assert allow_recovery.wait(5)
+
+        @staticmethod
+        def start():
+            cycled.set()
+
+        @staticmethod
+        def remove(*, force):
+            raise AssertionError(f"healthy recovery removed container: {force}")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._container = _Container()
+    sandbox._name = "double-cancel"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("double-cancel")
+
+    running = asyncio.create_task(sandbox.exec("sleep", "600"))
+    assert await asyncio.to_thread(exec_started.wait, 2)
+    running.cancel()
+    assert await asyncio.to_thread(recovery_started.wait, 2)
+    running.cancel()
+    assert sandbox._control.active_ops == 1
+    allow_recovery.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=5)
+    assert sandbox._control.active_ops == 0
 
 
 @pytest.mark.parametrize("raw_pids_limit", [0, 1, 63, -1, None])
@@ -1865,6 +2208,54 @@ class TestDockerSandbox:
 
             print("✅ Command execution test passed")
 
+        finally:
+            try:
+                await service.delete(name)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_cancelled_exec_cycles_running_sandbox(self, docker_service):
+        name = f"test_cancel_exec_{uuid.uuid4().hex[:8]}"
+        service = docker_service
+        try:
+            sandbox = await service.get_or_create(
+                name,
+                template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config=SandboxConfig(cpus=1, memory=256),
+            )
+            marker = "/tmp/xagent-cancel-marker"
+            started_marker = "/tmp/xagent-cancel-started"
+            before = await sandbox.exec("sh", "-c", f"printf before > {marker}")
+            assert before.exit_code == 0, before.stderr
+
+            running = asyncio.create_task(
+                sandbox.exec(
+                    "sh",
+                    "-c",
+                    f"printf started > {started_marker}; "
+                    f"sleep 2; printf late >> {marker}",
+                )
+            )
+            deadline = asyncio.get_running_loop().time() + 5
+            while True:
+                try:
+                    assert await sandbox.read_file(started_marker) == "started"
+                    break
+                except FileNotFoundError:
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise AssertionError("cancelled exec never started") from None
+                    await asyncio.sleep(0.05)
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(running, timeout=10)
+
+            # The original command would append after two seconds if recovery
+            # failed to terminate it. Wait past that boundary before probing.
+            await asyncio.sleep(3)
+            probe = await sandbox.exec("cat", marker)
+            assert probe.exit_code == 0, probe.stderr
+            assert probe.stdout == "before"
         finally:
             try:
                 await service.delete(name)

@@ -17,6 +17,7 @@ import stat
 import tarfile
 import tempfile
 import textwrap
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
@@ -71,6 +72,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
+_EXEC_START_BOUNDARY_TIMEOUT_SECONDS = 30.0
+_EXEC_FILE_LOCK_TIMEOUT_SECONDS = 30.0
+_EXEC_DRAIN_TIMEOUT_SECONDS = 10.0
 
 LABEL_MANAGED = "xagent.managed"
 LABEL_SANDBOX_NAME = "xagent.sandbox.name"
@@ -754,36 +758,89 @@ def _write_tar_from_content(
     file_obj.seek(0)
 
 
-def _exec_capped(
-    container: Any, cmd: list[str], env: Optional[dict[str, str]], cap: int
+class _ExecStartGate:
+    """Prevent a cancelled coroutine from starting an exec after recovery."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._abandoned = False
+        self._launched = False
+
+    def before_create(self) -> bool:
+        with self._lock:
+            if self._abandoned:
+                self._ready.set()
+                return False
+            return True
+
+    def before_start(self) -> bool:
+        with self._lock:
+            if self._abandoned:
+                self._ready.set()
+                return False
+            self._launched = True
+            self._ready.set()
+            return True
+
+    def create_failed(self) -> None:
+        self._ready.set()
+
+    def abandon_and_wait(self, timeout: float) -> bool:
+        with self._lock:
+            self._abandoned = True
+        if not self._ready.wait(timeout):
+            raise TimeoutError("Docker exec did not reach its launch boundary")
+        with self._lock:
+            return self._launched
+
+
+def _append_capped(buffer: bytearray, chunk: bytes, cap: int | None) -> bool:
+    if cap is None:
+        buffer.extend(chunk)
+        return False
+    room = cap - len(buffer)
+    if room > 0:
+        buffer.extend(chunk[:room])
+    return len(chunk) > max(room, 0)
+
+
+def _exec_streaming(
+    container: Any,
+    cmd: list[str],
+    env: Optional[dict[str, str]],
+    cap: int | None,
+    gate: _ExecStartGate | None = None,
 ) -> ExecResult:
-    """Exec ``cmd`` streaming stdout/stderr and keeping at most ``cap`` bytes of
-    each, so the host docker client never buffers an unbounded remote flood
-    (#3). ``container.exec_run(demux=True)`` reads the whole stream into host
-    memory before returning; the low-level exec API streams instead, letting us
-    drop everything past the cap while still draining to EOF (the caller's
-    ``timeout`` bounds how long that can take). Blocking — run in a thread."""
+    """Run one Docker exec through the streaming API.
+
+    The low-level stream can be drained after a container restart, unlike
+    ``container.exec_run`` hidden inside an abandoned worker thread.  When a
+    cap is supplied, retain at most that many bytes per output stream.
+    Blocking -- run in a thread.
+    """
     api = container.client.api
-    exec_id = api.exec_create(
-        container.id, cmd, environment=env, stdout=True, stderr=True
-    )["Id"]
+    if gate is not None and not gate.before_create():
+        return ExecResult(exit_code=-1, stdout="", stderr="")
+    try:
+        exec_id = api.exec_create(
+            container.id, cmd, environment=env, stdout=True, stderr=True
+        )["Id"]
+    except BaseException:
+        if gate is not None:
+            gate.create_failed()
+        raise
+    if gate is not None and not gate.before_start():
+        return ExecResult(exit_code=-1, stdout="", stderr="")
     out = bytearray()
     err = bytearray()
     out_truncated = False
     err_truncated = False
     for stdout_chunk, stderr_chunk in api.exec_start(exec_id, stream=True, demux=True):
         if stdout_chunk:
-            room = cap - len(out)
-            if room > 0:
-                out.extend(stdout_chunk[:room])
-            if len(stdout_chunk) > max(room, 0):
-                out_truncated = True
+            out_truncated |= _append_capped(out, stdout_chunk, cap)
         if stderr_chunk:
-            room = cap - len(err)
-            if room > 0:
-                err.extend(stderr_chunk[:room])
-            if len(stderr_chunk) > max(room, 0):
-                err_truncated = True
+            err_truncated |= _append_capped(err, stderr_chunk, cap)
     exit_code = api.exec_inspect(exec_id).get("ExitCode")
     return ExecResult(
         exit_code=exit_code if exit_code is not None else -1,
@@ -940,22 +997,21 @@ class DockerSandbox(Sandbox):
         *args: str,
         env: Optional[dict[str, str]] = None,
         max_output_bytes: Optional[int] = None,
+        container: Container | None = None,
+        cancellation_gate: _ExecStartGate | None = None,
     ) -> ExecResult:
         """Execute a command directly against the current container instance."""
-        container = await self._require_container()
+        if container is None:
+            container = await self._require_container()
         cmd: list[str] = [command, *args]
         try:
-            if max_output_bytes is not None:
-                return await asyncio.to_thread(
-                    _exec_capped, container, cmd, env, max_output_bytes
-                )
-            result = await asyncio.to_thread(
-                container.exec_run,
+            return await asyncio.to_thread(
+                _exec_streaming,
+                container,
                 cmd,
-                environment=env,
-                demux=True,
-                stdout=True,
-                stderr=True,
+                env,
+                max_output_bytes,
+                cancellation_gate,
             )
         except Exception as exc:
             return ExecResult(
@@ -965,14 +1021,87 @@ class DockerSandbox(Sandbox):
                 error_message=str(exc),
             )
 
-        output = cast(tuple[bytes | None, bytes | None] | None, result.output)
-        stdout_bytes, stderr_bytes = output if output is not None else (b"", b"")
-        return ExecResult(
-            exit_code=cast(int, result.exit_code),
-            stdout=(stdout_bytes or b"").decode("utf-8", errors="replace"),
-            stderr=(stderr_bytes or b"").decode("utf-8", errors="replace"),
-            error_message=None,
+    async def _recover_after_cancel(
+        self,
+        container: Container,
+        execution: asyncio.Task[ExecResult],
+        gate: _ExecStartGate,
+    ) -> None:
+        """Kill a cancelled exec and leave the persistent sandbox runnable.
+
+        Docker has no API for terminating one exec, and ``exec_inspect.Pid`` is
+        in the daemon host namespace rather than the container namespace.  A
+        targeted in-container kill is therefore not trustworthy. Stop then
+        start the dedicated sandbox using only broker-approved endpoints: its
+        filesystem and bind mounts persist while all descendants terminate.
+
+        File operations use ``file_lock``.  Taking it here drains any transfer
+        already in progress and prevents a new one from overlapping restart;
+        the caller still owns ``exec_lock`` for the same interval.
+        """
+        launched = await asyncio.to_thread(
+            gate.abandon_and_wait, _EXEC_START_BOUNDARY_TIMEOUT_SECONDS
         )
+        if not launched or execution.done():
+            await asyncio.shield(execution)
+            return
+
+        file_lock_acquired = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._control.file_lock.acquire(),
+                    timeout=_EXEC_FILE_LOCK_TIMEOUT_SECONDS,
+                )
+                file_lock_acquired = True
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    "Timed out waiting for sandbox file operations before recovery"
+                ) from exc
+
+            await asyncio.to_thread(container.stop, timeout=1)
+            await asyncio.to_thread(container.start)
+        except BaseException:
+            # Fail closed. An unknown process state must not accept another
+            # operation under this cached handle. Preserve the metadata row if
+            # removal fails so reconciliation can still find the container.
+            self._control.deleted = True
+            if file_lock_acquired:
+                try:
+                    await asyncio.to_thread(container.remove, force=True)
+                except errors.NotFound:
+                    self._store.delete_info(self._name)
+                except Exception:
+                    logger.error(
+                        "Failed to remove sandbox after exec recovery failure",
+                        exc_info=True,
+                    )
+                else:
+                    self._store.delete_info(self._name)
+            raise
+        finally:
+            if file_lock_acquired:
+                self._control.file_lock.release()
+
+        try:
+            self._store.update_info_state(self._name, "running")
+        except Exception:
+            logger.warning(
+                "Sandbox recovered but its persisted state was not updated",
+                exc_info=True,
+            )
+
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(execution), timeout=_EXEC_DRAIN_TIMEOUT_SECONDS
+            )
+        except TimeoutError:
+            logger.warning("Cancelled Docker exec stream did not drain after recovery")
+        except Exception:
+            logger.debug(
+                "Cancelled Docker exec stream ended after sandbox recovery",
+                exc_info=True,
+            )
 
     async def stop(self) -> None:
         """Stop the sandbox container while preserving filesystem state.
@@ -1023,12 +1152,53 @@ class DockerSandbox(Sandbox):
 
         Exec calls are serialized per sandbox to avoid Docker SDK stream
         corruption when concurrent execs read from the same container socket.
+        Cancelling a launched Docker exec stops and starts the container because
+        Docker exposes no single-exec kill endpoint. This preserves its writable
+        layer but terminates every background process in that sandbox; callers
+        with durable daemons must recreate their session after cancellation.
         """
         async with self._control.operation():
             async with self._control.exec_lock:
-                return await self._exec_in_container(
-                    command, *args, env=env, max_output_bytes=max_output_bytes
+                container = await self._require_container()
+                gate = _ExecStartGate()
+                execution = asyncio.create_task(
+                    self._exec_in_container(
+                        command,
+                        *args,
+                        env=env,
+                        max_output_bytes=max_output_bytes,
+                        container=container,
+                        cancellation_gate=gate,
+                    )
                 )
+                try:
+                    return await asyncio.shield(execution)
+                except asyncio.CancelledError as cancellation:
+                    if execution.done() and not execution.cancelled():
+                        raise
+                    recovery = asyncio.create_task(
+                        self._recover_after_cancel(container, execution, gate)
+                    )
+                    try:
+                        await asyncio.shield(recovery)
+                    except asyncio.CancelledError:
+                        # A second cancellation must not release the operation
+                        # guard while restart is still in flight.
+                        while not recovery.done():
+                            try:
+                                await asyncio.shield(recovery)
+                            except asyncio.CancelledError:
+                                continue
+                        try:
+                            recovery.result()
+                        except Exception:
+                            logger.error(
+                                "Docker exec recovery failed during repeated cancellation",
+                                exc_info=True,
+                            )
+                    except Exception:
+                        logger.error("Docker exec recovery failed", exc_info=True)
+                    raise cancellation
 
     async def run_code(
         self,

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { VoiceAudio, VoiceAudioError } from "./voice-audio"
+import { VoiceTurns } from "./voice-conversation"
 import { createVoiceVad } from "./voice-vad"
 
 const detectors = vi.hoisted(() => [] as Array<{ options: { speech: (active: boolean) => void; error: () => void }; process: ReturnType<typeof vi.fn>; destroy: ReturnType<typeof vi.fn> }>)
@@ -169,6 +170,30 @@ describe("browser voice resources", () => {
     expect(events.transcript).toHaveBeenLastCalledWith("final", "Hello there.", 1)
     expect(events.error).not.toHaveBeenCalled()
     call.close()
+  })
+
+  it("releases server activity before an empty partial flushes committed speech", async () => {
+    vi.useFakeTimers()
+    vi.mocked(createVoiceVad).mockRejectedValueOnce(new Error("WASM unavailable"))
+    const actions = {
+      send: vi.fn().mockResolvedValue(undefined), interrupt: vi.fn(), stopAudio: vi.fn(),
+      speak: vi.fn().mockResolvedValue(undefined), phase: vi.fn(), caption: vi.fn(), error: vi.fn(), playbackError: vi.fn(),
+    }
+    const turns = new VoiceTurns(actions)
+    const events = {
+      ...options(),
+      activity: (active: boolean) => turns.activity(active),
+      transcript: (type: "partial" | "final", text: string, segmentId: number) => turns.transcript(type, text, segmentId),
+    }
+    const call = new VoiceAudio(events)
+    const socket = await start(call)
+    socket.onmessage!({ data: JSON.stringify({ type: "final", text: "Open settings", segment_id: 1 }) })
+    socket.onmessage!({ data: JSON.stringify({ type: "partial", text: "uh", segment_id: 2 }) })
+    socket.onmessage!({ data: JSON.stringify({ type: "partial", text: "", segment_id: 2 }) })
+    await vi.advanceTimersByTimeAsync(300)
+    expect(actions.send).toHaveBeenCalledExactlyOnceWith("Open settings")
+    call.close()
+    turns.stop()
   })
 
   it("starts without waiting for local VAD and releases a detector arriving after close", async () => {

@@ -92,8 +92,15 @@ export class VoiceAudio {
                 this.serverSpeaking = true
                 this.options.activity(true)
               }
+              // Backend VAD uses an empty partial to signal that a false-start
+              // utterance has ended. Release the activity latch before the
+              // transcript callback so VoiceTurns can flush committed speech.
+              if (!this.vad && event.type === "partial" && !event.text.trim() && this.serverSpeaking) {
+                this.serverSpeaking = false
+                this.options.activity(false)
+              }
               this.options.transcript(event.type, event.text, event.segment_id)
-              if (!this.vad && event.type === "final") {
+              if (!this.vad && event.type === "final" && this.serverSpeaking) {
                 this.serverSpeaking = false
                 this.options.activity(false)
               }

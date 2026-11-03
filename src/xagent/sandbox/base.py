@@ -964,6 +964,18 @@ class Sandbox(abc.ABC):
             FileExistsError: Local file exists and overwrite=False.
         """
 
+    async def download_file_bounded(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Download with a streaming byte bound when the backend supports it."""
+        raise SandboxContractError(
+            f"Bounded downloads are not supported by {type(self).__name__}"
+        )
+
     @abc.abstractmethod
     async def write_file(
         self, content: str, remote_path: str, overwrite: bool = False
@@ -1124,6 +1136,10 @@ class SandboxService(abc.ABC):
         actually need the fixed in-container runtime group.
         """
         return None
+
+    def supports_task_workspace_transfer(self) -> bool:
+        """Whether this backend supports Docker archive task synchronization."""
+        return False
 
     def validate_host_workspace_access(self) -> None:
         """Fail readiness if required host bind ownership cannot be prepared."""

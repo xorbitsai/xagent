@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from ...config import (
     get_external_upload_dirs,
+    get_sandbox_workspace_mode,
     get_shared_task_execution_enabled,
 )
 from ...core.agent.context.memory_retrieval import (
@@ -1698,12 +1699,21 @@ class AgentServiceManager:
         suffix = scope.sandbox_key_suffix if scope is not None else None
         scoped = suffix is not None
         try:
-            sandbox = await sandbox_mgr.get_or_create_lease_provider(
+            sandbox: Any = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,
                 make_user_lifecycle_id(workspace_owner_id, suffix),
                 mount_intent=mount_intent,
                 prepare_root=prepare_root,
             )
+            if get_sandbox_workspace_mode() == "transfer":
+                scope_segments = scope.workspace_segments if scope is not None else ()
+                task_workspace_root = (
+                    Path(canonical_workspace_base(workspace_owner_id, scope_segments))
+                    .expanduser()
+                    .resolve()
+                    / f"web_task_{task_id}"
+                )
+                sandbox = sandbox.for_task_workspace(str(task_workspace_root))
         except SandboxCapacityError as e:
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)

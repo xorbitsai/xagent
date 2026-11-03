@@ -2,12 +2,17 @@
 Sandbox management in application layer.
 """
 
+from __future__ import annotations
+
 import asyncio
+import hashlib
 import logging
 import os
 import re
+import sys
 import threading
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -31,6 +36,7 @@ from ..config import (
     get_sandbox_volumes,
     get_sandbox_worker_id,
     get_sandbox_worker_namespace,
+    get_sandbox_workspace_mode,
     get_storage_root,
     get_uploads_dir,
 )
@@ -58,6 +64,14 @@ from ..sandbox.base import (
     canonical_sandbox_path,
     grant_sandbox_runtime_access,
     spec_matches_inspection,
+)
+from ..sandbox.task_workspace_transfer import (
+    ExplicitInput,
+    TaskWorkspaceTransfer,
+    WorkspaceCallPlan,
+    build_call_plan,
+    finish_transfer,
+    map_guest_result,
 )
 from .sandbox_keys import (
     DURABLE_CHROME_LIFECYCLE_TYPE,
@@ -171,6 +185,9 @@ class SandboxLeaseProvider:
         self._available_slots: asyncio.Queue[int] = asyncio.Queue()
         self._worker_locks: dict[int, asyncio.Lock] = {}
         self._workers: dict[int, Sandbox] = {}
+        self._task_workspace_providers: weakref.WeakValueDictionary[
+            str, TaskWorkspaceLeaseProvider
+        ] = weakref.WeakValueDictionary()
         self.primary_sandbox = primary_sandbox
         for slot in range(max(1, max_concurrency)):
             self._available_slots.put_nowait(slot)
@@ -178,6 +195,15 @@ class SandboxLeaseProvider:
     def lease(self, *, concurrency_safe: bool) -> SandboxLease:
         """Return an async context manager for the requested execution mode."""
         return SandboxLease(self, concurrency_safe=concurrency_safe)
+
+    def for_task_workspace(self, workspace_root: str) -> "TaskWorkspaceLeaseProvider":
+        """Bind this shared lifecycle provider to one task transfer boundary."""
+        key = str(Path(workspace_root).resolve())
+        provider = self._task_workspace_providers.get(key)
+        if provider is None:
+            provider = TaskWorkspaceLeaseProvider(self, Path(key))
+            self._task_workspace_providers[key] = provider
+        return provider
 
     def workspace_dirs_are_host_mounted(self, directories: Sequence[str]) -> bool:
         """Whether the provider's desired RW mounts cover every guest target.
@@ -278,6 +304,140 @@ class SandboxLeaseProvider:
             self._lifecycle_id,
         )
         self._workers.clear()
+
+
+class TaskWorkspaceLease:
+    """One tool lease with task-scoped checkout and file publication."""
+
+    def __init__(
+        self,
+        provider: "TaskWorkspaceLeaseProvider",
+        *,
+        concurrency_safe: bool,
+        inputs: Sequence[ExplicitInput],
+    ) -> None:
+        self._provider = provider
+        self._inputs = tuple(inputs)
+        self._inner = provider._base.lease(concurrency_safe=concurrency_safe)
+        self._sandbox: Sandbox | None = None
+
+    async def __aenter__(self) -> Sandbox:
+        await self._provider._transfer.lock.acquire()
+        try:
+            self._sandbox = await self._inner.__aenter__()
+            await finish_transfer(
+                self._provider._transfer.checkout(self._sandbox, self._inputs)
+            )
+            return self._sandbox
+        except BaseException:
+            try:
+                if self._sandbox is not None:
+                    try:
+                        await finish_transfer(
+                            self._provider._transfer.cleanup(
+                                self._sandbox, self._inputs
+                            )
+                        )
+                    except BaseException:
+                        logger.warning(
+                            "Failed to clean task workspace after checkout failure",
+                            exc_info=True,
+                        )
+                await self._inner.__aexit__(*sys.exc_info())
+            finally:
+                self._sandbox = None
+                self._provider._transfer.lock.release()
+            raise
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        original_error = exc_val
+        transfer_error: BaseException | None = None
+        try:
+            if self._sandbox is not None and original_error is None:
+                try:
+                    await finish_transfer(
+                        self._provider._transfer.check_in(self._sandbox)
+                    )
+                except BaseException as error:
+                    transfer_error = error
+            if self._sandbox is not None:
+                try:
+                    await finish_transfer(
+                        self._provider._transfer.cleanup(self._sandbox, self._inputs)
+                    )
+                except BaseException as error:
+                    if transfer_error is None:
+                        transfer_error = error
+        finally:
+            try:
+                await self._inner.__aexit__(exc_type, exc_val, exc_tb)
+            finally:
+                self._sandbox = None
+                self._provider._transfer.lock.release()
+        if original_error is None and transfer_error is not None:
+            raise transfer_error
+        if transfer_error is not None:
+            logger.warning(
+                "Task workspace cleanup failed while propagating %s",
+                type(original_error).__name__,
+                exc_info=(
+                    type(transfer_error),
+                    transfer_error,
+                    transfer_error.__traceback__,
+                ),
+            )
+
+
+class TaskWorkspaceLeaseProvider:
+    """Task-local transfer view over a cached user lifecycle provider."""
+
+    prepares_workspace_on_lease = True
+
+    def __init__(self, base: SandboxLeaseProvider, host_root: Path) -> None:
+        self._base = base
+        digest = hashlib.sha256(str(host_root.resolve()).encode()).hexdigest()[:24]
+        self._guest_root = Path("/home/sandbox/.xagent-workspaces") / digest
+        self._transfer = TaskWorkspaceTransfer(host_root, self._guest_root)
+        self.primary_sandbox = base.primary_sandbox
+
+    def lease(
+        self,
+        *,
+        concurrency_safe: bool,
+        inputs: Sequence[ExplicitInput] = (),
+    ) -> TaskWorkspaceLease:
+        return TaskWorkspaceLease(
+            self, concurrency_safe=concurrency_safe, inputs=inputs
+        )
+
+    def workspace_dirs_are_host_mounted(self, directories: Sequence[str]) -> bool:
+        del directories
+        return False
+
+    def plan_workspace_call(
+        self, workspace: object, args: dict[str, object]
+    ) -> WorkspaceCallPlan:
+        return build_call_plan(
+            workspace,
+            args,
+            host_root=self._transfer.host_root,
+            guest_root=self._guest_root,
+        )
+
+    def map_workspace_result(
+        self, result: object, inputs: Sequence[ExplicitInput] = ()
+    ) -> object:
+        return map_guest_result(
+            result,
+            self._guest_root,
+            self._transfer.host_root,
+            inputs,
+        )
 
 
 def absolute_backend_mount_path(path: str | Path) -> Path:
@@ -659,7 +819,10 @@ class SandboxManager:
 
     def requires_host_workspace_access(self) -> bool:
         """Whether this backend needs privileged host bind preparation."""
-        return self._service.host_workspace_gid() is not None
+        return (
+            get_sandbox_workspace_mode() == "bind"
+            and self._service.host_workspace_gid() is not None
+        )
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -784,7 +947,7 @@ class SandboxManager:
         self,
         lifecycle_type: str,
         lifecycle_id: str,
-        provider: SandboxLeaseProvider,
+        provider: SandboxLeaseProvider | TaskWorkspaceLeaseProvider,
     ) -> bool:
         """Attach one active task to a *specific* provider object (ABA-safe).
 
@@ -806,9 +969,14 @@ class SandboxManager:
         proceeding with a provider that may already be torn down.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        identity_provider = (
+            provider._base
+            if isinstance(provider, TaskWorkspaceLeaseProvider)
+            else provider
+        )
         async with self._activity_guard:
             current = self._lease_providers.get(base_name)
-            if current is None or current is not provider:
+            if current is None or current is not identity_provider:
                 return False
             self._touch_locked(base_name).ref_count += 1
         return True
@@ -879,6 +1047,13 @@ class SandboxManager:
 
     def _get_sandbox_image_and_config(self) -> tuple[str, SandboxConfig]:
         """Get sandbox image and configuration from centralized config module."""
+        if (
+            get_sandbox_workspace_mode() == "transfer"
+            and not self._service.supports_task_workspace_transfer()
+        ):
+            raise SandboxContractError(
+                "Task workspace transfer mode is supported only by Docker sandboxes"
+            )
         image = get_sandbox_image()
         config = SandboxConfig()
         path_mapper = SandboxPathMapper.from_env()
@@ -906,6 +1081,12 @@ class SandboxManager:
             host_side_sources=path_mapper.uses_host_storage_root
         )
         if volumes:
+            if get_sandbox_workspace_mode() == "transfer" and any(
+                mode == "rw" for _source, _target, mode in volumes
+            ):
+                raise SandboxContractError(
+                    "Writable SANDBOX_VOLUMES are not allowed in task transfer mode"
+                )
             if self.requires_host_workspace_access():
                 _validate_custom_volumes_for_uploads(
                     volumes,
@@ -1027,6 +1208,9 @@ class SandboxManager:
         exist on disk, not necessarily the (possibly shallower) directory
         actually bind-mounted. Extra/allowlist mounts are unaffected.
         """
+
+        if get_sandbox_workspace_mode() == "transfer":
+            return
 
         if self.requires_host_workspace_access():
             path_mapper = SandboxPathMapper.from_env()
@@ -1259,6 +1443,8 @@ class SandboxManager:
         """
         # Code mounts are always present (at least src/)
         volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
+        if get_sandbox_workspace_mode() == "transfer":
+            return volumes
         path_mapper = SandboxPathMapper.from_env()
 
         for backend_path, _should_create in self._workspace_mount_paths(

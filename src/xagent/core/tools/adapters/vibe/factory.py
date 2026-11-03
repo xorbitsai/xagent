@@ -824,7 +824,10 @@ class ToolFactory:
                             "falling back to sandbox directory setup",
                             exc_info=True,
                         )
-                if not workspace_is_host_mounted:
+                prepares_on_lease = (
+                    getattr(type(sandbox), "prepares_workspace_on_lease", False) is True
+                )
+                if not workspace_is_host_mounted and not prepares_on_lease:
                     from .sandboxed_tool.sandboxed_tool_wrapper import (
                         create_workspace_in_sandbox,
                         resolve_primary_sandbox,

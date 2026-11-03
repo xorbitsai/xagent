@@ -18,6 +18,7 @@ from typing import (
     Mapping,
     Optional,
     Protocol,
+    Sequence,
     Type,
     TypeGuard,
     cast,
@@ -134,7 +135,7 @@ class _SandboxLeaseProviderLike(Protocol):
 
     primary_sandbox: Sandbox
 
-    def lease(self, *, concurrency_safe: bool) -> Any: ...
+    def lease(self, *, concurrency_safe: bool, inputs: Sequence[Any] = ()) -> Any: ...
 
 
 def _is_sandbox_lease_provider(
@@ -447,7 +448,9 @@ class SandboxedToolWrapper(AbstractBaseTool):
         """Delegate result formatting to the wrapped tool."""
         return self._target.return_value_as_string(value)
 
-    def _build_execution_env(self) -> dict[str, str]:
+    def _build_execution_env(
+        self, extra: Mapping[str, str] | None = None
+    ) -> dict[str, str]:
         """Build per-exec environment variables (scoped to this process, not the sandbox)."""
         env: dict[str, str] = {}
 
@@ -462,11 +465,18 @@ class SandboxedToolWrapper(AbstractBaseTool):
         # these. A host PYTHONPATH would point the runner outside the sandbox.
         env["PYTHONPATH"] = SANDBOX_SRC_ROOT
         env[SANDBOX_TOOL_RUNNER] = "1"
+        if extra:
+            env.update(extra)
         return env
 
-    def _lease_sandbox(self) -> Any:
+    def _lease_sandbox(self, *, inputs: Sequence[Any] = ()) -> Any:
         """Lease the sandbox that should execute this tool call."""
         if _is_sandbox_lease_provider(self._sandbox):
+            if inputs:
+                return self._sandbox.lease(
+                    concurrency_safe=self.metadata.concurrency_safe,
+                    inputs=inputs,
+                )
             return self._sandbox.lease(concurrency_safe=self.metadata.concurrency_safe)
         return _StaticSandboxLease(self._sandbox)
 
@@ -713,6 +723,18 @@ class SandboxedToolWrapper(AbstractBaseTool):
     async def _run_json_in_sandbox(self, args: Mapping[str, Any]) -> Any:
         """Execute tool asynchronously in sandbox"""
 
+        call_args: Mapping[str, Any] = args
+        call_env: dict[str, str] = {}
+        call_inputs: Sequence[Any] = ()
+        result_mapper = getattr(self._sandbox, "map_workspace_result", None)
+        planner = getattr(self._sandbox, "plan_workspace_call", None)
+        workspace = getattr(self._reconstruction_target, "_workspace", None)
+        if workspace is not None and callable(planner):
+            plan = planner(workspace, dict(args))
+            call_args = plan.args
+            call_env = plan.env
+            call_inputs = plan.inputs
+
         # Keep every per-call payload in a private sandbox-side file. In
         # particular, MCP adapter init params contain the connection env, and
         # command-line base64 would expose those secrets through /proc and
@@ -723,13 +745,13 @@ class SandboxedToolWrapper(AbstractBaseTool):
         init_params_file = f"/tmp/xagent_init_{call_id}.b64"
 
         try:
-            async with self._lease_sandbox() as sandbox:
+            async with self._lease_sandbox(inputs=call_inputs) as sandbox:
                 # Ensure dependencies are installed
                 await self._ensure_dependencies(sandbox)
                 try:
                     await _write_sandbox_file_cancellation_safe(
                         sandbox,
-                        json.dumps(dict(args), ensure_ascii=False),
+                        json.dumps(dict(call_args), ensure_ascii=False),
                         args_file,
                         overwrite=False,
                     )
@@ -744,7 +766,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
                     # Execute script in sandbox
                     logger.debug(f"Executing tool {self._target.name} in sandbox")
                     command = self._build_execution_command(
-                        args,
+                        call_args,
                         result_file,
                         args_file=args_file,
                         init_params_file=init_params_file,
@@ -767,7 +789,9 @@ class SandboxedToolWrapper(AbstractBaseTool):
                         ]
                     started = time.monotonic()
                     result = await sandbox.exec(
-                        command[0], *command[1:], env=self._build_execution_env()
+                        command[0],
+                        *command[1:],
+                        env=self._build_execution_env(call_env),
                     )
 
                     if (
@@ -807,7 +831,12 @@ class SandboxedToolWrapper(AbstractBaseTool):
                     if not output:
                         return None
 
-                    return json.loads(output)
+                    decoded = json.loads(output)
+                    return (
+                        result_mapper(decoded, call_inputs)
+                        if callable(result_mapper)
+                        else decoded
+                    )
                 except json.JSONDecodeError as e:
                     logger.error(
                         f"Failed to parse tool output from {result_file}. Raw output:\n{output}"

@@ -91,6 +91,19 @@ Only if you use the matching feature:
 - `npx` — sandboxed `npx` MCP servers
 - `uvx` — sandboxed `uvx` MCP servers; Xagent no longer installs `uv` dynamically
 
+## Task-scoped workspace transfer
+
+`XAGENT_SANDBOX_WORKSPACE_MODE=transfer` is a Docker-only rollout mode that
+removes writable workspace bind mounts. Each tool lease copies only its
+current `web_task_<id>` tree to a fixed path owned by the sandbox user,
+snapshots only explicitly referenced external input files, and publishes only
+files changed by that tool. The default remains `bind`.
+
+Transfer mode must be enabled only after the restricted Docker broker supports
+the archive endpoints and Stage has passed cancellation, large-file, restart,
+and concurrent host-write smoke tests. It intentionally rejects writable
+custom `SANDBOX_VOLUMES`.
+
 ## Links
 
 - [Source and documentation](https://github.com/xorbitsai/xagent)

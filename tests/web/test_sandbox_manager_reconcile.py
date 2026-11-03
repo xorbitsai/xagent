@@ -66,6 +66,48 @@ def _make_manager() -> tuple[SandboxManager, FakeSandboxService]:
     return SandboxManager(service), service
 
 
+class TestTaskWorkspaceTransferMode:
+    def test_transfer_omits_user_bind_and_does_not_prepare_mount_root(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", "transfer")
+        manager, service = _make_manager()
+        service.supports_task_workspace_transfer = lambda: True  # type: ignore[method-assign]
+        intent = _intent(tmp_path)
+
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        manager._prepare_workspace_mounts("user", "1", intent)
+
+        assert desired.volumes == (("/repo/src", "/app/src", "ro"),)
+        assert not Path(intent.mount_root).exists()
+
+    def test_transfer_rejects_a_backend_without_archive_contract(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", "transfer")
+        manager, _service = _make_manager()
+        with pytest.raises(SandboxContractError, match="only by Docker"):
+            manager._build_runtime_spec("user", "1", mount_intent=_intent(tmp_path))
+
+    @pytest.mark.asyncio
+    async def test_task_view_keeps_cached_provider_identity(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", "transfer")
+        manager, service = _make_manager()
+        service.supports_task_workspace_transfer = lambda: True  # type: ignore[method-assign]
+        provider = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+        task_provider = provider.for_task_workspace(str(tmp_path / "web_task_1"))
+
+        assert await manager.attach_provider("user", "1", task_provider)
+        assert task_provider.prepares_workspace_on_lease is True
+        assert (
+            provider.for_task_workspace(str(tmp_path / "web_task_1")) is task_provider
+        )
+
+
 class TestBackendProbeRouting:
     def test_desired_spec_omits_limits_not_enforced_by_backend(
         self, _env, tmp_path

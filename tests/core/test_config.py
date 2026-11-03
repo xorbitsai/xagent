@@ -4734,3 +4734,16 @@ def test_python_executor_timeout_default_and_override(monkeypatch):
 def test_python_executor_timeout_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS", value)
     assert config.get_python_executor_timeout_seconds() == 1200
+
+
+def test_sandbox_workspace_mode_defaults_to_bind(monkeypatch):
+    monkeypatch.delenv("XAGENT_SANDBOX_WORKSPACE_MODE", raising=False)
+    assert config.get_sandbox_workspace_mode() == "bind"
+
+
+def test_sandbox_workspace_mode_accepts_transfer_and_rejects_unknown(monkeypatch):
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", " transfer ")
+    assert config.get_sandbox_workspace_mode() == "transfer"
+    monkeypatch.setenv("XAGENT_SANDBOX_WORKSPACE_MODE", "automatic")
+    with pytest.raises(ValueError, match="bind.*transfer"):
+        config.get_sandbox_workspace_mode()

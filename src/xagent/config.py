@@ -203,6 +203,7 @@ PYTHON_EXECUTOR_TIMEOUT_SECONDS = "XAGENT_PYTHON_EXECUTOR_TIMEOUT_SECONDS"
 SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
 SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 SANDBOX_MAX_CONCURRENCY = "XAGENT_SANDBOX_MAX_CONCURRENCY"
+SANDBOX_WORKSPACE_MODE = "XAGENT_SANDBOX_WORKSPACE_MODE"
 SANDBOX_IDLE_TTL = "XAGENT_SANDBOX_IDLE_TTL"
 SANDBOX_SWEEP_INTERVAL = "XAGENT_SANDBOX_SWEEP_INTERVAL"
 SANDBOX_MAX_CONTAINERS = "XAGENT_SANDBOX_MAX_CONTAINERS"
@@ -3291,6 +3292,23 @@ def get_sandbox_max_concurrency() -> int:
         The per-lifecycle sandbox worker cap (>= 1).
     """
     return _get_positive_int_env(SANDBOX_MAX_CONCURRENCY, 3)
+
+
+def get_sandbox_workspace_mode() -> str:
+    """Return how Docker sandboxes receive task workspace files.
+
+    ``bind`` preserves the existing host bind-mount behavior. ``transfer``
+    is an explicit rollout mode in which only the current task workspace and
+    explicitly referenced input files cross the Docker archive API. Unknown
+    values fail during configuration loading instead of silently weakening
+    the requested boundary.
+    """
+    value = os.getenv(SANDBOX_WORKSPACE_MODE, "bind").strip().lower()
+    if value not in {"bind", "transfer"}:
+        raise ValueError(
+            f"{SANDBOX_WORKSPACE_MODE} must be either 'bind' or 'transfer'"
+        )
+    return value
 
 
 def _get_positive_float_env(env_var: str, default: float | None) -> float | None:

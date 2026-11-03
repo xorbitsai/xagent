@@ -53,6 +53,7 @@ from .base import (
     Sandbox,
     SandboxAlreadyExistsError,
     SandboxConfig,
+    SandboxContractError,
     SandboxInfo,
     SandboxInspection,
     SandboxNotFoundError,
@@ -795,10 +796,19 @@ def _exec_capped(
 
 
 def _write_stream_to_file(
-    stream: Any, file_obj: io.BufferedRandom | io.BufferedWriter
+    stream: Any,
+    file_obj: io.BufferedRandom | io.BufferedWriter,
+    *,
+    max_bytes: int | None = None,
 ) -> None:
     """Copy a streamed Docker archive into a local file object."""
+    total = 0
     for chunk in stream:
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise SandboxContractError(
+                "Sandbox download archive exceeds its byte limit"
+            )
         file_obj.write(chunk)
     file_obj.flush()
     file_obj.seek(0)
@@ -807,6 +817,8 @@ def _write_stream_to_file(
 def _extract_single_file_from_tar(
     tar_file_obj: io.BufferedRandom | io.BufferedReader,
     output_file_obj: io.BufferedWriter | io.BytesIO,
+    *,
+    max_bytes: int | None = None,
 ) -> None:
     """Extract the first regular file from a Docker get_archive tar stream."""
     with tarfile.open(fileobj=tar_file_obj, mode="r:*") as tar:
@@ -816,7 +828,12 @@ def _extract_single_file_from_tar(
         fileobj = tar.extractfile(member)
         if fileobj is None:
             raise FileNotFoundError(f"Could not read file from archive: {member.name}")
-        shutil.copyfileobj(fileobj, output_file_obj)
+        total = 0
+        while chunk := fileobj.read(1024 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise SandboxContractError("Sandbox download exceeds its byte limit")
+            output_file_obj.write(chunk)
         output_file_obj.flush()
 
 
@@ -1081,7 +1098,12 @@ class DockerSandbox(Sandbox):
                         raise RuntimeError(f"Failed to upload file to {remote_path}")
 
     async def download_file(
-        self, remote_path: str, local_path: str, overwrite: bool = False
+        self,
+        remote_path: str,
+        local_path: str,
+        overwrite: bool = False,
+        *,
+        max_bytes: int | None = None,
     ) -> None:
         """Download a file from the sandbox to the local filesystem."""
         if not overwrite and os.path.exists(local_path):
@@ -1102,10 +1124,47 @@ class DockerSandbox(Sandbox):
                 local_dir = os.path.dirname(local_path)
                 if local_dir:
                     os.makedirs(local_dir, exist_ok=True)
-                with tempfile.TemporaryFile() as archive_file:
-                    await asyncio.to_thread(_write_stream_to_file, stream, archive_file)
-                    with open(local_path, "wb") as file_obj:
-                        _extract_single_file_from_tar(archive_file, file_obj)
+                destination_opened = False
+                try:
+                    with tempfile.TemporaryFile() as archive_file:
+                        # Docker tar metadata is small but not zero. Bound the
+                        # wire stream as well as the extracted regular file.
+                        archive_limit = (
+                            None if max_bytes is None else max_bytes + 1024 * 1024
+                        )
+                        await asyncio.to_thread(
+                            _write_stream_to_file,
+                            stream,
+                            archive_file,
+                            max_bytes=archive_limit,
+                        )
+                        with open(local_path, "wb") as file_obj:
+                            destination_opened = True
+                            _extract_single_file_from_tar(
+                                archive_file, file_obj, max_bytes=max_bytes
+                            )
+                except BaseException:
+                    if destination_opened:
+                        try:
+                            os.unlink(local_path)
+                        except FileNotFoundError:
+                            pass
+                    raise
+
+    async def download_file_bounded(
+        self,
+        remote_path: str,
+        local_path: str,
+        *,
+        max_bytes: int,
+    ) -> None:
+        """Download while bounding both Docker archive and extracted bytes."""
+        await self.download_file(
+            remote_path,
+            local_path,
+            overwrite=False,
+            max_bytes=max_bytes,
+        )
 
     async def write_file(
         self, content: str, remote_path: str, overwrite: bool = False
@@ -2007,6 +2066,10 @@ class DockerSandboxService(SandboxService):
 
     def host_workspace_gid(self) -> int | None:
         return SANDBOX_RUNTIME_GID
+
+    def supports_task_workspace_transfer(self) -> bool:
+        """Docker provides the bounded put/get archive contract transfer uses."""
+        return True
 
     def validate_host_workspace_access(self) -> None:
         """Validate Docker network policy and writable-bind ownership support."""

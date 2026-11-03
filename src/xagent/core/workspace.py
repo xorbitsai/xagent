@@ -7,6 +7,7 @@ ensuring that each agent has its own isolated workspace context.
 
 import contextvars
 import errno
+import json
 import logging
 import mimetypes
 import os
@@ -308,6 +309,44 @@ class TaskWorkspace:
         self._registration_lock = RLock()
         self._host_external_upload_staging_root = None
         self._host_external_upload_staging_cleanup = None
+        self._apply_sandbox_workspace_projection()
+
+    def _apply_sandbox_workspace_projection(self) -> None:
+        """Project a pickled host workspace onto its task-scoped guest root.
+
+        The mapping is present only in the short-lived sandbox tool-runner
+        process. Host ``TaskWorkspace`` objects and non-transfer sandboxes are
+        byte-for-byte unchanged.
+        """
+        if not in_sandbox_tool_runner():
+            return
+        host_root = os.getenv("XAGENT_SANDBOX_HOST_WORKSPACE_ROOT")
+        guest_root = os.getenv("XAGENT_SANDBOX_GUEST_WORKSPACE_ROOT")
+        if not host_root or not guest_root:
+            return
+        if str(self.workspace_dir.resolve()) != str(Path(host_root).resolve()):
+            raise ValueError("Sandbox workspace projection does not match the tool")
+        projected = Path(guest_root)
+        if not projected.is_absolute():
+            raise ValueError("Sandbox workspace projection must be absolute")
+        self.base_dir = projected.parent
+        self.workspace_dir = projected
+        self.input_dir = projected / "input"
+        self.output_dir = projected / "output"
+        self.temp_dir = projected / "temp"
+        # Exact external files are rewritten in the call arguments and copied
+        # into sandbox-owned input staging. The broad host allowlist must not
+        # survive into the guest as an authorization boundary.
+        raw_input_dirs = os.getenv("XAGENT_SANDBOX_GUEST_INPUT_DIRS", "[]")
+        try:
+            input_dirs = json.loads(raw_input_dirs)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Sandbox input projection is invalid") from exc
+        if not isinstance(input_dirs, list) or not all(
+            isinstance(value, str) and Path(value).is_absolute() for value in input_dirs
+        ):
+            raise ValueError("Sandbox input projection is invalid")
+        self.allowed_external_dirs = [Path(value) for value in input_dirs]
 
     @property
     def internal_temp_dir(self) -> Path:

@@ -4644,37 +4644,62 @@ def test_delete_issue_404_forbids_guessing_another_key(monkeypatch):
     assert "guessed" in message
 
 
+def _non_json_success_response():
+    # A 2xx whose body is not JSON (e.g. a proxy's HTML page): the request
+    # reached Jira, so the deletion may have happened.
+    response = MockResponse(status_code=200, text="<html>proxy</html>")
+    response.json = Mock(
+        side_effect=requests.exceptions.JSONDecodeError(
+            "Expecting value", "<html>proxy</html>", 0
+        )
+    )
+    return response
+
+
 @pytest.mark.parametrize(
     "failure",
     [
-        requests.ReadTimeout("read timed out"),
-        requests.ConnectionError("connection reset"),
-        MockResponse(status_code=502),
-        MockResponse(status_code=503),
-        MockResponse(status_code=504),
-    ],
-    ids=[
-        "read-timeout",
-        "connection-dropped",
-        "bad-gateway",
-        "unavailable",
-        "gateway-timeout",
+        pytest.param(requests.ReadTimeout("read timed out"), id="read-timeout"),
+        pytest.param(
+            requests.ConnectionError("connection reset"), id="connection-dropped"
+        ),
+        pytest.param(
+            requests.exceptions.ChunkedEncodingError("body cut off"),
+            id="chunked-encoding",
+        ),
+        pytest.param(MockResponse(status_code=502), id="bad-gateway"),
+        pytest.param(MockResponse(status_code=503), id="unavailable"),
+        pytest.param(MockResponse(status_code=504), id="gateway-timeout"),
+        pytest.param(_non_json_success_response(), id="non-json-body"),
     ],
 )
 def test_delete_issue_unknown_outcome_says_to_check_before_retrying(
     monkeypatch, failure
 ):
-    mock_request = (
-        Mock(return_value=failure)
-        if isinstance(failure, MockResponse)
-        else Mock(side_effect=failure)
-    )
-    monkeypatch.setattr(jira.requests, "request", mock_request)
+    # A Mock side_effect iterable raises exception items and returns the rest.
+    monkeypatch.setattr(jira.requests, "request", Mock(side_effect=[failure]))
 
     result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
 
     assert result["status"] == "error"
     assert result["message"].startswith(jira_delete.DELETE_MAY_HAVE_COMPLETED)
+
+
+@pytest.mark.parametrize("status_code", [401, 500])
+def test_delete_issue_unmapped_status_returns_jira_message_without_hint(
+    monkeypatch, status_code
+):
+    # Only the mapped statuses and the unknown-outcome set get a hint.
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=status_code)),
+    )
+
+    result = json.loads(jira.jira_delete_issue("ENG-1", cloud_id="site-a"))
+
+    assert result["status"] == "error"
+    assert result["message"].startswith(f"{status_code} Client Error")
 
 
 def test_delete_issue_connect_timeout_gets_no_outcome_hint(monkeypatch):
@@ -4693,16 +4718,15 @@ def test_delete_issue_connect_timeout_gets_no_outcome_hint(monkeypatch):
 
 
 def test_delete_issue_site_lookup_failure_gets_no_delete_hint(monkeypatch):
-    # A failure resolving the site says nothing about the issue, so neither a
-    # permission nor an outcome-unknown hint applies to it.
-    mock_request = Mock(
-        return_value=MockResponse(json_data=[_SITE_A, _SITE_B]),
-    )
+    # A ReadTimeout on the DELETE gets the outcome-unknown hint, so the same
+    # timeout on the site lookup would get it too if the lookup were inside the
+    # DELETE's try. It must not, since nothing was sent to the issue.
+    mock_request = Mock(side_effect=requests.ReadTimeout("read timed out"))
     monkeypatch.setattr(jira.requests, "request", mock_request)
 
     result = json.loads(jira.jira_delete_issue("ENG-1"))
 
     assert result["status"] == "error"
-    assert "Multiple Jira sites" in result["message"]
+    assert jira_delete.DELETE_MAY_HAVE_COMPLETED not in result["message"]
     assert mock_request.call_count == 1
     assert mock_request.call_args.kwargs["method"] == "GET"

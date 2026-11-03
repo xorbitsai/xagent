@@ -4331,12 +4331,14 @@ class ReActPattern(AgentPattern):
     ) -> list[dict[str, Any]]:
         """Add the stored-result reader once this run has actually stored one.
 
-        base_schemas is built once per run, before the iteration loop, so it
-        cannot know about a registry that fills up mid-run. This runs on
-        every iteration instead, and when a tool-not-found hint is built, so
-        both see the spill that just happened. spill_read_schema is None when
-        the run has no reader to offer (tool_choice "none", or no reader tool), and
-        base_schemas then comes back unchanged whatever the registry holds.
+        base_schemas never lists the reader: _tool_schemas_with_builtin_controls
+        leaves it out whatever the registry holds, and the loop builds
+        base_schemas once, before the first iteration. This runs on every
+        iteration instead, and when a tool-not-found hint is built, so both
+        see the spill that just happened. spill_read_schema is None when there
+        is no reader tool (the loop also passes None under tool_choice
+        "none"), and base_schemas then comes back unchanged whatever the
+        registry holds.
         """
         if spill_read_schema is None or not self._spilled_paths(context):
             return base_schemas  # byte-identical to the baseline surface

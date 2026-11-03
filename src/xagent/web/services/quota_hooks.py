@@ -11,7 +11,32 @@ Follows the same setter/getter idiom as set_user_tool_overrides_hook etc.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
+
+
+class UsageRecordHook(Protocol):
+    """Post-run metering callback registered with :func:`set_usage_record_hook`.
+
+    Called as ``hook(db, user_id, delta_details, delta_actions, task_id=...)``.
+    ``task_id`` is the id of the task whose run is being metered, always
+    passed as a keyword (``None`` only when the caller has no task), so the
+    application layer can attribute the usage to that task (e.g. per-task
+    spend in its own ledger). Implementations MUST accept the ``task_id``
+    keyword; one that ignores it should still declare it, e.g.
+    ``task_id: int | None = None``.
+    """
+
+    def __call__(
+        self,
+        db: Any,
+        user_id: Any,
+        delta_details: list,
+        delta_actions: int,
+        /,
+        *,
+        task_id: int | None = None,
+    ) -> None: ...
+
 
 # (db, user_id) -> reason if the team is out of quota (block the run), else None.
 # The reason is either a plain message str or a structured mapping the app layer
@@ -22,10 +47,11 @@ from typing import Any, Callable
 # EXECUTION CONTRACT: invoked synchronously on the asyncio event loop. Existing
 # callbacks may rely on that affinity and must remain non-blocking.
 _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = None
-# (db, user_id, delta_details, delta_actions) -> None; best-effort post-run
-# metering. delta_details is this turn's per-model token breakdown (list of
-# {"type","tokens","model"}) for cost-based credits; delta_actions counts tool
-# calls (one billable action per tool invocation).
+# (db, user_id, delta_details, delta_actions, *, task_id) -> None; best-effort
+# post-run metering (see UsageRecordHook). delta_details is this turn's
+# per-model token breakdown (list of {"type","tokens","model"}) for cost-based
+# credits; delta_actions counts tool calls (one billable action per tool
+# invocation); task_id is the metered run's task, passed as a keyword.
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking
 # only after the run/runner-fenced token-usage update commits. The hook owns
@@ -36,7 +62,7 @@ _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = No
 #
 # EXECUTION CONTRACT: invoked synchronously on the asyncio event loop. Existing
 # callbacks may rely on that affinity and must remain non-blocking.
-_usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
+_usage_record_hook: UsageRecordHook | None = None
 # (db, user_id, delta_details, delta_actions) -> reason str if counting this
 # in-flight run's live-so-far usage would push the team over a run-gated quota,
 # else None. Polled per step (each LLM reply / tool call) during a run so a
@@ -72,7 +98,8 @@ def set_run_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None:
     _run_gate_hook = hook
 
 
-def set_usage_record_hook(hook: Callable[[Any, Any, list, int], None] | None) -> None:
+def set_usage_record_hook(hook: UsageRecordHook | None) -> None:
+    """Register the post-run metering callback; it must accept ``task_id=``."""
     global _usage_record_hook
     _usage_record_hook = hook
 
@@ -176,11 +203,16 @@ def check_run_gate(db: Any, user_id: Any) -> str | Mapping[str, Any] | None:
 
 
 def record_usage(
-    db: Any, user_id: Any, delta_details: list, delta_actions: int
+    db: Any,
+    user_id: Any,
+    delta_details: list,
+    delta_actions: int,
+    task_id: int | None = None,
 ) -> None:
+    """Forward one finished run's usage, and the task it belongs to, to the hook."""
     if _usage_record_hook is None or user_id is None:
         return
-    _usage_record_hook(db, user_id, delta_details, delta_actions)
+    _usage_record_hook(db, user_id, delta_details, delta_actions, task_id=task_id)
 
 
 def check_run_progress_gate(

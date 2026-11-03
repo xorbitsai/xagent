@@ -189,11 +189,17 @@ _VISION_TOOL_CATEGORY = "vision"
 # It exists because ``tool_categories`` alone cannot distinguish "this agent
 # was created before it had an ``mcp`` category" (an actor-marked task
 # re-adds it) from "this run explicitly excluded ``mcp``" (it must not).
-# Only :func:`apply_task_model_override` writes it, onto the detached
-# snapshot this module produces -- not the persisted ``Task`` row, and not
-# any response. Its sole reader is the MCP add-back/force-load guard in
+# Only :func:`apply_task_model_override` writes it: it builds a new
+# ``agent_config`` on the detached snapshot and never edits the persisted
+# ``Task`` row (nothing serializes that config into a response either). The
+# key is not in ``CLIENT_RESERVED_AGENT_CONFIG_KEYS``, so a client that seeds
+# the same name in its own ``agent_config`` survives the sanitizer; the
+# runtime config whitelist then drops it, so it cannot reach the reader
+# below. Its sole reader is the MCP add-back/force-load guard in
 # ``agent_service_manager``, so it can only ever *remove* tools: it grants
-# no category and never participates in actor authorization.
+# no category and never participates in actor authorization. A plain ``mcp``
+# exclusion does not strip an explicit ``mcp:<server>`` selection, which
+# still loads that server.
 TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY = (
     "__xagent_task_model_override_excluded_tool_categories"
 )
@@ -225,6 +231,12 @@ def mcp_excluded_by_task_model_override(agent_config: Any) -> bool:
     The one reader consulted by the actor-marked MCP add-back/force-load
     guards. "Not recorded" means "not excluded": old agents and tasks
     without an override keep the legacy MCP behaviour.
+
+    This is about the plain category only. A scoped ``mcp:<server>`` entry is
+    an exact-name mismatch for the exclusion, stays in the selection, and
+    keeps ``includes_mcp()`` true, so that server is still loaded. Only a
+    plain ``mcp`` exclusion with no scoped entry rules out MCP loading for
+    the run.
     """
     return "mcp" in task_model_override_excluded_tool_categories(agent_config)
 
@@ -296,8 +308,12 @@ def apply_task_model_override(
     only the categories this selection happened to contain -- an old agent's
     list may never have listed ``mcp``, yet the intent still excludes it --
     and merges with any earlier record, so it is idempotent and only ever
-    subtracts tools. The vision-category removal is deliberately NOT recorded
-    here: it already has its own stand-in mechanism.
+    subtracts tools. Exclusions match exact category names only: an explicit
+    ``mcp:<server>`` entry is left in the selection, keeps ``includes_mcp()``
+    true, and still loads that server -- the record only stops the
+    actor-marked add-back and forced load of the plain ``mcp`` category. The
+    vision-category removal is deliberately NOT recorded here: it already has
+    its own stand-in mechanism.
     """
     from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
 

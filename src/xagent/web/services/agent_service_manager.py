@@ -691,10 +691,13 @@ def _build_tool_selection_spec_for_task(
     )
     if include_mcp_tools and not mcp_excluded_by_task_model_override(agent_config):
         # An explicit "mcp" exclusion from the task model override wins over
-        # the actor-marked add-back: the caller asked this run to have no MCP
-        # tools, and ``tool_categories`` alone cannot express that (an old
-        # agent may never have listed ``mcp``). This only removes tools; a
-        # task without the marker keeps the legacy add-back unchanged.
+        # the actor-marked add-back: the caller asked this run not to add the
+        # plain "mcp" category, and ``tool_categories`` alone cannot express
+        # that (an old agent may never have listed ``mcp``). This only removes
+        # tools; a task without the marker keeps the legacy add-back
+        # unchanged. It does not remove an explicit ``mcp:<server>`` entry --
+        # see ``apply_task_model_override`` -- so a scoped selection still
+        # makes ``_spec_wants_mcp`` true and loads that server.
         spec = with_mcp_tools(spec)
     if omit_published_agent_tools:
         spec = without_published_agent_tools(spec)
@@ -2313,7 +2316,9 @@ class AgentServiceManager:
             mcp_actor_execution_identity=mcp_actor_execution_identity,
             # Same guard as the selection-spec add-back above: a task model
             # override that explicitly excluded "mcp" must not force MCP
-            # server config loading either. Only removes tools.
+            # server config loading either. Only removes tools; a scoped
+            # ``mcp:<server>`` selection can still request loading through
+            # the spec.
             force_mcp_tools=actor_execution
             and not mcp_excluded_by_task_model_override(agent_config),
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
@@ -3148,7 +3153,8 @@ class AgentServiceManager:
                     # model override that explicitly excluded "mcp" must not
                     # force MCP server config loading either. Only removes
                     # tools; without the marker actor-marked behaviour is
-                    # unchanged.
+                    # unchanged, and a scoped ``mcp:<server>`` selection can
+                    # still request loading through the spec.
                     force_mcp_tools=actor_marked
                     and not mcp_excluded_by_task_model_override(agent_config),
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(

@@ -43,6 +43,40 @@ from xagent.sandbox.docker_sandbox import (
 )
 
 
+def _raw_tar_records(archive: io.BytesIO) -> list[tuple[bytes, bytes, bytes]]:
+    """Return ``(type, name, payload)`` without asking tarfile to interpret PAX."""
+    raw = archive.getvalue()
+    records: list[tuple[bytes, bytes, bytes]] = []
+    offset = 0
+    while raw[offset : offset + tarfile.BLOCKSIZE] != b"\x00" * tarfile.BLOCKSIZE:
+        header = raw[offset : offset + tarfile.BLOCKSIZE]
+        assert len(header) == tarfile.BLOCKSIZE
+        size = int(header[124:136].rstrip(b"\x00 ") or b"0", 8)
+        payload_start = offset + tarfile.BLOCKSIZE
+        payload = raw[payload_start : payload_start + size]
+        records.append((header[156:157], header[:100].rstrip(b"\x00"), payload))
+        offset = (
+            payload_start
+            + ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        )
+    assert raw[offset:] == b"\x00" * (len(raw) - offset)
+    return records
+
+
+def _parse_pax_records(payload: bytes) -> dict[str, str]:
+    records: dict[str, str] = {}
+    while payload:
+        length_text, separator, _ = payload.partition(b" ")
+        assert separator == b" "
+        length = int(length_text)
+        record, payload = payload[:length], payload[length:]
+        assert len(record) == length and record.endswith(b"\n")
+        key, value = record[len(length_text) + 1 : -1].decode("utf-8").split("=", 1)
+        assert key not in records
+        records[key] = value
+    return records
+
+
 def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
     archive = io.BytesIO()
 
@@ -53,6 +87,43 @@ def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
         assert info.uid == 1100
         assert info.gid == 1010
         assert info.mode == 0o600
+        assert info.isreg()
+        assert info.pax_headers == {"Xagent.archive.version": "1"}
+
+
+@pytest.mark.parametrize(
+    ("arcname", "expected_path"),
+    [
+        ("id_key", None),
+        ("文件.txt", "文件.txt"),
+        ("a" * 101, "a" * 101),
+    ],
+)
+def test_write_tar_content_has_one_versioned_wire_shape(
+    arcname: str, expected_path: str | None
+) -> None:
+    archive = io.BytesIO()
+
+    _write_tar_from_content("x", arcname, archive)
+
+    extension, member = _raw_tar_records(archive)
+    assert extension[0] == b"x"
+    assert extension[1] == b"././@PaxHeader"
+    assert member[0] == tarfile.REGTYPE
+    assert member[2] == b"x"
+    expected_pax = {"Xagent.archive.version": "1"}
+    if expected_path is not None:
+        expected_pax["path"] = expected_path
+    assert _parse_pax_records(extension[2]) == expected_pax
+
+
+@pytest.mark.parametrize(
+    "arcname",
+    ["", ".", "..", "/absolute", "nested/file", "nul\x00name", "a" * 256, "\ud800"],
+)
+def test_write_tar_content_rejects_names_outside_wire_contract(arcname: str) -> None:
+    with pytest.raises(ValueError, match="valid UTF-8|single valid file name"):
+        _write_tar_from_content("x", arcname, io.BytesIO())
 
 
 @pytest.mark.parametrize("source_mode", [0o400, 0o644, 0o755])
@@ -72,6 +143,7 @@ def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
         assert info.gid == 1010
         assert info.mode == source_mode
         assert info.mtime == int(source.stat().st_mtime)
+        assert info.pax_headers == {"Xagent.archive.version": "1"}
         extracted = tar.extractfile(info)
         assert extracted is not None
         assert extracted.read() == b"secret"

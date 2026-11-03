@@ -95,6 +95,9 @@ _CPU_NANOS = 1_000_000_000
 _DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-dedicated-network-v2"
 SANDBOX_NETWORK_LABEL = "xagent.sandbox.network"
 SANDBOX_NETWORK_LABEL_VALUE = "v1"
+_SANDBOX_ARCHIVE_PAX_VERSION_KEY = "Xagent.archive.version"
+_SANDBOX_ARCHIVE_PAX_VERSION = "1"
+_MAX_SANDBOX_ARCHIVE_NAME_BYTES = 255
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -645,10 +648,59 @@ def _find_publish_mismatches(
     return mismatches
 
 
+def _sandbox_archive_info(
+    arcname: str,
+    *,
+    size: int,
+    mode: int,
+    mtime: int = 0,
+) -> tarfile.TarInfo:
+    """Build the one regular member allowed by the sandbox upload protocol."""
+    try:
+        encoded_name = arcname.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Sandbox upload file names must be valid UTF-8") from exc
+    if (
+        not arcname
+        or arcname in {".", ".."}
+        or "\x00" in arcname
+        or posixpath.basename(arcname) != arcname
+        or len(encoded_name) > _MAX_SANDBOX_ARCHIVE_NAME_BYTES
+    ):
+        raise ValueError("Sandbox uploads require a single valid file name")
+
+    info = tarfile.TarInfo(name=arcname)
+    info.size = size
+    info.mtime = mtime
+    info.uid = SANDBOX_RUNTIME_UID
+    info.gid = SANDBOX_RUNTIME_GID
+    info.mode = mode
+    # Every upload carries an explicit local PAX marker. The restricted Docker
+    # broker can therefore accept one bounded wire format instead of trying to
+    # distinguish arbitrary tar dialects. ``path`` is the only additional PAX
+    # key tarfile may add, for a long or non-ASCII basename.
+    info.pax_headers = {_SANDBOX_ARCHIVE_PAX_VERSION_KEY: _SANDBOX_ARCHIVE_PAX_VERSION}
+    return info
+
+
+def _open_sandbox_upload_archive(
+    file_obj: io.BufferedRandom,
+) -> tarfile.TarFile:
+    """Open a deterministic PAX archive with no global extension headers."""
+    return tarfile.open(
+        fileobj=file_obj,
+        mode="w",
+        format=tarfile.PAX_FORMAT,
+        encoding="utf-8",
+        errors="strict",
+        pax_headers={},
+    )
+
+
 def _write_tar_from_local_path(
     local_path: str, arcname: str, file_obj: io.BufferedRandom
 ) -> None:
-    """Pack a local file into a tar stream for Docker put_archive."""
+    """Pack a local file into the versioned single-file upload protocol."""
     # O_NOFOLLOW rejects symlinks, while O_NONBLOCK makes opening a FIFO or
     # device return promptly so the regular-file check can reject it without
     # blocking the async caller's event-loop thread.
@@ -663,15 +715,15 @@ def _write_tar_from_local_path(
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
             raise ValueError("Sandbox uploads require a regular local file")
-        info = tarfile.TarInfo(name=arcname)
-        info.size = source_stat.st_size
-        info.mtime = int(source_stat.st_mtime)
-        info.uid = SANDBOX_RUNTIME_UID
-        info.gid = SANDBOX_RUNTIME_GID
-        info.mode = stat.S_IMODE(source_stat.st_mode) & 0o755
+        info = _sandbox_archive_info(
+            arcname,
+            size=source_stat.st_size,
+            mtime=int(source_stat.st_mtime),
+            mode=stat.S_IMODE(source_stat.st_mode) & 0o755,
+        )
         with os.fdopen(source_fd, "rb", closefd=True) as source:
             source_fd = -1
-            with tarfile.open(fileobj=file_obj, mode="w") as tar:
+            with _open_sandbox_upload_archive(file_obj) as tar:
                 tar.addfile(info, source)
     finally:
         if source_fd >= 0:
@@ -684,14 +736,10 @@ def _write_tar_from_content(
     arcname: str,
     file_obj: io.BufferedRandom,
 ) -> None:
-    """Pack in-memory text content into a tar stream for Docker put_archive."""
+    """Pack text into the versioned single-file upload protocol."""
     data = content.encode("utf-8")
-    info = tarfile.TarInfo(name=arcname)
-    info.size = len(data)
-    info.uid = SANDBOX_RUNTIME_UID
-    info.gid = SANDBOX_RUNTIME_GID
-    info.mode = 0o600
-    with tarfile.open(fileobj=file_obj, mode="w") as tar:
+    info = _sandbox_archive_info(arcname, size=len(data), mode=0o600)
+    with _open_sandbox_upload_archive(file_obj) as tar:
         tar.addfile(info, io.BytesIO(data))
     file_obj.seek(0)
 

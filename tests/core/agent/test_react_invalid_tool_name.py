@@ -2,8 +2,9 @@
 
 Providers only accept tool names matching ``[A-Za-z0-9_-]{1,64}``, so a name
 outside that set has to leave every LLM request in a safe spelling. The
-rewritten spelling is only ever shown to the provider: lookup and the error
-keep what the model actually emitted, so a rewrite can never run a real tool.
+rewritten spelling is never used for lookup, so a rewrite can never run a
+real tool. The error reports what the model emitted, and names the rewritten
+spelling only as a suggestion when it is a tool the model is offered.
 """
 
 from __future__ import annotations
@@ -202,21 +203,20 @@ def test_not_found_error_suggests_close_names() -> None:
     tool_name = "billing_create_invoice_suggestion"
     tools = [RecordingTool(tool_name), RecordingTool("calculator")]
 
-    with pytest.raises(ValueError) as raised:
-        ReActPattern()._find_tool(f"{tool_name}_placeholder", tools)
+    error = ReActPattern()._tool_not_found_message(
+        f"{tool_name}_placeholder", tools, ExecutionContext()
+    )
 
-    assert str(raised.value) == (
+    assert error == (
         f"Tool not found: '{tool_name}_placeholder'. Did you mean: {tool_name}?"
     )
 
 
 def test_not_found_error_lists_tools_when_nothing_is_close() -> None:
-    with pytest.raises(ValueError) as raised:
-        ReActPattern(user_interaction_enabled=False)._find_tool(
-            "zzz", [RecordingTool("calculator")]
-        )
+    error = ReActPattern(user_interaction_enabled=False)._tool_not_found_message(
+        "zzz", [RecordingTool("calculator")], ExecutionContext()
+    )
 
-    error = str(raised.value)
     assert error.startswith("Tool not found: 'zzz'. Available tools: calculator, ")
     assert "final_answer" in error
 
@@ -225,10 +225,8 @@ def test_not_found_error_caps_a_long_tool_list() -> None:
     tools = [RecordingTool(f"tool_{index:03d}") for index in range(100)]
     pattern = ReActPattern()
 
-    with pytest.raises(ValueError) as raised:
-        pattern._find_tool("zzz", tools)
+    error = pattern._tool_not_found_message("zzz", tools, ExecutionContext())
 
-    error = str(raised.value)
     assert "tool_019" in error
     assert "tool_020" not in error
     builtin = pattern._schema_tool_names(pattern._builtin_tool_schemas())
@@ -236,15 +234,158 @@ def test_not_found_error_caps_a_long_tool_list() -> None:
     assert error.endswith(f"(and {hidden} more).")
 
 
-def test_not_found_error_does_not_offer_the_hidden_spill_reader() -> None:
+def test_replayed_spelling_of_a_real_tool_is_named_when_nothing_is_close() -> None:
+    tools = [RecordingTool(f"tool_{index:03d}") for index in range(25)]
+    tools.append(RecordingTool("a_b"))
+
+    error = ReActPattern()._tool_not_found_message("a b", tools, ExecutionContext())
+
+    assert error == "Tool not found: 'a b'. Did you mean: a_b?"
+
+
+def test_replayed_spelling_of_a_real_tool_is_named_first() -> None:
+    tools = [RecordingTool("create_report"), RecordingTool("create_report_")]
+
+    error = ReActPattern()._tool_not_found_message(
+        "create_report!", tools, ExecutionContext()
+    )
+
+    assert error == (
+        "Tool not found: 'create_report!'. Did you mean: create_report_, create_report?"
+    )
+
+
+def _context_with_stored_result() -> ExecutionContext:
+    from xagent.core.agent.context.components import SpillRegistryComponent
+
+    context = ExecutionContext()
+    context.set_component(
+        "spilled_results",
+        SpillRegistryComponent(
+            records=[
+                {
+                    "relative_path": "output/result.json",
+                    "kind": "array",
+                    "item_count": 1,
+                    "original_chars": 10,
+                    "value_path": "output",
+                    "record_fields": None,
+                    "truncated_after_items": None,
+                }
+            ]
+        ),
+    )
+    context.add_user_message("Go")
+    return context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored", [False, True])
+async def test_hint_candidates_are_the_tools_offered_on_that_turn(
+    stored: bool,
+) -> None:
     from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
 
-    with pytest.raises(ValueError) as raised:
-        ReActPattern()._find_tool(
-            "zzz", [RecordingTool(SPILL_READ_TOOL_NAME), RecordingTool("calculator")]
-        )
+    if stored:
+        context = _context_with_stored_result()
+    else:
+        context = ExecutionContext()
+        context.add_user_message("Go")
+    llm = ScriptedLLM([_tool_call_response("zzz"), {"content": "Recovered."}])
+    tools = [RecordingTool(SPILL_READ_TOOL_NAME), RecordingTool("calculator")]
 
-    assert SPILL_READ_TOOL_NAME not in str(raised.value)
+    await ReActPattern(max_iterations=3).run(context=context, tools=tools, llm=llm)
+
+    offered = [schema["function"]["name"] for schema in llm.calls[0]["tools"]]
+    assert (SPILL_READ_TOOL_NAME in offered) is stored
+    assert _tool_error(context) == (
+        f"Tool not found: 'zzz'. Available tools: {', '.join(offered)}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_mistyped_reader_is_suggested_once_a_result_is_stored() -> None:
+    from xagent.core.tools.tool_result_spill import SPILL_READ_TOOL_NAME
+
+    context = _context_with_stored_result()
+    llm = ScriptedLLM(
+        [_tool_call_response("read_tool_reslt"), {"content": "Recovered."}]
+    )
+    tools = [RecordingTool(SPILL_READ_TOOL_NAME), RecordingTool("calculator")]
+
+    await ReActPattern(max_iterations=3).run(context=context, tools=tools, llm=llm)
+
+    assert _tool_error(context) == (
+        "Tool not found: 'read_tool_reslt'. Did you mean: read_tool_result?"
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_invalid_call_among_valid_ones_keeps_ids_and_order() -> None:
+    tool = RecordingTool("calculator")
+    llm = ScriptedLLM(
+        [
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "calculator", "arguments": '{"x": 1}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "weather lookup", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_3",
+                        "type": "function",
+                        "function": {"name": "calculator", "arguments": '{"x": 2}'},
+                    },
+                ],
+            },
+            {"content": "Recovered."},
+        ]
+    )
+    context = ExecutionContext()
+    context.add_user_message("Go")
+
+    result = await ReActPattern(max_iterations=3).run(
+        context=context, tools=[tool], llm=llm
+    )
+
+    assert result["response"] == "Recovered."
+    assert tool.calls == 2
+    messages = llm.calls[1]["messages"]
+    replayed = [
+        (tool_call["id"], tool_call["function"]["name"])
+        for message in messages
+        for tool_call in message.get("tool_calls") or []
+    ]
+    assert replayed == [
+        ("call_1", "calculator"),
+        ("call_2", "weather_lookup"),
+        ("call_3", "calculator"),
+    ]
+    assert [m["tool_call_id"] for m in messages if m["role"] == "tool"] == [
+        "call_1",
+        "call_2",
+        "call_3",
+    ]
+    results = {
+        message.tool_call_id: message.metadata["raw_result"]
+        for message in context.get_messages_by_role("tool")
+    }
+    assert results["call_1"] == {"success": True, "output": "ok"}
+    assert results["call_3"] == {"success": True, "output": "ok"}
+    assert results["call_2"]["error"].startswith("Tool not found: 'weather lookup'.")
+    [assistant] = [m for m in context.get_messages_by_role("assistant") if m.tool_calls]
+    assert [c["function"]["name"] for c in assistant.tool_calls] == [
+        "calculator",
+        "weather lookup",
+        "calculator",
+    ]
 
 
 def _context_with_tool_call(name: Any) -> ExecutionContext:
@@ -272,6 +413,7 @@ def _context_with_tool_call(name: Any) -> ExecutionContext:
         ("a\nb", "a_b"),
         ("a b.c", "a_b_c"),
         ("工具", "__"),
+        ("y" * 64, "y" * 64),
         ("x" * 70, "x" * 64),
         ("", "invalid_tool_name"),
         (None, "invalid_tool_name"),

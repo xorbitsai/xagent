@@ -130,9 +130,6 @@ def snapshot_container(value: Any) -> Any:
 
 
 READ_FILE_CONTEXT_LIMIT = 12_000
-# Character rule shared by Bedrock's toolUse.name and OpenAI-compatible function
-# names, sized by the same provider limit generated tool names are built to.
-_PROVIDER_TOOL_NAME_RE = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_AGENT_TOOL_NAME_LENGTH}}}")
 _INVALID_TOOL_NAME_PLACEHOLDER = "invalid_tool_name"
 SPILL_REGISTRY_MAX_RECORDS = 64
 # Set by the web layer into ``ExecutionContext.metadata`` at turn start: the
@@ -307,13 +304,15 @@ def estimate_provider_prompt_tokens(
 def provider_safe_tool_name(name: Any) -> str:
     """Return ``name`` in a spelling that providers accept in a replayed call.
 
-    The result is for LLM requests only. It must never be used to look a tool
-    up: ``create report`` becomes ``create_report``, which may be a real tool
+    The result may be shown to the model: in LLM requests, and in a tool error
+    that names it as a suggestion. It must never be used to look up or run a
+    tool: ``create report`` becomes ``create_report``, which may be a real tool
     the model did not call.
     """
+    # Bedrock's toolUse.name and OpenAI-compatible function names share this
+    # character rule, and the cut is the same provider limit generated tool
+    # names are built to. A name already within the rule comes back unchanged.
     text = "" if name is None else str(name)
-    if _PROVIDER_TOOL_NAME_RE.fullmatch(text):
-        return text
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", text)[:MAX_AGENT_TOOL_NAME_LENGTH]
     return safe or _INVALID_TOOL_NAME_PLACEHOLDER
 

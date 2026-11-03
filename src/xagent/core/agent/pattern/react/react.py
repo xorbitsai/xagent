@@ -117,6 +117,7 @@ from ...context.enrichment import (
 )
 from ...context.execution import (
     note_compaction_evidence_loss,
+    provider_safe_tool_name,
     snapshot_container,
     tool_evidence_state,
 )
@@ -6333,7 +6334,7 @@ class ReActPattern(AgentPattern):
                     self._mcp_gate_execution_context(tool_call, context, runtime)
                 ):
                     result = await runtime.run_tool_call(
-                        lambda: self._execute_tool(tool_call, tools)
+                        lambda: self._execute_tool(tool_call, tools, context=context)
                     )
             except ToolCallInterrupted as exc:
                 await runtime.on_tool_cancelled(
@@ -6787,8 +6788,14 @@ class ReActPattern(AgentPattern):
             return {"type": "array"}
         return {}
 
-    async def _execute_tool(self, tool_call: dict[str, Any], tools: list[Any]) -> Any:
-        tool = self._find_tool(tool_call["name"], tools)
+    async def _execute_tool(
+        self, tool_call: dict[str, Any], tools: list[Any], *, context: Any
+    ) -> Any:
+        tool = self._match_tool(tool_call["name"], tools)
+        if tool is None:
+            raise ValueError(
+                self._tool_not_found_message(tool_call["name"], tools, context)
+            )
         args = self._tool_args_for_execution(tool_call, tool)
 
         execute = getattr(tool, "execute", None)
@@ -6824,7 +6831,11 @@ class ReActPattern(AgentPattern):
             args.setdefault("_xagent_step_id", str(step_id))
         return args
 
-    def _find_tool(self, name: str, tools: list[Any]) -> Any:
+    def _match_tool(self, name: str, tools: list[Any]) -> Any | None:
+        """The tool ``name`` resolves to, or None.
+
+        Matches the emitted name only, never a provider-safe respelling of it.
+        """
         for tool in tools:
             if self._tool_name(tool) == name:
                 return tool
@@ -6835,27 +6846,42 @@ class ReActPattern(AgentPattern):
             matches_name = getattr(tool, "matches_name", None)
             if callable(matches_name) and matches_name(name):
                 return tool
-        raise ValueError(self._tool_not_found_message(name, tools))
+        return None
 
-    def _tool_not_found_message(self, name: Any, tools: list[Any]) -> str:
+    def _find_tool(self, name: str, tools: list[Any]) -> Any:
+        tool = self._match_tool(name, tools)
+        if tool is None:
+            raise ValueError(f"Tool not found: {name}")
+        return tool
+
+    def _tool_not_found_message(self, name: Any, tools: list[Any], context: Any) -> str:
         """Name what the model emitted and what it could have called instead.
 
+        The candidates are the tool names an ordinary turn offers the model,
+        built by the same functions as that turn's schema list, so the
+        stored-result reader is a candidate only once this run has stored a
+        result. Forced turns offer fewer tools, but a call outside a forced
+        turn's list is refused before any tool is looked up.
+
         ``repr`` keeps an invalid name visibly different from a real tool whose
-        name it resembles, including when the replayed call shows that spelling.
+        name it resembles. The replayed call shows the provider-safe spelling
+        instead, so when that spelling is itself an offered tool it is named
+        first: the model sees that name in its history and has to be told the
+        call did not run it. The spelling is only named here; lookup always
+        uses the emitted name.
         """
-        available = list(
-            dict.fromkeys(
-                [
-                    # Not offered in the schema until a result has been spilled.
-                    *(
-                        tool_name
-                        for tool_name in map(self._tool_name, tools)
-                        if tool_name != SPILL_READ_TOOL_NAME
-                    ),
-                    *self._schema_tool_names(self._builtin_tool_schemas()),
-                ]
-            )
+        spill_read_tool = next(
+            (tool for tool in tools if self._tool_name(tool) == SPILL_READ_TOOL_NAME),
+            None,
         )
+        offered = self._tool_schemas_with_spill_read(
+            self._tool_schemas_with_builtin_controls(tools),
+            None
+            if spill_read_tool is None
+            else self._build_tool_schema(spill_read_tool),
+            context,
+        )
+        available = list(dict.fromkeys(self._schema_tool_names(offered)))
         message = f"Tool not found: {name!r}."
         close = difflib.get_close_matches(
             str(name),
@@ -6863,6 +6889,11 @@ class ReActPattern(AgentPattern):
             n=TOOL_NOT_FOUND_MAX_CLOSE_NAMES,
             cutoff=TOOL_NOT_FOUND_CLOSE_CUTOFF,
         )
+        replayed = provider_safe_tool_name(name)
+        if replayed in available:
+            close = [replayed, *(match for match in close if match != replayed)][
+                :TOOL_NOT_FOUND_MAX_CLOSE_NAMES
+            ]
         if close:
             return f"{message} Did you mean: {', '.join(close)}?"
         listed = ", ".join(available[:TOOL_NOT_FOUND_MAX_LISTED_NAMES])

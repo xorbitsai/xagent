@@ -123,6 +123,14 @@ from ...context.memory_tool import MEMORY_TOOLS_METADATA_KEY, build_memory_tools
 from ...context.skill_tool import build_load_skill_tool
 from ...grounding import evidence_facts, grounding_rule
 from ...language import effective_output_language, final_answer_language_rule
+from ...prompt_composition import (
+    BUILTIN_TOOL_ORIGIN,
+    CALL_KIND_DECISION,
+    CALL_KIND_MAIN,
+    CALL_KIND_PROTOCOL_RETRY,
+    PROMPT_COMPOSITION_KEY,
+    build_prompt_composition,
+)
 from ...result import (
     CONTROL_TOOL_NAMES,
     normalize_tool_failure_code,
@@ -1013,6 +1021,7 @@ class ReActPattern(AgentPattern):
             "generate_image" in self._tool_decision_groups_by_name
             and "edit_image" not in self._tool_decision_groups_by_name
         )
+        self._tool_origins = self._tool_origin_map(tools)
         base_tool_schemas = (
             []
             if self.tool_choice == "none"
@@ -1203,6 +1212,13 @@ class ReActPattern(AgentPattern):
                 ),
             )
             await runtime.checkpoint("before_llm", context=context, pattern=self)
+            llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+                context,
+                messages,
+                tool_schemas,
+                call_kind=CALL_KIND_MAIN,
+                iteration=iteration,
+            )
             await runtime.on_llm_start(
                 context=context,
                 messages=messages,
@@ -2287,6 +2303,13 @@ class ReActPattern(AgentPattern):
             context=context,
             pattern=self,
             metadata=metadata,
+        )
+        metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+            context,
+            messages,
+            tools,
+            call_kind=CALL_KIND_PROTOCOL_RETRY,
+            iteration=iteration,
         )
         await runtime.on_llm_start(
             context=context,
@@ -5493,6 +5516,13 @@ class ReActPattern(AgentPattern):
             **resolved_llm_metadata(call_llm),
             **metadata,
         }
+        llm_metadata[PROMPT_COMPOSITION_KEY] = self._prompt_composition(
+            context,
+            messages,
+            decision_tools,
+            call_kind=CALL_KIND_DECISION,
+            iteration=self.current_iteration,
+        )
         await runtime.on_llm_start(
             context=context,
             messages=messages,
@@ -6715,6 +6745,54 @@ class ReActPattern(AgentPattern):
         if require_mapping:
             raise ValueError("Tool call args must be a JSON object.")
         return {}
+
+    def _tool_origin_map(self, tools: list[Any]) -> dict[str, str]:
+        """Tool name -> category (plus MCP/connector server), for sizing only."""
+        origins: dict[str, str] = {}
+        for tool in tools:
+            try:
+                name = self._tool_name(tool)
+            except ValueError:
+                continue
+            metadata = getattr(tool, "metadata", None)
+            category = getattr(metadata, "category", None)
+            origin = str(getattr(category, "value", category) or "other")
+            server = getattr(metadata, "source_server", None)
+            if isinstance(server, str) and server:
+                origin = f"{origin}:{server}"
+            origins[name] = origin
+        return origins
+
+    def _prompt_composition(
+        self,
+        context: Any,
+        messages: list[dict[str, Any]],
+        tool_schemas: list[dict[str, Any]] | None,
+        *,
+        call_kind: str,
+        iteration: int,
+    ) -> dict[str, Any]:
+        """Sizes of this call's request; counts and lengths, never content."""
+        origins = {
+            name: BUILTIN_TOOL_ORIGIN
+            for name in self._schema_tool_names(tool_schemas or [])
+        }
+        origins.update(getattr(self, "_tool_origins", {}))
+        context_tokens: int | None = None
+        estimate = getattr(context, "estimate_context_tokens", None)
+        if callable(estimate):
+            try:
+                context_tokens = estimate(messages, tool_schemas or None)
+            except Exception:  # noqa: BLE001 - diagnostics must not break the call
+                context_tokens = None
+        return build_prompt_composition(
+            messages,
+            tool_schemas,
+            call_kind=call_kind,
+            iteration=iteration,
+            tool_origins=origins,
+            context_tokens=context_tokens,
+        )
 
     def _tool_name(self, tool: Any) -> str:
         metadata = getattr(tool, "metadata", None)

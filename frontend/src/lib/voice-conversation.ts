@@ -9,6 +9,10 @@ export function speechText(value: string): string {
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/[*_`#>|]/g, "")
+    // Unpunctuated list items still need boundaries for streaming synthesis.
+    .replace(/(^[ \t]*\d+[.)][ \t]+[^\r\n]*\S)[ \t]*\r?\n(?:[ \t]*\r?\n)*(?=[ \t]*\d+[.)][ \t]+)/gm,
+      (_match, line: string) => `${line}${/[.!?。！？]$/.test(line) ? "" : "."}\n`)
+    .replace(/^[ \t]*\d+[.)][ \t]+/gm, "")
     .replace(/\[|\]/g, "")
     .replace(/\s+/g, " ").trim()
 }
@@ -106,7 +110,15 @@ export class VoiceTurns {
   }
 
   transcript(type: "partial" | "final", text: string, segmentId: number) {
-    if (this.stopped || this.muted || !text.trim() || this.segmentIds.has(segmentId)) return
+    if (this.stopped || this.muted || this.segmentIds.has(segmentId)) return
+    if (!text.trim()) {
+      if (type === "partial") {
+        this.transcriptPending = false
+        this.actions.caption([this.pending, ...this.segments].filter(Boolean).join(" "))
+        this.schedule()
+      }
+      return
+    }
     if (!this.speechAccepted) {
       this.speechAccepted = true
       this.cutOff()

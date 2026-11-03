@@ -11,7 +11,11 @@ All endpoints authenticate via ``get_principal_from_api_key`` -- an
 agent-bound key scopes to its agent's SDK tasks, a workforce-bound key
 scopes to the tasks behind its workforce's runs (``WorkforceRun.task_id``
 is a 1:1 unique binding; runs are created via
-``POST /v1/workforces/{id}/runs``). Task creation stays agent-only.
+``POST /v1/workforces/{id}/runs``), and a personal key scopes to the SDK
+tasks its holder created with a personal key. A runtime key never reaches
+a task a personal key created. Tasks are created with an agent key for
+its own agent, or with a personal key for any agent the holder can see;
+the task then runs as the holder.
 All responses use the stable ``V1ApiError`` envelope. Task turn
 lifecycle (claim RUNNING, persist messages, schedule bg, sync output)
 is delegated to ``services.task_orchestrator.TaskTurnOrchestrator``,
@@ -96,7 +100,11 @@ from ...services.uploaded_file_store import (
 from ...utils.db_timezone import normalize_datetime_from_db
 from . import _events_stream
 from ._step_mapping import map_trace_events_to_public_steps
-from .deps import ApiKeyPrincipal, get_principal_from_api_key, record_key_usage
+from .deps import (
+    ApiKeyPrincipal,
+    get_principal_from_api_key,
+    record_principal_usage,
+)
 from .errors import V1ApiError, V1ErrorCode, raise_for_turn_rejection
 
 logger = logging.getLogger(__name__)
@@ -212,18 +220,39 @@ async def upload_task_files(
 
 
 def _sdk_task_scope(principal: ApiKeyPrincipal) -> task_start_service.SdkTaskScope:
-    return task_start_service.SdkTaskScope(
-        agent_id=int(principal.agent.id) if principal.agent is not None else None,
-        workforce_id=int(principal.workforce.id)
-        if principal.workforce is not None
-        else None,
-    )
+    """The task scope of ``principal``: its bound agent or workforce, or the
+    holder of a personal key.
+
+    Any other principal has no task scope and gets the same 404 a task
+    outside its scope gets.
+    """
+    if principal.agent is not None:
+        return task_start_service.SdkTaskScope(
+            agent_id=int(principal.agent.id), workforce_id=None
+        )
+    if principal.workforce is not None:
+        return task_start_service.SdkTaskScope(
+            agent_id=None, workforce_id=int(principal.workforce.id)
+        )
+    if principal.user is not None:
+        return task_start_service.SdkTaskScope(
+            agent_id=None, workforce_id=None, user_id=int(principal.user.id)
+        )
+    raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
 
 
 def _raise_start_rejection(exc: task_start_service.TaskStartRejected) -> NoReturn:
     if exc.reason == "agent_id_required":
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT, 422, message="agent_id is required"
+        ) from exc
+    if exc.reason == "prompt_context_fields_rejected":
+        # Names only, without the reason or the declared limit.
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            422,
+            message="prompt_context fields this agent does not accept: "
+            + ", ".join(exc.fields),
         ) from exc
     if exc.reason == "connector_runtime_setup_failed":
         raise V1ApiError(
@@ -306,12 +335,27 @@ def _validate_owner_scope(
     *,
     request_agent_id: int | None,
     request_workforce_id: int | None,
+    task_agent_id: int,
 ) -> None:
     try:
         task_start_service.validate_sdk_owner_scope(
             _sdk_task_scope(principal),
             request_agent_id=request_agent_id,
             request_workforce_id=request_workforce_id,
+            task_agent_id=task_agent_id,
+        )
+    except task_start_service.TaskStartRejected as exc:
+        _raise_start_rejection(exc)
+
+
+def _ensure_agent_reachable(
+    principal: ApiKeyPrincipal, task: Task, db: Session
+) -> None:
+    """404 ``agent_not_found`` once a personal key's holder can no longer run
+    the task's agent; see ``ensure_sdk_task_agent_reachable``."""
+    try:
+        task_start_service.ensure_sdk_task_agent_reachable(
+            db, _sdk_task_scope(principal), task
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -331,13 +375,18 @@ async def create_chat_task(
     Single endpoint does three things atomically from the caller's
     perspective:
 
-      1. Verifies the body's ``agent_id`` matches the agent bound to
-         the presented API key. Mismatch -> 404 ``agent_not_found``
-         (404 not 403, so the existence of unrelated agents isn't
-         leaked via error code).
-      2. Persists a new :class:`Task` row owned by the agent's user,
-         with ``source='sdk'``, ``is_visible=False``, and ``input`` set
-         to the user message. Also persists the first user message to
+      1. Verifies the body's ``agent_id``: with an agent key it must be
+         the agent bound to the key; with a personal key it must be an
+         agent the key holder can see (the same set ``GET /v1/agents``
+         lists). Otherwise -> 404 ``agent_not_found`` (404 not 403, so
+         the existence of unrelated agents isn't leaked via error code),
+         decided before any file or connector input is examined.
+      2. Persists a new :class:`Task` row owned by the agent's user for
+         an agent key, or by the key holder for a personal key (the turn
+         then runs with the holder's files, connectors and skills), with
+         ``source='sdk'``, ``is_visible=False``, the credential kind,
+         and ``input`` set to the user message. Also persists the first
+         user message to
          ``task_chat_messages`` so the existing background execution
          path can consume it without special-casing this entry point.
       3. Schedules background execution via
@@ -354,9 +403,9 @@ async def create_chat_task(
         request: Validated :class:`CreateTaskRequest`. ``message.content``
             is guaranteed non-empty by Pydantic; ``agent_id`` is the
             target agent the SDK caller wants to invoke.
-        authed: ``(Agent, AgentApiKey)`` tuple resolved by the auth
-            dependency. The agent here is the *key-bound* agent, the
-            single source of truth for what this caller may touch.
+        principal: Key owner from the auth dependency: an agent key's
+            bound agent, or a personal key's holder. A workforce key
+            cannot create tasks here.
     Returns:
         :class:`CreateTaskResponse` with the new ``task_id``,
         ``agent_id``, ``status='running'`` (the atomic claim inside
@@ -366,9 +415,14 @@ async def create_chat_task(
 
     Raises:
         V1ApiError 401: missing/invalid/revoked key (raised inside
-            ``get_agent_from_api_key``; envelope is uniform with
+            ``get_principal_from_api_key``; envelope is uniform with
             other auth failures).
-        V1ApiError 404: ``request.agent_id != authed_agent.id``.
+        V1ApiError 404: ``agent_not_found`` -- the agent is not the one
+            bound to the agent key, or not one the personal key's holder
+            can see.
+        V1ApiError 422: ``prompt_context`` is malformed, or a personal
+            key sent a field the agent does not declare or longer than its
+            declared length.
         500 (V1 envelope): any unexpected exception -- the global
             handler in ``web/app.py`` translates to
             ``{"error": {"code": "internal_error", ...}}`` and the raw
@@ -376,14 +430,24 @@ async def create_chat_task(
     """
     agent_identity = principal.agent
     _validate_prompt_context(request.prompt_context)
-    if agent_identity is None or request.agent_id != agent_identity.id:
+    credential_kind: task_start_service.SdkCredentialKind
+    if principal.user is not None:
+        # create_sdk_task checks that the holder can see this agent.
+        agent_id = int(request.agent_id)
+        task_owner_user_id = int(principal.user.id)
+        credential_kind = "personal"
+    elif agent_identity is not None and request.agent_id == agent_identity.id:
+        agent_id = int(agent_identity.id)
+        task_owner_user_id = int(agent_identity.user_id)
+        credential_kind = "runtime"
+    else:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
     try:
         started = await task_start_service.create_sdk_task(
-            agent_id=int(agent_identity.id),
-            task_owner_user_id=int(agent_identity.user_id),
-            actor_user_id=int(agent_identity.user_id),
+            agent_id=agent_id,
+            task_owner_user_id=task_owner_user_id,
+            actor_user_id=task_owner_user_id,
             message=request.message.content,
             file_ids=tuple(request.message.files or ()),
             connector_runtime_context=tuple(
@@ -393,6 +457,7 @@ async def create_chat_task(
             requested_dispatch_class=request.dispatch_class,
             requested_priority=request.priority,
             prompt_context=request.prompt_context,
+            credential_kind=credential_kind,
         )
     except task_start_service.TaskStartRejected as exc:
         _raise_start_rejection(exc)
@@ -405,7 +470,12 @@ async def create_chat_task(
     except DurableStorageOperationError as exc:
         _raise_v1_storage_unavailable(exc)
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal,
+        route="create_task",
+        task_id=started.task_id,
+        agent_id=started.agent_id,
+    )
 
     return CreateTaskResponse(
         task_id=started.task_id,
@@ -990,19 +1060,24 @@ async def append_message_to_task(
 
     Phase 1 multi-turn model is task-centric: subsequent user inputs
     extend the same ``task_id`` rather than creating a new task or a
-    new ``conversation_id``. Works for both key owner types: an
-    agent-bound key appends to its agent's SDK tasks, a workforce-bound
-    key appends to the manager tasks behind its workforce's SDK runs
-    (the workforce turn guard revalidates archive/config drift on every
-    append). This endpoint:
+    new ``conversation_id``. Works for every key type: an agent-bound
+    key appends to its agent's SDK tasks, a workforce-bound key appends
+    to the manager tasks behind its workforce's SDK runs (the workforce
+    turn guard revalidates archive/config drift on every append), and a
+    personal key appends to the tasks its holder created with a personal
+    key. This endpoint:
 
       1. Validates the path ``task_id`` exists and belongs to the
          key-bound owner (404 ``task_not_found`` otherwise).
       2. Validates ``body.agent_id`` matches the key-bound agent
          (404 ``agent_not_found`` otherwise; required for agent keys,
-         rejected for workforce keys). ``body.workforce_id``, when
+         rejected for workforce keys, optional for personal keys, where
+         it must be the task's agent). ``body.workforce_id``, when
          provided with a workforce key, must match the bound workforce
-         (404 ``workforce_not_found`` otherwise).
+         (404 ``workforce_not_found`` otherwise); a personal key never
+         passes one. For a personal key, the holder must still be able
+         to see the task's agent (404 ``agent_not_found`` otherwise),
+         checked before ``prompt_context`` and connector input.
       3. Rejects the call with 409 ``task_busy`` if the task is
          currently ``RUNNING``, or 409 ``interaction_response_required``
          if it is ``WAITING_FOR_USER`` -- that status answers a pending
@@ -1029,10 +1104,13 @@ async def append_message_to_task(
         V1ApiError 401: missing / invalid / revoked key.
         V1ApiError 404: task not found OR not owned by the key OR
             body.agent_id / body.workforce_id doesn't match the bound
-            owner.
+            owner OR a personal key's holder can no longer see the agent.
         V1ApiError 410: ``task_expired`` -- the retention policy expired
             a task this key could have seen; ``details`` carries
             ``task_id`` and ``expired_at``.
+        V1ApiError 422: ``prompt_context`` is malformed, sent with a
+            workforce key, or, with a personal key, has a field the agent
+            does not declare or longer than its declared length.
         V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
             code (not retryable), or ``interaction_response_required``
             (use ``reply`` instead).
@@ -1072,7 +1150,12 @@ async def append_message_to_task(
     except DurableStorageOperationError as exc:
         _raise_v1_storage_unavailable(exc)
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal,
+        route="append_message",
+        task_id=started.task_id,
+        agent_id=started.agent_id,
+    )
 
     return AppendMessageResponse(
         task_id=started.task_id,
@@ -1197,7 +1280,9 @@ async def delete_chat_task(
 
     await asyncio.shield(asyncio.create_task(_cleanup_runtime_state()))
     outcome = await finish_task_deletion(committed)
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal, route="delete_task", task_id=task_id, agent_id=None
+    )
     return DeleteTaskResponse(
         task_id=task_id,
         workspace_cleanup_pending=outcome.workspace_cleanup_pending,
@@ -1217,7 +1302,9 @@ async def cancel_waiting_task_question(
     """Abandon the pending question on a ``waiting_for_user`` task.
 
     Reuses ``GET``'s ownership rule (another agent's task, another user's
-    agent, a missing id, or a non-SDK task all answer 404). The pending
+    agent, a missing id, or a non-SDK task all answer 404). It does not
+    re-check, for a personal key, that the holder can still see the
+    task's agent: ending a question starts no work with it. The pending
     interaction row is terminated rather than deleted, the paused run is
     finalized to ``completed``, and the same task then accepts
     ``POST /v1/chat/tasks/{id}/messages`` (fresh connector context, same
@@ -1261,7 +1348,9 @@ async def cancel_waiting_task_question(
     except TaskTurnError as exc:
         raise_for_turn_rejection(exc.reason)
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal, route="cancel_question", task_id=result.task_id, agent_id=None
+    )
     return CancelQuestionResponse(
         task_id=result.task_id,
         status=result.status,
@@ -1662,7 +1751,8 @@ async def stream_chat_task_events(
       - The stream force-closes with ``task.input_required`` if the task
         is found waiting on user input (same steps-then-close shape:
         ``task.status``, the task's steps, then ``task.input_required``);
-        with ``stream.error`` if the API key is revoked/paused, the task
+        with ``stream.error`` if the API key is revoked/paused (a personal
+        key: revoked or expired), the task
         row disappears (within one watchdog cycle, 30s in production, of
         the delete: ``task_expired`` when the retention policy expired
         it, ``task_deleted`` for any other removal), the client can't

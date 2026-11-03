@@ -26,6 +26,7 @@ from ..config import (
     get_sandbox_max_concurrency,
     get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_sandbox_worker_id,
@@ -1364,7 +1365,23 @@ class SandboxManager:
         cached_spec = self._config_cache.get(sandbox_name)
         if cached_spec is not None:
             self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
-            return self._cache[sandbox_name]
+            if not await self._resolve_backend_probe():
+                return self._cache[sandbox_name]
+            inspection = await self._service.inspect(sandbox_name)
+            if inspection is None:
+                # The daemon object was removed out of band. Drop the stale
+                # process-local handle and continue through normal recovery.
+                self._cache.pop(sandbox_name, None)
+                self._config_cache.pop(sandbox_name, None)
+            elif not inspection.runtime_policy_matches:
+                # Do not leave a poisoned cache entry behind. Falling
+                # through to reconciliation lets an idle sandbox converge
+                # immediately, while _reconcile_mismatch still rejects the
+                # destructive rebuild if an existing task is attached.
+                self._cache.pop(sandbox_name, None)
+                self._config_cache.pop(sandbox_name, None)
+            else:
+                return self._cache[sandbox_name]
 
         probe = await self._resolve_backend_probe()
         if not probe:
@@ -2097,23 +2114,53 @@ class SandboxManager:
         degrades to "no cached spec, allow".
 
         ``prepare_root`` is used while initially creating or reconciling the
-        sandbox. Cached providers do not repeat mount preparation.
+        sandbox. A matching cached provider does not repeat mount preparation;
+        recovery from a missing or drifted runtime may do so before rebuild.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
             async with self._activity_guard:
                 provider = self._lease_providers.get(base_name)
-                if provider is not None:
-                    self._ensure_config_equivalent(
-                        sandbox_name,
-                        self._config_cache.get(sandbox_name),
-                        self._build_runtime_spec(
-                            lifecycle_type, lifecycle_id, mount_intent=mount_intent
-                        ),
+
+            if provider is not None:
+                cached_spec = self._config_cache.get(sandbox_name)
+                self._ensure_config_equivalent(
+                    sandbox_name,
+                    cached_spec,
+                    self._build_runtime_spec(
+                        lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                    ),
+                )
+
+                # Re-enter the common cached-sandbox path on reconciliation
+                # backends so the hottest provider reuse path also
+                # re-inspects the live network attachment. Legacy backends
+                # have no inspection contract and keep their cache-only path.
+                # This intentionally does not depend on cached_spec being
+                # present: after an active mismatch rejects a rebuild the
+                # instance caches are empty, but every later acquire must
+                # continue to fail closed until the drift is repaired.
+                if await self._resolve_backend_probe():
+                    primary = await self._get_or_create_sandbox_locked(
+                        lifecycle_type,
+                        lifecycle_id,
+                        mount_intent=mount_intent,
+                        prepare_root=prepare_root,
                     )
+                    if primary is not provider.primary_sandbox:
+                        provider = await self._create_lease_provider_locked(
+                            lifecycle_type,
+                            lifecycle_id,
+                            mount_intent=mount_intent,
+                            prepare_root=prepare_root,
+                        )
+                        async with self._activity_guard:
+                            self._lease_providers[base_name] = provider
+
+                async with self._activity_guard:
                     self._touch_locked(base_name)
-                    return provider
+                return provider
 
             provider = await self._create_lease_provider_locked(
                 lifecycle_type,
@@ -2450,9 +2497,20 @@ class SandboxManager:
             template = SandboxTemplate(type="image", image=image)
             # Use empty config for warmup - no need for volumes/env
             warmup_config = SandboxConfig()
-            async with await self._service.get_or_create(
-                warmup_name, template=template, config=warmup_config
-            ):
+            try:
+                sandbox = await self._service.get_or_create(
+                    warmup_name, template=template, config=warmup_config
+                )
+            except SandboxRuntimeConflictError:
+                logger.warning(
+                    "Deleting stale sandbox warmup container after runtime "
+                    "policy mismatch"
+                )
+                await self._service.delete(warmup_name)
+                sandbox = await self._service.get_or_create(
+                    warmup_name, template=template, config=warmup_config
+                )
+            async with sandbox:
                 pass
             await self._service.delete(warmup_name)
             logger.info(f"Sandbox image warmup completed: {image}")
@@ -3075,6 +3133,13 @@ def _create_docker_service() -> Optional[SandboxService]:
             "(pip/systemd) must pick their own stable value (see "
             "docker/README.md 'Sandbox Runtime Overlays' and example.env)"
         )
+    network = get_sandbox_network()
+    if network is None:
+        raise RuntimeError(
+            "XAGENT_SANDBOX_NETWORK is required when the Docker sandbox "
+            "implementation is enabled; set it to the dedicated, firewalled "
+            "Docker network created for untrusted sandboxes"
+        )
     try:
         from ..sandbox import DockerSandboxService
     except ImportError as exc:
@@ -3087,11 +3152,17 @@ def _create_docker_service() -> Optional[SandboxService]:
     store = DBDockerStore(namespace=namespace if get_sandbox_worker_id() else None)
 
     try:
-        service = DockerSandboxService(store=store, namespace=namespace)
+        service = DockerSandboxService(
+            store=store, namespace=namespace, network=network
+        )
     except Exception as exc:
         raise RuntimeError("Failed to initialize the Docker sandbox runtime") from exc
 
-    logger.info("Created Docker sandbox service (namespace=%s)", namespace)
+    logger.info(
+        "Created Docker sandbox service (namespace=%s, network=%s)",
+        namespace,
+        network,
+    )
     try:
         running_legacy_count, inactive_legacy_count = service.count_legacy_containers()
     except Exception as exc:

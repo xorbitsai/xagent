@@ -225,6 +225,7 @@ def test_conversation_expiry_leaves_a_content_free_tombstone(sessions) -> None:
             "agent_id",
             "workforce_id",
             "source",
+            "sdk_credential_kind",
             "trigger_type",
             "is_visible",
             "is_channel_plumbing",

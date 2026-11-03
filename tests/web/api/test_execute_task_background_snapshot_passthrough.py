@@ -421,15 +421,16 @@ async def test_cancellation_during_finalization_broadcasts_committed_result(
             return_value={"success": True, "output": "ok", "status": "completed"}
         ),
     )
-    finalization_started = threading.Event()
+    finalization_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
     allow_finalization = threading.Event()
     broadcast = AsyncMock(
         side_effect=RuntimeError("client disconnected") if broadcast_fails else None
     )
 
     def blocking_finalize(**_kwargs: Any) -> Any:
-        finalization_started.set()
-        assert allow_finalization.wait(timeout=2)
+        loop.call_soon_threadsafe(finalization_started.set)
+        assert allow_finalization.wait(timeout=GUARD_TIMEOUT)
         return SimpleNamespace(
             normalized_outputs=[],
             ai_response="ok",
@@ -477,10 +478,7 @@ async def test_cancellation_during_finalization_broadcasts_committed_result(
                 resolved_execution_scope=None,
             )
         )
-        await asyncio.wait_for(
-            asyncio.to_thread(finalization_started.wait, 1),
-            timeout=1,
-        )
+        await asyncio.wait_for(finalization_started.wait(), timeout=GUARD_TIMEOUT)
         execution.cancel()
         await asyncio.sleep(0)
         assert not execution.done()
@@ -508,14 +506,15 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
             return_value={"success": True, "output": "ok", "status": "completed"}
         ),
     )
-    finalization_started = threading.Event()
+    finalization_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
     allow_finalization = threading.Event()
     broadcast_error = RuntimeError("client disconnected")
     broadcast = AsyncMock(side_effect=broadcast_error)
 
     def blocking_finalize(**_kwargs: Any) -> Any:
-        finalization_started.set()
-        assert allow_finalization.wait(timeout=2)
+        loop.call_soon_threadsafe(finalization_started.set)
+        assert allow_finalization.wait(timeout=GUARD_TIMEOUT)
         return SimpleNamespace(
             normalized_outputs=[],
             ai_response="ok",
@@ -569,10 +568,7 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
                 resolved_execution_scope=None,
             )
         )
-        await asyncio.wait_for(
-            asyncio.to_thread(finalization_started.wait, 1),
-            timeout=1,
-        )
+        await asyncio.wait_for(finalization_started.wait(), timeout=GUARD_TIMEOUT)
         execution.cancel()
         await asyncio.sleep(0)
         assert not execution.done()

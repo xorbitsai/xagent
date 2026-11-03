@@ -597,9 +597,10 @@ class ObservedRuntimeFacts:
     divided-and-clamped values a display-facing parser would produce; live
     ``docker update`` edits must remain observable here.
 
-    ``runtime_networks`` reflects network attachments at inspection time; it
-    is not part of any spec comparison because network attachment can change
-    at runtime independent of the sandbox's declared configuration.
+    ``runtime_networks`` reflects network attachments at inspection time. It
+    is not part of the user/runtime spec; a backend may evaluate it against an
+    operator-owned policy and report the result through
+    ``SandboxInspection.runtime_policy_matches``.
     """
 
     raw_status: str
@@ -639,6 +640,10 @@ class SandboxInspection:
     facts: ObservedRuntimeFacts
     fingerprint_label: Optional[str]
     version_label: Optional[str]
+    # Backend-owned policy that is intentionally outside the user/runtime
+    # spec (for Docker, the exact deployment-controlled network attachment).
+    # A false value is a hard mismatch even for an otherwise valid label.
+    runtime_policy_matches: bool = True
 
 
 def _require_absolute_mount_path(path: str, field: str) -> None:
@@ -777,9 +782,11 @@ def spec_matches_inspection(
       is enabled or bumped, which is not an acceptable outcome; the label is
       also immutable once written, so there is no backfill path that could
       turn a legacy container into a verified one.
-    - A matching fingerprint label is followed by a live re-check of the
-      fields Docker allows to drift after creation (cpus/memory/pids, compared
-      in their raw backend units) to catch e.g. ``docker update --cpus 0.5``.
+    - A backend runtime-policy failure is always ``MISMATCH``, including for
+      an otherwise-unverified legacy container. A matching fingerprint label
+      is then followed by a live re-check of the fields Docker allows to drift
+      after creation (cpus/memory/pids, compared in their raw backend units)
+      to catch e.g. ``docker update --cpus 0.5``.
       Disagreement there is ``MISMATCH`` even though the label matched.
     - A non-matching fingerprint label is always ``MISMATCH``.
     - ``env`` / ``volumes`` / ``ports`` / ``image`` are not independently
@@ -807,6 +814,8 @@ def spec_matches_inspection(
     fallback for a non-zero-reference-count sandbox is to reject new
     callers, not to tear down one already in use.
     """
+    if not inspection.runtime_policy_matches:
+        return SpecVerdict.MISMATCH
     if inspection.fingerprint_label is None or inspection.version_label is None:
         return SpecVerdict.UNVERIFIED
     try:

@@ -7,8 +7,8 @@ a caller who could see the live task can be told it expired instead of
 getting a bare not-found.
 
 It holds **no conversation content**. Each column is an input some surface's
-access predicate reads -- owner, agent, workforce, source, visibility, the MCP
-channel-plumbing marker -- so a surface can apply the same predicate to this
+access predicate reads -- owner, agent, workforce, source, SDK credential kind,
+visibility, the MCP channel-plumbing marker -- so a surface can apply the same predicate to this
 row that it applied to the live task, and disclose the expiry to exactly the
 callers who could have seen the task and to no one else. Anything that is not
 such an input does not belong here.
@@ -25,7 +25,7 @@ task that exists.
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .database import Base
@@ -42,8 +42,9 @@ class ExpiredTaskTombstone(Base):  # type: ignore
         nullable=False,
         index=True,
     )
-    #: v1 agent-key ownership. SET NULL mirrors what agent deletion does to
-    #: the live task (``stage_delete_agent`` nulls ``Task.agent_id``).
+    #: v1 agent-key ownership; the personal-key scope also requires it to be
+    #: set. SET NULL mirrors what agent deletion does to the live task
+    #: (``stage_delete_agent`` nulls ``Task.agent_id``).
     agent_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("agents.id", ondelete="SET NULL"),
@@ -62,6 +63,16 @@ class ExpiredTaskTombstone(Base):  # type: ignore
     #: ``Task.source``: v1 serves only ``sdk``; Conversation Logs selects on
     #: the external sources.
     source: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    #: ``Task.sdk_credential_kind``: NULL for a task no personal key created,
+    #: ``personal`` for one a personal key created; v1 key scopes read it.
+    sdk_credential_kind: Mapped[str | None] = mapped_column(
+        String(16),
+        CheckConstraint(
+            "sdk_credential_kind IS NULL OR sdk_credential_kind = 'personal'",
+            name="ck_expired_task_tombstones_sdk_credential_kind",
+        ),
+        nullable=True,
+    )
     #: ``AgentTrigger.type`` (raw value: webhook/scheduled/gmail -- not the
     #: derived UI source). Conversation Logs' detail and list predicates read
     #: it as ``coalesce(Task.agent_config["trigger_type"], <trigger type of

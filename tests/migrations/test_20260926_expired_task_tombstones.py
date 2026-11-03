@@ -1,6 +1,8 @@
 """The expired-task revision matches the models and is idempotent (#2565)."""
 
 import importlib
+from contextlib import nullcontext
+from unittest.mock import patch
 
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
@@ -13,6 +15,8 @@ from xagent.web.models.expired_task import ExpiredTaskTombstone
 engine = engine_fixture
 
 MIGRATION = "xagent.migrations.versions.20260926_expired_task_tombstones"
+#: Adds the one model column this revision predates.
+LATER_MIGRATION = "xagent.migrations.versions.20261031_task_sdk_credential_kind"
 
 
 def _drop_revision_objects(connection, migration) -> None:
@@ -29,12 +33,16 @@ def test_upgrade_matches_the_models_and_is_idempotent(engine):
     Base.metadata.create_all(engine)
     with (
         engine.begin() as connection,
-        Operations.context(MigrationContext.configure(connection)),
+        Operations.context(context := MigrationContext.configure(connection)),
     ):
         _drop_revision_objects(connection, migration)
 
         migration.upgrade()
         migration.upgrade()
+        # This test owns the transaction, and ``autocommit_block`` asserts the
+        # migration context does, as only holds when Alembic drives the run.
+        with patch.object(context, "autocommit_block", nullcontext):
+            importlib.import_module(LATER_MIGRATION).upgrade()
 
         inspector = sa.inspect(connection)
         for table, column in migration.ADDED_COLUMNS:

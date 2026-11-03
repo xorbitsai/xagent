@@ -150,6 +150,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from datetime import datetime, timezone
 from time import monotonic
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, cast
 
@@ -159,6 +160,8 @@ from fastapi.responses import StreamingResponse
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_session_local
 from ...models.task import TaskStatus
+from ...models.user import User
+from ...models.user_api_key import UserApiKey
 from ...schemas.v1 import PublicStep
 from ...services.db_runtime import run_db_io_cancellation_safe
 from ...services.public_trace_events import (
@@ -170,7 +173,12 @@ from ...services.task_event_trace_handler import serialize_trace_data
 from ...services.task_execution_controller import TaskControlState
 from ..websocket import _is_versioned_task_event, manager
 from ._step_mapping import PublicStepProjector
-from .deps import ApiKeyPrincipal, active_runtime_key_filters
+from .deps import (
+    ApiKeyPrincipal,
+    PersonalApiKeySnapshot,
+    active_runtime_key_filters,
+    personal_key_usable,
+)
 from .errors import V1ApiError, V1ErrorCode
 
 if TYPE_CHECKING:
@@ -988,11 +996,13 @@ class V1EventStreamSink:
     """One SSE consumer's broadcast-frame filter and outbound queue.
 
     Bound to exactly one ``task_id`` and one ``principal`` for the life
-    of the connection. The principal is used only for quota accounting
-    and the watchdog's key-validity check -- it is **not** an
-    authorization gate for who may act on the task; that check already
-    happened once, at attach time, via ``get_principal_from_api_key`` +
-    ``_resolve_task_or_404``.
+    of the connection. ``principal_key_prefix`` is the principal's
+    ``stream_principal_id`` -- the bare prefix for a runtime key,
+    ``personal:<prefix>`` for a personal key -- and is used only for slot
+    accounting; the watchdog checks the key through the principal itself.
+    Neither is an authorization gate for who may act on the task; that
+    check already happened once, at attach time, via
+    ``get_principal_from_api_key`` + ``_resolve_task_or_404``.
     """
 
     # This sink only consumes the broadcast fan-out; it must never be
@@ -1335,6 +1345,9 @@ class V1EventStreamSink:
 
 
 # -- Per-principal concurrency accounting --------------------------------
+# Counted per ``ApiKeyPrincipal.stream_principal_id``: a runtime key under its
+# bare prefix, a personal key under ``personal:<prefix>``, so the two kinds
+# never share slots even when their prefixes are equal.
 
 _principal_stream_counts: dict[str, int] = {}
 
@@ -1384,10 +1397,11 @@ def count_task_sinks(task_id: int) -> int:
 
 
 def _is_runtime_key_active(key_prefix: str) -> bool:
-    """One indexed lookup without secret verification.
+    """One indexed lookup without secret verification, for a runtime key.
 
     The handshake already verified the secret; this only re-checks
-    revoked/paused state.
+    revoked/paused state. A personal key is checked by
+    :func:`_is_personal_key_active` instead.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -1397,6 +1411,33 @@ def _is_runtime_key_active(key_prefix: str) -> bool:
             .first()
             is not None
         )
+
+
+def _is_personal_key_active(key_prefix: str) -> bool:
+    """One indexed lookup without secret verification, for a personal key.
+
+    Usable means the key row and its holder's user row still exist and
+    ``personal_key_usable`` holds (not revoked, not expired). The
+    application principal policy is not re-run: an open stream only
+    carries the holder's own task, and the next request re-authenticates.
+    """
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        row = (
+            db.query(UserApiKey.revoked_at, UserApiKey.expires_at)
+            .join(User, User.id == UserApiKey.user_id)
+            .filter(UserApiKey.key_prefix == key_prefix)
+            .first()
+        )
+    return row is not None and personal_key_usable(
+        row.revoked_at, row.expires_at, datetime.now(timezone.utc)
+    )
+
+
+def _is_principal_key_active(principal: ApiKeyPrincipal) -> bool:
+    if isinstance(principal.key, PersonalApiKeySnapshot):
+        return _is_personal_key_active(principal.key.key_prefix)
+    return _is_runtime_key_active(principal.key.key_prefix)
 
 
 async def watchdog_check_once(
@@ -1415,7 +1456,7 @@ async def watchdog_check_once(
     database.
     """
     key_active = await run_db_io_cancellation_safe(
-        lambda: _is_runtime_key_active(sink.principal_key_prefix)
+        lambda: _is_principal_key_active(principal)
     )
     if not key_active:
         return sink.enqueue_close(error_frame("unauthorized"))
@@ -2170,6 +2211,10 @@ async def _generate(
     ``build_event_stream_response`` (read-only, no mutation) -- so a
     rejected attach still fails before any stream bytes are sent; only
     the actual counter mutation and registration move here.
+
+    ``key_prefix`` is the principal's ``stream_principal_id``, the key the
+    per-principal slot is counted under: the bare prefix for a runtime
+    key, ``personal:<prefix>`` for a personal key.
     """
     deadline = monotonic() + stream_max_duration_seconds
     sink = V1EventStreamSink(
@@ -2349,7 +2394,7 @@ async def build_event_stream_response(
     if count_task_sinks(task_id) >= PER_TASK_STREAM_CAP:
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
 
-    key_prefix = principal.key.key_prefix
+    key_prefix = principal.stream_principal_id
     if not principal_slot_available(key_prefix):
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)
 

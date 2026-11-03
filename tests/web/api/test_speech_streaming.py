@@ -81,6 +81,9 @@ class FakeASR:
     model_name = "scribe_v2_realtime"
     provider_name = "elevenlabs"
 
+    async def get_streaming_capabilities(self):
+        return {"streaming": self.supports_streaming}
+
     def __init__(self):
         self.sessions = []
         self.opening = threading.Event()
@@ -108,6 +111,9 @@ class FakeTTS:
     model_id = "voice"
     model_name = "eleven_flash_v2_5"
     provider_name = "elevenlabs"
+
+    async def get_streaming_capabilities(self):
+        return {"streaming": self.supports_streaming}
 
     def __init__(self):
         self.calls = []
@@ -1136,3 +1142,116 @@ def test_asr_refused_by_the_gate_reports_the_code_and_closes_with_1008(
     assert not api.asr.sessions
     assert api.asr.close_count == 1
     assert not api.usage
+
+
+def test_speech_capabilities_require_model_access_and_close_provider(api):
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == {"streaming": True}
+    assert api.tts.close_count == 1
+    other = build_access_token(sub="other", user_id=2)
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers={"Authorization": f"Bearer {other}"},
+    )
+    assert result.status_code == 404
+    assert api.tts_factory.call_count == 1
+
+
+@pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+def test_speech_capabilities_for_each_role_close_provider(api, ability, model_id):
+    result = api.client.get(
+        f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == {"streaming": True}
+    assert getattr(api, ability).close_count == 1
+
+
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (RuntimeError("synthetic-provider-secret"), 502),
+        (TimeoutError("synthetic-provider-secret"), 504),
+    ],
+)
+def test_tts_capability_probe_failures_are_gateway_errors(api, caplog, error, status):
+    api.tts.get_streaming_capabilities = AsyncMock(side_effect=error)
+    response = api.client.post(
+        TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}
+    )
+    assert response.status_code == status
+    assert "synthetic-provider-secret" not in response.text + caplog.text
+    assert "Speech stream failed" in caplog.text
+    assert api.tts.close_count == 1 and not api.tts.calls
+
+
+def test_asr_capability_probe_failure_closes_and_redacts(api, caplog):
+    api.asr.get_streaming_capabilities = AsyncMock(
+        side_effect=RuntimeError("synthetic-provider-secret")
+    )
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        result = ws.receive_json()
+        assert result["type"] == "error" and result["code"] == "stream_failed"
+    assert "synthetic-provider-secret" not in json.dumps(result) + caplog.text
+    assert api.asr.close_count == 1 and not api.asr.sessions
+
+
+def test_capability_endpoint_only_returns_browser_contract(api):
+    expected = {
+        "streaming": True,
+        "server_vad": True,
+        "formats": ["pcm"],
+        "sample_rates": [24000],
+        "voices": [{"voice_id": "voice", "name": "Voice"}],
+    }
+    api.tts.get_streaming_capabilities = AsyncMock(
+        return_value={**expected, "internal_config": {"private": "provider-detail"}}
+    )
+    result = api.client.get(
+        "/api/models/speech/capabilities?model_id=voice&ability=tts",
+        headers=api.headers,
+    )
+    assert result.status_code == 200 and result.json() == expected
+
+
+@pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+@pytest.mark.parametrize(
+    "error,status",
+    [
+        (RuntimeError("synthetic-provider-secret"), 502),
+        (TimeoutError("synthetic-provider-secret"), 504),
+    ],
+)
+def test_capability_endpoint_maps_and_logs_upstream_failure(
+    api, caplog, ability, model_id, error, status
+):
+    provider = getattr(api, ability)
+    provider.get_streaming_capabilities = AsyncMock(side_effect=error)
+    response = api.client.get(
+        f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
+        headers=api.headers,
+    )
+    assert response.status_code == status
+    assert "synthetic-provider-secret" not in response.text + caplog.text
+    assert "Speech stream failed" in caplog.text
+    assert provider.close_count == 1
+
+
+@pytest.mark.parametrize("ability,model_id", [("asr", "live"), ("tts", "voice")])
+def test_capability_endpoint_rejects_invalid_model_configuration(
+    api, caplog, ability, model_id
+):
+    getattr(api, ability + "_factory").side_effect = ValueError(
+        "synthetic-provider-secret"
+    )
+    response = api.client.get(
+        f"/api/models/speech/capabilities?model_id={model_id}&ability={ability}",
+        headers=api.headers,
+    )
+    assert response.status_code == 400
+    assert "synthetic-provider-secret" not in response.text + caplog.text
+    assert "Speech stream failed" in caplog.text

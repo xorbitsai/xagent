@@ -36,6 +36,7 @@ export class VoiceAudio {
     asr: string
     tts: string
     voice?: string
+    vadSilenceThreshold?: number
     token: string
     sessionId: string | null
     activity: (active: boolean) => void
@@ -75,7 +76,7 @@ export class VoiceAudio {
       this.readyTimeout = setTimeout(() => this.fail("connection_failed"), 30000)
       socket.onopen = () => socket.send(JSON.stringify({
         type: "start", model_id: this.options.asr, format: "pcm", sample_rate: 16000,
-        vad: true, vad_silence_threshold_secs: 0.5,
+        vad: true, vad_silence_threshold_secs: this.options.vadSilenceThreshold,
       }))
       socket.onmessage = ({ data }) => {
         if (this.closed) return

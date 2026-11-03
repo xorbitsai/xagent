@@ -49,6 +49,7 @@ async def test_sdk_create_and_append_return_durable_acceptance(ingress):
         file_ids=(),
         connector_runtime_context=(),
         timezone="Asia/Taipei",
+        credential_kind="runtime",
     )
     with get_session_local()() as db:
         task = db.get(Task, first.task_id)
@@ -315,6 +316,7 @@ async def test_sdk_append_records_current_actor_after_owner_transfer(
         timezone=None,
         file_ids=(),
         connector_runtime_context=(),
+        credential_kind="runtime",
     )
     with get_session_local()() as db:
         actor = User(username="new-owner", password_hash="unused")

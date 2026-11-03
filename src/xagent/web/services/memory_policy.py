@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 MEMORY_POLICY_RESOLVER_FAILURE_REASON = "resolver_failed"
 MEMORY_POLICY_BINDING_FAILURE_REASON = "binding_failed"
+MEMORY_BINDING_RESOLUTION_FAILURE_REASON = "binding_resolution_failed"
 MEMORY_POLICY_TASK_MISSING_REASON = "task_missing"
 MEMORY_POLICY_TASK_LOOKUP_FAILURE_REASON = "task_lookup_failed"
 
@@ -109,6 +110,8 @@ def memory_retrieval_scope_fingerprint(
     access_scope: MemoryAccessScope | None,
     ambient_owner_user_id: int | None,
     ambient_execution_scope: ExecutionScope | None,
+    backend_identity: str | None = None,
+    route_generation: str | None = None,
 ) -> str | None:
     """Return a cache identity for the current trusted memory namespace.
 
@@ -121,6 +124,18 @@ def memory_retrieval_scope_fingerprint(
 
     if not enabled:
         return None
+    if (backend_identity is None) != (route_generation is None):
+        raise ValueError(
+            "backend_identity and route_generation must be supplied together"
+        )
+    if backend_identity is not None and (
+        not isinstance(backend_identity, str) or not backend_identity.strip()
+    ):
+        raise TypeError("backend_identity must be a non-empty string or None")
+    if route_generation is not None and (
+        not isinstance(route_generation, str) or not route_generation.strip()
+    ):
+        raise TypeError("route_generation must be a non-empty string or None")
     owner_user_id: int | None
     if access_scope is not None:
         owner_user_id = access_scope.owner_user_id
@@ -148,5 +163,11 @@ def memory_retrieval_scope_fingerprint(
         "memory_dimensions": sorted(dimensions.items()),
         "strict_memory_isolation": strict,
     }
+    # Preserve the exact legacy digest when no trusted backend binding is in
+    # use. Registered hosts add opaque routing fences without exposing either
+    # value in execution metadata.
+    if backend_identity is not None:
+        payload["backend_identity"] = backend_identity
+        payload["route_generation"] = route_generation
     serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()

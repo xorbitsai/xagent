@@ -111,6 +111,7 @@ export function VoiceConversation({ taskId, messages, busy, waiting, disabled, o
     setPhase("connecting")
     const call = new VoiceAudio({
       asr: asrId, tts: ttsId, voice: saved.preferences.voice || undefined, token: auth.token, sessionId: auth.session?.sessionId ?? null,
+      vadSilenceThreshold: liveAsr.find(model => model.model_id === asrId)?.model_provider?.trim().toLowerCase() === "elevenlabs" ? 0.5 : undefined,
       activity: speaking => { if (current()) turns.current?.activity(speaking) },
       transcript: (type, text, id) => { if (current()) turns.current?.transcript(type, text, id) },
       error: reason => { if (current()) fail(reason) },

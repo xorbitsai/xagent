@@ -22,9 +22,9 @@ from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ...services.llm_utils import AutoModelUnavailableError
-from .deps import ApiKeyPrincipal, record_key_usage
+from .deps import ApiKeyPrincipal, record_principal_usage
 from .errors import V1ApiError, V1ErrorCode
-from .tasks import _resolve_task_or_404, _validate_owner_scope
+from .tasks import _ensure_agent_reachable, _resolve_task_or_404, _validate_owner_scope
 
 
 def _prepare_reply_context_sync(
@@ -45,7 +45,9 @@ def _prepare_reply_context_sync(
             principal,
             request_agent_id=request.agent_id,
             request_workforce_id=request.workforce_id,
+            task_agent_id=int(task.agent_id),
         )
+        _ensure_agent_reachable(principal, task, db)
         if request.message.files:
             raise V1ApiError(
                 V1ErrorCode.INVALID_INPUT,
@@ -91,9 +93,11 @@ async def reply_to_task(
 
     Raises:
         V1ApiError 401: missing / invalid / revoked key.
-        V1ApiError 404: task not found, not owned by the key, or
+        V1ApiError 404: task not found, not owned by the key,
             body.agent_id / body.workforce_id doesn't match the bound
-            owner.
+            owner, or a personal key's holder can no longer see the
+            task's agent (checked in the same read that authorizes the
+            task; the resume claim then runs in its own transaction).
         V1ApiError 410: ``task_expired`` -- the retention policy expired
             a task this key could have seen.
         V1ApiError 422: body.message.files is non-empty, or
@@ -170,7 +174,9 @@ async def reply_to_task(
     except AutoModelUnavailableError as exc:
         raise V1ApiError(V1ErrorCode.AUTO_MODEL_UNAVAILABLE, 409) from exc
 
-    await record_key_usage(str(principal.key.key_prefix))
+    await record_principal_usage(
+        principal, route="reply", task_id=ctx.task_id, agent_id=ctx.agent_id
+    )
 
     return ReplyResponse(
         command_id=result.command_id,

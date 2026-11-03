@@ -1253,6 +1253,7 @@ async def list_speech_voices(
         ) from None
     try:
         release_db_connection_if_clean(db)
+        await model.get_streaming_capabilities()
         if not model.supports_voice_listing:
             raise HTTPException(
                 status_code=400, detail="Voice listing is not supported"
@@ -2186,6 +2187,7 @@ async def update_model(
     ]
     if routing_candidates and "abilities" in update_data:
         from ..services.auto_model_service import (
+            UnknownAutoProfileError,
             load_router_profile_catalog,
             validate_candidate_modalities,
         )
@@ -2193,11 +2195,17 @@ async def update_model(
         try:
             catalog = load_router_profile_catalog()
             for candidate in routing_candidates:
-                validate_candidate_modalities(
-                    catalog,
-                    str(candidate.routing_model_id),
-                    update_data["abilities"] or [],
-                )
+                try:
+                    validate_candidate_modalities(
+                        catalog,
+                        str(candidate.routing_model_id),
+                        update_data["abilities"] or [],
+                    )
+                except UnknownAutoProfileError:
+                    # Routing skips a binding whose profile is not in the
+                    # installed catalog, so that binding does not constrain
+                    # this edit. A known profile still has to match.
+                    continue
         except AutoModelConfigurationError as exc:
             raise HTTPException(409, detail=str(exc)) from exc
         except AutoModelDependencyError as exc:

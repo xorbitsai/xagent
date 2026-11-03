@@ -336,12 +336,19 @@ async def test_stream_reader_does_not_accumulate_audio():
     assert closed.is_set()
 
 
-def test_only_implemented_adapters_advertise_streaming(provider):
+async def test_streaming_requires_provider_capability(provider, monkeypatch):
     assert provider.model.supports_streaming
     local = XinferenceTTS()
+    capabilities = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        "xagent.core.model.tts.xinference.fetch_audio_capabilities", capabilities
+    )
     assert not local.supports_streaming
-    with pytest.raises(NotImplementedError):
-        local.synthesize_stream("Hello")
+    with pytest.raises(ValueError, match="does not support streaming speech"):
+        await anext(local.synthesize_stream("Hello"))
+    capabilities.assert_awaited_once_with(local)
+    assert not local.supports_streaming
+    await local.aclose()
 
 
 async def test_real_sdk_stream_yields_before_response_completion(monkeypatch, provider):

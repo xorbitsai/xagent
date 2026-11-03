@@ -272,7 +272,7 @@ async def stream_asr(
             raise HTTPException(
                 status_code=400, detail="Invalid ASR model configuration"
             ) from None
-        if not model.supports_streaming:
+        if not (await model.get_streaming_capabilities()).get("streaming"):
             raise HTTPException(
                 status_code=400, detail="Selected ASR model does not support live audio"
             )
@@ -445,12 +445,64 @@ async def stream_tts(
     try:
         model = get_tts_model_instance(config)
     except ValueError as exc:
+        _log_provider_error(config, exc)
         raise HTTPException(
             status_code=400, detail="Invalid TTS model configuration"
         ) from exc
-    if not model.supports_streaming:
+    try:
+        capabilities = await model.get_streaming_capabilities()
+    except BaseException as exc:
+        await _close_model(model)
+        if isinstance(exc, Exception):
+            _log_provider_error(model, exc)
+            raise HTTPException(
+                status_code=504 if isinstance(exc, TimeoutError) else 502,
+                detail="Speech capabilities unavailable",
+            ) from None
+        raise
+    if not capabilities.get("streaming"):
         await _close_model(model)
         raise HTTPException(
             status_code=400, detail="Selected TTS model does not support streaming"
         )
     return _TTSAudioResponse(model, user_id, request)
+
+
+@speech_router.get("/capabilities")
+async def speech_capabilities(
+    model_id: str = Query(min_length=1, max_length=512),
+    ability: Literal["asr", "tts"] = Query(),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    user_id = int(user.id)
+    release_db_connection_if_clean(db)
+    config = await run_db_io_cancellation_safe(
+        lambda: _load_speech_config(user_id, model_id, ability)
+    )
+    try:
+        model = (
+            get_asr_model_instance(config)
+            if ability == "asr"
+            else get_tts_model_instance(config)
+        )
+    except ValueError as exc:
+        _log_provider_error(config, exc)
+        raise HTTPException(
+            status_code=400, detail="Invalid speech model configuration"
+        ) from None
+    try:
+        capabilities = await model.get_streaming_capabilities()
+        return {
+            key: capabilities[key]
+            for key in ("streaming", "server_vad", "formats", "sample_rates", "voices")
+            if key in capabilities
+        }
+    except Exception as exc:
+        _log_provider_error(model, exc)
+        raise HTTPException(
+            status_code=504 if isinstance(exc, TimeoutError) else 502,
+            detail="Speech capabilities unavailable",
+        ) from None
+    finally:
+        await _close_model(model)

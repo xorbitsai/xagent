@@ -22,12 +22,15 @@ from xagent.web.services.agent_service_manager import (
 )
 from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
+    TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY,
     RuntimeUserFields,
     TaskModelOverride,
     TaskModelOverrideError,
     TaskSetupSnapshot,
     _TaskFields,
     apply_task_model_override,
+    mcp_excluded_by_task_model_override,
+    task_model_override_excluded_tool_categories,
 )
 
 
@@ -148,6 +151,94 @@ class TestApply:
             "basic",
         ]
 
+    def test_explicit_exclusions_are_recorded_for_downstream_guards(self):
+        applied = apply_task_model_override(
+            _snapshot(["web_search", "mcp", "basic"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert applied.agent_config["tool_categories"] == ["web_search", "basic"]
+        assert applied.agent_config[
+            TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY
+        ] == ["mcp"]
+        assert mcp_excluded_by_task_model_override(applied.agent_config)
+
+    def test_an_exclusion_the_selection_never_listed_is_still_recorded(self):
+        # An old agent created before it had an "mcp" category still honours
+        # the run's explicit exclusion: the actor-marked MCP add-back must not
+        # re-introduce it just because its persisted list never held it.
+        applied = apply_task_model_override(
+            _snapshot(["web_search", "basic"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert applied.agent_config["tool_categories"] == ["web_search", "basic"]
+        assert applied.agent_config[
+            TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY
+        ] == ["mcp"]
+        assert mcp_excluded_by_task_model_override(applied.agent_config)
+
+    def test_the_record_is_idempotent_and_only_ever_grows(self):
+        excluded = frozenset({"mcp"})
+        first = apply_task_model_override(
+            _snapshot(["mcp", "basic"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"), excluded_tool_categories=excluded
+            ),
+        )
+        same = apply_task_model_override(
+            first,
+            TaskModelOverride(
+                llm=NamedLLM("selected"), excluded_tool_categories=excluded
+            ),
+        )
+        assert same.agent_config[TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY] == [
+            "mcp"
+        ]
+        # A later override cannot un-exclude an earlier one: the marker is a
+        # monotone subtraction, never a re-grant.
+        wider = apply_task_model_override(
+            same,
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"web_search"}),
+            ),
+        )
+        assert set(
+            wider.agent_config[TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY]
+        ) == {"mcp", "web_search"}
+        assert mcp_excluded_by_task_model_override(wider.agent_config)
+
+    def test_the_vision_removal_is_not_part_of_the_record(self):
+        # The vision category has its own stand-in mechanism; only the
+        # caller's explicit exclusions feed the downstream MCP guard.
+        applied = apply_task_model_override(
+            _snapshot(["basic", "vision", "mcp"]),
+            TaskModelOverride(
+                llm=NamedLLM("selected"),
+                excluded_tool_categories=frozenset({"mcp"}),
+            ),
+        )
+        assert applied.agent_config["tool_categories"] == ["basic"]
+        assert applied.agent_config[
+            TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY
+        ] == ["mcp"]
+
+    def test_without_explicit_exclusions_no_record_is_written(self):
+        selected = NamedLLM("selected", ["chat", "vision"])
+        applied = apply_task_model_override(
+            _snapshot(["basic"]),
+            TaskModelOverride(llm=selected, vision_llm=selected),
+        )
+        assert (
+            TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY not in applied.agent_config
+        )
+        assert not mcp_excluded_by_task_model_override(applied.agent_config)
+
     def test_a_missing_vision_model_takes_vision_tools_out_of_the_selection(self):
         applied = apply_task_model_override(
             _snapshot(["basic", "vision", "image"]),
@@ -218,6 +309,37 @@ class TestExcludedCategories:
     def test_names_must_be_strings(self):
         with pytest.raises(TypeError):
             TaskModelOverride(llm=NamedLLM("selected"), excluded_tool_categories={1})  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        "agent_config",
+        [
+            None,
+            {},
+            {"tool_categories": ["mcp"]},
+            {TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: "mcp"},
+            {TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: {"mcp": True}},
+            {TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: 1},
+            {TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: None},
+        ],
+    )
+    def test_a_missing_or_malformed_record_means_no_exclusion(self, agent_config):
+        # Fail towards the ordinary behaviour: only a well-formed record may
+        # suppress the MCP re-add.
+        assert task_model_override_excluded_tool_categories(agent_config) == frozenset()
+        assert mcp_excluded_by_task_model_override(agent_config) is False
+
+    def test_the_record_reads_string_category_names_only(self):
+        record = {TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: ["mcp", 1, None]}
+        assert task_model_override_excluded_tool_categories(record) == frozenset(
+            {"mcp"}
+        )
+        assert mcp_excluded_by_task_model_override(record) is True
+        assert (
+            mcp_excluded_by_task_model_override(
+                {TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: ("mcp",)}
+            )
+            is True
+        )
 
 
 def test_the_stand_in_is_not_reported_as_a_configured_vision_model() -> None:

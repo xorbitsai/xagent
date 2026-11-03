@@ -168,6 +168,7 @@ from .task_setup_snapshot import (
     detach_runtime_user_fields,
     load_memory_policy_task_fields_sync,
     load_task_setup_snapshot_sync,
+    mcp_excluded_by_task_model_override,
 )
 from .task_workspace_cleanup import (
     WorkspaceCleanupTarget,
@@ -688,7 +689,12 @@ def _build_tool_selection_spec_for_task(
         ),
         extras_only_when_unconfigured=workforce_runtime is not None,
     )
-    if include_mcp_tools:
+    if include_mcp_tools and not mcp_excluded_by_task_model_override(agent_config):
+        # An explicit "mcp" exclusion from the task model override wins over
+        # the actor-marked add-back: the caller asked this run to have no MCP
+        # tools, and ``tool_categories`` alone cannot express that (an old
+        # agent may never have listed ``mcp``). This only removes tools; a
+        # task without the marker keeps the legacy add-back unchanged.
         spec = with_mcp_tools(spec)
     if omit_published_agent_tools:
         spec = without_published_agent_tools(spec)
@@ -2305,7 +2311,11 @@ class AgentServiceManager:
             connector_runtime_turn_id=connector_runtime_turn_id,
             mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
             mcp_actor_execution_identity=mcp_actor_execution_identity,
-            force_mcp_tools=actor_execution,
+            # Same guard as the selection-spec add-back above: a task model
+            # override that explicitly excluded "mcp" must not force MCP
+            # server config loading either. Only removes tools.
+            force_mcp_tools=actor_execution
+            and not mcp_excluded_by_task_model_override(agent_config),
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
             mcp_load_summary_tracer=parent_tracer,
             mcp_load_summary_trace_task_id=str(task_id),
@@ -3134,7 +3144,13 @@ class AgentServiceManager:
                     connector_runtime_turn_id=connector_runtime_turn_id,
                     mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                     mcp_actor_execution_identity=mcp_actor_execution_identity,
-                    force_mcp_tools=actor_marked,
+                    # Same guard as the selection-spec add-back above: a task
+                    # model override that explicitly excluded "mcp" must not
+                    # force MCP server config loading either. Only removes
+                    # tools; without the marker actor-marked behaviour is
+                    # unchanged.
+                    force_mcp_tools=actor_marked
+                    and not mcp_excluded_by_task_model_override(agent_config),
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(
                         task.source if task is not None else None
                     ),

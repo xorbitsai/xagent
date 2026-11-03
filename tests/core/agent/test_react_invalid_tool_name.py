@@ -255,6 +255,40 @@ def test_replayed_spelling_of_a_real_tool_is_named_first() -> None:
     )
 
 
+def test_suggestions_are_capped_at_three() -> None:
+    tools = [
+        RecordingTool(name)
+        for name in (
+            "create_report_",
+            "create_report",
+            "create_reports",
+            "create_reporta",
+        )
+    ]
+
+    error = ReActPattern()._tool_not_found_message(
+        "create_report!", tools, ExecutionContext()
+    )
+
+    assert error == (
+        "Tool not found: 'create_report!'. "
+        "Did you mean: create_report_, create_report, create_reports?"
+    )
+
+
+def test_rewritten_name_is_suggested_only_when_offered() -> None:
+    tools = [RecordingTool("read_tool_result"), RecordingTool("calculator")]
+
+    error = ReActPattern()._tool_not_found_message(
+        "read tool result", tools, ExecutionContext()
+    )
+
+    assert error == (
+        "Tool not found: 'read tool result'. "
+        "Available tools: calculator, final_answer, send_message, ask_user_question."
+    )
+
+
 def _context_with_stored_result() -> ExecutionContext:
     from xagent.core.agent.context.components import SpillRegistryComponent
 

@@ -4258,7 +4258,7 @@ class ReActPattern(AgentPattern):
             for tool in tools
             if (name := self._tool_name(tool)) not in control_tool_names
             # Unconditional: this function only sees the static tool list
-            # (it runs once per run, before the iteration loop even starts),
+            # (the loop builds it once, before the first iteration),
             # so it cannot know whether the run has stored anything yet.
             # _tool_schemas_with_spill_read adds the reader back once the
             # registry is non-empty -- a dynamic fact this function has no
@@ -4333,9 +4333,9 @@ class ReActPattern(AgentPattern):
 
         base_schemas is built once per run, before the iteration loop, so it
         cannot know about a registry that fills up mid-run. This runs on
-        every iteration instead, which is the only place that sees the
-        spill that just happened. spill_read_schema is None when the run
-        has no reader to offer (tool_choice "none", or no reader tool), and
+        every iteration instead, and when a tool-not-found hint is built, so
+        both see the spill that just happened. spill_read_schema is None when
+        the run has no reader to offer (tool_choice "none", or no reader tool), and
         base_schemas then comes back unchanged whatever the registry holds.
         """
         if spill_read_schema is None or not self._spilled_paths(context):

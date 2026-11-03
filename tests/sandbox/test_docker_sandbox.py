@@ -36,11 +36,50 @@ from xagent.sandbox.docker_sandbox import (
     DockerSandboxService,
     MemDockerStore,
     _parse_container_config,
+    _sandbox_archive_info,
     _SandboxControl,
     _write_tar_from_content,
     _write_tar_from_local_path,
     is_docker_available,
 )
+
+
+def _raw_tar_records(archive: io.BytesIO) -> list[tuple[bytes, bytes, bytes]]:
+    """Return ``(type, name, payload)`` without asking tarfile to interpret PAX."""
+    raw = archive.getvalue()
+    records: list[tuple[bytes, bytes, bytes]] = []
+    offset = 0
+    while raw[offset : offset + tarfile.BLOCKSIZE] != b"\x00" * tarfile.BLOCKSIZE:
+        header = raw[offset : offset + tarfile.BLOCKSIZE]
+        assert len(header) == tarfile.BLOCKSIZE
+        size = int(header[124:136].rstrip(b"\x00 ") or b"0", 8)
+        payload_start = offset + tarfile.BLOCKSIZE
+        payload = raw[payload_start : payload_start + size]
+        records.append((header[156:157], header[:100].rstrip(b"\x00"), payload))
+        offset = (
+            payload_start
+            + ((size + tarfile.BLOCKSIZE - 1) // tarfile.BLOCKSIZE) * tarfile.BLOCKSIZE
+        )
+    assert raw[offset:] == b"\x00" * (len(raw) - offset)
+    return records
+
+
+def _parse_pax_records(payload: bytes) -> dict[str, str]:
+    records: dict[str, str] = {}
+    while payload:
+        length_text, separator, _ = payload.partition(b" ")
+        assert separator == b" "
+        length = int(length_text)
+        record, payload = payload[:length], payload[length:]
+        assert len(record) == length and record.endswith(b"\n")
+        key, value = record[len(length_text) + 1 : -1].decode("utf-8").split("=", 1)
+        assert key not in records
+        records[key] = value
+    return records
+
+
+def _tar_octal(raw: bytes) -> int:
+    return int(raw.rstrip(b"\x00 ") or b"0", 8)
 
 
 def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
@@ -53,6 +92,60 @@ def test_write_tar_content_uses_unprivileged_owner_and_private_mode() -> None:
         assert info.uid == 1100
         assert info.gid == 1010
         assert info.mode == 0o600
+        assert info.isreg()
+        assert info.pax_headers == {"Xagent.archive.version": "1"}
+
+
+@pytest.mark.parametrize(
+    ("arcname", "expected_path"),
+    [
+        ("id_key", None),
+        ("文件.txt", "文件.txt"),
+        ("a" * 101, "a" * 101),
+        ("a" * 255, "a" * 255),
+        ("é" * 127 + "a", "é" * 127 + "a"),
+    ],
+)
+def test_write_tar_content_has_one_versioned_wire_shape(
+    arcname: str, expected_path: str | None
+) -> None:
+    archive = io.BytesIO()
+
+    _write_tar_from_content("x", arcname, archive)
+
+    extension, member = _raw_tar_records(archive)
+    extension_header = archive.getvalue()[: tarfile.BLOCKSIZE]
+    assert extension[0] == b"x"
+    assert extension[1] == b"././@PaxHeader"
+    assert _tar_octal(extension_header[100:108]) == 0
+    assert _tar_octal(extension_header[108:116]) == 0
+    assert _tar_octal(extension_header[116:124]) == 0
+    assert _tar_octal(extension_header[136:148]) == 0
+    assert member[0] == tarfile.REGTYPE
+    assert member[2] == b"x"
+    expected_pax = {"Xagent.archive.version": "1"}
+    if expected_path is not None:
+        expected_pax["path"] = expected_path
+    assert _parse_pax_records(extension[2]) == expected_pax
+
+
+@pytest.mark.parametrize(
+    "arcname",
+    [
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "nested/file",
+        "nul\x00name",
+        "a" * 256,
+        "é" * 128,
+        "\ud800",
+    ],
+)
+def test_write_tar_content_rejects_names_outside_wire_contract(arcname: str) -> None:
+    with pytest.raises(ValueError, match="valid UTF-8|single valid file name"):
+        _write_tar_from_content("x", arcname, io.BytesIO())
 
 
 @pytest.mark.parametrize("source_mode", [0o400, 0o644, 0o755])
@@ -71,10 +164,20 @@ def test_write_tar_local_path_normalizes_owner_and_preserves_mode(
         assert info.uid == 1100
         assert info.gid == 1010
         assert info.mode == source_mode
-        assert info.mtime == int(source.stat().st_mtime)
+        assert info.mtime == 0
+        assert info.pax_headers == {"Xagent.archive.version": "1"}
         extracted = tar.extractfile(info)
         assert extracted is not None
         assert extracted.read() == b"secret"
+
+
+def test_archive_size_must_fit_the_legacy_tar_field() -> None:
+    info = _sandbox_archive_info("probe", size=8**11 - 1, mode=0o600)
+    assert info.size == 8**11 - 1
+
+    for invalid_size in (-1, 8**11):
+        with pytest.raises(ValueError, match="file size"):
+            _sandbox_archive_info("probe", size=invalid_size, mode=0o600)
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO not available")
@@ -495,6 +598,35 @@ class TestDockerSandboxRunCodeValidation:
 
         with pytest.raises(ValueError, match="Unsupported code type: ruby"):
             await sandbox.run_code("puts 'hi'", code_type="ruby")  # type: ignore[arg-type]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("operation", ["upload", "write"])
+    async def test_invalid_remote_name_is_rejected_before_container_side_effects(
+        self, operation: str, tmp_path: Path
+    ) -> None:
+        sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+        control = _SandboxControl("test")
+        sandbox._control = control
+        touched_container = False
+
+        async def unexpected_container_call(*_args, **_kwargs):
+            nonlocal touched_container
+            touched_container = True
+            raise AssertionError("invalid archive name touched the container")
+
+        sandbox._require_container = unexpected_container_call
+        sandbox._exec_in_container = unexpected_container_call
+        local_path = tmp_path / "probe.txt"
+        local_path.write_text("probe")
+
+        with pytest.raises(ValueError, match="single valid file name"):
+            if operation == "upload":
+                await sandbox.upload_file(str(local_path), "/home/sandbox/newdir/")
+            else:
+                await sandbox.write_file("probe", "/home/sandbox/newdir/")
+
+        assert not touched_container
+        assert control.active_ops == 0
 
 
 class _LabelFilteredCollection(_FakeContainerCollection):

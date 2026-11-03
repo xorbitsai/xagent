@@ -27,6 +27,26 @@ Docker backend enforces uid 1100/gid 1010, while Boxlite runs the image's
 `sandbox` user. Replacement images must provide that identity, a writable
 `/home/sandbox` working directory, and writable cache directories.
 
+### File upload wire contract
+
+The Docker backend sends `upload_file` and `write_file` through Docker's
+archive endpoint using a versioned, single-file PAX archive. The wire stream
+contains exactly one local PAX header followed by one regular-file member and
+zero-block padding. The PAX header always contains
+`Xagent.archive.version=1`; `path` is the only other permitted key and appears
+only when tar's legacy name field cannot represent the UTF-8 basename. Global
+PAX headers, directories, links, devices, sparse files, multiple members, and
+path components are never emitted. The local PAX header is named
+`././@PaxHeader`, uses type `x`, and has mode, uid, gid, and mtime set to zero;
+the regular-file member also has mtime zero and a size below `8**11` bytes.
+Basenames must be valid UTF-8 and at most 255 bytes; empty names, `.`, `..`,
+NUL, and names containing path components are rejected.
+
+This deliberately narrow format is the upload boundary consumed by the
+restricted Docker broker maintained in
+[`xagent-saas`](https://github.com/xorbitsai/xagent-saas/blob/main/docs/sandbox-broker.md).
+Change it only together with that parser and its real-Docker upload smoke test.
+
 ## Tags
 
 - `latest` — the most recently published build

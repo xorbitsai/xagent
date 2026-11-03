@@ -401,6 +401,24 @@ class BenchmarkRuntime(PatternRuntime):
             context.compact_config.threshold = threshold
 
 
+def build_context(
+    ledger: str, first_invoice: int, context_window: int, *, compaction: bool
+) -> ExecutionContext:
+    context = ExecutionContext(
+        system_prompt="You audit invoices using the supplied ledger and tools. Complete the entire audit and save it before answering. Never invent amounts or receipts.",
+        metadata={OBSERVE_PROMPT_PREFIX_KEY: True},
+        compact_config=CompactConfig(threshold=int(context_window * 0.9)),
+    )
+    context.add_user_message(
+        f"Reference ledger for the following audit task:\n{ledger}"
+    )
+    request = f"Audit the invoice chain starting with invoice-{first_invoice:06d}. Read each amount_cents from the reference ledger. Call check_invoice once at a time, passing previous_receipt=START initially and the returned receipt thereafter. Follow next_invoice until null; retry explicitly retryable failures. Then use sum_amounts to compute the total of successfully verified amounts, call save_audit with every successful receipt in order and that total, and report the saved audit."
+    if compaction:
+        request += " If compaction removes ledger text, read_ledger_invoice can read it from the saved reference file."
+    context.add_user_message(request)
+    return context
+
+
 async def run(args: argparse.Namespace) -> dict[str, Any]:
     from tokenizers import Tokenizer
 
@@ -430,13 +448,8 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         timeout_config=TimeoutConfig(args.timeout, 60),
         abilities=["chat", "tool_calling"],
     )
-    context = ExecutionContext(
-        system_prompt="You audit invoices using the supplied ledger and tools. Complete the entire audit and save it before answering. Never invent amounts or receipts.",
-        metadata={OBSERVE_PROMPT_PREFIX_KEY: True},
-        compact_config=CompactConfig(threshold=int(args.context_window * 0.9)),
-    )
-    context.add_user_message(
-        f"Reference ledger for the following audit task:\n{ledger}"
+    context = build_context(
+        ledger, targets[0], args.context_window, compaction=bool(args.compact_after)
     )
 
     def tools() -> list[Any]:
@@ -448,14 +461,6 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         if args.compact_after:
             items.append(AuditTool(workload, read=True))
         return items
-
-    context.add_user_message(
-        f"Audit the invoice chain starting with invoice-{targets[0]:06d}. Read each amount_cents from the reference ledger. Call check_invoice once at a time, passing previous_receipt=START initially and the returned receipt thereafter. Follow next_invoice until null; retry explicitly retryable failures. Then use sum_amounts to compute the total of successfully verified amounts, call save_audit with every successful receipt in order and that total, and report the saved audit."
-    )
-    if args.compact_after:
-        context.messages[
-            -1
-        ].content += " If compaction removes ledger text, read_ledger_invoice can read it from the saved reference file."
 
     def pattern() -> ReActPattern:
         return ReActPattern(

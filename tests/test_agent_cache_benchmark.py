@@ -10,12 +10,23 @@ from scripts.agent_cache_benchmark import (
     BenchmarkRuntime,
     BenchmarkTrace,
     SumAmountsTool,
+    build_context,
     cache_summary,
     invoice_amount,
 )
 from xagent.core.agent import ExecutionContext, ReActPattern
 from xagent.core.agent.prompt_prefix import OBSERVE_PROMPT_PREFIX_KEY
 from xagent.core.agent.runtime import load_pattern_checkpoint
+
+
+@pytest.mark.parametrize("compaction", [False, True])
+def test_context_setup_keeps_audit_request_and_recovery_guidance(compaction):
+    context = build_context("reference-ledger", 42, 131072, compaction=compaction)
+    request = context.current_user_request_text()
+    assert "Audit the invoice chain starting with invoice-000042" in request
+    assert ("read_ledger_invoice" in request) is compaction
+    assert len(context.messages) == 2
+    assert "reference-ledger" in context.messages[0].content
 
 
 def test_audit_requires_real_ordered_receipts_and_retries(tmp_path):

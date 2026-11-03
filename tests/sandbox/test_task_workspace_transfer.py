@@ -178,6 +178,64 @@ async def test_task_round_trip_publishes_only_changed_files(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_nested_existing_upload_keeps_trusted_serving_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host = tmp_path / "owner" / "web_task_served"
+    preview = host / "uploads" / "preview"
+    preview.mkdir(parents=True)
+    served = preview / "document.html"
+    served.write_text("before")
+    (host / "uploads").chmod(0o750)
+    preview.chmod(0o750)
+    served.chmod(0o640)
+    guest_path = Path("/home/sandbox/.xagent-workspaces/task-served")
+    guest = tmp_path / "guest"
+    sandbox = _LocalSandbox(guest_path, guest)
+    transfer = TaskWorkspaceTransfer(host, guest_path)
+    await transfer.checkout(sandbox)  # type: ignore[arg-type]
+    (guest / "uploads" / "preview" / "document.html").write_text("after")
+
+    real_stat = Path.stat
+
+    def trusted_root_stat(
+        path: Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        metadata = real_stat(path, follow_symlinks=follow_symlinks)
+        if path != host:
+            return metadata
+        values = list(metadata)
+        values[5] = 1010
+        return os.stat_result(values)
+
+    file_chowns: list[tuple[Path, int, int, bool]] = []
+    directory_chowns: list[tuple[int, int, int]] = []
+    monkeypatch.setattr(Path, "stat", trusted_root_stat)
+    monkeypatch.setattr(
+        os,
+        "chown",
+        lambda path, uid, gid, *, follow_symlinks=True: file_chowns.append(
+            (Path(path), uid, gid, follow_symlinks)
+        ),
+    )
+    monkeypatch.setattr(
+        os,
+        "fchown",
+        lambda descriptor, uid, gid: directory_chowns.append((descriptor, uid, gid)),
+    )
+
+    await transfer.check_in(sandbox)  # type: ignore[arg-type]
+
+    assert served.read_text() == "after"
+    assert any(
+        path.name == "document.html" and gid == 1010 and follow is False
+        for path, _uid, gid, follow in file_chowns
+    )
+    assert directory_chowns
+    assert all(gid == 1010 for _descriptor, _uid, gid in directory_chowns)
+
+
+@pytest.mark.asyncio
 async def test_same_file_host_change_fails_closed(tmp_path: Path) -> None:
     host = tmp_path / "web_task_8"
     host.mkdir()

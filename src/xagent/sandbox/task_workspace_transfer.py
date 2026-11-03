@@ -233,7 +233,13 @@ def scan_host_tree(root: Path) -> TreeState:
     return TreeState(tuple(directories), tuple(files), total)
 
 
-def _open_host_parent(root: Path, relative: Path) -> int:
+def _open_host_parent(
+    root: Path,
+    relative: Path,
+    *,
+    trusted_uid: int,
+    trusted_gid: int,
+) -> int:
     """Open/create a publication parent without following guest-controlled links."""
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     current_fd = os.open(root, flags)
@@ -244,6 +250,9 @@ def _open_host_parent(root: Path, relative: Path) -> int:
             except FileExistsError:
                 pass
             next_fd = os.open(component, flags, dir_fd=current_fd)
+            identity = os.fstat(next_fd)
+            if (identity.st_uid, identity.st_gid) != (trusted_uid, trusted_gid):
+                os.fchown(next_fd, trusted_uid, trusted_gid)
             os.close(current_fd)
             current_fd = next_fd
         return current_fd
@@ -412,6 +421,11 @@ class TaskWorkspaceTransfer:
                 f"Failed to inspect task workspace: {result.stderr or result.stdout}"
             )
         guest = parse_guest_manifest(result.stdout)
+        root_identity = self.host_root.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(root_identity.st_mode):
+            raise SandboxContractError("Task workspace root is no longer a directory")
+        trusted_uid = root_identity.st_uid
+        trusted_gid = root_identity.st_gid
         old = baseline.files_by_path
         new = guest.files_by_path
         changed = [path for path, state in new.items() if old.get(path) != state]
@@ -442,7 +456,11 @@ class TaskWorkspaceTransfer:
 
             for relative in (*changed, *removed):
                 parent_fd = await asyncio.to_thread(
-                    _open_host_parent, self.host_root, relative
+                    _open_host_parent,
+                    self.host_root,
+                    relative,
+                    trusted_uid=trusted_uid,
+                    trusted_gid=trusted_gid,
                 )
                 try:
                     current = await asyncio.to_thread(
@@ -457,9 +475,24 @@ class TaskWorkspaceTransfer:
 
             for relative in changed:
                 staged = staging / relative
+                staged_identity = staged.stat(follow_symlinks=False)
+                if (staged_identity.st_uid, staged_identity.st_gid) != (
+                    trusted_uid,
+                    trusted_gid,
+                ):
+                    os.chown(
+                        staged,
+                        trusted_uid,
+                        trusted_gid,
+                        follow_symlinks=False,
+                    )
                 staged.chmod(new[relative].mode & 0o755)
                 parent_fd = await asyncio.to_thread(
-                    _open_host_parent, self.host_root, relative
+                    _open_host_parent,
+                    self.host_root,
+                    relative,
+                    trusted_uid=trusted_uid,
+                    trusted_gid=trusted_gid,
                 )
                 try:
                     current = await asyncio.to_thread(
@@ -488,7 +521,11 @@ class TaskWorkspaceTransfer:
                     os.close(parent_fd)
             for relative in removed:
                 parent_fd = await asyncio.to_thread(
-                    _open_host_parent, self.host_root, relative
+                    _open_host_parent,
+                    self.host_root,
+                    relative,
+                    trusted_uid=trusted_uid,
+                    trusted_gid=trusted_gid,
                 )
                 try:
                     current = await asyncio.to_thread(

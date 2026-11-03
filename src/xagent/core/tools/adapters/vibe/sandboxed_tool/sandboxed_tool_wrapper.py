@@ -726,8 +726,24 @@ class SandboxedToolWrapper(AbstractBaseTool):
         call_args: Mapping[str, Any] = args
         call_env: dict[str, str] = {}
         call_inputs: Sequence[Any] = ()
-        result_mapper = getattr(self._sandbox, "map_workspace_result", None)
-        planner = getattr(self._sandbox, "plan_workspace_call", None)
+        # Some Sandbox implementations (and many compatibility test doubles)
+        # synthesize arbitrary attributes through ``__getattr__``.  The
+        # transfer hooks are an explicit lease-provider contract, so only use
+        # methods actually declared on the object or its type.  Treating a
+        # dynamically-created MagicMock as a mapper corrupts the decoded tool
+        # result before host-side output registration can run.
+        result_mapper = (
+            getattr(self._sandbox, "map_workspace_result", None)
+            if inspect.getattr_static(self._sandbox, "map_workspace_result", None)
+            is not None
+            else None
+        )
+        planner = (
+            getattr(self._sandbox, "plan_workspace_call", None)
+            if inspect.getattr_static(self._sandbox, "plan_workspace_call", None)
+            is not None
+            else None
+        )
         workspace = getattr(self._reconstruction_target, "_workspace", None)
         if workspace is not None and callable(planner):
             plan = planner(workspace, dict(args))

@@ -121,8 +121,10 @@ interface ChatInputProps {
    * failure toast. Each new `id` is one request. A request that arrives while
    * another is being typed or sent is dropped. Sending is held while the text
    * is being typed, so Enter or the send button never sends part of it. The
-   * text is sent only if the composer still holds exactly that text once it is
-   * typed, so a controlled caller must pass it back as `inputValue`. When the
+   * text is typed without its leading whitespace, which the send trims off
+   * anyway, so the draft is never blank while it is being typed. It is sent
+   * only if the composer still holds exactly the typed text once it is in, so
+   * a controlled caller must pass that back as `inputValue`. When the
    * composer cannot send at that moment, the text stays in it for the visitor
    * to send. An edit by the visitor while it is being typed stops it without
    * sending.
@@ -387,7 +389,11 @@ export function ChatInput({
   useEffect(() => {
     if (!autoSendRequest || handledAutoSendIdRef.current === autoSendRequest.id) return;
     handledAutoSendIdRef.current = autoSendRequest.id;
-    const { text } = autoSendRequest;
+    // Typed without its leading whitespace, so every step leaves a draft that
+    // is not blank. A blank draft counts as the visitor clearing the composer,
+    // which forgets the message id kept for retrying a failed send, so a retry
+    // of the same prompt would get a new id. The send trims it off anyway.
+    const text = autoSendRequest.text.trimStart();
     if (autoTyping || isSubmittingRef.current || !text.trim()) return;
 
     // Whole characters as a reader sees them, so an emoji or an accented

@@ -2848,6 +2848,27 @@ describe("ChatInput autoSendRequest", () => {
     expect(editorOf(container)).toBeEmptyDOMElement()
   })
 
+  it("reuses the message id when a prompt starting with whitespace is retried after an unknown outcome", async () => {
+    // One character per step, so typing the text as given would first leave
+    // only the leading space in the composer.
+    const text = " Show my schedule"
+    const onSend = vi.fn()
+      .mockRejectedValueOnce(new Error("Message delivery was not acknowledged"))
+      .mockResolvedValueOnce(undefined)
+    const { rerender } = render(composer({ onSend, autoSendRequest: { id: 1, text } }))
+    await advance(1000)
+    expect(onSend).toHaveBeenCalledTimes(1)
+
+    await advance(600)
+    rerender(composer({ onSend, autoSendRequest: { id: 2, text } }))
+    await advance(1000)
+
+    expect(onSend.mock.calls.map(([message, config]) => [message, config.clientMessageId])).toEqual([
+      ["Show my schedule", "client-message-1"],
+      ["Show my schedule", "client-message-1"],
+    ])
+  })
+
   it("puts the whole message in at once when reduced motion is preferred", async () => {
     vi.stubGlobal("matchMedia", (query: string) => ({
       matches: query === "(prefers-reduced-motion: reduce)",

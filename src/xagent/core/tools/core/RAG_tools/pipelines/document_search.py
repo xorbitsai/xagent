@@ -43,7 +43,7 @@ from ..retrieval.search_sparse import search_sparse
 from ..utils.config_utils import coerce_search_config
 from ..utils.embedding_utils import normalize_single_embedding
 from ..utils.model_resolver import resolve_embedding_adapter, resolve_rerank_adapter
-from ..utils.user_scope import resolve_user_scope
+from ..utils.user_scope import resolve_user_scope, user_scope_context
 
 if TYPE_CHECKING:
     from ..kb import KBPipelineCompatibilityFacade
@@ -697,12 +697,14 @@ def _search_documents_impl(
     )
 
     try:
-        embedding_config, embedding_adapter = resolve_embedding_adapter(
-            cfg.embedding_model_id,
-            api_key=None,
-            base_url=None,
-            timeout_sec=None,
-        )
+        # A bare model name resolves only among models this user may use.
+        with user_scope_context(user_id, is_admin):
+            embedding_config, embedding_adapter = resolve_embedding_adapter(
+                cfg.embedding_model_id,
+                api_key=None,
+                base_url=None,
+                timeout_sec=None,
+            )
         # IMPORTANT: We use the Hub model ID as the single source of truth.
         # It is used for embedding table naming and persisted collection binding.
         embedding_model_id = (cfg.embedding_model_id or "").strip()
@@ -825,9 +827,10 @@ def _search_documents_impl(
 
         # Apply optional rerank
         current_step = "apply_rerank"
-        results, used_rerank, rerank_warnings = _apply_rerank_if_needed(
-            results, query_text, cfg
-        )
+        with user_scope_context(user_id, is_admin):
+            results, used_rerank, rerank_warnings = _apply_rerank_if_needed(
+                results, query_text, cfg
+            )
         warnings.extend(rerank_warnings)
 
         return _build_pipeline_result(

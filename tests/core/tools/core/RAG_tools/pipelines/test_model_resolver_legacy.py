@@ -18,7 +18,7 @@ class _StubHub:
     def list(self) -> Dict[str, object]:
         return self._models
 
-    def load(self, model_id: str) -> object:
+    def load(self, model_id: str, **_kwargs: object) -> object:
         if model_id not in self._models:
             raise ModelNotFoundError(model_id)
         return self._models[model_id]

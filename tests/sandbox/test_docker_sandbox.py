@@ -242,6 +242,7 @@ async def test_cancelled_exec_cycles_container_and_drains_stream() -> None:
     stopped = threading.Event()
     started_again = threading.Event()
     drained = threading.Event()
+    allow_drain = threading.Event()
 
     class _ExecAPI:
         calls = 0
@@ -256,6 +257,7 @@ async def test_cancelled_exec_cycles_container_and_drains_stream() -> None:
                 def blocked_stream():
                     started.set()
                     assert started_again.wait(timeout=5)
+                    assert allow_drain.wait(timeout=5)
                     drained.set()
                     if False:
                         yield None
@@ -298,6 +300,11 @@ async def test_cancelled_exec_cycles_container_and_drains_stream() -> None:
     running = asyncio.create_task(sandbox.exec("sleep", "600"))
     assert await asyncio.to_thread(started.wait, 2)
     running.cancel()
+    assert await asyncio.to_thread(started_again.wait, 2)
+    await asyncio.sleep(0.05)
+    assert not running.done()
+    assert sandbox._control.exec_lock.locked()
+    allow_drain.set()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(running, timeout=5)
 
@@ -359,6 +366,71 @@ def test_abandoned_exec_gate_never_creates_an_exec() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cancel_before_launch_does_not_cycle_container(monkeypatch) -> None:
+    worker_entered = threading.Event()
+    allow_gate_check = threading.Event()
+
+    def delayed_exec(_container, _cmd, _env, _cap, gate):
+        worker_entered.set()
+        assert allow_gate_check.wait(5)
+        assert gate.before_create() is False
+        return ExecResult(exit_code=-1, stdout="", stderr="")
+
+    class _Container:
+        id = "container"
+
+        @staticmethod
+        def reload():
+            return None
+
+        @staticmethod
+        def stop(*, timeout):
+            raise AssertionError(f"unlaunched exec cycled container: {timeout}")
+
+    monkeypatch.setattr(docker_sandbox_module, "_exec_streaming", delayed_exec)
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._container = _Container()
+    sandbox._name = "cancel-before-launch"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("cancel-before-launch")
+
+    running = asyncio.create_task(sandbox.exec("true"))
+    assert await asyncio.to_thread(worker_entered.wait, 2)
+    running.cancel()
+    # Let recovery mark the gate abandoned before the worker reaches it.
+    await asyncio.sleep(0.05)
+    allow_gate_check.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=2)
+    assert sandbox._control.active_ops == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_execution_skips_container_cycle() -> None:
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            raise AssertionError(f"completed exec cycled container: {timeout}")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "already-complete"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("already-complete")
+    gate = docker_sandbox_module._ExecStartGate()
+    assert gate.before_create() is True
+    assert gate.before_start() is True
+    execution = asyncio.create_task(
+        asyncio.sleep(0, result=ExecResult(exit_code=0, stdout="", stderr=""))
+    )
+    await execution
+
+    await sandbox._recover_after_cancel(_Container(), execution, gate)
+
+    assert sandbox._control.deleted is False
+
+
+@pytest.mark.asyncio
 async def test_recovery_store_failure_keeps_healthy_container() -> None:
     released = asyncio.Event()
 
@@ -398,8 +470,146 @@ async def test_recovery_store_failure_keeps_healthy_container() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recovery_start_failure_preserves_stopped_container() -> None:
+    states = []
+
+    class _Store(MemDockerStore):
+        def update_info_state(self, name, state):
+            states.append((name, state))
+
+        def delete_info(self, name):
+            raise AssertionError(f"stopped container row deleted: {name}")
+
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            assert timeout == 1
+
+        @staticmethod
+        def start():
+            raise RuntimeError("temporary daemon failure")
+
+        @staticmethod
+        def remove(*, force):
+            raise AssertionError(f"stopped container removed: {force}")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "start-failure"
+    sandbox._store = _Store()
+    sandbox._control = _SandboxControl("start-failure")
+    gate = docker_sandbox_module._ExecStartGate()
+    assert gate.before_create() is True
+    assert gate.before_start() is True
+    execution = asyncio.create_task(asyncio.Event().wait())
+
+    try:
+        with pytest.raises(RuntimeError, match="temporary daemon failure"):
+            await sandbox._recover_after_cancel(_Container(), execution, gate)
+        assert sandbox._control.deleted is True
+        assert sandbox.is_usable is False
+        assert states == [("start-failure", "stopped")]
+    finally:
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remove_outcome", ["missing", "failure"])
+async def test_stop_failure_only_deletes_row_after_confirmed_removal(
+    remove_outcome,
+) -> None:
+    deleted_names = []
+
+    class _Store(MemDockerStore):
+        def delete_info(self, name):
+            deleted_names.append(name)
+
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            raise RuntimeError(f"stop failed: {timeout}")
+
+        @staticmethod
+        def remove(*, force):
+            assert force is True
+            if remove_outcome == "missing":
+                raise errors.NotFound("already gone")
+            raise RuntimeError("remove failed")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "stop-failure"
+    sandbox._store = _Store()
+    sandbox._control = _SandboxControl("stop-failure")
+    gate = docker_sandbox_module._ExecStartGate()
+    assert gate.before_create() is True
+    assert gate.before_start() is True
+    execution = asyncio.create_task(asyncio.Event().wait())
+
+    try:
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await sandbox._recover_after_cancel(_Container(), execution, gate)
+        assert deleted_names == (
+            ["stop-failure"] if remove_outcome == "missing" else []
+        )
+        assert sandbox.is_usable is False
+    finally:
+        execution.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+
+
+@pytest.mark.asyncio
+async def test_recovery_warns_then_waits_for_exec_launch_boundary(
+    monkeypatch, caplog
+) -> None:
+    calls = 0
+
+    class _SlowGate:
+        def abandon_and_wait(self, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("not ready")
+            assert timeout is None
+            return False
+
+    class _Container:
+        @staticmethod
+        def stop(*, timeout):
+            raise AssertionError(f"unlaunched exec stopped container: {timeout}")
+
+    sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
+    sandbox._name = "slow-gate"
+    sandbox._store = MemDockerStore()
+    sandbox._control = _SandboxControl("slow-gate")
+    execution = asyncio.create_task(
+        asyncio.sleep(0, result=ExecResult(exit_code=-1, stdout="", stderr=""))
+    )
+    monkeypatch.setattr(
+        docker_sandbox_module, "_EXEC_START_BOUNDARY_WARN_SECONDS", 0.01
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await sandbox._recover_after_cancel(_Container(), execution, _SlowGate())
+
+    assert calls == 2
+    assert "continuing to wait" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_recovery_failure_preserves_caller_cancellation() -> None:
     exec_started = threading.Event()
+    removed = threading.Event()
+
+    class _Store(MemDockerStore):
+        def __init__(self):
+            super().__init__()
+            self.deleted_names = []
+
+        def delete_info(self, name):
+            self.deleted_names.append(name)
+            super().delete_info(name)
 
     class _API:
         @staticmethod
@@ -435,11 +645,12 @@ async def test_recovery_failure_preserves_caller_cancellation() -> None:
         @staticmethod
         def remove(*, force):
             assert force is True
+            removed.set()
 
     sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
     sandbox._container = _Container()
     sandbox._name = "failed-recovery"
-    sandbox._store = MemDockerStore()
+    sandbox._store = _Store()
     sandbox._control = _SandboxControl("failed-recovery")
 
     running = asyncio.create_task(sandbox.exec("sleep", "600"))
@@ -449,10 +660,12 @@ async def test_recovery_failure_preserves_caller_cancellation() -> None:
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(running, timeout=5)
     assert sandbox._control.deleted is True
+    assert removed.is_set()
+    assert sandbox._store.deleted_names == ["failed-recovery"]
 
 
 @pytest.mark.asyncio
-async def test_recovery_bounds_file_lock_wait(monkeypatch) -> None:
+async def test_recovery_warns_then_waits_for_file_lock(monkeypatch, caplog) -> None:
     sandbox = object.__new__(docker_sandbox_module.DockerSandbox)
     sandbox._name = "locked-recovery"
     sandbox._store = MemDockerStore()
@@ -461,23 +674,41 @@ async def test_recovery_bounds_file_lock_wait(monkeypatch) -> None:
     gate = docker_sandbox_module._ExecStartGate()
     assert gate.before_create() is True
     assert gate.before_start() is True
-    execution = asyncio.create_task(asyncio.Event().wait())
-    monkeypatch.setattr(docker_sandbox_module, "_EXEC_FILE_LOCK_TIMEOUT_SECONDS", 0.01)
+    execution_finished = asyncio.Event()
+    execution = asyncio.create_task(execution_finished.wait())
+    monkeypatch.setattr(docker_sandbox_module, "_EXEC_FILE_LOCK_WARN_SECONDS", 0.01)
+    stopped = asyncio.Event()
 
     class _Container:
         @staticmethod
         def stop(*, timeout):
-            raise AssertionError(f"stop called while file lock is held: {timeout}")
+            assert timeout == 1
+            stopped.set()
+
+        @staticmethod
+        def start():
+            execution_finished.set()
 
     try:
-        with pytest.raises(RuntimeError, match="file operations"):
-            await sandbox._recover_after_cancel(_Container(), execution, gate)
-        assert sandbox._control.deleted is True
+        with caplog.at_level(logging.WARNING):
+            recovery = asyncio.create_task(
+                sandbox._recover_after_cancel(_Container(), execution, gate)
+            )
+            await asyncio.sleep(0.05)
+            assert not recovery.done()
+            assert not stopped.is_set()
+            assert sandbox._control.deleted is False
+            sandbox._control.file_lock.release()
+            await asyncio.wait_for(recovery, timeout=2)
+        assert "continuing to wait before recovery" in caplog.text
+        assert stopped.is_set()
     finally:
-        sandbox._control.file_lock.release()
-        execution.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await execution
+        if sandbox._control.file_lock.locked():
+            sandbox._control.file_lock.release()
+        if not execution.done():
+            execution.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await execution
 
 
 @pytest.mark.asyncio
@@ -570,7 +801,10 @@ async def test_second_cancellation_does_not_release_recovery_guards() -> None:
     running.cancel()
     assert await asyncio.to_thread(recovery_started.wait, 2)
     running.cancel()
+    await asyncio.sleep(0.05)
+    assert not running.done()
     assert sandbox._control.active_ops == 1
+    assert sandbox._control.exec_lock.locked()
     allow_recovery.set()
 
     with pytest.raises(asyncio.CancelledError):
@@ -2234,7 +2468,7 @@ class TestDockerSandbox:
                     "sh",
                     "-c",
                     f"printf started > {started_marker}; "
-                    f"sleep 2; printf late >> {marker}",
+                    f"sleep 5; printf late >> {marker}",
                 )
             )
             deadline = asyncio.get_running_loop().time() + 5
@@ -2250,9 +2484,9 @@ class TestDockerSandbox:
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(running, timeout=10)
 
-            # The original command would append after two seconds if recovery
+            # The original command would append after five seconds if recovery
             # failed to terminate it. Wait past that boundary before probing.
-            await asyncio.sleep(3)
+            await asyncio.sleep(6)
             probe = await sandbox.exec("cat", marker)
             assert probe.exit_code == 0, probe.stderr
             assert probe.stdout == "before"

@@ -202,6 +202,45 @@ class TestChromeDaemonClient:
 
         assert client.result_cleanup_failed is True
 
+    @pytest.mark.asyncio
+    async def test_result_stat_timeout_marks_client_unusable(self, monkeypatch):
+        async def exec_command(command, *args, **kwargs):
+            if command == "stat":
+                await asyncio.Event().wait()
+            return ExecResult(exit_code=0, stdout="", stderr="")
+
+        sandbox = _sandbox()
+        sandbox.exec.side_effect = exec_command
+        client = ChromeDaemonClient(sandbox, session_id="d" * 32)
+        monkeypatch.setattr(chrome_session, "_RUNNER_TIMEOUT_SECONDS", 0.01)
+
+        with pytest.raises(ChromeSessionTransportError, match="stat timed out"):
+            await client.status()
+
+        assert client.result_cleanup_failed is True
+
+    @pytest.mark.asyncio
+    async def test_cancellation_marks_client_unusable(self):
+        started = asyncio.Event()
+
+        async def exec_command(command, *args, **kwargs):
+            if command == "python":
+                started.set()
+                await asyncio.Event().wait()
+            return ExecResult(exit_code=0, stdout="", stderr="")
+
+        sandbox = _sandbox()
+        sandbox.exec.side_effect = exec_command
+        client = ChromeDaemonClient(sandbox, session_id="e" * 32)
+        running = asyncio.create_task(client.status())
+        await started.wait()
+        running.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        assert client.result_cleanup_failed is True
+
     def test_rejects_untrusted_session_names(self):
         with pytest.raises(ValueError, match="lowercase hex"):
             ChromeDaemonClient(_sandbox(), session_id="../../shared")

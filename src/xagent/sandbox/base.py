@@ -877,6 +877,18 @@ class Sandbox(abc.ABC):
     def name(self) -> str:
         """Sandbox name (unique identifier)."""
 
+    @property
+    def is_usable(self) -> bool:
+        """Whether this process-local handle may accept another operation.
+
+        Backends may invalidate a handle after an uncertain runtime failure.
+        Managers should discard such a handle and reconcile backend state
+        before serving another operation. Backends without that concept remain
+        usable by default.
+        """
+
+        return True
+
     # --- Lifecycle ---
 
     @abc.abstractmethod
@@ -910,6 +922,13 @@ class Sandbox(abc.ABC):
 
         Returns:
             ExecResult: Execution result with exit code, stdout, and stderr.
+
+        Cancellation:
+            A backend must ensure a launched command is no longer running
+            before cancellation is returned. Docker may satisfy this by
+            cycling the per-owner container, which also terminates unrelated
+            background processes in that sandbox while preserving its
+            writable layer and bind mounts.
         """
 
     @abc.abstractmethod

@@ -242,6 +242,13 @@ class ChromeDaemonClient:
                     ),
                     timeout=_RUNNER_TIMEOUT_SECONDS,
                 )
+            except asyncio.TimeoutError as exc:
+                # Docker cancellation cycles the sandbox, so this timeout also
+                # terminates the daemon and makes the session unsafe to reuse.
+                self._result_cleanup_failed = True
+                raise ChromeSessionTransportError(
+                    f"sandbox Chrome {operation} result stat timed out"
+                ) from exc
             except Exception as exc:
                 raise ChromeSessionTransportError(
                     f"sandbox Chrome {operation} result stat failed"

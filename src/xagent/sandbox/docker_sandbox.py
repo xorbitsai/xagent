@@ -25,9 +25,9 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Awaitable,
     AsyncContextManager,
     AsyncIterator,
-    Coroutine,
     Optional,
     cast,
 )
@@ -72,8 +72,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_SANDBOX_IMAGE = get_sandbox_image()
-_EXEC_START_BOUNDARY_TIMEOUT_SECONDS = 30.0
-_EXEC_FILE_LOCK_TIMEOUT_SECONDS = 30.0
+_EXEC_START_BOUNDARY_WARN_SECONDS = 30.0
+_EXEC_FILE_LOCK_WARN_SECONDS = 30.0
 _EXEC_DRAIN_TIMEOUT_SECONDS = 10.0
 
 LABEL_MANAGED = "xagent.managed"
@@ -103,6 +103,39 @@ _SANDBOX_ARCHIVE_PAX_VERSION_KEY = "Xagent.archive.version"
 _SANDBOX_ARCHIVE_PAX_VERSION = "1"
 _MAX_SANDBOX_ARCHIVE_NAME_BYTES = 255
 _MAX_SANDBOX_ARCHIVE_FILE_SIZE = 8**11
+
+
+async def _await_shielded(coro: Awaitable[Any]) -> Any:
+    """Run ``coro`` to completion and preserve a caller cancellation.
+
+    Repeated cancellations are absorbed until the underlying operation has
+    settled. If cancellation occurred, its ``CancelledError`` remains the
+    externally-visible result even when the operation itself fails.
+    """
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not task.cancelled():
+            task_error = task.exception()
+            if task_error is not None:
+                logger.error(
+                    "Shielded operation failed while a cancelled caller was "
+                    "waiting for it to settle",
+                    exc_info=(
+                        type(task_error),
+                        task_error,
+                        task_error.__traceback__,
+                    ),
+                )
+        raise
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -786,7 +819,7 @@ class _ExecStartGate:
     def create_failed(self) -> None:
         self._ready.set()
 
-    def abandon_and_wait(self, timeout: float) -> bool:
+    def abandon_and_wait(self, timeout: float | None) -> bool:
         with self._lock:
             self._abandoned = True
         if not self._ready.wait(timeout):
@@ -981,6 +1014,12 @@ class DockerSandbox(Sandbox):
         """Sandbox name (unique identifier)."""
         return self._name
 
+    @property
+    def is_usable(self) -> bool:
+        """Return false after recovery invalidates this cached handle."""
+
+        return not self._control.deleted
+
     async def _require_container(self) -> Container:
         """Return the managed container or raise if it has been deleted."""
         try:
@@ -1032,41 +1071,52 @@ class DockerSandbox(Sandbox):
         Docker has no API for terminating one exec, and ``exec_inspect.Pid`` is
         in the daemon host namespace rather than the container namespace.  A
         targeted in-container kill is therefore not trustworthy. Stop then
-        start the dedicated sandbox using only broker-approved endpoints: its
+        start the per-owner sandbox using only broker-approved endpoints: its
         filesystem and bind mounts persist while all descendants terminate.
 
         File operations use ``file_lock``.  Taking it here drains any transfer
         already in progress and prevents a new one from overlapping restart;
         the caller still owns ``exec_lock`` for the same interval.
         """
-        launched = await asyncio.to_thread(
-            gate.abandon_and_wait, _EXEC_START_BOUNDARY_TIMEOUT_SECONDS
-        )
+        try:
+            launched = await asyncio.to_thread(
+                gate.abandon_and_wait, _EXEC_START_BOUNDARY_WARN_SECONDS
+            )
+        except TimeoutError:
+            logger.warning(
+                "Cancelled Docker exec did not reach its launch boundary "
+                "within %.1fs; continuing to wait",
+                _EXEC_START_BOUNDARY_WARN_SECONDS,
+            )
+            launched = await asyncio.to_thread(gate.abandon_and_wait, None)
         if not launched or execution.done():
             await asyncio.shield(execution)
             return
 
         file_lock_acquired = False
         try:
+            acquire_file_lock = asyncio.create_task(self._control.file_lock.acquire())
             try:
                 await asyncio.wait_for(
-                    self._control.file_lock.acquire(),
-                    timeout=_EXEC_FILE_LOCK_TIMEOUT_SECONDS,
+                    asyncio.shield(acquire_file_lock),
+                    timeout=_EXEC_FILE_LOCK_WARN_SECONDS,
                 )
-                file_lock_acquired = True
-            except TimeoutError as exc:
-                raise RuntimeError(
-                    "Timed out waiting for sandbox file operations before recovery"
-                ) from exc
+            except TimeoutError:
+                logger.warning(
+                    "Cancelled Docker exec waited %.1fs for an in-flight file "
+                    "operation; continuing to wait before recovery",
+                    _EXEC_FILE_LOCK_WARN_SECONDS,
+                )
+                await acquire_file_lock
+            file_lock_acquired = True
 
-            await asyncio.to_thread(container.stop, timeout=1)
-            await asyncio.to_thread(container.start)
-        except BaseException:
-            # Fail closed. An unknown process state must not accept another
-            # operation under this cached handle. Preserve the metadata row if
-            # removal fails so reconciliation can still find the container.
-            self._control.deleted = True
-            if file_lock_acquired:
+            try:
+                await asyncio.to_thread(container.stop, timeout=1)
+            except BaseException:
+                # A failed stop leaves the process state unknown. Fail closed
+                # and remove the container; preserve its metadata row if that
+                # removal fails so reconciliation can still find it.
+                self._control.deleted = True
                 try:
                     await asyncio.to_thread(container.remove, force=True)
                 except errors.NotFound:
@@ -1078,7 +1128,26 @@ class DockerSandbox(Sandbox):
                     )
                 else:
                     self._store.delete_info(self._name)
-            raise
+                raise
+
+            try:
+                await asyncio.to_thread(container.start)
+            except BaseException:
+                # Stop succeeded, so every process is dead and the writable
+                # layer is safe. Keep the stopped container for
+                # start_existing() rather than destroying user state, but
+                # make this stale handle unusable until the manager resolves
+                # a fresh one.
+                self._control.deleted = True
+                try:
+                    self._store.update_info_state(self._name, "stopped")
+                except Exception:
+                    logger.warning(
+                        "Sandbox stopped after exec recovery but its persisted "
+                        "state was not updated",
+                        exc_info=True,
+                    )
+                raise
         finally:
             if file_lock_acquired:
                 self._control.file_lock.release()
@@ -1180,22 +1249,12 @@ class DockerSandbox(Sandbox):
                         self._recover_after_cancel(container, execution, gate)
                     )
                     try:
-                        await asyncio.shield(recovery)
+                        await _await_shielded(recovery)
                     except asyncio.CancelledError:
-                        # A second cancellation must not release the operation
-                        # guard while restart is still in flight.
-                        while not recovery.done():
-                            try:
-                                await asyncio.shield(recovery)
-                            except asyncio.CancelledError:
-                                continue
-                        try:
-                            recovery.result()
-                        except Exception:
-                            logger.error(
-                                "Docker exec recovery failed during repeated cancellation",
-                                exc_info=True,
-                            )
+                        # Preserve the cancellation which initiated recovery;
+                        # _await_shielded has already kept the operation guard
+                        # until recovery settled.
+                        pass
                     except Exception:
                         logger.error("Docker exec recovery failed", exc_info=True)
                     raise cancellation
@@ -1534,7 +1593,7 @@ class DockerSandboxService(SandboxService):
         return self._locks.locked(name)
 
     @staticmethod
-    async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
+    async def _await_shielded(coro: Awaitable[Any]) -> Any:
         """Run ``coro`` to completion even under repeated cancellation.
 
         Used by create() for its two compensating ``container.remove()``
@@ -1559,30 +1618,7 @@ class DockerSandboxService(SandboxService):
         still honored; if no cancellation occurred, the task's result or
         exception is returned/propagated unchanged.
         """
-        task = asyncio.ensure_future(coro)
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break
-            if not task.cancelled():
-                task_error = task.exception()
-                if task_error is not None:
-                    logger.error(
-                        "Compensating container operation failed while a"
-                        " cancelled caller was waiting for it to settle",
-                        exc_info=(
-                            type(task_error),
-                            task_error,
-                            task_error.__traceback__,
-                        ),
-                    )
-            raise
+        return await _await_shielded(coro)
 
     def _get_control(self, name: str) -> _SandboxControl:
         """Get the shared runtime control object for a sandbox."""

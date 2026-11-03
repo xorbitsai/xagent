@@ -1365,23 +1365,32 @@ class SandboxManager:
         cached_spec = self._config_cache.get(sandbox_name)
         if cached_spec is not None:
             self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
-            if not await self._resolve_backend_probe():
-                return self._cache[sandbox_name]
-            inspection = await self._service.inspect(sandbox_name)
-            if inspection is None:
-                # The daemon object was removed out of band. Drop the stale
-                # process-local handle and continue through normal recovery.
+            cached_sandbox = self._cache[sandbox_name]
+            if not cached_sandbox.is_usable:
+                # A backend recovery failure can intentionally poison only
+                # the process-local handle while retaining a stopped runtime
+                # and its writable layer. Drop both cache entries so normal
+                # reconciliation can restart/adopt it through a fresh handle.
                 self._cache.pop(sandbox_name, None)
                 self._config_cache.pop(sandbox_name, None)
-            elif not inspection.runtime_policy_matches:
-                # Do not leave a poisoned cache entry behind. Falling
-                # through to reconciliation lets an idle sandbox converge
-                # immediately, while _reconcile_mismatch still rejects the
-                # destructive rebuild if an existing task is attached.
-                self._cache.pop(sandbox_name, None)
-                self._config_cache.pop(sandbox_name, None)
+            elif not await self._resolve_backend_probe():
+                return cached_sandbox
             else:
-                return self._cache[sandbox_name]
+                inspection = await self._service.inspect(sandbox_name)
+                if inspection is None:
+                    # The daemon object was removed out of band. Drop the stale
+                    # process-local handle and continue through normal recovery.
+                    self._cache.pop(sandbox_name, None)
+                    self._config_cache.pop(sandbox_name, None)
+                elif not inspection.runtime_policy_matches:
+                    # Do not leave a poisoned cache entry behind. Falling
+                    # through to reconciliation lets an idle sandbox converge
+                    # immediately, while _reconcile_mismatch still rejects the
+                    # destructive rebuild if an existing task is attached.
+                    self._cache.pop(sandbox_name, None)
+                    self._config_cache.pop(sandbox_name, None)
+                else:
+                    return cached_sandbox
 
         probe = await self._resolve_backend_probe()
         if not probe:

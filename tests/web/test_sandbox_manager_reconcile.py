@@ -166,6 +166,23 @@ class TestReconcileMatrixMatch:
         service.start_existing.assert_awaited_once_with("user::1")
 
     @pytest.mark.asyncio
+    async def test_unusable_cached_handle_restarts_stopped_runtime(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        first = await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+        first.is_usable = False
+        service._containers["user::1"].state = "stopped"
+        service.start_existing.reset_mock()
+
+        second = await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        assert second is not first
+        service.start_existing.assert_awaited_once_with("user::1")
+        assert service._containers["user::1"].state == "running"
+
+    @pytest.mark.asyncio
     async def test_match_without_store_row_backfills_then_reuses(
         self, _env, tmp_path
     ) -> None:

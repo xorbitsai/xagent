@@ -30,7 +30,6 @@ Out of scope:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -181,65 +180,6 @@ class TaskModelOverrideError(ValueError):
 # ``ToolCategory.VISION``: the tools that read images with the vision model.
 _VISION_TOOL_CATEGORY = "vision"
 
-# Server-internal ``agent_config`` key recording the tool categories a
-# :class:`TaskModelOverride` explicitly excluded for this run. Uses the
-# ``__xagent_`` convention of the other server-owned agent-config keys (see
-# ``task_runtime.MCP_RUNTIME_AUTHORIZATION_POLICY_REQUIRED_KEY``).
-#
-# It exists because ``tool_categories`` alone cannot distinguish "this agent
-# was created before it had an ``mcp`` category" (an actor-marked task
-# re-adds it) from "this run explicitly excluded ``mcp``" (it must not).
-# Only :func:`apply_task_model_override` writes it: it builds a new
-# ``agent_config`` on the detached snapshot and never edits the persisted
-# ``Task`` row (nothing serializes that config into a response either). The
-# key is not in ``CLIENT_RESERVED_AGENT_CONFIG_KEYS``, so a client that seeds
-# the same name in its own ``agent_config`` survives the sanitizer; the
-# runtime config whitelist then drops it, so it cannot reach the reader
-# below. Its sole reader is the MCP add-back/force-load guard in
-# ``agent_service_manager``, so it can only ever *remove* tools: it grants
-# no category and never participates in actor authorization. A plain ``mcp``
-# exclusion does not strip an explicit ``mcp:<server>`` selection, which
-# still loads that server.
-TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY = (
-    "__xagent_task_model_override_excluded_tool_categories"
-)
-
-
-def task_model_override_excluded_tool_categories(
-    agent_config: Any,
-) -> frozenset[str]:
-    """Categories a task model override explicitly excluded for this run.
-
-    Cheap and fail-open: a non-mapping config, a missing key, or a malformed
-    value all mean "nothing was explicitly excluded", so every caller keeps
-    its ordinary behaviour. Non-string entries are ignored rather than
-    raising -- the server wrote this value, so it must never break a build.
-    """
-    if not isinstance(agent_config, Mapping):
-        return frozenset()
-    value = agent_config.get(TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY)
-    # JSON arrays come back as lists; accept the other buildable sequences too.
-    # Anything else (scalar, mapping, string) is malformed and means "nothing".
-    if not isinstance(value, (list, tuple, set, frozenset)):
-        return frozenset()
-    return frozenset(category for category in value if isinstance(category, str))
-
-
-def mcp_excluded_by_task_model_override(agent_config: Any) -> bool:
-    """Whether this run's override explicitly excluded the ``mcp`` category.
-
-    The one reader consulted by the actor-marked MCP add-back/force-load
-    guards. "Not recorded" means "not excluded": old agents and tasks
-    without an override keep the legacy MCP behaviour.
-
-    This is about the plain category only. A scoped ``mcp:<server>`` entry is
-    an exact-name mismatch for the exclusion, stays in the selection, and
-    keeps ``includes_mcp()`` true, so that server is still loaded. Only a
-    plain ``mcp`` exclusion with no scoped entry rules out MCP loading for
-    the run.
-    """
-    return "mcp" in task_model_override_excluded_tool_categories(agent_config)
-
 
 @dataclass(frozen=True)
 class TaskModelOverride:
@@ -260,7 +200,13 @@ class TaskModelOverride:
     are built on the stand-in and refuse.) ``excluded_tool_categories``
     removes tool categories from this run's selection; it requires an
     explicit category list, since an unrestricted selection has no list to
-    remove from.
+    remove from. Exclusions match *exact category names* only: excluding the
+    plain ``mcp`` category does not remove ``mcp:<server>`` entries from the
+    selection, and such an entry still loads that server. A caller that wants
+    no MCP tools at all must therefore list every ``mcp:<server>`` it selects,
+    not just ``mcp``. The applied override remains on the snapshot
+    (``model_override``), where the tool build reads this set to decide
+    whether an actor-marked task may re-add ``mcp``.
 
     Handing ``AgentServiceManager.get_agent_for_task`` a snapshot this was
     applied to rebuilds a cached service for the task unless that service
@@ -301,19 +247,14 @@ def apply_task_model_override(
     Raises :class:`TaskModelOverrideError` when categories are to be excluded
     from a selection that is not an explicit list.
 
-    Explicit exclusions are also recorded under
-    :data:`TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY` so a later
-    actor-marked MCP add-back does not re-introduce a category this run
-    deliberately turned off. The record holds the caller's requested set, not
-    only the categories this selection happened to contain -- an old agent's
-    list may never have listed ``mcp``, yet the intent still excludes it --
-    and merges with any earlier record, so it is idempotent and only ever
-    subtracts tools. Exclusions match exact category names only: an explicit
-    ``mcp:<server>`` entry is left in the selection, keeps ``includes_mcp()``
-    true, and still loads that server -- the record only stops the
-    actor-marked add-back and forced load of the plain ``mcp`` category. The
-    vision-category removal is deliberately NOT recorded here: it already has
-    its own stand-in mechanism.
+    The returned snapshot also carries ``override`` as ``model_override``: the
+    requested exclusion set stays reachable there for the tool build, which
+    needs the intent (an old agent's list may never have listed ``mcp``, yet
+    this run still excludes it) to decide whether an actor-marked task may
+    re-add ``mcp``. See :class:`TaskModelOverride` for the exact-name /
+    scoped-``mcp:<server>`` semantics. The vision-category removal is
+    deliberately not part of that set: it already has its own stand-in
+    mechanism.
     """
     from ...core.model.chat.basic.call_boundary import UnavailableVisionModel
 
@@ -333,17 +274,6 @@ def apply_task_model_override(
             "tool_categories": [
                 category for category in categories if category not in removed
             ],
-        }
-    if override.excluded_tool_categories:
-        explicitly_excluded = set(
-            task_model_override_excluded_tool_categories(agent_config)
-        )
-        explicitly_excluded.update(override.excluded_tool_categories)
-        agent_config = {
-            **cast(dict[str, Any], agent_config),
-            TASK_MODEL_OVERRIDE_EXCLUDED_TOOL_CATEGORIES_KEY: sorted(
-                explicitly_excluded
-            ),
         }
     # Deliberately a truthy stand-in, never ``None``: the tool configuration
     # falls back to the owner's configured vision model when its explicit one

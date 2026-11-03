@@ -3535,6 +3535,7 @@ def test_item_write_lock_requires_user_confirmation(monkeypatch, caplog, operati
     assert result["lock_owner"] is None
     assert "locked" in result["message"]
     assert "Do not retry until the user confirms" in result["message"]
+    assert "possibly by someone else" in result["message"]
     assert "HTTP 423" not in result["message"]
     assert "SECRET" not in json.dumps(result) + caplog.text
     assert request.call_count == 1
@@ -3542,7 +3543,10 @@ def test_item_write_lock_requires_user_confirmation(monkeypatch, caplog, operati
     if operation in {"rename", "delete"}:
         assert result["suggested_actions"] == ["close_document_and_retry"]
         assert "save a copy" not in result["message"]
+        # Rename and delete accept folders, which a locked file inside blocks.
+        assert "or a file in it" in result["message"]
     else:
+        assert "or a file in it" not in result["message"]
         assert result["suggested_actions"] == [
             "close_document_and_retry",
             "save_as_copy",

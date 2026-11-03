@@ -338,12 +338,23 @@ def _error(message: str, *, details: Any = None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _resource_locked_error(operation: str, *, allow_save_as_copy: bool = True) -> str:
+def _resource_locked_error(
+    operation: str,
+    *,
+    allow_save_as_copy: bool = True,
+    may_be_folder: bool = False,
+) -> str:
     """Return a stable, caller-actionable contract for a Graph 423."""
+    # A folder can be refused because a file inside it is locked, so say so
+    # for operations that accept folders, as onedrive_move_item does.
+    subject = (
+        "The OneDrive item, or a file in it," if may_be_folder else "The OneDrive item"
+    )
     message = (
-        f"The OneDrive item is locked, so it could not be {operation}. "
-        "Ask the user to close it in Word, Excel, PowerPoint or Teams, or "
-        "check it in. The lock can take a few minutes to clear. "
+        f"{subject} is locked, so it could not be {operation}. "
+        "It is typically open in Word, Excel, PowerPoint or Teams (possibly "
+        "by someone else) or checked out. Ask the user to close it or check "
+        "it in. The lock can take a few minutes to clear. "
         "Do not retry until the user confirms."
     )
     actions = ["close_document_and_retry"]
@@ -373,8 +384,12 @@ def _item_write_error(
     """Explain known item-write failures without exposing Graph response bodies."""
     if isinstance(exc, _GraphRequestError):
         if exc.status_code == 423:
+            # Text uploads write a file; rename and delete also accept folders.
+            is_upload = operation == "overwritten"
             return _resource_locked_error(
-                operation, allow_save_as_copy=operation == "overwritten"
+                operation,
+                allow_save_as_copy=is_upload,
+                may_be_folder=not is_upload,
             )
         if exc.status_code == 403:
             return _error(

@@ -50,7 +50,7 @@ from .managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
-from .prompt_context import build_prompt_context_value
+from .prompt_context import filter_prompt_context
 from .task_command_transport import (
     _resolve_actor_subject,
     command_identity_matches_task,
@@ -87,7 +87,9 @@ class TaskStartRejected(Exception):
     """A domain rejection for the API to translate to its protocol.
 
     ``expired_at`` is set only on a ``task_expired`` rejection (see
-    :func:`resolve_sdk_task`), together with ``task_id``.
+    :func:`resolve_sdk_task`), together with ``task_id``. ``fields`` is set
+    only on a ``prompt_context_fields_rejected`` rejection: the rejected
+    ``prompt_context`` field names, in input order.
     """
 
     def __init__(
@@ -97,12 +99,14 @@ class TaskStartRejected(Exception):
         task_id: int | None = None,
         context_id: str | None = None,
         expired_at: datetime | None = None,
+        fields: tuple[str, ...] = (),
     ):
         super().__init__(reason)
         self.reason = reason
         self.task_id = task_id
         self.context_id = context_id
         self.expired_at = expired_at
+        self.fields = fields
 
 
 @dataclass(frozen=True)
@@ -221,13 +225,25 @@ def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPay
 
 
 def _prompt_context_value_for_agent(
-    prompt_context: dict[str, Any] | None, agent: Agent
+    prompt_context: dict[str, Any] | None, agent: Agent, *, signed: bool
 ) -> dict[str, Any] | None:
+    """Return the value to store for ``prompt_context``, or None for none.
+
+    Signed values (runtime keys) skip the field whitelist and the length
+    limits; declarations still supply field descriptions.
+    Unsigned values (personal keys) are all or nothing: a field the agent
+    does not declare, or longer than its declared length, rejects the whole
+    request with ``prompt_context_fields_rejected``. Callers run this before
+    any write, so a rejection leaves nothing behind.
+    """
     if prompt_context is None:
         return None
-    return build_prompt_context_value(
-        prompt_context, agent.prompt_context_fields, signed=True
+    value, rejected = filter_prompt_context(
+        prompt_context, agent.prompt_context_fields, signed=signed
     )
+    if rejected and not signed:
+        raise TaskStartRejected("prompt_context_fields_rejected", fields=rejected)
+    return value
 
 
 def _store_connector_runtime_values_or_fail(
@@ -311,7 +327,11 @@ def _prepare_created_task_isolated(
             agent = db.get(Agent, agent_id)
         if agent is None:
             raise TaskStartRejected("agent_not_found")
-        prompt_context_value = _prompt_context_value_for_agent(prompt_context, agent)
+        prompt_context_value = _prompt_context_value_for_agent(
+            prompt_context,
+            agent,
+            signed=stored_credential_kind != _PERSONAL_CREDENTIAL,
+        )
 
         file_infos = _resolve_turn_files(
             file_ids=list(file_ids),
@@ -522,7 +542,10 @@ def _prepare_append_turn_isolated(
         # A provided object replaces the stored value; ``{}`` clears the key.
         if prompt_context is not None:
             prompt_context_value = _prompt_context_value_for_agent(
-                prompt_context, runtime_agent
+                prompt_context,
+                runtime_agent,
+                signed=cast("str | None", task.sdk_credential_kind)
+                != _PERSONAL_CREDENTIAL,
             )
             task_agent_config = (
                 dict(task.agent_config) if isinstance(task.agent_config, dict) else {}

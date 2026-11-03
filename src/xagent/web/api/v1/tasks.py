@@ -246,6 +246,14 @@ def _raise_start_rejection(exc: task_start_service.TaskStartRejected) -> NoRetur
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT, 422, message="agent_id is required"
         ) from exc
+    if exc.reason == "prompt_context_fields_rejected":
+        # Names only, without the reason or the declared limit.
+        raise V1ApiError(
+            V1ErrorCode.INVALID_INPUT,
+            422,
+            message="prompt_context fields this agent does not accept: "
+            + ", ".join(exc.fields),
+        ) from exc
     if exc.reason == "connector_runtime_setup_failed":
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR,
@@ -307,18 +315,6 @@ def _validate_prompt_context(prompt_context: dict[str, Any] | None) -> None:
         validate_signed_prompt_context(prompt_context)
     except ValueError as exc:
         raise V1ApiError(V1ErrorCode.INVALID_INPUT, 422, message=str(exc)) from exc
-
-
-def _reject_personal_key_prompt_context(
-    principal: ApiKeyPrincipal, prompt_context: dict[str, Any] | None
-) -> None:
-    """A personal key may not send ``prompt_context``, not even ``{}``."""
-    if prompt_context is not None and principal.user is not None:
-        raise V1ApiError(
-            V1ErrorCode.INVALID_INPUT,
-            422,
-            message="prompt_context is not supported for personal keys.",
-        )
 
 
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
@@ -424,7 +420,9 @@ async def create_chat_task(
         V1ApiError 404: ``agent_not_found`` -- the agent is not the one
             bound to the agent key, or not one the personal key's holder
             can see.
-        V1ApiError 422: ``prompt_context`` sent with a personal key.
+        V1ApiError 422: ``prompt_context`` is malformed, or a personal
+            key sent a field the agent does not declare or longer than its
+            declared length.
         500 (V1 envelope): any unexpected exception -- the global
             handler in ``web/app.py`` translates to
             ``{"error": {"code": "internal_error", ...}}`` and the raw
@@ -432,7 +430,6 @@ async def create_chat_task(
     """
     agent_identity = principal.agent
     _validate_prompt_context(request.prompt_context)
-    _reject_personal_key_prompt_context(principal, request.prompt_context)
     credential_kind: task_start_service.SdkCredentialKind
     if principal.user is not None:
         # create_sdk_task checks that the holder can see this agent.
@@ -1111,8 +1108,9 @@ async def append_message_to_task(
         V1ApiError 410: ``task_expired`` -- the retention policy expired
             a task this key could have seen; ``details`` carries
             ``task_id`` and ``expired_at``.
-        V1ApiError 422: ``prompt_context`` sent with a workforce or a
-            personal key.
+        V1ApiError 422: ``prompt_context`` is malformed, sent with a
+            workforce key, or, with a personal key, has a field the agent
+            does not declare or longer than its declared length.
         V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
             code (not retryable), or ``interaction_response_required``
             (use ``reply`` instead).
@@ -1125,7 +1123,6 @@ async def append_message_to_task(
             422,
             message="prompt_context is not supported for workforce keys.",
         )
-    _reject_personal_key_prompt_context(principal, request.prompt_context)
     try:
         started = await task_start_service.append_sdk_turn(
             task_id=task_id,

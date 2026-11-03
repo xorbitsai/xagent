@@ -2,13 +2,61 @@
 
 import pytest
 
-from xagent.web.services.prompt_context import build_prompt_context_value
+from xagent.web.services.prompt_context import (
+    build_prompt_context_value,
+    filter_prompt_context,
+)
 
 DECLARATIONS = [
     {"name": "account", "max_length": 8},
     {"name": "tier", "max_length": 8},
     {"name": "exact", "max_length": 5},
 ]
+
+
+_FIVE_LONG = [{"name": f"f{i}", "max_length": 1024} for i in range(5)]
+
+
+@pytest.mark.parametrize(
+    ("values", "declarations", "rejected"),
+    [
+        pytest.param({"account": "acme", "tier": 3}, DECLARATIONS, (), id="all_kept"),
+        pytest.param({}, DECLARATIONS, (), id="empty"),
+        pytest.param(
+            {"other": "x", "account": "acme"}, DECLARATIONS, ("other",), id="undeclared"
+        ),
+        pytest.param(
+            {"exact": "abcdef", "account": "acme"},
+            DECLARATIONS,
+            ("exact",),
+            id="too_long",
+        ),
+        pytest.param(
+            {"other": "x", "account": "acme", "exact": "abcdef"},
+            DECLARATIONS,
+            ("other", "exact"),
+            id="mixed",
+        ),
+        pytest.param(
+            {"account": "acme", "tier": 3},
+            [{"name": "account"}],
+            ("account", "tier"),
+            id="malformed_declarations",
+        ),
+        # Every field fits its declaration, but together they exceed the
+        # rendered-size cap, so the value carries none of them.
+        pytest.param(
+            {f"f{i}": "x" * 1000 for i in range(5)},
+            _FIVE_LONG,
+            tuple(f"f{i}" for i in range(5)),
+            id="over_total_cap",
+        ),
+    ],
+)
+def test_unsigned_rejected_names_are_every_input_key_not_kept(
+    values, declarations, rejected
+) -> None:
+    assert filter_prompt_context(values, declarations, signed=False)[1] == rejected
 
 
 def test_unsigned_keeps_declared_primitive_values() -> None:

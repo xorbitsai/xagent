@@ -1312,3 +1312,53 @@ class TestMemoryApiUsage:
 
         assert response.status_code == 200
         self._assert_billed(hook, test_db)
+
+    @pytest.mark.parametrize(
+        "method,path,body",
+        [
+            ("get", "/api/memory/list?search=q", None),
+            ("post", "/api/memory", {"content": "x"}),
+            ("put", f"/api/memory/{MEMORY_ID_1}", {"content": "new"}),
+        ],
+        ids=["search", "create", "update"],
+    )
+    def test_a_gate_refusal_is_a_402_and_never_embeds(
+        self,
+        client,
+        mock_memory_store,
+        auth_headers,
+        hook,
+        test_db,
+        sample_memory_notes,
+        method,
+        path,
+        body,
+    ):
+        from xagent.core.memory.core import MemoryResponse
+        from xagent.web.services import quota_hooks
+
+        mock_memory_store.get.return_value = MemoryResponse(
+            success=True, content=sample_memory_notes[0]
+        )
+        gate_calls: list = []
+
+        def gate(user_id, source):
+            gate_calls.append((user_id, source))
+            return "Out of AI credits"
+
+        quota_hooks.set_standalone_gate_hook(gate)
+        try:
+            kwargs = {"headers": auth_headers}
+            if body is not None:
+                kwargs["json"] = body
+            response = getattr(client, method)(path, **kwargs)
+        finally:
+            quota_hooks.set_standalone_gate_hook(None)
+
+        assert response.status_code == 402
+        assert response.json()["detail"]["code"] == "standalone_usage_refused"
+        assert gate_calls == [(test_db.id, "memory_api")]
+        mock_memory_store.search.assert_not_called()
+        mock_memory_store.add.assert_not_called()
+        mock_memory_store.update.assert_not_called()
+        assert hook == []

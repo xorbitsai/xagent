@@ -1083,6 +1083,67 @@ async def test_tts_completion_through_full_app_stack(api, monkeypatch, caplog, f
     assert len(api.usage) == 1
 
 
+@pytest.fixture
+def refusing_gate(monkeypatch):
+    calls = []
+
+    def gate(user_id, source):
+        calls.append((user_id, source))
+        return "Out of AI credits"
+
+    monkeypatch.setattr(quota_hooks, "_standalone_gate_hook", gate)
+    return calls
+
+
+def test_tts_refused_by_the_gate_is_a_402_before_the_model_loads(api, refusing_gate):
+    response = api.client.post(
+        TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}
+    )
+    assert response.status_code == 402
+    assert response.json()["detail"]["code"] == "standalone_usage_refused"
+    assert response.json()["detail"]["message"] == "Out of AI credits"
+    assert refusing_gate == [(1, "speech_synthesize")]
+    api.tts_factory.assert_not_called()
+    assert not api.usage
+
+
+def test_tts_refused_when_the_stream_opens_is_still_a_402_and_closes_the_model(
+    api, monkeypatch
+):
+    # Allowed by the endpoint, refused by the metering scope a moment later.
+    answers = iter([None, "Out of AI credits"])
+    monkeypatch.setattr(
+        quota_hooks, "_standalone_gate_hook", lambda *_args: next(answers)
+    )
+    response = api.client.post(
+        TTS_PATH, headers=api.headers, json={"model_id": "voice", "text": "Hello"}
+    )
+    assert response.status_code == 402
+    assert response.json()["detail"]["code"] == "standalone_usage_refused"
+    assert not api.tts.calls
+    assert api.tts.close_count == 1
+    assert not api.usage
+
+
+def test_asr_refused_by_the_gate_reports_the_code_and_closes_with_1008(
+    api, refusing_gate
+):
+    with api.client.websocket_connect(ASR_PATH, subprotocols=api.protocols) as ws:
+        ws.send_json({"type": "start", "model_id": "live"})
+        assert ws.receive_json() == {
+            "type": "error",
+            "code": "standalone_usage_refused",
+            "message": "Out of AI credits",
+        }
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+        assert closed.value.code == 1008
+    assert refusing_gate == [(1, "speech_transcribe")]
+    assert not api.asr.sessions
+    assert api.asr.close_count == 1
+    assert not api.usage
+
+
 def test_speech_capabilities_require_model_access_and_close_provider(api):
     result = api.client.get(
         "/api/models/speech/capabilities?model_id=voice&ability=tts",

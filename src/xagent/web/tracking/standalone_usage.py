@@ -20,6 +20,11 @@ Use ``async with`` in coroutines and plain ``with`` in synchronous code
 ``loop.run_in_executor`` and a bare ``ThreadPoolExecutor`` do not, so work
 handed to those must be submitted through ``contextvars.copy_context().run``.
 
+A scope checks the gate registered with
+:func:`xagent.web.services.quota_hooks.set_standalone_gate_hook` when it opens,
+so a refused user never reaches the provider: entering raises
+:class:`StandaloneUsageRefused` and the body does not run.
+
 A scope delivers what was recorded when it exits. Blocking work handed to a
 thread from a coroutine outlives the coroutine when the await is cancelled or
 times out, so it runs under :func:`run_in_usage_scope`, which opens the scope
@@ -31,8 +36,11 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import logging
+from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Callable, Literal, Optional, TypeVar
+
+from fastapi import HTTPException
 
 from ...core.model.chat.token_context import TokenUsage, token_context
 
@@ -55,6 +63,91 @@ UsageSource = Literal[
     "speech_synthesize",
     "telegram_voice",
 ]
+
+#: Sources the gate is not consulted for. A model connection test runs on the
+#: credentials in the request, which is how a user without credits configures
+#: a model of their own; it is still metered.
+_UNGATED_SOURCES: frozenset[str] = frozenset({"model_probe"})
+
+#: The stable ``code`` of a refusal, in the HTTP detail and websocket error.
+STANDALONE_USAGE_REFUSED = "standalone_usage_refused"
+
+_DEFAULT_REFUSAL_MESSAGE = "Usage limit reached for this request"
+
+
+class StandaloneUsageRefused(HTTPException):
+    """The standalone gate refused work for a user.
+
+    An HTTP 402 so request handlers that pass ``HTTPException`` through return
+    it as is. ``detail`` carries the stable ``code``, the ``source``, a
+    human-readable ``message`` and the gate's ``reason`` as returned; ``str()``
+    is the message, for entry points that report a failure as text.
+    """
+
+    def __init__(self, usage_source: str, reason: str | Mapping[str, Any]) -> None:
+        if isinstance(reason, Mapping):
+            reason = dict(reason)
+            message = str(reason.get("message") or _DEFAULT_REFUSAL_MESSAGE)
+        else:
+            reason = str(reason)
+            message = reason
+        super().__init__(
+            status_code=402,
+            detail={
+                "code": STANDALONE_USAGE_REFUSED,
+                "source": usage_source,
+                "message": message,
+                "reason": reason,
+            },
+        )
+        self.usage_source = usage_source
+        self.reason = reason
+        self.message = message
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def _gate_hook(
+    user_id: Optional[int], usage_source: str
+) -> Optional[Callable[[int, str], Any]]:
+    if user_id is None or usage_source in _UNGATED_SOURCES:
+        return None
+    from ..services.quota_hooks import get_standalone_gate_hook
+
+    return get_standalone_gate_hook()
+
+
+def check_standalone_gate(user_id: Optional[int], usage_source: UsageSource) -> None:
+    """Raise :class:`StandaloneUsageRefused` if the gate refuses the work.
+
+    Synchronous; the hook may block. Coroutines use
+    :func:`check_standalone_gate_async`. A no-op when no gate is registered.
+    """
+    hook = _gate_hook(user_id, usage_source)
+    if hook is None or user_id is None:
+        return
+    try:
+        reason = hook(int(user_id), usage_source)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "Standalone gate failed for %s; allowing the work: %s",
+            usage_source,
+            e,
+            exc_info=True,
+        )
+        return
+    if reason:
+        raise StandaloneUsageRefused(usage_source, reason)
+
+
+async def check_standalone_gate_async(
+    user_id: Optional[int], usage_source: UsageSource
+) -> None:
+    """:func:`check_standalone_gate` with the hook run off the event loop."""
+    if _gate_hook(user_id, usage_source) is None:
+        return
+    await asyncio.to_thread(check_standalone_gate, user_id, usage_source)
 
 
 class UsageScope:
@@ -130,6 +223,7 @@ class UsageScope:
             )
 
     def __enter__(self) -> TokenUsage:
+        check_standalone_gate(self.user_id, self.usage_source)
         return self._bind()
 
     def __exit__(
@@ -144,6 +238,7 @@ class UsageScope:
             self._deliver(details)
 
     async def __aenter__(self) -> TokenUsage:
+        await check_standalone_gate_async(self.user_id, self.usage_source)
         return self._bind()
 
     async def __aexit__(
@@ -176,6 +271,10 @@ def usage_scope(user_id: Optional[int], *, usage_source: UsageSource) -> UsageSc
 
     Scopes nest: an inner scope's usage is delivered on its own and never
     reaches the outer one.
+
+    Entering checks the standalone gate and raises
+    :class:`StandaloneUsageRefused` when it refuses; see
+    :func:`check_standalone_gate`.
     """
     return UsageScope(user_id, usage_source)
 

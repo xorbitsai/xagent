@@ -60,6 +60,11 @@ _trigger_record_hook: Callable[[Any], None] | None = None
 _standalone_usage_hook: (
     Callable[[int | None, list[dict[str, Any]], str], None] | None
 ) = None
+# (user_id, source) -> reason if non-run work may not spend for this user now,
+# else None. See ``set_standalone_gate_hook``.
+_standalone_gate_hook: Callable[[int, str], str | Mapping[str, Any] | None] | None = (
+    None
+)
 
 
 def set_run_gate_hook(hook: Callable[[Any, Any], str | None] | None) -> None:
@@ -125,6 +130,43 @@ def get_standalone_usage_hook() -> (
     Callable[[int | None, list[dict[str, Any]], str], None] | None
 ):
     return _standalone_usage_hook
+
+
+def set_standalone_gate_hook(
+    hook: Callable[[int, str], str | Mapping[str, Any] | None] | None,
+) -> None:
+    """Register the gate checked before usage is incurred outside an agent run.
+
+    Called as ``hook(user_id, source)`` when a
+    :func:`xagent.web.tracking.standalone_usage.usage_scope` opens, before the
+    work inside it reaches a provider, and by the entry points that would
+    otherwise refuse only after writing state (KB ingest, TTS streaming).
+    ``user_id`` and ``source`` mean what they mean for
+    :func:`set_standalone_usage_hook`.
+
+    Return ``None`` to allow the work, or a reason to refuse it: a message
+    ``str`` or a structured mapping (e.g. ``{"code", "metric", "message"}``)
+    that core forwards to the client without interpreting it. A refusal is
+    surfaced as HTTP 402, a websocket close with code 1008, a failed
+    background job, or a reply in the channel, depending on the entry point.
+
+    Not consulted for work with no attributable user, nor for model
+    connection tests, which run on credentials supplied in the request.
+
+    EXECUTION CONTRACT: invoked synchronously, never on the asyncio event loop
+    -- async entry points check from a worker thread. No database session is
+    passed: the hook opens its own and must not write. Exceptions are logged
+    and the work is allowed: a broken gate must not take every standalone
+    feature down with it.
+    """
+    global _standalone_gate_hook
+    _standalone_gate_hook = hook
+
+
+def get_standalone_gate_hook() -> (
+    Callable[[int, str], str | Mapping[str, Any] | None] | None
+):
+    return _standalone_gate_hook
 
 
 def check_run_gate(db: Any, user_id: Any) -> str | Mapping[str, Any] | None:

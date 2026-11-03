@@ -5981,11 +5981,24 @@ async def test_top_level_argument_error_is_returned_before_mcp_execution(
     create_session_mock.assert_not_called()
 
 
+def _assert_rejection_logged_without_secret(caplog, secret):
+    assert secret not in caplog.text
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert any(
+        record.levelno == logging.WARNING
+        and "rejected supplied arguments" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 @pytest.mark.asyncio
-async def test_top_level_argument_error_does_not_echo_supplied_values(monkeypatch):
+async def test_top_level_argument_error_does_not_echo_supplied_values(
+    monkeypatch, caplog
+):
     adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
     create_session_mock = AsyncMock()
     monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+    caplog.set_level(logging.DEBUG, logger=mcp_adapter_module.logger.name)
 
     result = await adapter.run_json_async(
         {"item_id": 1, "description": ["top-secret-value"], "reasoning": "y"}
@@ -5994,6 +6007,35 @@ async def test_top_level_argument_error_does_not_echo_supplied_values(monkeypatc
     assert result["is_error"] is True
     assert "top-secret-value" not in repr(result)
     assert "pydantic" not in repr(result).lower()
+    _assert_rejection_logged_without_secret(caplog, "top-secret-value")
+    create_session_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "coerced_schema",
+    [
+        pytest.param({"type": "boolean"}, id="plain-type"),
+        pytest.param(
+            {"anyOf": [{"type": "integer"}, {"type": "boolean"}]}, id="any-of"
+        ),
+    ],
+)
+async def test_argument_error_names_a_field_the_args_model_rejected(
+    monkeypatch, coerced_schema
+):
+    """A value the args model coerces is not reported in place of a rejected one."""
+    adapter = _schema_adapter(
+        {"flag": coerced_schema, "b2": {"type": "boolean"}}, ["flag", "b2"]
+    )
+    create_session_mock = AsyncMock()
+    monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+
+    result = await adapter.run_json_async({"flag": "true", "b2": [1]})
+
+    assert result == _invalid_arguments(
+        "b2", 'the value has the wrong type (expected "boolean")'
+    )
     create_session_mock.assert_not_called()
 
 
@@ -6016,18 +6058,20 @@ async def test_top_level_argument_error_does_not_echo_supplied_values(monkeypatc
     ],
 )
 async def test_top_level_argument_error_without_compiled_validator(
-    monkeypatch, args, location, reason
+    monkeypatch, caplog, args, location, reason
 ):
     """A schema that failed to compile still yields a correctable error."""
     adapter = _schema_adapter(_TOP_LEVEL_PROPERTIES, _TOP_LEVEL_REQUIRED)
     adapter._args_validator = None
     create_session_mock = AsyncMock()
     monkeypatch.setattr(mcp_adapter_module, "create_session", create_session_mock)
+    caplog.set_level(logging.DEBUG, logger=mcp_adapter_module.logger.name)
 
     result = await adapter.run_json_async(args)
 
     assert result == _invalid_arguments(location, reason)
     assert "top-secret-value" not in repr(result)
+    _assert_rejection_logged_without_secret(caplog, "top-secret-value")
     create_session_mock.assert_not_called()
 
 

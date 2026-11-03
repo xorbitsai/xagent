@@ -2746,10 +2746,27 @@ class MCPToolAdapter(AbstractBaseTool):
                 )
             ]
 
-    def _nested_argument_error(self, args: Mapping[str, Any]) -> Any | None:
+    def _nested_argument_error(
+        self, args: Mapping[str, Any], *, rejected_fields: set[str] | None = None
+    ) -> Any | None:
+        """Return the schema error to report for ``args``, or None.
+
+        With ``rejected_fields``, only errors under those top-level fields are
+        candidates. The args model accepts some values the schema rejects, such
+        as ``"true"`` for a boolean, so after an args-model failure an error on
+        another field would name a value that was accepted. Errors on the
+        arguments object itself have no field and are dropped in that case.
+        """
         if self._args_validator is None:
             return None
         errors = list(self._args_validator.iter_errors(dict(args)))
+        if rejected_fields is not None:
+            errors = [
+                error
+                for error in errors
+                if error.absolute_path
+                and str(error.absolute_path[0]) in rejected_fields
+            ]
         for candidate in errors:
             if candidate.validator not in {"anyOf", "oneOf"}:
                 continue
@@ -2810,7 +2827,8 @@ class MCPToolAdapter(AbstractBaseTool):
         """Describe an args-model failure by field name and failure kind only.
 
         Used when the compiled validator cannot name the problem, for example
-        because the schema did not compile. Pydantic's own message echoes the
+        because the schema did not compile, or because it reports nothing on
+        the fields the args model rejected. Pydantic's own message echoes the
         supplied value and a documentation URL, so none of it is carried over.
         """
         first = exc.errors(
@@ -2819,7 +2837,7 @@ class MCPToolAdapter(AbstractBaseTool):
         field = [str(first["loc"][0])] if first["loc"] else []
         if first["type"] == "missing":
             return jsonschema_exceptions.ValidationError(
-                "missing", validator="required", validator_value=field, instance={}
+                "missing", validator="required", path=field
             )
         return jsonschema_exceptions.ValidationError(
             "invalid", validator=None, path=field
@@ -3494,8 +3512,19 @@ class MCPToolAdapter(AbstractBaseTool):
             except ValidationError as exc:
                 # The args model excludes runtime-bound fields, and so does the
                 # validator compiled from it, so neither reports them missing.
+                # The schema check sees the values before coercion, so limit it
+                # to the fields the args model rejected.
+                rejected_fields = {
+                    str(error["loc"][0])
+                    for error in exc.errors(
+                        include_url=False, include_context=False, include_input=False
+                    )
+                    if error["loc"]
+                }
                 return self._rejected_arguments_result(
-                    self._nested_argument_error(normalized_args)
+                    self._nested_argument_error(
+                        normalized_args, rejected_fields=rejected_fields
+                    )
                     or self._args_model_argument_error(exc)
                 )
             supplied_argument_names = set(normalized_args)

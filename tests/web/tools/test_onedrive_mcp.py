@@ -3536,6 +3536,7 @@ def test_item_write_lock_requires_user_confirmation(monkeypatch, caplog, operati
     assert "locked" in result["message"]
     assert "Do not retry until the user confirms" in result["message"]
     assert "possibly by someone else" in result["message"]
+    assert "(Graph error code: notAllowed)" in result["message"]
     assert "HTTP 423" not in result["message"]
     assert "SECRET" not in json.dumps(result) + caplog.text
     assert request.call_count == 1
@@ -3558,18 +3559,21 @@ def test_item_write_classifier_recognizes_lock_without_error_code():
     # Constructed boundary: the HTTP status is sufficient without error.code.
     error = onedrive._GraphRequestError("Graph request failed with HTTP 423", 423)
 
-    result = json.loads(onedrive._item_write_error(error, "deleted"))
+    result = json.loads(
+        onedrive._item_write_error(error, "deleted", is_file_write=False)
+    )
 
     assert result["code"] == "resource_locked"
     assert "Do not retry until the user confirms" in result["message"]
     assert "HTTP 423" not in result["message"]
+    assert "Graph error code" not in result["message"]
 
 
 @pytest.mark.parametrize(
     ("status", "graph_code", "expected_message"),
     [
         (403, "accessDenied", "no permission"),
-        (404, "itemNotFound", "no longer exists"),
+        (404, "itemNotFound", "was not found"),
     ],
 )
 def test_item_write_classifier_explains_access_errors(
@@ -3577,11 +3581,31 @@ def test_item_write_classifier_explains_access_errors(
 ):
     error = onedrive._GraphRequestError("Graph request failed", status, graph_code)
 
-    result = json.loads(onedrive._item_write_error(error, "deleted"))
+    result = json.loads(
+        onedrive._item_write_error(error, "deleted", is_file_write=False)
+    )
 
     assert result["status"] == "error"
     assert expected_message in result["message"]
+    assert f"(Graph error code: {graph_code})" in result["message"]
     assert result.get("code") != "resource_locked"
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_text_upload_access_errors_do_not_assume_an_existing_file(monkeypatch, status):
+    # A text upload usually creates a new file.
+    request = Mock(
+        return_value=MockResponse(
+            {"error": {"code": "accessDenied"}}, status_code=status
+        )
+    )
+    monkeypatch.setattr(onedrive.requests, "request", request)
+
+    result = _call_item_write_tool("text_upload")
+
+    assert result["status"] == "error"
+    assert "overwritten" not in result["message"]
+    assert "no longer exists" not in result["message"]
 
 
 def test_rename_name_conflict_suggests_a_different_name(monkeypatch):
@@ -3611,7 +3635,9 @@ def test_item_write_classifier_preserves_unknown_errors(status, graph_code):
 
     # Supply new_name so these cases exercise the boundary of rename guidance.
     result = json.loads(
-        onedrive._item_write_error(error, "renamed", new_name="new.txt")
+        onedrive._item_write_error(
+            error, "renamed", is_file_write=False, new_name="new.txt"
+        )
     )
 
     assert result == {"status": "error", "message": str(error)}

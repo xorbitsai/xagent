@@ -339,16 +339,17 @@ def _error(message: str, *, details: Any = None) -> str:
 
 
 def _resource_locked_error(
-    operation: str,
-    *,
-    allow_save_as_copy: bool = True,
-    may_be_folder: bool = False,
+    operation: str, *, is_file_write: bool = True, graph_code: str | None = None
 ) -> str:
-    """Return a stable, caller-actionable contract for a Graph 423."""
-    # A folder can be refused because a file inside it is locked, so say so
-    # for operations that accept folders, as onedrive_move_item does.
+    """Return a stable, caller-actionable contract for a Graph 423.
+
+    is_file_write is True when the caller writes a file's content, so saving
+    a copy elsewhere is an alternative. Otherwise the target may be a folder,
+    which Graph can refuse because a file inside it is locked, so the message
+    says so, as onedrive_move_item does.
+    """
     subject = (
-        "The OneDrive item, or a file in it," if may_be_folder else "The OneDrive item"
+        "The OneDrive item" if is_file_write else "The OneDrive item, or a file in it,"
     )
     message = (
         f"{subject} is locked, so it could not be {operation}. "
@@ -358,11 +359,12 @@ def _resource_locked_error(
         "Do not retry until the user confirms."
     )
     actions = ["close_document_and_retry"]
-    if allow_save_as_copy:
+    if is_file_write:
         message += (
             " Ask the user before choosing a different destination path to save a copy."
         )
         actions.append("save_as_copy")
+    message += _graph_code_suffix(graph_code)
     return json.dumps(
         {
             "status": "error",
@@ -378,26 +380,39 @@ def _resource_locked_error(
     )
 
 
+def _graph_code_suffix(graph_code: str | None) -> str:
+    # The tool result is what reaches the trace, so keep Graph's error code
+    # (e.g. accessDenied vs notAllowed) next to the explanation.
+    return f" (Graph error code: {graph_code})" if graph_code else ""
+
+
 def _item_write_error(
-    exc: Exception, operation: str, *, new_name: str | None = None
+    exc: Exception,
+    operation: str,
+    *,
+    is_file_write: bool,
+    new_name: str | None = None,
 ) -> str:
-    """Explain known item-write failures without exposing Graph response bodies."""
+    """Explain known item-write failures without exposing Graph response bodies.
+
+    The wording does not assume the target already exists, because a text
+    upload usually creates a new file.
+    """
     if isinstance(exc, _GraphRequestError):
+        suffix = _graph_code_suffix(exc.code)
         if exc.status_code == 423:
-            # Text uploads write a file; rename and delete also accept folders.
-            is_upload = operation == "overwritten"
             return _resource_locked_error(
-                operation,
-                allow_save_as_copy=is_upload,
-                may_be_folder=not is_upload,
+                operation, is_file_write=is_file_write, graph_code=exc.code
             )
         if exc.status_code == 403:
             return _error(
-                "The connected account has no permission for this OneDrive "
-                f"item to be {operation}"
+                "The connected account has no permission for this change, so "
+                f"the OneDrive item could not be {operation}{suffix}"
             )
         if exc.status_code == 404:
-            return _error("The OneDrive item or its parent folder no longer exists")
+            return _error(
+                f"The OneDrive item or its parent folder was not found{suffix}"
+            )
         if (
             exc.status_code == 409
             and exc.code == "nameAlreadyExists"
@@ -1565,6 +1580,10 @@ def onedrive_upload_text_file(
     plain-text content, not an actual PDF. To upload an already-generated
     local file's real bytes (a PDF, image, .docx, etc.), use
     onedrive_upload_file with that file's path instead.
+
+    If an existing file at file_path is locked, this tool returns
+    code="resource_locked"; do not retry until the user confirms that it has
+    been closed or checked in.
     """
     try:
         if _name_looks_binary(file_path):
@@ -1588,7 +1607,7 @@ def onedrive_upload_text_file(
         return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error uploading OneDrive text file %s: %s", file_path, e)
-        return _item_write_error(e, "overwritten")
+        return _item_write_error(e, "written", is_file_write=True)
 
 
 @mcp.tool()
@@ -1716,6 +1735,11 @@ def onedrive_upload_file(
             logger.exception(
                 "Unexpected error uploading OneDrive file %s", local_file_path
             )
+        # 409 is treated as a lock since #3040, following #3018 (an upload
+        # session may answer 409 for a locked file) and matching word.py.
+        # This is not yet verified against a real tenant; narrow it here and
+        # in word.py together once the actual status codes are known. Text
+        # uploads keep the raw 409.
         if _upload_status_code(e) in (409, 423):
             return _resource_locked_error("overwritten")
         return _error(str(e))
@@ -1760,7 +1784,12 @@ def onedrive_create_folder(
 
 @mcp.tool()
 def onedrive_rename_item(item_id: str, new_name: str) -> str:
-    """Rename a OneDrive file or folder by item_id."""
+    """Rename a OneDrive file or folder by item_id.
+
+    If the item, or a file in a folder, is locked, this tool returns
+    code="resource_locked"; do not retry until the user confirms that it has
+    been closed or checked in.
+    """
     try:
         if not new_name.strip():
             raise ValueError("new_name is required")
@@ -1772,7 +1801,7 @@ def onedrive_rename_item(item_id: str, new_name: str) -> str:
         return _success(item=_caller_safe_drive_item(result))
     except Exception as e:
         logger.error("Error renaming OneDrive item %s: %s", item_id, e)
-        return _item_write_error(e, "renamed", new_name=new_name)
+        return _item_write_error(e, "renamed", is_file_write=False, new_name=new_name)
 
 
 _CROSS_DRIVE_MOVE_MESSAGE = (
@@ -1972,7 +2001,12 @@ def onedrive_move_item(
 
 @mcp.tool()
 def onedrive_delete_item(item_id: str) -> str:
-    """Delete a OneDrive file or folder by item_id."""
+    """Delete a OneDrive file or folder by item_id.
+
+    If the item, or a file in a folder, is locked, this tool returns
+    code="resource_locked"; do not retry until the user confirms that it has
+    been closed or checked in.
+    """
     try:
         _graph_request(
             "DELETE",
@@ -1981,7 +2015,7 @@ def onedrive_delete_item(item_id: str) -> str:
         return _success(message="Item deleted successfully")
     except Exception as e:
         logger.error("Error deleting OneDrive item %s: %s", item_id, e)
-        return _item_write_error(e, "deleted")
+        return _item_write_error(e, "deleted", is_file_write=False)
 
 
 if __name__ == "__main__":

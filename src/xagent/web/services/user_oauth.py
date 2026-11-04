@@ -157,6 +157,10 @@ def delete_scoped_user_oauth_accounts(
     Transaction ownership remains with the caller; this function never
     commits. Callers must not retain matching identity-mapped rows because the
     bulk delete does not synchronize those in-memory objects.
+
+    Deleting a Composio-backed grant also deletes its Composio connected
+    account, best-effort, after the caller's transaction commits; a rollback
+    keeps it.
     """
     if isinstance(providers, str):
         raise TypeError("providers must be a sequence, not a string")
@@ -168,4 +172,11 @@ def delete_scoped_user_oauth_accounts(
         user_id=user_id,
         resource_owner_key=resource_owner_key,
     ).filter(UserOAuth.provider.in_(provider_keys))
-    return int(query.delete(synchronize_session=False))
+    from ..composio_auth import composio_account_ids, schedule_account_deletions
+
+    # A Composio-backed grant also lives at Composio; it is deleted there only
+    # once the caller commits this local delete.
+    composio_accounts = composio_account_ids(query)
+    deleted = int(query.delete(synchronize_session=False))
+    schedule_account_deletions(db, user_id=user_id, account_ids=composio_accounts)
+    return deleted

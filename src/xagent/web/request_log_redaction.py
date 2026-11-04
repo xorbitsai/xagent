@@ -26,6 +26,9 @@ _SENSITIVE_QUERY_NAMES = frozenset(
         "apikey",
         "auth",
         "code",
+        # Composio's hosted-auth redirects (web/composio_auth.py): the
+        # single-use verification session and the connection it activates.
+        "connected_account_id",
         "credential",
         "id_token",
         "jwt",
@@ -34,6 +37,7 @@ _SENSITIVE_QUERY_NAMES = frozenset(
         "refresh_token",
         "secret",
         "session",
+        "session_uri",
         "sig",
         "signature",
         "state",

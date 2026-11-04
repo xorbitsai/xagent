@@ -2760,11 +2760,20 @@ async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
         ]
     )
     pattern = DAGPattern(generator, max_completion_replans=1)
+    assessments: list[tuple[str, Any]] = []
+
+    class AssessmentTracer(TracerCheckpointStore):
+        async def trace_event(
+            self, event_type: Any, *, data: dict[str, Any], **_: Any
+        ) -> None:
+            if data.get("phase") == "dag_completion_assessment":
+                assessments.append((event_type.action.value, data.get("prompt_prefix")))
 
     result = await pattern.run(
         context=ExecutionContext(execution_id="dag-completion-replan"),
         tools=[],
         llm=llm,
+        runtime=PatternRuntime(tracer=AssessmentTracer()),
     )
 
     assert result["success"] is True
@@ -2777,6 +2786,9 @@ async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
     assert generator.requests[1].replan is True
     assert generator.requests[1].completion_feedback == "Add a second step."
     assert generator.requests[1].completed_step_results == {"first": "first done"}
+    assert [action for action, _ in assessments] == ["start", "end", "start", "end"]
+    assert assessments[0][1] is not None and assessments[0][1] == assessments[1][1]
+    assert assessments[2][1] is not None and assessments[2][1] == assessments[3][1]
 
 
 def test_dag_completion_assessment_keeps_user_request_as_scope_authority() -> None:

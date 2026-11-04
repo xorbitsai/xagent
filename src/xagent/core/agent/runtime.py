@@ -76,6 +76,7 @@ from .context.execution import (
     context_checkpoint_gate,
     derive_compact_threshold,
 )
+from .prompt_prefix import PROMPT_PREFIX_KEY, PromptPrefixObserver
 from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
@@ -347,6 +348,9 @@ class PatternRuntime:
     """
 
     tracer: Any | None = None
+    _prompt_prefix_observer: PromptPrefixObserver | None = field(
+        default=None, init=False, repr=False
+    )
     execution_id: str | None = None
     interrupt_checker: Callable[[], bool] | Callable[[], Any] | None = None
     outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
@@ -1594,6 +1598,23 @@ class PatternRuntime:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         event_metadata = metadata or {}
+        if callable(getattr(self.tracer, "trace_event", None)):
+            if self._prompt_prefix_observer is None:
+                self._prompt_prefix_observer = PromptPrefixObserver()
+            observation = self._prompt_prefix_observer.observe(
+                messages,
+                tools,
+                scope=(
+                    str(getattr(context, "execution_id", "")),
+                    str(event_metadata.get("step_id") or self._step_id(context)),
+                    str(event_metadata.get("selected_model") or ""),
+                ),
+                call_kind=call_kind_from_metadata(event_metadata),
+                phase=str(event_metadata.get("phase") or ""),
+            )
+            if metadata is not None:
+                metadata[PROMPT_PREFIX_KEY] = observation
+            event_metadata = {**event_metadata, PROMPT_PREFIX_KEY: observation}
         if PROMPT_COMPOSITION_KEY not in event_metadata:
             # Call sites without tool-origin knowledge (compaction) still get
             # sizes. Written into the caller's dict so the matching

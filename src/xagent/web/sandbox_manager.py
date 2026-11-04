@@ -29,6 +29,9 @@ from ..config import (
     get_sandbox_network,
     get_sandbox_sweep_interval,
     get_sandbox_volumes,
+    get_sandbox_workspace_mount_mode,
+    get_sandbox_workspace_volume,
+    get_sandbox_workspace_volume_root,
     get_sandbox_worker_id,
     get_sandbox_worker_namespace,
     get_storage_root,
@@ -48,6 +51,7 @@ from ..sandbox.base import (
     SandboxContractError,
     SandboxInfo,
     SandboxInspection,
+    SandboxMount,
     SandboxMountIntent,
     SandboxNotFoundError,
     SandboxReconcileUnsupportedError,
@@ -1196,6 +1200,7 @@ class SandboxManager:
             memory=info.config.memory,
             env=info.config.env,
             volumes=info.config.volumes,
+            mounts=info.config.mounts,
             network_isolated=bool(info.config.network_isolated),
             ports=info.config.ports,
             pids_limit=info.config.pids_limit,
@@ -1225,6 +1230,9 @@ class SandboxManager:
         volumes += self._make_default_volumes(
             lifecycle_type, lifecycle_id, mount_intent=mount_intent
         )
+        mounts = self._make_workspace_volume_mounts(
+            lifecycle_type, lifecycle_id, mount_intent=mount_intent
+        )
         return ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image",
             image=image,
@@ -1233,6 +1241,7 @@ class SandboxManager:
             memory=config.memory,
             env=config.env,
             volumes=volumes,
+            mounts=mounts,
             network_isolated=bool(config.network_isolated),
             ports=config.ports,
             pids_limit=config.pids_limit,
@@ -1261,16 +1270,74 @@ class SandboxManager:
         volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
         path_mapper = SandboxPathMapper.from_env()
 
-        for backend_path, _should_create in self._workspace_mount_paths(
-            lifecycle_type,
-            lifecycle_id,
-            mount_intent,
-        ):
-            self._append_unique_volume(
-                volumes, path_mapper.volume_for_backend_path(backend_path, "rw")
-            )
+        if get_sandbox_workspace_mount_mode() == "bind":
+            for backend_path, _should_create in self._workspace_mount_paths(
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent,
+            ):
+                self._append_unique_volume(
+                    volumes, path_mapper.volume_for_backend_path(backend_path, "rw")
+                )
 
         return volumes
+
+    def _make_workspace_volume_mounts(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        mount_intent: SandboxMountIntent | None = None,
+    ) -> list[SandboxMount]:
+        """Build fail-closed named-volume subpath mounts for workspaces."""
+        if get_sandbox_workspace_mount_mode() != "volume_subpath":
+            return []
+        volume = get_sandbox_workspace_volume()
+        volume_root = get_sandbox_workspace_volume_root()
+        if volume is None or volume_root is None:
+            raise SandboxContractError(
+                "volume_subpath mode requires both "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME and "
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT"
+            )
+
+        canonical_root = Path(
+            canonical_sandbox_path(str(absolute_backend_mount_path(volume_root)))
+        )
+        if Path(os.path.realpath(canonical_root)) != canonical_root:
+            raise SandboxContractError(
+                "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT must not be a symlink"
+            )
+
+        mounts: list[SandboxMount] = []
+        for backend_path, _should_create in self._workspace_mount_paths(
+            lifecycle_type, lifecycle_id, mount_intent
+        ):
+            target = Path(
+                canonical_sandbox_path(str(absolute_backend_mount_path(backend_path)))
+            )
+            try:
+                relative = target.relative_to(canonical_root)
+            except ValueError as exc:
+                raise SandboxContractError(
+                    "Every workspace mount must be below "
+                    "XAGENT_SANDBOX_WORKSPACE_VOLUME_ROOT in volume_subpath mode"
+                ) from exc
+            subpath = relative.as_posix()
+            if subpath in {"", "."}:
+                raise SandboxContractError(
+                    "A sandbox cannot mount the workspace volume root"
+                )
+            mounts.append(
+                SandboxMount(
+                    type="volume",
+                    source=volume,
+                    target=str(target),
+                    mode="rw",
+                    subpath=subpath,
+                )
+            )
+        return mounts
 
     async def _resolve_backend_probe(self) -> bool:
         """Resolve and cache ``await service.supports_runtime_spec()``.

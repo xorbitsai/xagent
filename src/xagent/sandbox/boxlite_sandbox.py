@@ -533,6 +533,10 @@ async def _create_or_reuse_box(  # type: ignore[no-any-unimported]
     runtime: boxlite.Boxlite,
 ) -> SimpleBox:
     """Create a new Box."""
+    if config.mounts:
+        raise ValueError(
+            "Structured named-volume mounts require the Docker sandbox backend"
+        )
     if config.ports and config.network_isolated:
         raise ValueError(
             "Published ports cannot be combined with isolated guest networking"

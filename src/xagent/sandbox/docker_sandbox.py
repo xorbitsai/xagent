@@ -32,12 +32,14 @@ from typing import (
 )
 
 from docker import errors, from_env
+from docker.types import Mount as DockerMount
 
 from ..config import (
     get_sandbox_image,
     get_sandbox_namespace,
     get_sandbox_network,
     get_sandbox_pids_limit,
+    get_sandbox_workspace_mount_mode,
     get_uploads_dir,
     validate_sandbox_namespace,
     validate_sandbox_network,
@@ -55,6 +57,7 @@ from .base import (
     SandboxConfig,
     SandboxInfo,
     SandboxInspection,
+    SandboxMount,
     SandboxNotFoundError,
     SandboxRuntimeConflictError,
     SandboxService,
@@ -95,6 +98,11 @@ _CPU_NANOS = 1_000_000_000
 _DOCKER_RUNTIME_SECURITY_PROFILE = "nonroot-docker-dedicated-network-v2"
 SANDBOX_NETWORK_LABEL = "xagent.sandbox.network"
 SANDBOX_NETWORK_LABEL_VALUE = "v1"
+
+
+def _version_at_least(value: object, minimum: tuple[int, int]) -> bool:
+    match = re.match(r"^(\d+)\.(\d+)", str(value or ""))
+    return bool(match and tuple(map(int, match.groups())) >= minimum)
 
 
 def _effective_pids_limit(config: SandboxConfig) -> int | None:
@@ -284,6 +292,57 @@ def _get_state(status: str | None) -> str:
     return "unknown"
 
 
+def _parse_mount_facts(
+    attrs: dict[str, Any],
+) -> tuple[list[tuple[str, str, str]], list[SandboxMount]]:
+    """Read legacy binds and structured mounts from Docker inspect data.
+
+    Docker reports effective mount points in top-level ``Mounts``, but keeps
+    ``VolumeOptions.Subpath`` only in ``HostConfig.Mounts``.  The latter is
+    therefore authoritative for structured mounts.  Binds represented there
+    are excluded from the legacy list so one mount is not compared twice.
+    """
+    host_config = cast(dict[str, Any], attrs.get("HostConfig") or {})
+    structured: list[SandboxMount] = []
+    structured_keys: set[tuple[str, str]] = set()
+    for raw in cast(list[dict[str, Any]], host_config.get("Mounts") or []):
+        mount_type = str(raw.get("Type") or "")
+        if mount_type not in {"bind", "volume"}:
+            raise SandboxRuntimeConflictError(
+                f"Unsupported structured sandbox mount type: {mount_type!r}"
+            )
+        source = str(raw.get("Source") or "")
+        target = str(raw.get("Target") or "")
+        volume_options = cast(dict[str, Any], raw.get("VolumeOptions") or {})
+        subpath = volume_options.get("Subpath")
+        try:
+            mount = SandboxMount(
+                type=cast(Any, mount_type),
+                source=source,
+                target=target,
+                mode=cast(Any, "ro" if bool(raw.get("ReadOnly")) else "rw"),
+                subpath=str(subpath) if subpath is not None else None,
+            )
+        except ValueError as exc:
+            raise SandboxRuntimeConflictError(
+                "Docker reported an invalid structured sandbox mount"
+            ) from exc
+        structured.append(mount)
+        structured_keys.add((mount.source, mount.target))
+
+    volumes: list[tuple[str, str, str]] = []
+    for raw in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
+        if raw.get("Type") != "bind":
+            continue
+        source = str(raw.get("Source") or "")
+        target = str(raw.get("Destination") or "")
+        if not source or not target or (source, target) in structured_keys:
+            continue
+        mode = "ro" if bool(raw.get("RW")) is False else "rw"
+        volumes.append((source, target, mode))
+    return volumes, structured
+
+
 def _parse_container_config(container: Container) -> SandboxInfo:
     """Reconstruct SandboxInfo from Docker inspect data."""
     attrs = cast(dict[str, Any], container.attrs)
@@ -298,16 +357,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
             key, value = item.split("=", 1)
             env_map[key] = value
 
-    volumes: list[tuple[str, str, str]] = []
-    # Only bind mounts
-    for mount in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
-        if mount.get("Type") != "bind":
-            continue
-        source = str(mount.get("Source") or "")
-        target = str(mount.get("Destination") or "")
-        mode = "ro" if bool(mount.get("RW")) is False else "rw"
-        if source and target:
-            volumes.append((source, target, mode))
+    volumes, mounts = _parse_mount_facts(attrs)
 
     ports: list[tuple[int, int]] = []
     port_bindings = cast(
@@ -344,6 +394,7 @@ def _parse_container_config(container: Container) -> SandboxInfo:
         pids_limit=pids_limit,
         env=env_map or None,
         volumes=volumes or None,
+        mounts=mounts or None,
         network_isolated=bool(
             attrs.get("NetworkSettings", {}).get("Networks") == {}
             or host_config.get("NetworkMode") == "none"
@@ -396,15 +447,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
             key, value = item.split("=", 1)
             env_map[key] = value
 
-    volumes: list[tuple[str, str, str]] = []
-    for mount in cast(list[dict[str, Any]], attrs.get("Mounts") or []):
-        if mount.get("Type") != "bind":
-            continue
-        source = str(mount.get("Source") or "")
-        target = str(mount.get("Destination") or "")
-        mode = "ro" if bool(mount.get("RW")) is False else "rw"
-        if source and target:
-            volumes.append((source, target, mode))
+    volumes, mounts = _parse_mount_facts(attrs)
 
     ports: list[tuple[int, int]] = []
     port_bindings = cast(
@@ -442,6 +485,7 @@ def _build_inspection(container: Container) -> SandboxInspection:
         labels=labels,
         created_at=cast(Optional[str], attrs.get("Created")),
         working_dir=cast(Optional[str], config_data.get("WorkingDir")),
+        mounts=tuple(mounts),
     )
     return SandboxInspection(
         state="running" if _get_state(raw_status) == "running" else "stopped",
@@ -473,6 +517,7 @@ def _attestation_label(value: Optional[str]) -> Optional[str]:
 
 def _check_no_conflicting_volumes(
     volumes: Optional[list[tuple[str, str, str]]],
+    mounts: Optional[list[SandboxMount]] = None,
 ) -> None:
     """Reject desired volumes that collide on either side of the mount.
 
@@ -496,11 +541,11 @@ def _check_no_conflicting_volumes(
     uses) so equivalent-but-differently-spelled paths are treated as the
     same key on both sides.
     """
-    if not volumes:
+    if not volumes and not mounts:
         return
     seen_by_host: dict[str, tuple[str, str]] = {}
-    seen_by_guest: dict[str, tuple[str, str]] = {}
-    for host_path, guest_path, mode in volumes:
+    seen_by_guest: dict[str, tuple[str, ...]] = {}
+    for host_path, guest_path, mode in volumes or []:
         normalized_host = canonical_sandbox_path(host_path)
         normalized_guest = canonical_sandbox_path(guest_path)
 
@@ -521,6 +566,20 @@ def _check_no_conflicting_volumes(
                 f"{normalized_guest!r}: {prior_for_guest} vs {guest_key}"
             )
         seen_by_guest[normalized_guest] = guest_key
+
+    for mount in mounts or []:
+        structured_guest_key = (
+            mount.type,
+            mount.source,
+            mount.mode,
+            mount.subpath or "",
+        )
+        prior_for_guest = seen_by_guest.get(mount.target)
+        if prior_for_guest is not None and prior_for_guest != structured_guest_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting desired mounts for guest path {mount.target!r}"
+            )
+        seen_by_guest[mount.target] = structured_guest_key
 
 
 def _check_no_conflicting_ports(
@@ -624,6 +683,8 @@ def _find_publish_mismatches(
         mismatches.append("image")
     if set(facts.volumes) != set(desired.volumes):
         mismatches.append("volumes")
+    if set(facts.mounts) != set(desired.mounts):
+        mismatches.append("mounts")
     if set(facts.ports) != set(desired.ports):
         mismatches.append("ports")
     if facts.working_dir != desired.working_dir:
@@ -1151,6 +1212,7 @@ async def _create_container(
     deployment's owner. This function is the single owner of their value
     for every container it creates."""
     await _ensure_image(client, image)
+    _check_no_conflicting_volumes(config.volumes, config.mounts)
 
     volumes: dict[str, dict[str, str]] | None = None
     if config.volumes:
@@ -1158,6 +1220,22 @@ async def _create_container(
             host_path: {"bind": guest_path, "mode": mode}
             for host_path, guest_path, mode in config.volumes
         }
+
+    mounts: list[DockerMount] | None = None
+    if config.mounts:
+        mounts = [
+            DockerMount(
+                target=mount.target,
+                source=mount.source,
+                type=mount.type,
+                read_only=mount.mode == "ro",
+                no_copy=mount.type == "volume",
+                # docker 7.2 implements this argument; types-docker's latest
+                # 7.1-derived stub has not caught up yet.
+                subpath=mount.subpath,  # type: ignore[call-arg]
+            )
+            for mount in sorted(set(config.mounts))
+        ]
 
     ports: dict[str, int] | None = None
     if config.ports:
@@ -1196,6 +1274,7 @@ async def _create_container(
         # intentionally configured another value.
         "environment": {"HOME": "/home/sandbox", **(config.env or {})},
         "volumes": volumes,
+        "mounts": mounts,
         "ports": ports,
         "nano_cpus": int((config.cpus or 1) * _CPU_NANOS),
         "mem_limit": (config.memory or 512) * 1024 * 1024,
@@ -1215,6 +1294,7 @@ async def _create_container(
     if effective_pids_limit is not None:
         kwargs["pids_limit"] = effective_pids_limit
     guest_paths = [guest for _, guest, _ in (config.volumes or [])]
+    guest_paths.extend(mount.target for mount in (config.mounts or []))
     if any(path.startswith("/root/") for path in guest_paths):
         # The stock image keeps /root at 0700. A private tmpfs supplies only
         # traversable parents for nested workspace bind mounts; it exposes no
@@ -1588,7 +1668,7 @@ class DockerSandboxService(SandboxService):
                 resolved_image = template.image or DEFAULT_SANDBOX_IMAGE
                 spec_image, spec_snapshot_id = resolved_image, None
 
-            _check_no_conflicting_volumes(config.volumes)
+            _check_no_conflicting_volumes(config.volumes, config.mounts)
             _check_no_conflicting_ports(config.ports)
 
             desired = ResolvedSandboxRuntimeSpec.from_parts(
@@ -1600,6 +1680,7 @@ class DockerSandboxService(SandboxService):
                 memory=config.memory,
                 env=config.env,
                 volumes=config.volumes,
+                mounts=config.mounts,
                 network_isolated=bool(config.network_isolated),
                 ports=config.ports,
                 pids_limit=_effective_pids_limit(config),
@@ -1965,6 +2046,20 @@ class DockerSandboxService(SandboxService):
                 "docker-socket-proxy is in use, allow the /info endpoint "
                 "(for Tecnativa/docker-socket-proxy, set INFO=1)."
             ) from exc
+        if get_sandbox_workspace_mount_mode() == "volume_subpath":
+            try:
+                daemon_version = self._client.version()
+            except Exception as exc:
+                raise SandboxRuntimeConflictError(
+                    "Cannot verify Docker Engine support for volume subpaths"
+                ) from exc
+            if not _version_at_least(daemon_version.get("Version"), (26, 0)) or not (
+                _version_at_least(daemon_version.get("ApiVersion"), (1, 45))
+            ):
+                raise SandboxRuntimeConflictError(
+                    "volume_subpath mode requires Docker Engine >= 26.0 and "
+                    "API >= 1.45; bind fallback is intentionally disabled"
+                )
         try:
             sandbox_network = self._client.networks.get(self._network)
         except errors.NotFound as exc:

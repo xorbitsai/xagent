@@ -536,7 +536,9 @@ class TestTaskTracker:
         monkeypatch.setattr(database, "_SessionLocal", session_factory)
         usage_hook_calls: list[int] = []
         quota_hooks.set_usage_record_hook(
-            lambda _db, _user_id, _details, _actions: usage_hook_calls.append(1)
+            lambda _db, _user_id, _details, _actions, *, task_id=None: (
+                usage_hook_calls.append(1)
+            )
         )
         try:
             tracker = TaskTracker(task_id=123, expected_run_id="run-a")
@@ -607,7 +609,9 @@ class TestTaskTracker:
         monkeypatch.setattr(database, "_SessionLocal", session_factory)
         usage_hook_calls: list[int] = []
         quota_hooks.set_usage_record_hook(
-            lambda _db, _user_id, _details, _actions: usage_hook_calls.append(1)
+            lambda _db, _user_id, _details, _actions, *, task_id=None: (
+                usage_hook_calls.append(1)
+            )
         )
         periodic_tracker = None
         try:
@@ -756,7 +760,7 @@ class TestTaskTracker:
 
         monkeypatch.setattr(database, "_SessionLocal", session_factory)
 
-        def pool_pressured_usage_hook(db, *_args):
+        def pool_pressured_usage_hook(db, *_args, task_id=None):
             # The fenced counter commit has returned its connection. Occupy that
             # only slot before the hook's compatibility-session read, reproducing
             # a real QueuePool checkout timeout inside best-effort metering.
@@ -832,7 +836,7 @@ class TestTaskTracker:
             hook_sessions.append(db)
             return None
 
-        def usage_hook(db, user_id, delta_details, delta_actions):
+        def usage_hook(db, user_id, delta_details, delta_actions, *, task_id=None):
             hook_threads.append(threading.get_ident())
             hook_sessions.append(db)
 
@@ -1094,9 +1098,12 @@ class TestTaskTracker:
 
         captured = {}
 
-        def _hook(db, user_id, delta_details, delta_actions):
+        def _hook(db, user_id, delta_details, delta_actions, *, task_id=None):
             captured.update(
-                user_id=user_id, details=delta_details, actions=delta_actions
+                user_id=user_id,
+                details=delta_details,
+                actions=delta_actions,
+                task_id=task_id,
             )
 
         quota_hooks.set_usage_record_hook(_hook)
@@ -1113,6 +1120,8 @@ class TestTaskTracker:
             quota_hooks.set_usage_record_hook(None)
 
         assert captured["user_id"] == 42
+        # The metered run's task, so the hook can attribute the usage to it.
+        assert captured["task_id"] == 123
         assert captured["actions"] == 3  # only this turn's tool calls (baseline was 0)
         # Only the two entries appended this turn, not the two seeded ones.
         assert len(captured["details"]) == 2

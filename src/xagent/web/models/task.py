@@ -412,27 +412,31 @@ class Task(Base):  # type: ignore
     # compare in Python -- so an index would be pure write cost.
     lease_attempt_id = Column(String(64), nullable=True)
 
-    # Protocol version of the interaction row that will back this task's
-    # current wait. Three writer groups are spoken for. The three wait
-    # finalizers will write it (1 when a row was staged, NULL when staging
-    # degraded) and have no writer yet. The four legacy-resume injection
-    # sites (the two WebSocket sites, the A2A resume-input path, and the
-    # v1 reply resume-input path) retire the row they answered and clear
-    # this column back to NULL in the same transaction, the clear
-    # conditioned on no active row for that run remaining afterwards;
-    # that writer already exists in task_interaction_close.py
-    # (close_legacy_resume_interaction). The three resume-abandonment
-    # paths have no row to retire and only reconcile the column, under
-    # the same condition; that writer also already exists in
-    # task_interaction_close.py
-    # (clear_interaction_marker_if_unpaired), called from the A2A prelease
-    # restore (a2a.py), the WebSocket lease restore (websocket.py), and
-    # the v1 reply prelease restore (task_reply.py), all
-    # production-reachable. Readers will need to gate on status ==
-    # WAITING_FOR_USER first: a task that left the waiting state by a path
-    # with no injection site (cancel, delete, failure, TTL reclaim, admin
-    # cleanup) will be able to carry a stale 1, and the next wait will
-    # overwrite it either way.
+    # Protocol version of the interaction row that backs this task's
+    # current wait. Four writer groups. The three wait finalizers
+    # (task_execution.py, managed_task_lease.py) write 1 in the settlement
+    # transaction when create() has staged a row, which needs the rollout
+    # policy to allow native publication; when nothing is published they
+    # do not write it. The four legacy-resume injection sites
+    # (handle_task_message, execute_resume_background,
+    # _update_a2a_resume_input_sync and _update_reply_input_sync) retire
+    # the row they answered and clear this column back to NULL in the same
+    # transaction, the clear conditioned on no active row for that run
+    # remaining afterwards (close_legacy_resume_interaction,
+    # task_interaction_close.py). The three resume-abandonment paths
+    # (_restore_a2a_resume_prelease_sync, _restore_reply_prelease_sync and
+    # _restore_resumed_task_lease_to_prior_status) have no row to retire
+    # and only reconcile the column, under the same condition
+    # (clear_interaction_marker_if_unpaired, task_interaction_close.py).
+    # The question cancel terminates the active row and reconciles the
+    # column the same way (terminate_active_interaction_for_question_cancel,
+    # task_interaction_close.py). The read surface's consumers gate on
+    # status == WAITING_FOR_USER first: a task that left the waiting state
+    # by a path with no injection site (task cancel, delete, failure, TTL
+    # reclaim, admin cleanup) can carry a stale 1. A later wait that
+    # publishes writes 1 again; one that does not publish leaves the value
+    # as it is, and the rich view then finds no active row and falls back
+    # to the transcript.
     #
     # Why a column on tasks rather than an EXISTS over
     # task_interaction_requests: the read surface's first check is

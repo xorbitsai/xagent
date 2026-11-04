@@ -515,30 +515,32 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     ``_assert_current_attempt`` in ``task_interaction_staging.py`` records
     what that costs
     on SQLite, where SQLAlchemy drops ``with_for_update()`` and only
-    single-writer semantics keep the window shut. Choosing among those
-    belongs to the change that introduces the first call site, together
-    with the structured answering path it would race; neither exists yet,
-    so nothing is arranged here. A passing SQLite test says nothing either
-    way about that ordering, for the reason the staging module documents.
+    single-writer semantics keep the window shut. Its callers supply that
+    ordering themselves, and today both kinds call it while their own
+    transaction already holds the task row's write lock: the finalizers that
+    publish a native clarification (``task_execution.py``,
+    ``managed_task_lease.py``) hold it through their settlement lock read or
+    their fenced lease-release ``UPDATE``, and the question cancel
+    (``task_question_cancel.py``) through its fenced task ``UPDATE``. The
+    structured answering path that would race a relabel does not exist yet,
+    so no ordering against it is arranged here. A passing SQLite test says
+    nothing either way about that ordering, for the reason the staging
+    module documents.
 
-    This function has no caller in ``src/`` yet. The intended call site
-    sits inside ``interaction_handoff`` (``task_interaction_staging.py``),
-    after ``persist_assistant_message_no_commit``, and would supersede
-    the very transcript row that call staged — on purpose, because the
-    structured interaction row staged in the same turn is meant to become
-    the question a future protocol-version-gated reader serves instead.
-    Making that pending row visible to the UPDATE is the flush above, so
-    it is this function's own job and not a call-site obligation. That
-    reader gate does not exist yet: ``get_latest_waiting_question`` gates
-    on ``task_id``/``role``/``message_type`` only, nothing about protocol
-    version. This paragraph is therefore a contract on the follow-up that
-    introduces both the caller and that reader gate, not a description of
-    current behavior. The two remaining call-site obligations are carried
-    here, by this docstring, and a caller that lands without honouring
-    them is out of contract regardless of what its own tracking issue
-    says: call this only after the interaction row for the same turn is
-    staged, and never call it on a transcript question that is meant to
-    remain answerable.
+    Two kinds of caller in ``src/``, with different reasons. A finalizer
+    calls it after ``create()`` has returned with a newly staged native
+    interaction row, outside ``interaction_handoff``'s ``with`` block and
+    in the same settlement transaction: the structured row becomes the
+    question the protocol-version-gated reader
+    (``get_pending_interaction_question``, ``task_interaction_read.py``)
+    serves, so the transcript copy is relabelled. The question cancel calls
+    it after terminating the task's active interaction row, so a cancelled
+    question stops reading as pending. Making a row the caller staged
+    earlier in the same transaction visible to the UPDATE is the flush
+    above, so it is this function's own job and not a call-site obligation.
+    The remaining call-site obligation is carried here, by this docstring:
+    never call it on a transcript question that is meant to remain
+    answerable.
     """
 
     # ``Session.begin_nested()`` flushes the whole session before issuing the

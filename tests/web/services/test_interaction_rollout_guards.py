@@ -624,9 +624,19 @@ def _count_calls(symbol: str) -> list[tuple[Path, int]]:
     return hits
 
 
-def test_tw2a_evaluate_native_publication_has_zero_production_callers():
-    hits = _count_calls("evaluate_native_publication")
-    assert hits == [], f"unexpected production caller(s): {hits}"
+_PUBLICATION_GATE_CALL_SITES = [
+    ("managed_task_lease.py", "finalize_managed_task_lease_result"),
+    ("task_execution.py", "_finalize_resumed_task"),
+    ("task_execution.py", "_finalize_task_execution_result_isolated"),
+]
+
+
+def test_tw2a_evaluate_native_publication_is_called_only_by_the_three_finalizers():
+    # A list, not a set: a second call in one finalizer is red too.
+    assert (
+        sorted(_call_site_functions("evaluate_native_publication"))
+        == _PUBLICATION_GATE_CALL_SITES
+    )
 
 
 _GET_POLICY_SITE_WHITELIST = {

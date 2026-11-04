@@ -126,9 +126,10 @@ went in.
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
 (``_classify_close_rowcount``): exactly one row closed is the expected
-case and logs at info; zero rows is the overwhelmingly common case today
-(no production writer has inserted into ``task_interaction_requests``
-yet) and logs at debug, carrying with it a short description of why
+case and logs at info; zero rows is the common case, and the only one
+under the default rollout mode (the finalizers insert into
+``task_interaction_requests`` only when the rollout policy allows native
+publication), and logs at debug, carrying with it a short description of why
 nothing matched (``_unmatched_close_row``) -- "nothing was ever there"
 and "something was there and is no longer this run's live question" are
 the same rowcount and different situations; more than one row is
@@ -398,10 +399,13 @@ def active_interaction_id_sync(task_id: int) -> ActiveInteractionRead:
     message, and under a NULL marker it now costs one primary-key lookup
     instead of an uncached catalog inspection plus a two-table join.
 
-    That gate decides every call today: the only statements in ``src/``
-    that write the column are this module's two clears, and both of them
-    write ``NULL``, so the marker is NULL for every task and this branch
-    returns ``ActiveInteractionAbsent()`` before anything below it runs.
+    Under the default rollout mode that gate decides every call. Besides
+    this module's two clears, which write ``NULL``, the only statements in
+    ``src/`` that write the column are the three finalizers' native
+    publication, which writes ``1`` and runs only when the rollout policy
+    allows native publication. So under the default mode the marker is
+    NULL for every task and this branch returns ``ActiveInteractionAbsent()``
+    before anything below it runs.
 
     This is also the resume command seam's reader (the refusal gate in
     ``resume_task``, for a resume whose payload cannot prove it answered the
@@ -543,9 +547,10 @@ def close_legacy_resume_interaction(
     the marker only when no active row for this ``(task_id, run_id)``
     pair remains once the close above has had its turn. That covers the
     case this function is normally in (the close retired the one live
-    row, so nothing is left and the marker goes) and today's 100% case
-    (this run never staged a row at all, so nothing was ever there and
-    the marker still goes, since the table has no production writer yet),
+    row, so nothing is left and the marker goes) and the only case under
+    the default rollout mode (this run never staged a row at all, so
+    nothing was ever there and the marker still goes, since the finalizers
+    stage rows only when the rollout policy allows native publication),
     while refusing the case that used to lose a question: the
     pre-injection read came back ``None`` -- or came back with an id the
     close did not match -- while a live row is in fact still sitting

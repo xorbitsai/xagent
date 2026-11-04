@@ -32,10 +32,18 @@ task's answer slot -- a NULL marker in step 1, and the two fallback
 branches of the rich view in step 2. A marker value this reader does not
 recognize leaves the slot's state unknown, and unknown keeps the gate
 shut. Step 1 still costs one attribute access and no query: the gate value
-comes from the marker, which is already in memory. Once a writer for those
-relabelled rows exists, this gate is a client-visible change at all four
-consumers: a waiting task that renders an empty or generic waiting state
-today starts rendering the recovered question instead.
+comes from the marker, which is already in memory. The three finalizers
+that settle a waiting run are the only writers that relabel in the same
+transaction that moves a task into its wait: they do so together with
+writing an active native row and the marker, and only when the rollout
+policy allows native publication, so under the default legacy mode they
+relabel nothing and write no native row. The question cancel in
+``task_question_cancel.py`` also relabels, under any rollout mode, and it
+leaves the task completed; a later turn on that task can wait again, and
+the rows that cancel relabelled, from the earlier round, are still on the
+task. This gate is a client-visible change at all four consumers wherever
+it finds such a row: a waiting task that would otherwise render an empty
+or generic waiting state renders the recovered question instead.
 
 This function performs **no authorization**. It takes a ``Task`` object,
 not an id, precisely so that a caller has to have resolved and
@@ -88,12 +96,13 @@ answer, written here because this adapter's projection depends on them:
   window where the interface offers an answer the backend will not take
   is therefore wider than the unresolved-anchor tier this projection was
   originally reasoned about.
-* That window is **currently unreachable, and what makes it unreachable
-  is that no writer has been wired yet**, not this design. The seam only
-  triggers when an active native row exists, and nothing in production
-  writes one today, so every waiting read takes the marker fast path.
-  The change that wires the first finalizer makes it reachable, on the
-  day it merges.
+* That window is **reachable only when the rollout policy allows native
+  publication**, not closed by this design. The seam only triggers when an
+  active native row exists, and the only production writers of one are
+  the three finalizers that settle a waiting run, which publish only when
+  the policy allows it. Under the default legacy mode they write none, so
+  every waiting read takes the marker fast path; once the policy allows
+  publication, the window is open.
 * The seam is installed on the websocket resume path only. The a2a and
   v1 reply resume paths do not have it. So "no controls shown" and "a
   free-text answer would be refused anyway" agree on the websocket path

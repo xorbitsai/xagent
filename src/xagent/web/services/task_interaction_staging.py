@@ -61,11 +61,13 @@ Caller obligations, because none of them happen here:
   already committed in this transaction.
 
 One production caller today: ``task_interaction_service.create`` enters
-``interaction_handoff`` and calls ``stage()``. ``create()`` itself still
-has zero production callers, held there by a live gate
-(``tests/web/services/test_task_interaction_service_create_gate.py``), so
-the chain is not reachable in production yet. The old zero-caller gate on
-this module's two entry points was replaced by three static guards
+``interaction_handoff`` and calls ``stage()``. ``create()`` in turn is
+called only by the three finalizers that settle a waiting run
+(``task_execution.py`` and ``managed_task_lease.py``), pinned by
+``tests/web/services/test_task_interaction_service_create_gate.py``; they
+reach it only when the rollout policy allows native publication. The old
+zero-caller gate on this module's two entry points was replaced by three
+static guards
 (``tests/web/services/test_interaction_handoff_production_surface.py``)
 asserting: the only production use of ``interaction_handoff`` is
 ``task_interaction_service``, validation always runs before it is
@@ -451,9 +453,9 @@ _SWALLOWED: tuple[type[BaseException], ...] = (
 # other five's shared INTERACTION_HANDOFF_DEGRADED, precisely because it is
 # the one override that cannot be validated at this layer -- see
 # interaction_handoff's docstring. Keeping it separately addressable in
-# /health lets the change that wires the first production caller tell "a
-# run-partition anchor went stale" apart from every other reason a handoff
-# degraded, without having to reparse log lines to do it.
+# /health lets an operator tell "a run-partition anchor went stale" apart
+# from every other reason a handoff degraded, without having to reparse
+# log lines to do it.
 _DEGRADATION_SIGNALS: dict[type[BaseException], str] = {
     InteractionSlotTaken: INTERACTION_HANDOFF_DEGRADED,
     InteractionRequestClosed: INTERACTION_HANDOFF_DEGRADED,
@@ -1416,11 +1418,17 @@ def interaction_handoff(
     has already happened before this is ever called, and the attempt and
     anchor assertions that used to be caller obligations are now checked by
     ``handoff.stage()`` itself, on every call. The one obligation that
-    remains is structural, not sequential: the ``with`` block must be the
-    transaction's last word before the caller commits -- no I/O in between
-    -- because every write inside it, including the reclaim UPDATE, holds
-    SQLite's database-wide writer lock (or, on PostgreSQL, ordinary row
-    locks) for the whole span, not just an instant.
+    remains is structural, not sequential. This context manager's caller is
+    ``create()``, which returns once the ``with`` block exits; the finalizer
+    that called ``create()`` then commits. Between the block and that commit
+    only a bounded number of statements on the same session and connection
+    may run -- the finalizer's protocol-marker UPDATE, the legacy-question
+    relabel, and the rest of its own settlement (lease release, transcript
+    row, result fact, channel result and completion block) -- and never I/O
+    outside that connection, because every write inside the block,
+    including the reclaim UPDATE, holds SQLite's database-wide writer lock
+    (or, on PostgreSQL, ordinary row locks) for the whole span, not just an
+    instant.
 
     This handoff fails closed, on purpose, and does not inherit the
     silent-discard shape a sibling primitive in this package uses.
@@ -1505,12 +1513,16 @@ def interaction_handoff(
     (``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED``, kept separate from the
     other five's shared ``INTERACTION_HANDOFF_DEGRADED`` so it stays
     individually addressable on ``/health``) and a structured log line
-    naming the task, the lease's run, and the anchor's run partition. This
-    override ships with zero production callers and therefore zero
-    real-world reachability data for it: **the change that wires the first
-    production caller -- the one that removes the zero-production-caller
-    AST gate -- must re-adjudicate this policy once a real reachability
-    picture exists**, not carry it forward unexamined.
+    naming the task, the lease's run, and the anchor's run partition. The
+    override stands now that the finalizers call this through ``create()``.
+    In the write direction the mismatch can only mean the anchor a
+    finalizer resolved and the lease's run disagree, and every finalizer
+    resolves the anchor while it holds the task row's lock and stages
+    immediately after, so the two read one run identity. Degrading to "no
+    native row this round; the question stays a transcript message" is
+    safer than failing the whole settlement over it. The expected frequency
+    of the dedicated signal is zero; a nonzero rate is a reason to
+    investigate. This reasoning covers the write direction only.
 
     Every degradation signal this module registers is sticky in a way none
     of ``ops_signals.py``'s other six signals are.

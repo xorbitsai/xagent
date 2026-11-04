@@ -35,20 +35,29 @@ first, so that the classification a caller observes always names the first
 thing that actually went wrong -- never a later, coincidentally-true guard
 that happens to fail on the same input for an unrelated reason.
 
-Callers. This function's caller set is exactly the finalizers that settle a
-task run against its lease and load the task row under a lock: nothing else
-holds the combination of task, lease and anchor this function's guards
+Callers. This function's caller set is exactly the three finalizers that
+settle a task run against its lease: ``_finalize_task_execution_result_isolated``
+and ``_finalize_resumed_task`` (``task_execution.py``) and
+``finalize_managed_task_lease_result`` (``managed_task_lease.py``). Nothing
+else holds the combination of task, lease and anchor this function's guards
 depend on. A caller reached from anywhere else -- a builder chat session, a
 nested sub-agent's own turn -- was never going to be a caller in the first
 place, and this module makes no claim about what happens there. Extending
 the caller set to a fourth site is a reason to come back and re-read this
 module, not to assume its guards still describe the new caller's situation.
 
-Timing is as strict as the caller set: the finalizer must call this
-function before it releases the lease, against the same task row it
-already holds locked under ``SELECT ... FOR UPDATE`` -- never a row
-re-read afterward, which could already reflect a different attempt's
-ownership by the time this function's ownership and attempt guards run.
+Timing is as strict as the caller set. The two ``task_execution.py``
+finalizers call this function before they release the lease, against the
+task row they loaded under their settlement lock
+(``lock_task_lease_for_settlement_no_commit`` and a ``SELECT ... FOR
+UPDATE`` on PostgreSQL). The managed-lease finalizer calls it after its
+lease release, against the row it re-reads in that same transaction: the
+release's fenced ``UPDATE`` holds the row's lock until the transaction
+ends, and under the coordinator that owns the lease it leaves the lease
+identity columns in place, so the ownership and attempt guards still
+compare against this lease. No caller passes a row read in another
+transaction, which could already reflect a different attempt's ownership
+by the time this function's ownership and attempt guards run.
 
 This module is also the only place allowed to construct or parse the JSON
 shape a published row's ``request_payload`` carries -- see

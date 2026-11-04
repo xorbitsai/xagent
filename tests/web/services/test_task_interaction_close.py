@@ -1080,10 +1080,11 @@ def test_only_resume_task_returns_from_a_branch_on_the_active_interaction_read()
 
 
 # --------------------------------------------------------------------------
-# Statement-count pin for the marker gate: on every deployment today (the
-# protocol marker is NULL for every task -- see active_interaction_id_sync's
-# own docstring), the marker gate short-circuits before the row lookup, so
-# this reader issues exactly one statement and returns ActiveInteractionAbsent
+# Statement-count pin for the marker gate: under the default rollout mode
+# (where the protocol marker is NULL for every task -- see
+# active_interaction_id_sync's own docstring), the marker gate
+# short-circuits before the row lookup, so this reader issues exactly one
+# statement and returns ActiveInteractionAbsent
 # rather than paying for the uncached catalog inspection plus the two-table
 # join below it. This test covers only that success path: the marker read
 # itself can raise (see

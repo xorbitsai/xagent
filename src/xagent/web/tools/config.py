@@ -5374,7 +5374,26 @@ class WebToolConfig(BaseToolConfig):
             .order_by(MCPServer.id)
         )
 
-    async def load_mcp_server_config(self, server_id: int) -> Dict[str, Any] | None:
+    def resolve_connector_team_selection(self) -> Any:
+        """Resolve the governing connector team once for this config."""
+        from ..services.connector_team_scope import resolve_team_connector_selection_or_raise
+
+        return resolve_team_connector_selection_or_raise(
+            self.db, team_id=self._connector_team_id, log_subject=self._user_id
+        )
+
+    def visible_mcp_server_query(self, *, team_selection: Any | None = None) -> Any:
+        """Return visible MCP servers, reusing an already resolved team scope."""
+        selection = (
+            team_selection
+            if team_selection is not None
+            else self.resolve_connector_team_selection()
+        )
+        return self._visible_mcp_server_query(selection.mcp_ids)
+
+    async def load_mcp_server_config(
+        self, server_id: int, *, team_selection: Any | None = None
+    ) -> Dict[str, Any] | None:
         """Build one visible server's config exactly as a task would, uncached.
 
         Returns None when the server is not visible to this config's user.
@@ -5383,15 +5402,44 @@ class WebToolConfig(BaseToolConfig):
         """
         if self._user_id is None:
             return None
-        for config in await self._load_mcp_server_configs(only_server_id=server_id):
+        for config in await self._load_mcp_server_configs(
+            only_server_id=server_id, team_selection=team_selection
+        ):
             inner = config.get("config")
             unavailable_id = inner.get("server_id") if isinstance(inner, dict) else None
             if server_id in (config.get("id"), unavailable_id):
                 return config
         return None
 
+    async def load_actor_stdio_config(
+        self, app_id: str, *, team_selection: Any | None = None
+    ) -> Dict[str, Any] | None:
+        """Build one actor stdio config without formatting ordinary servers."""
+        from ..services.actor_mcp_runtime import resolve_actor_mcp_stdio_configs
+
+        if self._user_id is None:
+            return None
+        selection = (
+            team_selection
+            if team_selection is not None
+            else self.resolve_connector_team_selection()
+        )
+        servers = self.visible_mcp_server_query(team_selection=selection).all()
+        resolution = resolve_actor_mcp_stdio_configs(
+            self.db,
+            user_id=int(self._user_id),
+            policy=self._mcp_runtime_authorization_policy,
+            adapter=self._mcp_actor_stdio_connection_adapter,
+            visible_servers=servers,
+            execution_identity=self._mcp_actor_execution_identity,
+        )
+        return next(
+            (config for config in resolution.configs if config.get("name") == app_id),
+            None,
+        )
+
     async def _load_mcp_server_configs(
-        self, *, only_server_id: int | None = None
+        self, *, only_server_id: int | None = None, team_selection: Any | None = None
     ) -> List[Dict[str, Any]]:
         """Load MCP server configurations visible to this run: the user's
         personal servers, unioned with the governing agent's team-owned
@@ -5414,15 +5462,8 @@ class WebToolConfig(BaseToolConfig):
         # for "the scope could not be resolved". The typed error is what
         # survives the tool-creator frame -- an untyped one is dropped there
         # with a WARNING and no tool set at all.
-        from ..services.connector_team_scope import (
-            resolve_team_connector_selection_or_raise,
-        )
-
-        team_selection = resolve_team_connector_selection_or_raise(
-            self.db,
-            team_id=self._connector_team_id,
-            log_subject=self._user_id,
-        )
+        if team_selection is None:
+            team_selection = self.resolve_connector_team_selection()
         team_mcp_ids = team_selection.mcp_ids
 
         try:

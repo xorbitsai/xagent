@@ -337,7 +337,7 @@ def _grants(db: Session) -> list[UserOAuth]:
 
 
 def _expected_composio_user(user: User, owner: str = OWNER) -> str:
-    config = composio_auth.load_config()
+    config = composio_auth.load_config(composio_auth.FACEBOOK_APP_ID)
     assert config is not None
     return composio_auth.composio_user_id(config, user_id=int(user.id), owner_key=owner)
 
@@ -464,7 +464,7 @@ def test_begin_creates_the_link_and_keeps_the_flow(db_session, composio_env, com
 
 
 def test_composio_user_id_is_per_actor_and_opaque(composio_env):
-    config = composio_auth.load_config()
+    config = composio_auth.load_config(composio_auth.FACEBOOK_APP_ID)
     assert config is not None
     alice = composio_auth.composio_user_id(config, user_id=3, owner_key=OWNER)
     bob = composio_auth.composio_user_id(config, user_id=3, owner_key=OTHER_OWNER)

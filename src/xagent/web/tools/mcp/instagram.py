@@ -38,11 +38,30 @@ MEDIA_FIELDS = (
     "id,caption,media_type,media_url,permalink,timestamp,username,thumbnail_url"
 )
 MEDIA_CONTAINER_STATUS_FIELDS = "status_code,status"
+# Instagram Login (#3533): the account is the token's own user, with no
+# Facebook Page in between. ``user_id`` is the professional account id the
+# other tools address; ``email`` does not exist there.
+INSTAGRAM_LOGIN_ACCOUNT_FIELDS = "user_id,username,name,profile_picture_url"
+INSTAGRAM_LOGIN_AUTH_FIELDS = "user_id,username,name,account_type"
 MEDIA_CONTAINER_MAX_POLLS = 30
 MEDIA_CONTAINER_POLL_INTERVAL_SECONDS = 1.0
 MEDIA_CONTAINER_TIMEOUT_SECONDS = 60.0
 _MEDIA_CONTAINER_READY_STATUSES = frozenset({"FINISHED", "PUBLISHED"})
 _MEDIA_CONTAINER_FAILED_STATUSES = frozenset({"ERROR", "EXPIRED"})
+
+
+def _instagram_login() -> bool:
+    """A Composio-backed grant is an Instagram Login grant (#3533)."""
+    return meta_graph.uses_composio_proxy()
+
+
+def _request(method: str, path: str, **kwargs: Any) -> Any:
+    base_url = (
+        meta_graph.INSTAGRAM_GRAPH_BASE_URL
+        if _instagram_login()
+        else meta_graph.GRAPH_BASE_URL
+    )
+    return _graph_request(method, path, base_url=base_url, **kwargs)
 
 
 def _graph_path(object_id: str, suffix: str | None = None) -> str:
@@ -80,7 +99,7 @@ def _linked_account(page: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _list_pages_with_instagram_accounts() -> list[dict[str, Any]]:
-    result = _graph_request(
+    result = _request(
         "GET",
         "/me/accounts",
         params={"fields": LINKED_ACCOUNT_FIELDS},
@@ -104,7 +123,7 @@ def _wait_for_media_container(container_id: str) -> None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        status = _graph_request(
+        status = _request(
             "GET",
             _graph_path(container_id),
             params={"fields": MEDIA_CONTAINER_STATUS_FIELDS},
@@ -131,9 +150,24 @@ def _wait_for_media_container(container_id: str) -> None:
 
 @mcp.tool()
 def instagram_auth_status() -> str:
-    """Check whether the injected Meta access token is usable."""
+    """Check whether the injected Meta access token is usable.
+
+    On an Instagram Login connection the user is the Instagram account itself:
+    ``id`` is its professional account id and there is no email.
+    """
     try:
-        me = _graph_request("GET", "/me", params={"fields": "id,name,email"})
+        if _instagram_login():
+            me = _request("GET", "/me", params={"fields": INSTAGRAM_LOGIN_AUTH_FIELDS})
+            return _success(
+                authenticated=True,
+                user={
+                    "id": me.get("user_id"),
+                    "username": me.get("username"),
+                    "name": me.get("name"),
+                    "account_type": me.get("account_type"),
+                },
+            )
+        me = _request("GET", "/me", params={"fields": "id,name,email"})
         return _success(
             authenticated=True,
             user={
@@ -152,8 +186,29 @@ def instagram_auth_status() -> str:
 
 @mcp.tool()
 def instagram_list_linked_accounts() -> str:
-    """List Facebook Pages that have linked Instagram professional accounts."""
+    """List Facebook Pages that have linked Instagram professional accounts.
+
+    On an Instagram Login connection there are no Pages: the one connected
+    Instagram account is returned, without a ``page`` entry. Use its
+    ``instagram_account.id`` with the other Instagram tools.
+    """
     try:
+        if _instagram_login():
+            me = _request(
+                "GET", "/me", params={"fields": INSTAGRAM_LOGIN_ACCOUNT_FIELDS}
+            )
+            return _success(
+                accounts=[
+                    {
+                        "instagram_account": {
+                            "id": me.get("user_id"),
+                            "username": me.get("username"),
+                            "name": me.get("name"),
+                            "profile_picture_url": me.get("profile_picture_url"),
+                        }
+                    }
+                ]
+            )
         return _success(accounts=_list_pages_with_instagram_accounts())
     except GraphAPIError as e:
         logger.error("Error listing Instagram linked accounts: %s", e)
@@ -167,7 +222,7 @@ def instagram_list_linked_accounts() -> str:
 def instagram_get_profile(instagram_account_id: str) -> str:
     """Get profile information for an Instagram professional account."""
     try:
-        profile = _graph_request(
+        profile = _request(
             "GET",
             _graph_path(instagram_account_id),
             params={"fields": PROFILE_FIELDS},
@@ -189,7 +244,7 @@ def instagram_get_profile(instagram_account_id: str) -> str:
 def instagram_list_media(instagram_account_id: str, limit: int = 10) -> str:
     """List recent media for an Instagram professional account."""
     try:
-        result = _graph_request(
+        result = _request(
             "GET",
             _graph_path(instagram_account_id, "media"),
             params={"fields": MEDIA_FIELDS, "limit": _bounded_limit(limit)},
@@ -245,7 +300,7 @@ def instagram_publish_image(
         if caption:
             data["caption"] = caption
 
-        container = _graph_request(
+        container = _request(
             "POST",
             _graph_path(instagram_account_id, "media"),
             data=data,
@@ -256,7 +311,7 @@ def instagram_publish_image(
         container_id = str(raw_container_id)
 
         _wait_for_media_container(container_id)
-        published = _graph_request(
+        published = _request(
             "POST",
             _graph_path(instagram_account_id, "media_publish"),
             data={"creation_id": container_id},

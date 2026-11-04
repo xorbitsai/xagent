@@ -366,6 +366,20 @@ jobs:
         if: needs.changes.outputs.code == 'true'
         uses: actions/checkout@v7
 
+      # The web leg installs the full backend environment and pulls a sandbox
+      # image before running a large test shard. GitHub's stock image otherwise
+      # runs out of disk while pytest is still writing the runner diagnostic log.
+      - name: Free GitHub-hosted runner disk space
+        if: needs.changes.outputs.code == 'true' && (matrix.name == 'web')
+        uses: endersonmenezes/free-disk-space@e6ed9b02e683a3b55ed0252f1ee469ce3b39a885
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          remove_tool_cache: true
+          rm_cmd: rmz
+          rmz_version: "3.1.1"
+
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
         shell: bash

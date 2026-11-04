@@ -26,16 +26,22 @@ cookie is sent to:
    says which flow this was; only that flow is spent. It must be ``ACTIVE``,
    of our auth config and of the Facebook toolkit. ``GET /me`` through the
    proxy gives the Facebook user id, and the grant is stored for #3531 to
-   execute. A refused completion spends nothing; a completion whose outcome
-   was lost ends the flow and deletes its account only when a single open
-   flow ties the session to it.
+   execute. A refused completion spends nothing. When the outcome is lost,
+   an open flow whose link Composio now reports ``ACTIVE`` was completed by
+   this session: it is spent and its account deleted. An account is deleted
+   only when this request has spent the flow that created it, or when no
+   open flow claims a just-activated account and Composio confirms it is
+   this actor's.
 
 The three steps are told apart by their parameters only: a ``session_uri``
-never begins a flow and a ``state`` never completes one.
+never begins a flow and a ``state`` never completes one. A denied or failed
+authorization comes back to ``callback_url`` with a ``connected_account_id``
+and no ``state``; it gets the native "Permission was not granted" page.
 
 Disconnect: every local delete of a Composio grant goes through
 ``delete_scoped_user_oauth_accounts``, which schedules the Composio account for
-deletion once the caller's transaction commits (``schedule_account_deletions``).
+deletion once the caller's outermost transaction commits
+(``schedule_account_deletions``); a rolled-back SAVEPOINT cancels it.
 
 Nothing here logs or returns the API key, a connected account id, the
 Composio user id or a ``session_uri``.
@@ -54,7 +60,7 @@ import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 from urllib.parse import urlencode, urlsplit
 
 from cryptography.fernet import InvalidToken
@@ -242,9 +248,10 @@ def begin_location(redirect_uri: str, state: str) -> str:
 def callback_step(provider: str, query: Mapping[str, Any]) -> Step | None:
     """Which Composio trip a Meta callback request is, if any.
 
-    A native Meta callback always carries ``code`` or ``error``. Everything
-    else that reaches this path used to be refused as "missing code or
-    state", so routing it here changes no native outcome.
+    A native Meta callback always carries ``code`` or ``error`` with
+    ``state``. A request with ``state`` and neither of them was refused as
+    "missing code or state" before; begin still refuses it unless the state
+    carries the Composio marker, now with an actor-flow page.
     """
     if provider.lower() != META_PROVIDER:
         return None
@@ -360,8 +367,10 @@ def complete_auth(config: ComposioConfig, *, session_uri: str, user_id: str) -> 
         raise ComposioError("complete_auth_failed")
     account_id = _valid_account_id(payload.get("connected_account_id"))
     if account_id is None:
+        # Composio reports success, so an account may be active: treat it like
+        # a lost answer, not a refusal.
         logger.warning("Composio completed a connection without a usable id")
-        raise ComposioError("account_invalid", rejected=True)
+        raise ComposioError("complete_auth_failed")
     return account_id
 
 
@@ -497,20 +506,79 @@ def schedule_account_deletions(
     to_delete = [account_id for account_id in candidates if account_id not in remaining]
     if not to_delete:
         return
-    pending = db.info.get(_PENDING_DELETES_KEY)
-    if pending is None:
-        pending = db.info[_PENDING_DELETES_KEY] = []
-        event.listen(db, "after_commit", _delete_pending_after_commit)
-        event.listen(db, "after_transaction_end", _drop_pending_after_transaction)
-    pending.extend(account_id for account_id in to_delete if account_id not in pending)
+    pending = _pending_by_transaction(db)
+    level = _transaction_level(db)
+    bucket = pending.setdefault(level, [])
+    bucket.extend(account_id for account_id in to_delete if account_id not in bucket)
 
 
-def _delete_pending_after_commit(session: Session) -> None:
+def _transaction_level(session: Session) -> Any:
+    """The transaction a deletion belongs to: the innermost SAVEPOINT, if any."""
+    return session.get_nested_transaction() or session.get_transaction()
+
+
+def _scope_of(transaction: Any) -> Any:
+    """The nearest enclosing SAVEPOINT or outermost transaction."""
+    parent = transaction.parent
+    while parent is not None and not parent.nested and parent.parent is not None:
+        parent = parent.parent
+    return parent
+
+
+def _pending_by_transaction(session: Session) -> dict[Any, list[str]]:
+    """Account ids to delete, by the transaction that removed their grant.
+
+    A SAVEPOINT's ids move to its enclosing transaction when it commits and are
+    dropped when it rolls back. Only a commit of the outermost transaction
+    deletes anything: SQLAlchemy also fires ``after_commit`` for a SAVEPOINT.
+    """
     pending = session.info.get(_PENDING_DELETES_KEY)
-    if not pending:
+    if pending is None:
+        pending = session.info[_PENDING_DELETES_KEY] = {}
+        session.info[_COMMITTED_SAVEPOINTS_KEY] = set()
+        event.listen(session, "after_commit", _after_commit)
+        event.listen(session, "after_transaction_end", _after_transaction_end)
+    return cast(dict[Any, list[str]], pending)
+
+
+_COMMITTED_SAVEPOINTS_KEY = "xagent_composio_committed_savepoints"
+
+
+def _after_commit(session: Session) -> None:
+    if session.in_nested_transaction():
+        # A SAVEPOINT committed; its ids wait for the enclosing transaction.
+        session.info[_COMMITTED_SAVEPOINTS_KEY].add(session.get_nested_transaction())
         return
-    account_ids = list(pending)
+    pending = session.info.get(_PENDING_DELETES_KEY) or {}
+    account_ids = list(
+        dict.fromkeys(account_id for ids in pending.values() for account_id in ids)
+    )
     pending.clear()
+    if account_ids:
+        _delete_after_commit(account_ids)
+
+
+def _after_transaction_end(session: Session, transaction: Any) -> None:
+    pending = session.info.get(_PENDING_DELETES_KEY)
+    if pending is None:
+        return
+    committed = session.info[_COMMITTED_SAVEPOINTS_KEY]
+    ids = pending.pop(transaction, [])
+    if transaction.nested and transaction in committed:
+        committed.discard(transaction)
+        scope = _scope_of(transaction)
+        if scope is not None:
+            bucket = pending.setdefault(scope, [])
+            bucket.extend(i for i in ids if i not in bucket)
+        return
+    committed.discard(transaction)
+    if transaction.parent is None:
+        # The outermost transaction ended: a commit has already taken what it
+        # allows, so anything left was rolled back or abandoned.
+        pending.clear()
+
+
+def _delete_after_commit(account_ids: list[str]) -> None:
     # Runs inside commit(): it must never raise, and must not emit SQL.
     try:
         api_key = _env(COMPOSIO_API_KEY_ENV)
@@ -536,15 +604,6 @@ def _delete_pending_after_commit(session: Session) -> None:
             "Composio account deletion after disconnect failed (exception_type=%s)",
             type(exc).__name__,
         )
-
-
-def _drop_pending_after_transaction(session: Session, transaction: Any) -> None:
-    # after_commit has already taken what a commit allows; whatever is left
-    # when the outermost transaction ends was rolled back or abandoned.
-    if transaction.parent is None:
-        pending = session.info.get(_PENDING_DELETES_KEY)
-        if pending:
-            pending.clear()
 
 
 # --- Browser trips -------------------------------------------------------------
@@ -724,15 +783,19 @@ class _OpenFlow:
         return self.flow.user_id, self.flow.owner_key
 
 
-def _open_flows(
-    request: Any, db: Session
-) -> tuple[list[_OpenFlow], list[str], list[str]]:
-    """Check every flow cookie the browser sent, without spending any flow.
+@dataclass
+class _BrowserFlows:
+    """What the flow cookies a browser sent amount to."""
 
-    Returns the flows that pass every check that needs no Composio call, the
-    cookie names to clear because their flow is dead, and the rejection
-    reasons of those dead flows.
-    """
+    open: list[_OpenFlow]
+    # Cookie names to clear: their flow is spent, expired or not genuine.
+    dead: list[str]
+    # Why each dead flow failed its checks.
+    reasons: list[str]
+
+
+def _open_flows(request: Any, db: Session) -> _BrowserFlows:
+    """Check every flow cookie the browser sent, without spending any flow."""
     open_flows: list[_OpenFlow] = []
     dead: list[str] = []
     reasons: list[str] = []
@@ -757,7 +820,7 @@ def _open_flows(
             continue
         open_flows.append(_OpenFlow(flow, account_id, name))
     db.rollback()
-    return open_flows, dead, reasons
+    return _BrowserFlows(open_flows, dead, reasons)
 
 
 def _clear_flow_cookies(
@@ -807,8 +870,9 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     # completed with the one Composio user id they share. Another actor's
     # flows are dropped: their sessions then fail complete_auth's user check
     # and are never activated.
-    existing, dead, _ = _open_flows(request, db)
-    stale = dead + [
+    browser_flows = _open_flows(request, db)
+    existing = browser_flows.open
+    stale = browser_flows.dead + [
         open_flow.cookie_name
         for open_flow in existing
         if open_flow.actor != (flow.user_id, flow.owner_key)
@@ -836,11 +900,10 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
     except ComposioError as exc:
         _log_rejection(exc.reason)
         return _unavailable_page()
-    # A begin reloaded for the same flow replaces its link; the previous link's
-    # account is this flow's own and could no longer be bound, so delete it.
-    for open_flow in existing:
-        if open_flow.flow.nonce == flow.nonce and open_flow.account_id != account_id:
-            delete_account(config.api_key, open_flow.account_id)
+    # A reloaded begin replaces this flow's link. The previous link is not
+    # deleted here: the original window may be completing it right now. If its
+    # session still comes back, no open flow claims the account and it is
+    # removed there; otherwise it stays paused and is never activated.
 
     response = RedirectResponse(redirect_url, status_code=302)
     # Our URL carries the state; Composio's page must not receive it.
@@ -874,6 +937,27 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     )
 
     query = request.query_params
+    browser_flows = _open_flows(request, db)
+    dead = browser_flows.dead
+    returned = _valid_account_id(query.get("connected_account_id"))
+    matches = [f for f in browser_flows.open if returned and f.account_id == returned]
+    config = load_config()
+    for match in matches:
+        dead.append(match.cookie_name)
+        # Unfinished, or (without verification) active but never bound here.
+        if _spend(db, match) and config is not None:
+            delete_account(config.api_key, match.account_id)
+    if query.get("status") == "success":
+        # Composio activated the connection without handing it to us: its
+        # project has no OAuth user verification pointed at this callback.
+        # Only a return for one of this browser's own flows says so; anyone
+        # can send the bare query, so that is logged at warning level only.
+        (logger.error if matches else logger.warning)(
+            "Composio returned a connection without verification; set the "
+            "project's OAuth user verification to this callback URL"
+        )
+        _log_rejection("verification_not_configured")
+        return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
     provider_error = _oauth_callback_provider_error(
         META_PROVIDER, query.get("error") or "access_denied", None
     )
@@ -885,15 +969,6 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
         actor_flow=True,
         provider_error=provider_error,
     )
-    open_flows, dead, _ = _open_flows(request, db)
-    returned = _valid_account_id(query.get("connected_account_id"))
-    matches = [f for f in open_flows if returned and f.account_id == returned]
-    config = load_config()
-    for match in matches:
-        dead.append(match.cookie_name)
-        _spend(db, match)
-        if config is not None:
-            delete_account(config.api_key, match.account_id)
     return _clear_flow_cookies(
         _actor_oauth_provider_error_response(META_PROVIDER, provider_error),
         db_provider,
@@ -901,10 +976,66 @@ def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
     )
 
 
+def _account_status(config: ComposioConfig, account_id: str) -> str | None:
+    """The account's status at Composio, or None when it cannot be read."""
+    try:
+        status, payload = _call(
+            config.api_key, "GET", f"/connected_accounts/{account_id}"
+        )
+    except ComposioError:
+        return None
+    if not 200 <= status < 300 or not isinstance(payload, dict):
+        return None
+    value = payload.get("status")
+    return value if isinstance(value, str) else None
+
+
+def _belongs_to(config: ComposioConfig, *, account_id: str, user_id: str) -> bool:
+    """Whether Composio reports the account as this actor's, of our config."""
+    try:
+        status, payload = _call(
+            config.api_key, "GET", f"/connected_accounts/{account_id}"
+        )
+    except ComposioError:
+        return False
+    if not 200 <= status < 300 or not isinstance(payload, dict):
+        return False
+    auth_config = payload.get("auth_config")
+    return (
+        payload.get("user_id") == user_id
+        and isinstance(auth_config, dict)
+        and auth_config.get("id") == config.auth_config_id
+    )
+
+
 def _spend(db: Session, open_flow: _OpenFlow) -> bool:
     """Spend one flow; False when it was spent or expired meanwhile."""
     deleted = _flow_row_query(db, open_flow.flow.nonce).delete(
         synchronize_session=False
+    )
+    if deleted != 1:
+        db.rollback()
+        return False
+    db.commit()
+    return True
+
+
+def _spend_expired_for_cleanup(db: Session, open_flow: _OpenFlow) -> bool:
+    """Claim an expired, unspent flow for cleanup, never for storing a grant.
+
+    The deadline can pass during complete_auth. Deleting the remaining row
+    atomically distinguishes that case from a flow another request consumed.
+    Every successful binding consumes this same row first.
+    """
+    from .models.actor_oauth_flow import ActorOAuthFlowState
+
+    deleted = (
+        db.query(ActorOAuthFlowState)
+        .filter(
+            ActorOAuthFlowState.nonce == open_flow.flow.nonce,
+            ActorOAuthFlowState.expires_at <= datetime.now(timezone.utc),
+        )
+        .delete(synchronize_session=False)
     )
     if deleted != 1:
         db.rollback()
@@ -928,8 +1059,10 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
 
     # The session_uri names no flow, so every flow this browser holds is
     # checked first; complete_auth's answer then says which one it was.
-    open_flows, dead, reasons = _open_flows(request, db)
+    browser_flows = _open_flows(request, db)
+    open_flows, dead = browser_flows.open, browser_flows.dead
     if not open_flows:
+        reasons = browser_flows.reasons
         reason = reasons[-1] if reasons else "cookie_missing"
         _log_rejection(reason)
         return _clear_flow_cookies(_reject(reason).response, db_provider, dead)
@@ -958,39 +1091,46 @@ def _handle_verify(request: Any, db: Session, db_provider: Any) -> Response:
             return _clear_flow_cookies(
                 _reject("composio_rejected").response, db_provider, dead
             )
-        # Composio may have activated the account before the answer was
-        # lost. Only a single open flow ties this session to one account,
-        # so only then is that flow ended and its account deleted.
-        if len(open_flows) == 1:
-            (only,) = open_flows
-            _spend(db, only)
-            delete_account(config.api_key, only.account_id)
-            dead.append(only.cookie_name)
-        else:
-            logger.warning(
-                "Composio completion outcome unknown with %d open flows; "
-                "nothing was deleted",
-                len(open_flows),
-            )
+        # Composio may have activated an account before the answer was lost.
+        # Each open flow's link stays paused until its own session completes,
+        # so one that is now ACTIVE was completed here. A stored grant needs
+        # its flow spent first, so an open flow's account is never bound: it
+        # is deleted once this request has spent that flow. Unfinished links
+        # are left alone, and their flows stay open.
+        for open_flow in open_flows:
+            if _account_status(config, open_flow.account_id) == "ACTIVE" and (
+                _spend(db, open_flow) or _spend_expired_for_cleanup(db, open_flow)
+            ):
+                delete_account(config.api_key, open_flow.account_id)
+                dead.append(open_flow.cookie_name)
         return _clear_flow_cookies(_unavailable_page(), db_provider, dead)
 
     matches = [
         open_flow for open_flow in open_flows if open_flow.account_id == account_id
     ]
     if not matches:
-        # Not a link any open flow created, so not ours to bind or to delete.
+        # No open flow created it: a flow whose cookie already expired, or an
+        # id that is not ours at all. Composio answers 404 for a session that
+        # was already used, so an account complete_auth has just activated is
+        # never one that is already bound. It is deleted when Composio
+        # confirms it is this actor's, and left alone otherwise.
         logger.warning("Composio completed a connection no open flow created")
         _log_rejection("account_invalid")
+        if _belongs_to(config, account_id=account_id, user_id=composio_user):
+            delete_account(config.api_key, account_id)
         return _clear_flow_cookies(
             _reject("composio_rejected").response, db_provider, dead
         )
-    (match,) = matches
+    match = matches[0]
     dead.append(match.cookie_name)
     # From here on the account is the one this flow created for this actor:
     # if it cannot be bound, it is deleted rather than left unbound.
     if not _spend(db, match):
+        # An expired row can still be claimed for cleanup. A missing row was
+        # consumed by another request, whose account must be left alone.
+        if _spend_expired_for_cleanup(db, match):
+            delete_account(config.api_key, account_id)
         _log_rejection("flow_used_or_expired")
-        delete_account(config.api_key, account_id)
         return _clear_flow_cookies(
             _reject("flow_used_or_expired").response, db_provider, dead
         )

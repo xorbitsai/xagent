@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
@@ -74,6 +74,10 @@ class FakeComposio:
         self.owners: dict[str, str] = {}
         self.completed: set[str] = set()
         self.complete_status = 200
+        # Composio activates the account, then the answer never arrives.
+        self.lose_completion = False
+        # Composio answers 2xx but with no usable connected_account_id.
+        self.complete_without_id = False
         self.complete_account: str | None = None
         self.account_overrides: dict[str, Any] = {}
         self.me_response: tuple[int, Any] | None = None
@@ -114,6 +118,10 @@ class FakeComposio:
             if json["user_id"] != self.owners[account_id]:
                 return _Response(400, {"error": {"message": "user mismatch"}})
             self.completed.add(account_id)
+            if self.lose_completion:
+                raise TimeoutError(f"read timed out for {url}")
+            if self.complete_without_id:
+                return _Response(200, {"toolkit_slug": "facebook"})
             return _Response(
                 200,
                 {
@@ -125,7 +133,7 @@ class FakeComposio:
             account_id = path.rsplit("/", 1)[1]
             account = {
                 "id": account_id,
-                "status": "ACTIVE",
+                "status": "ACTIVE" if account_id in self.completed else "INITIALIZING",
                 "user_id": self.owners.get(account_id),
                 "toolkit": {"slug": "facebook"},
                 "auth_config": {"id": AUTH_CONFIG_ID},
@@ -168,6 +176,17 @@ def composio(monkeypatch) -> FakeComposio:
 @pytest.fixture
 def db_session(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'composio.db'}")
+
+    # pysqlite does not emit BEGIN itself, so SAVEPOINT and ROLLBACK would not
+    # undo anything; SQLAlchemy's documented recipe makes them real.
+    @event.listens_for(engine, "connect")
+    def _no_driver_transactions(dbapi_connection, _record):
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _emit_begin(connection):
+        connection.exec_driver_sql("BEGIN")
+
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     with factory() as db:
@@ -668,6 +687,28 @@ def test_another_actors_begin_drops_the_first_actors_flow(
     assert (grant.resource_owner_key, grant.access_token) == (OTHER_OWNER, bob)
 
 
+def test_a_session_whose_flow_cookie_expired_is_not_left_active(
+    db_session, composio_env, composio
+):
+    """A's cookie expired while the member was on Facebook; B is still open.
+    Composio activates A (same actor, same user id), which no open flow
+    created: it is deleted once Composio confirms it is this actor's."""
+    db, user = db_session
+    browser = Browser()
+    _begin(db, user, browser)
+    first_cookie = _flow_cookies(browser)[0]
+    _begin(db, user, browser)
+    first, second = composio.created
+    browser.cookies.pop(first_cookie)
+
+    response = browser.get(db, _verify_url(composio, first))
+
+    assert response.status_code == 400
+    assert _grants(db) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{first}"]
+    assert browser.get(db, _verify_url(composio, second)).status_code == 200
+
+
 def test_a_begin_past_the_open_flow_limit_creates_no_link(
     db_session, composio_env, composio
 ):
@@ -684,28 +725,105 @@ def test_a_begin_past_the_open_flow_limit_creates_no_link(
     assert composio.paths().count("/connected_accounts/link") == 3
 
 
-def test_a_reloaded_begin_deletes_the_link_it_replaces(
+def test_a_reloaded_begin_deletes_nothing_and_its_old_link_is_cleaned_if_completed(
     db_session, composio_env, composio
 ):
+    """The original window may be completing the replaced link while the
+    reload runs, so the reload deletes nothing. If that old link's session
+    comes back later, no open flow claims it and it is removed there."""
     db, user = db_session
     browser = Browser()
     start = _start(db, user, browser)
     assert browser.get(db, start.headers["location"]).status_code == 302
     assert browser.get(db, start.headers["location"]).status_code == 302
     replaced, current = composio.created
+    assert composio.paths("DELETE") == []
 
+    assert browser.get(db, _verify_url(composio, replaced)).status_code == 400
     assert composio.paths("DELETE") == [f"/connected_accounts/{replaced}"]
     assert browser.get(db, _verify_url(composio, current)).status_code == 200
     assert _grants(db)[0].access_token == current
 
 
-def test_a_lost_completion_with_one_open_flow_ends_it_and_deletes_its_account(
-    db_session, composio_env, composio
+def test_a_reload_racing_a_completion_never_deletes_the_bound_account(
+    db_session, composio_env, composio, monkeypatch
 ):
-    """Composio may have activated the account before the answer was lost (R2)."""
+    """The original window completes while the reload waits on Composio."""
+    db, user = db_session
+    browser = Browser()
+    start = _start(db, user, browser)
+    assert browser.get(db, start.headers["location"]).status_code == 302
+    first = composio.created[0]
+    original = composio.request
+    raced = []
+
+    def complete_during_link(**kwargs):
+        if kwargs["url"].endswith("/connected_accounts/link") and not raced:
+            raced.append(True)
+            other_window = Browser()
+            other_window.cookies = dict(browser.cookies)
+            assert other_window.get(db, _verify_url(composio, first)).status_code == 200
+        return original(**kwargs)
+
+    monkeypatch.setattr(composio_auth.requests, "request", complete_during_link)
+    browser.get(db, start.headers["location"])
+
+    (grant,) = _grants(db)
+    assert grant.access_token == first
+    assert f"/connected_accounts/{first}" not in composio.paths("DELETE")
+
+
+@pytest.mark.parametrize("lost_answer", [False, True], ids=["reply", "lost-reply"])
+@pytest.mark.parametrize("flow_end", ["expired", "spent-by-another-request"])
+def test_completion_crossing_the_deadline_cleans_only_an_unspent_flow(
+    db_session, composio_env, composio, monkeypatch, lost_answer, flow_end
+):
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)
-    composio.raise_on = "/connected_accounts/complete_auth"
+    account = composio.created[0]
+    composio.lose_completion = lost_answer
+    complete = composio_auth.complete_auth
+
+    def complete_as_flow_ends(*args, **kwargs):
+        try:
+            return complete(*args, **kwargs)
+        finally:
+            if flow_end == "expired":
+                # The request began in time, but its network call crossed the
+                # deadline. The server-side flow still exists, unclaimed.
+                db.query(ActorOAuthFlowState).update(
+                    {
+                        ActorOAuthFlowState.expires_at: datetime.now(timezone.utc)
+                        - timedelta(seconds=1)
+                    }
+                )
+                db.commit()
+            else:
+                # Another request owns the flow now and has bound its account.
+                db.query(ActorOAuthFlowState).delete()
+                _store_composio_grant(db, user, account_id=account)
+
+    monkeypatch.setattr(composio_auth, "complete_auth", complete_as_flow_ends)
+    response = browser.get(db, _verify_url(composio, account))
+
+    assert response.status_code == (503 if lost_answer else 400)
+    assert account in composio.completed
+    assert db.query(ActorOAuthFlowState).count() == 0
+    if flow_end == "expired":
+        assert _grants(db) == []
+        assert composio.paths("DELETE") == [f"/connected_accounts/{account}"]
+    else:
+        assert _grants(db)[0].access_token == account
+        assert composio.paths("DELETE") == []
+
+
+def test_a_lost_completion_ends_the_flow_composio_activated(
+    db_session, composio_env, composio
+):
+    """Composio activated the account, then the answer was lost (R2)."""
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+    composio.lose_completion = True
 
     response = browser.get(db, _verify_url(composio))
 
@@ -716,21 +834,73 @@ def test_a_lost_completion_with_one_open_flow_ends_it_and_deletes_its_account(
     assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
 
 
-def test_a_lost_completion_with_several_open_flows_deletes_nothing(
+def test_a_lost_completion_among_several_flows_ends_only_the_activated_one(
     db_session, composio_env, composio
 ):
     db, user = db_session
     browser = Browser()
     _begin(db, user, browser)
     _begin(db, user, browser)
+    first, second = composio.created
+    composio.lose_completion = True
+
+    response = browser.get(db, _verify_url(composio, second))
+
+    assert response.status_code == 503
+    assert composio.paths("DELETE") == [f"/connected_accounts/{second}"]
+    # The other flow is untouched and still completes.
+    assert db.query(ActorOAuthFlowState).count() == 1
+    composio.lose_completion = False
+    assert browser.get(db, _verify_url(composio, first)).status_code == 200
+
+
+def test_a_lost_answer_before_activation_deletes_nothing(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
     composio.raise_on = "/connected_accounts/complete_auth"
 
     response = browser.get(db, _verify_url(composio))
 
     assert response.status_code == 503
     assert composio.paths("DELETE") == []
-    assert db.query(ActorOAuthFlowState).count() == 2
-    assert len(_flow_cookies(browser)) == 2
+    assert db.query(ActorOAuthFlowState).count() == 1
+
+
+def test_a_lost_completion_of_an_expired_flow_does_not_end_another_flow(
+    db_session, composio_env, composio
+):
+    """A's cookie expired and B is open; A's lost completion must not be
+    pinned on B just because B is the only open flow."""
+    db, user = db_session
+    browser = Browser()
+    _begin(db, user, browser)
+    first_cookie = _flow_cookies(browser)[0]
+    _begin(db, user, browser)
+    first, second = composio.created
+    browser.cookies.pop(first_cookie)
+    composio.lose_completion = True
+
+    response = browser.get(db, _verify_url(composio, first))
+
+    assert response.status_code == 503
+    assert composio.paths("DELETE") == []
+    composio.lose_completion = False
+    assert browser.get(db, _verify_url(composio, second)).status_code == 200
+
+
+def test_a_completion_without_an_id_is_handled_as_a_lost_answer(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+    composio.complete_without_id = True
+
+    response = browser.get(db, _verify_url(composio))
+
+    assert response.status_code == 503
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
 
 
 def _denied_url(account_id: str) -> str:
@@ -773,6 +943,42 @@ def test_a_denied_return_for_an_account_no_flow_created_deletes_nothing(
     assert composio.paths("DELETE") == []
     assert db.query(ActorOAuthFlowState).count() == 1
     assert len(_flow_cookies(browser)) == 1
+
+
+def test_a_return_without_verification_tells_operators_and_deletes_the_account(
+    db_session, composio_env, composio, caplog
+):
+    """A Composio project without OAuth user verification activates the
+    connection itself and sends status=success; it is never bound here."""
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+    account = composio.created[0]
+
+    response = browser.get(
+        db, f"{CALLBACK_URL}?status=success&connected_account_id={account}"
+    )
+
+    assert response.status_code == 503
+    assert "Permission was not granted" not in response.body.decode()
+    assert "verification_not_configured" in caplog.text
+    assert _grants(db) == []
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert composio.paths("DELETE") == [f"/connected_accounts/{account}"]
+
+
+def test_a_bare_success_return_is_not_logged_as_an_operator_error(
+    db_session, composio_env, composio, caplog
+):
+    db, _ = db_session
+
+    response = Browser().get(
+        db, f"{CALLBACK_URL}?status=success&connected_account_id=ca_stray"
+    )
+
+    assert response.status_code == 503
+    assert composio.paths("DELETE") == []
+    records = [r for r in caplog.records if "without verification" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.WARNING]
 
 
 def test_a_user_id_composio_refuses_stores_nothing(db_session, composio_env, composio):
@@ -837,7 +1043,9 @@ def test_an_account_this_flow_did_not_create_is_not_stored_or_deleted(
 
     assert response.status_code == 400
     assert _grants(db) == []
-    assert "/connected_accounts/ca_belongs_to_someone_else" not in composio.paths()
+    # Looked up, found not to be this actor's, and left alone.
+    assert "/connected_accounts/ca_belongs_to_someone_else" in composio.paths("GET")
+    assert composio.paths("DELETE") == []
 
 
 @pytest.mark.parametrize(
@@ -1054,6 +1262,54 @@ def test_a_composio_failure_does_not_fail_the_disconnect(
     messages = " ".join(record.getMessage() for record in caplog.records)
     assert "deletion" in messages
     assert "ca_flaky" not in messages and API_KEY not in messages
+
+
+def test_a_savepoint_committed_then_rolled_back_outside_keeps_the_account(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    _store_composio_grant(db, user, account_id="ca_savepoint")
+
+    savepoint = db.begin_nested()
+    _disconnect(db, user)
+    savepoint.commit()  # SQLAlchemy fires after_commit for this too
+    assert composio.calls == []
+    db.rollback()
+    db.commit()
+
+    assert composio.calls == []
+    assert len(_grants(db)) == 1
+
+
+def test_a_savepoint_rolled_back_then_committed_outside_keeps_the_account(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    _store_composio_grant(db, user, account_id="ca_savepoint")
+
+    savepoint = db.begin_nested()
+    _disconnect(db, user)
+    savepoint.rollback()
+    db.commit()
+
+    assert composio.calls == []
+    assert len(_grants(db)) == 1
+
+
+def test_a_savepoint_committed_with_its_transaction_deletes_the_account(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    _store_composio_grant(db, user, account_id="ca_savepoint")
+
+    savepoint = db.begin_nested()
+    _disconnect(db, user)
+    savepoint.commit()
+    assert composio.calls == []
+    db.commit()
+
+    assert composio.paths("DELETE") == ["/connected_accounts/ca_savepoint"]
+    assert _grants(db) == []
 
 
 def test_an_account_still_referenced_is_not_deleted(db_session, composio_env, composio):

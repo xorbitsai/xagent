@@ -4,7 +4,10 @@ from typing import Any
 
 import aiohttp
 from xinference_client import RESTfulClient
-from xinference_client.client.restful.async_restful_client import AsyncClient
+from xinference_client.client.restful.async_restful_client import (
+    AsyncClient,
+    AsyncRESTfulChatModelHandle,
+)
 
 from .network_policy import ModelNetworkPolicy
 from .public_http import create_public_model_aiohttp_session
@@ -57,6 +60,24 @@ class PublicAsyncXinferenceClient(AsyncClient):  # type: ignore[no-any-unimporte
 
     async def get_model(self, model_uid: str) -> Any:
         handle = await super().get_model(model_uid)
+        return await self._guard_model_handle(handle)
+
+    async def get_chat_model(self, model_uid: str) -> tuple[Any, bool]:
+        """Discover the chat handle and its routing support in one request."""
+        description = await self.describe_model(model_uid)
+        if description.get("model_type") != "LLM" or "chat" not in description.get(
+            "model_ability", []
+        ):
+            raise ValueError(f"Model {model_uid} does not support chat")
+        handle = AsyncRESTfulChatModelHandle(
+            model_uid, self.base_url, auth_headers=self._headers
+        )
+        return (
+            await self._guard_model_handle(handle),
+            description.get("supports_chat_session_affinity") is True,
+        )
+
+    async def _guard_model_handle(self, handle: Any) -> Any:
         await handle.session.close()
         handle.session = create_public_model_aiohttp_session(timeout=handle.timeout)
         return handle

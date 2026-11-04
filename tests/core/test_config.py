@@ -793,13 +793,6 @@ class TestMCPOAuthConfig:
         assert config.get_hubspot_mcp_client_secret() is None
 
 
-def test_xinference_session_affinity_is_opt_in(monkeypatch):
-    monkeypatch.delenv("XAGENT_XINFERENCE_SESSION_AFFINITY", raising=False)
-    assert config.get_xinference_session_affinity_enabled() is False
-    monkeypatch.setenv("XAGENT_XINFERENCE_SESSION_AFFINITY", "true")
-    assert config.get_xinference_session_affinity_enabled() is True
-
-
 class TestTrustedEgressProxyConfig:
     def test_trusted_egress_proxy_constant(self):
         assert TRUSTED_EGRESS_PROXY == "XAGENT_TRUSTED_EGRESS_PROXY"

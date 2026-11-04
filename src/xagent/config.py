@@ -336,7 +336,6 @@ TOBY_PERSONAL_STDIO_ENABLED = "XAGENT_TOBY_PERSONAL_STDIO_ENABLED"
 TRUSTED_EGRESS_PROXY = "XAGENT_TRUSTED_EGRESS_PROXY"
 MODEL_PRIVATE_ENDPOINTS = "XAGENT_MODEL_PRIVATE_ENDPOINTS"
 MODEL_PRIVATE_CIDRS = "XAGENT_MODEL_PRIVATE_CIDRS"
-XINFERENCE_SESSION_AFFINITY = "XAGENT_XINFERENCE_SESSION_AFFINITY"
 MCP_PRIVATE_ENDPOINTS = "XAGENT_MCP_PRIVATE_ENDPOINTS"
 MCP_PRIVATE_CIDRS = "XAGENT_MCP_PRIVATE_CIDRS"
 
@@ -1138,11 +1137,6 @@ def get_model_private_endpoints() -> list[str]:
 def get_model_private_cidrs() -> list[str]:
     """Operator-only DNS address constraints for private model origins."""
     return _csv_env(MODEL_PRIVATE_CIDRS)
-
-
-def get_xinference_session_affinity_enabled() -> bool:
-    """Send task routing keys to Xinference servers that support them."""
-    return _get_bool_env(XINFERENCE_SESSION_AFFINITY, False)
 
 
 def get_mcp_private_endpoints() -> list[str]:

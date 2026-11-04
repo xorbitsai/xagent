@@ -19,7 +19,6 @@ from ...config import (
     COMPACT_THRESHOLD_DEFAULT,
     get_compact_threshold_default,
     get_session_secret,
-    get_xinference_session_affinity_enabled,
 )
 from ..context_materializer import WorkspaceContextReferenceResolver
 from ..context_ref import CONTEXT_REFS_KEY, ContextReference
@@ -536,21 +535,20 @@ class AgentRunner:
         routing_token = None
 
         try:
-            if get_xinference_session_affinity_enabled():
-                scope = get_execution_scope()
-                owner = current_user_id.get()
-                identity = json.dumps(
-                    [
-                        "xinference-session-affinity",
-                        str(owner) if owner is not None else context.user_id,
-                        scope.workspace_segments if scope is not None else (),
-                        execution_id,
-                    ]
-                )
-                key = hmac.new(
-                    get_session_secret().encode(), identity.encode(), "sha256"
-                ).hexdigest()
-                routing_token = xinference_routing_key.set(key)
+            scope = get_execution_scope()
+            owner = current_user_id.get()
+            identity = json.dumps(
+                [
+                    "xinference-session-affinity",
+                    str(owner) if owner is not None else context.user_id,
+                    scope.workspace_segments if scope is not None else (),
+                    execution_id,
+                ]
+            )
+            key = hmac.new(
+                get_session_secret().encode(), identity.encode(), "sha256"
+            ).hexdigest()
+            routing_token = xinference_routing_key.set(key)
             if inherited_budget is None:
                 policy = (
                     self.budget_policy_provider()

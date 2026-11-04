@@ -1569,9 +1569,8 @@ async def test_runner_restores_context_and_pattern_from_checkpoint(
 
 @pytest.mark.asyncio
 async def test_xinference_routing_key_survives_checkpoint_resume(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("XAGENT_XINFERENCE_SESSION_AFFINITY", "true")
     keys: list[str | None] = []
     messages = [{"role": "user", "content": "Continue the task"}]
 
@@ -1601,6 +1600,7 @@ async def test_xinference_routing_key_survives_checkpoint_resume(
     llm = XinferenceLLM()
     llm._client = MagicMock()
     llm._model_handle = ModelHandle()
+    llm._supports_session_affinity = True
     runner = AgentRunner(
         agent=Agent(name="writer", llm=llm, patterns=[ModelPattern({"success": True})]),
         workspace_manager=FakeWorkspaceManager(tmp_path),

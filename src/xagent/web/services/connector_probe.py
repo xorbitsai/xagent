@@ -297,24 +297,18 @@ async def _run(
     connector_team_id: int | None,
 ) -> ConnectorProbeResult:
     from ..mcp_apps import get_app_for_mcp_server
-<<<<<<< HEAD
     from ..tools.config import WebToolConfig
 
     team_selection = WebToolConfig(
         db=db, request=None, user=user, user_id=int(user.id), connector_team_id=connector_team_id
     ).resolve_connector_team_selection()
-=======
->>>>>>> origin/main
 
     server = find_visible_server(
         db,
         user_id=int(user.id),
         server_id=server_id,
         connector_team_id=connector_team_id,
-<<<<<<< HEAD
         team_selection=team_selection,
-=======
->>>>>>> origin/main
     )
     if server is None:
         return ConnectorProbeResult(ConnectorProbeOutcome.NOT_FOUND, server_id)
@@ -347,10 +341,7 @@ async def _run(
         mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
         mcp_actor_execution_identity=mcp_actor_execution_identity,
         connector_team_id=connector_team_id,
-<<<<<<< HEAD
         team_selection=team_selection,
-=======
->>>>>>> origin/main
     )
     return await _call_declared_probe(listing, probe, app_id=app_id, result=result)
 

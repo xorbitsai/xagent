@@ -97,10 +97,7 @@ async def list_connector_tools(
     mcp_actor_stdio_connection_adapter: ActorMCPStdioConnectionAdapter | None = None,
     mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     connector_team_id: int | None = None,
-<<<<<<< HEAD
     team_selection: Any | None = None,
-=======
->>>>>>> origin/main
 ) -> ConnectorToolsResult:
     """Start ``server_id`` for ``user`` as a task would and list its tools.
 
@@ -138,7 +135,6 @@ async def list_connector_tools(
     from ...core.tools.adapters.vibe.config import MCPConfigLoadError
 
     user_id = int(user.id)
-<<<<<<< HEAD
     tool_config = _task_tool_config(
         db,
         user,
@@ -148,17 +144,12 @@ async def list_connector_tools(
         connector_team_id=connector_team_id,
     )
     team_selection = team_selection or tool_config.resolve_connector_team_selection()
-=======
->>>>>>> origin/main
     server = find_visible_server(
         db,
         user_id=user_id,
         server_id=server_id,
         connector_team_id=connector_team_id,
-<<<<<<< HEAD
         team_selection=team_selection,
-=======
->>>>>>> origin/main
     )
     if server is None:
         return ConnectorToolsResult(ConnectorToolsOutcome.NOT_FOUND, server_id)
@@ -170,23 +161,10 @@ async def list_connector_tools(
     if _is_execution_scoped(db, server):
         return result(ConnectorToolsOutcome.UNSUPPORTED, reason="execution_scoped")
 
-<<<<<<< HEAD
     try:
         server_config = await tool_config.load_mcp_server_config(
             server_id, team_selection=team_selection
         )
-=======
-    tool_config = _task_tool_config(
-        db,
-        user,
-        mcp_runtime_authorization_policy=mcp_runtime_authorization_policy,
-        mcp_actor_stdio_connection_adapter=mcp_actor_stdio_connection_adapter,
-        mcp_actor_execution_identity=mcp_actor_execution_identity,
-        connector_team_id=connector_team_id,
-    )
-    try:
-        server_config = await tool_config.load_mcp_server_config(server_id)
->>>>>>> origin/main
     except MCPConfigLoadError:
         return result(
             ConnectorToolsOutcome.FAILED_TO_START, reason="config_load_failed"
@@ -229,10 +207,7 @@ async def list_actor_stdio_connector_tools(
     mcp_actor_execution_identity: MCPActorExecutionIdentity | None = None,
     connector_team_id: int | None = None,
     refuse_sandboxed: bool = False,
-<<<<<<< HEAD
     team_selection: Any | None = None,
-=======
->>>>>>> origin/main
 ) -> ConnectorToolsResult:
     """Start the actor stdio connection for catalog ``app_id`` as a task would.
 
@@ -265,11 +240,6 @@ async def list_actor_stdio_connector_tools(
     signature parity with ``list_connector_tools``.
     """
     from ..builtin_mcp_registry import get_builtin_stdio_session_scope
-<<<<<<< HEAD
-=======
-    from .actor_mcp_runtime import resolve_actor_mcp_stdio_configs
-
->>>>>>> origin/main
     user_id = int(user.id)
 
     def result(outcome: ConnectorToolsOutcome, **fields: Any) -> ConnectorToolsResult:
@@ -278,38 +248,6 @@ async def list_actor_stdio_connector_tools(
     if get_builtin_stdio_session_scope(app_id) == "execution":
         return result(ConnectorToolsOutcome.UNSUPPORTED, reason="execution_scoped")
 
-<<<<<<< HEAD
-=======
-    # The team scope is resolved outside the guard, and its typed error
-    # propagates, as in the task's _load_mcp_server_configs; a scan failure
-    # inside it is the task's config_load_failed.
-    visible_query = _visible_server_query(
-        db, user_id=user_id, connector_team_id=connector_team_id
-    )
-    try:
-        resolution = resolve_actor_mcp_stdio_configs(
-            db,
-            user_id=user_id,
-            policy=mcp_runtime_authorization_policy,
-            adapter=mcp_actor_stdio_connection_adapter,
-            visible_servers=visible_query.all(),
-            execution_identity=mcp_actor_execution_identity,
-        )
-    except Exception as error:
-        logger.warning(
-            "Failed to scan actor stdio configs with %s", type(error).__name__
-        )
-        return result(
-            ConnectorToolsOutcome.FAILED_TO_START, reason="config_load_failed"
-        )
-    server_config = next(
-        (config for config in resolution.configs if config.get("name") == app_id),
-        None,
-    )
-    if server_config is None:
-        return result(ConnectorToolsOutcome.NOT_FOUND)
-
->>>>>>> origin/main
     tool_config = _task_tool_config(
         db,
         user,
@@ -318,7 +256,6 @@ async def list_actor_stdio_connector_tools(
         mcp_actor_execution_identity=mcp_actor_execution_identity,
         connector_team_id=connector_team_id,
     )
-<<<<<<< HEAD
     team_selection = team_selection or tool_config.resolve_connector_team_selection()
     try:
         server_config = await tool_config.load_actor_stdio_config(
@@ -333,8 +270,6 @@ async def list_actor_stdio_connector_tools(
         )
     if server_config is None:
         return result(ConnectorToolsOutcome.NOT_FOUND)
-=======
->>>>>>> origin/main
     return await _start_and_list(
         tool_config,
         server_config,
@@ -347,12 +282,8 @@ async def list_actor_stdio_connector_tools(
 
 
 def find_visible_server(
-<<<<<<< HEAD
     db: Any, *, user_id: int, server_id: int, connector_team_id: int | None,
     team_selection: Any | None = None,
-=======
-    db: Any, *, user_id: int, server_id: int, connector_team_id: int | None
->>>>>>> origin/main
 ) -> Any | None:
     """The ``MCPServer`` row ``server_id`` if the task's config would see it.
 
@@ -363,43 +294,24 @@ def find_visible_server(
     from ..models.mcp import MCPServer
 
     return (
-<<<<<<< HEAD
         _visible_server_query(db, user_id=user_id, connector_team_id=connector_team_id,
                               team_selection=team_selection)
-=======
-        _visible_server_query(db, user_id=user_id, connector_team_id=connector_team_id)
->>>>>>> origin/main
         .filter(MCPServer.id == server_id)
         .first()
     )
 
 
 def _visible_server_query(
-<<<<<<< HEAD
     db: Any, *, user_id: int, connector_team_id: int | None, team_selection: Any | None = None
-=======
-    db: Any, *, user_id: int, connector_team_id: int | None
->>>>>>> origin/main
 ) -> Any:
     """The config's own ``_visible_mcp_server_query``, run with the team ids
     resolved by the same function ``_load_mcp_server_configs`` uses, so the
     two cannot drift."""
     from ..tools.config import WebToolConfig
-<<<<<<< HEAD
     config = WebToolConfig(
         db=db, request=None, user_id=user_id
     )
     return config.visible_mcp_server_query(team_selection=team_selection)
-=======
-    from .connector_team_scope import resolve_team_connector_selection_or_raise
-
-    team_selection = resolve_team_connector_selection_or_raise(
-        db, team_id=connector_team_id, log_subject=user_id
-    )
-    return WebToolConfig(
-        db=db, request=None, user_id=user_id
-    )._visible_mcp_server_query(team_selection.mcp_ids)
->>>>>>> origin/main
 
 
 def _task_tool_config(

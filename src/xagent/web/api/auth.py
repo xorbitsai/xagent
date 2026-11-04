@@ -3473,6 +3473,12 @@ def start_builtin_oauth_for_resource_owner(
         app_id=app_id,
     )
 
+    from .. import composio_auth
+
+    via_composio = composio_auth.facebook_uses_composio(provider, app_id)
+    if via_composio and (refusal := composio_auth.start_preflight()):
+        return refusal
+
     browser_nonce = secrets.token_urlsafe(32)
     nonce_digest = hashlib.sha256(browser_nonce.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + _ACTOR_OAUTH_FLOW_TTL
@@ -3488,9 +3494,21 @@ def start_builtin_oauth_for_resource_owner(
         actor_flow_nonce=nonce_digest,
         account=account,
         force_google_consent=force_google_consent,
+        auth_backend=composio_auth.AUTH_BACKEND if via_composio else None,
     )
     if not isinstance(response, RedirectResponse):
         return response
+    if via_composio:
+        # Same state, flow row and proof cookie; the browser comes back to our
+        # callback path first, which sends it on to Composio (composio_auth).
+        from urllib.parse import parse_qs, urlsplit
+
+        state = parse_qs(urlsplit(response.headers["location"]).query)["state"][0]
+        response = RedirectResponse(
+            composio_auth.begin_location(
+                _resolve_oauth_redirect_uri(provider, db_provider), state
+            )
+        )
     db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
     cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
     response.set_cookie(
@@ -3877,6 +3895,7 @@ def _generic_oauth_login(
     account: str | None,
     trusted_session_epoch: str | None = None,
     force_google_consent: bool = False,
+    auth_backend: str | None = None,
 ) -> Any:
     """Build an ordinary or trusted actor provider authorization redirect."""
     if db is None:
@@ -4043,6 +4062,10 @@ def _generic_oauth_login(
             resource_owner_key=encrypted_owner_key,
             actor_flow_nonce=actor_flow_nonce,
         )
+        if auth_backend is not None:
+            from ..composio_auth import AUTH_BACKEND_CLAIM
+
+            state_payload[AUTH_BACKEND_CLAIM] = auth_backend
     app_scopes: list[str] | None = None
     app_optional_scopes: list[str] = []
     app_info: dict[str, Any] | None = None
@@ -4355,6 +4378,44 @@ def _ensure_user_mcp_server(
         db.add(user_mcp)
 
 
+def _oauth_success_response(
+    *, redirect_url: Any, email: Any, provider_label: str
+) -> HTMLResponse:
+    """Tell the opener the connect succeeded, then close the popup."""
+    from urllib.parse import urlparse
+
+    target_origin = "window.location.origin"
+    if redirect_url:
+        try:
+            parsed = urlparse(redirect_url)
+            if parsed.scheme and parsed.netloc:
+                target_origin = script_safe_json(f"{parsed.scheme}://{parsed.netloc}")
+        except Exception:
+            pass
+
+    return HTMLResponse(
+        content=f"""
+        <html>
+            <head>
+                <title>Connected</title>
+                <script>
+                    window.opener.postMessage({{
+                        type: 'oauth-success',
+                        email: {script_safe_json(email)},
+                        provider: {script_safe_json(provider_label)}
+                    }}, {target_origin});
+                    window.close();
+                </script>
+            </head>
+            <body>
+                <h1>Connected Successfully</h1>
+                <p>You can close this window now.</p>
+            </body>
+        </html>
+        """
+    )
+
+
 def generic_oauth_callback(
     provider: str,
     request: Request,
@@ -4371,6 +4432,12 @@ def generic_oauth_callback(
     is_myob = provider.lower() == "myob"
     if db is None:
         raise RuntimeError("db session is required")
+    from .. import composio_auth
+
+    if (
+        step := composio_auth.callback_step(provider, request.query_params)
+    ) is not None:
+        return composio_auth.handle_callback(step, request, db, db_provider)
     if (
         provider.lower() == "microsoft"
         and request.query_params.get("admin_consent") is not None
@@ -4454,6 +4521,16 @@ def generic_oauth_callback(
         return HTMLResponse(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
+    if payload.get(composio_auth.AUTH_BACKEND_CLAIM) is not None:
+        # A Composio flow's state is never spent on a provider code exchange.
+        _log_oauth_callback_rejection(
+            provider,
+            "state_invalid",
+            app_id=payload.get("app_id"),
+            actor_flow=True,
+            provider_error=provider_error,
+        )
+        return _actor_oauth_flow_rejected_response("state_invalid")
 
     browser_nonce_hash = payload.get("browser_nonce_hash")
     is_actor_flow = (
@@ -6061,40 +6138,10 @@ def generic_oauth_callback(
                     **side_effect_kwargs,
                 )
 
-        from urllib.parse import urlparse
-
-        redirect_url = payload.get("redirect")
-        target_origin = "window.location.origin"
-        if redirect_url:
-            try:
-                parsed = urlparse(redirect_url)
-                if parsed.scheme and parsed.netloc:
-                    target_origin = script_safe_json(
-                        f"{parsed.scheme}://{parsed.netloc}"
-                    )
-            except Exception:
-                pass
-
-        return HTMLResponse(
-            content=f"""
-        <html>
-            <head>
-                <title>Connected</title>
-                <script>
-                    window.opener.postMessage({{
-                        type: 'oauth-success',
-                        email: {script_safe_json(email)},
-                        provider: {script_safe_json(app_id or provider)}
-                    }}, {target_origin});
-                    window.close();
-                </script>
-            </head>
-            <body>
-                <h1>Connected Successfully</h1>
-                <p>You can close this window now.</p>
-            </body>
-        </html>
-        """
+        return _oauth_success_response(
+            redirect_url=payload.get("redirect"),
+            email=email,
+            provider_label=app_id or provider,
         )
     except Exception:
         # str(e) is not rendered to the client: db.add(oauth_account)/db.commit()

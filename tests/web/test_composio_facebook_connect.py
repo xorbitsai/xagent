@@ -733,6 +733,48 @@ def test_a_lost_completion_with_several_open_flows_deletes_nothing(
     assert len(_flow_cookies(browser)) == 2
 
 
+def _denied_url(account_id: str) -> str:
+    # What Composio sends back when the member cancels on Facebook (seen live).
+    return (
+        f"{CALLBACK_URL}?status=failed&error=access_denied"
+        f"&error_description=Permissions+error&connected_account_id={account_id}"
+    )
+
+
+def test_a_denied_authorization_says_what_to_do_and_ends_its_flow(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+
+    response = browser.get(db, _denied_url(composio.created[0]))
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "Permission was not granted" in body
+    assert "access_denied" in body
+    assert composio.created[0] not in body
+    assert _grants(db) == []
+    assert db.query(ActorOAuthFlowState).count() == 0
+    assert _flow_cookies(browser) == []
+    assert composio.paths("DELETE") == [f"/connected_accounts/{composio.created[0]}"]
+
+
+def test_a_denied_return_for_an_account_no_flow_created_deletes_nothing(
+    db_session, composio_env, composio
+):
+    db, user = db_session
+    browser, _ = _connect_until_verification(db, user)
+
+    response = browser.get(db, _denied_url("ca_someone_elses"))
+
+    assert response.status_code == 400
+    assert "Permission was not granted" in response.body.decode()
+    assert composio.paths("DELETE") == []
+    assert db.query(ActorOAuthFlowState).count() == 1
+    assert len(_flow_cookies(browser)) == 1
+
+
 def test_a_user_id_composio_refuses_stores_nothing(db_session, composio_env, composio):
     db, user = db_session
     browser, _ = _connect_until_verification(db, user)

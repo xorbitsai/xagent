@@ -110,7 +110,7 @@ _FACEBOOK_USER_ID_RE = re.compile(r"[0-9]{1,32}")
 _MAX_SESSION_URI_LENGTH = 4096
 _NONCE_RE = re.compile(r"[0-9a-f]{64}")
 
-Step = Literal["begin", "verify"]
+Step = Literal["begin", "verify", "denied"]
 
 
 class ComposioConfig(NamedTuple):
@@ -254,6 +254,11 @@ def callback_step(provider: str, query: Mapping[str, Any]) -> Step | None:
 
     if has("session_uri"):
         return "verify"
+    # Composio sends a denied or failed authorization back to callback_url
+    # with its connected_account_id and no state (seen live, #3532); a
+    # native Meta callback always carries state.
+    if has("connected_account_id") and not has("state") and not has("code"):
+        return "denied"
     if has("code") or has("error"):
         return None
     if has("state"):
@@ -771,6 +776,8 @@ def handle_callback(
 ) -> Response:
     if step == "begin":
         return _handle_begin(request, db, db_provider)
+    if step == "denied":
+        return _handle_denied(request, db, db_provider)
     return _handle_verify(request, db, db_provider)
 
 
@@ -851,6 +858,47 @@ def _handle_begin(request: Any, db: Session, db_provider: Any) -> Response:
         path=path,
     )
     return response
+
+
+def _handle_denied(request: Any, db: Session, db_provider: Any) -> Response:
+    """Say what to do after Composio returns a denied or failed authorization.
+
+    The returned id is trusted only to find the open flow whose encrypted
+    cookie names the same account; that flow is ended and its unfinished
+    account deleted. Anything else is left alone.
+    """
+    from .api.auth import (
+        _actor_oauth_provider_error_response,
+        _log_oauth_callback_rejection,
+        _oauth_callback_provider_error,
+    )
+
+    query = request.query_params
+    provider_error = _oauth_callback_provider_error(
+        META_PROVIDER, query.get("error") or "access_denied", None
+    )
+    assert provider_error is not None  # a non-empty error is passed in
+    _log_oauth_callback_rejection(
+        META_PROVIDER,
+        "provider_error",
+        app_id=FACEBOOK_APP_ID,
+        actor_flow=True,
+        provider_error=provider_error,
+    )
+    open_flows, dead, _ = _open_flows(request, db)
+    returned = _valid_account_id(query.get("connected_account_id"))
+    matches = [f for f in open_flows if returned and f.account_id == returned]
+    config = load_config()
+    for match in matches:
+        dead.append(match.cookie_name)
+        _spend(db, match)
+        if config is not None:
+            delete_account(config.api_key, match.account_id)
+    return _clear_flow_cookies(
+        _actor_oauth_provider_error_response(META_PROVIDER, provider_error),
+        db_provider,
+        dead,
+    )
 
 
 def _spend(db: Session, open_flow: _OpenFlow) -> bool:

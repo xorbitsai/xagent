@@ -155,11 +155,6 @@ uv run pytest -q \
 74 passed
 ```
 
-测试环境先安装了 macOS 所需的 OpenMP 运行库：
-
-```bash
-brew install libomp
-```
 
 ## 6. 重点查看文件
 
@@ -169,9 +164,9 @@ brew install libomp
 - `tests/web/services/test_connector_session_actor_policy.py`
 - `tests/web/services/test_connector_probe.py`
 
-## 7. 面试介绍建议
+## 7. 介绍
 
-可以这样概括本次修改：
+概括本次修改：
 
 > 原实现存在两个 MCP 配置加载入口，connector session 自己重复处理 team scope 和 actor stdio 配置，导致一次 probe 可能重复调用 team hook，并且为了一个 actor stdio connector 构建全部配置。本次修改把这些逻辑统一收口到 `WebToolConfig`，由 probe 解析一次 team selection 后向下传递，同时增加单个 actor stdio 配置入口，在保持可见性、权限和 probe 行为不变的前提下降低重复解析。
 

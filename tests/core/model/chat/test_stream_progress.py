@@ -18,6 +18,7 @@ from xagent.core.model.chat.stream_progress import (
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
+    attach_reasoning_content_to_raw,
     no_progress_tail_chunk,
 )
 from xagent.core.model.chat.types import ChunkType
@@ -527,6 +528,33 @@ class TestNoPayloadTimeout:
         assert guard.observe(reasoning_texts=("more",)) is None
 
 
+class TestAttachReasoningContentToRaw:
+    def test_attaches_shared_runtime_keys(self) -> None:
+        raw = attach_reasoning_content_to_raw(
+            {"provider": "value"},
+            "think",
+            has_reasoning_content=True,
+        )
+
+        assert raw == {
+            "provider": "value",
+            "reasoning_content": "think",
+            "reasoning": "think",
+        }
+
+    def test_leaves_payload_alone_without_reasoning(self) -> None:
+        payload = {"provider": "value"}
+
+        assert (
+            attach_reasoning_content_to_raw(
+                payload,
+                "think",
+                has_reasoning_content=False,
+            )
+            is payload
+        )
+
+
 class TestNoProgressTailChunk:
     def test_end_chunk_stamps_abort_reason(self) -> None:
         abort = StreamAbort(reason="empty_deltas", detail="empty")
@@ -555,6 +583,7 @@ class TestNoProgressTailChunk:
         assert chunk.type == ChunkType.TOOL_CALL
         assert chunk.finish_reason == NO_PROGRESS_FINISH_REASON
         assert chunk.tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
+        assert calls["call_1"]["function"]["arguments"] == '{"q": "x"}'
         assert chunk.raw == {STREAM_ABORTED_KEY: "tool_call_trailing_bytes"}
 
 

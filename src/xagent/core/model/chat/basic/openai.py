@@ -34,6 +34,7 @@ from ..stream_progress import (
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
+    attach_reasoning_content_to_raw,
     no_progress_tail_chunk,
 )
 from ..timeout_config import TimeoutConfig
@@ -1064,18 +1065,11 @@ class OpenAICompatibleLLM(BaseLLM):
         has_reasoning_content: bool = False,
     ) -> Any:
         """Attach accumulated reasoning content to a raw payload when possible."""
-        if not has_reasoning_content:
-            return raw_payload
-
-        if hasattr(raw_payload, "model_dump"):
-            raw_payload = raw_payload.model_dump()
-
-        if isinstance(raw_payload, dict):
-            raw_payload = dict(raw_payload)
-            raw_payload["reasoning_content"] = reasoning_content
-            raw_payload["reasoning"] = reasoning_content
-
-        return raw_payload
+        return attach_reasoning_content_to_raw(
+            raw_payload,
+            reasoning_content,
+            has_reasoning_content=has_reasoning_content,
+        )
 
     async def vision_chat(
         self,

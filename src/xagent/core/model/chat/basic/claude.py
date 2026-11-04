@@ -27,6 +27,7 @@ from ..stream_progress import (
     StreamAbort,
     StreamProgressConfig,
     StreamProgressGuard,
+    attach_reasoning_content_to_raw,
     no_progress_tail_chunk,
 )
 from ..timeout_config import TimeoutConfig
@@ -78,7 +79,7 @@ def _anthropic_input_usage(usage: Any) -> tuple[int, int, int]:
 
 
 async def _close_stream(stream: Any) -> None:
-    """Close the SDK stream after a deadline expired, best effort."""
+    """Close the SDK stream after a deadline expired or the progress guard aborted."""
     close = getattr(stream, "close", None)
     if not callable(close):
         return
@@ -127,25 +128,6 @@ def _anthropic_progress_tool_calls(
         }
         for tool_id, tool_call in accumulated_tool_calls.items()
     }
-
-
-def _attach_anthropic_reasoning_to_raw(
-    raw_payload: Any,
-    reasoning_content: str,
-    *,
-    has_reasoning_content: bool,
-) -> Any:
-    """Attach accumulated Claude thinking to an emitted raw payload."""
-    if not has_reasoning_content:
-        return raw_payload
-    if hasattr(raw_payload, "model_dump"):
-        raw_payload = raw_payload.model_dump()
-    if not isinstance(raw_payload, dict):
-        return raw_payload
-    raw = dict(raw_payload)
-    raw["reasoning_content"] = reasoning_content
-    raw["reasoning"] = reasoning_content
-    return raw
 
 
 def _handle_union_type(schema: Dict[str, Any], union_key: str) -> Dict[str, Any]:
@@ -1046,7 +1028,6 @@ class ClaudeLLM(BaseLLM):
             events = aiter(stream)
             first_event = True
             raw_event_count = 0
-            last_raw_event: Any = None
             progress_guard = StreamProgressGuard(
                 StreamProgressConfig.from_env(model_name=self._model_name)
             )
@@ -1074,7 +1055,6 @@ class ClaudeLLM(BaseLLM):
                     raise
                 first_event = False
                 raw_event_count += 1
-                last_raw_event = event
 
                 # Anthropic streams include structural events that carry no
                 # model delta.  Only events classified below are observations;
@@ -1119,8 +1099,9 @@ class ClaudeLLM(BaseLLM):
                         elif block.type == "redacted_thinking":
                             # Redacted thinking has no inspectable text, but
                             # is genuine provider-native reasoning activity.
-                            reasoning_opaque = bool(getattr(block, "data", None))
-                            observe_event = reasoning_opaque
+                            # Anthropic only surfaces it as a block start.
+                            reasoning_opaque = True
+                            observe_event = True
 
                 elif event.type == "content_block_delta":
                     # Incremental content update
@@ -1137,7 +1118,7 @@ class ClaudeLLM(BaseLLM):
                                     type=ChunkType.TOKEN,
                                     content=current_content,
                                     delta=text,
-                                    raw=_attach_anthropic_reasoning_to_raw(
+                                    raw=attach_reasoning_content_to_raw(
                                         event,
                                         accumulated_reasoning_content,
                                         has_reasoning_content=has_reasoning_content,
@@ -1146,19 +1127,16 @@ class ClaudeLLM(BaseLLM):
                             )
                         elif delta.type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", None)
-                            has_reasoning_content = True
                             observe_event = True
-                            if isinstance(thinking_text, str):
+                            if isinstance(thinking_text, str) and thinking_text:
                                 accumulated_reasoning_content += thinking_text
+                                has_reasoning_content = True
                                 reasoning_texts.append(thinking_text)
-                            elif thinking_text is not None:
+                            elif thinking_text not in (None, ""):
                                 reasoning_opaque = True
-                        elif delta.type == "redacted_thinking_delta":
-                            reasoning_opaque = bool(getattr(delta, "data", None))
-                            observe_event = reasoning_opaque
-                        elif delta.type == "signature_delta":
-                            # A signature authenticates the preceding thinking
-                            # block but is not itself generated reasoning.
+                        elif delta.type in {"signature_delta", "citations_delta"}:
+                            # Signatures authenticate thinking; citations are
+                            # metadata. Neither is generated reasoning text.
                             pass
                         elif delta.type == "input_json_delta":
                             observe_event = True
@@ -1191,8 +1169,10 @@ class ClaudeLLM(BaseLLM):
                                     logger.warning("No event.index, using first tool")
                                     tool_id = list(accumulated_tool_calls.keys())[0]
                                 else:
+                                    # No tool can consume this delta. Leave it
+                                    # as an empty observation for the guard.
                                     logger.warning(
-                                        "No event.index and accumulated_tool_calls is empty, skipping chunk"
+                                        "No event.index and accumulated_tool_calls is empty"
                                     )
                                     tool_id = ""
 
@@ -1212,17 +1192,23 @@ class ClaudeLLM(BaseLLM):
                                             tool_calls=_anthropic_stream_tool_calls(
                                                 accumulated_tool_calls
                                             ),
-                                            raw=_attach_anthropic_reasoning_to_raw(
+                                            raw=attach_reasoning_content_to_raw(
                                                 event,
                                                 accumulated_reasoning_content,
                                                 has_reasoning_content=has_reasoning_content,
                                             ),
                                         ),
                                     )
-                            else:
+                            elif tool_id:
                                 logger.warning(
                                     f"tool_id {tool_id} not found in accumulated_tool_calls"
                                 )
+                        else:
+                            # An Anthropic-compatible endpoint may stream an
+                            # unrecognized delta subtype. Observe it so a loop
+                            # of unknown events can still trip empty_deltas
+                            # instead of running to the output cap unseen.
+                            observe_event = True
 
                 elif event.type == "content_block_stop":
                     # End of content block
@@ -1290,7 +1276,7 @@ class ClaudeLLM(BaseLLM):
                             StreamChunk(
                                 type=ChunkType.USAGE,
                                 usage=usage_dict,
-                                raw=_attach_anthropic_reasoning_to_raw(
+                                raw=attach_reasoning_content_to_raw(
                                     event,
                                     accumulated_reasoning_content,
                                     has_reasoning_content=has_reasoning_content,
@@ -1316,7 +1302,7 @@ class ClaudeLLM(BaseLLM):
                                             accumulated_tool_calls
                                         ),
                                         finish_reason=stop_reason,
-                                        raw=_attach_anthropic_reasoning_to_raw(
+                                        raw=attach_reasoning_content_to_raw(
                                             event,
                                             accumulated_reasoning_content,
                                             has_reasoning_content=has_reasoning_content,
@@ -1328,7 +1314,7 @@ class ClaudeLLM(BaseLLM):
                                     StreamChunk(
                                         type=ChunkType.END,
                                         finish_reason=stop_reason,
-                                        raw=_attach_anthropic_reasoning_to_raw(
+                                        raw=attach_reasoning_content_to_raw(
                                             event,
                                             accumulated_reasoning_content,
                                             has_reasoning_content=has_reasoning_content,
@@ -1354,6 +1340,9 @@ class ClaudeLLM(BaseLLM):
                     yield chunk
 
             if stream_abort is not None:
+                # Closing early can lose the final message_delta and its output
+                # usage. As in openai.py, do not fabricate token counts: the
+                # trace can show usage_missing alongside the abort reason.
                 await _close_stream(stream)
                 logger.warning(
                     "Aborting Claude stream for %s after %d events: %s (%s)",
@@ -1362,14 +1351,19 @@ class ClaudeLLM(BaseLLM):
                     stream_abort.reason,
                     stream_abort.detail,
                 )
-                raw = _attach_anthropic_reasoning_to_raw(
-                    last_raw_event,
+                raw = attach_reasoning_content_to_raw(
+                    event,
                     accumulated_reasoning_content,
                     has_reasoning_content=has_reasoning_content,
                 )
+                # Observations need real argument bytes; the public tail uses
+                # the same empty-argument normalization as normal tool chunks.
                 yield no_progress_tail_chunk(
                     stream_abort,
-                    _anthropic_progress_tool_calls(accumulated_tool_calls),
+                    {
+                        call["id"]: call
+                        for call in _anthropic_stream_tool_calls(accumulated_tool_calls)
+                    },
                     raw,
                 )
 

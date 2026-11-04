@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import textwrap
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import get_args
@@ -939,6 +940,143 @@ def test_every_call_site_of_active_interaction_id_sync_names_unavailable() -> No
         ):
             offenders.append(str(path))
     assert offenders == []
+
+
+_READ_STATE_NAMES = frozenset(
+    {
+        "ActiveInteractionFound",
+        "ActiveInteractionAbsent",
+        "ActiveInteractionUnavailable",
+    }
+)
+
+
+def _function_defs(tree: ast.Module) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+
+def _enclosing_function(tree: ast.Module, lineno: int) -> str | None:
+    """Name of the innermost function definition spanning ``lineno``."""
+    best = None
+    for node in _function_defs(tree):
+        if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+            if best is None or node.lineno > best.lineno:
+                best = node
+    return best.name if best is not None else None
+
+
+def _reader_call_sites() -> list[tuple[str, str | None, ast.Module]]:
+    """``(file name, enclosing function, parsed module)`` for every
+    production call of ``active_interaction_id_sync``."""
+    sites = []
+    for path in _scan_root(_CLOSE_MODULE_STEM):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == _READER_NAME) or (
+                isinstance(func, ast.Attribute) and func.attr == _READER_NAME
+            ):
+                sites.append((path.name, _enclosing_function(tree, node.lineno), tree))
+    return sites
+
+
+def test_active_interaction_id_sync_is_called_from_exactly_four_production_functions():
+    """The reader has four production callers: the resume command seam and
+    the three sites that inject a message into a waiting run and then close
+    its active row. A fifth caller has to decide what each of the three
+    read states means for it, so adding one fails here first."""
+    assert sorted((name, func) for name, func, _ in _reader_call_sites()) == [
+        ("task_command_execution.py", "handle_task_message"),
+        ("task_command_execution.py", "resume_task"),
+        ("task_resume.py", "resume_a2a_task"),
+        ("task_resume.py", "resume_task_reply"),
+    ]
+
+
+def _names_a_read_state(node: ast.AST) -> bool:
+    """Whether any of the three read states is named anywhere under ``node``,
+    whatever expression or pattern wraps it."""
+    return any(
+        (isinstance(inner, ast.Name) and inner.id in _READ_STATE_NAMES)
+        or (isinstance(inner, ast.Attribute) and inner.attr in _READ_STATE_NAMES)
+        for inner in ast.walk(node)
+    )
+
+
+def _read_state_branches(node: ast.AST) -> list[list[ast.stmt]]:
+    """The statement lists ``node`` chooses between, if it branches on a read
+    state: both arms of an ``if``, every case of a ``match``. A check stored in
+    a variable first, or a conditional expression, is not followed."""
+    if isinstance(node, ast.If) and _names_a_read_state(node.test):
+        return [node.body, node.orelse]
+    if isinstance(node, ast.Match) and any(
+        _names_a_read_state(case.pattern)
+        or (case.guard is not None and _names_a_read_state(case.guard))
+        for case in node.cases
+    ):
+        return [case.body for case in node.cases]
+    return []
+
+
+def _returning_read_state_branches(tree: ast.AST) -> list[ast.AST]:
+    """Every node under ``tree`` with a read-state branch that returns."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if any(
+            isinstance(inner, ast.Return)
+            for branch in _read_state_branches(node)
+            for statement in branch
+            for inner in ast.walk(statement)
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if isinstance(read, ActiveInteractionFound):\n    return 1\n",
+        "if isinstance(read, (ActiveInteractionFound, Other)):\n    return 1\n",
+        "if not isinstance(read, ActiveInteractionAbsent):\n    return 1\n",
+        "if isinstance(read, ActiveInteractionFound) and flag:\n    return 1\n",
+        "if type(read) is ActiveInteractionFound:\n    return 1\n",
+        "if isinstance(read, close.ActiveInteractionFound):\n    return 1\n",
+        "if isinstance(read, ActiveInteractionAbsent):\n    pass\nelse:\n    return 1\n",
+        "match read:\n    case ActiveInteractionFound():\n        return 1\n",
+        "match read:\n"
+        "    case close.ActiveInteractionUnavailable(reason=why):\n"
+        "        return 1\n",
+        "match read:\n"
+        "    case state if isinstance(state, ActiveInteractionFound):\n"
+        "        return 1\n",
+    ],
+)
+def test_the_read_state_branch_scan_recognizes_each_way_to_write_the_branch(
+    source: str,
+) -> None:
+    tree = ast.parse(f"def caller(read):\n{textwrap.indent(source, '    ')}")
+    assert _returning_read_state_branches(tree) != []
+
+
+def test_only_resume_task_returns_from_a_branch_on_the_active_interaction_read():
+    """Only the resume command seam turns the read's result into a decision
+    that ends the call (a refusal, a skip or a deferral). The three injection sites
+    branch on the same result but always go on to inject the message, so
+    none of their branches on it returns."""
+    returning = set()
+    for name, func_name, tree in _reader_call_sites():
+        for func in _function_defs(tree):
+            if func.name != func_name:
+                continue
+            if _returning_read_state_branches(func):
+                returning.add((name, func_name))
+    assert returning == {("task_command_execution.py", "resume_task")}
 
 
 # --------------------------------------------------------------------------

@@ -281,8 +281,9 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # per wording, so only the "didn't go through" one asserts a code: 57.
     # The pause pre-check's not-applicable reply adds one: 58.
     # The planned-restart hold refusal's plain error frame adds one: 59.
-    assert result.error_payloads == 59, (
-        f"expected exactly 59 error payloads, matched {result.error_payloads}; "
+    # The resume seam's refusal when it cannot read the active interaction row adds one: 60.
+    assert result.error_payloads == 60, (
+        f"expected exactly 60 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry

@@ -8,8 +8,9 @@ Runs on SQLite and, when ``XAGENT_TEST_POSTGRES_URL`` is set, PostgreSQL.
 
 from __future__ import annotations
 
+import logging
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -18,6 +19,9 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import Session, sessionmaker
 
+from tests.web.services.interaction_rollout_policy_shared import (
+    install_interaction_rollout_policy,
+)
 from tests.web.services.task_database_shared import engine as engine_fixture
 from xagent.web.models.agent import Agent
 from xagent.web.models.database import Base
@@ -44,9 +48,15 @@ from xagent.web.services.task_command_execution import (
     ResumeCommandOutcome,
     execute_durable_task_command,
 )
-from xagent.web.services.task_command_transport import dispatch_one_task_command
+from xagent.web.services.task_command_transport import (
+    dispatch_one_task_command,
+    max_command_defers,
+)
 from xagent.web.services.task_execution import ResumeReservationOutcome
-from xagent.web.services.task_interaction_close import ActiveInteractionAbsent
+from xagent.web.services.task_interaction_close import (
+    ActiveInteractionAbsent,
+    ActiveInteractionUnavailable,
+)
 from xagent.web.services.task_lease_service import utc_now
 
 engine = engine_fixture
@@ -582,12 +592,13 @@ async def test_row_moved_after_the_guard_defers_and_the_retry_skips(factory, han
 
 
 async def _dispatch_auto_command(factory: sessionmaker, task_id: int) -> Any:
+    """Run the task's newest command, which is the last one dispatched."""
     with factory() as db:
         command_db_id = db.scalars(
-            sa.select(TaskExecutionCommand.id).where(
-                TaskExecutionCommand.task_id == task_id
-            )
-        ).one()
+            sa.select(TaskExecutionCommand.id)
+            .where(TaskExecutionCommand.task_id == task_id)
+            .order_by(TaskExecutionCommand.id.desc())
+        ).first()
     assert await dispatch_one_task_command(
         execute_durable_task_command, command_db_id=command_db_id
     )
@@ -985,6 +996,256 @@ async def test_resume_task_skips_an_unanswered_question_without_an_error(
     assert result.reason_code == "interaction_pending"
     reply.assert_not_awaited()
     handler.manager.try_reserve_resume.assert_not_called()
+
+
+_ROLLOUT_POLICIES = [
+    ("legacy", True),
+    ("legacy", False),
+    ("read", True),
+    ("read", False),
+    ("native", True),
+    ("native", False),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "shared_task_execution"), _ROLLOUT_POLICIES)
+async def test_resume_task_skips_an_unverifiable_interaction_read_without_an_error(
+    factory, handler, monkeypatch, caplog, mode, shared_task_execution
+):
+    """An automatic resume at the fence whose active interaction read could
+    not be made is skipped, not refused, in a process that can publish native
+    rows; everywhere else it proceeds. Neither outcome sends a reply."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode=mode, shared_task_execution=shared_task_execution
+    )
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+
+    with caplog.at_level(logging.INFO, logger=commands.__name__):
+        result, reply = await _resume(factory, task_id)
+
+    reply.assert_not_awaited()
+    skipped_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == commands.__name__
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("auto resume skipped")
+    ]
+    if (mode, shared_task_execution) == ("native", True):
+        assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+        assert result.reason_code == "interaction_unverifiable"
+        handler.manager.try_reserve_resume.assert_not_called()
+        assert skipped_lines == [
+            f"auto resume skipped task_id={task_id} run_id={RUN} "
+            "why=interaction_unverifiable component=auto-resume"
+        ]
+    else:
+        assert result.outcome is ResumeCommandOutcome.SCHEDULED
+        assert skipped_lines == []
+
+
+@pytest.mark.asyncio
+async def test_a_retry_still_at_the_fence_skips_an_unverifiable_interaction_read(
+    factory, handler, monkeypatch
+):
+    """What turns a skip into a deferral is the moved fence, not the attempt
+    number: an earlier attempt that deferred before its transition left the
+    fence where it was, so housekeeping still schedules the run again."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+    with factory() as db:
+        task_id, _ = _seed(db)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+
+    result, reply = await _resume(factory, task_id, attempt_count=2)
+
+    assert result.outcome is ResumeCommandOutcome.AUTO_SKIPPED
+    assert result.reason_code == "interaction_unverifiable"
+    reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("mode", "shared_task_execution"), _ROLLOUT_POLICIES)
+async def test_own_retry_defers_an_unverifiable_read_and_goes_on_after_it(
+    factory, handler, monkeypatch, caplog, mode, shared_task_execution
+):
+    """A command that already wrote RESUME_REQUESTED must not complete while
+    the read is failing, in a process that can publish native rows: housekeeping
+    would confirm the moved fence and nothing would resume the task. It defers,
+    writes nothing, and goes ahead on the attempt that can read. Everywhere else
+    it proceeds, like a first attempt."""
+    install_interaction_rollout_policy(
+        monkeypatch, mode=mode, shared_task_execution=shared_task_execution
+    )
+    with factory() as db:
+        task_id, _ = _seed(db, control_state="resume_requested", state_version=PV + 1)
+        db.commit()
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+
+    with caplog.at_level(logging.INFO, logger=commands.__name__):
+        result, reply = await _resume(factory, task_id, attempt_count=2)
+
+    reply.assert_not_awaited()
+    if (mode, shared_task_execution) != ("native", True):
+        assert result.outcome is ResumeCommandOutcome.SCHEDULED
+        return
+    assert result.outcome is ResumeCommandOutcome.DEFERRED
+    assert not result.client_visible
+    handler.manager.try_reserve_resume.assert_not_called()
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("resume_requested", PV + 1)
+    assert _row(factory, task_id).state == "dispatched"
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == commands.__name__
+        and record.levelno == logging.INFO
+        and record.getMessage().startswith("Deferring resume")
+    ] == [
+        f"Deferring resume for task {task_id} run {RUN}: the active interaction "
+        "read was unavailable (reason=lookup_failed) (attempt 2)"
+    ]
+
+    handler.interaction.return_value = ActiveInteractionAbsent()
+    retry, _reply = await _resume(factory, task_id, attempt_count=3)
+
+    assert retry.outcome is ResumeCommandOutcome.SCHEDULED
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("resume_requested", PV + 2)
+
+
+@pytest.mark.asyncio
+async def test_a_manual_resume_at_resume_requested_is_refused_not_deferred(
+    factory, handler, monkeypatch
+):
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+    with factory() as db:
+        task_id, _ = _seed(db, control_state="resume_requested", state_version=PV + 1)
+        db.commit()
+        user_id = db.get(Task, task_id).user_id
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+    reply = AsyncMock()
+
+    result = await commands.resume_task(
+        reply,
+        task_id,
+        {"type": "resume_task", "user": SimpleNamespace(id=user_id, is_admin=False)},
+    )
+
+    assert result.outcome is ResumeCommandOutcome.REJECTED
+    assert result.reason_code == "interaction_unverifiable"
+    reply.assert_awaited_once()
+
+
+def _just_after_next_attempt(row: TaskAutoRecovery) -> datetime:
+    return task_auto_resume._utc(row.next_attempt_at) + timedelta(seconds=1)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_read_is_dispatched_again_until_the_run_is_exhausted(
+    factory, handler, monkeypatch
+):
+    """Every skip at the fence leads to a new command, each one counted against
+    the run, and the no-progress limit (3 for ``lease_expired``) ends it."""
+    monkeypatch.setattr(
+        task_auto_resume, "notify_task_command_dispatcher", lambda: None
+    )
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+    task_id = _scheduled(factory)
+
+    command_ids = []
+    now = utc_now()
+    for dispatches in (1, 2, 3):
+        assert run_auto_resume_tick(now=now).dispatched == 1
+        row = _row(factory, task_id)
+        assert (row.state, row.total_resumes) == ("dispatched", dispatches)
+        command_ids.append(row.last_command_id)
+
+        command = await _dispatch_auto_command(factory, task_id)
+
+        assert command.status == "completed"
+        assert command.result["resume_outcome"] == "auto_skipped"
+        now = _just_after_next_attempt(row)
+        run_auto_resume_tick(now=now)
+        row = _row(factory, task_id)
+        if dispatches < 3:
+            assert row.state == "scheduled"
+            now = _just_after_next_attempt(row)
+
+    assert row.state == "exhausted"
+    assert len(set(command_ids)) == 3
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("paused", PV)
+
+
+@pytest.mark.asyncio
+async def test_own_retry_out_of_defers_fails_and_leaves_the_task_resume_requested(
+    factory, handler, monkeypatch
+):
+    """A read that outlasts the defer budget ends with a failed command and a
+    terminal broadcast. Housekeeping still takes the moved fence for a
+    confirmation, so the task stays in resume_requested for a person."""
+    monkeypatch.setattr(
+        task_auto_resume, "notify_task_command_dispatcher", lambda: None
+    )
+    install_interaction_rollout_policy(
+        monkeypatch, mode="native", shared_task_execution=True
+    )
+    handler.interaction.return_value = ActiveInteractionUnavailable("lookup_failed")
+    broadcasts = AsyncMock()
+    monkeypatch.setattr(commands, "_broadcast_terminal_command_error", broadcasts)
+    task_id = _scheduled(factory)
+    assert run_auto_resume_tick(now=utc_now()).dispatched == 1
+    # An earlier attempt wrote RESUME_REQUESTED and died.
+    with factory() as db:
+        task = db.get(Task, task_id)
+        task.control_state = "resume_requested"
+        task.state_version = PV + 1
+        stored = db.scalars(
+            sa.select(TaskExecutionCommand).where(
+                TaskExecutionCommand.task_id == task_id
+            )
+        ).one()
+        stored.attempt_count = 1
+        db.commit()
+
+    command = await _dispatch_auto_command(factory, task_id)
+
+    assert (command.status, command.defer_count) == ("pending", 1)
+    broadcasts.assert_not_awaited()
+
+    with factory() as db:
+        stored = db.get(TaskExecutionCommand, command.id)
+        stored.defer_count = max_command_defers() - 1
+        stored.claim_expires_at = None
+        stored.retry_available_at = None
+        db.commit()
+
+    command = await _dispatch_auto_command(factory, task_id)
+
+    assert command.status == "failed"
+    assert command.error.startswith("Deferred command exceeded retry budget: ")
+    broadcasts.assert_awaited_once()
+    handler.background.assert_not_called()
+
+    report = run_auto_resume_tick(now=_just_after_next_attempt(_row(factory, task_id)))
+
+    assert report.confirmed == 1
+    row = _row(factory, task_id)
+    assert (row.state, row.next_attempt_at) == ("dispatched", None)
+    task = _task(factory, task_id)
+    assert (task.control_state, task.state_version) == ("resume_requested", PV + 1)
 
 
 @pytest.mark.asyncio
